@@ -483,6 +483,10 @@ const APPROVAL_BINDINGS: &[(ApprovalShortcut, KeyBinding)] = &[
         ApprovalShortcut::Deny,
         KeyBinding::new(KeyCode::Char('d'), KeyModifiers::NONE),
     ),
+    (
+        ApprovalShortcut::Deny,
+        KeyBinding::new(KeyCode::Esc, KeyModifiers::NONE),
+    ),
 ];
 
 pub fn resolve_shortcut(context: ShortcutContext, event: KeyEvent) -> Option<ShortcutAction> {
@@ -1138,6 +1142,20 @@ mod tests {
                 key(KeyCode::Up, KeyModifiers::NONE)
             ),
             Some(ShortcutAction::Approval(ApprovalShortcut::SelectAllow))
+        );
+    }
+
+    #[test]
+    fn esc_denies_an_approval() {
+        // The approval panel's hint has always read "Esc deny" (ui.rs's
+        // `render_approval_panel`), but until now no binding backed it, so
+        // the key was silently swallowed by `handle_approval_dialog_key`'s
+        // catch-all arm. Pin the resolver half of the fix here; the
+        // approval_dialog_actions test pins that it actually resolves the
+        // dialog end to end.
+        assert_eq!(
+            approval_shortcut(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(ApprovalShortcut::Deny)
         );
     }
 

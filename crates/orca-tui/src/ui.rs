@@ -5719,6 +5719,9 @@ pub(crate) fn approval_option_hit_index(state: &AppState, column: u16, row: u16)
 }
 
 fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog, theme: &Theme) {
+    if area.is_empty() {
+        return;
+    }
     let geometry = approval_dialog_geometry(area, dialog);
     let popup = geometry.popup;
     let inner_width = usize::from(popup.width.saturating_sub(4));
@@ -8200,6 +8203,28 @@ mod tests {
         let frame = frame_string(&mut state, 100, 30);
         assert!(frame.contains("Approve · bash"), "{frame}");
         assert!(!frame.contains("Commands"), "{frame}");
+    }
+
+    #[test]
+    fn approval_render_guard_hides_mention_candidates_even_if_left_open() {
+        // The mention half of the guard above: same "left open" scenario
+        // (`approval_dialog` set directly, bypassing any reducer that would
+        // otherwise clear `mention`), pinning that `render()`'s guard hides
+        // the mention popup too, not just the slash menu.
+        let mut state = approval_state();
+        state.mention.candidates = vec![orca_runtime::mentions::MentionCandidate::from_file_match(
+            &orca_file_search::SearchMatch {
+                root: std::path::PathBuf::from("/workspace"),
+                path: "mention-target.rs".to_string(),
+                kind: orca_file_search::MatchKind::File,
+                score: 1,
+                indices: Vec::new(),
+            },
+        )];
+        state.mention.phase = Some(SearchPhase::Complete);
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(frame.contains("Approve · bash"), "{frame}");
+        assert!(!frame.contains("mention-target.rs"), "{frame}");
     }
 
     #[test]

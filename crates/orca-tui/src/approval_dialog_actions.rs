@@ -58,3 +58,68 @@ pub(crate) fn handle_approval_dialog_key(
         Some(_) | None => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{TuiInteractionKey, TuiInteractionKind};
+    use crate::types::{AppStatus, ApprovalDialog};
+    use crossterm::event::KeyModifiers;
+    use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
+
+    /// A `WaitingApproval` state with an open dialog, plus the action
+    /// channel `handle_approval_dialog_key` reports its resolution on. The
+    /// dialog is permission-kind (rather than the plain tool-approval kind)
+    /// so a denial resolves to `TuiPermissionDecision::Deny`, which shows up
+    /// in the sent action's `Debug` output; a tool-approval denial would
+    /// resolve to the indistinguishable `Approval(false)`. Both kinds
+    /// travel through the same `resolve_approval` call either way, so the
+    /// choice only affects what the test below can observe, not what code
+    /// path Esc takes.
+    fn approval_fixture() -> (
+        AppState,
+        mpsc::Sender<UserAction>,
+        mpsc::Receiver<UserAction>,
+    ) {
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            event_tx,
+            "test".to_string(),
+            "model".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = AppStatus::WaitingApproval;
+        state.approval_dialog = Some(ApprovalDialog {
+            id: "approval-1".to_string(),
+            interaction: Some(TuiInteractionKey::new(
+                orca_core::cancel::OperationIdAllocator::new().allocate(),
+                "approval-1",
+                TuiInteractionKind::Permission,
+            )),
+            tool: "bash".to_string(),
+            target: Some("curl https://api.example.invalid".to_string()),
+            permission_kind: Some(RuntimePermissionRequestKind::NetworkBlock),
+            background_task_id: None,
+            selected: 0,
+            options: ApprovalDialog::options_for("bash", Some("curl https://api.example.invalid")),
+            diff: None,
+        });
+        let (action_tx, action_rx) = mpsc::unbounded();
+        (state, action_tx, action_rx)
+    }
+
+    #[test]
+    fn pressing_esc_resolves_the_approval_as_denied() {
+        let (mut state, action_tx, action_rx) = approval_fixture();
+
+        handle_approval_dialog_key(
+            &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &action_tx,
+        );
+
+        assert!(state.approval_dialog.is_none(), "the dialog must close");
+        let action = action_rx.try_recv().expect("a response is sent");
+        assert!(format!("{action:?}").contains("Deny"), "{action:?}");
+    }
+}
