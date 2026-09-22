@@ -235,7 +235,7 @@ fn dispatch_slash_command(
             state.show_agents();
         }
         SlashCommand::TaskWorkspace => {
-            state.show_agents();
+            state.toggle_tasks_dock();
         }
         SlashCommand::TaskFollowUp { task_id, prompt } => {
             let _ = action_tx.send(UserAction::FollowUpTask { task_id, prompt });
@@ -569,6 +569,7 @@ mod tests {
     use crate::protocol::TuiEvent;
     use crate::surface_projection::SurfaceProjectionState;
     use crate::test_support::test_run_config;
+    use crate::types::PanelMode;
 
     fn state() -> AppState {
         let (action_tx, _) = mpsc::unbounded();
@@ -578,6 +579,30 @@ mod tests {
             "deepseek-v4-pro".to_string(),
             "/tmp/project".to_string(),
         )
+    }
+
+    #[test]
+    fn tasks_opens_the_dock_and_agents_still_opens_the_panel() {
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, _) = mpsc::unbounded();
+
+        let mut dock_state = state();
+        handle_slash_command("/tasks", &mut config, &shared, &mut dock_state, &action_tx);
+
+        assert!(dock_state.tasks_dock_expanded);
+        assert_eq!(dock_state.panel_mode, PanelMode::Conversation);
+
+        let mut panel_state = state();
+        handle_slash_command(
+            "/agents",
+            &mut config,
+            &shared,
+            &mut panel_state,
+            &action_tx,
+        );
+
+        assert_eq!(panel_state.panel_mode, PanelMode::Agents);
     }
 
     #[test]

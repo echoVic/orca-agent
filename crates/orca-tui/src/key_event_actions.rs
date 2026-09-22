@@ -379,6 +379,41 @@ mod tests {
     }
 
     #[test]
+    fn esc_collapses_the_dock_before_anything_else_handles_it() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        // The dock can be expanded while the full Agents panel is also open
+        // (activity_lines renders it under both PanelMode::Conversation and
+        // PanelMode::Agents). Esc must collapse the dock first and leave the
+        // panel open, proving the dock's priority over the panel-close arm.
+        state.show_agents();
+        state.tasks_dock_expanded = true;
+        let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(false);
+
+        let flow = handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(flow, KeyEventFlow::Continue));
+        assert!(!state.tasks_dock_expanded, "the dock collapses first");
+        assert_eq!(
+            state.panel_mode,
+            PanelMode::Agents,
+            "the panel stays open for a second Esc"
+        );
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn escape_returns_from_agent_transcript_before_closing_workspace() {
         let (action_tx, action_rx) = mpsc::unbounded();
         let mut state = state_with_search_matches();
@@ -818,6 +853,15 @@ where
     {
         vim_state.cancel_pending_command();
         state.clear_task_transcript();
+        return Ok(KeyEventFlow::Continue);
+    }
+
+    // The tasks dock is the more transient layer: collapse it on its own
+    // before falling through to the full Workflows/Agents panel close below,
+    // so a dock expanded on top of an open panel takes one Esc at a time.
+    if state.tasks_dock_expanded && key.code == KeyCode::Esc {
+        vim_state.cancel_pending_command();
+        state.collapse_tasks_dock();
         return Ok(KeyEventFlow::Continue);
     }
 

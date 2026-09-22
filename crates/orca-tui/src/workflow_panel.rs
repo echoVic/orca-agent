@@ -458,6 +458,18 @@ impl AppState {
         self.panel_mode = PanelMode::Conversation;
     }
 
+    /// Flip the tasks dock between collapsed and expanded. Unlike
+    /// `show_agents`/`show_workflows`, this never touches `panel_mode`: the
+    /// dock lives in the activity area above the composer and layers over
+    /// the transcript instead of replacing it.
+    pub fn toggle_tasks_dock(&mut self) {
+        self.tasks_dock_expanded = !self.tasks_dock_expanded;
+    }
+
+    pub fn collapse_tasks_dock(&mut self) {
+        self.tasks_dock_expanded = false;
+    }
+
     pub(crate) fn apply_workflow_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         let previous = self.workflow_panel.tasks().to_vec();
         // Only update the parent snapshot when Main is focused. While a child
@@ -495,7 +507,10 @@ impl AppState {
         self.emit_subagent_terminal_notices(&previous);
         self.refresh_open_task_transcript();
         if should_reveal_background_approval {
-            self.panel_mode = PanelMode::Workflows;
+            // A background approval must surface without stealing the
+            // transcript: expand the dock in place rather than switching
+            // panel_mode to the full Workflows panel.
+            self.tasks_dock_expanded = true;
             if let Some(task_id) = self
                 .workflow_tasks()
                 .iter()
@@ -505,7 +520,7 @@ impl AppState {
                 self.workflow_panel.select_task_id(&task_id);
             }
         } else if should_reveal_background_task {
-            self.panel_mode = PanelMode::Workflows;
+            self.tasks_dock_expanded = true;
             if let Some(task_id) = self
                 .workflow_tasks()
                 .iter()
@@ -520,8 +535,8 @@ impl AppState {
         {
             let selected_is_now_foregrounded = selected_was_backgrounded_main_session
                 && is_foregrounded_running_main_session(selected_task);
-            if selected_is_now_foregrounded && self.panel_mode == PanelMode::Workflows {
-                self.panel_mode = PanelMode::Conversation;
+            if selected_is_now_foregrounded && self.tasks_dock_expanded {
+                self.tasks_dock_expanded = false;
             }
         }
     }

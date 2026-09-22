@@ -466,6 +466,10 @@ pub struct AppState {
     pub(crate) workflow_panel: WorkflowPanelState,
     pub(crate) agent_workspace: AgentWorkspaceState,
     pub(crate) agent_dock_selected_task_id: Option<String>,
+    /// Whether `/tasks` has expanded the background-task dock in the
+    /// activity area above the composer. Distinct from `panel_mode`: the
+    /// dock stays layered above the transcript instead of replacing it.
+    pub tasks_dock_expanded: bool,
     pub(crate) announced_startup_warnings: std::collections::HashSet<String>,
     pub(crate) announced_subagent_batches: std::collections::HashSet<String>,
     pub(crate) announced_subagent_terminals: std::collections::HashSet<String>,
@@ -711,6 +715,7 @@ impl AppState {
             workflow_panel: WorkflowPanelState::default(),
             agent_workspace: AgentWorkspaceState::default(),
             agent_dock_selected_task_id: None,
+            tasks_dock_expanded: false,
             announced_startup_warnings: std::collections::HashSet::new(),
             announced_subagent_batches: std::collections::HashSet::new(),
             announced_subagent_terminals: std::collections::HashSet::new(),

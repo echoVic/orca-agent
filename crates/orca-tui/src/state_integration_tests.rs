@@ -2982,7 +2982,7 @@ fn workflow_task_update_preserves_owner_selection() {
 }
 
 #[test]
-fn backgrounded_main_session_update_reveals_and_selects_task_panel_once() {
+fn backgrounded_main_session_update_expands_the_dock_and_selects_the_task_once() {
     let mut state = state();
     let mut backgrounded = workflow_task_summary("task-main", "backgrounded");
     backgrounded.task_type = TaskType::MainSession;
@@ -2995,7 +2995,12 @@ fn backgrounded_main_session_update_reveals_and_selects_task_panel_once() {
 
     state.apply_workflow_tasks_for_test(vec![workflow.clone(), backgrounded.clone()]);
 
-    assert_eq!(state.panel_mode, PanelMode::Workflows);
+    assert!(state.tasks_dock_expanded, "the reveal expands the dock");
+    assert_eq!(
+        state.panel_mode,
+        PanelMode::Conversation,
+        "the transcript is not replaced"
+    );
     assert_eq!(
         state.selected_workflow_task().map(|task| task.id.as_str()),
         Some("task-main")
@@ -3017,7 +3022,7 @@ fn backgrounded_main_session_update_reveals_and_selects_task_panel_once() {
 }
 
 #[test]
-fn backgrounded_approval_update_reveals_and_selects_task_panel_once() {
+fn backgrounded_approval_update_expands_the_dock_and_selects_the_task_once() {
     let mut state = state();
     let mut approval = workflow_task_summary("task-approval", "approval");
     approval.task_type = TaskType::MainSession;
@@ -3037,7 +3042,12 @@ fn backgrounded_approval_update_reveals_and_selects_task_panel_once() {
 
     state.apply_workflow_tasks_for_test(vec![workflow.clone(), approval.clone()]);
 
-    assert_eq!(state.panel_mode, PanelMode::Workflows);
+    assert!(state.tasks_dock_expanded, "the reveal expands the dock");
+    assert_eq!(
+        state.panel_mode,
+        PanelMode::Conversation,
+        "the transcript is not replaced"
+    );
     assert_eq!(
         state.selected_workflow_task().map(|task| task.id.as_str()),
         Some("task-approval")
@@ -3161,9 +3171,9 @@ fn background_output_attach_clears_suppression_before_replayed_delta() {
 }
 
 #[test]
-fn foregrounded_selected_main_session_returns_to_conversation_panel() {
+fn foregrounded_selected_main_session_collapses_the_dock() {
     let mut state = state();
-    state.panel_mode = PanelMode::Workflows;
+    state.tasks_dock_expanded = true;
     state.suppress_background_main_session_output = true;
 
     let mut selected = workflow_task_summary("task-main", "selected");
@@ -3178,7 +3188,7 @@ fn foregrounded_selected_main_session_returns_to_conversation_panel() {
     selected.is_backgrounded = false;
     state.apply_workflow_tasks_for_test(vec![selected, other]);
 
-    assert_eq!(state.panel_mode, PanelMode::Conversation);
+    assert!(!state.tasks_dock_expanded);
     assert!(!state.suppress_background_main_session_output);
 }
 

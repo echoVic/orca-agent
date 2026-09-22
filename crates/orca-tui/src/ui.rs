@@ -101,7 +101,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     let goal_height: u16 = if state.current_goal().is_some() { 3 } else { 0 };
     // Live child work is visible from the conversation view. Keep the stack bounded so
     // a large fan-out cannot displace the transcript and composer entirely.
-    let activity_lines = activity_lines(state, theme);
+    let activity_lines = activity_lines(state, theme, frame.area().width);
     let queue_preview_lines = queued_preview_lines(state, frame.area().width, theme);
     let queue_preview_height = queue_preview_lines.len().min(3) as u16;
     let desired_activity_height = 1_u16.saturating_add(activity_lines.len() as u16);
@@ -4876,17 +4876,26 @@ fn approval_mode_color(mode: ApprovalMode, theme: &Theme) -> Color {
 /// bounded stack returned by `activity_lines`.
 #[cfg(test)]
 fn activity_line(state: &AppState, theme: &Theme) -> Option<String> {
-    activity_lines(state, theme).into_iter().next().map(|line| {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    })
+    // Width is generous and unused by any non-hint row; focused tests here
+    // never assert on the expanded dock's trailing hint line.
+    activity_lines(state, theme, 120)
+        .into_iter()
+        .next()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        })
 }
 
 const MAX_DEFAULT_SUBAGENTS: usize = 4;
+/// Row cap for the subagent list once the tasks dock is expanded (`/tasks`
+/// or an automatic reveal). Higher than the compact default because the
+/// dock now owns the activity area instead of sharing it with a panel.
+const MAX_EXPANDED_SUBAGENTS: usize = 6;
 
-fn activity_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+fn activity_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if state.composer_images.is_paste_in_flight() {
         lines.push(Line::from(Span::styled(
@@ -4906,6 +4915,8 @@ fn activity_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
             theme,
             state.tick,
             state.agent_dock_selected_task_id.as_deref(),
+            state.tasks_dock_expanded,
+            width,
         ));
     }
     lines
@@ -4990,11 +5001,34 @@ fn background_task_activity_lines(
     theme: &Theme,
     tick: u64,
     selected_task_id: Option<&str>,
+    expanded: bool,
+    width: u16,
 ) -> Vec<Line<'static>> {
     let activity_row = |text: String, color: Color| -> Line<'static> {
         Line::from(Span::styled(format!(" {text}"), Style::default().fg(color)))
     };
     let mut lines = Vec::new();
+
+    // Expanded is the `/tasks` dock: it always shows a header (even with
+    // nothing running) so the dock has something to display and advertise
+    // its close hint, and its counts span every task type -- not just
+    // subagents -- so a MainSession approval is reflected even though it
+    // never becomes a selectable row below.
+    if expanded {
+        let overall = TaskActivitySummary::from_tasks(tasks);
+        lines.push(activity_row(
+            format!(
+                "◆ Tasks · {} active · {} needs approval",
+                overall.active_count, overall.attention_count
+            ),
+            if overall.requires_attention() {
+                theme.approval
+            } else {
+                theme.warning
+            },
+        ));
+    }
+
     let visible_subagents = tasks
         .iter()
         .filter(|task| {
@@ -5003,30 +5037,37 @@ fn background_task_activity_lines(
         })
         .collect::<Vec<_>>();
     if !visible_subagents.is_empty() {
-        let active = visible_subagents
-            .iter()
-            .filter(|task| task.status.is_active())
-            .count();
-        let attention = visible_subagents
-            .iter()
-            .filter(|task| task.status.requires_attention())
-            .count();
-        let mut header = format!("● Agents {active} active");
-        if attention > 0 {
-            header.push_str(&format!(" · {attention} attention"));
-        }
-        header.push_str(" · /agents view");
-        lines.push(activity_row(
-            header,
+        let subagent_cap = if expanded {
+            MAX_EXPANDED_SUBAGENTS
+        } else {
+            MAX_DEFAULT_SUBAGENTS
+        };
+        if !expanded {
+            let active = visible_subagents
+                .iter()
+                .filter(|task| task.status.is_active())
+                .count();
+            let attention = visible_subagents
+                .iter()
+                .filter(|task| task.status.requires_attention())
+                .count();
+            let mut header = format!("● Agents {active} active");
             if attention > 0 {
-                theme.approval
-            } else {
-                theme.warning
-            },
-        ));
+                header.push_str(&format!(" · {attention} attention"));
+            }
+            header.push_str(" · /agents view");
+            lines.push(activity_row(
+                header,
+                if attention > 0 {
+                    theme.approval
+                } else {
+                    theme.warning
+                },
+            ));
+        }
         lines.push(activity_row("  ○ Main [default]".to_string(), theme.text));
 
-        for task in visible_subagents.iter().take(MAX_DEFAULT_SUBAGENTS) {
+        for task in visible_subagents.iter().take(subagent_cap) {
             let selected = selected_task_id == Some(task.id.as_str());
             let selection = if selected { "›" } else { "○" };
             let status = task_status_label(task.status);
@@ -5058,9 +5099,7 @@ fn background_task_activity_lines(
             };
             lines.push(activity_row(format!("    {detail}"), theme.muted));
         }
-        let overflow = visible_subagents
-            .len()
-            .saturating_sub(MAX_DEFAULT_SUBAGENTS);
+        let overflow = visible_subagents.len().saturating_sub(subagent_cap);
         if overflow > 0 {
             lines.push(activity_row(
                 format!("  +{overflow} more · /tasks manage"),
@@ -5081,37 +5120,49 @@ fn background_task_activity_lines(
             }
             activity
         });
-    if !activity.has_active_tasks() && !activity.requires_attention() {
-        return lines;
+    if activity.has_active_tasks() || activity.requires_attention() {
+        let mut labels = Vec::with_capacity(2);
+        if activity.active_count > 0 {
+            let noun = if activity.active_count == 1 {
+                "task"
+            } else {
+                "tasks"
+            };
+            labels.push(format!(
+                "{} background {noun} running",
+                activity.active_count
+            ));
+        }
+        if activity.attention_count > 0 {
+            let verb = if activity.attention_count == 1 {
+                "needs"
+            } else {
+                "need"
+            };
+            labels.push(format!("{} {verb} approval", activity.attention_count));
+        }
+
+        let color = if activity.requires_attention() {
+            theme.approval
+        } else {
+            theme.warning
+        };
+        lines.push(activity_row(format!("● {}", labels.join(" · ")), color));
     }
 
-    let mut labels = Vec::with_capacity(2);
-    if activity.active_count > 0 {
-        let noun = if activity.active_count == 1 {
-            "task"
-        } else {
-            "tasks"
-        };
-        labels.push(format!(
-            "{} background {noun} running",
-            activity.active_count
-        ));
-    }
-    if activity.attention_count > 0 {
-        let verb = if activity.attention_count == 1 {
-            "needs"
-        } else {
-            "need"
-        };
-        labels.push(format!("{} {verb} approval", activity.attention_count));
+    // Trailing hint row: leading space matches `activity_row`'s left margin
+    // so the hint lines up with every other row in the dock.
+    if expanded {
+        let hint = crate::chrome::hint_line(
+            theme,
+            usize::from(width).saturating_sub(1),
+            &[("↑↓", "select"), ("Enter", "open"), ("Esc", "close")],
+        );
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(hint.spans);
+        lines.push(Line::from(spans));
     }
 
-    let color = if activity.requires_attention() {
-        theme.approval
-    } else {
-        theme.warning
-    };
-    lines.push(activity_row(format!("● {}", labels.join(" · ")), color));
     lines
 }
 
@@ -11281,7 +11332,7 @@ mod tests {
         task.subagent_turn = Some(1);
         state.replace_workflow_tasks_for_test(vec![task]);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
-        let rendered = activity_lines(&state, &theme)
+        let rendered = activity_lines(&state, &theme, 120)
             .into_iter()
             .map(|line| {
                 line.spans
@@ -11404,15 +11455,16 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let lines: Vec<String> = background_task_activity_lines(&tasks, &theme, 0, None)
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect();
+        let lines: Vec<String> =
+            background_task_activity_lines(&tasks, &theme, 0, None, false, 100)
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect();
 
         assert_eq!(lines.len(), 11);
         assert_eq!(lines[0], " ● Agents 5 active · /agents view");
@@ -11423,6 +11475,113 @@ mod tests {
         assert!(lines[9].starts_with("    "));
         assert_eq!(lines[10], "   +1 more · /tasks manage");
         assert!(lines.iter().all(|line| !line.contains("agent 5")));
+    }
+
+    #[test]
+    fn expanded_dock_raises_the_subagent_cap_and_appends_the_close_hint() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let tasks = (1..=7)
+            .map(|index| {
+                let mut task = workflow_task_for_agent_dashboard(
+                    &format!("agent {index}"),
+                    &format!("agent-{index}"),
+                    orca_core::workflow_types::WorkflowAgentStatus::Running,
+                );
+                task.task_type = TaskType::Subagent;
+                task.workflow_agents.clear();
+                task.created_at_ms = index * 1_000;
+                task.last_activity_at_ms = Some(index * 1_000);
+                task
+            })
+            .collect::<Vec<_>>();
+
+        let lines: Vec<String> = background_task_activity_lines(&tasks, &theme, 0, None, true, 100)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert_eq!(lines[0], " ◆ Tasks · 7 active · 0 needs approval");
+        assert!(lines.iter().any(|line| line.contains("agent 6")));
+        assert!(
+            !lines.iter().any(|line| line.contains("agent 7")),
+            "cap is 6, not the full 7: {lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("+1 more")));
+        assert_eq!(lines.last().unwrap(), " ↑↓ select · Enter open · Esc close");
+    }
+
+    #[test]
+    fn slash_tasks_expands_the_dock_without_replacing_the_transcript() {
+        let mut state = test_state();
+        state.push_message(ChatMessage::User("并行做三件事".into()));
+        state.tasks_dock_expanded = true;
+        let frame = frame_string(&mut state, 100, 30);
+        // Wide CJK glyphs leave their trailing cell untouched in the test
+        // backend buffer, which `frame_string` reads back as a plain space
+        // (see the established pattern at `" ›  跑 一 下 测 试"` above).
+        assert!(
+            frame.contains(" ›  并 行 做 三 件 事"),
+            "transcript stays visible: {frame}"
+        );
+        assert_eq!(
+            state.panel_mode,
+            PanelMode::Conversation,
+            "the panel must not swap"
+        );
+        assert!(frame.contains("◆ Tasks"), "{frame}");
+        assert!(
+            frame.contains("Esc"),
+            "the dock advertises how to close: {frame}"
+        );
+    }
+
+    /// End-to-end proof for the automatic reveal: a backgrounded MainSession
+    /// task going into ApprovalRequired must become visible on its own,
+    /// through the same path `apply_workflow_tasks_update` drives in
+    /// production (not by setting `tasks_dock_expanded` directly), and the
+    /// transcript already on screen must stay put.
+    #[test]
+    fn background_approval_reveal_renders_visibly_without_replacing_the_transcript() {
+        let mut state = test_state();
+        state.push_message(ChatMessage::User("kick off the deploy".into()));
+
+        let mut approval = workflow_task_for_agent_dashboard(
+            "deploy",
+            "agent",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        approval.task_type = TaskType::MainSession;
+        approval.status = TaskStatus::ApprovalRequired;
+        approval.is_backgrounded = true;
+        approval.pending_tool_call = Some(orca_core::task_types::PendingToolCallSummary {
+            id: "approval-1".to_string(),
+            name: "bash".to_string(),
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            arguments: "{}".to_string(),
+        });
+
+        state.apply_workflow_tasks_for_test(vec![approval]);
+        assert!(
+            state.tasks_dock_expanded,
+            "the approval must expand the dock automatically"
+        );
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
+
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(
+            frame.contains(" ›  kick off the deploy"),
+            "the transcript is still visible: {frame}"
+        );
+        assert!(
+            frame.contains("◆ Tasks · 0 active · 1 needs approval"),
+            "the pending approval is visible in the dock header: {frame}"
+        );
     }
 
     #[test]
