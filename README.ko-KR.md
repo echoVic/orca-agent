@@ -56,6 +56,10 @@ TUI에서 `@`로 파일, Skills, Plugins, MCP Resources를 검색할 수 있습�
 `/plan`은 읽기 전용 계획, `/goal`은 지속 목표, `/workflows`는 백그라운드 작업,
 `/trust`는 현재 폴더의 샌드박스 권한을 관리합니다.
 
+### Pilion Browser에서 Orca 사용하기
+
+[Pilion Browser](https://github.com/echoVic/pilion-browser)는 ACP 클라이언트로 동작하는 데스크톱 브라우저입니다. Agent 패널에서 **Orca**를 선택하면 Pilion이 `orca --mode=acp`를 실행하고 `DEEPSEEK_API_KEY`를 전달하며, 자신의 탭을 MCP 도구(`browser_snapshot`, `browser_screenshot`, 이동, 클릭, 입력)로 Orca에 노출합니다. 실행 전 승인과 사람 인계도 지원합니다. macOS, Windows, Linux 설치 파일은 [Pilion 릴리스 페이지](https://github.com/echoVic/pilion-browser/releases)에서 받을 수 있습니다.
+
 ## 주요 기능
 
 - DeepSeek의 추론 및 도구 사용 의미 체계를 직접 지원하며 SSE 스트리밍,
