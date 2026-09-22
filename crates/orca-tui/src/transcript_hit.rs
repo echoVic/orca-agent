@@ -13,7 +13,6 @@ use crate::transcript_state::ChatMessage;
 
 /// A collapsible message's on-screen rect for the frame just drawn, and the
 /// index of the message it belongs to.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CollapsibleHitArea {
     pub(crate) rect: Rect,
@@ -22,8 +21,11 @@ pub(crate) struct CollapsibleHitArea {
 
 /// Whether `message` can be expanded/collapsed, and therefore whether it
 /// gets an entry in `collapsible_hit_areas`. Kept in one place so future
-/// collapsible kinds (e.g. `ChatMessage::System`) extend a single match arm.
-fn is_collapsible(message: &ChatMessage) -> bool {
+/// collapsible kinds (e.g. `ChatMessage::System`) extend a single match arm —
+/// `types.rs`'s `toggle_latest_expandable`/`toggle_expandable_at`/
+/// `toggle_all_expandable` all call this too, so the `e` key, `Shift+E`, and
+/// a mouse click never disagree about what counts as collapsible.
+pub(crate) fn is_collapsible(message: &ChatMessage) -> bool {
     matches!(
         message,
         ChatMessage::ToolCall { .. } | ChatMessage::Reasoning { .. }

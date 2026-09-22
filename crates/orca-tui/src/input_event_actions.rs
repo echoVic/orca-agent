@@ -634,6 +634,32 @@ pub(crate) fn handle_mouse_event(
             };
             state.viewport.last_left_click = Some((now, mouse.column, mouse.row, count));
 
+            // A single click on a collapsed tool-output or reasoning row
+            // expands (or re-collapses) just that message instead of
+            // starting a text selection. Only a plain single click does
+            // this: double/triple clicks are the word/line selection
+            // gestures below and must keep working even when they land on a
+            // collapsible row, so `count == 1` is checked before the hit
+            // areas ever come into it. Each `CollapsibleHitArea.rect` is
+            // already clipped to the transcript area by `render_live_messages`,
+            // so a click outside it (or outside `PanelMode::Conversation`
+            // entirely) can never resolve to a message here.
+            if count == 1
+                && state.panel_mode == PanelMode::Conversation
+                && let Some(area) = state
+                    .collapsible_hit_areas
+                    .iter()
+                    .find(|area| {
+                        area.rect
+                            .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                    })
+                    .copied()
+            {
+                state.toggle_expandable_at(area.message_index);
+                state.viewport.selection = None;
+                return MouseFlow::Handled;
+            }
+
             state.viewport.selection = if state.panel_mode == PanelMode::Conversation {
                 let pos = state.transcript_pos_at(mouse.column, mouse.row);
                 match (count, pos) {
@@ -816,6 +842,211 @@ mod tests {
         state.viewport.transcript_area = Some(Rect::new(0, 0, 20, 5));
         state.viewport.viewport_base_row = 0;
         state
+    }
+
+    /// A fresh `AppState` with no messages yet, for tests that need a real
+    /// `crate::ui::render` pass (via `render_once`) rather than a hand-primed
+    /// render cache like `state_with_transcript`.
+    fn test_state() -> AppState {
+        let (tx, _rx) = crossbeam_channel::unbounded::<UserAction>();
+        AppState::new(
+            tx,
+            "0.0.0".to_string(),
+            "model".to_string(),
+            "cwd".to_string(),
+        )
+    }
+
+    /// Matches `ui.rs`'s test `tool_call` helper field-for-field.
+    fn tool_call(
+        name: &str,
+        target: Option<&str>,
+        status: &str,
+        output: Option<&str>,
+        expanded: bool,
+    ) -> ChatMessage {
+        ChatMessage::ToolCall {
+            id: "call-1".into(),
+            name: name.into(),
+            target: target.map(str::to_string),
+            status: status.into(),
+            output: output.map(str::to_string),
+            diff: None,
+            kind: None,
+            expanded,
+        }
+    }
+
+    /// Renders one real frame at `width`x`height`, exactly as the render
+    /// loop would: populates `state.viewport.transcript_area`,
+    /// `state.collapsible_hit_areas`, and everything else a click handler
+    /// reads. Mirrors `image_preview.rs`'s
+    /// `message_thumbnail_registers_a_clickable_hit_area` test.
+    fn render_once(state: &mut AppState, width: u16, height: u16) {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("test backend");
+        terminal
+            .draw(|frame| crate::ui::render(frame, state, &textarea, &theme))
+            .expect("draw");
+    }
+
+    /// Presses and releases the left mouse button at `(column, row)` in one
+    /// click, returning whether the press was consumed by
+    /// `handle_mouse_event`.
+    fn click_at(state: &mut AppState, column: u16, row: u16) -> bool {
+        let now = Instant::now();
+        let handled = handle_mouse_event(
+            &mouse_at(MouseEventKind::Down(MouseButton::Left), column, row),
+            state,
+            now,
+        ) == MouseFlow::Handled;
+        handle_mouse_event(
+            &mouse_at(MouseEventKind::Up(MouseButton::Left), column, row),
+            state,
+            now,
+        );
+        handled
+    }
+
+    #[test]
+    fn clicking_a_collapsed_tool_row_expands_only_that_message() {
+        let mut state = test_state();
+        state.push_message(tool_call(
+            "bash",
+            Some("a"),
+            "completed",
+            Some("l1\nl2\nl3\nl4"),
+            false,
+        ));
+        state.push_message(tool_call(
+            "bash",
+            Some("b"),
+            "completed",
+            Some("m1\nm2\nm3\nm4"),
+            false,
+        ));
+        render_once(&mut state, 100, 30);
+        let area = state.collapsible_hit_areas[0];
+
+        let handled = click_at(&mut state, area.rect.x + 2, area.rect.y);
+
+        assert!(handled);
+        assert!(matches!(
+            &state.transcript.messages[0],
+            ChatMessage::ToolCall { expanded: true, .. }
+        ));
+        assert!(matches!(
+            &state.transcript.messages[1],
+            ChatMessage::ToolCall {
+                expanded: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_click_that_hits_no_collapsible_row_still_starts_a_text_selection() {
+        let mut state = test_state();
+        state.push_message(ChatMessage::Assistant("plain paragraph".into()));
+        render_once(&mut state, 100, 30);
+        let transcript = state.viewport.transcript_area.expect("transcript");
+
+        // Check the press alone, like `drag_selects_and_release_stages_a_clipboard_copy`
+        // does: a plain click's release (no drag) legitimately clears an empty
+        // cell selection back to `None` (`plain_click_clears_selection_without_copying`),
+        // so asserting post-release here would conflate that with a regression.
+        handle_mouse_event(
+            &mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                transcript.x + 1,
+                transcript.y,
+            ),
+            &mut state,
+            Instant::now(),
+        );
+
+        assert!(
+            state.viewport.selection.is_some(),
+            "a click that misses every collapsible hit area must fall through \
+             to the ordinary text-selection gesture"
+        );
+    }
+
+    #[test]
+    fn a_click_below_the_transcript_area_does_not_toggle_a_collapsible_row() {
+        // Carried from Task 4's review: `message_index_at_row` alone has no
+        // upper bound on `row`, so this pins that the click handler itself
+        // never resolves a row outside the drawn transcript to a message —
+        // whether that guarantee comes from confining to the transcript
+        // rect explicitly or (as implemented) from every `CollapsibleHitArea`
+        // already being clipped to it by `render_live_messages`.
+        let mut state = test_state();
+        state.push_message(tool_call(
+            "bash",
+            Some("a"),
+            "completed",
+            Some("l1\nl2\nl3\nl4"),
+            false,
+        ));
+        render_once(&mut state, 100, 30);
+        let transcript = state.viewport.transcript_area.expect("transcript");
+        let below = transcript.y + transcript.height;
+
+        click_at(&mut state, transcript.x + 2, below);
+
+        assert!(matches!(
+            &state.transcript.messages[0],
+            ChatMessage::ToolCall {
+                expanded: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn double_clicking_a_collapsible_row_toggles_once_then_selects_a_word() {
+        // The one way to silently break word/line selection would be to
+        // intercept every click that lands on a collapsible row, not just
+        // single clicks. Pin that a double click on such a row still behaves
+        // like `double_click_selects_the_word_and_copies_immediately`: only
+        // the first (single) press toggles, the second press selects.
+        let mut state = test_state();
+        state.push_message(tool_call(
+            "read_file",
+            Some("src/main.rs"),
+            "completed",
+            Some("l1\nl2\nl3\nl4"),
+            false,
+        ));
+        render_once(&mut state, 100, 30);
+        let area = state.collapsible_hit_areas[0];
+
+        assert!(click_at(&mut state, area.rect.x + 2, area.rect.y));
+        assert!(matches!(
+            &state.transcript.messages[0],
+            ChatMessage::ToolCall { expanded: true, .. }
+        ));
+        assert_eq!(
+            state.viewport.selection, None,
+            "toggling a row must not also start a selection"
+        );
+
+        click_at(&mut state, area.rect.x + 2, area.rect.y);
+
+        assert!(
+            matches!(
+                &state.transcript.messages[0],
+                ChatMessage::ToolCall { expanded: true, .. }
+            ),
+            "the second press of a double click must not toggle the row shut again"
+        );
+        assert!(
+            state.viewport.selection.is_some(),
+            "the second press of a double click must select a word, same as any other row"
+        );
     }
 
     #[test]

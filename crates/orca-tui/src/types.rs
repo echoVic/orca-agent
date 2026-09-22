@@ -42,7 +42,7 @@ use crate::surface_projection::{
     SurfaceGoalProjectionState, SurfaceMetricsState, SurfaceOperationProjectionState,
     SurfaceSessionProjectionState, SurfaceWorkflowTaskProjectionState,
 };
-use crate::transcript_hit::CollapsibleHitArea;
+use crate::transcript_hit::{CollapsibleHitArea, is_collapsible};
 use crate::transcript_state::{ChatMessage, TranscriptState};
 use crate::transcript_view::TranscriptRenderCache;
 #[cfg(test)]
@@ -1354,12 +1354,7 @@ impl AppState {
             .min(self.transcript.messages.len());
         let Some(index) = self.transcript.messages[live_start..]
             .iter()
-            .rposition(|message| {
-                matches!(
-                    message,
-                    ChatMessage::ToolCall { .. } | ChatMessage::Reasoning { .. }
-                )
-            })
+            .rposition(is_collapsible)
         else {
             return false;
         };
@@ -1372,6 +1367,73 @@ impl AppState {
             }
             _ => unreachable!(),
         });
+        true
+    }
+
+    /// Expands or collapses the message at `index` — the click counterpart
+    /// to `toggle_latest_expandable`. Returns `false` without touching
+    /// anything when `index` is before `flushed_count` (already committed to
+    /// the terminal's immutable scrollback), out of range, or not a
+    /// collapsible message.
+    pub fn toggle_expandable_at(&mut self, index: usize) -> bool {
+        if index < self.transcript.flushed_count {
+            return false;
+        }
+        let Some(message) = self.transcript.messages.get(index) else {
+            return false;
+        };
+        if !is_collapsible(message) {
+            return false;
+        }
+        self.mutate_message(index, |message| match message {
+            ChatMessage::ToolCall { expanded, .. } => {
+                *expanded = !*expanded;
+            }
+            ChatMessage::Reasoning { expanded, .. } => {
+                *expanded = !*expanded;
+            }
+            _ => unreachable!(),
+        });
+        true
+    }
+
+    /// `Shift+E`: one target state for every collapsible live message rather
+    /// than flipping each row independently. If any of them is collapsed,
+    /// expands them all; if they are all already expanded, collapses them
+    /// all. Live == not yet flushed to the terminal's immutable scrollback
+    /// (see `toggle_latest_expandable`). Returns whether anything changed —
+    /// always `true` when the live pane has at least one collapsible
+    /// message, since the target is by construction the opposite of the
+    /// current uniform state.
+    pub fn toggle_all_expandable(&mut self) -> bool {
+        let live_start = self
+            .transcript
+            .flushed_count
+            .min(self.transcript.messages.len());
+        let collapsible_indices: Vec<usize> = self.transcript.messages[live_start..]
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| is_collapsible(message))
+            .map(|(offset, _)| live_start + offset)
+            .collect();
+        if collapsible_indices.is_empty() {
+            return false;
+        }
+        let all_expanded = collapsible_indices.iter().all(|&index| {
+            matches!(
+                self.transcript.messages[index],
+                ChatMessage::ToolCall { expanded: true, .. }
+                    | ChatMessage::Reasoning { expanded: true, .. }
+            )
+        });
+        let target = !all_expanded;
+        for index in collapsible_indices {
+            self.mutate_message(index, |message| match message {
+                ChatMessage::ToolCall { expanded, .. } => *expanded = target,
+                ChatMessage::Reasoning { expanded, .. } => *expanded = target,
+                _ => unreachable!(),
+            });
+        }
         true
     }
 }

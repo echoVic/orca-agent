@@ -67,6 +67,14 @@ pub(crate) fn handle_idle_navigation_shortcut(
                 apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme);
             }
         }
+        IdleShortcut::ExpandAll => {
+            if textarea_text(textarea).trim().is_empty() && state.toggle_all_expandable() {
+                vim_state.cancel_pending_command();
+                state.scroll_to_bottom();
+            } else {
+                apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme);
+            }
+        }
         IdleShortcut::Submit
         | IdleShortcut::Newline
         | IdleShortcut::EditLatestQueued

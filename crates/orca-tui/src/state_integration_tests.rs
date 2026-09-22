@@ -52,6 +52,26 @@ fn state() -> AppState {
     )
 }
 
+/// Matches `ui.rs`'s test `tool_call` helper field-for-field.
+fn tool_call(
+    name: &str,
+    target: Option<&str>,
+    status: &str,
+    output: Option<&str>,
+    expanded: bool,
+) -> ChatMessage {
+    ChatMessage::ToolCall {
+        id: "call-1".to_string(),
+        name: name.to_string(),
+        target: target.map(str::to_string),
+        status: status.to_string(),
+        output: output.map(str::to_string),
+        diff: None,
+        kind: None,
+        expanded,
+    }
+}
+
 #[test]
 fn startup_warnings_are_announced_once_per_session() {
     let mut state = state();
@@ -2486,6 +2506,157 @@ fn toggle_latest_expandable_flips_expanded_state() {
         ChatMessage::ToolCall { expanded, .. } => assert!(*expanded),
         other => panic!("expected tool call, got {other:?}"),
     }
+}
+
+#[test]
+fn toggle_expandable_at_flips_the_message_at_that_index_and_reports_the_change() {
+    let mut state = state();
+    state.push_message(tool_call("bash", None, "completed", Some("a\nb"), false));
+
+    assert!(state.toggle_expandable_at(0));
+    assert!(matches!(
+        &state.transcript.messages[0],
+        ChatMessage::ToolCall { expanded: true, .. }
+    ));
+
+    assert!(state.toggle_expandable_at(0));
+    assert!(matches!(
+        &state.transcript.messages[0],
+        ChatMessage::ToolCall {
+            expanded: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn toggle_expandable_at_refuses_a_message_already_flushed_to_scrollback() {
+    let mut state = state();
+    state.push_message(tool_call("bash", None, "completed", Some("a"), false));
+    state.push_message(tool_call("bash", None, "completed", Some("b"), false));
+    // Simulate the render loop flushing the first tool into scrollback.
+    state.transcript.flushed_count = 1;
+
+    assert!(
+        !state.toggle_expandable_at(0),
+        "a flushed message must stay frozen"
+    );
+    assert!(matches!(
+        &state.transcript.messages[0],
+        ChatMessage::ToolCall {
+            expanded: false,
+            ..
+        }
+    ));
+
+    assert!(
+        state.toggle_expandable_at(1),
+        "a live message beyond flushed_count can still toggle"
+    );
+    assert!(matches!(
+        &state.transcript.messages[1],
+        ChatMessage::ToolCall { expanded: true, .. }
+    ));
+}
+
+#[test]
+fn toggle_expandable_at_ignores_out_of_range_and_non_collapsible_messages() {
+    let mut state = state();
+    state.push_message(ChatMessage::Assistant("hi".into()));
+
+    assert!(
+        !state.toggle_expandable_at(0),
+        "Assistant is not collapsible"
+    );
+    assert!(!state.toggle_expandable_at(5), "index is out of range");
+}
+
+#[test]
+fn shift_e_toggles_every_collapsible_message_in_the_live_pane() {
+    let mut state = state();
+    state.push_message(tool_call("bash", None, "completed", Some("a\nb\nc"), false));
+    state.push_message(ChatMessage::Reasoning {
+        text: "x\ny".into(),
+        expanded: false,
+    });
+
+    assert!(state.toggle_all_expandable());
+    assert!(matches!(
+        &state.transcript.messages[0],
+        ChatMessage::ToolCall { expanded: true, .. }
+    ));
+    assert!(matches!(
+        &state.transcript.messages[1],
+        ChatMessage::Reasoning { expanded: true, .. }
+    ));
+
+    assert!(state.toggle_all_expandable());
+    assert!(matches!(
+        &state.transcript.messages[0],
+        ChatMessage::ToolCall {
+            expanded: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &state.transcript.messages[1],
+        ChatMessage::Reasoning {
+            expanded: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn toggle_all_expandable_treats_a_mixed_pane_as_not_fully_expanded() {
+    // If even one collapsible message is closed, the whole pane counts as
+    // "not fully expanded", so the first press must expand everything —
+    // not, say, collapse the one message that already happened to be open.
+    let mut state = state();
+    state.push_message(tool_call("bash", None, "completed", Some("a"), true));
+    state.push_message(tool_call("bash", None, "completed", Some("b"), false));
+
+    assert!(state.toggle_all_expandable());
+    assert!(matches!(
+        &state.transcript.messages[0],
+        ChatMessage::ToolCall { expanded: true, .. }
+    ));
+    assert!(matches!(
+        &state.transcript.messages[1],
+        ChatMessage::ToolCall { expanded: true, .. }
+    ));
+}
+
+#[test]
+fn toggle_all_expandable_only_affects_the_live_pane() {
+    let mut state = state();
+    state.push_message(tool_call("bash", None, "completed", Some("a"), false));
+    state.push_message(tool_call("bash", None, "completed", Some("b"), false));
+    state.transcript.flushed_count = 1;
+
+    assert!(state.toggle_all_expandable());
+    assert!(
+        matches!(
+            &state.transcript.messages[0],
+            ChatMessage::ToolCall {
+                expanded: false,
+                ..
+            }
+        ),
+        "flushed tool must stay collapsed"
+    );
+    assert!(matches!(
+        &state.transcript.messages[1],
+        ChatMessage::ToolCall { expanded: true, .. }
+    ));
+}
+
+#[test]
+fn toggle_all_expandable_returns_false_when_nothing_is_collapsible() {
+    let mut state = state();
+    state.push_message(ChatMessage::Assistant("hi".into()));
+
+    assert!(!state.toggle_all_expandable());
 }
 
 #[test]

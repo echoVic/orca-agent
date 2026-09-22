@@ -115,6 +115,7 @@ pub enum IdleShortcut {
     HalfPageDown,
     Backtrack,
     ExpandToolOutput,
+    ExpandAll,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -372,6 +373,10 @@ const IDLE_BINDINGS: &[(IdleShortcut, KeyBinding)] = &[
     (
         IdleShortcut::ExpandToolOutput,
         KeyBinding::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    ),
+    (
+        IdleShortcut::ExpandAll,
+        KeyBinding::new(KeyCode::Char('E'), KeyModifiers::SHIFT),
     ),
 ];
 
@@ -711,8 +716,8 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     },
     ShortcutHint {
         scope: ShortcutScope::Idle,
-        keys: "e",
-        action: "expand latest tool output",
+        keys: "e · Shift+E",
+        action: "expand latest tool output · expand all",
     },
     ShortcutHint {
         scope: ShortcutScope::Running,
@@ -914,6 +919,29 @@ mod tests {
             idle_shortcut(key(KeyCode::Char('e'), KeyModifiers::NONE)),
             Some(IdleShortcut::ExpandToolOutput)
         );
+    }
+
+    #[test]
+    fn idle_shortcuts_resolve_expand_all() {
+        assert_eq!(
+            idle_shortcut(key(KeyCode::Char('E'), KeyModifiers::SHIFT)),
+            Some(IdleShortcut::ExpandAll)
+        );
+        // Some terminals report the shifted letter without also setting the
+        // modifier bit; `normalize_key_parts` must still resolve it.
+        assert_eq!(
+            idle_shortcut(key(KeyCode::Char('E'), KeyModifiers::NONE)),
+            Some(IdleShortcut::ExpandAll)
+        );
+    }
+
+    #[test]
+    fn expand_hint_documents_both_e_and_shift_e() {
+        let hint = shortcut_hints()
+            .find(|hint| hint.scope == ShortcutScope::Idle && hint.keys.contains('E'))
+            .expect("an Idle-scope hint mentioning E");
+        assert_eq!(hint.keys, "e · Shift+E");
+        assert_eq!(hint.action, "expand latest tool output · expand all");
     }
 
     #[test]

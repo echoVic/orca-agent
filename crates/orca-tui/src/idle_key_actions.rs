@@ -117,12 +117,21 @@ pub(crate) fn handle_idle_key(
             | IdleShortcut::HalfPageUp
             | IdleShortcut::HalfPageDown
             | IdleShortcut::Backtrack
-            | IdleShortcut::ExpandToolOutput),
+            | IdleShortcut::ExpandToolOutput
+            | IdleShortcut::ExpandAll),
         )) => {
             if shortcut == IdleShortcut::Backtrack && !textarea.is_empty() {
                 return;
             }
-            if shortcut != IdleShortcut::ExpandToolOutput {
+            // `e`/`E` are also vim motions (word-end); deferred to
+            // `handle_idle_navigation_shortcut`, which only cancels a
+            // pending vim command once it has actually consumed the key as
+            // an expand shortcut rather than passed it through as text/vim
+            // input.
+            if !matches!(
+                shortcut,
+                IdleShortcut::ExpandToolOutput | IdleShortcut::ExpandAll
+            ) {
                 vim_state.cancel_pending_command();
             }
             handle_idle_navigation_shortcut(
@@ -508,5 +517,101 @@ mod tests {
             panic!("expected tool call");
         };
         assert!(*expanded);
+    }
+
+    #[test]
+    fn shift_e_expands_all_when_composer_is_empty() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.update(TuiEvent::ToolRequested {
+            id: "tool-1".to_string(),
+            name: "grep".to_string(),
+            target: None,
+        });
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+        let key = KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT);
+
+        handle_idle_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(
+            textarea.is_empty(),
+            "an empty composer must consume Shift+E as the expand-all shortcut, not type it"
+        );
+        let crate::transcript_state::ChatMessage::ToolCall { expanded, .. } =
+            &state.transcript.messages[0]
+        else {
+            panic!("expected tool call");
+        };
+        assert!(*expanded);
+    }
+
+    #[test]
+    fn shift_e_types_a_capital_e_when_the_composer_already_has_text() {
+        // Same gate as plain `e` (`nonempty_composer_keeps_vim_count_when_e_matches_expand_shortcut`
+        // above): a non-empty draft means the keystroke is text, not a shortcut.
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.update(TuiEvent::ToolRequested {
+            id: "tool-1".to_string(),
+            name: "grep".to_string(),
+            target: None,
+        });
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::from(["draft"]);
+        let key = KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT);
+
+        handle_idle_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(
+            textarea_text(&textarea).contains('E'),
+            "a non-empty composer must type the character, not consume it as a shortcut; got {:?}",
+            textarea_text(&textarea)
+        );
+        let crate::transcript_state::ChatMessage::ToolCall { expanded, .. } =
+            &state.transcript.messages[0]
+        else {
+            panic!("expected tool call");
+        };
+        assert!(
+            !*expanded,
+            "a non-empty composer must not trigger the expand-all shortcut"
+        );
     }
 }

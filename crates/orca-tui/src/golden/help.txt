@@ -29,7 +29,7 @@
                 │   ctrl+u                    clear input, or scroll half page when empty    │
                 │   ctrl+d                    delete forward, or scroll when input is empty  │
                 │   esc                       backtrack only when input is empty             │
-                │   e                         expand latest tool output                      │
+                │   e · Shift+E               expand latest tool output · expand all         │
                 │                                                                            │
                 │ ? or Esc close                                                             │
                 ╰────────────────────────────────────────────────────────────────────────────╯
