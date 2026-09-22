@@ -414,6 +414,73 @@ mod tests {
     }
 
     #[test]
+    fn esc_closes_workflows_in_one_press_when_the_dock_is_toggled_but_covered() {
+        // Reproduces the review finding: `/workflows` covers the dock
+        // without clearing `tasks_dock_expanded` (activity_lines only
+        // renders the dock under Conversation/Agents), so the flag alone
+        // used to make the first Esc collapse an invisible dock and swallow
+        // the keypress, leaving the Workflows panel open until a second
+        // Esc. `tasks_dock_visible()` must resolve this in one press.
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        state.toggle_tasks_dock();
+        state.show_workflows();
+        assert!(
+            state.tasks_dock_expanded,
+            "the flag stays on; only visibility changes"
+        );
+        let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(false);
+
+        let flow = handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(flow, KeyEventFlow::Continue));
+        assert_eq!(
+            state.panel_mode,
+            PanelMode::Conversation,
+            "one Esc closes the Workflows panel; the covered dock must not swallow it"
+        );
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn esc_collapses_a_visible_dock_under_plain_conversation() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        state.toggle_tasks_dock();
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
+        let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(false);
+
+        let flow = handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(flow, KeyEventFlow::Continue));
+        assert!(!state.tasks_dock_expanded);
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn escape_returns_from_agent_transcript_before_closing_workspace() {
         let (action_tx, action_rx) = mpsc::unbounded();
         let mut state = state_with_search_matches();
@@ -859,7 +926,12 @@ where
     // The tasks dock is the more transient layer: collapse it on its own
     // before falling through to the full Workflows/Agents panel close below,
     // so a dock expanded on top of an open panel takes one Esc at a time.
-    if state.tasks_dock_expanded && key.code == KeyCode::Esc {
+    // `tasks_dock_visible()` (not the raw `tasks_dock_expanded` flag) is the
+    // check: the dock can be toggled on and then covered by `/workflows`
+    // without ever being cleared, and an Esc that lands on an invisible
+    // dock must fall through to whatever is actually on screen instead of
+    // silently consuming the keypress.
+    if state.tasks_dock_visible() && key.code == KeyCode::Esc {
         vim_state.cancel_pending_command();
         state.collapse_tasks_dock();
         return Ok(KeyEventFlow::Continue);

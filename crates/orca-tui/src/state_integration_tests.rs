@@ -3189,6 +3189,11 @@ fn foregrounded_selected_main_session_collapses_the_dock() {
     state.apply_workflow_tasks_for_test(vec![selected, other]);
 
     assert!(!state.tasks_dock_expanded);
+    assert_eq!(
+        state.panel_mode,
+        PanelMode::Conversation,
+        "the transcript is not replaced"
+    );
     assert!(!state.suppress_background_main_session_output);
 }
 

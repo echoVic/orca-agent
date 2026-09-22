@@ -470,6 +470,19 @@ impl AppState {
         self.tasks_dock_expanded = false;
     }
 
+    /// Whether the dock is both expanded and actually on screen right now.
+    /// `tasks_dock_expanded` alone is just the user's toggle state; the dock
+    /// only renders in the activity area under `PanelMode::Conversation` or
+    /// `PanelMode::Agents` (`activity_lines`, `ui.rs`) — e.g. `/workflows`
+    /// covers it without clearing the flag. Anything that needs to know
+    /// whether the dock is visible (rendering, Esc handling) must go
+    /// through this method rather than reading `tasks_dock_expanded`
+    /// directly, so the two can never independently drift apart.
+    pub fn tasks_dock_visible(&self) -> bool {
+        self.tasks_dock_expanded
+            && matches!(self.panel_mode, PanelMode::Conversation | PanelMode::Agents)
+    }
+
     pub(crate) fn apply_workflow_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         let previous = self.workflow_panel.tasks().to_vec();
         // Only update the parent snapshot when Main is focused. While a child

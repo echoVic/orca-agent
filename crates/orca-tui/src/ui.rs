@@ -4928,7 +4928,7 @@ fn activity_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Line<'stat
             theme,
             state.tick,
             state.agent_dock_selected_task_id.as_deref(),
-            state.tasks_dock_expanded,
+            state.tasks_dock_visible(),
             width,
         ));
     }
