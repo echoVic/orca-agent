@@ -493,6 +493,8 @@ impl AppState {
                 preview,
             } => {
                 self.user_input_dialog = None;
+                self.slash_menu = None;
+                self.mention.clear_projection();
                 self.interaction.pending_submission = None;
                 self.close_transcript_search();
                 self.set_status(AppStatus::WaitingApproval);
@@ -517,6 +519,8 @@ impl AppState {
                 permission_kind,
             } => {
                 self.user_input_dialog = None;
+                self.slash_menu = None;
+                self.mention.clear_projection();
                 self.interaction.pending_submission = None;
                 self.close_transcript_search();
                 self.set_status(AppStatus::WaitingApproval);

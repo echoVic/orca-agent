@@ -77,6 +77,62 @@ fn user_input_requested_event_tracks_pending_runtime_interaction_id() {
 }
 
 #[test]
+fn approval_needed_event_closes_the_slash_menu_and_mention_projection() {
+    // Mirrors `user_input_requested_event_tracks_pending_runtime_interaction_id`
+    // above: the approval dialog now shares the composer slot with the slash
+    // menu and mention popups (`crate::ui`'s `InputRegion::Approval`), so it
+    // must clear them the same way `UserInputRequested` always has.
+    let mut state = state();
+    state.slash_menu = Some(SlashMenu {
+        items: vec![SlashMenuItem {
+            command: "/config".to_string(),
+            description: "Configure".to_string(),
+        }],
+        selected: 0,
+        sub_menu: None,
+    });
+    state.mention.phase = Some(SearchPhase::Complete);
+    state.update(TuiEvent::ApprovalNeeded {
+        key: interaction_key(TuiInteractionKind::Approval, "approval-1"),
+        tool: "bash".to_string(),
+        target: Some("cargo test".to_string()),
+        preview: None,
+    });
+
+    assert!(state.approval_dialog.is_some());
+    assert!(state.slash_menu.is_none());
+    assert!(state.mention.phase.is_none());
+}
+
+#[test]
+fn permission_approval_needed_event_closes_the_slash_menu_and_mention_projection() {
+    // Same fix, the sibling event: `PermissionApprovalNeeded` sets the same
+    // `approval_dialog` slot and must clear the same popups.
+    let mut state = state();
+    state.slash_menu = Some(SlashMenu {
+        items: vec![SlashMenuItem {
+            command: "/config".to_string(),
+            description: "Configure".to_string(),
+        }],
+        selected: 0,
+        sub_menu: None,
+    });
+    state.mention.phase = Some(SearchPhase::Complete);
+    state.update(TuiEvent::PermissionApprovalNeeded {
+        key: interaction_key(TuiInteractionKind::Permission, "approval-1"),
+        tool: "bash".to_string(),
+        target: Some("curl https://api.example.invalid".to_string()),
+        preview: None,
+        permission_kind:
+            orca_runtime::runtime_permission::RuntimePermissionRequestKind::NetworkBlock,
+    });
+
+    assert!(state.approval_dialog.is_some());
+    assert!(state.slash_menu.is_none());
+    assert!(state.mention.phase.is_none());
+}
+
+#[test]
 fn multi_question_free_text_request_opens_the_inline_dialog() {
     let mut state = state();
     state.update(TuiEvent::UserInputRequested {

@@ -189,6 +189,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     render_status(frame, chunks[7], state, theme);
 
     if state.user_input_dialog.is_none()
+        && state.approval_dialog.is_none()
         && state.full_access_confirmation.is_none()
         && !state.transcript.search.open
         && state.slash_menu.is_some()
@@ -197,6 +198,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     }
 
     if state.user_input_dialog.is_none()
+        && state.approval_dialog.is_none()
         && state.full_access_confirmation.is_none()
         && !state.transcript.search.open
         && state.mention.phase.is_some()
@@ -8119,6 +8121,85 @@ mod tests {
                 "click on the drawn row for {needle} must resolve to option {index}: {frame}"
             );
         }
+    }
+
+    #[test]
+    fn approval_needed_closes_an_open_slash_menu() {
+        // Both halves of the fix: `state_reducer.rs`'s `ApprovalNeeded` arm now
+        // clears `slash_menu` the way `UserInputRequested` always has, and
+        // `render()`'s slash-menu guard now also excludes `Approval`. This test
+        // drives the real event end to end and checks both the state and the
+        // rendered frame.
+        let mut state = test_state();
+        state.slash_menu = Some(SlashMenu {
+            items: vec![SlashMenuItem {
+                command: "/config".to_string(),
+                description: "Configure".to_string(),
+            }],
+            selected: 0,
+            sub_menu: None,
+        });
+        state.update(TuiEvent::ApprovalNeeded {
+            key: interaction_key(TuiInteractionKind::Approval, "approval-1"),
+            tool: "bash".to_string(),
+            target: Some("cargo test".to_string()),
+            preview: None,
+        });
+        assert!(state.slash_menu.is_none());
+
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(frame.contains("Approve · bash"), "{frame}");
+        assert!(!frame.contains("Commands"), "{frame}");
+    }
+
+    #[test]
+    fn approval_needed_closes_open_mention_candidates() {
+        // The mention half of the same fix: `mention.clear_projection()` is a
+        // separate call from clearing `slash_menu`, so it gets its own test.
+        let mut state = test_state();
+        state.mention.candidates = vec![orca_runtime::mentions::MentionCandidate::from_file_match(
+            &orca_file_search::SearchMatch {
+                root: std::path::PathBuf::from("/workspace"),
+                path: "mention-target.rs".to_string(),
+                kind: orca_file_search::MatchKind::File,
+                score: 1,
+                indices: Vec::new(),
+            },
+        )];
+        state.mention.phase = Some(SearchPhase::Complete);
+        state.update(TuiEvent::ApprovalNeeded {
+            key: interaction_key(TuiInteractionKind::Approval, "approval-1"),
+            tool: "bash".to_string(),
+            target: Some("cargo test".to_string()),
+            preview: None,
+        });
+        assert!(state.mention.phase.is_none());
+
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(frame.contains("Approve · bash"), "{frame}");
+        assert!(!frame.contains("mention-target.rs"), "{frame}");
+    }
+
+    #[test]
+    fn approval_render_guard_hides_a_slash_menu_even_if_left_open() {
+        // `render()`'s guard is load-bearing on its own, not just
+        // defense-in-depth for `ApprovalNeeded`: `open_selected_background_
+        // approval_dialog` (workflow_panel.rs) is a second producer of
+        // `approval_dialog` that does not clear `slash_menu`/`mention`. This
+        // constructs that "left open" state directly, without going through
+        // any reducer, to pin the render-time guard by itself.
+        let mut state = approval_state();
+        state.slash_menu = Some(SlashMenu {
+            items: vec![SlashMenuItem {
+                command: "/config".to_string(),
+                description: "Configure".to_string(),
+            }],
+            selected: 0,
+            sub_menu: None,
+        });
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(frame.contains("Approve · bash"), "{frame}");
+        assert!(!frame.contains("Commands"), "{frame}");
     }
 
     #[test]
