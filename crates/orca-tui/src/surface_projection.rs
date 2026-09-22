@@ -650,9 +650,12 @@ fn history_message_from_surface_item(
         {
             None
         }
-        SurfaceItem::SystemMessage { content, .. } => Some(
-            crate::transcript_state::ChatMessage::System(content.as_str().to_string()),
-        ),
+        SurfaceItem::SystemMessage { content, .. } => {
+            Some(crate::transcript_state::ChatMessage::System {
+                text: content.as_str().to_string(),
+                expanded: false,
+            })
+        }
         SurfaceItem::AssistantMessage { text, .. } => (!text.as_str().trim().is_empty())
             .then(|| crate::transcript_state::ChatMessage::Assistant(text.as_str().to_string())),
         SurfaceItem::AssistantReasoning {
@@ -2805,7 +2808,7 @@ mod tests {
             messages.as_slice(),
             [
                 crate::transcript_state::ChatMessage::User(prompt),
-                crate::transcript_state::ChatMessage::System(system),
+                crate::transcript_state::ChatMessage::System { text: system, .. },
                 crate::transcript_state::ChatMessage::Reasoning { text: reasoning, .. },
                 crate::transcript_state::ChatMessage::Assistant(answer),
                 crate::transcript_state::ChatMessage::ProposedPlan(plan),

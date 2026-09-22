@@ -730,9 +730,10 @@ pub(crate) fn chat_messages_from_history(message: Message) -> Vec<ChatMessage> {
                     .map(|tool| tool.function_name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                vec![ChatMessage::System(format!(
-                    "Previous assistant requested tools: {names}"
-                ))]
+                vec![ChatMessage::System {
+                    text: format!("Previous assistant requested tools: {names}"),
+                    expanded: false,
+                }]
             } else {
                 Vec::new()
             }

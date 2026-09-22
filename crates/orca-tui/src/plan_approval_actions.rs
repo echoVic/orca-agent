@@ -64,9 +64,10 @@ fn stay_in_plan_mode(state: &mut AppState) {
     state.plan_approval_dialog = None;
     state.request_runtime_queue_start();
     state.resume_queued_follow_up_autosend();
-    state.push_message(crate::transcript_state::ChatMessage::System(
-        "Staying in Plan mode. Send feedback to revise the plan.".to_string(),
-    ));
+    state.push_message(crate::transcript_state::ChatMessage::System {
+        text: "Staying in Plan mode. Send feedback to revise the plan.".to_string(),
+        expanded: false,
+    });
     state.scroll_to_bottom();
 }
 

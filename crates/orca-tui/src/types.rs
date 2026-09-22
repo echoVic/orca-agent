@@ -1365,6 +1365,9 @@ impl AppState {
             ChatMessage::Reasoning { expanded, .. } => {
                 *expanded = !*expanded;
             }
+            ChatMessage::System { expanded, .. } => {
+                *expanded = !*expanded;
+            }
             _ => unreachable!(),
         });
         true
@@ -1390,6 +1393,9 @@ impl AppState {
                 *expanded = !*expanded;
             }
             ChatMessage::Reasoning { expanded, .. } => {
+                *expanded = !*expanded;
+            }
+            ChatMessage::System { expanded, .. } => {
                 *expanded = !*expanded;
             }
             _ => unreachable!(),
@@ -1424,6 +1430,7 @@ impl AppState {
                 self.transcript.messages[index],
                 ChatMessage::ToolCall { expanded: true, .. }
                     | ChatMessage::Reasoning { expanded: true, .. }
+                    | ChatMessage::System { expanded: true, .. }
             )
         });
         let target = !all_expanded;
@@ -1431,6 +1438,7 @@ impl AppState {
             self.mutate_message(index, |message| match message {
                 ChatMessage::ToolCall { expanded, .. } => *expanded = target,
                 ChatMessage::Reasoning { expanded, .. } => *expanded = target,
+                ChatMessage::System { expanded, .. } => *expanded = target,
                 _ => unreachable!(),
             });
         }
@@ -1509,7 +1517,7 @@ impl AppState {
             | ChatMessage::Image(_)
             | ChatMessage::Diagnostic(_)
             | ChatMessage::Error(_)
-            | ChatMessage::System(_)
+            | ChatMessage::System { .. }
             | ChatMessage::PlanUpdate { .. } => true,
         }
     }

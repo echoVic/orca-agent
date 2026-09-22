@@ -4266,7 +4266,7 @@ fn resume_slash_command_never_implicitly_resumes_a_recoverable_operation() {
         assert_eq!(state.status, AppStatus::Idle);
         assert!(matches!(
             state.transcript.messages.last(),
-            Some(ChatMessage::System(message)) if message == "No saved conversations."
+            Some(ChatMessage::System { text: message, .. }) if message == "No saved conversations."
         ));
     });
 }
@@ -6798,7 +6798,10 @@ fn hosted_tui_runs_app_state_queued_follow_ups_one_at_a_time_in_fifo_order() {
 fn search_keyboard_frames_move_active_match_without_composer_mutation() {
     let (mut state, _rx) = test_state();
     for index in 0..30 {
-        state.push_message(ChatMessage::System(format!("row {index:02} alpha")));
+        state.push_message(ChatMessage::System {
+            text: format!("row {index:02} alpha"),
+            expanded: false,
+        });
     }
     state.viewport.auto_scroll = false;
     let theme = Theme::named(ThemeName::Dark);
@@ -6893,7 +6896,10 @@ fn running_search_esc_closes_before_interrupt_and_paste_never_touches_composer()
 #[test]
 fn mouse_selection_over_search_match_wins_and_copy_stays_exact() {
     let (mut state, _rx) = test_state();
-    state.push_message(ChatMessage::System("alpha beta".to_string()));
+    state.push_message(ChatMessage::System {
+        text: "alpha beta".to_string(),
+        expanded: false,
+    });
     state.open_transcript_search();
     state.replace_transcript_search_query("alpha");
     let theme = Theme::named(ThemeName::Dark);

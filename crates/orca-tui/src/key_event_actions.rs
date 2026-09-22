@@ -92,8 +92,14 @@ mod tests {
             "mock".to_string(),
             "/tmp".to_string(),
         );
-        state.push_message(ChatMessage::System("alpha one".to_string()));
-        state.push_message(ChatMessage::System("alpha two".to_string()));
+        state.push_message(ChatMessage::System {
+            text: "alpha one".to_string(),
+            expanded: false,
+        });
+        state.push_message(ChatMessage::System {
+            text: "alpha two".to_string(),
+            expanded: false,
+        });
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let messages = &state.transcript.messages;
         let revisions = &state.transcript.message_revisions;

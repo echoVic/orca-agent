@@ -85,7 +85,9 @@ fn startup_warnings_are_announced_once_per_session() {
             .transcript
             .messages
             .iter()
-            .filter(|message| matches!(message, ChatMessage::System(text) if text == &warning))
+            .filter(
+                |message| matches!(message, ChatMessage::System { text, .. } if text == &warning)
+            )
             .count(),
         1
     );
@@ -93,7 +95,7 @@ fn startup_warnings_are_announced_once_per_session() {
     state.reset_session_projection();
     state.update(TuiEvent::StartupWarning(warning.clone()));
     assert!(
-        matches!(state.transcript.messages.as_slice(), [ChatMessage::System(text)] if text == &warning)
+        matches!(state.transcript.messages.as_slice(), [ChatMessage::System { text, .. }] if text == &warning)
     );
 }
 
@@ -123,7 +125,10 @@ fn conversation_replacement_resets_all_queued_follow_up_state() {
         if clear {
             state.clear_messages();
         } else {
-            state.replace_messages([ChatMessage::System("replacement".to_string())]);
+            state.replace_messages([ChatMessage::System {
+                text: "replacement".to_string(),
+                expanded: false,
+            }]);
         }
 
         assert!(state.queued_pending_visible_text().is_empty());
@@ -196,14 +201,26 @@ fn dummy_selection() -> crate::selection::TranscriptSelection {
 #[test]
 fn transcript_mutations_invalidate_the_selection_only_when_rows_can_shift() {
     let mut state = state();
-    state.push_message(ChatMessage::System("one".to_string()));
-    state.push_message(ChatMessage::System("two".to_string()));
-    state.push_message(ChatMessage::System("three".to_string()));
+    state.push_message(ChatMessage::System {
+        text: "one".to_string(),
+        expanded: false,
+    });
+    state.push_message(ChatMessage::System {
+        text: "two".to_string(),
+        expanded: false,
+    });
+    state.push_message(ChatMessage::System {
+        text: "three".to_string(),
+        expanded: false,
+    });
 
     // Appending and rewriting the TAIL keep the selection: earlier rows
     // cannot move.
     state.viewport.selection = Some(dummy_selection());
-    state.push_message(ChatMessage::System("four".to_string()));
+    state.push_message(ChatMessage::System {
+        text: "four".to_string(),
+        expanded: false,
+    });
     assert!(state.viewport.selection.is_some());
     state.touch_message(state.transcript.messages.len() - 1);
     assert!(state.viewport.selection.is_some());
@@ -218,7 +235,9 @@ fn transcript_mutations_invalidate_the_selection_only_when_rows_can_shift() {
     assert_eq!(state.viewport.selection, None);
 
     state.viewport.selection = Some(dummy_selection());
-    state.retain_messages(|message| !matches!(message, ChatMessage::System(text) if text == "two"));
+    state.retain_messages(
+        |message| !matches!(message, ChatMessage::System { text, .. } if text == "two"),
+    );
     assert_eq!(state.viewport.selection, None);
 
     // A retain that keeps everything moves nothing: selection survives.
@@ -256,7 +275,7 @@ fn history_loaded_replaces_legacy_prefix_and_freezes_snapshot() {
         [
             ChatMessage::User(prompt),
             ChatMessage::Assistant(answer),
-            ChatMessage::System(label),
+            ChatMessage::System { text: label, .. },
         ] if prompt == "restored"
             && answer == "answer"
             && label == "Resumed saved conversation."
@@ -498,7 +517,7 @@ fn task_snapshot_keeps_running_subagent_out_of_main_conversation() {
 
     assert!(matches!(
         state.transcript.messages.as_slice(),
-        [ChatMessage::System(text)] if text == "Delegating to 1 agent"
+        [ChatMessage::System { text, .. }] if text == "Delegating to 1 agent"
     ));
 }
 
@@ -541,14 +560,14 @@ fn surface_projection_announces_group_once_without_inline_child_messages() {
     assert_eq!(state.transcript.messages.len(), 1);
     assert!(matches!(
         &state.transcript.messages[0],
-        ChatMessage::System(text) if text == "Delegating to 4 agents in parallel"
+        ChatMessage::System { text, .. } if text == "Delegating to 4 agents in parallel"
     ));
     assert!(
         state
             .transcript
             .messages
             .iter()
-            .all(|message| matches!(message, ChatMessage::System(_)))
+            .all(|message| matches!(message, ChatMessage::System { .. }))
     );
     assert_eq!(state.workflow_tasks().len(), 4);
 }
@@ -767,7 +786,7 @@ fn surface_subagent_projection_updates_dock_without_parent_transcript_materializ
             .transcript
             .messages
             .iter()
-            .all(|message| matches!(message, ChatMessage::System(_)))
+            .all(|message| matches!(message, ChatMessage::System { .. }))
     );
     assert_eq!(state.workflow_tasks()[0].result.as_deref(), Some("done"));
 }
@@ -1495,7 +1514,7 @@ fn surface_operation_projection_fences_conflicts_and_resets() {
         state.transcript.messages
                 .iter()
                 .filter(|message| {
-                    matches!(message, ChatMessage::System(text) if text.starts_with("A recoverable operation is suspended."))
+                    matches!(message, ChatMessage::System { text, .. } if text.starts_with("A recoverable operation is suspended."))
                 })
                 .count()
     };
@@ -1782,7 +1801,7 @@ fn surface_session_projection_presents_once_per_cursor() {
             .filter(|message| {
                 matches!(
                     message,
-                    ChatMessage::System(text)
+                    ChatMessage::System { text, .. }
                         if text == "Renamed conversation to Committed title."
                 )
             })
@@ -1790,7 +1809,7 @@ fn surface_session_projection_presents_once_per_cursor() {
         1
     );
     assert!(!state.transcript.messages.iter().any(|message| {
-        matches!(message, ChatMessage::System(text) if text.starts_with("Forked conversation"))
+        matches!(message, ChatMessage::System { text, .. } if text.starts_with("Forked conversation"))
     }));
 }
 
@@ -1900,7 +1919,7 @@ fn surface_goal_projection_rejects_equal_usage_stale_snapshot() {
         state.transcript.messages
                 .iter()
                 .filter(|message| {
-                    matches!(message, ChatMessage::System(text) if text.contains("new objective"))
+                    matches!(message, ChatMessage::System { text, .. } if text.contains("new objective"))
                 })
                 .count()
     };
@@ -2048,7 +2067,7 @@ fn surface_goal_projection_presents_clear_once_per_cursor() {
             .messages
             .iter()
             .filter(|message| {
-                matches!(message, ChatMessage::System(text) if text == "Goal cleared.")
+                matches!(message, ChatMessage::System { text, .. } if text == "Goal cleared.")
             })
             .count(),
         1
@@ -2277,7 +2296,10 @@ fn tool_call_index_matches_canonical_scan_after_mutations() {
 
     let mut state = state();
     state.push_message(tool_call("first"));
-    state.push_message(ChatMessage::System("between".to_string()));
+    state.push_message(ChatMessage::System {
+        text: "between".to_string(),
+        expanded: false,
+    });
     state.push_message(tool_call("duplicate"));
     state.push_message(tool_call("duplicate"));
     assert_matches_canonical_scan(&state, &["first", "duplicate", "missing"]);
@@ -2288,7 +2310,7 @@ fn tool_call_index_matches_canonical_scan_after_mutations() {
     state.truncate_messages(3);
     assert_matches_canonical_scan(&state, &["replacement", "duplicate"]);
 
-    state.retain_messages(|message| !matches!(message, ChatMessage::System(_)));
+    state.retain_messages(|message| !matches!(message, ChatMessage::System { .. }));
     assert_matches_canonical_scan(&state, &["replacement", "duplicate"]);
 
     state.replace_messages([tool_call("history"), tool_call("history")]);
@@ -2659,6 +2681,81 @@ fn toggle_all_expandable_returns_false_when_nothing_is_collapsible() {
     assert!(!state.toggle_all_expandable());
 }
 
+// A long system notice (more than two lines) is collapsible through the same
+// `transcript_hit::is_collapsible` predicate as a tool call or a reasoning
+// block, so it must flip through all three entry points: the `e` key
+// (`toggle_latest_expandable`), a mouse click (`toggle_expandable_at`, what
+// `input_event_actions` calls when a `collapsible_hit_areas` rect is hit),
+// and `Shift+E` (`toggle_all_expandable`). A short (<=2 line) notice must
+// refuse all three, exactly like a message that isn't collapsible at all.
+
+#[test]
+fn e_toggles_a_long_system_notice() {
+    let mut state = state();
+    state.push_message(ChatMessage::System {
+        text: "one\ntwo\nthree".to_string(),
+        expanded: false,
+    });
+
+    assert!(state.toggle_latest_expandable());
+    assert!(matches!(
+        &state.transcript.messages[0],
+        ChatMessage::System { expanded: true, .. }
+    ));
+}
+
+#[test]
+fn a_click_toggles_a_long_system_notice_but_not_a_short_one() {
+    let mut state = state();
+    state.push_message(ChatMessage::System {
+        text: "one line only".to_string(),
+        expanded: false,
+    });
+    state.push_message(ChatMessage::System {
+        text: "one\ntwo\nthree".to_string(),
+        expanded: false,
+    });
+
+    assert!(
+        !state.toggle_expandable_at(0),
+        "a one-line notice has nothing to expand"
+    );
+    assert!(state.toggle_expandable_at(1));
+    assert!(matches!(
+        &state.transcript.messages[1],
+        ChatMessage::System { expanded: true, .. }
+    ));
+}
+
+#[test]
+fn shift_e_toggles_a_long_system_notice_alongside_a_tool_call() {
+    let mut state = state();
+    state.push_message(tool_call("bash", None, "completed", Some("a\nb\nc"), false));
+    state.push_message(ChatMessage::System {
+        text: "one\ntwo\nthree".to_string(),
+        expanded: false,
+    });
+
+    assert!(state.toggle_all_expandable());
+    assert!(matches!(
+        &state.transcript.messages[0],
+        ChatMessage::ToolCall { expanded: true, .. }
+    ));
+    assert!(matches!(
+        &state.transcript.messages[1],
+        ChatMessage::System { expanded: true, .. }
+    ));
+
+    assert!(state.toggle_all_expandable());
+    assert!(matches!(
+        &state.transcript.messages[1],
+        ChatMessage::System {
+            expanded: false,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn workflow_panel_state_defaults_to_empty() {
     let state = state();
@@ -2980,7 +3077,7 @@ fn workflow_events_update_panel_and_queue_model_notification() {
     );
     assert!(matches!(
         state.transcript.messages.last(),
-        Some(ChatMessage::System(message)) if message.contains("Workflow completed. audit: done")
+        Some(ChatMessage::System { text: message, .. }) if message.contains("Workflow completed. audit: done")
     ));
 }
 
@@ -3013,7 +3110,7 @@ fn duplicate_workflow_notification_id_is_not_queued_twice() {
         .filter(|message| {
             matches!(
                 message,
-                ChatMessage::System(text) if text.starts_with("Workflow completed.")
+                ChatMessage::System { text, .. } if text.starts_with("Workflow completed.")
             )
         })
         .count();
@@ -3419,7 +3516,7 @@ fn backgrounded_main_session_completion_adds_system_notice() {
 
     assert!(matches!(
         state.transcript.messages.last(),
-        Some(ChatMessage::System(message))
+        Some(ChatMessage::System { text: message, .. })
             if message == "Background session completed: success"
     ));
     assert_eq!(state.status, AppStatus::Idle);
@@ -3489,7 +3586,7 @@ fn goal_status_is_presentation_only() {
 
     assert_eq!(state.current_goal(), Some(&committed));
     assert!(state.transcript.messages.iter().any(
-        |message| matches!(message, ChatMessage::System(text) if text.contains("queried objective"))
+        |message| matches!(message, ChatMessage::System { text, .. } if text.contains("queried objective"))
     ));
 }
 
@@ -3510,7 +3607,7 @@ fn goal_status_messages_compact_long_objectives() {
 
     state.update(TuiEvent::GoalStatus(Some(goal)));
 
-    let Some(ChatMessage::System(message)) = state.transcript.messages.last() else {
+    let Some(ChatMessage::System { text: message, .. }) = state.transcript.messages.last() else {
         panic!("goal status should add a system message");
     };
     assert!(message.starts_with("Goal active · 目标内容"));
@@ -3540,7 +3637,7 @@ fn running_goal_does_not_repeat_unchanged_status_notice() {
     assert_eq!(
             state.transcript.messages
                 .iter()
-                .filter(|message| matches!(message, ChatMessage::System(text) if text.starts_with("Goal active")))
+                .filter(|message| matches!(message, ChatMessage::System { text, .. } if text.starts_with("Goal active")))
                 .count(),
             1
         );
@@ -3572,7 +3669,7 @@ fn idle_goal_refreshes_between_turns_do_not_repeat_unchanged_status_notice() {
     assert_eq!(
             state.transcript.messages
                 .iter()
-                .filter(|message| matches!(message, ChatMessage::System(text) if text.starts_with("Goal active")))
+                .filter(|message| matches!(message, ChatMessage::System { text, .. } if text.starts_with("Goal active")))
                 .count(),
             1
         );
@@ -3594,7 +3691,7 @@ fn compacted_event_explains_runtime_recovery_reason() {
 
     assert!(matches!(
         state.transcript.messages.last(),
-        Some(ChatMessage::System(message))
+        Some(ChatMessage::System { text: message, .. })
             if message == "Compacted conversation context after prompt-too-long: 12 -> 5 messages (collapsed 7, remote_summary)."
     ));
     assert_eq!(state.status, AppStatus::Idle);
@@ -5028,7 +5125,10 @@ fn injected_worker_spawn_failure_is_silent_and_leaves_no_pending_state() {
 #[test]
 fn exact_ready_result_touches_only_matching_message_and_stores_arc_map() {
     let (_directory, mut state, job) = state_with_submitted_edit_job();
-    state.push_message(ChatMessage::System("unrelated".to_string()));
+    state.push_message(ChatMessage::System {
+        text: "unrelated".to_string(),
+        expanded: false,
+    });
     let revisions_before = state.transcript.message_revisions.clone();
     let result = ready_result(job.clone());
     let expected_styles = match &result.outcome {
@@ -5077,7 +5177,10 @@ fn refinement_rebuilds_only_matching_message_then_steady_and_scroll_build_nothin
     use std::cell::RefCell;
 
     let (_directory, mut state, job) = state_with_submitted_edit_job();
-    state.push_message(ChatMessage::System("stable".to_string()));
+    state.push_message(ChatMessage::System {
+        text: "stable".to_string(),
+        expanded: false,
+    });
     let stable_index = job.message_index + 1;
     let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
     let built_indices = RefCell::new(Vec::new());
@@ -5645,7 +5748,10 @@ fn message_lifecycle_prunes_applied_maps_and_pending_jobs() {
 
         match action {
             "clear" => state.clear_messages(),
-            "replace" => state.replace_messages([ChatMessage::System("new".to_string())]),
+            "replace" => state.replace_messages([ChatMessage::System {
+                text: "new".to_string(),
+                expanded: false,
+            }]),
             "truncate" => state.truncate_messages(job.message_index),
             "retain" => {
                 state.retain_messages(|message| !matches!(message, ChatMessage::ToolCall { .. }))
@@ -5665,15 +5771,18 @@ fn message_lifecycle_prunes_applied_maps_and_pending_jobs() {
 #[test]
 fn retained_reindexing_clears_all_pending_jobs_conservatively() {
     let (_directory, mut state, job) = state_with_submitted_edit_job();
-    state
-        .transcript
-        .messages
-        .insert(0, ChatMessage::System("remove".to_string()));
+    state.transcript.messages.insert(
+        0,
+        ChatMessage::System {
+            text: "remove".to_string(),
+            expanded: false,
+        },
+    );
     state.reconcile_message_tracking();
     assert_eq!(state.pending_edit_highlight_count(), 1);
 
     state.retain_messages(
-        |message| !matches!(message, ChatMessage::System(text) if text == "remove"),
+        |message| !matches!(message, ChatMessage::System { text, .. } if text == "remove"),
     );
 
     assert_eq!(state.pending_edit_highlight_count(), 0);

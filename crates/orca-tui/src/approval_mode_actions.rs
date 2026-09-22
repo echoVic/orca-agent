@@ -9,10 +9,10 @@ pub(crate) fn cycle_approval_mode(
     let next = state.approval_mode.next();
     let dispatched = request_settings_change(state, action_tx, None, None, Some(next));
     if dispatched {
-        state.push_message(crate::transcript_state::ChatMessage::System(format!(
-            "Approval mode change requested: {}.",
-            next.as_str()
-        )));
+        state.push_message(crate::transcript_state::ChatMessage::System {
+            text: format!("Approval mode change requested: {}.", next.as_str()),
+            expanded: false,
+        });
         state.scroll_to_bottom();
     }
 }

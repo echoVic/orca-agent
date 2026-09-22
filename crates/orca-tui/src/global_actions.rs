@@ -48,7 +48,10 @@ where
                 return Ok(GlobalShortcutFlow::Exit(130));
             }
             state.last_ctrl_c = Some(now);
-            state.push_message(ChatMessage::System("Press Ctrl+C again to quit.".into()));
+            state.push_message(ChatMessage::System {
+                text: "Press Ctrl+C again to quit.".into(),
+                expanded: false,
+            });
             state.scroll_to_bottom();
         }
         GlobalShortcut::ToggleSideConversation => {

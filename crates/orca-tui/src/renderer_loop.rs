@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(presentations.get(), 1);
         assert!(matches!(
             fixture.state.transcript.messages.as_slice(),
-            [ChatMessage::System(message)] if message == "loop notice"
+            [ChatMessage::System { text: message, .. }] if message == "loop notice"
         ));
         assert!(matches!(
             fixture.action_rx.try_recv(),

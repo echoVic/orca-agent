@@ -14,11 +14,11 @@
  ●  有  ego-browser skill， 我 读 一 下 它 的 使 用 说 明 。
 
     ℹ Resumed saved conversation.
+    └ +2 lines · click or e to expand
 
     ✗ Provider limit reached  [provider.rate_limit]
       cause  DeepSeek provider error: 429 rate limit exceeded
       next   Wait before retrying and check the provider account quota if the error persists.
-
 
 
 

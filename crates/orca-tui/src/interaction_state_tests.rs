@@ -192,7 +192,7 @@ fn mcp_elicitation_requested_event_tracks_pending_runtime_interaction_id() {
     );
     assert!(matches!(
         state.transcript.messages.last(),
-        Some(ChatMessage::System(message))
+        Some(ChatMessage::System { text: message, .. })
             if message.contains("MCP github requests input: Authorize GitHub")
                 && message.contains("Mode: url")
                 && message.contains("URL: https://github.com/login/device")

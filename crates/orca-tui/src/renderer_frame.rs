@@ -399,7 +399,10 @@ mod tests {
     #[test]
     fn idle_ready_poll_schedules_actual_render_with_refined_styles_once() {
         let (_directory, mut state) = state_with_pending_edit();
-        state.push_message(ChatMessage::System("stable".to_string()));
+        state.push_message(ChatMessage::System {
+            text: "stable".to_string(),
+            expanded: false,
+        });
         assert_eq!(state.status, AppStatus::Idle);
         let theme = Theme::named(ThemeName::Dark);
         let textarea = TextArea::default();

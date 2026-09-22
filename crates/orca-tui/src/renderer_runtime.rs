@@ -492,7 +492,7 @@ mod tests {
             state.transcript.messages.as_slice(),
             [
                 ChatMessage::Assistant(history),
-                ChatMessage::System(label),
+                ChatMessage::System { text: label, .. },
                 ChatMessage::User(prompt),
             ] if history == "hydrated"
                 && label == "loaded history"

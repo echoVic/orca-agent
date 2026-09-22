@@ -830,7 +830,10 @@ mod tests {
             "model".to_string(),
             "cwd".to_string(),
         );
-        state.push_message(ChatMessage::System("seed".to_string()));
+        state.push_message(ChatMessage::System {
+            text: "seed".to_string(),
+            expanded: false,
+        });
         state.reconcile_message_tracking();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         state.transcript.render_cache.prepare(

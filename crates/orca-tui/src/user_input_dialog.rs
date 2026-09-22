@@ -1140,7 +1140,7 @@ mod tests {
         assert!(state.interaction.pending_submission.is_none());
         assert!(state.transcript.messages.iter().any(|message| matches!(
             message,
-            crate::transcript_state::ChatMessage::System(summary)
+            crate::transcript_state::ChatMessage::System { text: summary, .. }
                 if summary.contains("Your answers")
                     && summary.contains("Audit")
         )));

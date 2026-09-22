@@ -347,7 +347,10 @@ where
         .filter(|session| session.health == StoredSessionHealth::RecoverableTail)
         .map(|session| recoverable_storage_message(session, "Resume"));
     if let Some(warning) = warning {
-        state.push_message(ChatMessage::System(warning));
+        state.push_message(ChatMessage::System {
+            text: warning,
+            expanded: false,
+        });
     }
     clear_terminal()?;
     state.enter_running();
@@ -383,7 +386,10 @@ where
                 .filter(|session| session.health == StoredSessionHealth::RecoverableTail)
                 .map(|session| recoverable_storage_message(session, "Resume"));
             if let Some(warning) = warning {
-                state.push_message(ChatMessage::System(warning));
+                state.push_message(ChatMessage::System {
+                    text: warning,
+                    expanded: false,
+                });
             }
             clear_terminal()?;
             state.enter_running();
@@ -401,7 +407,10 @@ where
                 .filter(|session| session.health == StoredSessionHealth::RecoverableTail)
                 .map(|session| recoverable_storage_message(session, "Fork"));
             if let Some(warning) = warning {
-                state.push_message(ChatMessage::System(warning));
+                state.push_message(ChatMessage::System {
+                    text: warning,
+                    expanded: false,
+                });
             }
             state.enter_running();
             let _ = action_tx.send(UserAction::ForkSavedSession { session_id });

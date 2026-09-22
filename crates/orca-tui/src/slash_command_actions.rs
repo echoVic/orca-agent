@@ -115,21 +115,27 @@ fn dispatch_slash_command(
             Err(error) => state.push_message(ChatMessage::Error(error)),
         },
         SlashCommand::Model(None) => {
-            state.push_message(ChatMessage::System(format!(
-                "Current model: {} (reasoning effort: {}). Use the /model menu to change both.",
-                state.model_name,
-                state.reasoning_effort.as_str()
-            )));
+            state.push_message(ChatMessage::System {
+                text: format!(
+                    "Current model: {} (reasoning effort: {}). Use the /model menu to change both.",
+                    state.model_name,
+                    state.reasoning_effort.as_str()
+                ),
+                expanded: false,
+            });
         }
         SlashCommand::Cost => {
             let usage = state.usage();
-            state.push_message(ChatMessage::System(format!(
-                "Session usage: {} input, {} output, {} cache tokens, estimated ${:.6}.",
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cache_tokens,
-                usage.estimated_cost_usd
-            )));
+            state.push_message(ChatMessage::System {
+                text: format!(
+                    "Session usage: {} input, {} output, {} cache tokens, estimated ${:.6}.",
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_tokens,
+                    usage.estimated_cost_usd
+                ),
+                expanded: false,
+            });
         }
         SlashCommand::Config => {
             if state.status == AppStatus::Idle {
@@ -154,10 +160,10 @@ fn dispatch_slash_command(
             )),
         },
         SlashCommand::Mode(None) => {
-            state.push_message(ChatMessage::System(format!(
-                "Current mode: {}",
-                state.approval_mode.as_str()
-            )));
+            state.push_message(ChatMessage::System {
+                text: format!("Current mode: {}", state.approval_mode.as_str()),
+                expanded: false,
+            });
         }
         SlashCommand::Plan(arg) => match arg.as_deref() {
             Some("off") => {
@@ -254,9 +260,10 @@ fn dispatch_slash_command(
         }
         SlashCommand::Resume => match open_session_picker(state) {
             Ok(true) => {}
-            Ok(false) => {
-                state.push_message(ChatMessage::System("No saved conversations.".to_string()))
-            }
+            Ok(false) => state.push_message(ChatMessage::System {
+                text: "No saved conversations.".to_string(),
+                expanded: false,
+            }),
             Err(error) => state.push_message(ChatMessage::Error(format!(
                 "failed to list saved conversations: {error}"
             ))),
@@ -296,7 +303,10 @@ fn dispatch_slash_command(
             let _ = action_tx.send(UserAction::RenameCurrentSession { title });
         }
         SlashCommand::Status => {
-            state.push_message(ChatMessage::System(format_status(state, config)));
+            state.push_message(ChatMessage::System {
+                text: format_status(state, config),
+                expanded: false,
+            });
         }
         SlashCommand::Copy(argument) => {
             let position = match argument.as_deref() {
@@ -328,31 +338,43 @@ fn dispatch_slash_command(
         SlashCommand::Trust(trust_command) => match trust_command {
             TrustSlashCommand::Show => {
                 if TuiHostActions::folder_is_trusted(&cwd) {
-                    state.push_message(ChatMessage::System(format!(
+                    state.push_message(ChatMessage::System {
+                        text: format!(
                             "{} is trusted; the OS sandbox honors the configured write and network policy.",
                             cwd.display()
-                        )))
+                        ),
+                        expanded: false,
+                    })
                 } else {
-                    state.push_message(ChatMessage::System(format!(
+                    state.push_message(ChatMessage::System {
+                        text: format!(
                             "{} is not trusted; commands run read-only with no network. Use /trust add to trust it.",
                             cwd.display()
-                        )))
+                        ),
+                        expanded: false,
+                    })
                 }
             }
             TrustSlashCommand::Add => match TuiHostActions::set_folder_trust(&cwd, true) {
-                Ok(()) => state.push_message(ChatMessage::System(format!(
-                    "Trusted {}. Restart Orca to load project config from this folder.",
-                    cwd.display()
-                ))),
+                Ok(()) => state.push_message(ChatMessage::System {
+                    text: format!(
+                        "Trusted {}. Restart Orca to load project config from this folder.",
+                        cwd.display()
+                    ),
+                    expanded: false,
+                }),
                 Err(error) => state.push_message(ChatMessage::Error(format!(
                     "failed to trust folder: {error}"
                 ))),
             },
             TrustSlashCommand::Remove => match TuiHostActions::set_folder_trust(&cwd, false) {
-                Ok(()) => state.push_message(ChatMessage::System(format!(
-                    "Removed trust for {}; commands now run read-only with no network.",
-                    cwd.display()
-                ))),
+                Ok(()) => state.push_message(ChatMessage::System {
+                    text: format!(
+                        "Removed trust for {}; commands now run read-only with no network.",
+                        cwd.display()
+                    ),
+                    expanded: false,
+                }),
                 Err(error) => state.push_message(ChatMessage::Error(format!(
                     "failed to update trust: {error}"
                 ))),
@@ -730,7 +752,8 @@ mod tests {
 
         handle_slash_command("/status", &mut config, &shared, &mut state, &action_tx);
 
-        let Some(ChatMessage::System(status)) = state.transcript.messages.last() else {
+        let Some(ChatMessage::System { text: status, .. }) = state.transcript.messages.last()
+        else {
             panic!("status output was not appended");
         };
         for expected in [
@@ -763,7 +786,7 @@ mod tests {
 
         assert!(matches!(
             state.transcript.messages.last(),
-            Some(ChatMessage::System(message)) if message == "Current mode: full-auto"
+            Some(ChatMessage::System { text: message, .. }) if message == "Current mode: full-auto"
         ));
 
         handle_slash_command("/plan off", &mut config, &shared, &mut state, &action_tx);
@@ -813,7 +836,8 @@ mod tests {
 
         handle_slash_command("/status", &mut config, &shared, &mut state, &action_tx);
 
-        let Some(ChatMessage::System(status)) = state.transcript.messages.last() else {
+        let Some(ChatMessage::System { text: status, .. }) = state.transcript.messages.last()
+        else {
             panic!("status output was not appended");
         };
         assert!(status.contains("mode: full-auto"), "{status}");

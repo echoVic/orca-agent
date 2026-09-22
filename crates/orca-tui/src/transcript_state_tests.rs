@@ -90,7 +90,10 @@ fn opening_search_preserves_scroll_and_refresh_selects_viewport_match() {
 fn explicit_search_jump_disables_follow_and_reveals_match() {
     let mut state = state();
     for index in 0..30 {
-        state.push_message(ChatMessage::System(format!("line {index} target")));
+        state.push_message(ChatMessage::System {
+            text: format!("line {index} target"),
+            expanded: false,
+        });
     }
     prepare_transcript_cache(&mut state, 80);
     state.viewport.visible_height = 5;
@@ -113,7 +116,10 @@ fn clear_resets_search_but_truncate_reconciles_lazily() {
     let mut state = state();
     state.open_transcript_search();
     state.replace_transcript_search_query("x");
-    state.push_message(ChatMessage::System("x".to_string()));
+    state.push_message(ChatMessage::System {
+        text: "x".to_string(),
+        expanded: false,
+    });
     prepare_transcript_cache(&mut state, 40);
     state.refresh_transcript_search();
     assert_eq!(state.transcript.search.match_count(), 1);
@@ -131,8 +137,14 @@ fn clear_resets_search_but_truncate_reconciles_lazily() {
 #[test]
 fn append_and_retain_preserve_active_revision_identity() {
     let mut state = state();
-    state.push_message(ChatMessage::System("remove".to_string()));
-    state.push_message(ChatMessage::System("target".to_string()));
+    state.push_message(ChatMessage::System {
+        text: "remove".to_string(),
+        expanded: false,
+    });
+    state.push_message(ChatMessage::System {
+        text: "target".to_string(),
+        expanded: false,
+    });
     prepare_transcript_cache(&mut state, 40);
     state.open_transcript_search();
     state.replace_transcript_search_query("target");
@@ -144,7 +156,10 @@ fn append_and_retain_preserve_active_revision_identity() {
         .unwrap()
         .line_identity;
 
-    state.push_message(ChatMessage::System("later target".to_string()));
+    state.push_message(ChatMessage::System {
+        text: "later target".to_string(),
+        expanded: false,
+    });
     prepare_transcript_cache(&mut state, 40);
     state.refresh_transcript_search();
     assert_eq!(
@@ -158,7 +173,7 @@ fn append_and_retain_preserve_active_revision_identity() {
     );
 
     state.retain_messages(
-        |message| !matches!(message, ChatMessage::System(text) if text == "remove"),
+        |message| !matches!(message, ChatMessage::System { text, .. } if text == "remove"),
     );
     prepare_transcript_cache(&mut state, 40);
     state.refresh_transcript_search();
@@ -177,7 +192,10 @@ fn append_and_retain_preserve_active_revision_identity() {
 fn one_append_rebuilds_one_message_then_rescans_without_render_rebuilds() {
     let mut state = state();
     for index in 0..1_000 {
-        state.push_message(ChatMessage::System(format!("item {index} needle")));
+        state.push_message(ChatMessage::System {
+            text: format!("item {index} needle"),
+            expanded: false,
+        });
     }
     prepare_transcript_cache(&mut state, 80);
     state.open_transcript_search();
@@ -185,7 +203,10 @@ fn one_append_rebuilds_one_message_then_rescans_without_render_rebuilds() {
     state.refresh_transcript_search();
     let scans = state.transcript.search.scan_count_for_test();
 
-    state.push_message(ChatMessage::System("last needle".to_string()));
+    state.push_message(ChatMessage::System {
+        text: "last needle".to_string(),
+        expanded: false,
+    });
     prepare_transcript_cache(&mut state, 80);
     assert_eq!(state.transcript.render_cache.last_prepare_visited(), 1);
     let render_generation = state.transcript.render_cache.content_generation();
@@ -202,7 +223,10 @@ fn one_append_rebuilds_one_message_then_rescans_without_render_rebuilds() {
 fn removal_chooses_nearest_following_match_and_open_does_not_disable_follow() {
     let mut state = state();
     for text in ["target one", "middle", "target two"] {
-        state.push_message(ChatMessage::System(text.to_string()));
+        state.push_message(ChatMessage::System {
+            text: text.to_string(),
+            expanded: false,
+        });
     }
     prepare_transcript_cache(&mut state, 40);
     state.viewport.auto_scroll = true;
@@ -218,7 +242,7 @@ fn removal_chooses_nearest_following_match_and_open_does_not_disable_follow() {
         .line_identity;
 
     state.retain_messages(
-        |message| !matches!(message, ChatMessage::System(text) if text == "target one"),
+        |message| !matches!(message, ChatMessage::System { text, .. } if text == "target one"),
     );
     prepare_transcript_cache(&mut state, 40);
     state.refresh_transcript_search();
@@ -271,7 +295,10 @@ fn retaining_messages_rebases_watermarks_and_cache_entries() {
 
     let mut state = state();
     state.push_message(ChatMessage::User("keep before".to_string()));
-    state.push_message(ChatMessage::System("remove before".to_string()));
+    state.push_message(ChatMessage::System {
+        text: "remove before".to_string(),
+        expanded: false,
+    });
     state.push_message(ChatMessage::Assistant("keep after".to_string()));
     state.transcript.finalized_count = 3;
     state.transcript.flushed_count = 2;
@@ -285,7 +312,7 @@ fn retaining_messages_rebases_watermarks_and_cache_entries() {
     assert_eq!(state.transcript.render_cache.populated_len(), 3);
 
     state.retain_messages(
-        |message| !matches!(message, ChatMessage::System(text) if text == "remove before"),
+        |message| !matches!(message, ChatMessage::System { text, .. } if text == "remove before"),
     );
 
     assert_eq!(state.transcript.messages.len(), 2);
@@ -551,10 +578,13 @@ fn discarded_attempt_removes_only_trailing_assistant_output() {
 #[test]
 fn retaining_messages_reindexes_the_active_assistant_tail() {
     let mut state = state();
-    state.push_message(ChatMessage::System("remove".to_string()));
+    state.push_message(ChatMessage::System {
+        text: "remove".to_string(),
+        expanded: false,
+    });
     state.update(TuiEvent::MessageDelta("first\n".to_string()));
     state.retain_messages(
-        |message| !matches!(message, ChatMessage::System(text) if text == "remove"),
+        |message| !matches!(message, ChatMessage::System { text, .. } if text == "remove"),
     );
 
     state.update(TuiEvent::MessageDelta("second\n".to_string()));
@@ -574,7 +604,7 @@ fn system_notice_finishes_hidden_assistant_text_before_notice() {
 
     assert!(matches!(
         &state.transcript.messages[..],
-        [ChatMessage::Assistant(text), ChatMessage::System(notice)]
+        [ChatMessage::Assistant(text), ChatMessage::System { text: notice, .. }]
             if text == "hidden tail" && notice == "notice"
     ));
 }
@@ -697,10 +727,10 @@ fn flushable_prefix_is_bounded_by_already_flushed_count() {
         .transcript
         .messages
         .push(ChatMessage::User("a".to_string()));
-    state
-        .transcript
-        .messages
-        .push(ChatMessage::System("b".to_string()));
+    state.transcript.messages.push(ChatMessage::System {
+        text: "b".to_string(),
+        expanded: false,
+    });
     state.transcript.flushed_count = 1;
     // Counts the contiguous settled run starting from flushed_count, not from 0.
     assert_eq!(state.flushable_prefix_end(false), 2);

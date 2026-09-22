@@ -622,10 +622,10 @@ impl Client for TuiClient {
                     projection.ready = true;
                     projection.dirty = true;
                     projection.metrics_dirty = true;
-                    projection.messages.push(ChatMessage::System(format!(
-                        "ACP session {}",
-                        note.session_id
-                    )));
+                    projection.messages.push(ChatMessage::System {
+                        text: format!("ACP session {}", note.session_id),
+                        expanded: false,
+                    });
                 }
                 "reload_required" => self.reload.set(true),
                 _ => {}
@@ -1781,7 +1781,7 @@ mod tests {
         assert_eq!(renderer.state.usage().estimated_cost_usd, 0.125);
         assert_eq!(renderer.state.status, crate::types::AppStatus::Running);
         assert!(renderer.state.transcript.messages.iter().any(
-            |message| matches!(message, ChatMessage::System(text) if text == "shell unavailable")
+            |message| matches!(message, ChatMessage::System { text, .. } if text == "shell unavailable")
         ));
         assert!(
             renderer

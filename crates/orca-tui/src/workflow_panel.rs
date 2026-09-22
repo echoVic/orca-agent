@@ -589,7 +589,10 @@ impl AppState {
         for (id, notice) in notices {
             self.announced_subagent_terminals.insert(id);
             self.finish_assistant_stream();
-            self.push_message(ChatMessage::System(notice));
+            self.push_message(ChatMessage::System {
+                text: notice,
+                expanded: false,
+            });
         }
     }
 

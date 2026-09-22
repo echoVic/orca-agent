@@ -151,7 +151,10 @@ impl AppState {
                 self.reset_session_selection_to_first_match();
                 self.session_picker_phase = SessionPickerPhase::Browsing;
                 self.session_picker_error = None;
-                self.push_message(ChatMessage::System(notice));
+                self.push_message(ChatMessage::System {
+                    text: notice,
+                    expanded: false,
+                });
                 self.set_status(AppStatus::SessionPicker);
             }
             TuiEvent::SavedSessionActionFailed(message) => {
@@ -175,7 +178,10 @@ impl AppState {
                 if let Some(plan) = plan {
                     self.restore_plan(Some(plan));
                 }
-                self.push_message(ChatMessage::System(label));
+                self.push_message(ChatMessage::System {
+                    text: label,
+                    expanded: false,
+                });
                 self.transcript.finalized_count = self.transcript.messages.len();
                 self.set_status(AppStatus::Idle);
             }
@@ -483,7 +489,10 @@ impl AppState {
                     .push_pending_workflow_notification(PendingWorkflowNotification { id, prompt })
                 {
                     self.finish_assistant_stream();
-                    self.push_message(ChatMessage::System(format!("Workflow {status}. {summary}")));
+                    self.push_message(ChatMessage::System {
+                        text: format!("Workflow {status}. {summary}"),
+                        expanded: false,
+                    });
                 }
             }
             TuiEvent::ApprovalNeeded {
@@ -557,7 +566,10 @@ impl AppState {
                         .iter()
                         .any(|question| !question.options.is_empty()))
                 .then(|| UserInputDialog::new(questionnaire));
-                self.push_message(ChatMessage::System(transcript_message));
+                self.push_message(ChatMessage::System {
+                    text: transcript_message,
+                    expanded: false,
+                });
             }
             TuiEvent::McpElicitationRequested {
                 key,
@@ -588,7 +600,10 @@ impl AppState {
                         }
                     }
                 }
-                self.push_message(ChatMessage::System(lines.join("\n")));
+                self.push_message(ChatMessage::System {
+                    text: lines.join("\n"),
+                    expanded: false,
+                });
             }
             TuiEvent::SubmissionRejected {
                 queued_id: _,
@@ -634,12 +649,18 @@ impl AppState {
             TuiEvent::StartupWarning(msg) => {
                 self.finish_assistant_stream();
                 if self.announced_startup_warnings.insert(msg.clone()) {
-                    self.push_message(ChatMessage::System(msg));
+                    self.push_message(ChatMessage::System {
+                        text: msg,
+                        expanded: false,
+                    });
                 }
             }
             TuiEvent::Notice(msg) => {
                 self.finish_assistant_stream();
-                self.push_message(ChatMessage::System(msg));
+                self.push_message(ChatMessage::System {
+                    text: msg,
+                    expanded: false,
+                });
             }
             TuiEvent::MentionSearchDirty { .. }
             | TuiEvent::MentionCatalogDirty { .. }
@@ -667,12 +688,15 @@ impl AppState {
                 if approval_mode == ApprovalMode::FullAuto {
                     self.full_access_confirmation = None;
                 }
-                self.push_message(ChatMessage::System(format!(
-                    "Runtime settings updated: model {}, reasoning effort {}, approval mode {}.",
-                    self.model_name,
-                    self.reasoning_effort.as_str(),
-                    self.approval_mode.as_str()
-                )));
+                self.push_message(ChatMessage::System {
+                    text: format!(
+                        "Runtime settings updated: model {}, reasoning effort {}, approval mode {}.",
+                        self.model_name,
+                        self.reasoning_effort.as_str(),
+                        self.approval_mode.as_str()
+                    ),
+                    expanded: false,
+                });
             }
             TuiEvent::PlanImplementationStarted { prompt } => {
                 self.record_prompt(prompt.clone());
@@ -704,9 +728,10 @@ impl AppState {
                     .then(|| self.current_turn_proposed_plan())
                     .flatten();
                 if was_backgrounded {
-                    self.push_message(ChatMessage::System(format!(
-                        "Background session completed: {status}"
-                    )));
+                    self.push_message(ChatMessage::System {
+                        text: format!("Background session completed: {status}"),
+                        expanded: false,
+                    });
                 }
                 if let Some(diagnostic) = fallback_diagnostic {
                     self.push_message(ChatMessage::Diagnostic(diagnostic));
@@ -730,14 +755,17 @@ impl AppState {
                 status_text,
             } => {
                 self.finish_assistant_stream();
-                self.push_message(ChatMessage::System(format_compaction_notice(
-                    &reason,
-                    &strategy,
-                    before_messages,
-                    after_messages,
-                    collapsed_messages,
-                    &status_text,
-                )));
+                self.push_message(ChatMessage::System {
+                    text: format_compaction_notice(
+                        &reason,
+                        &strategy,
+                        before_messages,
+                        after_messages,
+                        collapsed_messages,
+                        &status_text,
+                    ),
+                    expanded: false,
+                });
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::GoalStatus(goal) => {
@@ -751,9 +779,10 @@ impl AppState {
                     }
                     None => {
                         self.finish_assistant_stream();
-                        self.push_message(ChatMessage::System(
-                            "No goal is currently set.".to_string(),
-                        ));
+                        self.push_message(ChatMessage::System {
+                            text: "No goal is currently set.".to_string(),
+                            expanded: false,
+                        });
                     }
                 }
                 if !should_keep_running {
@@ -762,10 +791,10 @@ impl AppState {
             }
             TuiEvent::Backtracked { prompt } => {
                 self.remove_after_last_user();
-                self.push_message(ChatMessage::System(format!(
-                    "Backtracked to previous prompt: {}",
-                    prompt.trim()
-                )));
+                self.push_message(ChatMessage::System {
+                    text: format!("Backtracked to previous prompt: {}", prompt.trim()),
+                    expanded: false,
+                });
                 self.set_status(AppStatus::Idle);
             }
         }
@@ -783,13 +812,16 @@ impl AppState {
             .iter()
             .rev()
             .find_map(|message| match message {
-                ChatMessage::System(text) if text.starts_with("Goal ") => Some(text),
+                ChatMessage::System { text, .. } if text.starts_with("Goal ") => Some(text),
                 _ => None,
             })
             == Some(&notice);
         if !duplicate {
             self.finish_assistant_stream();
-            self.push_message(ChatMessage::System(notice));
+            self.push_message(ChatMessage::System {
+                text: notice,
+                expanded: false,
+            });
         }
     }
 
@@ -842,9 +874,10 @@ impl AppState {
                 } else {
                     "agents in parallel"
                 };
-                self.push_message(ChatMessage::System(format!(
-                    "Delegating to {batch_size} {noun}"
-                )));
+                self.push_message(ChatMessage::System {
+                    text: format!("Delegating to {batch_size} {noun}"),
+                    expanded: false,
+                });
             }
         }
     }
@@ -888,10 +921,11 @@ impl AppState {
                 Some(SurfaceOperationProjectionEffect::RecoveryPromptShown) => {
                     self.recovery_prompt_visible = true;
                     self.recovery_prompt_selected = 0;
-                    self.push_message(ChatMessage::System(
-                    "A recoverable operation is suspended. Use the recovery controls to continue it or /cancel-operation to close it."
-                        .to_string(),
-                ));
+                    self.push_message(ChatMessage::System {
+                        text: "A recoverable operation is suspended. Use the recovery controls to continue it or /cancel-operation to close it."
+                            .to_string(),
+                        expanded: false,
+                    });
                 }
                 Some(SurfaceOperationProjectionEffect::RecoveryPromptCleared) => {
                     self.recovery_prompt_visible = false;
@@ -912,7 +946,10 @@ impl AppState {
             }
             Some(SurfaceGoalProjectionEffect::Cleared) => {
                 self.finish_assistant_stream();
-                self.push_message(ChatMessage::System("Goal cleared.".to_string()));
+                self.push_message(ChatMessage::System {
+                    text: "Goal cleared.".to_string(),
+                    expanded: false,
+                });
                 self.set_status(AppStatus::Idle);
             }
             None => {}
@@ -921,17 +958,19 @@ impl AppState {
             SurfaceSessionProjectionApply::Accepted(Some(
                 SurfaceSessionProjectionEffect::Renamed { title },
             )) => {
-                self.push_message(ChatMessage::System(format!(
-                    "Renamed conversation to {title}."
-                )));
+                self.push_message(ChatMessage::System {
+                    text: format!("Renamed conversation to {title}."),
+                    expanded: false,
+                });
                 self.set_status(AppStatus::Idle);
             }
             SurfaceSessionProjectionApply::Accepted(Some(
                 SurfaceSessionProjectionEffect::Forked { title },
             )) => {
-                self.push_message(ChatMessage::System(format!(
-                    "Forked conversation as {title}."
-                )));
+                self.push_message(ChatMessage::System {
+                    text: format!("Forked conversation as {title}."),
+                    expanded: false,
+                });
                 self.set_status(AppStatus::Idle);
             }
             SurfaceSessionProjectionApply::Accepted(None)

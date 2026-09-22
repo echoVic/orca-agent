@@ -227,7 +227,7 @@ mod tests {
         assert_eq!(exit, None);
         assert!(matches!(
             fixture.state.transcript.messages.as_slice(),
-            [ChatMessage::System(message)] if message == "routed notice"
+            [ChatMessage::System { text: message, .. }] if message == "routed notice"
         ));
         assert!(fixture.action_rx.try_recv().is_err());
     }

@@ -1582,7 +1582,10 @@ pub(crate) fn render_live_messages(
         // The welcome screen renders through its own cache so its text is
         // selectable and copyable exactly like transcript content.
         let lines = build_welcome_lines(state, theme, width);
-        let welcome_message = [ChatMessage::System(String::new())];
+        let welcome_message = [ChatMessage::System {
+            text: String::new(),
+            expanded: false,
+        }];
         // Sentinel revision: never collides with allocated ones, and the
         // explicit invalidate below forces a rebuild whenever we redraw.
         let welcome_revisions = [u64::MAX];
@@ -3231,7 +3234,7 @@ fn leading_blank(previous: Option<&ChatMessage>, message: &ChatMessage) -> bool 
         ChatMessage::User(_)
         | ChatMessage::Diagnostic(_)
         | ChatMessage::Error(_)
-        | ChatMessage::System(_)
+        | ChatMessage::System { .. }
         | ChatMessage::ProposedPlan(_)
         | ChatMessage::PlanUpdate { .. } => true,
         ChatMessage::Assistant(_) | ChatMessage::AssistantChunk { .. } => matches!(
@@ -3239,7 +3242,7 @@ fn leading_blank(previous: Option<&ChatMessage>, message: &ChatMessage) -> bool 
             ChatMessage::ToolCall { .. }
                 | ChatMessage::Diagnostic(_)
                 | ChatMessage::Error(_)
-                | ChatMessage::System(_)
+                | ChatMessage::System { .. }
                 | ChatMessage::User(_)
                 | ChatMessage::Image(_)
         ),
@@ -3432,19 +3435,8 @@ fn append_message_lines(
         ChatMessage::Diagnostic(diagnostic) => {
             append_diagnostic_lines(lines, diagnostic, theme);
         }
-        ChatMessage::System(text) => {
-            let mut rows = text.lines();
-            let first = rows.next().unwrap_or_default();
-            lines.push(Line::from(vec![
-                Span::raw(GUTTER_CONTINUATION),
-                Span::styled(format!("ℹ {first}"), theme.muted_style()),
-            ]));
-            for row in rows {
-                lines.push(Line::from(Span::styled(
-                    format!("      {row}"),
-                    theme.muted_style(),
-                )));
-            }
+        ChatMessage::System { text, expanded } => {
+            append_system_lines(lines, text, *expanded, force_expand, theme);
         }
     }
 }
@@ -3557,6 +3549,46 @@ fn append_reasoning_lines(
     for row in rows.take(limit) {
         lines.push(Line::from(Span::styled(format!("      {row}"), style)));
     }
+}
+
+/// A system notice always shows its first line; a notice of three or more
+/// lines collapses the rest behind a tail row, matching
+/// `append_tool_output_lines`'s `└ ` convention, unless `expanded` or
+/// `force_expand` (the scrollback flush path, which must commit every line)
+/// says otherwise. A one- or two-line notice has no affordance to collapse —
+/// `transcript_hit::is_collapsible` draws the same line, so the two never
+/// disagree about whether this notice is worth a hit area.
+fn append_system_lines(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    expanded: bool,
+    force_expand: bool,
+    theme: &Theme,
+) {
+    let total = text.lines().count();
+    let mut rows = text.lines();
+    let first = rows.next().unwrap_or_default();
+    lines.push(Line::from(vec![
+        Span::raw(GUTTER_CONTINUATION),
+        Span::styled(format!("ℹ {first}"), theme.muted_style()),
+    ]));
+    if total <= 2 || expanded || force_expand {
+        for row in rows {
+            lines.push(Line::from(Span::styled(
+                format!("      {row}"),
+                theme.muted_style(),
+            )));
+        }
+        return;
+    }
+    let hidden = total.saturating_sub(1);
+    lines.push(Line::from(vec![
+        Span::styled("    └ ".to_string(), theme.dim_style()),
+        Span::styled(
+            format!("+{hidden} lines · click or e to expand"),
+            theme.muted_style(),
+        ),
+    ]));
 }
 
 fn plan_panel_height(state: &AppState) -> u16 {
@@ -7418,9 +7450,10 @@ mod tests {
     fn user_input_questionnaire_renders_inline_without_skill_popup() {
         let mut state = test_state();
         state.set_status(AppStatus::WaitingUserInput);
-        state.push_message(ChatMessage::System(
-            "conversation context remains visible".to_string(),
-        ));
+        state.push_message(ChatMessage::System {
+            text: "conversation context remains visible".to_string(),
+            expanded: false,
+        });
         state.user_input_dialog = Some(UserInputDialog::new(
             crate::protocol::TuiUserInputQuestionnaire {
                 questions: vec![
@@ -7574,7 +7607,10 @@ mod tests {
     fn narrow_user_input_questionnaire_keeps_context_and_stacks_preview() {
         let mut state = test_state();
         state.set_status(AppStatus::WaitingUserInput);
-        state.push_message(ChatMessage::System("narrow transcript context".to_string()));
+        state.push_message(ChatMessage::System {
+            text: "narrow transcript context".to_string(),
+            expanded: false,
+        });
         state.user_input_dialog = Some(UserInputDialog::new(
             crate::protocol::TuiUserInputQuestionnaire {
                 questions: vec![
@@ -7752,7 +7788,10 @@ mod tests {
         ] {
             let mut state = test_state();
             state.set_status(status);
-            state.push_message(ChatMessage::System("alpha".to_string()));
+            state.push_message(ChatMessage::System {
+                text: "alpha".to_string(),
+                expanded: false,
+            });
             state.open_transcript_search();
             let theme = Theme::named(orca_core::config::ThemeName::Dark);
             let textarea = TextArea::default();
@@ -7778,9 +7817,10 @@ mod tests {
     #[test]
     fn narrow_search_frame_keeps_count_and_cursor_segment_without_composer_cursor() {
         let mut state = test_state();
-        state.push_message(ChatMessage::System(
-            "long-query-tail long-query-tail".to_string(),
-        ));
+        state.push_message(ChatMessage::System {
+            text: "long-query-tail long-query-tail".to_string(),
+            expanded: false,
+        });
         state.open_transcript_search();
         state.replace_transcript_search_query("prefix-long-query-tail");
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
@@ -8605,7 +8645,10 @@ mod tests {
     fn system_notice_is_a_single_info_row_with_indented_detail() {
         let text = message_text(
             None,
-            &ChatMessage::System("Resumed saved conversation.\nmodel deepseek-flash".into()),
+            &ChatMessage::System {
+                text: "Resumed saved conversation.\nmodel deepseek-flash".into(),
+                expanded: false,
+            },
         );
         assert_eq!(
             text,
@@ -8614,6 +8657,71 @@ mod tests {
                 "      model deepseek-flash",
             ]
         );
+    }
+
+    #[test]
+    fn a_long_system_notice_collapses_to_its_first_line() {
+        let text = "Shell unavailable under the current restricted policy\nno OS-enforced sandbox backend\nrun Orca on a host that permits sandbox enforcement";
+        let collapsed = message_text(
+            None,
+            &ChatMessage::System {
+                text: text.into(),
+                expanded: false,
+            },
+        );
+        assert_eq!(
+            collapsed.len(),
+            2,
+            "first line plus the expand affordance: {collapsed:?}"
+        );
+        assert!(
+            collapsed[0].starts_with("    ℹ Shell unavailable"),
+            "{collapsed:?}"
+        );
+        assert!(collapsed[1].contains("+2 lines"), "{collapsed:?}");
+
+        let expanded = message_text(
+            None,
+            &ChatMessage::System {
+                text: text.into(),
+                expanded: true,
+            },
+        );
+        assert_eq!(expanded.len(), 3);
+
+        let flushed = lines_text(&build_lines_for_message_after(
+            None,
+            &ChatMessage::System {
+                text: text.into(),
+                expanded: false,
+            },
+            &Theme::named(ThemeName::Dark),
+            80,
+            0,
+            true,
+            None,
+        ));
+        assert_eq!(flushed.len(), 3, "flush must commit every line");
+    }
+
+    #[test]
+    fn a_short_system_notice_has_no_expand_affordance() {
+        let one = message_text(
+            None,
+            &ChatMessage::System {
+                text: "Resumed saved conversation.".into(),
+                expanded: false,
+            },
+        );
+        assert_eq!(one.len(), 1, "{one:?}");
+        let two = message_text(
+            None,
+            &ChatMessage::System {
+                text: "a\nb".into(),
+                expanded: false,
+            },
+        );
+        assert_eq!(two.len(), 2, "two lines fit without collapsing: {two:?}");
     }
 
     #[test]
@@ -10807,10 +10915,10 @@ mod tests {
         let textarea = TextArea::default();
         let mut state = test_state();
         for index in 0..80 {
-            state
-                .transcript
-                .messages
-                .push(ChatMessage::System(format!("line {index}")));
+            state.transcript.messages.push(ChatMessage::System {
+                text: format!("line {index}"),
+                expanded: false,
+            });
         }
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
             .expect("test backend");
@@ -10833,10 +10941,16 @@ mod tests {
         assert!(state.viewport.jump_to_bottom_area.is_some());
 
         // Messages landing while detached turn it into an unread counter.
-        state.push_message(ChatMessage::System("late one".to_string()));
+        state.push_message(ChatMessage::System {
+            text: "late one".to_string(),
+            expanded: false,
+        });
         let one = draw(&mut state);
         assert!(one.contains("1 new message (click) ↓"));
-        state.push_message(ChatMessage::System("late two".to_string()));
+        state.push_message(ChatMessage::System {
+            text: "late two".to_string(),
+            expanded: false,
+        });
         let two = draw(&mut state);
         assert!(two.contains("2 new messages (click) ↓"));
 
@@ -10849,7 +10963,10 @@ mod tests {
         assert_eq!(state.viewport.unseen_messages, 0);
 
         // Messages arriving while FOLLOWING never count as unread.
-        state.push_message(ChatMessage::System("seen".to_string()));
+        state.push_message(ChatMessage::System {
+            text: "seen".to_string(),
+            expanded: false,
+        });
         assert_eq!(state.viewport.unseen_messages, 0);
         state.scroll_up(10);
         let detached_again = draw(&mut state);
@@ -10862,10 +10979,10 @@ mod tests {
         let textarea = TextArea::default();
         let mut state = test_state();
         for index in 0..80 {
-            state
-                .transcript
-                .messages
-                .push(ChatMessage::System(format!("line {index}")));
+            state.transcript.messages.push(ChatMessage::System {
+                text: format!("line {index}"),
+                expanded: false,
+            });
         }
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
             .expect("test backend");
@@ -10990,7 +11107,10 @@ mod tests {
         let theme = monochrome_theme();
         let textarea = TextArea::default();
         let mut state = test_state();
-        state.push_message(ChatMessage::System("abc".to_string()));
+        state.push_message(ChatMessage::System {
+            text: "abc".to_string(),
+            expanded: false,
+        });
         let pos = crate::selection::SelectionPos { row: 0, col: 0 };
         state.viewport.selection = Some(crate::selection::TranscriptSelection::begin(pos));
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8))
@@ -14999,7 +15119,10 @@ mod tests {
         state.push_message(ChatMessage::Assistant(
             "有 ego-browser skill，我读一下它的使用说明。".into(),
         ));
-        state.push_message(ChatMessage::System("Resumed saved conversation.".into()));
+        state.push_message(ChatMessage::System {
+            text: "Resumed saved conversation.\nmodel deepseek-flash\ncwd /Users/dev/Documents/GitHub/blade-deepseek".into(),
+            expanded: false,
+        });
         state.push_message(ChatMessage::Error(
             "DeepSeek provider error: 429 rate limit exceeded".into(),
         ));

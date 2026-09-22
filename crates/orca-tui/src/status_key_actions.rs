@@ -280,12 +280,14 @@ mod tests {
     }
 
     fn prepare_two_search_matches(state: &mut AppState) {
-        state.push_message(crate::transcript_state::ChatMessage::System(
-            "alpha one".to_string(),
-        ));
-        state.push_message(crate::transcript_state::ChatMessage::System(
-            "alpha two".to_string(),
-        ));
+        state.push_message(crate::transcript_state::ChatMessage::System {
+            text: "alpha one".to_string(),
+            expanded: false,
+        });
+        state.push_message(crate::transcript_state::ChatMessage::System {
+            text: "alpha two".to_string(),
+            expanded: false,
+        });
         let theme = Theme::named(ThemeName::Dark);
         let messages = &state.transcript.messages;
         let revisions = &state.transcript.message_revisions;

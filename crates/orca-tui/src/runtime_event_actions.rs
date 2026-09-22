@@ -34,7 +34,10 @@ pub(crate) fn handle_interaction_response_ack(
                 .and_then(|submission| submission.response_summary.clone());
             state.discard_pending_interaction_submission(&key);
             if let Some(summary) = summary {
-                state.push_message(crate::transcript_state::ChatMessage::System(summary));
+                state.push_message(crate::transcript_state::ChatMessage::System {
+                    text: summary,
+                    expanded: false,
+                });
             }
         }
         InteractionResponseAck::NoLongerPending { key, message } => {

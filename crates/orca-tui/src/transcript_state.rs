@@ -44,7 +44,10 @@ pub enum ChatMessage {
     },
     Diagnostic(TuiDiagnostic),
     Error(String),
-    System(String),
+    System {
+        text: String,
+        expanded: bool,
+    },
 }
 
 #[derive(Default)]

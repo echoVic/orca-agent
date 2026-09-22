@@ -1637,7 +1637,10 @@ mod tests {
             .scroll(((total_height - visible_height) as u16, 0))
             .render(expected.area, &mut expected);
 
-        let messages = vec![ChatMessage::System("whitespace".to_string())];
+        let messages = vec![ChatMessage::System {
+            text: "whitespace".to_string(),
+            expanded: false,
+        }];
         let revisions = vec![1];
         let mut cache = TranscriptRenderCache::default();
         let theme = theme();
@@ -1660,7 +1663,10 @@ mod tests {
         width: usize,
     ) -> TranscriptRenderCache {
         let messages: Vec<ChatMessage> = (0..lines_per_message.len())
-            .map(|index| ChatMessage::System(index.to_string()))
+            .map(|index| ChatMessage::System {
+                text: index.to_string(),
+                expanded: false,
+            })
             .collect();
         let revisions: Vec<u64> = (1..=messages.len() as u64).collect();
         let mut cache = TranscriptRenderCache::default();
@@ -1670,7 +1676,7 @@ mod tests {
             &revisions,
             TranscriptRenderContext::new(&theme, width, 0, false),
             |_, message, _, _, _, _| {
-                let ChatMessage::System(index) = message else {
+                let ChatMessage::System { text: index, .. } = message else {
                     unreachable!()
                 };
                 lines_per_message[index.parse::<usize>().unwrap()].clone()
@@ -2029,8 +2035,14 @@ mod tests {
     #[test]
     fn structural_cache_mutations_bump_generation_only_when_effective() {
         let messages = vec![
-            ChatMessage::System("one".to_string()),
-            ChatMessage::System("two".to_string()),
+            ChatMessage::System {
+                text: "one".to_string(),
+                expanded: false,
+            },
+            ChatMessage::System {
+                text: "two".to_string(),
+                expanded: false,
+            },
         ];
         let revisions = vec![1, 2];
         let mut cache = TranscriptRenderCache::default();
@@ -2177,7 +2189,10 @@ mod tests {
         width: usize,
     ) -> TranscriptRenderCache {
         let messages = (0..lines_per_message.len())
-            .map(|index| ChatMessage::System(index.to_string()))
+            .map(|index| ChatMessage::System {
+                text: index.to_string(),
+                expanded: false,
+            })
             .collect::<Vec<_>>();
         let revisions = (1..=messages.len() as u64).collect::<Vec<_>>();
         let mut cache = TranscriptRenderCache::default();
@@ -2187,7 +2202,7 @@ mod tests {
             &revisions,
             TranscriptRenderContext::new(&theme, width, 0, false),
             |_, message, _, _, _, _| {
-                let ChatMessage::System(index) = message else {
+                let ChatMessage::System { text: index, .. } = message else {
                     unreachable!();
                 };
                 lines_per_message[index.parse::<usize>().unwrap()].clone()
@@ -2198,7 +2213,10 @@ mod tests {
 
     #[test]
     fn search_maps_span_and_soft_wrap_matches_to_absolute_rows() {
-        let messages = vec![ChatMessage::System("fixture".to_string())];
+        let messages = vec![ChatMessage::System {
+            text: "fixture".to_string(),
+            expanded: false,
+        }];
         let revisions = vec![7];
         let mut cache = TranscriptRenderCache::default();
         let theme = theme();
@@ -2644,9 +2662,18 @@ mod tests {
     #[test]
     fn builder_receives_initial_and_selectively_invalidated_message_indices() {
         let messages = vec![
-            ChatMessage::System("zero".to_string()),
-            ChatMessage::System("one".to_string()),
-            ChatMessage::System("two".to_string()),
+            ChatMessage::System {
+                text: "zero".to_string(),
+                expanded: false,
+            },
+            ChatMessage::System {
+                text: "one".to_string(),
+                expanded: false,
+            },
+            ChatMessage::System {
+                text: "two".to_string(),
+                expanded: false,
+            },
         ];
         let mut revisions = vec![1, 2, 3];
         let built_indices = RefCell::new(Vec::new());
@@ -2685,7 +2712,10 @@ mod tests {
     #[test]
     fn ten_thousand_messages_search_once_then_steady_scroll_and_navigation_scan_zero() {
         let messages = (0..10_000)
-            .map(|index| ChatMessage::System(format!("message {index} needle")))
+            .map(|index| ChatMessage::System {
+                text: format!("message {index} needle"),
+                expanded: false,
+            })
             .collect::<Vec<_>>();
         let revisions = (1..=10_000).collect::<Vec<u64>>();
         let mut cache = TranscriptRenderCache::default();
@@ -2695,7 +2725,7 @@ mod tests {
             &revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, message, _, _, _, _| match message {
-                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                ChatMessage::System { text, .. } => vec![Line::from(text.clone())],
                 _ => unreachable!(),
             },
         );
@@ -2720,7 +2750,10 @@ mod tests {
     #[test]
     fn transcript_search_ignores_unchanged_render_frames_and_rescans_only_changed_entries() {
         let messages = (0..5_000)
-            .map(|index| ChatMessage::System(format!("message {index} needle")))
+            .map(|index| ChatMessage::System {
+                text: format!("message {index} needle"),
+                expanded: false,
+            })
             .collect::<Vec<_>>();
         let mut revisions = (1..=5_000).collect::<Vec<u64>>();
         let mut cache = TranscriptRenderCache::default();
@@ -2730,7 +2763,7 @@ mod tests {
             &revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, message, _, _, _, _| match message {
-                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                ChatMessage::System { text, .. } => vec![Line::from(text.clone())],
                 _ => unreachable!(),
             },
         );
@@ -2755,7 +2788,7 @@ mod tests {
             &revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, message, _, _, _, _| match message {
-                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                ChatMessage::System { text, .. } => vec![Line::from(text.clone())],
                 _ => unreachable!(),
             },
         );
@@ -3036,7 +3069,10 @@ mod tests {
     #[test]
     fn thousands_of_messages_render_a_bounded_viewport_window() {
         let messages = (0..5_000)
-            .map(|index| ChatMessage::System(format!("message {index}")))
+            .map(|index| ChatMessage::System {
+                text: format!("message {index}"),
+                expanded: false,
+            })
             .collect::<Vec<_>>();
         let revisions = (1..=messages.len() as u64).collect::<Vec<_>>();
         let mut cache = TranscriptRenderCache::default();
@@ -3047,7 +3083,7 @@ mod tests {
             &revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, message, _, _, _, _| match message {
-                ChatMessage::System(text) => vec![Line::from(text.clone()), Line::from("")],
+                ChatMessage::System { text, .. } => vec![Line::from(text.clone()), Line::from("")],
                 _ => unreachable!(),
             },
         );
@@ -3061,7 +3097,10 @@ mod tests {
     #[test]
     fn offsets_above_u16_max_remain_representable_and_navigable() {
         let messages = (0..40_000)
-            .map(|index| ChatMessage::System(format!("message {index}")))
+            .map(|index| ChatMessage::System {
+                text: format!("message {index}"),
+                expanded: false,
+            })
             .collect::<Vec<_>>();
         let revisions = (1..=messages.len() as u64).collect::<Vec<_>>();
         let mut cache = TranscriptRenderCache::default();
@@ -3072,7 +3111,7 @@ mod tests {
             &revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, message, _, _, _, _| match message {
-                ChatMessage::System(text) => vec![Line::from(text.clone()), Line::from("")],
+                ChatMessage::System { text, .. } => vec![Line::from(text.clone()), Line::from("")],
                 _ => unreachable!(),
             },
         );
@@ -3086,7 +3125,10 @@ mod tests {
     #[test]
     fn retained_prefix_rebases_total_height_and_visible_message_indices() {
         let messages = (0..100)
-            .map(|index| ChatMessage::System(format!("message {index}")))
+            .map(|index| ChatMessage::System {
+                text: format!("message {index}"),
+                expanded: false,
+            })
             .collect::<Vec<_>>();
         let revisions = (1..=messages.len() as u64).collect::<Vec<_>>();
         let mut cache = TranscriptRenderCache::default();
@@ -3097,7 +3139,7 @@ mod tests {
             &revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, message, _, _, _, _| match message {
-                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                ChatMessage::System { text, .. } => vec![Line::from(text.clone())],
                 _ => unreachable!(),
             },
         );
@@ -3113,8 +3155,14 @@ mod tests {
     #[test]
     fn tall_message_discards_complete_logical_lines_before_materializing_rows() {
         let messages = vec![
-            ChatMessage::System("tall".to_string()),
-            ChatMessage::System("tail".to_string()),
+            ChatMessage::System {
+                text: "tall".to_string(),
+                expanded: false,
+            },
+            ChatMessage::System {
+                text: "tail".to_string(),
+                expanded: false,
+            },
         ];
         let revisions = vec![1, 2];
         let mut cache = TranscriptRenderCache::default();
@@ -3125,10 +3173,10 @@ mod tests {
             &revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, message, _, _, _, _| match message {
-                ChatMessage::System(text) if text == "tall" => (0..70_000)
+                ChatMessage::System { text, .. } if text == "tall" => (0..70_000)
                     .map(|index| Line::from(format!("line {index}")))
                     .collect(),
-                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                ChatMessage::System { text, .. } => vec![Line::from(text.clone())],
                 _ => unreachable!(),
             },
         );
@@ -3141,7 +3189,10 @@ mod tests {
 
     #[test]
     fn tall_message_bounds_logical_lines_at_the_top_of_the_viewport() {
-        let messages = vec![ChatMessage::System("tall".to_string())];
+        let messages = vec![ChatMessage::System {
+            text: "tall".to_string(),
+            expanded: false,
+        }];
         let revisions = vec![1];
         let mut cache = TranscriptRenderCache::default();
         let theme = theme();
@@ -3166,8 +3217,14 @@ mod tests {
     #[test]
     fn trimming_stops_after_the_first_partially_visible_wrapped_line() {
         let messages = vec![
-            ChatMessage::System("wrapped".to_string()),
-            ChatMessage::System("later".to_string()),
+            ChatMessage::System {
+                text: "wrapped".to_string(),
+                expanded: false,
+            },
+            ChatMessage::System {
+                text: "later".to_string(),
+                expanded: false,
+            },
         ];
         let revisions = vec![1, 2];
         let mut cache = TranscriptRenderCache::default();
@@ -3178,10 +3235,10 @@ mod tests {
             &revisions,
             TranscriptRenderContext::new(&theme, 5, 0, false),
             |_, message, _, _, _, _| match message {
-                ChatMessage::System(text) if text == "wrapped" => {
+                ChatMessage::System { text, .. } if text == "wrapped" => {
                     vec![Line::from("abcdefghijklmnopqrstuvwxy")]
                 }
-                ChatMessage::System(_) => vec![Line::from("b"), Line::from("c")],
+                ChatMessage::System { .. } => vec![Line::from("b"), Line::from("c")],
                 _ => unreachable!(),
             },
         );
@@ -3197,7 +3254,10 @@ mod tests {
     #[test]
     fn one_logical_line_above_u16_rows_rebases_to_the_requested_row() {
         let body = format!("{}Z{}", "a".repeat(69_980), "b".repeat(19));
-        let messages = vec![ChatMessage::System("huge".to_string())];
+        let messages = vec![ChatMessage::System {
+            text: "huge".to_string(),
+            expanded: false,
+        }];
         let revisions = vec![1];
         let mut cache = TranscriptRenderCache::default();
         let theme = theme();
@@ -3218,7 +3278,10 @@ mod tests {
     #[test]
     fn oversized_logical_line_bounds_materialized_content_at_the_top() {
         let body = "a".repeat(70_000);
-        let messages = vec![ChatMessage::System("huge".to_string())];
+        let messages = vec![ChatMessage::System {
+            text: "huge".to_string(),
+            expanded: false,
+        }];
         let revisions = vec![1];
         let mut cache = TranscriptRenderCache::default();
         let theme = theme();
@@ -3288,11 +3351,12 @@ mod tests {
     #[test]
     fn transcript_reflow_is_budgeted_and_converges() {
         let messages = (0..5_000)
-            .map(|index| {
-                ChatMessage::System(format!(
+            .map(|index| ChatMessage::System {
+                text: format!(
                     "message {index}: {}",
                     "content that changes wrapped height ".repeat(3)
-                ))
+                ),
+                expanded: false,
             })
             .collect::<Vec<_>>();
         let revisions = (1..=5_000).collect::<Vec<u64>>();
@@ -3303,7 +3367,7 @@ mod tests {
             &revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, message, _, _, _, _| match message {
-                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                ChatMessage::System { text, .. } => vec![Line::from(text.clone())],
                 _ => unreachable!(),
             },
         );
@@ -3325,7 +3389,7 @@ mod tests {
                     .with_reflow_window(0, requested_scroll, visible_height)
                     .with_reflow_entry_budget(32),
                 |_, message, _, _, _, _| match message {
-                    ChatMessage::System(text) => vec![Line::from(text.clone())],
+                    ChatMessage::System { text, .. } => vec![Line::from(text.clone())],
                     _ => unreachable!(),
                 },
             );
@@ -3354,7 +3418,7 @@ mod tests {
             &revisions,
             TranscriptRenderContext::new(&theme, 20, 0, false),
             |_, message, _, _, _, _| match message {
-                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                ChatMessage::System { text, .. } => vec![Line::from(text.clone())],
                 _ => unreachable!(),
             },
         );
@@ -3367,11 +3431,12 @@ mod tests {
     #[test]
     fn transcript_reflow_has_a_default_entry_budget() {
         let messages = (0..5_000)
-            .map(|index| {
-                ChatMessage::System(format!(
+            .map(|index| ChatMessage::System {
+                text: format!(
                     "message {index}: {}",
                     "content that changes wrapped height ".repeat(3)
-                ))
+                ),
+                expanded: false,
             })
             .collect::<Vec<_>>();
         let revisions = (1..=5_000).collect::<Vec<u64>>();
@@ -3382,7 +3447,7 @@ mod tests {
             &revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, message, _, _, _, _| match message {
-                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                ChatMessage::System { text, .. } => vec![Line::from(text.clone())],
                 _ => unreachable!(),
             },
         );
@@ -3401,7 +3466,7 @@ mod tests {
                 visible_height,
             ),
             |_, message, _, _, _, _| match message {
-                ChatMessage::System(text) => vec![Line::from(text.clone())],
+                ChatMessage::System { text, .. } => vec![Line::from(text.clone())],
                 _ => unreachable!(),
             },
         );

@@ -21,15 +21,20 @@ pub(crate) struct CollapsibleHitArea {
 
 /// Whether `message` can be expanded/collapsed, and therefore whether it
 /// gets an entry in `collapsible_hit_areas`. Kept in one place so future
-/// collapsible kinds (e.g. `ChatMessage::System`) extend a single match arm —
-/// `types.rs`'s `toggle_latest_expandable`/`toggle_expandable_at`/
-/// `toggle_all_expandable` all call this too, so the `e` key, `Shift+E`, and
-/// a mouse click never disagree about what counts as collapsible.
+/// collapsible kinds extend a single match arm — `types.rs`'s
+/// `toggle_latest_expandable`/`toggle_expandable_at`/`toggle_all_expandable`
+/// all call this too, so the `e` key, `Shift+E`, and a mouse click never
+/// disagree about what counts as collapsible.
+///
+/// `ChatMessage::System` only counts past two lines: a one- or two-line
+/// notice already renders in full, so it must not gain a `└ +N lines` tail
+/// row or a hit area that would toggle nothing visible.
 pub(crate) fn is_collapsible(message: &ChatMessage) -> bool {
-    matches!(
-        message,
-        ChatMessage::ToolCall { .. } | ChatMessage::Reasoning { .. }
-    )
+    match message {
+        ChatMessage::ToolCall { .. } | ChatMessage::Reasoning { .. } => true,
+        ChatMessage::System { text, .. } => text.lines().count() > 2,
+        _ => false,
+    }
 }
 
 /// The message whose rendered rows contain `row`, given the cache's per-message
@@ -151,5 +156,37 @@ mod tests {
         assert_eq!(areas[0].rect.y, 4);
         assert_eq!(areas[0].rect.height, 3);
         assert_eq!(areas[1].message_index, 2);
+    }
+
+    #[test]
+    fn a_system_notice_only_gets_a_hit_area_past_two_lines() {
+        let messages = vec![
+            ChatMessage::System {
+                text: "one line".into(),
+                expanded: false,
+            },
+            ChatMessage::System {
+                text: "one\ntwo".into(),
+                expanded: false,
+            },
+            ChatMessage::System {
+                text: "one\ntwo\nthree".into(),
+                expanded: false,
+            },
+        ];
+        let ranges = [0..1, 1..2, 2..4];
+        let areas = collapsible_hit_areas(
+            &messages,
+            |index| ranges.get(index).cloned(),
+            0,
+            4,
+            Rect::new(0, 0, 80, 4),
+        );
+        assert_eq!(
+            areas.len(),
+            1,
+            "a one- or two-line notice has nothing to expand: {areas:?}"
+        );
+        assert_eq!(areas[0].message_index, 2);
     }
 }
