@@ -42,6 +42,7 @@ use crate::surface_projection::{
     SurfaceGoalProjectionState, SurfaceMetricsState, SurfaceOperationProjectionState,
     SurfaceSessionProjectionState, SurfaceWorkflowTaskProjectionState,
 };
+use crate::transcript_hit::CollapsibleHitArea;
 use crate::transcript_state::{ChatMessage, TranscriptState};
 use crate::transcript_view::TranscriptRenderCache;
 #[cfg(test)]
@@ -392,6 +393,7 @@ pub struct AppState {
     pub(crate) image_viewer: Option<ImageViewerState>,
     pub(crate) image_renderer: ImageRenderState,
     pub(crate) image_hit_areas: Vec<ImageHitArea>,
+    pub(crate) collapsible_hit_areas: Vec<CollapsibleHitArea>,
     pub status: AppStatus,
     pub running_started_at: Option<Instant>,
     pub(crate) viewport: ViewportState,
@@ -655,6 +657,7 @@ impl AppState {
             image_viewer: None,
             image_renderer: ImageRenderState::default(),
             image_hit_areas: Vec::new(),
+            collapsible_hit_areas: Vec::new(),
             status: AppStatus::Idle,
             running_started_at: None,
             app_version,

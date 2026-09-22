@@ -1568,6 +1568,11 @@ pub(crate) fn render_live_messages(
     let visible_height = area.height as usize;
     state.reconcile_message_tracking();
     state.viewport.transcript_area = Some(area);
+    // Cleared unconditionally so a frame that takes the empty-transcript
+    // branch below never leaves a stale hit area pointing at a message
+    // index that no longer exists; the non-empty path further down
+    // overwrites this with the real rebuild.
+    state.collapsible_hit_areas = Vec::new();
 
     if state.transcript.messages.is_empty() {
         state
@@ -1716,6 +1721,14 @@ pub(crate) fn render_live_messages(
             })
         })
         .collect();
+
+    state.collapsible_hit_areas = crate::transcript_hit::collapsible_hit_areas(
+        &state.transcript.messages,
+        |index| state.transcript.render_cache.message_row_range(index),
+        visible_start,
+        visible_height,
+        area,
+    );
 
     frame.render_widget(viewport_paragraph(lines), area);
     let native_previews = state

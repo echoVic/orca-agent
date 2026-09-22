@@ -102,6 +102,7 @@ mod terminal_capabilities;
 mod terminal_presentation;
 mod terminal_session;
 pub mod theme;
+mod transcript_hit;
 mod transcript_search;
 mod transcript_state;
 mod transcript_view;
