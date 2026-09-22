@@ -5740,7 +5740,12 @@ fn render_plan_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Them
 struct ApprovalDialogGeometry {
     popup: Rect,
     shown_diff_lines: usize,
-    diff_truncated: bool,
+    /// Whether a truncation row was counted into `first_option_row`. Can be
+    /// `false` even when the diff itself is truncated, if the height floor
+    /// leaves no room to show the row; the renderer must key off this field,
+    /// not the diff's truncation state, so it never draws a row the geometry
+    /// didn't budget for.
+    truncation_row: bool,
     first_option_row: u16,
 }
 
@@ -5793,7 +5798,7 @@ fn approval_dialog_geometry(area: Rect, dialog: &ApprovalDialog) -> ApprovalDial
     ApprovalDialogGeometry {
         popup,
         shown_diff_lines,
-        diff_truncated,
+        truncation_row: truncation_row > 0,
         first_option_row,
     }
 }
@@ -5865,7 +5870,7 @@ fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog,
                 ),
             ]));
         }
-        if geometry.diff_truncated {
+        if geometry.truncation_row {
             content.push(Line::from(Span::styled(
                 "… preview truncated",
                 theme.dim_style(),
@@ -5913,7 +5918,6 @@ fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog,
             (pick_keys.as_str(), "pick"),
             ("Enter", "confirm"),
             ("Esc", "deny"),
-            ("PgUp/PgDn", "preview"),
         ],
     ));
     // Permission-specific risk titles stay in `ApprovalDialog::title()`; the
@@ -8231,6 +8235,45 @@ mod tests {
                 "click on the drawn row for {needle} must resolve to option {index}: {frame}"
             );
         }
+    }
+
+    #[test]
+    fn approval_hit_test_agrees_with_geometry_at_the_height_floor() {
+        // Whole-branch review I1: at the `approval_region_height` clamp(8,
+        // 18) floor, `available_diff_rows` can bottom out at 0 even though
+        // the diff is truncated. The geometry only counts a truncation row
+        // when `available_diff_rows > 0`, so the renderer must key off the
+        // same condition (`geometry.truncation_row`), not `diff_truncated`
+        // alone — otherwise every option row drifts by one and a click on
+        // "Allow once" resolves to the next option down.
+        let mut state = test_state();
+        let area = Rect::new(0, 0, 80, 8);
+        state.viewport.input_area = Some(area);
+        let diff: String = (0..20).map(|n| format!("+line {n}\n")).collect();
+        state.approval_dialog = Some(ApprovalDialog {
+            id: "1".into(),
+            interaction: None,
+            tool: "bash".into(),
+            target: Some("cargo test -p orca-tui".into()),
+            permission_kind: None,
+            background_task_id: None,
+            selected: 0,
+            options: ApprovalDialog::options_for("bash", Some("cargo test -p orca-tui")),
+            diff: Some(diff),
+        });
+
+        let geometry = approval_dialog_geometry(area, state.approval_dialog.as_ref().unwrap());
+        assert!(
+            !geometry.truncation_row,
+            "no room left for a truncation row at the height floor"
+        );
+
+        assert_eq!(
+            approval_option_hit_index(&state, area.x + 4, geometry.first_option_row),
+            Some(0),
+            "the first option row must map to index 0, not be offset by a \
+             truncation row the renderer wouldn't actually draw"
+        );
     }
 
     #[test]

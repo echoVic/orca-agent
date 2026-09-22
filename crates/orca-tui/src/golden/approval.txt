@@ -25,6 +25,6 @@
 │   3  Allow bash this session  skip approval for this tool until you quit                         │
 │   4  Deny                     ask Orca for another way                                           │
 │                                                                                                  │
-│ ↑↓ move · 1/2/3/4 pick · Enter confirm · Esc deny · PgUp/PgDn preview                            │
+│ ↑↓ move · 1/2/3/4 pick · Enter confirm · Esc deny                                                │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
  ⇧Tab auto-edit      /Users/dev/Documents/GitHub/blade-deepseek       deepseek-flash · max · ? help
