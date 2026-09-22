@@ -57,6 +57,10 @@ para planificación de solo lectura, `/goal` para un objetivo persistente,
 `/workflows` para trabajo en segundo plano y `/trust` para administrar los
 permisos del sandbox de la carpeta actual.
 
+### Usar Orca desde Pilion Browser
+
+[Pilion Browser](https://github.com/echoVic/pilion-browser) es un navegador de escritorio que funciona como cliente ACP. Elige **Orca** en su panel de Agent: Pilion inicia `orca --mode=acp`, reenvía `DEEPSEEK_API_KEY` y expone sus propias pestañas a Orca como herramientas MCP (`browser_snapshot`, `browser_screenshot`, navegar, hacer clic, escribir), con aprobación previa a cada acción y control humano. Los instaladores para macOS, Windows y Linux están en la [página de versiones de Pilion](https://github.com/echoVic/pilion-browser/releases).
+
 ## Funciones principales
 
 - Usa directamente la semántica de razonamiento y herramientas de DeepSeek, con
