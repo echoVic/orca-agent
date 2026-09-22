@@ -1291,6 +1291,12 @@ mod tests {
         let mut state = state_with_transcript();
         state.status = AppStatus::WaitingApproval;
         state.viewport.frame_area = Some(Rect::new(0, 0, 80, 24));
+        // The approval panel now renders in the composer slot, and its hit
+        // test reads `input_area` (not `frame_area`) to match; the panel
+        // fills whatever rect it is given, so a click test can hand it the
+        // same full-frame rect the old centered-modal geometry used to
+        // derive its popup from.
+        state.viewport.input_area = Some(Rect::new(0, 0, 80, 24));
         state.approval_dialog = Some(ApprovalDialog {
             id: "1".to_string(),
             interaction: None,

@@ -39,7 +39,8 @@ use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_state::ChatMessage;
 use crate::transcript_view::{TranscriptRenderContext, viewport_paragraph};
 use crate::types::{
-    AppState, AppStatus, ApprovalOption, ConfigDialog, PanelMode, SessionPickerPhase,
+    AppState, AppStatus, ApprovalDialog, ApprovalOption, ConfigDialog, PanelMode,
+    SessionPickerPhase,
 };
 use crate::user_input_dialog::{UserInputDialog, UserInputDialogMode};
 use crate::workspace_status::{GitIdentity, compact_cwd};
@@ -88,6 +89,11 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
             .as_ref()
             .map(|dialog| user_input_region_height(frame.area().width, dialog))
             .unwrap_or(0),
+        InputRegion::Approval => state
+            .approval_dialog
+            .as_ref()
+            .map(|dialog| approval_region_height(frame.area().width, dialog))
+            .unwrap_or(0),
     }
     .min(frame.area().height.saturating_sub(3));
 
@@ -126,13 +132,11 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     if goal_height > 0 {
         render_goal_banner(frame, chunks[0], state, theme);
     }
-    let compact_conversation_background = state.status == AppStatus::WaitingApproval;
     match state.panel_mode {
         PanelMode::Conversation => render_live_messages(frame, chunks[1], state, theme),
         PanelMode::Workflows => render_workflows_panel(frame, chunks[1], state, theme),
         PanelMode::Agents => render_agents_panel(frame, chunks[1], state, theme),
     }
-    let _ = compact_conversation_background;
     if plan_height > 0 {
         render_plan_panel(frame, chunks[2], state, theme);
     }
@@ -166,6 +170,15 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
                 frame,
                 chunks[6],
                 state.user_input_dialog.as_ref().expect("dialog checked"),
+                theme,
+            );
+        }
+        InputRegion::Approval => {
+            state.viewport.input_area = Some(chunks[6]);
+            render_approval_panel(
+                frame,
+                chunks[6],
+                state.approval_dialog.as_ref().expect("dialog checked"),
                 theme,
             );
         }
@@ -214,10 +227,6 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
             &mut state.image_renderer,
             theme,
         );
-    }
-
-    if state.status == AppStatus::WaitingApproval {
-        render_approval_dialog(frame, state, theme);
     }
 
     if state.status == AppStatus::Idle && state.plan_approval_dialog.is_some() {
@@ -338,11 +347,15 @@ enum InputRegion {
     Hidden,
     Composer,
     Interaction,
+    Approval,
 }
 
 fn input_region(state: &AppState) -> InputRegion {
-    if matches!(state.status, AppStatus::WaitingApproval) || state.plan_approval_dialog.is_some() {
+    if state.plan_approval_dialog.is_some() {
         InputRegion::Hidden
+    } else if matches!(state.status, AppStatus::WaitingApproval) && state.approval_dialog.is_some()
+    {
+        InputRegion::Approval
     } else if state.user_input_dialog.is_some() {
         InputRegion::Interaction
     } else {
@@ -5630,12 +5643,27 @@ struct ApprovalDialogGeometry {
     first_option_row: u16,
 }
 
-fn approval_dialog_geometry(
-    area: Rect,
-    dialog: &crate::types::ApprovalDialog,
-) -> ApprovalDialogGeometry {
-    let width = 72u16.min(area.width.saturating_sub(4));
-    let max_height = area.height.saturating_sub(2);
+/// Mirrors `user_input_region_height`: an upper-bound row budget for the
+/// composer slot so `render()` can size `chunks[6]` before the panel exists.
+/// `approval_dialog_geometry` then lays the actual content out within
+/// whatever height this reserves, truncating further if it must.
+fn approval_region_height(area_width: u16, dialog: &ApprovalDialog) -> u16 {
+    let _ = area_width;
+    let tool_rows = u16::from(dialog.permission_kind.is_some());
+    let target_rows = u16::from(dialog.target.is_some());
+    let diff_line_count = dialog.diff.as_ref().map_or(0, |diff| diff.lines().count());
+    let diff_rows = diff_line_count.min(8) as u16;
+    let truncation_row = u16::from(diff_line_count > 8);
+    let option_rows = dialog.options.len() as u16;
+    (2 + tool_rows + target_rows + diff_rows + truncation_row + 1 + option_rows + 1 + 1)
+        .clamp(8, 18)
+}
+
+fn approval_dialog_geometry(area: Rect, dialog: &ApprovalDialog) -> ApprovalDialogGeometry {
+    // `area` is the composer slot itself now (sized by `approval_region_height`),
+    // not the whole frame, so the popup fills it exactly instead of being
+    // centered and width-capped by `chrome::dialog_rect`.
+    let max_height = area.height;
     // Content rows once laid out: tool (0/1, permission requests only) +
     // target (0/1) + diff + truncation row + a blank separator + one row per
     // option + a trailing blank + the hint row.
@@ -5656,8 +5684,7 @@ fn approval_dialog_geometry(
     let truncation_row = usize::from(diff_truncated && available_diff_rows > 0);
     let shown_diff_lines =
         desired_diff_lines.min(available_diff_rows.saturating_sub(truncation_row));
-    let content_rows = fixed_content_rows + shown_diff_lines as u16 + truncation_row as u16;
-    let popup = crate::chrome::dialog_rect(area, width, content_rows, max_height);
+    let popup = area;
     // Border, then the tool/target header lines, then the bounded diff
     // block, then the blank separator before the first option.
     let first_option_row =
@@ -5673,7 +5700,7 @@ fn approval_dialog_geometry(
 /// Which approval option a click lands on, if any.
 pub(crate) fn approval_option_hit_index(state: &AppState, column: u16, row: u16) -> Option<usize> {
     let dialog = state.approval_dialog.as_ref()?;
-    let area = state.viewport.frame_area?;
+    let area = state.viewport.input_area?;
     let geometry = approval_dialog_geometry(area, dialog);
     let popup = geometry.popup;
     if popup.width < 3 || popup.height < 3 {
@@ -5689,11 +5716,7 @@ pub(crate) fn approval_option_hit_index(state: &AppState, column: u16, row: u16)
     (index < dialog.options.len()).then_some(index)
 }
 
-fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
-    let Some(dialog) = &state.approval_dialog else {
-        return;
-    };
-    let area = frame.area();
+fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog, theme: &Theme) {
     let geometry = approval_dialog_geometry(area, dialog);
     let popup = geometry.popup;
     let inner_width = usize::from(popup.width.saturating_sub(4));
@@ -5789,7 +5812,6 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
             ("PgUp/PgDn", "preview"),
         ],
     ));
-    frame.render_widget(Clear, popup);
     // Permission-specific risk titles stay in `ApprovalDialog::title()`; the
     // ordinary case names the tool being approved instead of a generic label.
     let title = match dialog.permission_kind {
@@ -7726,6 +7748,23 @@ mod tests {
         let mut approval = test_state();
         approval.open_transcript_search();
         approval.set_status(AppStatus::WaitingApproval);
+        // `input_region` now requires both the status *and* the dialog
+        // (mirroring `Interaction`'s `user_input_dialog.is_some()` gate) to
+        // route into the inline `Approval` slot; `status` alone is no longer
+        // enough, matching every real producer of `WaitingApproval`
+        // (`ApprovalNeeded`/`PermissionApprovalNeeded` in state_reducer.rs
+        // always set both together).
+        approval.approval_dialog = Some(ApprovalDialog {
+            id: "1".into(),
+            interaction: None,
+            tool: "bash".into(),
+            target: None,
+            permission_kind: None,
+            background_task_id: None,
+            selected: 0,
+            options: ApprovalDialog::options_for("bash", None),
+            diff: None,
+        });
         let (backend, events) = RecordingBackend::new(50, 12);
         let mut terminal = ratatui::Terminal::new(backend).expect("test backend");
         terminal
@@ -8006,6 +8045,80 @@ mod tests {
         assert!(frame.contains("Network Permission Required"), "{frame}");
         assert!(frame.contains("tool  bash"), "{frame}");
         assert!(!frame.contains("Approve · bash"), "{frame}");
+    }
+
+    fn approval_state() -> AppState {
+        let mut state = test_state();
+        state.push_message(ChatMessage::User("跑一下测试".into()));
+        state.status = AppStatus::WaitingApproval;
+        state.approval_dialog = Some(ApprovalDialog {
+            id: "1".into(),
+            interaction: None,
+            tool: "bash".into(),
+            target: Some("cargo test -p orca-tui".into()),
+            permission_kind: None,
+            background_task_id: None,
+            selected: 0,
+            options: ApprovalDialog::options_for("bash", Some("cargo test -p orca-tui")),
+            diff: None,
+        });
+        state
+    }
+
+    #[test]
+    fn approval_renders_in_the_composer_slot_and_leaves_the_transcript_visible() {
+        let mut state = approval_state();
+        let frame = frame_string(&mut state, 100, 30);
+        // The transcript above the panel still shows the user's message.
+        // `frame_string` reads the TestBackend cell-by-cell, and ratatui
+        // resets a wide glyph's trailing continuation cell to its default
+        // " " symbol (see the same spacing already pinned in
+        // golden/approval.txt), so each double-width han character reads
+        // back with a trailing space.
+        assert!(frame.contains(" ›  跑 一 下 测 试"), "{frame}");
+        // The panel occupies the input region, not a centered modal.
+        let input = state
+            .viewport
+            .input_area
+            .expect("approval occupies the input slot");
+        assert!(input.height >= 8, "{input:?}");
+        let panel_top = frame
+            .lines()
+            .position(|line| line.contains("Approve · bash"))
+            .expect("title");
+        assert_eq!(
+            panel_top as u16, input.y,
+            "panel must start at the input rect: {frame}"
+        );
+        // The status bar is still the last row.
+        assert!(frame.lines().last().unwrap().contains("? help"), "{frame}");
+    }
+
+    #[test]
+    fn approval_hit_test_agrees_with_the_rendered_option_rows() {
+        let mut state = approval_state();
+        let frame = frame_string(&mut state, 100, 30);
+        let input = state.viewport.input_area.expect("input area");
+        for (index, needle) in [
+            "Allow once",
+            "Allow this exact call",
+            "Allow bash this session",
+            "Deny",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = frame
+                .lines()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("option {needle} not drawn: {frame}"))
+                as u16;
+            assert_eq!(
+                approval_option_hit_index(&state, input.x + 4, row),
+                Some(index),
+                "click on the drawn row for {needle} must resolve to option {index}: {frame}"
+            );
+        }
     }
 
     #[test]
@@ -9521,7 +9634,18 @@ mod tests {
             .expect("test backend");
 
         terminal
-            .draw(|frame| render_approval_dialog(frame, &state, &theme))
+            .draw(|frame| {
+                let area = frame.area();
+                render_approval_panel(
+                    frame,
+                    area,
+                    state
+                        .approval_dialog
+                        .as_ref()
+                        .expect("dialog set by ApprovalNeeded"),
+                    &theme,
+                )
+            })
             .expect("draw");
         let rendered = format!("{:?}", terminal.backend().buffer());
 
@@ -10653,13 +10777,18 @@ mod tests {
         }
         state.viewport.auto_scroll = false;
         state.viewport.scroll_offset = 0;
-        state.update(TuiEvent::ApprovalNeeded {
-            key: interaction_key(TuiInteractionKind::Approval, "approval-1"),
-            tool: "bash".to_string(),
-            target: Some("cargo test".to_string()),
-            preview: None,
+        // The approval dialog now renders inline in the composer slot and
+        // sets `input_area` like the composer itself does (the pill then
+        // docks on its top rule, covered by
+        // `jump_to_bottom_pill_sits_on_the_composer_rule_when_scrolled_up`'s
+        // sibling behavior), so it no longer exercises the "no input region
+        // at all" fallback this test pins. `plan_approval_dialog` still
+        // does: it is the one remaining state `input_region` maps to
+        // `InputRegion::Hidden`, leaving `input_area` unset.
+        state.plan_approval_dialog = Some(PlanApprovalDialog {
+            plan: "# Plan\n1. Inspect\n2. Implement".to_string(),
+            selected: 0,
         });
-        assert_eq!(state.status, AppStatus::WaitingApproval);
 
         let theme = Theme::named(ThemeName::Dark);
         let textarea =
@@ -10672,7 +10801,7 @@ mod tests {
 
         assert!(
             state.viewport.input_area.is_none(),
-            "composer should be hidden behind the approval dialog"
+            "composer should be hidden behind the plan approval dialog"
         );
         let pill = state.viewport.jump_to_bottom_area.expect("pill");
         let transcript_area = state.viewport.transcript_area.expect("transcript area");
@@ -13385,6 +13514,22 @@ mod tests {
         );
 
         state.status = AppStatus::WaitingApproval;
+        // `input_region` routes into the inline `Approval` slot only when a
+        // dialog backs the status (matching `Interaction`'s
+        // `user_input_dialog.is_some()` gate); without one it now falls
+        // through to `Composer`, which would show the hardware cursor again
+        // and defeat this test's purpose.
+        state.approval_dialog = Some(ApprovalDialog {
+            id: "1".into(),
+            interaction: None,
+            tool: "bash".into(),
+            target: None,
+            permission_kind: None,
+            background_task_id: None,
+            selected: 0,
+            options: ApprovalDialog::options_for("bash", None),
+            diff: None,
+        });
         terminal
             .draw(|frame| render(frame, &mut state, &textarea, &theme))
             .unwrap();
