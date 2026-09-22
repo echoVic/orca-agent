@@ -9,8 +9,8 @@ use orca_core::config::RunConfig;
 use crate::agent_workspace_actions::handle_agent_workspace_key;
 use crate::composer_image_actions::handle_composer_image_preview_key;
 use crate::composer_input_actions::{
-    apply_composer_key_input, handle_composer_editor_shortcut, insert_composer_newline,
-    recall_next_history, recall_previous_history,
+    apply_composer_key_input, clear_composer_input, handle_composer_editor_shortcut,
+    insert_composer_newline, recall_next_history, recall_previous_history,
 };
 use crate::idle_navigation_actions::handle_idle_navigation_shortcut;
 use crate::idle_submit_actions::handle_idle_submit;
@@ -120,7 +120,11 @@ pub(crate) fn handle_idle_key(
             | IdleShortcut::ExpandToolOutput
             | IdleShortcut::ExpandAll),
         )) => {
+            // A non-empty draft is never silently discarded: Esc clears it
+            // first (same path as Ctrl+U, so undo stays consistent) and only
+            // backtracks once the composer is already empty.
             if shortcut == IdleShortcut::Backtrack && !textarea.is_empty() {
+                clear_composer_input(textarea, state, vim_state, theme);
                 return;
             }
             // `e`/`E` are also vim motions (word-end); deferred to
@@ -305,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_does_not_backtrack_over_a_non_empty_draft() {
+    fn esc_clears_a_non_empty_composer_before_it_can_backtrack() {
         let (action_tx, action_rx) = mpsc::unbounded();
         let mut state = AppState::new(
             action_tx.clone(),
@@ -313,11 +317,12 @@ mod tests {
             "mock".to_string(),
             "/tmp".to_string(),
         );
+        state.status = crate::types::AppStatus::Idle;
         let mut config = test_run_config();
         let shared = Arc::new(Mutex::new(config.clone()));
         let theme = Theme::named(ThemeName::Dark);
         let mut vim = VimState::new(false);
-        let mut textarea = make_textarea_with_text("draft", &vim, &theme);
+        let mut textarea = make_textarea_with_text("half-written prompt", &vim, &theme);
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
 
         handle_idle_key(
@@ -332,8 +337,40 @@ mod tests {
             &theme,
         );
 
-        assert_eq!(textarea_text(&textarea), "draft");
-        assert!(action_rx.try_recv().is_err());
+        assert!(textarea.is_empty(), "Esc clears the draft");
+        assert!(action_rx.try_recv().is_err(), "and does not backtrack");
+    }
+
+    #[test]
+    fn esc_still_backtracks_when_the_composer_is_empty() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = crate::types::AppStatus::Idle;
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        handle_idle_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Backtrack)));
     }
 
     #[test]

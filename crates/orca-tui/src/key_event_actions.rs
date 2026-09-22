@@ -76,13 +76,68 @@ pub(crate) fn handle_transcript_search_key(key: KeyEvent, state: &mut AppState) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{Event, KeyModifiers};
+    use std::sync::{Arc, Mutex};
+    use tui_textarea::TextArea;
 
+    use crate::protocol::{TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
+    use crate::selection::{SelectionPos, TranscriptSelection};
+    use crate::status_key_actions::handle_status_key;
     use crate::test_support::test_run_config;
     use crate::theme::Theme;
     use crate::transcript_state::ChatMessage;
     use crate::transcript_view::TranscriptRenderContext;
     use crate::ui::build_lines_for_messages;
+    use orca_core::cancel::OperationIdAllocator;
+    use orca_runtime::history::SessionTranscript;
+
+    /// Drives a plain Esc through the real two-stage router: preflight
+    /// first, then (only when preflight returns `Unhandled`) the status
+    /// stage — exactly what `RendererInputRouter::route` does for a key
+    /// event, minus the mouse/paste/resize handling this module's tests
+    /// don't need. Used to pin the precedence table documented on
+    /// `handle_key_event_preflight`.
+    #[allow(clippy::too_many_arguments)]
+    fn press_esc(
+        state: &mut AppState,
+        config: &mut RunConfig,
+        action_tx: &mpsc::Sender<UserAction>,
+        textarea: &mut TextArea,
+        vim: &mut VimState,
+        theme: &Theme,
+    ) {
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let flow = handle_key_event_preflight(
+            key,
+            state,
+            config,
+            action_tx,
+            vim,
+            !textarea.is_empty(),
+            || Ok(()),
+        )
+        .unwrap();
+        if !matches!(flow, KeyEventFlow::Unhandled) {
+            return;
+        }
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let preloaded: Arc<Mutex<Option<SessionTranscript>>> = Arc::new(Mutex::new(None));
+        handle_status_key(
+            &Event::Key(key),
+            &key,
+            state,
+            config,
+            &shared_config,
+            action_tx,
+            &preloaded,
+            textarea,
+            vim,
+            theme,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+    }
 
     fn state_with_search_matches() -> AppState {
         let (tx, _rx) = mpsc::unbounded();
@@ -754,8 +809,340 @@ mod tests {
             &orca_core::conversation::ConversationTarget::Main
         );
     }
+
+    /// Carried finding: a tool/permission approval reaching a *focused*
+    /// child (the child's own turn asked for one while the user is watching
+    /// it — reachable via `HostedChildFocus`'s `child_interaction_capabilities`,
+    /// which registers `ToolApproval`/`PermissionRequest` interactions on the
+    /// active child attachment; see `hosted_child.rs`) used to be shadowed:
+    /// the focused-child branch above claimed Esc before `handle_status_key`
+    /// ever saw `AppStatus::WaitingApproval`, so denying was impossible
+    /// without first losing the child focus. The approval is what is on
+    /// screen asking for a decision, so it must win.
+    #[test]
+    fn esc_prefers_a_pending_approval_over_returning_to_a_focused_parent() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.update(crate::protocol::TuiEvent::ChildFocusChanged {
+            task_id: Some("child".to_string()),
+        });
+        state.update(crate::protocol::TuiEvent::ApprovalNeeded {
+            key: TuiInteractionKey::new(
+                OperationIdAllocator::new().allocate(),
+                "req-1",
+                TuiInteractionKind::Approval,
+            ),
+            tool: "bash".to_string(),
+            target: None,
+            preview: None,
+        });
+        assert!(
+            state.conversation_target().task_id().is_some(),
+            "test setup: still focused on the child"
+        );
+        assert_eq!(
+            state.status,
+            AppStatus::WaitingApproval,
+            "test setup: an approval is pending"
+        );
+        let mut config = test_run_config();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(
+            matches!(
+                action_rx.try_recv(),
+                Ok(UserAction::RespondToInteraction {
+                    response: TuiInteractionResponse::Approval(false),
+                    ..
+                })
+            ),
+            "the on-screen approval wins and Esc denies it"
+        );
+        assert!(
+            action_rx.try_recv().is_err(),
+            "ReturnToParentThread must not also fire"
+        );
+        assert_eq!(
+            state.conversation_target().task_id(),
+            Some("child"),
+            "denying the approval does not itself navigate away"
+        );
+    }
+
+    // The remaining table rows not already pinned elsewhere in this module
+    // (the tasks dock, a task-transcript checkpoint, and the Workflows/
+    // Agents panel close all have dedicated coverage above). Each case here
+    // sets up its row's trigger plus the next lower-priority trigger and
+    // asserts only the higher one fired.
+
+    #[test]
+    fn esc_precedence_help_overlay_closes_before_it_can_clear_a_selection() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.show_shortcuts = true;
+        state.viewport.selection =
+            Some(TranscriptSelection::begin(SelectionPos { row: 0, col: 0 }));
+        let mut config = test_run_config();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(!state.show_shortcuts, "the help overlay closes");
+        assert!(
+            state.viewport.selection.is_some(),
+            "the selection underneath is untouched by this Esc"
+        );
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn esc_precedence_selection_clears_before_it_can_backtrack() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = AppStatus::Idle;
+        state.viewport.selection =
+            Some(TranscriptSelection::begin(SelectionPos { row: 0, col: 0 }));
+        let mut config = test_run_config();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(state.viewport.selection.is_none(), "the selection clears");
+        assert!(
+            action_rx.try_recv().is_err(),
+            "Idle's empty-composer backtrack must not also fire"
+        );
+    }
+
+    #[test]
+    fn esc_precedence_denies_a_pending_approval() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.update(crate::protocol::TuiEvent::ApprovalNeeded {
+            key: TuiInteractionKey::new(
+                OperationIdAllocator::new().allocate(),
+                "req-1",
+                TuiInteractionKind::Approval,
+            ),
+            tool: "bash".to_string(),
+            target: None,
+            preview: None,
+        });
+        assert_eq!(state.status, AppStatus::WaitingApproval, "test setup");
+        let mut config = test_run_config();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(
+            matches!(
+                action_rx.try_recv(),
+                Ok(UserAction::RespondToInteraction {
+                    response: TuiInteractionResponse::Approval(false),
+                    ..
+                })
+            ),
+            "Esc denies the pending approval"
+        );
+        assert!(state.approval_dialog.is_none());
+    }
+
+    #[test]
+    fn esc_precedence_interrupts_a_running_turn() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = AppStatus::Running;
+        let mut config = test_run_config();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+    }
+
+    #[test]
+    fn esc_precedence_clears_a_non_empty_composer_through_the_full_router() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = AppStatus::Idle;
+        let mut config = test_run_config();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea =
+            crate::composer_textarea::make_textarea_with_text("half-written prompt", &vim, &theme);
+
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(textarea.is_empty(), "the draft clears");
+        assert!(action_rx.try_recv().is_err(), "and does not backtrack");
+    }
+
+    #[test]
+    fn esc_precedence_backtracks_when_idle_and_the_composer_is_empty() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = AppStatus::Idle;
+        let mut config = test_run_config();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Backtrack)));
+    }
 }
 
+/// # Esc precedence
+///
+/// Esc is resolved by a two-stage pipeline: this function (preflight) runs
+/// first, and only when it returns [`KeyEventFlow::Unhandled`] does
+/// `status_key_actions::handle_status_key` (status) get a turn. Whichever
+/// branch matches first — in either stage — wins, consumes the keypress, and
+/// is the *only* effect that runs; nothing lower ever also fires for the
+/// same keypress. **A new Esc meaning is a new row in this table, in the
+/// stack below, not a new branch dropped in wherever seems convenient.**
+///
+/// At the level the spec asks for, Esc has five cases:
+///
+///   1. something is open on top of the conversation -> close only the
+///      topmost one
+///   2. the turn is Running or Compacting             -> interrupt it
+///   3. Idle, and the composer has a draft             -> clear the draft
+///   4. Idle, and the composer is empty                -> backtrack
+///   5. the session picker is open                     -> return to the
+///      conversation
+///
+/// Case 1's "topmost" is itself an ordered stack spanning both stages. In
+/// source order:
+///
+/// Preflight (this function):
+///   1. the image viewer (`composer_image_actions::handle_image_viewer_key`)
+///   2. full-access confirmation pending (deferred to status)
+///   3. a focused child thread -> `ReturnToParentThread`, UNLESS a tool or
+///      permission approval is pending (`AppStatus::WaitingApproval`) — the
+///      approval is what is on screen asking for a decision, so it gets Esc
+///      before navigation does. Without this carve-out the branch below
+///      would claim Esc first and the approval's deny (case 14) would never
+///      run; see `esc_prefers_a_pending_approval_over_returning_to_a_focused_parent`.
+///   4. plan approval / config dialog / user-input dialog pending (each
+///      deferred to status)
+///   5. transcript search open
+///   6. the shortcuts help overlay (`show_shortcuts`)
+///   7. an active transcript selection
+///   8. a task-transcript checkpoint view (Agents panel)
+///   9. the tasks dock, if visible (`tasks_dock_visible()`)
+///   10. the Workflows/Agents panel
+///
+/// Status (`handle_status_key`, only once preflight returns `Unhandled`):
+///   11. setup / session-picker phases (case 5: returns to the conversation)
+///   12. full-access confirmation
+///   13. a pending approval (`WaitingApproval`) -> Esc denies (see case 3
+///       above for why a focused child does not shadow this)
+///   14. plan approval
+///   15. the recovery prompt
+///   16. the config dialog
+///   17. the questionnaire (user-input dialog) -> backs out one step at a
+///       time
+///   18. the mention popup / slash menu (inside Idle handling)
+///   19. Idle: case 3 (clear a non-empty draft) or case 4 (backtrack)
+///   20. Running/Compacting: case 2 (interrupt)
 pub(crate) fn handle_key_event_preflight<F>(
     key: KeyEvent,
     state: &mut AppState,
@@ -782,10 +1169,17 @@ where
         return Ok(KeyEventFlow::Unhandled);
     }
 
-    // A focused child owns Esc as the return-to-parent action. Handle it before
-    // the global cancel binding so returning does not interrupt the child turn.
+    // A focused child owns Esc as the return-to-parent action, UNLESS a
+    // tool/permission approval is pending (`AppStatus::WaitingApproval`):
+    // that dialog is what is on screen asking for a decision, so it must
+    // get Esc before navigation does (see the precedence table above).
+    // Standing aside here lets the key fall through to `Unhandled`, where
+    // `handle_status_key`'s `WaitingApproval` arm denies it. Otherwise,
+    // handle it before the global cancel binding so returning does not
+    // interrupt the child turn.
     if key.code == KeyCode::Esc
         && key.modifiers.is_empty()
+        && state.status != AppStatus::WaitingApproval
         && state.conversation_target().task_id().is_some()
     {
         vim_state.cancel_pending_command();

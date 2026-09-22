@@ -644,7 +644,21 @@ pub(crate) fn handle_mouse_event(
             // already clipped to the transcript area by `render_live_messages`,
             // so a click outside it (or outside `PanelMode::Conversation`
             // entirely) can never resolve to a message here.
+            //
+            // Same guard as the image hit-area click below. The shortcuts
+            // overlay and the plan-approval dialog draw on top of a
+            // still-rendered transcript instead of replacing it (both use a
+            // floating `Clear`-then-redraw popup over `frame.area()`), so
+            // the hit areas underneath stay live unless a click is
+            // explicitly barred from reaching them. `WaitingApproval`
+            // doesn't share that rendering quirk — `render_approval_panel`
+            // replaces the composer chunk, not the transcript — but is
+            // barred too, matching the image click's existing precedent of
+            // deferring every click to a pending decision.
             if count == 1
+                && !state.show_shortcuts
+                && state.plan_approval_dialog.is_none()
+                && state.status != AppStatus::WaitingApproval
                 && state.panel_mode == PanelMode::Conversation
                 && let Some(area) = state
                     .collapsible_hit_areas
@@ -948,6 +962,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_click_while_the_shortcuts_overlay_is_open_does_not_toggle_a_collapsible_row_underneath() {
+        // `render_shortcuts` (ui.rs) draws the help overlay on top of a
+        // still-rendered transcript, so `collapsible_hit_areas` stays
+        // populated underneath it. The overlay owns the click, same as it
+        // already owns Esc (`key_event_actions.rs`'s `show_shortcuts` guard).
+        let mut state = test_state();
+        state.push_message(tool_call(
+            "bash",
+            Some("a"),
+            "completed",
+            Some("l1\nl2\nl3\nl4"),
+            false,
+        ));
+        render_once(&mut state, 100, 30);
+        let area = state.collapsible_hit_areas[0];
+        state.show_shortcuts = true;
+
+        click_at(&mut state, area.rect.x + 2, area.rect.y);
+
+        assert!(
+            matches!(
+                &state.transcript.messages[0],
+                ChatMessage::ToolCall {
+                    expanded: false,
+                    ..
+                }
+            ),
+            "the shortcuts overlay must own the click, not the row underneath it"
+        );
+        assert!(state.show_shortcuts, "the overlay itself stays open");
     }
 
     #[test]
