@@ -1096,8 +1096,8 @@ mod tests {
 /// `status_key_actions::handle_status_key` (status) get a turn. Whichever
 /// branch matches first — in either stage — wins, consumes the keypress, and
 /// is the *only* effect that runs; nothing lower ever also fires for the
-/// same keypress. **A new Esc meaning is a new row in this table, in the
-/// stack below, not a new branch dropped in wherever seems convenient.**
+/// same keypress. **A new Esc meaning is a new row in the stack below, not
+/// a new branch dropped in wherever seems convenient.**
 ///
 /// At the level the spec asks for, Esc has five cases:
 ///
