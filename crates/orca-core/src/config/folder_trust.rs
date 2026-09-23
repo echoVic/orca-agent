@@ -167,13 +167,6 @@ fn save_path(path: &Path, store: &TrustFile) -> Result<(), String> {
         .map_err(|error| format!("replacing {}: {error}", path.display()))
 }
 
-fn save(store: &TrustFile) -> Result<(), String> {
-    let Some(path) = trust_file_path() else {
-        return Err("no config directory available for folder trust".to_string());
-    };
-    save_path(&path, store)
-}
-
 /// Look up the trust level for `path`, treating any ancestor trust decision as
 /// applying to descendants. Returns `None` when no decision has been recorded.
 pub fn trust_level(path: &Path) -> Option<TrustLevel> {
