@@ -124,7 +124,7 @@ fn tui_cancel_returns_to_idle_through_the_runtime_surface() {
     receive_until(
         &process,
         &mut output,
-        "running 0s",
+        "Running 0s",
         Duration::from_secs(20),
         "TUI did not render the active turn before cancellation",
     );
@@ -165,7 +165,7 @@ fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
         "parent did not expose the running detached child",
     );
 
-    process.write(b"/tasks\r").expect("open Tasks workspace");
+    process.write(b"/agents\r").expect("open Tasks workspace");
     assert_screen_shows(
         &process,
         &mut output,
@@ -286,7 +286,7 @@ fn tui_bracketed_image_path_paste_materializes_an_atomic_attachment() {
     receive_until(
         &process,
         &mut output,
-        "running 0s",
+        "Running 0s",
         Duration::from_secs(20),
         "TUI did not render the active turn before image paste",
     );
@@ -368,7 +368,7 @@ fn tui_side_conversation_is_separate_disposable_and_returns_to_parent() {
     receive_until(
         &process,
         &mut output,
-        "Ctrl+/ to switch",
+        "Ctrl+/ back",
         Duration::from_secs(5),
         "TUI did not open Side",
     );
@@ -392,7 +392,7 @@ fn tui_side_conversation_is_separate_disposable_and_returns_to_parent() {
     receive_until_after(
         &process,
         &mut output,
-        "Main · Side available",
+        "Side · Ctrl+/",
         parent_toggle_start,
         Duration::from_secs(5),
         "TUI did not restore the parent while retaining Side",
@@ -422,7 +422,7 @@ fn tui_side_conversation_is_separate_disposable_and_returns_to_parent() {
     receive_until_after(
         &process,
         &mut output,
-        "Side from",
+        "Ctrl+/ back",
         side_toggle_start,
         Duration::from_secs(5),
         "TUI did not reactivate Side",
@@ -484,7 +484,7 @@ fn tui_side_toggle_keeps_transcripts_visible_without_resubmitting() {
     receive_until(
         &process,
         &mut output,
-        "Ctrl+/ to switch",
+        "Ctrl+/ back",
         Duration::from_secs(5),
         "TUI did not open Side",
     );
@@ -504,28 +504,27 @@ fn tui_side_toggle_keeps_transcripts_visible_without_resubmitting() {
     process
         .write(b"\x1b[47;5u")
         .expect("return to parent with Ctrl+/");
-    receive_until(
+    // The mode chip shows only on the parent's status line.
+    assert_screen_shows(
         &process,
         &mut output,
-        "Main · Side available",
-        Duration::from_secs(5),
+        "⇧Tab auto-edit Side · Ctrl+/",
         "TUI did not restore the parent status line",
     );
     assert_screen_shows(
         &process,
         &mut output,
-        "> main pty seed",
+        "›  main pty seed",
         "parent transcript went blank after toggling back without resubmitting",
     );
 
     // Toggle to Side again. Its inherited echo must remain on the reconstructed
     // screen after the switch, again without submitting.
     process.write(b"\x1b[47;5u").expect("return to Side");
-    receive_until(
+    assert_screen_shows(
         &process,
         &mut output,
-        "Side from",
-        Duration::from_secs(5),
+        "Ctrl+/ back",
         "TUI did not reactivate the Side status line",
     );
     assert_screen_shows(
