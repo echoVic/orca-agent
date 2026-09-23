@@ -156,6 +156,13 @@ fn wrap_line_hanging(line: &Line<'_>, width: u16) -> CompactWrappedLine {
     wrap_line(line, width, hanging_indent(line, width))
 }
 
+/// Rows `line` takes once the transcript wraps it at `width`, for a renderer
+/// that must choose a message's layout before the cache wraps it.
+pub(crate) fn wrapped_row_count(line: &Line<'_>, width: usize) -> usize {
+    let width = u16::try_from(width).unwrap_or(u16::MAX);
+    wrap_line_hanging(line, width).row_count()
+}
+
 fn wrap_line(line: &Line<'_>, width: u16, continuation_indent: u16) -> CompactWrappedLine {
     let mut wrapped = CompactWrappedLine::new(line.alignment);
     if width == 0 {

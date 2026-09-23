@@ -26,13 +26,15 @@ pub(crate) struct CollapsibleHitArea {
 /// all call this too, so the `e` key, `Shift+E`, and a mouse click never
 /// disagree about what counts as collapsible.
 ///
-/// `ChatMessage::System` only counts past two lines: a one- or two-line
-/// notice already renders in full, so it must not gain a `└ +N lines` tail
-/// row or a hit area that would toggle nothing visible.
-pub(crate) fn is_collapsible(message: &ChatMessage) -> bool {
+/// `ChatMessage::System` only counts past two rows at `width`, the width the
+/// transcript draws at: a notice of one or two rows already renders in full,
+/// so it must not gain a `└ +N lines` tail row or a hit area that would
+/// toggle nothing visible. Rows, not lines — a single long line such as the
+/// sandbox warning wraps into several.
+pub(crate) fn is_collapsible(message: &ChatMessage, width: usize) -> bool {
     match message {
         ChatMessage::ToolCall { .. } | ChatMessage::Reasoning { .. } => true,
-        ChatMessage::System { text, .. } => text.lines().count() > 2,
+        ChatMessage::System { text, .. } => crate::ui::system_notice_rows(text, width) > 2,
         _ => false,
     }
 }
@@ -77,7 +79,7 @@ pub(crate) fn collapsible_hit_areas(
         .iter()
         .enumerate()
         .filter_map(|(message_index, message)| {
-            if !is_collapsible(message) {
+            if !is_collapsible(message, usize::from(area.width)) {
                 return None;
             }
             let range = row_range_for(message_index)?;
@@ -188,5 +190,30 @@ mod tests {
             "a one- or two-line notice has nothing to expand: {areas:?}"
         );
         assert_eq!(areas[0].message_index, 2);
+    }
+
+    #[test]
+    fn a_one_line_notice_is_collapsible_only_where_it_wraps_past_two_rows() {
+        let one_line = ChatMessage::System {
+            text: "word ".repeat(40),
+            expanded: false,
+        };
+        assert!(is_collapsible(&one_line, 60), "five rows at 60 columns");
+        assert!(!is_collapsible(&one_line, 400), "a single row at 400");
+
+        let three_lines = ChatMessage::System {
+            text: "one\ntwo\nthree".into(),
+            expanded: false,
+        };
+        assert!(is_collapsible(&three_lines, 400), "three rows at any width");
+
+        let areas = collapsible_hit_areas(
+            std::slice::from_ref(&one_line),
+            |_| Some(0..2),
+            0,
+            4,
+            Rect::new(0, 0, 60, 4),
+        );
+        assert_eq!(areas.len(), 1, "the hit area follows the drawn width");
     }
 }

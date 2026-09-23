@@ -3443,7 +3443,7 @@ fn append_message_lines(
             append_diagnostic_lines(lines, diagnostic, theme);
         }
         ChatMessage::System { text, expanded } => {
-            append_system_lines(lines, text, *expanded, force_expand, theme);
+            append_system_lines(lines, text, *expanded, force_expand, width, theme);
         }
     }
 }
@@ -3558,37 +3558,40 @@ fn append_reasoning_lines(
     }
 }
 
-/// A system notice always shows its first line; a notice of three or more
-/// lines collapses the rest behind a tail row, matching
-/// `append_tool_output_lines`'s `└ ` convention, unless `expanded` or
-/// `force_expand` (the scrollback flush path, which must commit every line)
-/// says otherwise. A one- or two-line notice has no affordance to collapse —
-/// `transcript_hit::is_collapsible` draws the same line, so the two never
-/// disagree about whether this notice is worth a hit area.
+/// A system notice collapses to its first row plus a tail row, matching
+/// `append_tool_output_lines`'s `└ ` convention, once it takes more than two
+/// rows at `width` — counted after wrapping, so a single long line such as the
+/// sandbox warning folds too — unless `expanded` or `force_expand` (the
+/// scrollback flush path, which must commit every line) says otherwise. A
+/// notice of one or two rows has no affordance: `transcript_hit::is_collapsible`
+/// asks `system_notice_rows` the same question, so the two never disagree
+/// about whether a notice is worth a hit area.
 fn append_system_lines(
     lines: &mut Vec<Line<'static>>,
     text: &str,
     expanded: bool,
     force_expand: bool,
+    width: usize,
     theme: &Theme,
 ) {
-    let total = text.lines().count();
-    let mut rows = text.lines();
-    let first = rows.next().unwrap_or_default();
-    lines.push(Line::from(vec![
-        Span::raw(GUTTER_CONTINUATION),
-        Span::styled(format!("ℹ {first}"), theme.muted_style()),
-    ]));
-    if total <= 2 || expanded || force_expand {
-        for row in rows {
-            lines.push(Line::from(Span::styled(
-                format!("      {row}"),
-                theme.muted_style(),
-            )));
-        }
+    let notice = system_notice_lines(text, theme.muted_style());
+    let rows = notice_rows(&notice, width);
+    if rows <= 2 || expanded || force_expand {
+        lines.extend(notice);
         return;
     }
-    let hidden = total.saturating_sub(1);
+    let first = text.lines().next().unwrap_or_default();
+    // `    ℹ ` takes six columns; the rest of the row holds the first line, cut
+    // so the collapsed row never wraps into a second one.
+    let budget = width.saturating_sub(GUTTER_WIDTH + 2);
+    lines.push(Line::from(vec![
+        Span::raw(GUTTER_CONTINUATION),
+        Span::styled(
+            format!("ℹ {}", truncate_to_display_width(first, budget)),
+            theme.muted_style(),
+        ),
+    ]));
+    let hidden = rows - 1;
     lines.push(Line::from(vec![
         Span::styled("    └ ".to_string(), theme.dim_style()),
         Span::styled(
@@ -3596,6 +3599,32 @@ fn append_system_lines(
             theme.muted_style(),
         ),
     ]));
+}
+
+/// Every line of a notice as drawn in full: `ℹ` opens the first, the rest
+/// hang six columns in, under its text.
+fn system_notice_lines(text: &str, style: Style) -> Vec<Line<'static>> {
+    let mut rows = text.lines();
+    let first = rows.next().unwrap_or_default();
+    let mut lines = vec![Line::from(vec![
+        Span::raw(GUTTER_CONTINUATION),
+        Span::styled(format!("ℹ {first}"), style),
+    ])];
+    lines.extend(rows.map(|row| Line::from(Span::styled(format!("      {row}"), style))));
+    lines
+}
+
+fn notice_rows(lines: &[Line<'_>], width: usize) -> usize {
+    lines
+        .iter()
+        .map(|line| crate::transcript_view::wrapped_row_count(line, width))
+        .sum()
+}
+
+/// Rows a notice takes in full once the transcript wraps it at `width`: what
+/// decides whether it collapses, for the renderer and the hit test alike.
+pub(crate) fn system_notice_rows(text: &str, width: usize) -> usize {
+    notice_rows(&system_notice_lines(text, Style::default()), width)
 }
 
 fn plan_panel_height(state: &AppState) -> u16 {
@@ -8819,6 +8848,78 @@ mod tests {
             },
         );
         assert_eq!(two.len(), 2, "two lines fit without collapsing: {two:?}");
+    }
+
+    /// Shaped like the sandbox warning: one logical line that only becomes
+    /// several rows once the transcript wraps it.
+    const ONE_LINE_NOTICE: &str = "Shell unavailable under the current restricted policy: no OS-enforced sandbox backend on this host: seatbelt probe terminated by signal 6 at /usr/bin/sandbox-exec (backend=seatbelt). Dedicated file tools remain available.";
+
+    #[test]
+    fn a_one_line_notice_that_wraps_past_two_rows_collapses_to_one_row() {
+        let theme = Theme::named(ThemeName::Dark);
+        let notice = |expanded| ChatMessage::System {
+            text: ONE_LINE_NOTICE.into(),
+            expanded,
+        };
+        let rows = system_notice_rows(ONE_LINE_NOTICE, 60);
+        assert!(
+            rows > 2,
+            "the fixture wraps past two rows at 60 columns: {rows}"
+        );
+
+        let collapsed = lines_text(&build_lines_for_message_after(
+            None,
+            &notice(false),
+            &theme,
+            60,
+            0,
+            false,
+            None,
+        ));
+        assert_eq!(collapsed.len(), 2, "{collapsed:?}");
+        assert!(
+            collapsed[0].starts_with("    ℹ Shell unavailable") && collapsed[0].ends_with('…'),
+            "{collapsed:?}"
+        );
+        assert!(
+            UnicodeWidthStr::width(collapsed[0].as_str()) <= 60,
+            "the collapsed row must not wrap itself: {collapsed:?}"
+        );
+        assert_eq!(
+            collapsed[1],
+            format!("    └ +{} lines · click or e to expand", rows - 1)
+        );
+
+        let expanded = lines_text(&build_lines_for_message_after(
+            None,
+            &notice(true),
+            &theme,
+            60,
+            0,
+            false,
+            None,
+        ));
+        assert_eq!(expanded, vec![format!("    ℹ {ONE_LINE_NOTICE}")]);
+    }
+
+    #[test]
+    fn a_one_line_notice_that_fits_in_two_rows_renders_in_full() {
+        let theme = Theme::named(ThemeName::Dark);
+        assert!(system_notice_rows(ONE_LINE_NOTICE, 400) <= 2);
+
+        let lines = lines_text(&build_lines_for_message_after(
+            None,
+            &ChatMessage::System {
+                text: ONE_LINE_NOTICE.into(),
+                expanded: false,
+            },
+            &theme,
+            400,
+            0,
+            false,
+            None,
+        ));
+        assert_eq!(lines, vec![format!("    ℹ {ONE_LINE_NOTICE}")]);
     }
 
     #[test]

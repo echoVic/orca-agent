@@ -2681,6 +2681,32 @@ fn toggle_all_expandable_returns_false_when_nothing_is_collapsible() {
     assert!(!state.toggle_all_expandable());
 }
 
+// A notice written as one long line only becomes several rows once the
+// transcript wraps it, so whether `e` can expand it follows the width the
+// transcript last drew at — the width that decided whether the renderer drew
+// its `└ +N lines` row.
+#[test]
+fn e_expands_a_one_line_notice_only_where_the_transcript_wraps_it() {
+    let mut state = state();
+    state.push_message(ChatMessage::System {
+        text: "word ".repeat(40),
+        expanded: false,
+    });
+
+    state.viewport.transcript_area = Some(ratatui::layout::Rect::new(0, 0, 400, 20));
+    assert!(
+        !state.toggle_latest_expandable(),
+        "one row at 400 columns has nothing to expand"
+    );
+
+    state.viewport.transcript_area = Some(ratatui::layout::Rect::new(0, 0, 60, 20));
+    assert!(state.toggle_latest_expandable());
+    assert!(matches!(
+        &state.transcript.messages[0],
+        ChatMessage::System { expanded: true, .. }
+    ));
+}
+
 // A long system notice (more than two lines) is collapsible through the same
 // `transcript_hit::is_collapsible` predicate as a tool call or a reasoning
 // block, so it must flip through all three entry points: the `e` key

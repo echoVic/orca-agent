@@ -1344,6 +1344,15 @@ impl AppState {
         }
     }
 
+    /// The width the transcript last drew at. Whether a long notice collapses
+    /// depends on how many rows it wraps into, so the toggles must ask at the
+    /// width the renderer used. Before the first frame nothing has wrapped.
+    fn transcript_width(&self) -> usize {
+        self.viewport
+            .transcript_area
+            .map_or(usize::MAX, |area| usize::from(area.width.max(1)))
+    }
+
     pub fn toggle_latest_expandable(&mut self) -> bool {
         // Only the live pane is mutable and re-renderable. Anything below `flushed_count`
         // has been committed to the terminal's immutable scrollback (in fully-expanded
@@ -1352,9 +1361,10 @@ impl AppState {
             .transcript
             .flushed_count
             .min(self.transcript.messages.len());
+        let width = self.transcript_width();
         let Some(index) = self.transcript.messages[live_start..]
             .iter()
-            .rposition(is_collapsible)
+            .rposition(|message| is_collapsible(message, width))
         else {
             return false;
         };
@@ -1385,7 +1395,7 @@ impl AppState {
         let Some(message) = self.transcript.messages.get(index) else {
             return false;
         };
-        if !is_collapsible(message) {
+        if !is_collapsible(message, self.transcript_width()) {
             return false;
         }
         self.mutate_message(index, |message| match message {
@@ -1416,10 +1426,11 @@ impl AppState {
             .transcript
             .flushed_count
             .min(self.transcript.messages.len());
+        let width = self.transcript_width();
         let collapsible_indices: Vec<usize> = self.transcript.messages[live_start..]
             .iter()
             .enumerate()
-            .filter(|(_, message)| is_collapsible(message))
+            .filter(|(_, message)| is_collapsible(message, width))
             .map(|(offset, _)| live_start + offset)
             .collect();
         if collapsible_indices.is_empty() {
