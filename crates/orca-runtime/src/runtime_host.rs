@@ -8489,11 +8489,27 @@ fn reconcile_main_session_task_mirrors_on_start(
     }
 }
 
+/// Whether this thread's surface is the one its task registry's session
+/// belongs to. An agent's child thread shares its parent's registry, whose
+/// main-session tasks are the parent's turns: the child has nothing of its own
+/// to import from them, and the commit authority refuses the attempt, which
+/// used to fail the child's start once the parent had finished a turn.
+fn owns_task_registry_session(
+    task_registry: &TaskRegistry,
+    coordinator: &surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+) -> bool {
+    let thread_id = &coordinator.state().snapshot().thread.thread_id;
+    task_registry.session_id() == uuid::Uuid::from_bytes(*thread_id.as_bytes()).to_string()
+}
+
 fn reconcile_legacy_terminal_main_session_tasks_on_start(
     thread: &RuntimeThread,
     coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
 ) -> Result<(), RuntimeHostError> {
     let task_registry = thread.session().task_registry();
+    if !owns_task_registry_session(task_registry, coordinator) {
+        return Ok(());
+    }
     let reconciliation = task_registry
         .with_terminal_main_session_reconciliation(|receipt| {
             let snapshot = coordinator.state().snapshot().clone();
@@ -8573,6 +8589,9 @@ fn adopt_legacy_active_main_session_tasks_on_start(
     host_incarnation: &surface::HostIncarnation,
 ) -> Result<(), RuntimeHostError> {
     let task_registry = thread.session().task_registry();
+    if !owns_task_registry_session(task_registry, coordinator) {
+        return Ok(());
+    }
     let adoption = task_registry
         .with_active_main_session_adoption(|receipt| {
             let snapshot = coordinator.state().snapshot().clone();

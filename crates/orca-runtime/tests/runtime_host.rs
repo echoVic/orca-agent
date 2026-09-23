@@ -1564,6 +1564,85 @@ fn parent_waits_for_async_agent_while_child_thread_remains_addressable() {
     host.shutdown().expect("shutdown runtime host");
 }
 
+#[test]
+fn an_agent_launched_after_a_finished_turn_starts_its_child_thread() {
+    let cwd = tempfile::tempdir().unwrap();
+    let release_marker = cwd.path().join("release-async-agent");
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.approval_mode = ApprovalMode::FullAuto;
+    let host = RuntimeHost::start().expect("start runtime host");
+    let host_handle = host.handle();
+    let thread = host
+        .start_thread(config, "agent after a finished turn")
+        .expect("start runtime thread");
+    // A finished user turn leaves a completed main-session task in the
+    // session's registry, which the agent's child thread shares.
+    let first = thread
+        .start_turn(
+            HostedTurnRequest::new("mock_usage").with_task_description("first turn"),
+            io::sink(),
+        )
+        .expect("start the first turn");
+    assert_eq!(
+        first
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("first turn terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+
+    // A queued prompt or a background-agent wake starts its turn without a
+    // surface operation, so its async agent runs on a child thread.
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::new(format!(
+                "subagent async mock_stream_release_marker {}",
+                release_marker.display()
+            )),
+            io::sink(),
+        )
+        .expect("start the agent turn");
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        let failed = thread
+            .task_registry()
+            .list()
+            .into_iter()
+            .find(|task| task.status == TaskStatus::Failed);
+        assert!(
+            failed.is_none(),
+            "the agent failed to start: {:?}",
+            failed.and_then(|task| thread.task_registry().get(&task.id)?.error)
+        );
+        if host_handle
+            .agent_registry_snapshot(thread.thread_id())
+            .agents
+            .iter()
+            .any(|agent| !agent.thread_id.is_empty())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent never published its child thread"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(&release_marker, b"release").expect("release the agent");
+    assert_eq!(
+        operation
+            .wait_timeout(if cfg!(windows) {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_secs(10)
+            })
+            .expect("agent turn terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    host.shutdown().expect("shutdown runtime host");
+}
+
 #[cfg(unix)]
 #[test]
 fn foreground_interrupt_does_not_stop_registered_async_subagent_worker() {
