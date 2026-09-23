@@ -209,6 +209,53 @@ fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
 }
 
 #[test]
+fn tui_shows_a_background_agents_progress_while_the_parent_turn_waits_on_it() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n")
+        .expect("configure full-auto mode");
+    let release_marker = cwd.path().join("release-background-agent");
+    let mut process = PtyProcess::spawn_with_prompt(
+        home.path(),
+        cwd.path(),
+        &format!(
+            "subagent async mock_stream_release_marker {}",
+            release_marker.display()
+        ),
+    )
+    .expect("spawn background-agent TUI in PTY");
+    let mut output = Vec::new();
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "Agents 1 active",
+        "parent did not expose the running background agent",
+    );
+    // The agent is parked on its marker and the parent turn waits for it, so
+    // its progress can only arrive through the relay poll of a running turn,
+    // which used to be starved until the turn ended.
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "phase: Thinking",
+        "the background agent's progress did not reach the screen while the parent turn ran",
+    );
+
+    std::fs::write(&release_marker, b"release").expect("release background agent");
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "Agent completed",
+        "the background agent's completion did not reach the screen",
+    );
+
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
 fn tui_escape_cancels_a_running_subagent_and_keeps_the_parent_usable() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");

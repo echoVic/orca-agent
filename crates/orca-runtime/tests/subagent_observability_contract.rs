@@ -111,12 +111,53 @@ fn detached_relays_are_woken_in_idle_and_active_actor_states() {
     // active branch leaves a durable relay stranded as soon as the parent
     // generation returns, which is exactly when an async child is most likely
     // to continue producing events.
-    let poll_arm = "_ = tokio::time::sleep(SUBAGENT_RELAY_POLL_INTERVAL) =>";
+    let poll_arm = "_ = subagent_relay_poll.tick() =>";
     let poll_count = RUNTIME_HOST.matches(poll_arm).count();
     assert!(
         poll_count >= 2,
         "relay polling must be present in both idle and active select! branches; found {poll_count} arm(s)"
     );
+    // The poll keeps its own cadence across loop turns. A sleep armed inside
+    // select! starts over every time another arm fires first, and the 25ms
+    // terminal-waiter tick a TUI turn holds starved it for the whole turn.
+    let run = balanced_block(RUNTIME_HOST, "async fn run(");
+    let timer = run
+        .find("let mut subagent_relay_poll = subagent_relay_poll_interval();")
+        .expect("the relay poll timer must be created once per actor run");
+    let first_loop = run.find("loop {").expect("actor run loop");
+    assert!(
+        timer < first_loop,
+        "the relay poll timer must outlive each loop turn"
+    );
+    assert!(
+        !RUNTIME_HOST.contains("tokio::time::sleep(SUBAGENT_RELAY_POLL_INTERVAL)"),
+        "a per-turn sleep would let faster arms postpone the relay poll indefinitely"
+    );
+}
+
+#[test]
+fn both_relay_polls_match_detached_bindings_through_the_resident_thread() {
+    // A turn started by the prompt queue or by a finished background agent
+    // carries no surface operation fence. The running-turn poll used to
+    // require one, so it skipped every detached relay until the turn ended.
+    let matcher = balanced_block(RUNTIME_HOST, "fn drains_detached");
+    for (name, poll) in [
+        (
+            "running-turn",
+            balanced_block(RUNTIME_HOST, "fn drain_subagent_relays_for_active"),
+        ),
+        (
+            "idle",
+            balanced_block(RUNTIME_HOST, "fn drain_subagent_relays_while_idle"),
+        ),
+    ] {
+        assert!(
+            poll.contains(".filter(|binding| relays.drains_detached(binding))"),
+            "the {name} poll must match detached bindings through the resident thread"
+        );
+    }
+    assert!(matcher.contains("self.thread_id"));
+    assert!(!matcher.contains("surface_operation"));
 }
 
 #[test]

@@ -5696,6 +5696,18 @@ impl TaskPersistence {
         recover_interrupted: bool,
         requesting_session_id: &str,
     ) -> io::Result<Option<TaskRecord>> {
+        // Most lookups are for the requesting session's own tasks, which its
+        // records answer directly. The global index lists every task ever
+        // created, and parsing it on each relay poll kept a core busy.
+        {
+            let _session_lock =
+                ExclusiveFileLock::acquire(&self.session_lock_path(requesting_session_id))
+                    .map_err(io::Error::other)?;
+            let mut records = self.load_session_records_unlocked(requesting_session_id)?;
+            if let Some(record) = records.remove(id) {
+                return Ok(Some(record));
+            }
+        }
         let index = self.load_index()?;
         let Some(session_id) = index.get(id).cloned() else {
             return Ok(None);
@@ -9991,6 +10003,26 @@ while :; do :; done
         worker.request_stop(&task.id).unwrap();
 
         assert!(!parent.subagent_relay_replay_allowed(&task.id).unwrap());
+    }
+
+    #[test]
+    fn a_sessions_own_task_is_read_without_the_global_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let parent = TaskRegistry::new_persistent("session-1".to_string(), root.clone()).unwrap();
+        let task = parent.create_subagent("explore".to_string(), None);
+        let worker =
+            TaskRegistry::new_persistent_attached("session-1".to_string(), root.clone()).unwrap();
+        worker.request_stop(&task.id).unwrap();
+        // The index lists every task of every session, and the relay poll
+        // parsed all of it for each running child every 50ms. A session's own
+        // records answer for its own tasks.
+        std::fs::remove_file(root.join("task-index.json")).unwrap();
+
+        assert!(
+            !parent.subagent_relay_replay_allowed(&task.id).unwrap(),
+            "the worker's stop request is read from the session's records"
+        );
     }
 
     #[test]

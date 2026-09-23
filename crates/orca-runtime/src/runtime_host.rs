@@ -13954,6 +13954,28 @@ impl GoalRecoverySurfaceCommit for PendingSurfaceAdmissionTerminal {
     }
 }
 
+/// The children one relay poll reads. A child the surface has settled is
+/// never read again: its relay has nothing left to show, and re-reading every
+/// finished child's relay and registry record each poll kept a core busy for
+/// the rest of the session.
+#[derive(Default)]
+struct SubagentRelaysToDrain {
+    thread_id: Option<surface::SurfaceThreadId>,
+    running_detached: std::collections::HashSet<String>,
+    settled: std::collections::HashSet<String>,
+}
+
+impl SubagentRelaysToDrain {
+    fn drains_detached(&self, binding: &crate::tasks::DetachedSubagentBinding) -> bool {
+        self.running_detached.contains(&binding.task_id)
+            && binding
+                .parent_fence
+                .as_ref()
+                .zip(self.thread_id.as_ref())
+                .is_some_and(|(fence, thread_id)| fence.thread_id == *thread_id)
+    }
+}
+
 struct ActiveOperation {
     operation_id: OperationId,
     runtime_task_id: Option<String>,
@@ -17011,6 +17033,10 @@ impl ThreadActor {
         if !active.task_registry.supports_detached_subagent_relay() {
             return;
         }
+        let relays = self.subagent_relays_to_drain();
+        if relays.running_detached.is_empty() && active.surface_operation.is_none() {
+            return;
+        }
         let detached_bindings = match active.task_registry.detached_subagent_bindings() {
             Ok(bindings) => bindings
                 .into_iter()
@@ -17021,14 +17047,14 @@ impl ThreadActor {
                 std::collections::HashMap::new()
             }
         };
-        for binding in detached_bindings.values().filter(|binding| {
-            binding.parent_fence.as_ref().is_some_and(|parent_fence| {
-                active
-                    .surface_operation
-                    .as_ref()
-                    .is_some_and(|fence| fence.thread_id == parent_fence.thread_id)
-            })
-        }) {
+        // Bindings are matched to this thread through the resident surface, as
+        // the idle poll does. A turn the prompt queue starts has no surface
+        // operation fence, and requiring one skipped every relay until the
+        // turn ended.
+        for binding in detached_bindings
+            .values()
+            .filter(|binding| relays.drains_detached(binding))
+        {
             match self.drain_detached_subagent_relay(&active.task_registry, binding) {
                 Ok(()) => self.clear_subagent_relay_poll_failure(
                     &binding.task_id,
@@ -17051,6 +17077,7 @@ impl ThreadActor {
             .into_iter()
             .filter(|summary| summary.task_type == orca_core::task_types::TaskType::Subagent)
             .filter(|summary| !detached_bindings.contains_key(&summary.id))
+            .filter(|summary| !relays.settled.contains(&summary.id))
             .filter_map(|summary| {
                 active
                     .task_registry
@@ -17089,26 +17116,14 @@ impl ThreadActor {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        if !state
-            .thread
-            .session()
-            .task_registry()
-            .supports_detached_subagent_relay()
-        {
+        let task_registry = state.thread.session().task_registry().clone();
+        if !task_registry.supports_detached_subagent_relay() {
             return;
         }
-        let Some(current_thread_id) = self.resident_surface.0.as_ref().map(|surface| {
-            surface
-                .coordinator
-                .state()
-                .snapshot()
-                .thread
-                .thread_id
-                .clone()
-        }) else {
+        let relays = self.subagent_relays_to_drain();
+        if relays.running_detached.is_empty() {
             return;
-        };
-        let task_registry = state.thread.session().task_registry().clone();
+        }
         let bindings = match task_registry.detached_subagent_bindings() {
             Ok(bindings) => bindings,
             Err(error) => {
@@ -17116,12 +17131,10 @@ impl ThreadActor {
                 return;
             }
         };
-        for binding in bindings.into_iter().filter(|binding| {
-            binding
-                .parent_fence
-                .as_ref()
-                .is_some_and(|fence| fence.thread_id == current_thread_id)
-        }) {
+        for binding in bindings
+            .into_iter()
+            .filter(|binding| relays.drains_detached(binding))
+        {
             match self.drain_detached_subagent_relay(&task_registry, &binding) {
                 Ok(()) => self.clear_subagent_relay_poll_failure(
                     &binding.task_id,
@@ -17135,6 +17148,30 @@ impl ThreadActor {
                 ),
             }
         }
+    }
+
+    /// What the surface says about this thread's children for one relay poll.
+    fn subagent_relays_to_drain(&self) -> SubagentRelaysToDrain {
+        let Some(resident) = self.resident_surface.0.as_ref() else {
+            return SubagentRelaysToDrain::default();
+        };
+        let snapshot = resident.coordinator.state().snapshot();
+        let mut relays = SubagentRelaysToDrain {
+            thread_id: Some(snapshot.thread.thread_id.clone()),
+            ..SubagentRelaysToDrain::default()
+        };
+        for subagent in &snapshot.subagents {
+            let task_id = subagent.task_id.as_str().to_string();
+            if subagent.status != surface::SurfaceSubagentStatus::Running {
+                relays.settled.insert(task_id);
+            } else if matches!(
+                subagent.owner,
+                surface::SurfaceSubagentOwner::DetachedTask { .. }
+            ) {
+                relays.running_detached.insert(task_id);
+            }
+        }
+        relays
     }
 
     /// Seal the resident surface hub so no new attachments can observe a live
@@ -17154,6 +17191,7 @@ impl ThreadActor {
         mut capability_change_rx: tokio_mpsc::Receiver<()>,
     ) {
         let mut subscription_seal_reason = surface::SurfaceSubscriptionSealReason::ThreadClosed;
+        let mut subagent_relay_poll = subagent_relay_poll_interval();
         loop {
             if self.active.is_none() {
                 self.resume_recovered_continuation_turns();
@@ -17195,7 +17233,7 @@ impl ThreadActor {
                     .is_some_and(|surface| surface.commit.has_terminal_waiters());
                 tokio::select! {
                     biased;
-                    _ = tokio::time::sleep(SUBAGENT_RELAY_POLL_INTERVAL) => {
+                    _ = subagent_relay_poll.tick() => {
                         self.drain_subagent_relays_while_idle();
                         self.drain_detached_permission_requests(None);
                     }
@@ -17478,7 +17516,7 @@ impl ThreadActor {
                     self.cancel_surface_terminal_waiters();
                     self.active = Some(active);
                 }
-                _ = tokio::time::sleep(SUBAGENT_RELAY_POLL_INTERVAL) => {
+                _ = subagent_relay_poll.tick() => {
                     self.drain_subagent_relays_for_active(&mut active);
                     self.drain_detached_permission_requests(Some(&active));
                     self.active = Some(active);
@@ -22903,6 +22941,17 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         return message.clone();
     }
     "operation executor panicked".to_string()
+}
+
+/// The cadence of the detached-child poll: relay progress and permission
+/// requests. It must be one timer for the whole actor run. A sleep armed
+/// inside `select!` starts over on every loop turn, so any arm that fires
+/// sooner, such as the 25ms terminal-waiter tick held for a whole TUI turn,
+/// postponed the poll until the turn ended.
+fn subagent_relay_poll_interval() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(SUBAGENT_RELAY_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
 }
 
 async fn wait_for_surface_transition_retry(deadline: Option<tokio::time::Instant>) {
