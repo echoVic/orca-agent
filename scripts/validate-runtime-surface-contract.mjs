@@ -1307,15 +1307,15 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     1,
   ],
   [
-    "crates/orca-tui/src/queued_input_actions.rs:enqueue_composer_follow_up_to_runtime:state.atomic_skill_tokens.clear",
+    "crates/orca-tui/src/queued_input_actions.rs:send_composer_follow_up:state.atomic_skill_tokens.clear",
     1,
   ],
   [
-    "crates/orca-tui/src/queued_input_actions.rs:enqueue_composer_follow_up_to_runtime:state.mention_bindings.clear",
+    "crates/orca-tui/src/queued_input_actions.rs:send_composer_follow_up:state.mention_bindings.clear",
     1,
   ],
   [
-    "crates/orca-tui/src/queued_input_actions.rs:enqueue_composer_follow_up_to_runtime:state.pending_pastes.clear",
+    "crates/orca-tui/src/queued_input_actions.rs:send_composer_follow_up:state.pending_pastes.clear",
     1,
   ],
   [
@@ -1396,6 +1396,7 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/ui.rs:render_table_as_records:lines.insert", 1],
   ["crates/orca-tui/src/ui.rs:render_textarea_visual_line:attached_zero_width.clear", 1],
   ["crates/orca-tui/src/hosted_session.rs:convert:self.tool_names.insert", 1],
+  ["crates/orca-tui/src/operation_controller.rs:newest_first_order:ordered_ids.insert", 1],
   ["crates/orca-tui/src/transcript_view.rs:materialize_rows:spans.insert", 1],
   ["crates/orca-tui/src/ui.rs:append_assistant_markdown:line.spans.insert", 1],
   ["crates/orca-tui/src/ui.rs:append_diff_lines:line.spans.insert", 1],
@@ -1869,11 +1870,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 45 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 46 unique variants matching UserAction at baseline",
         (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 45,
-          "current_tui_user_actions must contain 45 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 46,
+          "current_tui_user_actions must contain 46 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,

@@ -50,11 +50,6 @@ pub(crate) struct QueuedSubmissionState {
     pending_edit: Option<PendingQueuedEdit>,
     ready_edit: Option<QueuedComposerState>,
     error: Option<String>,
-    /// Set by a Ctrl+Enter submission while its `QueuePrompt` is still in
-    /// flight. `QueuePrompt` is async, so the new item's id isn't known yet;
-    /// this holds the submission text so the next queue snapshot that shows
-    /// a matching item can trigger the front-of-queue `Reorder`.
-    pending_front_prompt: Option<String>,
 }
 
 struct PendingQueuedComposer {
@@ -77,20 +72,16 @@ impl Default for QueuedSubmissionState {
             pending_edit: None,
             ready_edit: None,
             error: None,
-            pending_front_prompt: None,
         }
     }
 }
 
 impl QueuedSubmissionState {
-    /// Replaces the local queue projection with a fresher snapshot from the
-    /// runtime, and returns a `Reorder` to fire when this snapshot is the
-    /// first to show the item requested via [`Self::request_front_prompt`].
     fn replace_runtime_projection(
         &mut self,
         snapshot: orca_runtime::prompt_queue::PromptQueueSnapshot,
         confirmed_delete: Option<&orca_runtime::prompt_queue::QueuedSubmissionId>,
-    ) -> Option<orca_runtime::prompt_queue::PromptQueueAction> {
+    ) {
         for item in &snapshot.items {
             let is_new = !self
                 .projection
@@ -128,49 +119,6 @@ impl QueuedSubmissionState {
             .retain(|id, _| snapshot.items.iter().any(|item| item.id == *id));
         self.projection = snapshot;
         self.error = None;
-        self.take_front_reorder_if_ready()
-    }
-
-    /// Records that the next queue item whose text matches `prompt` should
-    /// be moved to the front once it appears in a snapshot.
-    fn request_front_prompt(&mut self, prompt: String) {
-        self.pending_front_prompt = Some(prompt);
-    }
-
-    /// If a `Ctrl+Enter` submission is awaiting its item in the current
-    /// projection, and that item has now arrived, builds the `Reorder`
-    /// action that moves it to the front and clears the pending request.
-    ///
-    /// While a turn is running, the runtime's `Accepted` dispatch fence
-    /// requires the running item to stay at index 0 (`Reorder` rejects any
-    /// order that moves it), so "front" here means right after the running
-    /// item rather than absolute index 0.
-    fn take_front_reorder_if_ready(
-        &mut self,
-    ) -> Option<orca_runtime::prompt_queue::PromptQueueAction> {
-        let prompt = self.pending_front_prompt.as_ref()?;
-        let item_index = self
-            .projection
-            .items
-            .iter()
-            .position(|item| &item.input.text == prompt)?;
-        self.pending_front_prompt = None;
-        let target_index = usize::from(self.projection.running_item().is_some());
-        if item_index <= target_index {
-            return None;
-        }
-        let mut ordered_ids: Vec<_> = self
-            .projection
-            .items
-            .iter()
-            .map(|item| item.id.clone())
-            .collect();
-        let id = ordered_ids.remove(item_index);
-        ordered_ids.insert(target_index, id);
-        Some(orca_runtime::prompt_queue::PromptQueueAction::Reorder {
-            expected_revision: self.projection.revision,
-            ordered_ids,
-        })
     }
 
     fn remember_composer(&mut self, message: QueuedUserMessage) {
@@ -579,24 +527,12 @@ impl AppState {
         &mut self,
         snapshot: orca_runtime::prompt_queue::PromptQueueSnapshot,
     ) {
-        if let Some(reorder) = self
-            .queued_submission
-            .replace_runtime_projection(snapshot, None)
-        {
-            let _ = self.event_tx.send(UserAction::PromptQueueControl(reorder));
-        }
+        self.queued_submission
+            .replace_runtime_projection(snapshot, None);
     }
 
     pub(crate) fn remember_runtime_queued_message(&mut self, message: QueuedUserMessage) {
         self.queued_submission.remember_composer(message);
-    }
-
-    /// Requests that the queue item matching `prompt`'s text be moved to the
-    /// front once it shows up in a runtime snapshot. Used by Ctrl+Enter,
-    /// whose `QueuePrompt` is async — the item's id isn't known yet when the
-    /// request is made.
-    pub(crate) fn request_front_prompt(&mut self, prompt: String) {
-        self.queued_submission.request_front_prompt(prompt);
     }
 
     pub(crate) fn replace_runtime_queue_control_projection(
@@ -604,12 +540,8 @@ impl AppState {
         snapshot: orca_runtime::prompt_queue::PromptQueueSnapshot,
         deleted_id: Option<&orca_runtime::prompt_queue::QueuedSubmissionId>,
     ) {
-        if let Some(reorder) = self
-            .queued_submission
-            .replace_runtime_projection(snapshot, deleted_id)
-        {
-            let _ = self.event_tx.send(UserAction::PromptQueueControl(reorder));
-        }
+        self.queued_submission
+            .replace_runtime_projection(snapshot, deleted_id);
     }
     #[cfg(test)]
     pub(crate) fn enqueue_user_message(

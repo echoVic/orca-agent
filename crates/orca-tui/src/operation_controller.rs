@@ -177,6 +177,55 @@ impl TuiSurfaceTaskControl {
             .map_err(|error| io::Error::other(format!("runtime prompt queue failed: {error:?}")))
     }
 
+    /// `Ctrl+Enter` while a turn runs. Plain text joins the running turn
+    /// through its steer channel, so the model sees it before its next
+    /// request; the runtime's steer carries text only, so a follow-up with
+    /// attachments — or one that arrives as the turn ends — is queued ahead
+    /// of every other follow-up instead.
+    pub(crate) fn submit_now(
+        &self,
+        prompt: String,
+        bindings: orca_runtime::mentions::MentionBindings,
+        images: Vec<orca_core::conversation::ImageInput>,
+    ) -> io::Result<SubmitNowOutcome> {
+        let (surface, runtime) = {
+            let hosted = self.lock_hosted();
+            (hosted.surface_active.clone(), hosted.queue_runtime.clone())
+        };
+        let Some(surface) = surface else {
+            return Ok(SubmitNowOutcome::NoActiveOperation);
+        };
+        if bindings.is_empty()
+            && images.is_empty()
+            && runtime.is_some_and(|runtime| steer_running_turn(&runtime, &prompt))
+        {
+            return Ok(SubmitNowOutcome::Steered);
+        }
+        let queued = surface
+            .client
+            .prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::Add {
+                input: orca_runtime::prompt_queue::PromptQueueInput {
+                    text: prompt,
+                    mention_bindings: bindings,
+                    images,
+                },
+            })
+            .map_err(|error| io::Error::other(format!("runtime prompt queue failed: {error:?}")))?;
+        let Some(ordered_ids) = newest_first_order(&queued) else {
+            return Ok(SubmitNowOutcome::Queued(queued));
+        };
+        // A rejected reorder (the queue moved on meanwhile) leaves the
+        // follow-up queued last rather than lost.
+        let reordered = surface
+            .client
+            .prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::Reorder {
+                expected_revision: queued.revision,
+                ordered_ids,
+            })
+            .unwrap_or(queued);
+        Ok(SubmitNowOutcome::Queued(reordered))
+    }
+
     pub(crate) fn prompt_queue_action(
         &self,
         action: orca_runtime::prompt_queue::PromptQueueAction,
@@ -1276,6 +1325,54 @@ fn cancel_surface_if_active(hosted: &mut HostedOperationInner) -> bool {
     cancel_surface_if_active_checked(hosted).unwrap_or(false)
 }
 
+/// What `Ctrl+Enter` did with a follow-up while a turn runs.
+#[derive(Debug)]
+pub(crate) enum SubmitNowOutcome {
+    /// The running turn took it through its steer channel.
+    Steered,
+    /// It could not join the running turn, so it was queued first.
+    Queued(orca_runtime::prompt_queue::PromptQueueSnapshot),
+    /// No operation is active yet; the caller defers it like a queued prompt.
+    NoActiveOperation,
+}
+
+/// Steers `prompt` into the thread's running turn. `false` when nothing is
+/// running or the turn ended before the steer landed.
+fn steer_running_turn(
+    runtime: &orca_runtime::runtime_host::RuntimeThreadHandle,
+    prompt: &str,
+) -> bool {
+    let Ok(orca_runtime::runtime_host::RuntimeThreadState::Running { generation, .. }) =
+        runtime.state()
+    else {
+        return false;
+    };
+    matches!(
+        runtime.steer_operation(generation.operation_id(), prompt),
+        Ok(orca_runtime::runtime_host::SteerOperationResult::Accepted { .. })
+    )
+}
+
+/// The queue order that puts the item `Add` just appended first — right after
+/// a running item, which the runtime keeps at the front while it is being
+/// dispatched. `None` when it is already there.
+fn newest_first_order(
+    snapshot: &orca_runtime::prompt_queue::PromptQueueSnapshot,
+) -> Option<Vec<orca_runtime::prompt_queue::QueuedSubmissionId>> {
+    let front = usize::from(snapshot.running_item().is_some());
+    let mut ordered_ids = snapshot
+        .items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    if ordered_ids.len() <= front + 1 {
+        return None;
+    }
+    let newest = ordered_ids.pop()?;
+    ordered_ids.insert(front, newest);
+    Some(ordered_ids)
+}
+
 fn cancel_surface_if_active_checked(hosted: &mut HostedOperationInner) -> io::Result<bool> {
     let Some(surface) = hosted.surface_active.as_ref() else {
         return Ok(false);
@@ -1349,7 +1446,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use super::TuiSurfaceTaskControl;
+    use super::{TuiSurfaceTaskControl, newest_first_order};
+    use orca_runtime::prompt_queue::{
+        PromptQueueAction, PromptQueueSnapshot, PromptQueueState, QueueDispatchFence,
+    };
     use orca_runtime::surface::{ByteOffset, SurfaceOperationId, SurfaceStreamId};
 
     use crate::surface_projection::TuiStreamDeliveryWatermark;
@@ -1680,5 +1780,64 @@ mod tests {
                 .begin_surface_activation()
                 .expect("re-arm activation")
         );
+    }
+
+    fn queue(texts: &[&str]) -> PromptQueueSnapshot {
+        let mut state = PromptQueueState::from_snapshot(PromptQueueSnapshot::default());
+        let mut snapshot = PromptQueueSnapshot::default();
+        for (at, text) in texts.iter().enumerate() {
+            snapshot = state
+                .apply(
+                    PromptQueueAction::Add {
+                        input: (*text).into(),
+                    },
+                    at as i64,
+                )
+                .unwrap();
+        }
+        snapshot
+    }
+
+    fn texts(
+        snapshot: &PromptQueueSnapshot,
+        ids: &[orca_runtime::prompt_queue::QueuedSubmissionId],
+    ) -> Vec<String> {
+        ids.iter()
+            .map(|id| {
+                snapshot
+                    .items
+                    .iter()
+                    .find(|item| &item.id == id)
+                    .map(|item| item.input.text.clone())
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_follow_up_sent_now_goes_ahead_of_everything_queued() {
+        let snapshot = queue(&["first", "second", "urgent"]);
+        let order = newest_first_order(&snapshot).expect("reorder");
+        assert_eq!(texts(&snapshot, &order), ["urgent", "first", "second"]);
+
+        assert_eq!(
+            newest_first_order(&queue(&["urgent"])),
+            None,
+            "alone in the queue it is already first"
+        );
+    }
+
+    #[test]
+    fn a_follow_up_sent_now_stays_behind_the_item_that_is_running() {
+        let mut snapshot = queue(&["running", "second", "urgent"]);
+        snapshot.dispatch = Some(QueueDispatchFence::Accepted {
+            submission_id: snapshot.items[0].id.clone(),
+            client_user_message_id: snapshot.items[0].client_user_message_id.clone(),
+            operation_id: "operation".into(),
+            accepted_revision: snapshot.revision,
+        });
+
+        let order = newest_first_order(&snapshot).expect("reorder");
+        assert_eq!(texts(&snapshot, &order), ["running", "urgent", "second"]);
     }
 }

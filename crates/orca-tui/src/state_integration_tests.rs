@@ -2673,6 +2673,50 @@ fn toggle_all_expandable_only_affects_the_live_pane() {
     ));
 }
 
+// `Ctrl+Enter` steers a follow-up into the running turn. Once the runtime
+// accepts it, it joins the transcript where the user sent it: the reply
+// streamed so far stays above it, and what the model writes next lands
+// below, where it can answer the follow-up.
+#[test]
+fn a_steered_follow_up_joins_the_running_turn_as_the_users_message() {
+    let mut state = state();
+    state.enter_running();
+    // Whole lines: the streaming assembler holds a partial line back until it
+    // ends or the stream is finished.
+    state.update(TuiEvent::MessageDelta("Reading the crate\n".into()));
+
+    state.update(TuiEvent::PromptSteered {
+        prompt: "also check the tests".into(),
+    });
+    state.update(TuiEvent::MessageDelta("Checking the tests too\n".into()));
+
+    let texts = state
+        .transcript
+        .messages
+        .iter()
+        .map(|message| match message {
+            ChatMessage::User(text) => format!("user: {text}"),
+            ChatMessage::Assistant(text) | ChatMessage::AssistantChunk { text, .. } => {
+                format!("assistant: {}", text.trim_end())
+            }
+            other => format!("{other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        [
+            "assistant: Reading the crate",
+            "user: also check the tests",
+            "assistant: Checking the tests too",
+        ]
+    );
+    assert_eq!(
+        state.status,
+        AppStatus::Running,
+        "steering does not end the turn"
+    );
+}
+
 #[test]
 fn toggle_all_expandable_returns_false_when_nothing_is_collapsible() {
     let mut state = state();

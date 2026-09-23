@@ -199,6 +199,13 @@ impl AppState {
                 }
                 self.replace_runtime_queue_projection(snapshot);
             }
+            TuiEvent::PromptSteered { prompt } => {
+                // The reply streamed so far stays above the follow-up; what the
+                // model writes after reading it lands below.
+                self.finish_assistant_stream();
+                self.push_message(ChatMessage::User(prompt));
+                self.scroll_to_bottom();
+            }
             TuiEvent::PromptQueueControlUpdated {
                 deleted_id,
                 snapshot,

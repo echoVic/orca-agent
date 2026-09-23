@@ -276,6 +276,53 @@ fn route_action(
                 }
             }
         }
+        UserAction::SubmitNow {
+            prompt,
+            bindings,
+            images,
+        } => match controller.submit_now(
+            prompt.clone(),
+            bindings.clone(),
+            crate::composer_images::ComposerImageState::image_inputs(&images),
+        ) {
+            Ok(crate::operation_controller::SubmitNowOutcome::Steered) => {
+                if !deliver_dispatcher_outcome(
+                    event_tx,
+                    &mut pending.event,
+                    TuiEvent::PromptSteered { prompt },
+                ) {
+                    return false;
+                }
+            }
+            Ok(crate::operation_controller::SubmitNowOutcome::Queued(snapshot)) => {
+                let _ = event_tx.try_send(TuiEvent::PromptQueueUpdated(snapshot));
+            }
+            Ok(crate::operation_controller::SubmitNowOutcome::NoActiveOperation) => {
+                match enqueue_action(
+                    UserAction::SubmitNow {
+                        prompt,
+                        bindings,
+                        images,
+                    },
+                    command_tx,
+                    &mut pending.commands,
+                    backlog_capacity,
+                ) {
+                    EnqueueResult::Queued => {}
+                    EnqueueResult::Disconnected => return false,
+                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                }
+            }
+            Err(error) => {
+                let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
+                    queued_id: None,
+                    prompt,
+                    bindings,
+                    images,
+                    message: error.to_string(),
+                });
+            }
+        },
         UserAction::PromptQueueControl(action) => {
             let deleted_id = match &action {
                 orca_runtime::prompt_queue::PromptQueueAction::Delete { id, .. } => {
@@ -473,6 +520,11 @@ fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
             images,
         }
         | UserAction::QueuePrompt {
+            prompt,
+            bindings,
+            images,
+        }
+        | UserAction::SubmitNow {
             prompt,
             bindings,
             images,

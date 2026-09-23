@@ -78,6 +78,43 @@ pub(crate) fn enqueue_composer_follow_up_to_runtime(
     vim_state: &mut VimState,
     theme: &Theme,
 ) -> bool {
+    send_composer_follow_up(
+        state,
+        action_tx,
+        textarea,
+        vim_state,
+        theme,
+        FollowUp::Queue,
+    )
+}
+
+/// `Ctrl+Enter`: hands the composer's text to the dispatcher as `SubmitNow`,
+/// which steers it into the running turn when it can and otherwise queues it
+/// ahead of every other follow-up.
+pub(crate) fn submit_composer_follow_up_now(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+) -> bool {
+    send_composer_follow_up(state, action_tx, textarea, vim_state, theme, FollowUp::Now)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FollowUp {
+    Queue,
+    Now,
+}
+
+fn send_composer_follow_up(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+    follow_up: FollowUp,
+) -> bool {
     let visible_text = textarea_text(textarea);
     let images = state.composer_images.attachments_for_text(&visible_text);
     let Some(message) = QueuedUserMessage::from_composer_with_images(
@@ -95,18 +132,30 @@ pub(crate) fn enqueue_composer_follow_up_to_runtime(
         ));
         return false;
     }
-    if action_tx
-        .try_send(UserAction::QueuePrompt {
-            prompt: message.submission_text().to_string(),
-            bindings: message.submission_bindings().clone(),
-            images: message.images().to_vec(),
-        })
-        .is_err()
-    {
+    let prompt = message.submission_text().to_string();
+    let bindings = message.submission_bindings().clone();
+    let images = message.images().to_vec();
+    let action = match follow_up {
+        FollowUp::Queue => UserAction::QueuePrompt {
+            prompt,
+            bindings,
+            images,
+        },
+        FollowUp::Now => UserAction::SubmitNow {
+            prompt,
+            bindings,
+            images,
+        },
+    };
+    if action_tx.try_send(action).is_err() {
         state.report_queued_input_error("follow-up action queue is unavailable".to_string());
         return false;
     }
-    state.remember_runtime_queued_message(message);
+    // Only a queued follow-up is sure to become a queue item whose composer
+    // Alt+Up can restore; one sent now usually joins the running turn instead.
+    if follow_up == FollowUp::Queue {
+        state.remember_runtime_queued_message(message);
+    }
     state.slash_menu = None;
     state.mention.clear_projection();
     state.pending_pastes.clear();
@@ -117,39 +166,6 @@ pub(crate) fn enqueue_composer_follow_up_to_runtime(
     vim_state.reset_insert(textarea, theme);
     sync_vim_mode_label(state, vim_state);
     *textarea = make_textarea(vim_state, theme);
-    true
-}
-
-/// Queues the composer's text like [`enqueue_composer_follow_up_to_runtime`],
-/// then requests that it be moved to the front of the queue once its item
-/// appears in a runtime snapshot (see [`AppState::request_front_prompt`]).
-///
-/// Computes the submission text with the same construction the queued
-/// message itself uses, so the pending-front match in a later snapshot
-/// compares like with like.
-pub(crate) fn enqueue_composer_follow_up_at_front(
-    state: &mut AppState,
-    action_tx: &mpsc::Sender<UserAction>,
-    textarea: &mut TextArea,
-    vim_state: &mut VimState,
-    theme: &Theme,
-) -> bool {
-    let visible_text = textarea_text(textarea);
-    let images = state.composer_images.attachments_for_text(&visible_text);
-    let submission_text = QueuedUserMessage::from_composer_with_images(
-        visible_text,
-        state.pending_pastes.clone(),
-        state.mention_bindings.clone(),
-        images,
-    )
-    .map(|message| message.submission_text().to_string());
-
-    if !enqueue_composer_follow_up_to_runtime(state, action_tx, textarea, vim_state, theme) {
-        return false;
-    }
-    if let Some(submission_text) = submission_text {
-        state.request_front_prompt(submission_text);
-    }
     true
 }
 
@@ -291,9 +307,7 @@ pub(crate) fn handle_running_key(
                     return true;
                 }
                 if shortcut == RunningShortcut::SubmitNow {
-                    enqueue_composer_follow_up_at_front(
-                        state, action_tx, textarea, vim_state, theme,
-                    );
+                    submit_composer_follow_up_now(state, action_tx, textarea, vim_state, theme);
                 } else {
                     enqueue_composer_follow_up_to_runtime(
                         state, action_tx, textarea, vim_state, theme,
@@ -471,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_enter_queues_the_prompt_then_reorders_it_to_the_front_once_seen() {
+    fn ctrl_enter_hands_the_follow_up_over_as_submit_now() {
         let (action_tx, action_rx) = mpsc::unbounded();
         let mut state = state_with_tx(action_tx.clone());
         let theme = theme();
@@ -495,63 +509,16 @@ mod tests {
 
         assert_eq!(textarea_text(&textarea), "");
         match action_rx.try_recv() {
-            Ok(UserAction::QueuePrompt { prompt, .. }) => {
+            Ok(UserAction::SubmitNow { prompt, .. }) => {
                 assert_eq!(prompt, "urgent follow-up");
             }
-            other => panic!("expected QueuePrompt, got {other:?}"),
+            other => panic!("expected SubmitNow, got {other:?}"),
         }
-        // No id is known yet (QueuePrompt is async), so no Reorder fires
-        // until a snapshot shows the matching item.
-        assert!(action_rx.try_recv().is_err());
-
-        // Runtime settles two earlier items ahead of the new one.
-        let mut runtime = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
-            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
+        assert!(
+            action_rx.try_recv().is_err(),
+            "the dispatcher decides between steering and queueing; nothing else is sent"
         );
-        runtime
-            .apply(
-                orca_runtime::prompt_queue::PromptQueueAction::Add {
-                    input: "first".into(),
-                },
-                1,
-            )
-            .unwrap();
-        runtime
-            .apply(
-                orca_runtime::prompt_queue::PromptQueueAction::Add {
-                    input: "second".into(),
-                },
-                2,
-            )
-            .unwrap();
-        let snapshot = runtime
-            .apply(
-                orca_runtime::prompt_queue::PromptQueueAction::Add {
-                    input: "urgent follow-up".into(),
-                },
-                3,
-            )
-            .unwrap();
-        let new_item_id = snapshot.items[2].id.clone();
-
-        state.update(crate::protocol::TuiEvent::PromptQueueUpdated(snapshot));
-
-        let reorder = action_rx.try_recv().expect("Reorder action");
-        match reorder {
-            UserAction::PromptQueueControl(
-                orca_runtime::prompt_queue::PromptQueueAction::Reorder {
-                    expected_revision,
-                    ordered_ids,
-                },
-            ) => {
-                assert_eq!(expected_revision, state.runtime_queue_revision());
-                assert_eq!(ordered_ids[0], new_item_id);
-                assert_eq!(ordered_ids.len(), 3);
-            }
-            other => panic!("expected Reorder, got {other:?}"),
-        }
     }
-
     #[test]
     fn plain_enter_queues_without_reordering() {
         let (action_tx, action_rx) = mpsc::unbounded();
@@ -595,75 +562,9 @@ mod tests {
             .unwrap();
         state.update(crate::protocol::TuiEvent::PromptQueueUpdated(snapshot));
 
-        // Plain Enter never records a pending-front request, so no Reorder
-        // is emitted once the item shows up.
+        // A queue update never sends anything back: moving a follow-up to the
+        // front is the dispatcher's job, and only for `SubmitNow`.
         assert!(action_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn ctrl_enter_reorders_to_front_even_when_the_queue_is_paused() {
-        let (action_tx, action_rx) = mpsc::unbounded();
-        let mut state = state_with_tx(action_tx.clone());
-        let theme = theme();
-        let mut vim = VimState::new(false);
-        let mut textarea = make_textarea_with_text("urgent", &vim, &theme);
-        let key = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL);
-        let mut config = crate::test_support::test_run_config();
-        let shared = Arc::new(Mutex::new(config.clone()));
-
-        assert!(handle_running_key(
-            &Event::Key(key),
-            &key,
-            &mut state,
-            &mut config,
-            &shared,
-            &action_tx,
-            &mut textarea,
-            &mut vim,
-            &theme,
-        ));
-        assert!(matches!(
-            action_rx.try_recv(),
-            Ok(UserAction::QueuePrompt { .. })
-        ));
-
-        let mut runtime = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
-            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
-        );
-        runtime
-            .apply(
-                orca_runtime::prompt_queue::PromptQueueAction::Add {
-                    input: "first".into(),
-                },
-                1,
-            )
-            .unwrap();
-        let added = runtime
-            .apply(
-                orca_runtime::prompt_queue::PromptQueueAction::Add {
-                    input: "urgent".into(),
-                },
-                2,
-            )
-            .unwrap();
-        let new_item_id = added.items[1].id.clone();
-        let mut snapshot = added;
-        snapshot.paused = true;
-
-        state.update(crate::protocol::TuiEvent::PromptQueueUpdated(snapshot));
-
-        // The item still moves to the front while paused; we don't silently
-        // unpause on its behalf.
-        let reorder = action_rx.try_recv().expect("Reorder action");
-        match reorder {
-            UserAction::PromptQueueControl(
-                orca_runtime::prompt_queue::PromptQueueAction::Reorder { ordered_ids, .. },
-            ) => {
-                assert_eq!(ordered_ids[0], new_item_id);
-            }
-            other => panic!("expected Reorder, got {other:?}"),
-        }
-        assert!(!state.queued_autosend_enabled());
     }
 
     #[test]

@@ -742,7 +742,7 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     ShortcutHint {
         scope: ShortcutScope::Running,
         keys: "ctrl+enter",
-        action: "send now, skipping the queue (needs a terminal with the kitty keyboard protocol)",
+        action: "send now: the running turn reads it after its current step (needs a terminal with the kitty keyboard protocol)",
     },
     ShortcutHint {
         scope: ShortcutScope::Running,

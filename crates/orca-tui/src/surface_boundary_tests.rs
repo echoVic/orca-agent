@@ -6,7 +6,7 @@ use crate::protocol::UserAction;
 const MANIFEST: &str = include_str!(
     "../../../docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json"
 );
-const CURRENT_ACTIONS: [(&str, &str); 45] = [
+const CURRENT_ACTIONS: [(&str, &str); 46] = [
     ("StartSideConversation", "host_session_lifecycle_mutation"),
     ("ToggleSideConversation", "host_session_lifecycle_mutation"),
     ("CloseSideConversation", "host_session_lifecycle_mutation"),
@@ -23,6 +23,7 @@ const CURRENT_ACTIONS: [(&str, &str); 45] = [
     ("Submit", "runtime_mutation"),
     ("SubmitWithMentions", "runtime_mutation"),
     ("QueuePrompt", "runtime_mutation"),
+    ("SubmitNow", "runtime_mutation"),
     ("PromptQueueControl", "runtime_mutation"),
     ("SubmitQueued", "runtime_mutation"),
     ("PasteImages", "presentation_side_effect"),
@@ -74,6 +75,7 @@ fn current_user_action_name(action: &UserAction) -> &'static str {
         UserAction::Submit(_) => "Submit",
         UserAction::SubmitWithMentions { .. } => "SubmitWithMentions",
         UserAction::QueuePrompt { .. } => "QueuePrompt",
+        UserAction::SubmitNow { .. } => "SubmitNow",
         UserAction::PromptQueueControl(_) => "PromptQueueControl",
         UserAction::SubmitQueued { .. } => "SubmitQueued",
         UserAction::PasteImages { .. } => "PasteImages",

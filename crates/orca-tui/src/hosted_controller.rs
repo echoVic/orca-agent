@@ -469,11 +469,20 @@ pub(crate) fn hosted_tui_controller_loop(
                     &host,
                 );
             }
-            Ok(UserAction::QueuePrompt {
-                prompt,
-                bindings,
-                images,
-            }) => {
+            // A `SubmitNow` only reaches here when no operation was active to
+            // steer into, so it is simply queued.
+            Ok(
+                UserAction::QueuePrompt {
+                    prompt,
+                    bindings,
+                    images,
+                }
+                | UserAction::SubmitNow {
+                    prompt,
+                    bindings,
+                    images,
+                },
+            ) => {
                 handle_hosted_queued_prompt(
                     prompt,
                     bindings,

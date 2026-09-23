@@ -964,6 +964,11 @@ fn reject_action(client: &TuiClient, action: UserAction, message: &str) {
             prompt,
             bindings,
             images,
+        }
+        | UserAction::SubmitNow {
+            prompt,
+            bindings,
+            images,
         } => {
             client.reject_submission(
                 Submission {

@@ -12,6 +12,7 @@ use crate::agent_continuation::{conversation_has_open_tool_calls, try_last_settl
 use crate::child_agent_types::ChildAgentCheckpointObservation;
 use crate::lifecycle::{
     AgentLoopOutcome, RuntimeTaskActor, RuntimeTurnContext, RuntimeTurnDeps, RuntimeTurnLoopState,
+    ThreadSteerHandle,
 };
 use crate::operation_context::OperationContext;
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
@@ -409,6 +410,12 @@ impl RuntimeTurnLoopStep {
                     {
                         continue;
                     }
+                    if steer_awaits_answer(
+                        &result.terminal,
+                        input.request.turn_context.steer_handle,
+                    ) {
+                        continue;
+                    }
                     if result.status != orca_core::event_schema::RunStatus::ApprovalRequired {
                         let (conversation, observer) =
                             input.prepared_conversation.checkpoint_parts();
@@ -488,6 +495,20 @@ fn deliver_child_results<W: io::Write>(
         registry.ack_subagent_result(&ack);
     }
     Ok(delivered)
+}
+
+/// Whether a turn that ended on its own still owes the model a steer input:
+/// one that arrived while the model was writing its last reply, after the
+/// turn's final model request. Another iteration applies it before calling
+/// the model again, so the turn answers it instead of ending over it.
+fn steer_awaits_answer(
+    terminal: &orca_core::budget::OperationTerminal,
+    steer: Option<&ThreadSteerHandle>,
+) -> bool {
+    matches!(
+        terminal,
+        orca_core::budget::OperationTerminal::Completed { .. }
+    ) && steer.is_some_and(ThreadSteerHandle::has_pending)
 }
 
 fn settle_children_before_return<W: io::Write>(
@@ -963,6 +984,29 @@ mod tests {
             worker.join().unwrap();
         }
         assert_eq!(registry.execution_scope(&limits).live(), 0);
+    }
+
+    #[test]
+    fn a_turn_that_ended_on_its_own_continues_while_steer_input_is_pending() {
+        use orca_core::budget::{BudgetUsage, FailureClass, OperationTerminal};
+
+        let completed = OperationTerminal::Completed {
+            usage: BudgetUsage::default(),
+        };
+        let steer = ThreadSteerHandle::default();
+        assert!(!steer_awaits_answer(&completed, Some(&steer)));
+        assert!(!steer_awaits_answer(&completed, None));
+
+        steer.push("one more thing");
+        assert!(steer_awaits_answer(&completed, Some(&steer)));
+        let failed = OperationTerminal::Failed {
+            class: FailureClass::Provider,
+            message: "down".to_string(),
+        };
+        assert!(
+            !steer_awaits_answer(&failed, Some(&steer)),
+            "a failed turn ends; the operation requeues the steer instead"
+        );
     }
 
     #[test]

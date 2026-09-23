@@ -262,6 +262,11 @@ pub enum TuiEvent {
         id: u64,
     },
     PromptQueueUpdated(orca_runtime::prompt_queue::PromptQueueSnapshot),
+    /// The running turn accepted a `SubmitNow` follow-up; the model sees it
+    /// before its next request.
+    PromptSteered {
+        prompt: String,
+    },
     PromptQueueControlUpdated {
         deleted_id: Option<orca_runtime::prompt_queue::QueuedSubmissionId>,
         snapshot: orca_runtime::prompt_queue::PromptQueueSnapshot,
@@ -559,6 +564,13 @@ pub enum UserAction {
         images: Vec<ComposerImageAttachment>,
     },
     QueuePrompt {
+        prompt: String,
+        bindings: MentionBindings,
+        images: Vec<ComposerImageAttachment>,
+    },
+    /// `Ctrl+Enter` while a turn runs: steer the follow-up into the running
+    /// turn when it can take it, else queue it ahead of every other one.
+    SubmitNow {
         prompt: String,
         bindings: MentionBindings,
         images: Vec<ComposerImageAttachment>,

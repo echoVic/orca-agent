@@ -16273,6 +16273,41 @@ impl ThreadActor {
         });
     }
 
+    /// Steer input the finished operation accepted but never showed the
+    /// model, because it arrived after the turn's last model request. It goes
+    /// to the front of the prompt queue, in the order it was sent, so the next
+    /// turn answers it instead of the operation dropping it.
+    fn requeue_unapplied_steer_inputs(&mut self, active: &ActiveOperation) {
+        for text in active.steer_handle.drain().into_iter().rev() {
+            let Ok(added) =
+                self.apply_prompt_queue_action(crate::prompt_queue::PromptQueueAction::Add {
+                    input: crate::prompt_queue::PromptQueueInput {
+                        text,
+                        mention_bindings: crate::mentions::MentionBindings::default(),
+                        images: Vec::new(),
+                    },
+                })
+            else {
+                continue;
+            };
+            let mut ordered_ids = added
+                .items
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            let Some(requeued) = ordered_ids.pop() else {
+                continue;
+            };
+            ordered_ids.insert(0, requeued);
+            // A rejected reorder leaves the input queued last rather than lost.
+            let _ =
+                self.apply_prompt_queue_action(crate::prompt_queue::PromptQueueAction::Reorder {
+                    expected_revision: added.revision,
+                    ordered_ids,
+                });
+        }
+    }
+
     fn complete_prompt_queue_dispatch(&mut self, operation_id: OperationId) {
         let expected = format!("{operation_id:?}");
         let matches_operation = matches!(
@@ -21318,6 +21353,9 @@ impl ThreadActor {
                 .clear_operation(&fence.operation_id);
         }
         self.complete_prompt_queue_dispatch(active.operation_id);
+        if !matches!(outcome, OperationOutcome::Backgrounded { .. }) {
+            self.requeue_unapplied_steer_inputs(&active);
+        }
         self.goal_controller.clear_active(active.operation_id);
         let completed = active.completion.complete(OperationTerminal {
             operation_id: active.operation_id,

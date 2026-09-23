@@ -241,6 +241,7 @@
       "Submit",
       "SubmitWithMentions",
       "QueuePrompt",
+      "SubmitNow",
       "PromptQueueControl",
       "SubmitQueued",
       "PasteImages",
@@ -4293,6 +4294,29 @@
       "delete_tui_queue_ownership"
     ],
     [
+      "SubmitNow",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:573",
+        "crates/orca-tui/src/action_dispatcher.rs:279"
+      ],
+      "runtime_mutation",
+      "UserAction::SubmitNow{prompt,bindings,images}",
+      "SteerOperation or PromptQueue(Add+Reorder)",
+      "RuntimeThreadActor::SteerOperation or RuntimeThreadActor::PromptQueue(Add+Reorder)",
+      [
+        "ReadState",
+        "ReadSnapshot"
+      ],
+      [
+        "GenerationFence",
+        "QueueRevision"
+      ],
+      "SteerOperationResult or PromptQueueSnapshot",
+      "TUI echoes an accepted steer into the transcript, otherwise consumes runtime queue projection",
+      "delete_tui_queue_ownership"
+    ],
+    [
       "PromptQueueControl",
       "current",
       [
@@ -7651,7 +7675,7 @@
   ],
   "phase_0a_manifest_invariants": [
     "source_facts has exactly 58 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 45 unique variants matching UserAction at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 46 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",

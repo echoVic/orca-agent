@@ -253,6 +253,7 @@ struct ScriptedExecutor {
     calls: AtomicUsize,
     generations: Mutex<Vec<(GenerationFence, bool)>>,
     turn_ids: Mutex<Vec<TurnId>>,
+    prompts: Mutex<Vec<String>>,
     steer_inputs: Mutex<Vec<Vec<String>>>,
     task_states: Mutex<Vec<(String, RuntimeTaskStatus)>>,
     cancelled_on_entry: Mutex<Vec<bool>>,
@@ -266,6 +267,7 @@ impl ScriptedExecutor {
             calls: AtomicUsize::new(0),
             generations: Mutex::new(Vec::new()),
             turn_ids: Mutex::new(Vec::new()),
+            prompts: Mutex::new(Vec::new()),
             steer_inputs: Mutex::new(Vec::new()),
             task_states: Mutex::new(Vec::new()),
             cancelled_on_entry: Mutex::new(Vec::new()),
@@ -283,6 +285,10 @@ impl ScriptedExecutor {
 
     fn turn_ids(&self) -> Vec<TurnId> {
         self.turn_ids.lock().unwrap().clone()
+    }
+
+    fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().unwrap().clone()
     }
 
     fn steer_inputs(&self) -> Vec<Vec<String>> {
@@ -329,6 +335,10 @@ impl ThreadOperationExecutor for ScriptedExecutor {
             .lock()
             .unwrap()
             .push(request.turn_id().clone());
+        self.prompts
+            .lock()
+            .unwrap()
+            .push(request.prompt().to_string());
         let task = thread
             .lifecycle()
             .active_task()
@@ -2054,6 +2064,49 @@ fn actor_owned_steer_is_operation_fenced_and_drained_once() {
     second.wait_timeout(TEST_TIMEOUT).expect("second terminal");
     assert_eq!(executor.steer_inputs().len(), 2);
     assert!(executor.steer_inputs()[1].is_empty());
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn steer_a_finished_turn_never_applied_runs_as_the_next_turn() {
+    let first_gate = ManualGate::new();
+    let second_gate = ManualGate::new();
+    let executor = Arc::new(ScriptedExecutor::new([
+        TestBehavior::WaitForReleaseWithoutDrainingSteer {
+            gate: first_gate.clone(),
+            status: RunStatus::Success,
+        },
+        TestBehavior::WaitForRelease {
+            gate: second_gate.clone(),
+            status: RunStatus::Success,
+        },
+    ]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+    // A surface binds the prompt queue when it attaches, which is what lets
+    // the thread start queued work on its own.
+    thread
+        .prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::List)
+        .expect("bind the prompt queue");
+
+    let operation = thread
+        .start_turn(HostedTurnRequest::new("first"), io::sink())
+        .expect("start first turn");
+    first_gate.wait_until_entered();
+    assert!(matches!(
+        operation.steer("answer this too").expect("steer"),
+        SteerOperationResult::Accepted { .. }
+    ));
+    // The turn ends without another model request, so the steer never
+    // reached the model; it must not be dropped with the operation.
+    first_gate.release();
+    operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("finish first turn");
+
+    second_gate.wait_until_entered();
+    assert_eq!(executor.prompts(), ["first", "answer this too"]);
+    second_gate.release();
 
     host.shutdown().expect("shutdown runtime host");
 }
