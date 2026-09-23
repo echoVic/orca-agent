@@ -15213,10 +15213,13 @@ mod tests {
             ("chrome.rs", include_str!("chrome.rs")),
             ("shortcuts.rs", include_str!("shortcuts.rs")),
         ] {
+            // A Windows checkout has CRLF line endings; the test-module
+            // marker must still end the production part.
+            let source = source.replace("\r\n", "\n");
             let production = source
                 .split("#[cfg(test)]\nmod tests")
                 .next()
-                .unwrap_or(source);
+                .unwrap_or(&source);
             let offenders: Vec<&str> = production
                 .lines()
                 .filter(|line| {
