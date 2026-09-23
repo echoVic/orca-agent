@@ -56,6 +56,10 @@ Trong TUI, `@` tìm kiếm tệp, Skills, Plugins và MCP Resources. Dùng `/pla
 để lập kế hoạch chỉ đọc, `/goal` cho mục tiêu lâu dài, `/workflows` cho công việc
 nền và `/trust` để quản lý quyền sandbox của thư mục hiện tại.
 
+### Dùng Orca từ Pilion Browser
+
+[Pilion Browser](https://github.com/echoVic/pilion-browser) là một trình duyệt desktop hoạt động như một ACP client. Chọn **Orca** trong bảng Agent của nó: Pilion khởi chạy `orca --mode=acp`, chuyển tiếp `DEEPSEEK_API_KEY`, và cung cấp các tab của chính nó cho Orca dưới dạng công cụ MCP (`browser_snapshot`, `browser_screenshot`, điều hướng, nhấp, gõ) kèm phê duyệt trước hành động và bàn giao cho con người. Bộ cài đặt cho macOS, Windows và Linux có tại [trang phát hành của Pilion](https://github.com/echoVic/pilion-browser/releases).
+
 ## Khả năng chính
 
 - Tích hợp trực tiếp ngữ nghĩa suy luận và sử dụng công cụ của DeepSeek, với SSE,
