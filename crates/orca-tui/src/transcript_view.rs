@@ -38,6 +38,12 @@ struct CompactWrappedLine {
     /// shows it, but clipboard extraction re-inserts it so soft-wrapped prose
     /// copies as "foo bar", not "foobar".
     wrap_gaps: Vec<String>,
+    /// Blank columns drawn before every row after the first, so a wrapped
+    /// line hangs under its first content column instead of restarting at
+    /// the left edge (see `hanging_indent`). Presentation only: `text` never
+    /// holds these blanks, so copy, search and selection read the logical
+    /// line as written and only shift their screen columns by it.
+    continuation_indent: u16,
     style_runs: Vec<StyleRun>,
     alignment: Option<Alignment>,
 }
@@ -48,6 +54,7 @@ impl CompactWrappedLine {
             text: String::new(),
             row_boundaries: vec![0],
             wrap_gaps: Vec::new(),
+            continuation_indent: 0,
             style_runs: Vec::new(),
             alignment,
         }
@@ -79,6 +86,16 @@ impl CompactWrappedLine {
 
     fn row_count(&self) -> usize {
         self.row_boundaries.len().saturating_sub(1)
+    }
+
+    /// Screen columns before `row`'s text: none on the first row, the hang
+    /// on every later one.
+    fn row_indent(&self, row: usize) -> usize {
+        if row == 0 {
+            0
+        } else {
+            usize::from(self.continuation_indent)
+        }
     }
 
     fn materialize_rows(&self, start: usize, end: usize) -> Vec<Line<'static>> {
@@ -114,6 +131,10 @@ impl CompactWrappedLine {
                         run_index += 1;
                     }
                 }
+                let indent = self.row_indent(row);
+                if indent > 0 {
+                    spans.insert(0, Span::raw(" ".repeat(indent)));
+                }
                 let mut line = Line::from(spans);
                 line.alignment = self.alignment;
                 line
@@ -122,11 +143,29 @@ impl CompactWrappedLine {
     }
 }
 
+/// `line` wrapped exactly as ratatui's `Paragraph` with `Wrap { trim: false }`
+/// would, with no hang — the form the tests compare against ratatui.
+#[cfg(test)]
 fn wrap_line_ratatui_compatible(line: &Line<'_>, width: u16) -> CompactWrappedLine {
+    wrap_line(line, width, 0)
+}
+
+/// A transcript line wrapped with its later rows hung under its first
+/// content column.
+fn wrap_line_hanging(line: &Line<'_>, width: u16) -> CompactWrappedLine {
+    wrap_line(line, width, hanging_indent(line, width))
+}
+
+fn wrap_line(line: &Line<'_>, width: u16, continuation_indent: u16) -> CompactWrappedLine {
     let mut wrapped = CompactWrappedLine::new(line.alignment);
     if width == 0 {
         return wrapped;
     }
+    wrapped.continuation_indent = continuation_indent.min(width - 1);
+    let continuation_width = width - wrapped.continuation_indent;
+    // Room on the row being filled: the full width for the first row, less
+    // the hang for every row after it. With no hang this is plain ratatui.
+    let mut row_width = width;
 
     // This mirrors ratatui 0.29's WordWrapper with trim=false. Paragraph's
     // scroll offset is u16, so exceptionally tall logical lines get a compact
@@ -142,7 +181,7 @@ fn wrap_line_ratatui_compatible(line: &Line<'_>, width: u16) -> CompactWrappedLi
     for grapheme in line.styled_graphemes(Style::default()) {
         let is_whitespace = grapheme_is_whitespace(&grapheme);
         let symbol_width = grapheme.symbol.width() as u16;
-        if symbol_width > width {
+        if symbol_width > row_width {
             continue;
         }
 
@@ -151,7 +190,7 @@ fn wrap_line_ratatui_compatible(line: &Line<'_>, width: u16) -> CompactWrappedLi
             && word_width
                 .saturating_add(whitespace_width)
                 .saturating_add(symbol_width)
-                > width;
+                > row_width;
 
         if word_found || untrimmed_overflow {
             pending_line.extend(pending_whitespace.drain(..));
@@ -162,17 +201,18 @@ fn wrap_line_ratatui_compatible(line: &Line<'_>, width: u16) -> CompactWrappedLi
             word_width = 0;
         }
 
-        let line_full = line_width >= width;
+        let line_full = line_width >= row_width;
         let pending_word_overflow = symbol_width > 0
             && line_width
                 .saturating_add(whitespace_width)
                 .saturating_add(word_width)
-                >= width;
+                >= row_width;
 
         if line_full || pending_word_overflow {
-            let mut remaining_width = width.saturating_sub(line_width);
+            let mut remaining_width = row_width.saturating_sub(line_width);
             wrapped.push_row(mem::take(&mut pending_line));
             line_width = 0;
+            row_width = continuation_width;
 
             while let Some(grapheme) = pending_whitespace.front() {
                 let grapheme_width = grapheme.symbol.width() as u16;
@@ -219,11 +259,92 @@ fn wrap_line_ratatui_compatible(line: &Line<'_>, width: u16) -> CompactWrappedLi
 }
 
 fn grapheme_is_whitespace(grapheme: &StyledGrapheme<'_>) -> bool {
+    symbol_is_whitespace(grapheme.symbol)
+}
+
+fn symbol_is_whitespace(symbol: &str) -> bool {
     const NBSP: &str = "\u{00a0}";
     const ZWSP: &str = "\u{200b}";
 
-    grapheme.symbol == ZWSP
-        || (grapheme.symbol.chars().all(char::is_whitespace) && grapheme.symbol != NBSP)
+    symbol == ZWSP || (symbol.chars().all(char::is_whitespace) && symbol != NBSP)
+}
+
+/// Columns a wrapped line's later rows hang at, so they line up under its
+/// first content column instead of restarting at the left edge: its leading
+/// whitespace plus up to two marker prefixes, each followed by whitespace —
+/// a transcript gutter glyph (`●`, `ℹ`, `│`, `✓`…) and then a list bullet or
+/// ordered-list number (`•`, `-`, `12.`). Zero for centred or right-aligned
+/// lines, and when the hang would take more than half the width, where
+/// squeezing the text into a sliver reads worse than not hanging it.
+fn hanging_indent(line: &Line<'_>, width: u16) -> u16 {
+    if matches!(line.alignment, Some(Alignment::Center | Alignment::Right)) {
+        return 0;
+    }
+    // Only the prefix matters, and a prefix of 64 graphemes is already past
+    // the half-width cap on any real terminal.
+    let symbols = line
+        .styled_graphemes(Style::default())
+        .map(|grapheme| grapheme.symbol)
+        .take(64)
+        .collect::<Vec<_>>();
+    let is_space = |index: usize| {
+        symbols
+            .get(index)
+            .is_some_and(|symbol| symbol_is_whitespace(symbol))
+    };
+    let mut index = 0;
+    let mut markers = 0;
+    loop {
+        while is_space(index) {
+            index += 1;
+        }
+        if markers == 2 {
+            break;
+        }
+        let digits = symbols
+            .get(index..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|symbol| symbol.len() == 1 && symbol.as_bytes()[0].is_ascii_digit())
+            .count();
+        let marker_end = if digits > 0 {
+            symbols
+                .get(index + digits)
+                .is_some_and(|symbol| *symbol == "." || *symbol == ")")
+                .then_some(index + digits + 1)
+        } else {
+            symbols
+                .get(index)
+                .is_some_and(|symbol| is_marker_symbol(symbol))
+                .then_some(index + 1)
+        };
+        match marker_end {
+            Some(end) if is_space(end) => {
+                index = end;
+                markers += 1;
+            }
+            _ => break,
+        }
+    }
+    let columns = symbols[..index]
+        .iter()
+        .map(|symbol| symbol.width())
+        .sum::<usize>();
+    let columns = u16::try_from(columns).unwrap_or(u16::MAX);
+    if columns.saturating_mul(2) > width {
+        0
+    } else {
+        columns
+    }
+}
+
+/// Whether a prefix grapheme reads as a glyph rather than the start of a
+/// word. The Letterlike Symbols block counts as glyphs although Unicode
+/// files most of it as letters: `ℹ` opens every system notice.
+fn is_marker_symbol(symbol: &str) -> bool {
+    symbol
+        .chars()
+        .all(|ch| !ch.is_alphanumeric() || ('\u{2100}'..='\u{214f}').contains(&ch))
 }
 
 pub(crate) fn viewport_paragraph(lines: Vec<Line<'static>>) -> Paragraph<'static> {
@@ -975,7 +1096,7 @@ impl TranscriptRenderCache {
         let ratatui_width = width.min(u16::MAX as usize) as u16;
         let wrapped_lines = lines
             .iter()
-            .map(|line| wrap_line_ratatui_compatible(line, ratatui_width))
+            .map(|line| wrap_line_hanging(line, ratatui_width))
             .collect::<Vec<_>>();
         let mut line_cumulative_heights: Vec<usize> = Vec::with_capacity(wrapped_lines.len() + 1);
         line_cumulative_heights.push(0);
@@ -1296,7 +1417,7 @@ impl TranscriptRenderCache {
         let mut clicked: Option<usize> = None;
         for row_within in 0..wrapped.row_count() {
             let text = self.row_text(message_index, line_index, row_within);
-            let mut col = 0usize;
+            let mut col = wrapped.row_indent(row_within);
             for ch in text.chars() {
                 let width = ch.width().unwrap_or(0);
                 if row_within == clicked_row_within
@@ -1355,8 +1476,8 @@ impl TranscriptRenderCache {
         let first_abs_row = pos.row - row_within;
         let last_row_within = wrapped.row_count().saturating_sub(1);
         let last_text = self.row_text(message_index, line_index, last_row_within);
-        let mut last_leading_col = 0usize;
-        let mut col = 0usize;
+        let mut col = wrapped.row_indent(last_row_within);
+        let mut last_leading_col = col;
         for ch in last_text.chars() {
             last_leading_col = col;
             col += ch.width().unwrap_or(0);
@@ -1418,10 +1539,16 @@ impl TranscriptRenderCache {
             }
 
             let (col_start, col_end) = selection.cols_on_row(row).unwrap_or((0, None));
+            // Selection columns are screen columns; a continuation row's hang
+            // sits before its text and is not part of it.
+            let indent = self.entries[message_index]
+                .as_ref()
+                .and_then(|cached| cached.wrapped_lines.get(line_index))
+                .map_or(0, |wrapped| wrapped.row_indent(row_within));
             current_line.push_str(slice_row_by_columns(
                 self.row_text(message_index, line_index, row_within),
-                col_start,
-                col_end,
+                col_start.saturating_sub(indent),
+                col_end.map(|end| end.saturating_sub(indent)),
             ));
             previous = Some((message_index, line_index, row_within));
         }
@@ -1502,7 +1629,7 @@ fn searchable_logical_line(
         let row_end = wrapped.row_boundaries[row_within + 1];
         let row = &wrapped.text[row_start..row_end];
         let absolute_row = absolute_first_row.saturating_add(row_within);
-        let mut col = 0usize;
+        let mut col = wrapped.row_indent(row_within);
         for (character_index, character) in row.chars().enumerate() {
             let spinner = exclude_spinner
                 && row_within == 0
@@ -1546,7 +1673,7 @@ fn searchable_logical_line(
         let row = &wrapped.text[row_start..row_end];
         SelectionPos {
             row: absolute_first_row.saturating_add(last_row),
-            col: UnicodeWidthStr::width(row),
+            col: wrapped.row_indent(last_row) + UnicodeWidthStr::width(row),
         }
     } else {
         SelectionPos {
@@ -2237,6 +2364,96 @@ mod tests {
         assert_eq!(matches[0].start, SelectionPos { row: 0, col: 0 });
         assert_eq!(matches[0].end, SelectionPos { row: 1, col: 4 });
         assert_eq!(matches[0].line_identity.message_revision, 7);
+    }
+
+    #[test]
+    fn hanging_indent_lines_continuation_rows_up_under_the_first_content_column() {
+        use super::hanging_indent;
+        let at = |text: &str| hanging_indent(&Line::from(text.to_string()), 80);
+        assert_eq!(at(" ●  reply text"), 4, "assistant gutter");
+        assert_eq!(at("    continuation paragraph"), 4, "gutter continuation");
+        assert_eq!(at("    ℹ notice text"), 6, "notice marker");
+        assert_eq!(at("    • list item"), 6, "bullet under the gutter");
+        assert_eq!(at(" ●  • first item"), 6, "gutter glyph, then a bullet");
+        assert_eq!(at("    12. ordered item"), 8, "ordered-list number");
+        assert_eq!(
+            at("    │     indented output"),
+            10,
+            "rail, then the output's own indent"
+        );
+        assert_eq!(
+            at("    └ +12 lines"),
+            6,
+            "a marker must be followed by whitespace"
+        );
+        assert_eq!(
+            at("    // comment"),
+            4,
+            "punctuation glued to text is not a marker"
+        );
+        assert_eq!(at("plain text"), 0);
+    }
+
+    #[test]
+    fn hanging_indent_is_dropped_where_it_would_squeeze_the_text() {
+        use super::hanging_indent;
+        let line = Line::from("          ten spaces then text".to_string());
+        assert_eq!(hanging_indent(&line, 20), 10);
+        assert_eq!(hanging_indent(&line, 19), 0);
+        let centred = Line::from(" ●  centred".to_string()).alignment(Alignment::Center);
+        assert_eq!(hanging_indent(&centred, 80), 0);
+    }
+
+    #[test]
+    fn a_wrapped_gutter_line_hangs_its_continuation_rows_under_the_text() {
+        let cache = prepared_search_cache(&[vec![Line::from(" ●  alpha beta gamma delta")]], 14);
+
+        let rows = cache
+            .viewport(0, 0, 10)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(rows, [" ●  alpha beta", "    gamma", "    delta"]);
+    }
+
+    #[test]
+    fn the_hang_is_presentation_so_copy_search_and_selection_see_the_text() {
+        let cache = prepared_search_cache(&[vec![Line::from(" ●  alpha beta gamma delta")]], 14);
+        let pos = |row, col| SelectionPos { row, col };
+
+        assert_eq!(
+            cache.extract_text(&selection((0, 0), (99, 99))),
+            " ●  alpha beta gamma delta",
+            "copying the wrapped line rejoins it without the hang's blanks"
+        );
+        assert_eq!(cache.extract_text(&selection((1, 0), (1, 8))), "gamma");
+
+        let across_the_wrap = cache.search(0, &SearchQuery::new("beta gam"));
+        assert_eq!(across_the_wrap.len(), 1);
+        assert_eq!(
+            (across_the_wrap[0].start, across_the_wrap[0].end),
+            (pos(0, 10), pos(1, 7))
+        );
+        let last_word = cache.search(0, &SearchQuery::new("delta"));
+        assert_eq!(
+            (last_word[0].start, last_word[0].end),
+            (pos(2, 4), pos(2, 9))
+        );
+
+        assert_eq!(
+            cache.word_bounds_at(pos(1, 6)),
+            Some((pos(1, 4), pos(1, 8)))
+        );
+        assert_eq!(
+            cache.word_bounds_at(pos(1, 1)),
+            None,
+            "the hang holds no text"
+        );
+        assert_eq!(
+            cache.line_bounds_at(pos(1, 6)),
+            Some((pos(0, 0), pos(2, 8)))
+        );
     }
 
     #[test]
