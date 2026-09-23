@@ -1275,26 +1275,10 @@ where
         && key.modifiers.is_empty()
     {
         vim_state.cancel_pending_command();
-        if let Some(task) = state.selected_agent_dock_task() {
-            let Some(expected_revision) = task.publication_revision else {
-                return Ok(KeyEventFlow::Unhandled);
-            };
-            if task.subagent_child_thread_id.is_some() {
-                let _ = action_tx.send(UserAction::FocusChildThread {
-                    task_id: task.id.clone(),
-                    expected_revision,
-                });
-            } else {
-                let request = crate::protocol::TaskTranscriptRequest {
-                    task_id: task.id.clone(),
-                    expected_revision,
-                };
-                state.show_agents();
-                state.select_agent_workspace_task(&request.task_id);
-                state.begin_task_transcript_request(request.clone());
-                let _ = action_tx.send(UserAction::ReadTaskTranscript(request));
-            }
-        } else {
+        let Some(task_id) = state.selected_agent_dock_task().map(|task| task.id.clone()) else {
+            return Ok(KeyEventFlow::Unhandled);
+        };
+        if !crate::agent_workspace_actions::open_agent_task(state, action_tx, &task_id) {
             return Ok(KeyEventFlow::Unhandled);
         }
         return Ok(KeyEventFlow::Continue);

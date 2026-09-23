@@ -145,6 +145,20 @@ impl<'a, 'text> RendererInputRouter<'a, 'text> {
                         let event = Event::Key(key);
                         return self.route_status_key(&event, &key, &mut clear_terminal);
                     }
+                    MouseFlow::OpenAgent(task_id) => {
+                        self.vim_state.cancel_pending_command();
+                        crate::agent_workspace_actions::open_agent_task(
+                            self.state,
+                            self.action_tx,
+                            &task_id,
+                        );
+                        return Ok(None);
+                    }
+                    MouseFlow::ReturnToMain => {
+                        self.vim_state.cancel_pending_command();
+                        crate::agent_workspace_actions::return_to_main(self.state, self.action_tx);
+                        return Ok(None);
+                    }
                 }
                 let Event::Key(key) = &event else {
                     return Ok(None);

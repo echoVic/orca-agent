@@ -6,6 +6,56 @@ use crate::agent_workspace::AgentWorkspaceRow;
 use crate::protocol::{TaskTranscriptRequest, UserAction};
 use crate::types::{AppState, PanelMode};
 
+/// Opens a subagent the way Enter on it does: a child on a thread of this
+/// process takes over the conversation view, any other one opens its
+/// transcript in the Agents panel. `false` when there is nothing to open yet,
+/// because the surface has not published the task.
+pub(crate) fn open_agent_task(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+    task_id: &str,
+) -> bool {
+    let Some(task) = state
+        .workflow_tasks()
+        .iter()
+        .find(|task| task.id == task_id && task.task_type == TaskType::Subagent)
+    else {
+        return false;
+    };
+    let Some(expected_revision) = task.publication_revision else {
+        return false;
+    };
+    if task.subagent_child_thread_id.is_some() {
+        let _ = action_tx.send(UserAction::FocusChildThread {
+            task_id: task_id.to_string(),
+            expected_revision,
+        });
+        return true;
+    }
+    let request = TaskTranscriptRequest {
+        task_id: task_id.to_string(),
+        expected_revision,
+    };
+    state.show_agents();
+    state.select_agent_workspace_task(task_id);
+    state.begin_task_transcript_request(request.clone());
+    let _ = action_tx.send(UserAction::ReadTaskTranscript(request));
+    true
+}
+
+/// Leaves whatever agent is open for the main conversation: a focused child
+/// thread hands the view back to its parent and the Agents panel closes.
+pub(crate) fn return_to_main(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>) {
+    if state.conversation_target().task_id().is_some() {
+        let _ = action_tx.send(UserAction::ReturnToParentThread);
+    }
+    if state.panel_mode == PanelMode::Agents {
+        state.clear_task_transcript();
+        state.show_conversation();
+    }
+    state.agent_dock_selected_task_id = None;
+}
+
 pub(crate) fn handle_agent_workspace_key(
     key_code: KeyCode,
     state: &mut AppState,
@@ -40,31 +90,9 @@ pub(crate) fn handle_agent_workspace_key(
             true
         }
         KeyCode::Enter => {
-            let action = match state.selected_agent_row() {
-                Some(AgentWorkspaceRow::Subagent { task, .. }) => {
-                    task.publication_revision.map(|expected_revision| {
-                        if task.subagent_child_thread_id.is_some() {
-                            UserAction::FocusChildThread {
-                                task_id: task.id.clone(),
-                                expected_revision,
-                            }
-                        } else {
-                            UserAction::ReadTaskTranscript(TaskTranscriptRequest {
-                                task_id: task.id.clone(),
-                                expected_revision,
-                            })
-                        }
-                    })
-                }
-                Some(AgentWorkspaceRow::BackgroundTask { .. })
-                | Some(AgentWorkspaceRow::WorkflowAgent { .. }) => None,
-                None => None,
-            };
-            if let Some(action) = action {
-                if let UserAction::ReadTaskTranscript(request) = &action {
-                    state.begin_task_transcript_request(request.clone());
-                }
-                let _ = action_tx.send(action);
+            if let Some(AgentWorkspaceRow::Subagent { task, .. }) = state.selected_agent_row() {
+                let task_id = task.id.clone();
+                open_agent_task(state, action_tx, &task_id);
             }
             true
         }
@@ -143,7 +171,9 @@ mod tests {
     };
     use orca_core::workflow_types::WorkflowAgentStatus;
 
-    use super::handle_agent_workspace_key;
+    use super::{handle_agent_workspace_key, open_agent_task, return_to_main};
+    use crate::agent_workspace::AgentHitTarget;
+    use crate::input_event_actions::MouseFlow;
     use crate::protocol::{TaskTranscriptRequest, UserAction};
     use crate::types::{AppState, PanelMode};
 
@@ -390,5 +420,175 @@ mod tests {
             &tx,
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Draws one frame, as the render loop does, so the click targets are
+    /// the ones on screen.
+    fn render_once(state: &mut AppState) {
+        let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = tui_textarea::TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("test backend");
+        terminal
+            .draw(|frame| crate::ui::render(frame, state, &textarea, &theme))
+            .expect("draw");
+    }
+
+    fn clicks_on(state: &AppState, target: &AgentHitTarget) -> Vec<(u16, u16)> {
+        state
+            .agent_hit_areas
+            .iter()
+            .filter(|hit| hit.target == *target)
+            .map(|hit| (hit.rect.x + 2, hit.rect.y))
+            .collect()
+    }
+
+    fn click(state: &mut AppState, (column, row): (u16, u16)) -> MouseFlow {
+        let mut textarea = tui_textarea::TextArea::default();
+        crate::input_event_actions::handle_mouse_event(
+            &crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            }),
+            state,
+            &mut textarea,
+            std::time::Instant::now(),
+        )
+    }
+
+    fn conversation_with(
+        tasks: Vec<BackgroundTaskSummary>,
+    ) -> (AppState, mpsc::Receiver<UserAction>) {
+        let (mut state, rx) = state(tasks);
+        state.show_conversation();
+        (state, rx)
+    }
+
+    #[test]
+    fn a_click_on_a_running_agent_in_the_dock_opens_its_transcript() {
+        let (mut state, rx) = conversation_with(vec![task("worker", 1_000)]);
+        render_once(&mut state);
+        let rows = clicks_on(&state, &AgentHitTarget::DockAgent("worker".to_string()));
+        assert_eq!(rows.len(), 2, "its name row and its detail row");
+
+        for at in &rows {
+            assert_eq!(
+                click(&mut state, *at),
+                MouseFlow::OpenAgent("worker".to_string())
+            );
+        }
+        assert_eq!(state.agent_dock_selected_task_id.as_deref(), Some("worker"));
+
+        let tx = state.event_tx.clone();
+        assert!(open_agent_task(&mut state, &tx, "worker"));
+        assert_eq!(state.panel_mode, PanelMode::Agents);
+        assert_eq!(
+            state
+                .task_transcript()
+                .map(|view| view.request.task_id.as_str()),
+            Some("worker")
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserAction::ReadTaskTranscript(TaskTranscriptRequest {
+                task_id,
+                expected_revision: 7,
+            })) if task_id == "worker"
+        ));
+    }
+
+    #[test]
+    fn an_agent_on_a_live_child_thread_opens_by_focusing_that_thread() {
+        let mut child = task("child", 1_000);
+        child.subagent_child_thread_id = Some("child-thread".to_string());
+        let (mut state, rx) = conversation_with(vec![child]);
+        let tx = state.event_tx.clone();
+
+        assert!(open_agent_task(&mut state, &tx, "child"));
+
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserAction::FocusChildThread {
+                task_id,
+                expected_revision: 7,
+            }) if task_id == "child"
+        ));
+        let mut unpublished = task("unpublished", 2_000);
+        unpublished.publication_revision = None;
+        state.replace_workflow_tasks_for_test(vec![unpublished]);
+        assert!(
+            !open_agent_task(&mut state, &tx, "unpublished"),
+            "an agent the surface has not published has nothing to open"
+        );
+    }
+
+    #[test]
+    fn a_click_on_main_leaves_the_open_agent_for_the_main_conversation() {
+        let (mut state, rx) = conversation_with(vec![task("worker", 1_000)]);
+        let tx = state.event_tx.clone();
+        assert!(open_agent_task(&mut state, &tx, "worker"));
+        let _ = rx.try_recv();
+        render_once(&mut state);
+
+        let main = clicks_on(&state, &AgentHitTarget::Main);
+        assert_eq!(main.len(), 1);
+        assert_eq!(click(&mut state, main[0]), MouseFlow::ReturnToMain);
+        return_to_main(&mut state, &tx);
+
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
+        assert!(state.task_transcript().is_none());
+        assert!(state.agent_dock_selected_task_id.is_none());
+        assert!(rx.try_recv().is_err(), "no child thread was focused");
+
+        state.update(crate::protocol::TuiEvent::ChildFocusChanged {
+            task_id: Some("worker".to_string()),
+        });
+        return_to_main(&mut state, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserAction::ReturnToParentThread)
+        ));
+    }
+
+    #[test]
+    fn a_click_on_the_dock_header_opens_the_agents_panel() {
+        let (mut state, _rx) = conversation_with(vec![task("worker", 1_000)]);
+        render_once(&mut state);
+        let header = clicks_on(&state, &AgentHitTarget::Workspace);
+
+        assert_eq!(click(&mut state, header[0]), MouseFlow::Handled);
+        assert_eq!(state.panel_mode, PanelMode::Agents);
+    }
+
+    #[test]
+    fn a_panel_row_is_selected_by_one_click_and_opened_by_the_next() {
+        let (mut state, _rx) = state(vec![task("first", 1_000), task("second", 2_000)]);
+        render_once(&mut state);
+        let second = clicks_on(&state, &AgentHitTarget::WorkspaceRow(1));
+        assert_eq!(second.len(), 1);
+
+        assert_eq!(click(&mut state, second[0]), MouseFlow::Handled);
+        assert_eq!(state.agent_selected_index(), 1);
+        render_once(&mut state);
+        assert_eq!(
+            click(&mut state, second[0]),
+            MouseFlow::OpenAgent("second".to_string())
+        );
+    }
+
+    #[test]
+    fn the_shortcuts_overlay_keeps_the_dock_from_taking_a_click() {
+        let (mut state, _rx) = conversation_with(vec![task("worker", 1_000)]);
+        render_once(&mut state);
+        let rows = clicks_on(&state, &AgentHitTarget::DockAgent("worker".to_string()));
+        state.show_shortcuts = true;
+
+        assert_ne!(
+            click(&mut state, rows[0]),
+            MouseFlow::OpenAgent("worker".to_string())
+        );
     }
 }

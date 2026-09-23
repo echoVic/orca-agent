@@ -256,6 +256,55 @@ fn tui_shows_a_background_agents_progress_while_the_parent_turn_waits_on_it() {
 }
 
 #[test]
+fn tui_click_on_a_running_background_agent_opens_its_transcript() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n")
+        .expect("configure full-auto mode");
+    let release_marker = cwd.path().join("release-clicked-agent");
+    let mut process = PtyProcess::spawn_with_prompt(
+        home.path(),
+        cwd.path(),
+        &format!(
+            "subagent async mock_stream_release_marker {}",
+            release_marker.display()
+        ),
+    )
+    .expect("spawn background-agent TUI in PTY");
+    let mut output = Vec::new();
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "Agents 1 active",
+        "parent did not expose the running background agent",
+    );
+
+    // The agent's row in the dock under the transcript; the transcript's
+    // own echo of the prompt carries the "subagent" prefix.
+    let screen = reconstruct_screen(&output);
+    let row = screen
+        .lines()
+        .position(|line| line.contains("mock_stream_release_marker") && !line.contains("subagent"))
+        .map(|index| index + 1)
+        .unwrap_or_else(|| panic!("the dock does not list the agent; screen=\n{screen}"));
+    process
+        .write(format!("\x1b[<0;6;{row}M\x1b[<0;6;{row}m").as_bytes())
+        .expect("click the running agent");
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "Agent Transcript",
+        "clicking the running agent did not open its transcript",
+    );
+
+    std::fs::write(&release_marker, b"release").expect("release background agent");
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
 fn tui_escape_cancels_a_running_subagent_and_keeps_the_parent_usable() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");

@@ -2,6 +2,28 @@ use std::cmp::Ordering;
 
 use orca_core::task_types::{BackgroundTaskSummary, TaskType, WorkflowAgentTaskSummary};
 use orca_core::workflow_types::WorkflowAgentStatus;
+use ratatui::layout::Rect;
+
+/// What a click reaches in the agents dock under the transcript or in the
+/// Agents panel's list. Recomputed from scratch every frame, like
+/// `CollapsibleHitArea`, so it always matches what was last drawn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AgentHitTarget {
+    /// The dock's header or its overflow row: the Agents panel.
+    Workspace,
+    /// The dock's Main row: back to the main conversation.
+    Main,
+    /// A subagent in the dock, through its name row or its detail row.
+    DockAgent(String),
+    /// A row of the Agents panel's list, by index.
+    WorkspaceRow(usize),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentHitArea {
+    pub(crate) rect: Rect,
+    pub(crate) target: AgentHitTarget,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AgentWorkspaceIdentity {
@@ -173,6 +195,16 @@ impl AgentWorkspaceState {
         };
         self.selected = index;
         self.selected_identity = Some(rows[index].identity());
+        true
+    }
+
+    pub(crate) fn select_index(&mut self, tasks: &[BackgroundTaskSummary], index: usize) -> bool {
+        let rows = agent_workspace_rows(tasks);
+        let Some(row) = rows.get(index) else {
+            return false;
+        };
+        self.selected = index;
+        self.selected_identity = Some(row.identity());
         true
     }
 

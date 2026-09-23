@@ -24,7 +24,7 @@ use orca_file_search::SearchPhase;
 use orca_runtime::history::{SessionSummary, StoredSessionHealth};
 use orca_runtime::surface::{TaskTranscriptItem, TaskTranscriptToolStatus};
 
-use crate::agent_workspace::AgentWorkspaceRow;
+use crate::agent_workspace::{AgentHitArea, AgentHitTarget, AgentWorkspaceRow};
 use crate::chrome::{GUTTER_CONTINUATION, GUTTER_WIDTH, TAIL_ROW};
 use crate::diagnostics::{DiagnosticContext, DiagnosticLevel, TuiDiagnostic};
 use crate::display_text::{compact_long_text, truncate_to_display_width};
@@ -62,6 +62,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     state.viewport.frame_area = Some(frame.area());
     state.viewport.input_area = None;
     state.viewport.search_area = None;
+    state.agent_hit_areas = Vec::new();
     state.begin_image_render_frame();
     if state.status == AppStatus::Setup {
         render_setup(frame, state, textarea, theme);
@@ -101,7 +102,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     let goal_height: u16 = if state.current_goal().is_some() { 3 } else { 0 };
     // Live child work is visible from the conversation view. Keep the stack bounded so
     // a large fan-out cannot displace the transcript and composer entirely.
-    let activity_lines = activity_lines(state, theme, frame.area().width);
+    let (activity_lines, activity_targets): (Vec<_>, Vec<_>) =
+        activity_rows(state, theme, frame.area().width)
+            .into_iter()
+            .unzip();
     let queue_preview_lines = queued_preview_lines(state, frame.area().width, theme);
     let queue_preview_height = queue_preview_lines.len().min(3) as u16;
     let desired_activity_height = 1_u16.saturating_add(activity_lines.len() as u16);
@@ -142,6 +146,20 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     }
     if activity_height > 0 {
         render_activity(frame, chunks[3], &activity_lines);
+        // `render_activity` leaves the area's first row blank as a spacer.
+        let area = chunks[3];
+        state.agent_hit_areas.extend(
+            activity_targets
+                .into_iter()
+                .take(usize::from(area.height.saturating_sub(1)))
+                .enumerate()
+                .filter_map(|(row, target)| {
+                    Some(AgentHitArea {
+                        rect: Rect::new(area.x, area.y + 1 + row as u16, area.width, 1),
+                        target: target?,
+                    })
+                }),
+        );
     }
     if queue_preview_height > 0 {
         frame.render_widget(Paragraph::new(queue_preview_lines), chunks[4]);
@@ -2097,6 +2115,16 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
         let mut list_state = ListState::default();
         list_state.select(Some(selected_index));
         frame.render_stateful_widget(list, areas[2], &mut list_state);
+        let list_area = areas[2];
+        state.agent_hit_areas.extend(
+            (list_state.offset()..rows.len())
+                .take(usize::from(list_area.height))
+                .enumerate()
+                .map(|(row, index)| AgentHitArea {
+                    rect: Rect::new(list_area.x, list_area.y + row as u16, list_area.width, 1),
+                    target: AgentHitTarget::WorkspaceRow(index),
+                }),
+        );
     }
 
     if focus_height > 0 {
@@ -4977,22 +5005,38 @@ const MAX_DEFAULT_SUBAGENTS: usize = 4;
 /// dock now owns the activity area instead of sharing it with a panel.
 const MAX_EXPANDED_SUBAGENTS: usize = 6;
 
+#[cfg(test)]
 fn activity_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+    activity_rows(state, theme, width)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect()
+}
+
+/// The activity area's lines, each with what a click on it reaches.
+fn activity_rows(
+    state: &AppState,
+    theme: &Theme,
+    width: u16,
+) -> Vec<(Line<'static>, Option<AgentHitTarget>)> {
+    let mut rows = Vec::new();
     if state.composer_images.is_paste_in_flight() {
-        lines.push(Line::from(Span::styled(
-            " ● reading image...".to_string(),
-            Style::default().fg(theme.warning),
-        )));
+        rows.push((
+            Line::from(Span::styled(
+                " ● reading image...".to_string(),
+                Style::default().fg(theme.warning),
+            )),
+            None,
+        ));
     } else if let Some(line) = foreground_activity_line(state, theme) {
-        lines.push(line);
+        rows.push((line, None));
     }
 
     if matches!(
         state.panel_mode,
         PanelMode::Conversation | PanelMode::Agents
     ) {
-        lines.extend(background_task_activity_lines(
+        rows.extend(background_task_activity_rows(
             state.workflow_tasks(),
             theme,
             state.tick,
@@ -5001,7 +5045,7 @@ fn activity_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Line<'stat
             width,
         ));
     }
-    lines
+    rows
 }
 
 /// Name and target of the tool currently executing in the live pane, if any.
@@ -5078,6 +5122,7 @@ fn foreground_activity_line(state: &AppState, theme: &Theme) -> Option<Line<'sta
     }
 }
 
+#[cfg(test)]
 fn background_task_activity_lines(
     tasks: &[BackgroundTaskSummary],
     theme: &Theme,
@@ -5086,6 +5131,20 @@ fn background_task_activity_lines(
     expanded: bool,
     width: u16,
 ) -> Vec<Line<'static>> {
+    background_task_activity_rows(tasks, theme, tick, selected_task_id, expanded, width)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect()
+}
+
+fn background_task_activity_rows(
+    tasks: &[BackgroundTaskSummary],
+    theme: &Theme,
+    tick: u64,
+    selected_task_id: Option<&str>,
+    expanded: bool,
+    width: u16,
+) -> Vec<(Line<'static>, Option<AgentHitTarget>)> {
     let activity_row = |text: String, color: Color| -> Line<'static> {
         Line::from(Span::styled(format!(" {text}"), Style::default().fg(color)))
     };
@@ -5098,16 +5157,19 @@ fn background_task_activity_lines(
     // never becomes a selectable row below.
     if expanded {
         let overall = TaskActivitySummary::from_tasks(tasks);
-        lines.push(activity_row(
-            format!(
-                "◆ Tasks · {} active · {} needs approval",
-                overall.active_count, overall.attention_count
+        lines.push((
+            activity_row(
+                format!(
+                    "◆ Tasks · {} active · {} needs approval",
+                    overall.active_count, overall.attention_count
+                ),
+                if overall.requires_attention() {
+                    theme.approval
+                } else {
+                    theme.warning
+                },
             ),
-            if overall.requires_attention() {
-                theme.approval
-            } else {
-                theme.warning
-            },
+            Some(AgentHitTarget::Workspace),
         ));
     }
 
@@ -5138,16 +5200,22 @@ fn background_task_activity_lines(
                 header.push_str(&format!(" · {attention} attention"));
             }
             header.push_str(" · /agents view");
-            lines.push(activity_row(
-                header,
-                if attention > 0 {
-                    theme.approval
-                } else {
-                    theme.warning
-                },
+            lines.push((
+                activity_row(
+                    header,
+                    if attention > 0 {
+                        theme.approval
+                    } else {
+                        theme.warning
+                    },
+                ),
+                Some(AgentHitTarget::Workspace),
             ));
         }
-        lines.push(activity_row("  ○ Main [default]".to_string(), theme.text));
+        lines.push((
+            activity_row("  ○ Main [default]".to_string(), theme.text),
+            Some(AgentHitTarget::Main),
+        ));
 
         for task in visible_subagents.iter().take(subagent_cap) {
             let selected = selected_task_id == Some(task.id.as_str());
@@ -5165,7 +5233,11 @@ fn background_task_activity_lines(
             } else {
                 selection
             };
-            lines.push(activity_row(format!("  {marker} {name} · {status}"), color));
+            let target = Some(AgentHitTarget::DockAgent(task.id.clone()));
+            lines.push((
+                activity_row(format!("  {marker} {name} · {status}"), color),
+                target.clone(),
+            ));
             let detail = if task.subagent_current_activity.is_some() {
                 subagent_progress_label_with_activity_limit(task, Some(64))
             } else {
@@ -5179,13 +5251,13 @@ fn background_task_activity_lines(
                 detail.push(elapsed_label(task));
                 detail.join(", ")
             };
-            lines.push(activity_row(format!("    {detail}"), theme.muted));
+            lines.push((activity_row(format!("    {detail}"), theme.muted), target));
         }
         let overflow = visible_subagents.len().saturating_sub(subagent_cap);
         if overflow > 0 {
-            lines.push(activity_row(
-                format!("  +{overflow} more · /tasks manage"),
-                theme.muted,
+            lines.push((
+                activity_row(format!("  +{overflow} more · /tasks manage"), theme.muted),
+                Some(AgentHitTarget::Workspace),
             ));
         }
     }
@@ -5229,7 +5301,10 @@ fn background_task_activity_lines(
         } else {
             theme.warning
         };
-        lines.push(activity_row(format!("● {}", labels.join(" · ")), color));
+        lines.push((
+            activity_row(format!("● {}", labels.join(" · ")), color),
+            None,
+        ));
     }
 
     // Trailing hint row: leading space matches `activity_row`'s left margin
@@ -5242,7 +5317,7 @@ fn background_task_activity_lines(
         );
         let mut spans = vec![Span::raw(" ")];
         spans.extend(hint.spans);
-        lines.push(Line::from(spans));
+        lines.push((Line::from(spans), None));
     }
 
     lines

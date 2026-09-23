@@ -1142,8 +1142,10 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/background_tasks.rs:handle_hosted_task_action:task.mutate", 5],
   [
     "crates/orca-tui/src/agent_workspace_actions.rs:handle_agent_workspace_key:user_action.route",
-    3,
+    2,
   ],
+  ["crates/orca-tui/src/agent_workspace_actions.rs:open_agent_task:user_action.route", 2],
+  ["crates/orca-tui/src/agent_workspace_actions.rs:return_to_main:user_action.route", 1],
   [
     "crates/orca-tui/src/background_tasks.rs:handle_hosted_task_action:background_approval.respond",
     1,
@@ -1163,7 +1165,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:user_action.route", 2],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:input_history.record", 1],
   ["crates/orca-tui/src/key_event_actions.rs:handle_key_event_preflight:settings.update", 1],
-  ["crates/orca-tui/src/key_event_actions.rs:handle_key_event_preflight:user_action.route", 3],
+  ["crates/orca-tui/src/key_event_actions.rs:handle_key_event_preflight:user_action.route", 1],
   ["crates/orca-tui/src/plan_approval_actions.rs:implement:user_action.route", 1],
   ["crates/orca-tui/src/queued_input.rs:request_runtime_queue_pause:user_action.route", 1],
   ["crates/orca-tui/src/queued_input.rs:request_runtime_queue_start:user_action.route", 1],

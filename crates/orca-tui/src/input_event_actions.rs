@@ -6,6 +6,7 @@ use tui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
 
+use crate::agent_workspace::{AgentHitTarget, AgentWorkspaceRow};
 use crate::clipboard_image::{ImagePasteRequest, image_paths_from_paste};
 use crate::composer_image_actions::begin_image_paste;
 use crate::composer_input_actions::refresh_input_menus;
@@ -428,6 +429,11 @@ pub(crate) enum MouseFlow {
     /// A click confirmed the focused list row (approval option, session,
     /// menu item). The caller should run the same path a real Enter takes.
     SyntheticEnter,
+    /// A click on a subagent in the agents dock, or on the selected one in the
+    /// Agents panel: open it as Enter on it does.
+    OpenAgent(String),
+    /// A click on the dock's Main row: back to the main conversation.
+    ReturnToMain,
 }
 
 pub(crate) fn handle_mouse_event(
@@ -605,6 +611,50 @@ pub(crate) fn handle_mouse_event(
                 state.viewport.composer_mouse_selecting = true;
                 state.viewport.last_left_click = None;
                 return MouseFlow::Handled;
+            }
+
+            // The agents dock under the transcript and the Agents panel's
+            // list: a subagent opens with one click in the dock, a panel row
+            // is selected by the first click and opened by the next, and
+            // Main leads back to the main conversation. Barred while a
+            // decision is on screen, like the transcript's click targets.
+            if !state.show_shortcuts
+                && state.plan_approval_dialog.is_none()
+                && state.status != AppStatus::WaitingApproval
+                && let Some(target) = state
+                    .agent_hit_areas
+                    .iter()
+                    .find(|hit| {
+                        hit.rect
+                            .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                    })
+                    .map(|hit| hit.target.clone())
+            {
+                state.viewport.selection = None;
+                state.viewport.last_left_click = None;
+                return match target {
+                    AgentHitTarget::Workspace => {
+                        state.show_agents();
+                        MouseFlow::Handled
+                    }
+                    AgentHitTarget::Main => MouseFlow::ReturnToMain,
+                    AgentHitTarget::DockAgent(task_id) => {
+                        state.agent_dock_selected_task_id = Some(task_id.clone());
+                        MouseFlow::OpenAgent(task_id)
+                    }
+                    AgentHitTarget::WorkspaceRow(index) => {
+                        if state.agent_selected_index() != index {
+                            state.select_agent_workspace_row(index);
+                            return MouseFlow::Handled;
+                        }
+                        match state.selected_agent_row() {
+                            Some(AgentWorkspaceRow::Subagent { task, .. }) => {
+                                MouseFlow::OpenAgent(task.id.clone())
+                            }
+                            _ => MouseFlow::Handled,
+                        }
+                    }
+                };
             }
 
             // The floating "jump to bottom" pill eats the click before any

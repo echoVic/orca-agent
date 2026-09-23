@@ -374,6 +374,11 @@ impl AppState {
             .collect()
     }
 
+    pub(crate) fn select_agent_workspace_row(&mut self, index: usize) -> bool {
+        self.agent_workspace
+            .select_index(self.workflow_panel.tasks(), index)
+    }
+
     pub(crate) fn select_agent_workspace_task(&mut self, task_id: &str) -> bool {
         self.agent_workspace
             .select_task(self.workflow_panel.tasks(), task_id)
