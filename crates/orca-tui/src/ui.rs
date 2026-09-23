@@ -8512,9 +8512,9 @@ mod tests {
             workspace: std::path::PathBuf::from(
                 "/Users/qingyun/very/deeply/nested/workspace/directory/segment/for/wrap/testing/wraptestmarker",
             ),
-            config_dir: std::path::PathBuf::from("/tmp/orca-config"),
-            auth_path: std::path::PathBuf::from("/tmp/orca-config/auth.json"),
-            acknowledgement_path: std::path::PathBuf::from("/tmp/orca-config/onboarding.toml"),
+            config_dir: platform_temp_path("orca-config"),
+            auth_path: platform_temp_path("orca-config/auth.json"),
+            acknowledgement_path: platform_temp_path("orca-config/onboarding.toml"),
             security_policy_digest: "digest".to_string(),
             acknowledged: true,
             workspace_trusted: true,
@@ -9429,13 +9429,19 @@ mod tests {
         )
     }
 
+    /// A path under the host's temp directory, so the first-run fixtures stay
+    /// portable to Windows.
+    fn platform_temp_path(relative: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(relative)
+    }
+
     fn first_run_fixture() -> orca_runtime::onboarding::FirstRunState {
         orca_runtime::onboarding::FirstRunState {
             schema_version: 1,
-            workspace: std::path::PathBuf::from("/tmp/workspace"),
-            config_dir: std::path::PathBuf::from("/tmp/orca-config"),
-            auth_path: std::path::PathBuf::from("/tmp/orca-config/auth.json"),
-            acknowledgement_path: std::path::PathBuf::from("/tmp/orca-config/onboarding.toml"),
+            workspace: platform_temp_path("workspace"),
+            config_dir: platform_temp_path("orca-config"),
+            auth_path: platform_temp_path("orca-config/auth.json"),
+            acknowledgement_path: platform_temp_path("orca-config/onboarding.toml"),
             security_policy_digest: "digest".to_string(),
             acknowledged: true,
             workspace_trusted: true,
