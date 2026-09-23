@@ -39,6 +39,106 @@ fn validate_relay_activity_envelope(
     Err(io::Error::new(io::ErrorKind::InvalidData, relay_error))
 }
 
+/// The task and subagent patches that settle a detached child the way the
+/// task registry recorded its end. The registry's result is the payload the
+/// worker handed its parent; the surface shows the text inside it.
+fn settled_subagent_batch(
+    task: &surface::SurfaceTask,
+    subagent: &surface::SurfaceSubagent,
+    record: &crate::tasks::TaskRecord,
+    settled_at: surface::UnixMillis,
+) -> io::Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>> {
+    let (task_status, status, activity) = match record.status {
+        TaskStatus::Completed => (
+            surface::SurfaceTaskStatus::Completed,
+            surface::SurfaceSubagentTerminalStatus::Completed,
+            "completed",
+        ),
+        TaskStatus::Failed => (
+            surface::SurfaceTaskStatus::Failed,
+            surface::SurfaceSubagentTerminalStatus::Failed,
+            "failed",
+        ),
+        TaskStatus::Cancelled => (
+            surface::SurfaceTaskStatus::Cancelled,
+            surface::SurfaceSubagentTerminalStatus::Cancelled,
+            "cancelled",
+        ),
+        TaskStatus::Stopped => (
+            surface::SurfaceTaskStatus::Stopped,
+            surface::SurfaceSubagentTerminalStatus::Cancelled,
+            "stopped",
+        ),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only a settled task can settle its subagent",
+            ));
+        }
+    };
+    let revision_overflow = || io::Error::new(io::ErrorKind::InvalidData, "revision overflow");
+    let next_task_revision = task
+        .revision
+        .get()
+        .checked_add(1)
+        .and_then(|revision| surface::TaskRevision::try_new(revision).ok())
+        .ok_or_else(revision_overflow)?;
+    let next_subagent_revision = subagent
+        .revision
+        .get()
+        .checked_add(1)
+        .and_then(|revision| surface::SubagentRevision::try_new(revision).ok())
+        .ok_or_else(revision_overflow)?;
+    let text = |value: &Option<String>| {
+        value.as_deref().map(|value| {
+            surface::DisplayText::new(crate::subagent_async_worker::async_subagent_result_text(
+                value,
+            ))
+        })
+    };
+    let output = text(&record.result);
+    let error = text(&record.error);
+    let mut activity_history = subagent.subagent_activity_history.clone();
+    orca_core::task_types::append_subagent_activity_history(
+        &mut activity_history,
+        activity.to_string(),
+        subagent.turn,
+        settled_at.get(),
+    );
+    Ok(vec![
+        (
+            surface::SurfaceScope::Thread,
+            surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                task_id: task.task_id.clone(),
+                expected_revision: task.revision,
+                next_revision: next_task_revision,
+                status: task_status,
+                completed_at: Some(settled_at),
+                result: output.clone(),
+                error: error.clone(),
+            }),
+        ),
+        (
+            surface::SurfaceScope::Thread,
+            surface::SurfaceEvent::Subagent(surface::SubagentPatch::Settled {
+                subagent_id: subagent.subagent_id.clone(),
+                expected_revision: subagent.revision,
+                next_revision: next_subagent_revision,
+                owner: subagent.owner.clone(),
+                status,
+                output,
+                error,
+                usage: record
+                    .usage
+                    .map(surface_usage_totals)
+                    .or_else(|| subagent.usage.clone()),
+                subagent_activity_history: activity_history,
+                continuation: subagent.continuation.clone(),
+            }),
+        ),
+    ])
+}
+
 fn relay_health_issue_commit_id(task_id: &str, attempt_id: &str) -> surface::SurfaceCommitId {
     let mut hasher = Sha256::new();
     hasher.update(b"orca.subagent-relay.health.v1\0");
@@ -1665,6 +1765,62 @@ impl ThreadActor {
             if !page.has_more {
                 return Ok(());
             }
+        }
+    }
+
+    /// Settles the detached children the surface still shows running although
+    /// the task registry says they finished. A healthy relay delivers its
+    /// Completed frame before the worker settles the registry, so a child that
+    /// stays running past `SUBAGENT_SETTLE_GRACE` lost its relay: it was
+    /// quarantined, another agent resumed the continuation, or the worker
+    /// exited without a terminal frame. Without this the child showed as
+    /// running for the rest of the session, restarts included.
+    pub(super) fn settle_stranded_detached_subagents(
+        &mut self,
+        task_registry: &crate::tasks::TaskRegistry,
+    ) {
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let grace_ms = i64::try_from(SUBAGENT_SETTLE_GRACE.as_millis()).unwrap_or(i64::MAX);
+        for subagent in snapshot.subagents.iter().filter(|subagent| {
+            subagent.status == surface::SurfaceSubagentStatus::Running
+                && matches!(
+                    subagent.owner,
+                    surface::SurfaceSubagentOwner::DetachedTask { .. }
+                )
+        }) {
+            let Some(task) = snapshot
+                .tasks
+                .iter()
+                .find(|task| task.task_id == subagent.task_id)
+            else {
+                continue;
+            };
+            let Ok(Some(record)) = task_registry.settled_subagent_record(task.task_id.as_str())
+            else {
+                continue;
+            };
+            // Only along transitions the reducer allows: a stopping task can
+            // still end stopped, failed or cancelled, but not completed.
+            let settles = match task.status {
+                surface::SurfaceTaskStatus::Running => true,
+                surface::SurfaceTaskStatus::Stopping => record.status != TaskStatus::Completed,
+                _ => false,
+            };
+            if !settles {
+                continue;
+            }
+            let settled_at_ms = record.completed_at_ms.or(record.last_activity_at_ms);
+            if settled_at_ms.is_some_and(|at| now_ms.saturating_sub(at) < grace_ms) {
+                continue;
+            }
+            let settled_at = surface::UnixMillis::new(settled_at_ms.unwrap_or(now_ms));
+            let Ok(batch) = settled_subagent_batch(task, subagent, &record, settled_at) else {
+                continue;
+            };
+            let batch = self.surface_event_batch_with_commit_id(batch, None);
+            // A failed commit leaves the child running; the next poll retries.
+            let _ = self.commit_surface_actor_batch_with_retry(&batch);
         }
     }
 
@@ -5552,6 +5708,111 @@ mod task_transcript_query_tests {
             .expect_err("subagent without parent must fail closed");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("missing its parent_task_id"));
+    }
+
+    #[test]
+    fn a_settled_registry_record_settles_the_task_and_its_subagent_together() {
+        let registry = crate::tasks::TaskRegistry::new("settle-batch".to_string());
+        let child = registry.create_subagent("explore the provider".to_string(), None);
+        registry
+            .complete(
+                &child.id,
+                crate::subagent_async_worker::async_subagent_result_payload(
+                    "the report".to_string(),
+                    None,
+                ),
+            )
+            .expect("complete child");
+        let record = registry.get(&child.id).expect("child record");
+        let task = surface_task(&child.id, None, 3);
+        let owner = surface::SurfaceSubagentOwner::DetachedTask {
+            owner: surface::SurfaceTaskOwnerRef::new(
+                task.task_id.clone(),
+                surface::TaskRevision::try_new(1).expect("task revision"),
+                surface::SurfaceTaskAttemptId::try_new("attempt-1").expect("attempt"),
+                surface::Sha256Digest::new([7; 32]),
+            ),
+        };
+        let subagent = surface::SurfaceSubagent {
+            subagent_id: surface::SurfaceSubagentId::try_new(child.id.clone()).expect("id"),
+            task_id: task.task_id.clone(),
+            revision: surface::SubagentRevision::try_new(17).expect("subagent revision"),
+            description: surface::DisplayText::new("explore the provider"),
+            child_thread_id: None,
+            batch_id: surface::NonEmptyText::try_new("batch").expect("batch"),
+            batch_size: 1,
+            status: surface::SurfaceSubagentStatus::Running,
+            activity: Some(surface::DisplayText::new("phase: Thinking")),
+            subagent_activity_history: Vec::new(),
+            turn: Some(3),
+            usage: None,
+            output: None,
+            error: None,
+            continuation: None,
+            owner: owner.clone(),
+            source: surface::SurfaceSubagentSource::new(
+                surface::SurfaceTaskAttemptId::try_new("attempt-1").expect("attempt"),
+                orca_core::thread_identity::TurnId::new(),
+                17,
+                surface::UnixMillis::new(2),
+                surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("commit id"),
+                surface::Sha256Digest::new([8; 32]),
+            ),
+        };
+
+        let events = settled_subagent_batch(&task, &subagent, &record, surface::UnixMillis::new(9))
+            .expect("a completed record settles");
+
+        let [(task_scope, task_event), (subagent_scope, subagent_event)] = events.as_slice() else {
+            panic!(
+                "one task patch and one subagent patch, got {} events",
+                events.len()
+            );
+        };
+        assert!(matches!(task_scope, surface::SurfaceScope::Thread));
+        assert!(matches!(subagent_scope, surface::SurfaceScope::Thread));
+        assert!(matches!(
+            task_event,
+            surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                expected_revision,
+                next_revision,
+                status: surface::SurfaceTaskStatus::Completed,
+                completed_at: Some(completed_at),
+                result: Some(result),
+                error: None,
+                ..
+            }) if expected_revision.get() == 3
+                && next_revision.get() == 4
+                && completed_at.get() == 9
+                && result.as_str() == "the report"
+        ));
+        assert!(matches!(
+            subagent_event,
+            surface::SurfaceEvent::Subagent(surface::SubagentPatch::Settled {
+                expected_revision,
+                next_revision,
+                owner: settled_owner,
+                status: surface::SurfaceSubagentTerminalStatus::Completed,
+                output: Some(output),
+                subagent_activity_history,
+                ..
+            }) if expected_revision.get() == 17
+                && next_revision.get() == 18
+                && *settled_owner == owner
+                && output.as_str() == "the report"
+                && subagent_activity_history
+                    .last()
+                    .is_some_and(|entry| entry.activity == "completed")
+        ));
+
+        let running = registry.create_subagent("still running".to_string(), None);
+        let running = registry.get(&running.id).expect("running record");
+        assert!(
+            settled_subagent_batch(&task, &subagent, &running, surface::UnixMillis::new(9))
+                .is_err(),
+            "an active record settles nothing"
+        );
     }
 
     #[test]

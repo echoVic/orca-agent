@@ -6453,6 +6453,13 @@ fn actor_control_subagent_activity_authorized(
             next_revision,
             owner,
             ..
+        })
+        | super::SurfaceEvent::Subagent(super::SubagentPatch::Settled {
+            subagent_id,
+            expected_revision,
+            next_revision,
+            owner,
+            ..
         }) => {
             if !matches!(&subagent_event.scope, SurfaceScope::Thread) {
                 return false;
@@ -6506,6 +6513,24 @@ fn actor_control_subagent_activity_authorized(
         }
         super::SurfaceEvent::Subagent(super::SubagentPatch::Stopped { .. }) => {
             task.status == super::SurfaceTaskStatus::Stopped && task.completed_at.is_some()
+        }
+        // The registry may have settled a stopped child the user did not stop
+        // from this surface, so a cancelled subagent may pair with Stopped.
+        super::SurfaceEvent::Subagent(super::SubagentPatch::Settled { status, .. }) => {
+            task.completed_at.is_some()
+                && matches!(
+                    (status, task.status),
+                    (
+                        super::SurfaceSubagentTerminalStatus::Completed,
+                        super::SurfaceTaskStatus::Completed
+                    ) | (
+                        super::SurfaceSubagentTerminalStatus::Failed,
+                        super::SurfaceTaskStatus::Failed
+                    ) | (
+                        super::SurfaceSubagentTerminalStatus::Cancelled,
+                        super::SurfaceTaskStatus::Cancelled | super::SurfaceTaskStatus::Stopped
+                    )
+                )
         }
         _ => false,
     };
@@ -14382,6 +14407,154 @@ mod tests {
             &generation,
             super::super::SubagentRevision::try_new(1).unwrap(),
         ));
+    }
+
+    #[test]
+    fn actor_permit_settles_a_detached_subagent_only_with_the_matching_task_outcome() {
+        let mut snapshot = reducer_snapshot();
+        let operation = started_operation();
+        let fence = operation.generations[0].fence.clone();
+        let turn_id = operation.generations[0].logical_turn_id.clone();
+        snapshot.operation_history.push(operation);
+        let task_id = super::super::SurfaceTaskId::try_new("settled-task").unwrap();
+        let agent_id = super::super::SurfaceSubagentId::try_new("settled-agent").unwrap();
+        let owner = super::super::SurfaceSubagentOwner::DetachedTask {
+            owner: super::super::SurfaceTaskOwnerRef::new(
+                task_id.clone(),
+                super::super::TaskRevision::try_new(1).unwrap(),
+                super::super::SurfaceTaskAttemptId::try_new("attempt-settled").unwrap(),
+                super::super::Sha256Digest::new([9; 32]),
+            ),
+        };
+        snapshot.tasks.push(super::super::SurfaceTask {
+            task_id: task_id.clone(),
+            revision: super::super::TaskRevision::try_new(3).unwrap(),
+            task_type: super::super::SurfaceTaskType::Subagent,
+            status: super::super::SurfaceTaskStatus::Running,
+            backgrounded: false,
+            description: super::super::DisplayText::new("detached task"),
+            created_at: super::super::UnixMillis::new(1),
+            started_at: Some(super::super::UnixMillis::new(1)),
+            completed_at: None,
+            parent_operation: Some(fence.operation_id.clone()),
+            parent_task_id: None,
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: Some(agent_id.clone()),
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        });
+        snapshot.subagents.push(super::super::SurfaceSubagent {
+            subagent_id: agent_id.clone(),
+            task_id: task_id.clone(),
+            revision: super::super::SubagentRevision::try_new(3).unwrap(),
+            description: super::super::DisplayText::new("detached agent"),
+            child_thread_id: None,
+            batch_id: super::super::NonEmptyText::try_new("batch-settled").unwrap(),
+            batch_size: 1,
+            status: super::super::SurfaceSubagentStatus::Running,
+            activity: Some(super::super::DisplayText::new("phase: Thinking")),
+            subagent_activity_history: Vec::new(),
+            turn: Some(1),
+            usage: None,
+            output: None,
+            error: None,
+            continuation: None,
+            owner: owner.clone(),
+            source: super::super::SurfaceSubagentSource::new(
+                super::super::SurfaceTaskAttemptId::try_new("attempt-settled").unwrap(),
+                turn_id,
+                3,
+                super::super::UnixMillis::new(3),
+                super::super::SurfaceCommitId::try_from_bytes(uuid_v7_bytes(176)).unwrap(),
+                super::super::Sha256Digest::new([8; 32]),
+            ),
+        });
+        let state = SurfaceReducerState::new(snapshot);
+        let settle = |task_status, subagent_status| {
+            test_batch_with_events(
+                &state,
+                vec![
+                    (
+                        SurfaceScope::Thread,
+                        super::super::SurfaceEvent::Task(super::super::TaskPatch::StatusChanged {
+                            task_id: task_id.clone(),
+                            expected_revision: super::super::TaskRevision::try_new(3).unwrap(),
+                            next_revision: super::super::TaskRevision::try_new(4).unwrap(),
+                            status: task_status,
+                            completed_at: Some(super::super::UnixMillis::new(9)),
+                            result: Some(super::super::DisplayText::new("report")),
+                            error: None,
+                        }),
+                    ),
+                    (
+                        SurfaceScope::Thread,
+                        super::super::SurfaceEvent::Subagent(
+                            super::super::SubagentPatch::Settled {
+                                subagent_id: agent_id.clone(),
+                                expected_revision: super::super::SubagentRevision::try_new(3)
+                                    .unwrap(),
+                                next_revision: super::super::SubagentRevision::try_new(4).unwrap(),
+                                owner: owner.clone(),
+                                status: subagent_status,
+                                output: Some(super::super::DisplayText::new("report")),
+                                error: None,
+                                usage: None,
+                                subagent_activity_history: Vec::new(),
+                                continuation: None,
+                            },
+                        ),
+                    ),
+                ],
+            )
+        };
+
+        for (task_status, subagent_status) in [
+            (
+                super::super::SurfaceTaskStatus::Completed,
+                super::super::SurfaceSubagentTerminalStatus::Completed,
+            ),
+            (
+                super::super::SurfaceTaskStatus::Failed,
+                super::super::SurfaceSubagentTerminalStatus::Failed,
+            ),
+            (
+                super::super::SurfaceTaskStatus::Stopped,
+                super::super::SurfaceSubagentTerminalStatus::Cancelled,
+            ),
+        ] {
+            assert!(
+                actor_control_subagent_activity_authorized(
+                    &state,
+                    &settle(task_status, subagent_status.clone())
+                ),
+                "{task_status:?} settles a {subagent_status:?} child"
+            );
+        }
+        assert!(
+            !actor_control_subagent_activity_authorized(
+                &state,
+                &settle(
+                    super::super::SurfaceTaskStatus::Failed,
+                    super::super::SurfaceSubagentTerminalStatus::Completed,
+                ),
+            ),
+            "the task and its subagent must end the same way"
+        );
+        assert!(
+            !actor_control_subagent_activity_authorized(
+                &state,
+                &settle(
+                    super::super::SurfaceTaskStatus::Running,
+                    super::super::SurfaceSubagentTerminalStatus::Completed,
+                ),
+            ),
+            "a settled subagent needs a finished task"
+        );
     }
 
     #[test]

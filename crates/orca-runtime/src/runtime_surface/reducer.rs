@@ -1807,7 +1807,8 @@ fn scope_matches_event(
         SurfaceEvent::Subagent(SubagentPatch::ChildThreadBound { owner, .. })
         | SurfaceEvent::Subagent(SubagentPatch::Progress { owner, .. })
         | SurfaceEvent::Subagent(SubagentPatch::Completed { owner, .. })
-        | SurfaceEvent::Subagent(SubagentPatch::Stopped { owner, .. }) => match (scope, owner) {
+        | SurfaceEvent::Subagent(SubagentPatch::Stopped { owner, .. })
+        | SurfaceEvent::Subagent(SubagentPatch::Settled { owner, .. }) => match (scope, owner) {
             (
                 SurfaceScope::Generation { fence },
                 SurfaceSubagentOwner::Generation { fence: owner },
@@ -8965,6 +8966,71 @@ fn apply_subagent_patch(
             subagent.revision = *next_revision;
             subagent.status = SurfaceSubagentStatus::Cancelled;
             subagent.activity = Some(DisplayText::new("stopped by user"));
+            subagent.subagent_activity_history = subagent_activity_history.clone();
+            subagent.continuation = continuation.clone();
+            Ok(())
+        }
+        SubagentPatch::Settled {
+            subagent_id,
+            expected_revision,
+            next_revision,
+            owner,
+            status,
+            output,
+            error,
+            usage,
+            subagent_activity_history,
+            continuation,
+        } => {
+            if subagent_activity_history.len()
+                > orca_core::task_types::MAX_SUBAGENT_ACTIVITY_HISTORY
+            {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::InvalidOrdering,
+                    "subagent activity history exceeds the bounded limit",
+                ));
+            }
+            let Some(subagent) = snapshot
+                .subagents
+                .iter_mut()
+                .find(|value| value.subagent_id == *subagent_id)
+            else {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "absent subagent cannot be settled",
+                ));
+            };
+            if subagent.revision != *expected_revision
+                || !expected_revision
+                    .get()
+                    .checked_add(1)
+                    .is_some_and(|expected_next| next_revision.get() == expected_next)
+                || subagent.owner != *owner
+            {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::StaleRevision,
+                    "subagent owner or revision is stale",
+                ));
+            }
+            if subagent.status != SurfaceSubagentStatus::Running {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "terminal subagent is absorbing",
+                ));
+            }
+            subagent.revision = *next_revision;
+            subagent.status = match status {
+                SurfaceSubagentTerminalStatus::Completed => SurfaceSubagentStatus::Completed,
+                SurfaceSubagentTerminalStatus::Failed => SurfaceSubagentStatus::Failed,
+                SurfaceSubagentTerminalStatus::Cancelled => SurfaceSubagentStatus::Cancelled,
+            };
+            subagent.output = output.clone();
+            subagent.error = error.clone();
+            subagent.usage = usage.clone();
             subagent.subagent_activity_history = subagent_activity_history.clone();
             subagent.continuation = continuation.clone();
             Ok(())

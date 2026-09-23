@@ -805,7 +805,14 @@ patch_name_matcher!(
 patch_name_matcher!(
     subagent_patch_name,
     SubagentPatch,
-    [Started, ChildThreadBound, Progress, Completed, Stopped]
+    [
+        Started,
+        ChildThreadBound,
+        Progress,
+        Completed,
+        Stopped,
+        Settled
+    ]
 );
 patch_name_matcher!(
     goal_patch_name,

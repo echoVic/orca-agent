@@ -137,6 +137,9 @@ pub const THREAD_COMMAND_CAPACITY: usize = 16;
 pub const HOST_BACKGROUND_TASK_CAPACITY: usize = 16;
 const WORKFLOW_BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SUBAGENT_RELAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How long a detached child may stay running on the surface after the task
+/// registry settled it before the actor settles it from the registry instead.
+const SUBAGENT_SETTLE_GRACE: Duration = Duration::from_secs(2);
 /// The prompt of the turn a finished background agent starts on an idle main
 /// thread. The results themselves arrive as the task notifications the turn's
 /// opening drains in; this only asks the model to act on them.
@@ -17068,6 +17071,9 @@ impl ThreadActor {
                 ),
             }
         }
+        if !relays.running_detached.is_empty() {
+            self.settle_stranded_detached_subagents(&active.task_registry);
+        }
         let Some(fence) = active.surface_operation.clone() else {
             return;
         };
@@ -17148,6 +17154,7 @@ impl ThreadActor {
                 ),
             }
         }
+        self.settle_stranded_detached_subagents(&task_registry);
     }
 
     /// What the surface says about this thread's children for one relay poll.

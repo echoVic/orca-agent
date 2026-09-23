@@ -1824,6 +1824,31 @@ pub(crate) fn async_subagent_result_payload(
     .to_string()
 }
 
+/// The text inside a result `async_subagent_result_payload` wrapped for the
+/// registry, or the value itself when it is not such a payload.
+pub(crate) fn async_subagent_result_text(result: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .and_then(|payload| payload.get("output")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| result.to_string())
+}
+
+#[cfg(test)]
+mod result_text_tests {
+    use super::*;
+
+    #[test]
+    fn a_wrapped_result_shows_its_output_and_anything_else_shows_as_is() {
+        let wrapped = async_subagent_result_payload(
+            "the report".to_string(),
+            Some(serde_json::json!({ "status": "completed" })),
+        );
+        assert_eq!(async_subagent_result_text(&wrapped), "the report");
+        assert_eq!(async_subagent_result_text("plain text"), "plain text");
+        assert_eq!(async_subagent_result_text("{\"other\":1}"), "{\"other\":1}");
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

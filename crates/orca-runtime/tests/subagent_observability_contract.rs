@@ -161,6 +161,28 @@ fn both_relay_polls_match_detached_bindings_through_the_resident_thread() {
 }
 
 #[test]
+fn both_relay_polls_settle_the_children_their_relays_cannot_finish() {
+    // A quarantined relay, a continuation another agent resumed, or a worker
+    // that exited without a terminal frame left the child running on the
+    // surface for good while the registry said it had finished.
+    for (name, poll) in [
+        (
+            "running-turn",
+            balanced_block(RUNTIME_HOST, "fn drain_subagent_relays_for_active"),
+        ),
+        (
+            "idle",
+            balanced_block(RUNTIME_HOST, "fn drain_subagent_relays_while_idle"),
+        ),
+    ] {
+        assert!(
+            poll.contains("self.settle_stranded_detached_subagents("),
+            "the {name} poll must settle children from the task registry"
+        );
+    }
+}
+
+#[test]
 fn task_transcript_action_is_dispatched_instead_of_dropped() {
     let start = HOSTED_CONTROLLER
         .find("Ok(UserAction::ReadTaskTranscript(")

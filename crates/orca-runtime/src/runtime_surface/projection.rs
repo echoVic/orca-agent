@@ -1572,6 +1572,23 @@ pub enum SubagentPatch {
         subagent_activity_history: Vec<orca_core::task_types::SubagentActivityEntry>,
         continuation: Option<SurfaceSubagentContinuation>,
     },
+    /// Actor-owned terminal transition adopted from the task registry once a
+    /// detached child has finished but its relay can no longer deliver its
+    /// own terminal event: the relay was quarantined, another agent resumed
+    /// the continuation, or the worker exited without one. Like `Stopped`, it
+    /// carries no child source cursor.
+    Settled {
+        subagent_id: SurfaceSubagentId,
+        expected_revision: SubagentRevision,
+        next_revision: SubagentRevision,
+        owner: SurfaceSubagentOwner,
+        status: SurfaceSubagentTerminalStatus,
+        output: Option<DisplayText>,
+        error: Option<DisplayText>,
+        usage: Option<UsageTotals>,
+        subagent_activity_history: Vec<orca_core::task_types::SubagentActivityEntry>,
+        continuation: Option<SurfaceSubagentContinuation>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

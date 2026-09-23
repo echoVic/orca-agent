@@ -4307,6 +4307,28 @@ impl TaskRegistry {
             ))
     }
 
+    /// The record of a subagent task that has settled for good: completed,
+    /// failed, cancelled or stopped. `None` while it is still active or parked
+    /// on an approval, and for an unknown task. Persistent registries are
+    /// refreshed so a detached worker's own settlement is observed.
+    pub(crate) fn settled_subagent_record(&self, id: &str) -> Result<Option<TaskRecord>, String> {
+        let record = if self.persistence.is_some() {
+            self.refresh_task_from_persistence(id)?
+        } else {
+            self.get(id)
+        };
+        Ok(record.filter(|record| {
+            record.task_type == TaskType::Subagent
+                && matches!(
+                    record.status,
+                    TaskStatus::Completed
+                        | TaskStatus::Failed
+                        | TaskStatus::Cancelled
+                        | TaskStatus::Stopped
+                )
+        }))
+    }
+
     pub fn get(&self, id: &str) -> Option<TaskRecord> {
         if let Some(record) = self
             .with_tasks(|tasks| tasks.get(id).cloned())
@@ -10022,6 +10044,36 @@ while :; do :; done
         assert!(
             !parent.subagent_relay_replay_allowed(&task.id).unwrap(),
             "the worker's stop request is read from the session's records"
+        );
+    }
+
+    #[test]
+    fn only_a_settled_subagent_has_a_settled_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let parent = TaskRegistry::new_persistent("session-1".to_string(), root.clone()).unwrap();
+        let task = parent.create_subagent("explore".to_string(), None);
+        assert!(parent.settled_subagent_record(&task.id).unwrap().is_none());
+
+        let worker = TaskRegistry::new_persistent_attached("session-1".to_string(), root).unwrap();
+        worker.complete(&task.id, "report".to_string()).unwrap();
+        let settled = parent
+            .settled_subagent_record(&task.id)
+            .unwrap()
+            .expect("the worker's completion is observed");
+        assert_eq!(settled.status, TaskStatus::Completed);
+        assert_eq!(settled.result.as_deref(), Some("report"));
+
+        let approval = parent.create_subagent("parked".to_string(), None);
+        parent
+            .approval_required_for_pending_tool(&approval.id, "needs approval".to_string(), None)
+            .unwrap();
+        assert!(
+            parent
+                .settled_subagent_record(&approval.id)
+                .unwrap()
+                .is_none(),
+            "a child parked on an approval has not settled"
         );
     }
 

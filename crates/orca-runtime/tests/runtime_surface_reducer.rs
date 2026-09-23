@@ -3336,6 +3336,84 @@ fn actor_stopped_subagent_absorbs_late_child_progress() {
     );
 }
 
+#[test]
+fn a_registry_settled_subagent_takes_the_registry_outcome_and_absorbs_its_relay() {
+    let attempt_id = SurfaceTaskAttemptId::try_new("manifest-attempt").unwrap();
+    let owner = SurfaceSubagentOwner::DetachedTask {
+        owner: SurfaceTaskOwnerRef::new(
+            SurfaceTaskId::try_new("manifest-task").unwrap(),
+            TaskRevision::try_new(1).unwrap(),
+            attempt_id.clone(),
+            digest(42),
+        ),
+    };
+    let mut initial = snapshot();
+    let mut running = subagent(SurfaceSubagentStatus::Running, 1);
+    running.owner = owner.clone();
+    running.source.attempt_id = attempt_id;
+    let source_before = running.source.clone();
+    initial.subagents.push(running);
+    let state = SurfaceReducerState::new(initial);
+    let settled = applied(reduce_batch(
+        SurfaceReduceMode::Live,
+        &state,
+        &batch(
+            &state,
+            10_903,
+            vec![(
+                SurfaceScope::Thread,
+                SurfaceEvent::Subagent(SubagentPatch::Settled {
+                    subagent_id: SurfaceSubagentId::try_new("manifest-subagent").unwrap(),
+                    expected_revision: SubagentRevision::try_new(1).unwrap(),
+                    next_revision: SubagentRevision::try_new(2).unwrap(),
+                    owner: owner.clone(),
+                    status: SurfaceSubagentTerminalStatus::Completed,
+                    output: Some(DisplayText::new("the child's report")),
+                    error: None,
+                    usage: None,
+                    subagent_activity_history: Vec::new(),
+                    continuation: None,
+                }),
+            )],
+        ),
+    ));
+    let subagent = &settled.snapshot().subagents[0];
+    assert_eq!(subagent.status, SurfaceSubagentStatus::Completed);
+    assert_eq!(
+        subagent.output.as_ref().map(DisplayText::as_str),
+        Some("the child's report")
+    );
+    assert_eq!(subagent.revision.get(), 2);
+    assert_eq!(
+        subagent.source, source_before,
+        "an actor fact does not move the child's source cursor"
+    );
+
+    let late_frame = batch(
+        &settled,
+        10_904,
+        vec![(
+            SurfaceScope::Thread,
+            SurfaceEvent::Subagent(SubagentPatch::Progress {
+                subagent_id: SurfaceSubagentId::try_new("manifest-subagent").unwrap(),
+                expected_revision: SubagentRevision::try_new(2).unwrap(),
+                next_revision: SubagentRevision::try_new(3).unwrap(),
+                owner,
+                source: subagent_source(2),
+                activity: DisplayText::new("late relay frame"),
+                turn: Some(1),
+                usage: None,
+                subagent_activity_history: Vec::new(),
+                continuation: None,
+            }),
+        )],
+    );
+    rejected(
+        reduce_batch(SurfaceReduceMode::Live, &settled, &late_frame),
+        SurfaceReducerErrorCode::IllegalTransition,
+    );
+}
+
 fn task_status_name(status: SurfaceTaskStatus) -> &'static str {
     match status {
         SurfaceTaskStatus::Queued => "Queued",
