@@ -3000,14 +3000,15 @@ mod tests {
             },
         );
 
-        // One `●` opens the turn; the fenced code line is a continuation of the
-        // same streamed answer (indent only); "tail" is a distinct `Assistant`
-        // message, so it opens its own `●` immediately (no blank separator, since
-        // `leading_blank` doesn't insert one after a plain `AssistantChunk`), and
-        // carries no trailing blank of its own (nothing follows it here).
+        // One `●` opens the reply; the fenced code line and "tail" both
+        // continue it (indent only). "tail" is the stream's still-growing end,
+        // held as `Assistant` while the finished blocks before it froze into
+        // chunks, so it is the same answer rather than a new one — no `●` of
+        // its own, and no blank separator, since `leading_blank` doesn't insert
+        // one after a plain `AssistantChunk`.
         assert_eq!(
             cache.extract_text(&selection((0, 0), (99, 99))),
-            " ●  first paragraph\n\n      fn main() {}\n ●  tail"
+            " ●  first paragraph\n\n      fn main() {}\n    tail"
         );
     }
 

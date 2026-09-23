@@ -3325,7 +3325,11 @@ fn append_message_lines(
             append_reasoning_lines(lines, text, *expanded, force_expand, width, theme);
         }
         ChatMessage::Assistant(text) => {
-            append_assistant_markdown(lines, text, width, theme, false, true);
+            // A streamed reply freezes its finished blocks into chunks and
+            // keeps the still-growing tail as `Assistant`; the chunk already
+            // drew the reply's bullet, so the tail only continues it.
+            let first_of_turn = !matches!(previous, Some(ChatMessage::AssistantChunk { .. }));
+            append_assistant_markdown(lines, text, width, theme, false, first_of_turn);
         }
         ChatMessage::AssistantChunk {
             text,
@@ -7920,6 +7924,53 @@ mod tests {
         assert_eq!(
             tail_lines.last().map(ToString::to_string),
             Some(" ●  tail".to_string())
+        );
+    }
+
+    #[test]
+    fn a_streamed_reply_draws_its_bullet_once_across_chunks_and_the_tail() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let chunk = ChatMessage::AssistantChunk {
+            text: "first paragraph\n\n".to_string(),
+            trailing_blank: true,
+        };
+        let tail = ChatMessage::Assistant("closing paragraph".to_string());
+
+        let chunk_lines = build_lines_for_message_after(None, &chunk, &theme, 80, 0, false, None);
+        let tail_lines =
+            build_lines_for_message_after(Some(&chunk), &tail, &theme, 80, 0, false, None);
+
+        assert_eq!(
+            chunk_lines.first().map(ToString::to_string),
+            Some(" ●  first paragraph".to_string())
+        );
+        assert_eq!(
+            lines_text(&tail_lines),
+            vec!["    closing paragraph".to_string()],
+            "the stream tail continues the reply the chunk opened"
+        );
+    }
+
+    #[test]
+    fn an_assistant_reply_after_a_tool_call_opens_with_a_bullet() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let tool = ChatMessage::ToolCall {
+            id: "call-1".to_string(),
+            name: "read".to_string(),
+            target: Some("src/main.rs".to_string()),
+            status: "completed".to_string(),
+            output: None,
+            diff: None,
+            kind: None,
+            expanded: false,
+        };
+        let reply = ChatMessage::Assistant("done".to_string());
+
+        let lines = build_lines_for_message_after(Some(&tool), &reply, &theme, 80, 0, false, None);
+
+        assert_eq!(
+            lines.last().map(ToString::to_string),
+            Some(" ●  done".to_string())
         );
     }
 
