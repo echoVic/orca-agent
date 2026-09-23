@@ -185,7 +185,11 @@ fn wrap_line(line: &Line<'_>, width: u16, continuation_indent: u16) -> CompactWr
     let mut whitespace_width = 0u16;
     let mut non_whitespace_previous = false;
 
-    for grapheme in line.styled_graphemes(Style::default()) {
+    let mut graphemes = line.styled_graphemes(Style::default());
+    // What was still pending when a hung line's first row ended, fed through
+    // the loop again: it was measured against the wider first row.
+    let mut replay: VecDeque<StyledGrapheme<'_>> = VecDeque::new();
+    while let Some(grapheme) = replay.pop_front().or_else(|| graphemes.next()) {
         let is_whitespace = grapheme_is_whitespace(&grapheme);
         let symbol_width = grapheme.symbol.width() as u16;
         if symbol_width > row_width {
@@ -219,6 +223,7 @@ fn wrap_line(line: &Line<'_>, width: u16, continuation_indent: u16) -> CompactWr
             let mut remaining_width = row_width.saturating_sub(line_width);
             wrapped.push_row(mem::take(&mut pending_line));
             line_width = 0;
+            let narrowed = row_width != continuation_width;
             row_width = continuation_width;
 
             while let Some(grapheme) = pending_whitespace.front() {
@@ -235,6 +240,18 @@ fn wrap_line(line: &Line<'_>, width: u16, continuation_indent: u16) -> CompactWr
 
             if is_whitespace && pending_whitespace.is_empty() {
                 wrapped.note_gap(grapheme.symbol);
+                non_whitespace_previous = false;
+                continue;
+            }
+            if narrowed {
+                // A word begun on the first row can be wider than the rows the
+                // hang narrows; lay the pending tail out again at their width
+                // so it splits there instead of overflowing a row.
+                replay.extend(pending_whitespace.drain(..));
+                replay.extend(pending_word.drain(..));
+                replay.push_back(grapheme);
+                whitespace_width = 0;
+                word_width = 0;
                 non_whitespace_previous = false;
                 continue;
             }
@@ -2429,6 +2446,53 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         assert_eq!(rows, [" ●  alpha beta", "    gamma", "    delta"]);
+    }
+
+    #[test]
+    fn a_long_word_carried_onto_a_narrower_hung_row_is_split_not_clipped() {
+        // The word starts on the full-width first row, so by the time it wraps
+        // it can be wider than a hung row. It must split there instead of
+        // overflowing the row and losing its last cells off the right edge.
+        let word = "x".repeat(40);
+        let cache = prepared_search_cache(&[vec![Line::from(format!("    │ {word}"))]], 20);
+
+        let rows = cache
+            .viewport(0, 0, 10)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        for row in &rows {
+            assert!(UnicodeWidthStr::width(row.as_str()) <= 20, "{rows:?}");
+        }
+        let shown = rows
+            .iter()
+            .map(|row| row.matches('x').count())
+            .sum::<usize>();
+        assert_eq!(shown, 40, "every cell of the word is on screen: {rows:?}");
+    }
+
+    #[test]
+    fn text_after_a_split_long_word_keeps_its_cells_its_copy_and_its_search() {
+        let source = format!("    │ {}中文 tail words here", "x".repeat(33));
+        let cache = prepared_search_cache(&[vec![Line::from(source.clone())]], 20);
+
+        let rows = cache
+            .viewport(0, 0, 20)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        for row in &rows {
+            assert!(UnicodeWidthStr::width(row.as_str()) <= 20, "{rows:?}");
+        }
+        assert_eq!(
+            cache.extract_text(&selection((0, 0), (99, 99))),
+            source,
+            "copying rejoins the rows into the source exactly: {rows:?}"
+        );
+        assert_eq!(cache.search(0, &SearchQuery::new("中文 tail")).len(), 1);
+        assert_eq!(cache.search(0, &SearchQuery::new("words here")).len(), 1);
     }
 
     #[test]
