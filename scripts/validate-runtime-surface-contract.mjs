@@ -1395,6 +1395,10 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/ui.rs:render_markdown:table_rows.clear", 2],
   ["crates/orca-tui/src/ui.rs:render_table_as_records:lines.insert", 1],
   ["crates/orca-tui/src/ui.rs:render_textarea_visual_line:attached_zero_width.clear", 1],
+  ["crates/orca-tui/src/hosted_session.rs:convert:self.tool_names.insert", 1],
+  ["crates/orca-tui/src/transcript_view.rs:materialize_rows:spans.insert", 1],
+  ["crates/orca-tui/src/ui.rs:append_assistant_markdown:line.spans.insert", 1],
+  ["crates/orca-tui/src/ui.rs:append_diff_lines:line.spans.insert", 1],
 ]);
 
 const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_ITEM_SITES = new Map([
