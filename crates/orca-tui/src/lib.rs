@@ -99,6 +99,7 @@ mod surface_client;
 mod surface_projection;
 mod syntax_highlight;
 mod terminal_capabilities;
+mod terminal_output;
 mod terminal_presentation;
 mod terminal_session;
 pub mod theme;

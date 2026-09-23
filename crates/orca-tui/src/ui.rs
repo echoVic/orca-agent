@@ -2226,7 +2226,12 @@ fn render_agent_transcript(frame: &mut Frame, area: Rect, state: &AppState, them
                                 ("tool indeterminate ", theme.warning)
                             }
                         };
-                        push_agent_transcript_text(&mut lines, prefix, content.as_str(), color);
+                        let terminal =
+                            crate::terminal_output::terminal_output_display(content.as_str());
+                        let text = terminal
+                            .as_ref()
+                            .map_or(content.as_str(), |terminal| terminal.output.as_str());
+                        push_agent_transcript_text(&mut lines, prefix, text, color);
                     }
                 }
             }
@@ -3437,6 +3442,12 @@ fn append_message_lines(
                 "indeterminate" => Some("state unknown"),
                 other => Some(other),
             };
+            // A shell result is the runtime's JSON envelope around the
+            // command's output; show the output, and the envelope only where
+            // it changes what the output means.
+            let terminal = output
+                .as_deref()
+                .and_then(crate::terminal_output::terminal_output_display);
             let mut spans = vec![
                 Span::raw(GUTTER_CONTINUATION),
                 Span::styled(format!("{icon} "), Style::default().fg(color)),
@@ -3470,8 +3481,26 @@ fn append_message_lines(
                     Style::default().fg(color),
                 ));
             }
+            if let Some(note) = terminal
+                .as_ref()
+                .and_then(|terminal| terminal.note.as_ref())
+            {
+                spans.push(Span::styled(
+                    format!(" · {note}"),
+                    Style::default().fg(theme.warning),
+                ));
+            }
             lines.push(Line::from(spans));
-            if let Some(out) = output {
+            if let Some(terminal) = terminal.as_ref() {
+                append_tool_output_lines(
+                    lines,
+                    &terminal.output,
+                    *expanded,
+                    force_expand,
+                    width,
+                    theme,
+                );
+            } else if let Some(out) = output {
                 if !is_workflow_draft_tool(name)
                     || !append_workflow_draft_preview_lines(
                         lines,
@@ -3481,7 +3510,7 @@ fn append_message_lines(
                         theme,
                     )
                 {
-                    append_tool_output_lines(lines, out, *expanded, force_expand, theme);
+                    append_tool_output_lines(lines, out, *expanded, force_expand, width, theme);
                 }
             }
             if let Some(diff) = diff {
@@ -3870,6 +3899,7 @@ fn append_tool_output_lines(
     output: &str,
     expanded: bool,
     force_expand: bool,
+    width: usize,
     theme: &Theme,
 ) {
     // Flushing to the immutable scrollback (`force_expand`) commits the entire output so
@@ -3883,11 +3913,22 @@ fn append_tool_output_lines(
     } else {
         2
     };
+    // The collapsed view keeps each line to a single row: one long line (a
+    // minified payload, a log line) would otherwise wrap into dozens of rows.
+    let row_budget = (!expanded && !force_expand).then(|| width.saturating_sub(6).max(8));
+    let mut clipped = false;
     let rail = Span::styled("    │ ".to_string(), theme.dim_style());
     for line in output.lines().take(shown) {
+        let line = match row_budget {
+            Some(budget) if UnicodeWidthStr::width(line) > budget => {
+                clipped = true;
+                truncate_to_display_width(line, budget)
+            }
+            _ => line.to_string(),
+        };
         lines.push(Line::from(vec![
             rail.clone(),
-            Span::styled(line.to_string(), theme.muted_style()),
+            Span::styled(line, theme.muted_style()),
         ]));
     }
     if force_expand {
@@ -3896,6 +3937,8 @@ fn append_tool_output_lines(
     let hidden = total.saturating_sub(shown);
     let tail = if hidden > 0 {
         format!("+{hidden} lines · e to expand")
+    } else if clipped {
+        "e to expand".to_string()
     } else if expanded && total > 2 {
         format!("{total} lines · e to collapse")
     } else {
@@ -8713,6 +8756,84 @@ mod tests {
             ),
         );
         assert_eq!(expanded.last().unwrap(), "    └ 4 lines · e to collapse");
+    }
+
+    fn shell_result(output: &str, exit_code: i64) -> String {
+        serde_json::json!({
+            "task_id": "task-1",
+            "state": "completed",
+            "return_reason": "terminal_observed",
+            "termination_reason": "exited",
+            "exit_code": exit_code,
+            "output": output,
+            "next_cursor": output.len(),
+            "output_gap": null,
+            "effective_deadline_ms": null,
+            "deadline_source": null,
+            "terminal": "pipe",
+            "eof": true,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_shell_result_shows_the_commands_output_not_its_envelope() {
+        let result = shell_result(
+            "total 432\ndrwxr-xr-x  41 me  staff  1312 .\nCargo.toml\n",
+            0,
+        );
+        let text = message_text(
+            None,
+            &tool_call("bash", Some("ls -la"), "completed", Some(&result), false),
+        );
+        assert_eq!(text[0], "    ✓ bash  ls -la");
+        assert_eq!(text[1], "    │ total 432");
+        assert_eq!(text[2], "    │ drwxr-xr-x  41 me  staff  1312 .");
+        assert_eq!(text[3], "    └ +1 lines · e to expand");
+        assert!(
+            text.iter().all(|line| !line.contains("deadline_source")),
+            "{text:?}"
+        );
+
+        let failed = message_text(
+            None,
+            &tool_call(
+                "bash",
+                Some("cargo test"),
+                "completed",
+                Some(&shell_result("error[E0308]: mismatched types\n", 101)),
+                false,
+            ),
+        );
+        assert_eq!(failed[0], "    ✓ bash  cargo test · exit 101");
+        assert_eq!(failed[1], "    │ error[E0308]: mismatched types");
+    }
+
+    #[test]
+    fn a_collapsed_tool_row_keeps_one_long_line_to_one_row() {
+        let long = "x".repeat(300);
+        let text = message_text(
+            None,
+            &tool_call("grep", Some("needle"), "completed", Some(&long), false),
+        );
+        assert_eq!(text.len(), 3, "{text:?}");
+        assert!(UnicodeWidthStr::width(text[1].as_str()) <= 80, "{text:?}");
+        assert!(text[1].ends_with('…'), "{text:?}");
+        assert_eq!(text[2], "    └ e to expand");
+
+        let expanded = message_text(
+            None,
+            &tool_call("grep", Some("needle"), "completed", Some(&long), true),
+        );
+        assert_eq!(
+            expanded
+                .iter()
+                .skip(1)
+                .map(|line| line.matches('x').count())
+                .sum::<usize>(),
+            300,
+            "expanded, the whole line is there: {expanded:?}"
+        );
     }
 
     #[test]
