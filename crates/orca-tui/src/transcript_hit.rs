@@ -9,10 +9,11 @@
 
 use ratatui::layout::Rect;
 
+use crate::chrome::TAIL_ROW;
 use crate::transcript_state::ChatMessage;
 
-/// A collapsible message's on-screen rect for the frame just drawn, and the
-/// index of the message it belongs to.
+/// One clickable row of a collapsible message for the frame just drawn, and
+/// the index of the message it toggles.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CollapsibleHitArea {
     pub(crate) rect: Rect,
@@ -61,41 +62,49 @@ pub(crate) fn message_index_at_row(
         .position(|range| range.contains(&absolute_row))
 }
 
-/// Rebuilds the hit areas collapsible messages occupy on screen for the
-/// frame about to be drawn. Same shape as the `image_hit_areas` rebuild in
-/// `render_live_messages`: walk the messages once, keep only the
-/// collapsible ones, intersect each one's row range with the visible
-/// window, and drop anything the intersection leaves empty.
-pub(crate) fn collapsible_hit_areas(
+/// Rebuilds the rows that toggle a collapsible message for the frame about
+/// to be drawn: its header (the first non-blank row, since a message may
+/// open with a blank separator) and its `└ ` tail row, each while on screen.
+/// Every other row holds content — expanded output, a notice's text — and a
+/// click there must start a text selection like anywhere else in the
+/// transcript, not collapse what the user is trying to copy.
+///
+/// `row_range_for` gives a message's absolute rows and `row_text_for` an
+/// absolute row's text, both as the render cache laid them out.
+pub(crate) fn collapsible_hit_areas<'t>(
     messages: &[ChatMessage],
     row_range_for: impl Fn(usize) -> Option<std::ops::Range<usize>>,
+    row_text_for: impl Fn(usize) -> Option<&'t str>,
     viewport_base_row: usize,
     visible_height: usize,
     area: Rect,
 ) -> Vec<CollapsibleHitArea> {
-    let visible_start = viewport_base_row;
-    let visible_end = visible_start.saturating_add(visible_height);
-    messages
-        .iter()
-        .enumerate()
-        .filter_map(|(message_index, message)| {
-            if !is_collapsible(message, usize::from(area.width)) {
-                return None;
+    let visible = viewport_base_row..viewport_base_row.saturating_add(visible_height);
+    let mut areas = Vec::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        if !is_collapsible(message, usize::from(area.width)) {
+            continue;
+        }
+        let Some(range) = row_range_for(message_index) else {
+            continue;
+        };
+        let header = range
+            .clone()
+            .find(|&row| row_text_for(row).is_some_and(|text| !text.trim().is_empty()));
+        let on_screen = range.start.max(visible.start)..range.end.min(visible.end);
+        let tails = on_screen.filter(|&row| {
+            Some(row) != header && row_text_for(row).is_some_and(|text| text.starts_with(TAIL_ROW))
+        });
+        for row in header.into_iter().chain(tails) {
+            if visible.contains(&row) {
+                areas.push(CollapsibleHitArea {
+                    rect: Rect::new(area.x, area.y + (row - visible.start) as u16, area.width, 1),
+                    message_index,
+                });
             }
-            let range = row_range_for(message_index)?;
-            let start = range.start.max(visible_start);
-            let end = range.end.min(visible_end);
-            (start < end).then(|| CollapsibleHitArea {
-                rect: Rect::new(
-                    area.x,
-                    area.y + start.saturating_sub(visible_start) as u16,
-                    area.width,
-                    end.saturating_sub(start) as u16,
-                ),
-                message_index,
-            })
-        })
-        .collect()
+        }
+    }
+    areas
 }
 
 #[cfg(test)]
@@ -136,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn only_collapsible_messages_get_a_hit_area_and_it_is_clipped_to_the_viewport() {
+    fn a_collapsible_message_is_clickable_on_its_header_only_while_it_is_on_screen() {
         let messages = vec![
             ChatMessage::User("hi".into()),
             tool_call(),
@@ -146,18 +155,45 @@ mod tests {
             },
         ];
         let ranges = [0..1, 1..4, 4..5];
+        let rows = [
+            " ›  hi",
+            "",
+            "    ✓ read_file src/main.rs",
+            "    │ done",
+            "    ⋯ thinking · a",
+        ];
         let areas = collapsible_hit_areas(
             &messages,
             |index| ranges.get(index).cloned(),
+            |row| rows.get(row).copied(),
             0,
             5,
             Rect::new(0, 3, 80, 5),
         );
-        assert_eq!(areas.len(), 2, "user messages are not collapsible");
-        assert_eq!(areas[0].message_index, 1);
-        assert_eq!(areas[0].rect.y, 4);
-        assert_eq!(areas[0].rect.height, 3);
-        assert_eq!(areas[1].message_index, 2);
+        let hits = areas
+            .iter()
+            .map(|area| (area.message_index, area.rect.y, area.rect.height))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hits,
+            [(1, 5, 1), (2, 7, 1)],
+            "the user message is not collapsible, and the tool's blank separator \
+             and output row are not its header"
+        );
+
+        let scrolled = collapsible_hit_areas(
+            &messages,
+            |index| ranges.get(index).cloned(),
+            |row| rows.get(row).copied(),
+            3,
+            2,
+            Rect::new(0, 3, 80, 2),
+        );
+        let hits = scrolled
+            .iter()
+            .map(|area| (area.message_index, area.rect.y))
+            .collect::<Vec<_>>();
+        assert_eq!(hits, [(2, 4)], "the tool's header has scrolled off screen");
     }
 
     #[test]
@@ -177,19 +213,30 @@ mod tests {
             },
         ];
         let ranges = [0..1, 1..2, 2..4];
+        let rows = [
+            "    ℹ one line",
+            "    ℹ one",
+            "    ℹ one",
+            "    └ +2 lines · click or e to expand",
+        ];
         let areas = collapsible_hit_areas(
             &messages,
             |index| ranges.get(index).cloned(),
+            |row| rows.get(row).copied(),
             0,
             4,
             Rect::new(0, 0, 80, 4),
         );
+        let hits = areas
+            .iter()
+            .map(|area| (area.message_index, area.rect.y))
+            .collect::<Vec<_>>();
         assert_eq!(
-            areas.len(),
-            1,
-            "a one- or two-line notice has nothing to expand: {areas:?}"
+            hits,
+            [(2, 2), (2, 3)],
+            "a one- or two-line notice has nothing to expand; a longer one \
+             toggles from its header and its tail: {areas:?}"
         );
-        assert_eq!(areas[0].message_index, 2);
     }
 
     #[test]
@@ -207,13 +254,22 @@ mod tests {
         };
         assert!(is_collapsible(&three_lines, 400), "three rows at any width");
 
+        let rows = [
+            "    ℹ word word word…",
+            "    └ +4 lines · click or e to expand",
+        ];
         let areas = collapsible_hit_areas(
             std::slice::from_ref(&one_line),
             |_| Some(0..2),
+            |row| rows.get(row).copied(),
             0,
             4,
             Rect::new(0, 0, 60, 4),
         );
-        assert_eq!(areas.len(), 1, "the hit area follows the drawn width");
+        assert_eq!(
+            areas.len(),
+            2,
+            "at the drawn width it collapses, so its header and tail both toggle"
+        );
     }
 }

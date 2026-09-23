@@ -998,6 +998,80 @@ mod tests {
     }
 
     #[test]
+    fn a_press_inside_expanded_output_starts_a_selection_instead_of_collapsing_it() {
+        // Only a collapsible message's header and `└ ` tail rows toggle it.
+        // The rows in between are content: a press there begins the ordinary
+        // text selection, so output can be dragged over and copied.
+        let mut state = test_state();
+        state.push_message(tool_call(
+            "bash",
+            Some("cargo test"),
+            "completed",
+            Some("error one\nerror two\nerror three\nerror four"),
+            true,
+        ));
+        render_once(&mut state, 100, 30);
+        let transcript = state.viewport.transcript_area.expect("transcript");
+        let header = state.collapsible_hit_areas[0].rect.y;
+
+        handle_mouse_event(
+            &mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                transcript.x + 8,
+                header + 2,
+            ),
+            &mut state,
+            Instant::now(),
+        );
+
+        assert!(
+            matches!(
+                &state.transcript.messages[0],
+                ChatMessage::ToolCall { expanded: true, .. }
+            ),
+            "a press on an output row must not collapse the output"
+        );
+        assert!(
+            state
+                .viewport
+                .selection
+                .is_some_and(|selection| selection.dragging),
+            "the press begins a drag selection"
+        );
+    }
+
+    #[test]
+    fn only_the_header_and_tail_rows_of_a_collapsed_tool_toggle_it() {
+        let mut state = test_state();
+        state.push_message(tool_call(
+            "bash",
+            Some("a"),
+            "completed",
+            Some("l1\nl2\nl3\nl4"),
+            false,
+        ));
+        render_once(&mut state, 100, 30);
+        let rows = state
+            .collapsible_hit_areas
+            .iter()
+            .map(|area| (area.rect.y, area.rect.height))
+            .collect::<Vec<_>>();
+        let header = rows[0].0;
+        assert_eq!(
+            rows,
+            [(header, 1), (header + 3, 1)],
+            "the header and the `└ +2 lines` tail; the two preview rows stay selectable"
+        );
+
+        let tail = state.collapsible_hit_areas[1];
+        assert!(click_at(&mut state, tail.rect.x + 2, tail.rect.y));
+        assert!(matches!(
+            &state.transcript.messages[0],
+            ChatMessage::ToolCall { expanded: true, .. }
+        ));
+    }
+
+    #[test]
     fn a_click_that_hits_no_collapsible_row_still_starts_a_text_selection() {
         let mut state = test_state();
         state.push_message(ChatMessage::Assistant("plain paragraph".into()));

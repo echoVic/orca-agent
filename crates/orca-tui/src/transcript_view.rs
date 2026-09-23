@@ -1377,6 +1377,13 @@ impl TranscriptRenderCache {
         Some((message_index, line_index, row_within))
     }
 
+    /// Text of absolute row `row` as the transcript holds it (a continuation
+    /// row's hang excluded), or `None` past the last row.
+    pub(crate) fn row_text_at(&self, row: usize) -> Option<&str> {
+        let (message_index, line_index, row_within) = self.locate_row(row)?;
+        Some(self.row_text(message_index, line_index, row_within))
+    }
+
     fn row_text(&self, message_index: usize, line_index: usize, row_within: usize) -> &str {
         let Some(cached) = self.entries.get(message_index).and_then(Option::as_ref) else {
             return "";

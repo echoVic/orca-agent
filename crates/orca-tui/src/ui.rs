@@ -25,7 +25,7 @@ use orca_runtime::history::{SessionSummary, StoredSessionHealth};
 use orca_runtime::surface::{TaskTranscriptItem, TaskTranscriptToolStatus};
 
 use crate::agent_workspace::AgentWorkspaceRow;
-use crate::chrome::{GUTTER_CONTINUATION, GUTTER_WIDTH};
+use crate::chrome::{GUTTER_CONTINUATION, GUTTER_WIDTH, TAIL_ROW};
 use crate::diagnostics::{DiagnosticContext, DiagnosticLevel, TuiDiagnostic};
 use crate::display_text::{compact_long_text, truncate_to_display_width};
 use crate::protocol::TaskTranscriptResult;
@@ -1731,6 +1731,7 @@ pub(crate) fn render_live_messages(
     state.collapsible_hit_areas = crate::transcript_hit::collapsible_hit_areas(
         &state.transcript.messages,
         |index| state.transcript.render_cache.message_row_range(index),
+        |row| state.transcript.render_cache.row_text_at(row),
         visible_start,
         visible_height,
         area,
@@ -3593,7 +3594,7 @@ fn append_system_lines(
     ]));
     let hidden = rows - 1;
     lines.push(Line::from(vec![
-        Span::styled("    └ ".to_string(), theme.dim_style()),
+        Span::styled(TAIL_ROW.to_string(), theme.dim_style()),
         Span::styled(
             format!("+{hidden} lines · click or e to expand"),
             theme.muted_style(),
@@ -3843,7 +3844,7 @@ fn append_tool_output_lines(
         return;
     };
     lines.push(Line::from(vec![
-        Span::styled("    └ ".to_string(), theme.dim_style()),
+        Span::styled(TAIL_ROW.to_string(), theme.dim_style()),
         Span::styled(tail, theme.muted_style()),
     ]));
 }
