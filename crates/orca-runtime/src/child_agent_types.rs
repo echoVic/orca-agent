@@ -951,4 +951,41 @@ mod tests {
         assert_eq!(events[0].source_sequence, 2);
         assert_eq!(events[0].turn_id, turn_id);
     }
+
+    #[test]
+    fn a_relayed_cost_parses_back_to_the_value_its_digest_covers() {
+        // Costs a DeepSeek child reported on 2026-09-23. Without serde_json's
+        // exact float parsing each read back one ULP off, so the parent
+        // recomputed a different digest and quarantined a healthy relay.
+        for estimated_cost_usd in [0.0012501160000000001, 0.00020932800000000003] {
+            let event = SubagentActivityEvent::new(
+                SurfaceTaskId::try_new("task-cost").unwrap(),
+                SurfaceSubagentId::try_new("subagent-cost").unwrap(),
+                AgentAttemptId::new(),
+                TurnId::new(),
+                6,
+                SubagentActivityOwner::DetachedTask {
+                    task_id: SurfaceTaskId::try_new("task-cost").unwrap(),
+                    task_revision: TaskRevision::try_new(1).unwrap(),
+                    authority_digest: Sha256Digest::digest("authority-cost"),
+                },
+                SubagentActivityPayload::Usage {
+                    totals: UsageTotals {
+                        input_tokens: 3574,
+                        output_tokens: 343,
+                        cache_tokens: 3072,
+                        estimated_cost_usd,
+                    },
+                },
+            );
+            let relayed: SubagentActivityEvent =
+                serde_json::from_slice(&serde_json::to_vec(&event).unwrap()).unwrap();
+
+            assert_eq!(relayed, event, "{estimated_cost_usd} did not round-trip");
+            assert!(
+                relayed.verify_digest(),
+                "{estimated_cost_usd} broke the digest"
+            );
+        }
+    }
 }
