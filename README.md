@@ -105,6 +105,40 @@ deletion.
 
 [Pilion Browser](https://github.com/echoVic/pilion-browser) is a desktop browser that works as an ACP client. Choose **Orca** in its Agent panel: Pilion launches `orca --mode=acp`, forwards `DEEPSEEK_API_KEY`, and exposes its own tabs to Orca as MCP tools (`browser_snapshot`, `browser_screenshot`, navigate, click, type) with approval-before-action and human takeover. Installers for macOS, Windows and Linux are on the [Pilion releases page](https://github.com/echoVic/pilion-browser/releases).
 
+### Use another OpenAI-compatible endpoint
+
+Orca speaks the Chat Completions API, so any OpenAI-compatible endpoint works
+through `--base-url`, `--api-key`, and `--model`, or through the matching
+`ORCA_BASE_URL`, `ORCA_API_KEY`, and `ORCA_MODEL` environment variables. For
+example, [Yolo-Auto](https://yolo-auto.com) serves `yolo` and `yolo-small` from
+one OpenAI-compatible base URL, and keys are free to create:
+
+```bash
+export ORCA_BASE_URL=https://yolo-auto.com/v1
+export ORCA_API_KEY="$YOLO_AUTO_API_KEY"
+orca exec --model yolo "add a unit test for the parser"
+```
+
+The same selection per invocation, without environment variables:
+
+```bash
+orca exec --base-url https://yolo-auto.com/v1 --api-key "$YOLO_AUTO_API_KEY" \
+  --model yolo-small "summarize the failing test"
+```
+
+Or in `~/.orca/config.toml`, which applies to every session:
+
+```toml
+base_url = "https://yolo-auto.com/v1"
+api_key = "yolo_..."
+model = "yolo"
+```
+
+Keep the `/v1` suffix in the base URL, because Orca appends only
+`/chat/completions`. The stable model slugs are `yolo` and `yolo-small`; the
+list available to a key is discoverable at `GET https://yolo-auto.com/v1/models`.
+Orca does not use embeddings, image, or audio endpoints.
+
 ## What it does
 
 - Uses DeepSeek's reasoning and tool-use semantics directly, with SSE streaming,
