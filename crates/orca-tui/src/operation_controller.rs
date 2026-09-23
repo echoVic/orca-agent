@@ -113,7 +113,8 @@ impl TuiSurfaceTaskControl {
             })?
         });
         if let (Some(runtime), Some(snapshot)) = (queue_runtime, queue_snapshot) {
-            if snapshot.running_item().is_some() && !snapshot.paused {
+            let queued_turn = snapshot.running_item().is_some();
+            if queued_turn && !snapshot.paused {
                 // Persist the pause before waking a blocked interaction. The
                 // interaction may be the last thing keeping the active task
                 // alive; cancelling it first could let the next FIFO item
@@ -123,7 +124,11 @@ impl TuiSurfaceTaskControl {
                         expected_revision: snapshot.revision,
                     });
             }
-            if snapshot.running_item().is_some() {
+            // Besides a queued turn, the runtime may be running one it started
+            // itself — finished background agents waking the main thread —
+            // which Esc must reach too. An armed activation is the TUI's own
+            // turn still starting, and is interrupted once it installs below.
+            if queued_turn || !self.lock_hosted().surface_activation_armed {
                 self.cancel_queue_interactions();
                 runtime
                     .interrupt_active()
@@ -1839,5 +1844,86 @@ mod tests {
 
         let order = newest_first_order(&snapshot).expect("reorder");
         assert_eq!(texts(&snapshot, &order), ["running", "urgent", "second"]);
+    }
+
+    /// Holds a turn open until it is cancelled.
+    struct WaitForCancelExecutor {
+        entered: std::sync::mpsc::SyncSender<()>,
+    }
+
+    impl orca_runtime::runtime_host::ThreadOperationExecutor for WaitForCancelExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut orca_runtime::thread::RuntimeThread,
+            _request: &orca_runtime::runtime_host::HostedTurnRequest,
+            _generation: &orca_runtime::runtime_host::GenerationContext,
+            _events: &mut orca_core::event_schema::EventFactory,
+            _writer: &mut (dyn std::io::Write + Send),
+            cancel: &orca_core::cancel::CancelToken,
+        ) -> std::io::Result<orca_runtime::runtime_host::ThreadOperationOutcome> {
+            let _ = self.entered.send(());
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !cancel.is_cancelled() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let status = if cancel.is_cancelled() {
+                orca_core::event_schema::RunStatus::Cancelled
+            } else {
+                orca_core::event_schema::RunStatus::Success
+            };
+            thread.lifecycle_mut().finish_task(status);
+            Ok(status.into())
+        }
+    }
+
+    #[test]
+    fn esc_interrupts_a_turn_the_runtime_started_on_its_own() {
+        let _guard = crate::test_support::lock_process_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let host = orca_runtime::runtime_host::RuntimeHost::start_with_executor(Arc::new(
+            WaitForCancelExecutor {
+                entered: entered_tx,
+            },
+        ))
+        .expect("runtime host");
+        let thread = host
+            .start_thread(config, "runtime-started turn")
+            .expect("runtime thread");
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let _ = control.bind_prompt_queue_runtime(thread.clone(), &event_tx);
+
+        // Neither the TUI nor its queue started this turn, as when a finished
+        // background agent wakes the main thread.
+        let operation = thread
+            .start_turn(
+                orca_runtime::runtime_host::HostedTurnRequest::new("woken"),
+                std::io::sink(),
+            )
+            .expect("start the turn");
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the turn is running");
+
+        assert!(
+            control.interrupt_current().expect("interrupt"),
+            "Esc reaches the running turn"
+        );
+        assert!(
+            operation.wait_timeout(Duration::from_secs(10)).is_some(),
+            "the turn ends instead of running on"
+        );
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
     }
 }

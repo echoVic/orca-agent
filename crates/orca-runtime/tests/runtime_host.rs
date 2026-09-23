@@ -2068,6 +2068,102 @@ fn actor_owned_steer_is_operation_fenced_and_drained_once() {
     host.shutdown().expect("shutdown runtime host");
 }
 
+/// A background agent that finished and still owes the main conversation its
+/// result, as the task tool leaves one it launched without waiting.
+fn finish_background_agent(
+    thread: &orca_runtime::runtime_host::RuntimeThreadHandle,
+    description: &str,
+) {
+    let registry = thread.task_registry();
+    let agent = registry.create_subagent(description.to_string(), None);
+    registry.mark_subagent_result_pending(&agent.id);
+    registry
+        .complete(&agent.id, format!("{description}: done"))
+        .expect("finish the agent");
+}
+
+/// What an interactive surface does when it attaches: bind the prompt queue
+/// and observe the turns the thread starts on its own.
+fn attach_interactive_surface(thread: &orca_runtime::runtime_host::RuntimeThreadHandle) {
+    thread
+        .prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::List)
+        .expect("bind the prompt queue");
+    thread.set_prompt_queue_event_observer(Arc::new(|_: &EventEnvelope| Ok(())));
+}
+
+#[test]
+fn a_finished_background_agent_wakes_the_idle_main_thread() {
+    let gate = ManualGate::new();
+    let executor = Arc::new(ScriptedExecutor::new([TestBehavior::WaitForRelease {
+        gate: gate.clone(),
+        status: RunStatus::Success,
+    }]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+    attach_interactive_surface(&thread);
+
+    finish_background_agent(&thread, "survey the crate");
+
+    gate.wait_until_entered();
+    let prompts = executor.prompts();
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(
+        prompts[0].starts_with("[Background agents finished"),
+        "{prompts:?}"
+    );
+    gate.release();
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn a_finished_agent_leaves_the_main_thread_idle_when_nothing_is_owed_or_the_user_paused() {
+    let executor = Arc::new(ScriptedExecutor::new([]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+    attach_interactive_surface(&thread);
+
+    let registry = thread.task_registry();
+    let in_band = registry.create_subagent("returned in band".to_string(), None);
+    registry
+        .complete(&in_band.id, "already returned".to_string())
+        .expect("finish the in-band agent");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        executor.call_count(),
+        0,
+        "a result the parent already got owes nothing"
+    );
+
+    let snapshot = thread
+        .prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::List)
+        .expect("list the queue");
+    thread
+        .prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::Pause {
+            expected_revision: snapshot.revision,
+        })
+        .expect("pause the queue");
+    finish_background_agent(&thread, "survey the crate");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        executor.call_count(),
+        0,
+        "a paused queue means the user took over"
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn a_finished_background_agent_does_not_wake_a_thread_nothing_observes() {
+    let executor = Arc::new(ScriptedExecutor::new([]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+
+    finish_background_agent(&thread, "survey the crate");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(executor.call_count(), 0, "no surface would show the turn");
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
 #[test]
 fn steer_a_finished_turn_never_applied_runs_as_the_next_turn() {
     let first_gate = ManualGate::new();

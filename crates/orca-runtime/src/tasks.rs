@@ -3958,6 +3958,26 @@ impl TaskRegistry {
     ///
     /// The parent must resolve these before it can claim its own task is done,
     /// or report them as still outstanding.
+    /// Whether a finished subagent still owes the main conversation its
+    /// result — the ones [`Self::claim_subagent_results_for_parent`] claims
+    /// for the root — read under the lock without claiming or cloning, so an
+    /// idle thread can ask cheaply and often.
+    pub(crate) fn has_undelivered_root_subagent_results(&self) -> bool {
+        self.with_tasks(|tasks| {
+            tasks.values().any(|record| {
+                record.task_type == TaskType::Subagent
+                    && is_terminal(record.status)
+                    && record.result_delivery == ResultDelivery::Pending
+                    && record
+                        .parent_task_id
+                        .as_deref()
+                        .and_then(|id| tasks.get(id))
+                        .is_none_or(|parent| parent.task_type != TaskType::Subagent)
+            })
+        })
+        .unwrap_or(false)
+    }
+
     pub fn outstanding_subagent_results(&self) -> Vec<PendingSubagentResult> {
         self.list()
             .into_iter()

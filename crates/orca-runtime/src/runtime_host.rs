@@ -137,6 +137,13 @@ pub const THREAD_COMMAND_CAPACITY: usize = 16;
 pub const HOST_BACKGROUND_TASK_CAPACITY: usize = 16;
 const WORKFLOW_BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SUBAGENT_RELAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// The prompt of the turn a finished background agent starts on an idle main
+/// thread. The results themselves arrive as the task notifications the turn's
+/// opening drains in; this only asks the model to act on them.
+const CHILD_RESULTS_WAKE_PROMPT: &str = "[Background agents finished; their results are in the task notifications above. Continue the work with them, or tell the user what they found.]";
+/// The shortest gap between two such turns, so a wake that keeps failing to
+/// start does not spin the actor.
+const CHILD_RESULTS_WAKE_BACKOFF: Duration = Duration::from_secs(2);
 const SUBAGENT_ACTIVITY_DEDUPE_CAPACITY: usize = 4096;
 // Detached workers have a five-second adoption deadline. Allow that startup
 // window to elapse before turning repeated poll failures into durable health.
@@ -11673,6 +11680,8 @@ struct ThreadActor {
     subagent_activity_dedupe: VecDeque<(surface::SurfaceCommitId, surface::Sha256Digest)>,
     /// Consecutive relay drain failures keyed by durable task attempt.
     subagent_relay_failure_counts: HashMap<String, (String, u8)>,
+    /// When the thread last started a turn for finished background agents.
+    last_child_results_wake: Option<Instant>,
 }
 
 struct ResidentSurfaceSlot(Option<ResidentSurfaceState>);
@@ -16221,6 +16230,7 @@ impl ThreadActor {
             prompt_queue_path,
             subagent_activity_dedupe: VecDeque::new(),
             subagent_relay_failure_counts: HashMap::new(),
+            last_child_results_wake: None,
         }
     }
 
@@ -16365,6 +16375,111 @@ impl ThreadActor {
         true
     }
 
+    /// A foreground surface operation, or an interaction still waiting on the
+    /// user: either way the thread must not start work of its own.
+    fn surface_holds_the_thread(&self) -> bool {
+        self.resident_surface.0.as_ref().is_some_and(|resident| {
+            let snapshot = resident.coordinator.state().snapshot();
+            snapshot.foreground_operation.is_some()
+                || snapshot.interactions.iter().any(|interaction| {
+                    matches!(
+                        interaction.lifecycle,
+                        surface::SurfaceInteractionLifecycle::Requested
+                    )
+                })
+        })
+    }
+
+    /// Starts a turn on the idle main thread when a finished background agent
+    /// still owes it a result, so the main agent reads it and carries on
+    /// instead of waiting for the user's next message. The turn's opening
+    /// drains every pending result, so agents that finish together share one
+    /// turn. It only happens when an interactive surface observes the thread
+    /// (and so shows the turn and routes its approvals), nothing is queued
+    /// (that turn delivers the results too), the queue is not paused (an
+    /// interrupt means the user took over), nothing waits on the user, and
+    /// not again within [`CHILD_RESULTS_WAKE_BACKOFF`].
+    fn try_wake_for_finished_child_results(&mut self) {
+        // Agent and side threads share or fork the main thread's task tree;
+        // its results belong to the main thread alone.
+        if self.handle.parent_thread_id.is_some()
+            || self.active.is_some()
+            || self.goal_controller.is_blocking()
+        {
+            return;
+        }
+        let queue = self.prompt_queue.snapshot();
+        if !self
+            .handle
+            .prompt_queue_dispatch_ready
+            .load(Ordering::Acquire)
+            || queue.paused
+            || !queue.items.is_empty()
+        {
+            return;
+        }
+        if self
+            .last_child_results_wake
+            .is_some_and(|at| at.elapsed() < CHILD_RESULTS_WAKE_BACKOFF)
+            || self.surface_holds_the_thread()
+        {
+            return;
+        }
+        let owed = self.state.as_ref().is_some_and(|state| {
+            state
+                .thread
+                .session()
+                .task_registry()
+                .has_undelivered_root_subagent_results()
+        });
+        if !owed {
+            return;
+        }
+        let Some(observer) = self
+            .handle
+            .prompt_queue_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        self.last_child_results_wake = Some(Instant::now());
+        let mut request =
+            HostedTurnRequest::new(CHILD_RESULTS_WAKE_PROMPT).with_event_observer(observer);
+        let interaction_handlers = self
+            .handle
+            .prompt_queue_interaction_handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(handler) = interaction_handlers.approval {
+            request = request.with_approval_handler(handler);
+        }
+        if let Some(handler) = interaction_handlers.permission {
+            request = request.with_permission_handler(handler);
+        }
+        if let Some(handler) = interaction_handlers.user_input {
+            request = request.with_user_input_handler(handler);
+        }
+        if let Some(handler) = interaction_handlers.mcp_elicitation {
+            request = request.with_mcp_elicitation_handler(handler);
+        }
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.handle_idle_command(ThreadCommand::StartTurn {
+            request: Box::new(request),
+            writer: Box::new(PassthroughHostedOperationWriter::new(io::sink())),
+            config: None,
+            reply: reply_tx,
+        });
+        match receive_reply(reply_rx, "background results turn start") {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) | Err(error) => {
+                eprintln!("orca: finished background agents could not wake the thread: {error}");
+            }
+        }
+    }
+
     fn try_drain_prompt_queue(&mut self) {
         if !self
             .handle
@@ -16382,26 +16497,7 @@ impl ThreadActor {
         if !self.reconcile_prompt_queue_dispatch() {
             return;
         }
-        if self.resident_surface.0.as_ref().is_some_and(|resident| {
-            resident
-                .coordinator
-                .state()
-                .snapshot()
-                .foreground_operation
-                .is_some()
-                || resident
-                    .coordinator
-                    .state()
-                    .snapshot()
-                    .interactions
-                    .iter()
-                    .any(|interaction| {
-                        matches!(
-                            interaction.lifecycle,
-                            surface::SurfaceInteractionLifecycle::Requested
-                        )
-                    })
-        }) {
+        if self.surface_holds_the_thread() {
             return;
         }
         let before = self.prompt_queue.clone();
@@ -17062,6 +17158,7 @@ impl ThreadActor {
             if self.active.is_none() {
                 self.resume_recovered_continuation_turns();
                 self.try_drain_prompt_queue();
+                self.try_wake_for_finished_child_results();
             }
             if self.one_shot_close_ready() {
                 match self.close_ephemeral_one_shot(&mut command_rx).await {
