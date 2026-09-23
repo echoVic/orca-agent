@@ -613,8 +613,12 @@ impl ThreadActor {
         })
     }
 
+    /// `task_registry` is the session's: a running operation holds the
+    /// thread state, so the caller passes the operation's handle to the same
+    /// registry, and a transcript stays readable while its agent runs.
     pub(super) fn read_surface_task_transcript(
         &self,
+        task_registry: Option<&crate::tasks::TaskRegistry>,
         request_id: surface::SurfaceRequestId,
         task_id: surface::SurfaceTaskId,
         expected_revision: surface::TaskRevision,
@@ -652,15 +656,10 @@ impl ThreadActor {
             ));
         }
 
-        let Some(state) = self.state.as_ref() else {
+        let Some(task_registry) = task_registry else {
             return Ok(task_transcript_unavailable(request_id));
         };
-        let record = match state
-            .thread
-            .session()
-            .task_registry()
-            .read_task_transcript(task_id.as_str())
-        {
+        let record = match task_registry.read_task_transcript(task_id.as_str()) {
             Ok(record) => record,
             Err(crate::tasks::TaskTranscriptReadError::NotFound) => {
                 return Ok(task_transcript_not_found(request_id));

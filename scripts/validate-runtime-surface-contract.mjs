@@ -1193,6 +1193,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/surface_actions.rs:remember:memory.update", 2],
   ["crates/orca-tui/src/surface_actions.rs:save_api_key:credentials.update", 2],
   ["crates/orca-tui/src/state_reducer.rs:update:input_history.record", 1],
+  ["crates/orca-tui/src/state_reducer.rs:update:user_action.route", 1],
   ["crates/orca-tui/src/workflow_notifications.rs:submit_pending_workflow_notification:user_action.route", 1],
   [
     "crates/orca-tui/src/workflow_panel.rs:refresh_open_task_transcript:user_action.route",

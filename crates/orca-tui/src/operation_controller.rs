@@ -266,6 +266,22 @@ impl TuiSurfaceTaskControl {
             .map(Some)
     }
 
+    /// Reads an agent's transcript without going through the hosted
+    /// controller, which a running turn keeps busy until the turn ends: the
+    /// Agents panel opened on a running agent otherwise sat on "Loading" for
+    /// as long as the parent waited for that agent. `None` before the runtime
+    /// thread exists, when the controller answers instead.
+    pub(crate) fn read_task_transcript(
+        &self,
+        request: &crate::protocol::TaskTranscriptRequest,
+    ) -> Option<crate::protocol::TaskTranscriptResult> {
+        let runtime = self.lock_hosted().queue_runtime.clone()?;
+        Some(crate::surface_client::read_task_transcript(
+            &runtime.typed_surface(),
+            request,
+        ))
+    }
+
     pub(crate) fn pause_current_goal(&self) -> io::Result<bool> {
         let surface = self.lock_hosted().surface_active.clone();
         let Some(surface) = surface else {

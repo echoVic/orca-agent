@@ -2144,10 +2144,11 @@ fn render_agent_transcript(frame: &mut Frame, area: Rect, state: &AppState, them
     let Some(view) = state.task_transcript() else {
         return;
     };
-    let task_name = state
+    let task = state
         .workflow_tasks()
         .iter()
-        .find(|task| task.id == view.request.task_id)
+        .find(|task| task.id == view.request.task_id);
+    let task_name = task
         .map(|task| task.name.as_deref().unwrap_or(task.description.as_str()))
         .unwrap_or(view.request.task_id.as_str());
     let mut lines = Vec::new();
@@ -2228,6 +2229,35 @@ fn render_agent_transcript(frame: &mut Frame, area: Rect, state: &AppState, them
                         push_agent_transcript_text(&mut lines, prefix, content.as_str(), color);
                     }
                 }
+            }
+        }
+        // A running agent has no checkpoint until its first step settles;
+        // until then its live activity is all there is to show.
+        Some(TaskTranscriptResult::Unavailable(_))
+            if task.is_some_and(|task| task.status.is_active()) =>
+        {
+            lines.push(Line::from(Span::styled(
+                format!(" Esc back · {task_name}"),
+                Style::default().fg(theme.muted),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " No transcript checkpoint yet · one appears after the agent's first step",
+                Style::default().fg(theme.warning),
+            )));
+            lines.push(Line::from(""));
+            let history = task
+                .map(|task| task.subagent_activity_history.as_slice())
+                .unwrap_or_default();
+            for entry in history.iter().rev().take(12).rev() {
+                let turn = entry
+                    .turn
+                    .map(|turn| format!(" · turn {turn}"))
+                    .unwrap_or_default();
+                lines.push(Line::from(Span::styled(
+                    format!(" {}{turn}", entry.activity),
+                    Style::default().fg(theme.text),
+                )));
             }
         }
         Some(TaskTranscriptResult::NotFound(error))

@@ -9,7 +9,8 @@ use orca_core::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
 use crate::diagnostics::{DiagnosticContext, TuiDiagnostic};
 use crate::display_text::truncate_to_display_width;
 use crate::protocol::{
-    PendingTuiInput, PendingWorkflowNotification, TuiEvent, TuiMcpElicitationMode,
+    PendingTuiInput, PendingWorkflowNotification, TaskTranscriptRequest, TaskTranscriptResult,
+    TuiEvent, TuiMcpElicitationMode, UserAction,
 };
 use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssembler};
 use crate::surface_projection::{
@@ -220,17 +221,37 @@ impl AppState {
                 self.panel_mode = PanelMode::Conversation;
             }
             TuiEvent::TaskTranscriptResult { request, result } => {
-                if !self
-                    .task_transcript
-                    .as_ref()
-                    .is_some_and(|current| current.request == request)
-                {
+                let Some(current) = self.task_transcript.as_mut() else {
+                    return;
+                };
+                if current.request != request {
                     return;
                 }
+                // A running agent's own progress moves its task revision, so a
+                // read can lose that race. Ask again at the revision the runtime
+                // reported and keep showing what is on screen meanwhile.
+                if let TaskTranscriptResult::Stale(error) = &result
+                    && let Some(current_revision) = error.current_revision
+                    && current_revision > request.expected_revision
+                {
+                    let retry = TaskTranscriptRequest {
+                        task_id: request.task_id,
+                        expected_revision: current_revision,
+                    };
+                    current.request = retry.clone();
+                    let _ = self.event_tx.send(UserAction::ReadTaskTranscript(retry));
+                    return;
+                }
+                // A refresh of the transcript being read keeps its place.
+                let scroll = if current.result.is_some() {
+                    current.scroll
+                } else {
+                    0
+                };
                 self.task_transcript = Some(TaskTranscriptViewState {
                     request,
                     result: Some(result),
-                    scroll: 0,
+                    scroll,
                 });
             }
             TuiEvent::ReasoningDelta(text) => {

@@ -3084,6 +3084,71 @@ fn open_agent_transcript_refreshes_on_new_publication_and_ignores_stale_reply() 
 }
 
 #[test]
+fn a_transcript_read_that_loses_to_the_agents_progress_asks_again_and_keeps_its_place() {
+    let (tx, rx) = mpsc::unbounded();
+    let mut state = AppState::new(
+        tx,
+        "0.0.0-test".to_string(),
+        "mock".to_string(),
+        "/tmp".to_string(),
+    );
+    let mut task = workflow_task_summary("agent-child", "child");
+    task.task_type = TaskType::Subagent;
+    task.publication_revision = Some(7);
+    state.replace_workflow_tasks_for_test(vec![task]);
+    let request = crate::protocol::TaskTranscriptRequest {
+        task_id: "agent-child".to_string(),
+        expected_revision: 7,
+    };
+    state.begin_task_transcript_request(request.clone());
+    state.update(TuiEvent::TaskTranscriptResult {
+        request: request.clone(),
+        result: crate::protocol::TaskTranscriptResult::unavailable("no checkpoint yet"),
+    });
+    state.scroll_task_transcript_down();
+    state.scroll_task_transcript_down();
+
+    // The agent committed progress between the request and the read.
+    state.update(TuiEvent::TaskTranscriptResult {
+        request,
+        result: crate::protocol::TaskTranscriptResult::Stale(
+            crate::protocol::TaskTranscriptError {
+                code: orca_runtime::surface::SurfaceReadErrorCode::StaleRevision,
+                message: "task transcript revision is stale".to_string(),
+                current_revision: Some(9),
+            },
+        ),
+    });
+
+    let retry = crate::protocol::TaskTranscriptRequest {
+        task_id: "agent-child".to_string(),
+        expected_revision: 9,
+    };
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(UserAction::ReadTaskTranscript(request)) if request == retry
+    ));
+    let view = state.task_transcript().expect("the transcript stays open");
+    assert!(
+        matches!(
+            view.result,
+            Some(crate::protocol::TaskTranscriptResult::Unavailable(_))
+        ),
+        "what was on screen stays until the retry answers"
+    );
+
+    state.update(TuiEvent::TaskTranscriptResult {
+        request: retry,
+        result: crate::protocol::TaskTranscriptResult::unavailable("still no checkpoint"),
+    });
+    assert_eq!(
+        state.task_transcript_scroll(),
+        2,
+        "a refresh keeps the reader's place"
+    );
+}
+
+#[test]
 fn workflow_events_update_panel_and_queue_model_notification() {
     let mut state = state();
     state.apply_workflow_tasks_for_test(vec![BackgroundTaskSummary {

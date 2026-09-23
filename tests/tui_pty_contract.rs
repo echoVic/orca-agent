@@ -296,6 +296,14 @@ fn tui_click_on_a_running_background_agent_opens_its_transcript() {
         "Agent Transcript",
         "clicking the running agent did not open its transcript",
     );
+    // The parent turn keeps waiting on the agent, and the panel is answered
+    // anyway: the agent is still in its first step, so its live activity.
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "No transcript checkpoint yet",
+        "the running agent's panel was not answered while the parent turn ran",
+    );
 
     std::fs::write(&release_marker, b"release").expect("release background agent");
     arm_idle_exit(&mut process, &mut output);

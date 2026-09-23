@@ -409,6 +409,29 @@ fn route_action(
                 }
             }
         }
+        UserAction::ReadTaskTranscript(request) => {
+            match controller.read_task_transcript(&request) {
+                Some(result) => {
+                    if !deliver_dispatcher_outcome(
+                        event_tx,
+                        &mut pending.event,
+                        TuiEvent::TaskTranscriptResult { request, result },
+                    ) {
+                        return false;
+                    }
+                }
+                None => match enqueue_action(
+                    UserAction::ReadTaskTranscript(request),
+                    command_tx,
+                    &mut pending.commands,
+                    backlog_capacity,
+                ) {
+                    EnqueueResult::Queued => {}
+                    EnqueueResult::Disconnected => return false,
+                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                },
+            }
+        }
         UserAction::Cancel => return false,
         action => {
             let arms_surface_activation = matches!(

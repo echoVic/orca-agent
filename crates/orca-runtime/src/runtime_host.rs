@@ -18782,7 +18782,14 @@ impl ThreadActor {
                 let result = if self
                     .admits_surface_client(&client, surface::SurfaceCapability::ReadSnapshot)
                 {
-                    self.read_surface_task_transcript(request_id, task_id, expected_revision)
+                    self.read_surface_task_transcript(
+                        self.state
+                            .as_ref()
+                            .map(|state| state.thread.session().task_registry()),
+                        request_id,
+                        task_id,
+                        expected_revision,
+                    )
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
@@ -19498,7 +19505,12 @@ impl ThreadActor {
                 let result = if self
                     .admits_surface_client(&client, surface::SurfaceCapability::ReadSnapshot)
                 {
-                    self.read_surface_task_transcript(request_id, task_id, expected_revision)
+                    self.read_surface_task_transcript(
+                        Some(&active.task_registry),
+                        request_id,
+                        task_id,
+                        expected_revision,
+                    )
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
