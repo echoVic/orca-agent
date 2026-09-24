@@ -31097,7 +31097,20 @@ mod tests {
         .and_then(|background| background.task_id.clone())
         .expect("provider cancel checkpoint race owns a task");
         let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
-        std::thread::sleep(Duration::from_millis(200));
+        // The provider records its outcome durably and then holds the
+        // completion notification for 500ms. Wait for the record itself: a
+        // fixed pause lost the race to a slow write on a loaded CI runner.
+        while thread
+            .task_registry()
+            .typed_provider_outcome(task_id.as_str())
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "provider completion must own a private durable recovery receipt before notification"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(
             thread
                 .task_registry()
@@ -31106,13 +31119,6 @@ mod tests {
                 .status,
             TaskStatus::Running,
             "private durable outcome must not expose legacy terminal state before surface commit"
-        );
-        assert!(
-            thread
-                .task_registry()
-                .typed_provider_outcome(task_id.as_str())
-                .is_some(),
-            "provider completion must own a private durable recovery receipt before notification"
         );
         surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failures(transcript_path, 10);
         assert!(matches!(
