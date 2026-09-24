@@ -124,7 +124,8 @@ pub(crate) fn strip_lines(
 
 /// The detail panel's rectangle inside `area`, or `None` when the recap is
 /// not open or `area` is too small to show it.
-pub(crate) fn detail_rect(area: Rect, state: &RecapState) -> Option<Rect> {
+#[cfg(test)]
+fn detail_rect(area: Rect, state: &RecapState) -> Option<Rect> {
     detail_layout(area, state, None).map(|(rect, _)| rect)
 }
 
