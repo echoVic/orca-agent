@@ -3363,6 +3363,37 @@ fn leading_blank(previous: Option<&ChatMessage>, message: &ChatMessage) -> bool 
     }
 }
 
+/// Whether `e` has something to show or hide on `message` at `width`: a tool
+/// still running (its output is on the way), or a collapsible message whose
+/// collapsed and expanded renderings differ. It asks the renderer, which is
+/// what decides what a collapsed message hides.
+pub(crate) fn expanding_changes_view(message: &ChatMessage, width: usize) -> bool {
+    let mut flipped = message.clone();
+    match &mut flipped {
+        ChatMessage::ToolCall {
+            status, expanded, ..
+        } => {
+            if matches!(status.as_str(), "running" | "receiving") {
+                return true;
+            }
+            *expanded = !*expanded;
+        }
+        ChatMessage::Reasoning { expanded, .. } | ChatMessage::System { expanded, .. } => {
+            *expanded = !*expanded;
+        }
+        _ => return false,
+    }
+    // Only the text is compared, so any theme will do.
+    let theme = Theme::named(orca_core::config::ThemeName::Dark);
+    let rows = |message: &ChatMessage| {
+        build_lines_for_message_after(None, message, &theme, width, 0, false, None)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+    };
+    rows(message) != rows(&flipped)
+}
+
 /// Render the lines for one message, given the message immediately before it
 /// in the transcript (`None` when it opens the slice being rendered).
 pub(crate) fn build_lines_for_message_after(

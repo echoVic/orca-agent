@@ -1480,9 +1480,20 @@ impl AppState {
             .flushed_count
             .min(self.transcript.messages.len());
         let width = self.transcript_width();
-        let Some(index) = self.transcript.messages[live_start..]
+        let live = &self.transcript.messages[live_start..];
+        let changes = |message: &ChatMessage| {
+            is_collapsible(message, width) && crate::ui::expanding_changes_view(message, width)
+        };
+        let is_thinking = |message: &ChatMessage| matches!(message, ChatMessage::Reasoning { .. });
+        // `e` is "expand the latest tool output": a thinking row, which shows
+        // no hint, only when no tool output or notice would change.
+        let Some(index) = live
             .iter()
-            .rposition(|message| is_collapsible(message, width))
+            .rposition(|message| !is_thinking(message) && changes(message))
+            .or_else(|| {
+                live.iter()
+                    .rposition(|message| is_thinking(message) && changes(message))
+            })
         else {
             return false;
         };

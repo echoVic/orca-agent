@@ -2748,6 +2748,104 @@ fn clearing_receiving_progress_preserves_finalized_prefix_boundaries() {
     ));
 }
 
+fn expanded_at(state: &AppState, index: usize) -> bool {
+    match &state.transcript.messages[index] {
+        ChatMessage::ToolCall { expanded, .. }
+        | ChatMessage::Reasoning { expanded, .. }
+        | ChatMessage::System { expanded, .. } => *expanded,
+        other => panic!("not a collapsible message: {other:?}"),
+    }
+}
+
+#[test]
+fn e_expands_the_tool_output_behind_a_one_line_thinking_row() {
+    let mut state = state();
+    state.push_message(tool_call(
+        "bash",
+        Some("ls -la"),
+        "completed",
+        Some("total 8\n.\n..\n.git\nREADME.md\ndone"),
+        false,
+    ));
+    state.push_message(ChatMessage::Reasoning {
+        text: "Mock reasoning.".to_string(),
+        expanded: false,
+    });
+    state.push_message(ChatMessage::Assistant("done".to_string()));
+
+    assert!(state.toggle_latest_expandable());
+    assert!(
+        expanded_at(&state, 0),
+        "the output its hint offers to expand"
+    );
+    assert!(
+        !expanded_at(&state, 1),
+        "a thinking row with nothing hidden"
+    );
+}
+
+#[test]
+fn e_passes_over_a_later_tool_output_that_has_nothing_hidden() {
+    let mut state = state();
+    state.push_message(tool_call(
+        "bash",
+        Some("ls"),
+        "completed",
+        Some("a\nb\nc\nd\ne"),
+        false,
+    ));
+    state.push_message(tool_call(
+        "bash",
+        Some("true"),
+        "completed",
+        Some("ok"),
+        false,
+    ));
+
+    assert!(state.toggle_latest_expandable());
+    assert!(expanded_at(&state, 0));
+    assert!(!expanded_at(&state, 1));
+}
+
+#[test]
+fn e_opens_long_thinking_when_no_tool_output_can_change() {
+    let mut state = state();
+    state.push_message(tool_call(
+        "bash",
+        Some("true"),
+        "completed",
+        Some("ok"),
+        false,
+    ));
+    state.push_message(ChatMessage::Reasoning {
+        text: "first thought\nsecond thought\nthird thought".to_string(),
+        expanded: false,
+    });
+
+    assert!(state.toggle_latest_expandable());
+    assert!(!expanded_at(&state, 0));
+    assert!(expanded_at(&state, 1));
+}
+
+#[test]
+fn e_does_nothing_when_nothing_can_change() {
+    let mut state = state();
+    state.push_message(tool_call(
+        "bash",
+        Some("true"),
+        "completed",
+        Some("ok"),
+        false,
+    ));
+    state.push_message(ChatMessage::Reasoning {
+        text: "Mock reasoning.".to_string(),
+        expanded: false,
+    });
+
+    assert!(!state.toggle_latest_expandable());
+    assert!(!expanded_at(&state, 0) && !expanded_at(&state, 1));
+}
+
 #[test]
 fn toggle_latest_expandable_flips_expanded_state() {
     let mut state = state();
