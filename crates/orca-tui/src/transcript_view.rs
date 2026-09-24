@@ -184,6 +184,7 @@ fn wrap_line(line: &Line<'_>, width: u16, continuation_indent: u16) -> CompactWr
     let mut word_width = 0u16;
     let mut whitespace_width = 0u16;
     let mut non_whitespace_previous = false;
+    let mut previous_symbol = "";
 
     let mut graphemes = line.styled_graphemes(Style::default());
     // What was still pending when a hung line's first row ended, fed through
@@ -196,7 +197,10 @@ fn wrap_line(line: &Line<'_>, width: u16, continuation_indent: u16) -> CompactWr
             continue;
         }
 
-        let word_found = non_whitespace_previous && is_whitespace;
+        // ratatui breaks only at blanks; text written without them breaks
+        // between its wide characters too.
+        let word_found = non_whitespace_previous
+            && (is_whitespace || breaks_between(previous_symbol, grapheme.symbol));
         let untrimmed_overflow = pending_line.is_empty()
             && word_width
                 .saturating_add(whitespace_width)
@@ -213,11 +217,15 @@ fn wrap_line(line: &Line<'_>, width: u16, continuation_indent: u16) -> CompactWr
         }
 
         let line_full = line_width >= row_width;
+        // Counting the incoming symbol keeps a wide one from landing in the
+        // last free column and overflowing the row; for a one-column symbol
+        // this is ratatui's `>= row_width`.
         let pending_word_overflow = symbol_width > 0
             && line_width
                 .saturating_add(whitespace_width)
                 .saturating_add(word_width)
-                >= row_width;
+                .saturating_add(symbol_width)
+                > row_width;
 
         if line_full || pending_word_overflow {
             let mut remaining_width = row_width.saturating_sub(line_width);
@@ -257,6 +265,7 @@ fn wrap_line(line: &Line<'_>, width: u16, continuation_indent: u16) -> CompactWr
             }
         }
 
+        previous_symbol = grapheme.symbol;
         if is_whitespace {
             whitespace_width = whitespace_width.saturating_add(symbol_width);
             pending_whitespace.push_back(grapheme);
@@ -280,6 +289,28 @@ fn wrap_line(line: &Line<'_>, width: u16, continuation_indent: u16) -> CompactWr
     }
 
     wrapped
+}
+
+/// Punctuation a line never starts with, and punctuation a line never ends
+/// with (kinsoku), in their full- and half-width forms.
+const CLOSING_PUNCTUATION: &str = "，。、；：！？）」』】》〉〕｝］”’…,.;:!?)]}";
+const OPENING_PUNCTUATION: &str = "（「『【《〈〔｛［“‘([{";
+
+/// Whether a row may end between two adjacent non-blank graphemes. Blanks
+/// aside, only a wide character opens a break: CJK is written without
+/// blanks and breaks between any two characters, and an emoji breaks from
+/// what surrounds it. Closing punctuation stays with the character before
+/// it, opening punctuation with the one after it.
+fn breaks_between(previous: &str, current: &str) -> bool {
+    (previous.width() > 1 || current.width() > 1)
+        && !current
+            .chars()
+            .next()
+            .is_some_and(|ch| CLOSING_PUNCTUATION.contains(ch))
+        && !previous
+            .chars()
+            .next_back()
+            .is_some_and(|ch| OPENING_PUNCTUATION.contains(ch))
 }
 
 fn grapheme_is_whitespace(grapheme: &StyledGrapheme<'_>) -> bool {
@@ -1754,12 +1785,82 @@ mod tests {
         buffer
     }
 
+    fn wrapped_rows(text: &str, width: u16) -> Vec<String> {
+        let wrapped = super::wrap_line(&Line::from(text.to_string()), width, 0);
+        wrapped
+            .materialize_rows(0, wrapped.row_count())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    const MIXED: &str = "Rust 的所有权是一套编译期的内存管理规则：每个值都有唯一的所有者，\
+        值在所有者离开作用域时自动被释放，因此无需垃圾回收也无需手动 free。";
+
+    #[test]
+    fn a_cjk_run_after_a_word_starts_on_that_words_row() {
+        let rows = wrapped_rows(MIXED, 30);
+        assert!(rows[0].starts_with("Rust 的所有权"), "{rows:?}");
+        // Every row but the last is filled to within a wide character.
+        for row in &rows[..rows.len() - 1] {
+            assert!(row.width() >= 28, "{rows:?}");
+        }
+    }
+
+    #[test]
+    fn wide_characters_never_overflow_a_row_or_go_missing() {
+        let texts = [
+            MIXED,
+            "已完成 TUI 视觉统一并接入鲸鱼欢迎页 👨‍👩‍👧‍👦；仍有 1 个 PR 待合并",
+            "中文中文中文中文中文中文",
+        ];
+        for text in texts {
+            let kept = |value: &str| {
+                value
+                    .chars()
+                    .filter(|ch| !ch.is_whitespace())
+                    .collect::<String>()
+            };
+            for width in 2..=48 {
+                let rows = wrapped_rows(text, width);
+                for row in &rows {
+                    assert!(
+                        row.width() <= usize::from(width),
+                        "{width}: {row:?} in {rows:?}"
+                    );
+                }
+                assert_eq!(kept(&rows.concat()), kept(text), "{width}: {rows:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn closing_punctuation_stays_with_the_character_before_it() {
+        // From six columns up, the widest pair here ("free。") fits a row.
+        for width in 6..=48 {
+            let rows = wrapped_rows(MIXED, width);
+            for row in &rows[1..] {
+                assert!(
+                    !row.starts_with(['，', '。', '：', '；', '！', '？', '、', '）', '」']),
+                    "{width}: {rows:?}"
+                );
+            }
+        }
+    }
+
+    // Wide characters are left out on purpose: the transcript breaks between
+    // them where ratatui breaks only at blanks (see the tests above).
     #[test]
     fn compact_wrapper_matches_ratatui_cells_for_unicode_whitespace_and_styles() {
         let line = Line::from(vec![
             Span::styled("alpha  ", Style::default().fg(Color::Red)),
             Span::styled(
-                "世界\u{00a0}wide\u{200b}word ",
+                "ab\u{00a0}wide\u{200b}word ",
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
