@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
@@ -1234,24 +1234,13 @@ fn open_pty(columns: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
     // Tests spawn their TUIs in parallel: an inheritable PTY would leak into
     // every other test's child, and a detached subagent worker outliving that
-    // child would hold this terminal open so its reader never saw EOF. Each
-    // child still gets its own terminal: spawning dup2s it onto fds 0-2.
-    set_cloexec(&master)?;
-    set_cloexec(&slave)?;
-    Ok((master, slave))
+    // child would hold this terminal open so its reader never saw EOF. Keep
+    // close-on-exec duplicates and let the inheritable originals close; each
+    // child still gets its own terminal, which spawning puts on fds 0-2.
+    Ok((duplicate_fd(&master)?, duplicate_fd(&slave)?))
 }
 
-fn set_cloexec(fd: &impl AsRawFd) -> io::Result<()> {
-    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn duplicate_fd(fd: &impl AsRawFd) -> io::Result<OwnedFd> {
-    let duplicate = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-    if duplicate < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+fn duplicate_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {
+    // `try_clone` duplicates with close-on-exec.
+    fd.try_clone()
 }
