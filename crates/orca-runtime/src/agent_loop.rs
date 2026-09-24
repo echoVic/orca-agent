@@ -5,8 +5,8 @@ use crate::agent_common;
 use crate::child_agent_loop_setup::try_prepare_child_agent_conversation;
 use crate::cost::CostTracker;
 use crate::lifecycle::{
-    AgentLoopContext, AgentLoopOutcome, RuntimeSessionLifecycle, RuntimeTaskActor,
-    RuntimeTurnContext, RuntimeTurnExecution,
+    AgentLoopContext, AgentLoopOutcome, AgentLoopResult, RuntimeSessionLifecycle, RuntimeTaskActor,
+    RuntimeTurnContext, RuntimeTurnExecution, TurnEndReason,
 };
 use crate::runtime_conversation_bootstrap::{
     AgentConversationContext, RuntimeConversationBootstrapStep,
@@ -22,7 +22,7 @@ use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow_execution::observe_background_workflows;
 use orca_core::budget::OperationTerminal;
 use orca_core::config::{OutputFormat, RunConfig};
-use orca_core::event_schema::EventFactory;
+use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::thread_identity::TurnId;
 
@@ -58,6 +58,7 @@ pub(crate) fn run_agent_loop(
     let turn_deps = turn_deps.expect("agent loop turn deps");
     let turn_state = turn_state.expect("agent loop turn state");
     let loop_state = turn_state.into_loop_state();
+    let cancel = loop_state.runtime.cancel;
     let RuntimeTurnExecution {
         background_workflows,
         workflow_ipc,
@@ -123,7 +124,7 @@ pub(crate) fn run_agent_loop(
     let mut actor = RuntimeTaskActor::new(lifecycle);
     let mut turn_loop_step = RuntimeTurnLoopStep::new();
 
-    let mut outcome = run_agent_turn_loop(
+    let outcome = run_agent_turn_loop(
         &mut turn_loop_step,
         RuntimeAgentTurnLoopInput {
             actor: &mut actor,
@@ -143,7 +144,23 @@ pub(crate) fn run_agent_loop(
             workflow: RuntimeTurnWorkflowContext::new(background_workflows, workflow_ipc),
         },
         RuntimeTurnLoopExecutors::new(execute_child_agent_loop, execute_child_agent_loop),
-    )?;
+    );
+    let mut outcome = match outcome {
+        Ok(outcome) => outcome,
+        // Once it cancels a generation, the runtime refuses whatever the loop
+        // still tries to record -- a provider response that raced the cancel,
+        // say -- as interrupted. That refusal is the cancellation reaching the
+        // loop, not a failure of the turn: end the turn the way a cancel seen
+        // in time ends it.
+        Err(error) if error.kind() == io::ErrorKind::Interrupted && cancel.is_cancelled() => {
+            AgentLoopOutcome::Completed(AgentLoopResult::terminal(
+                RunStatus::Cancelled,
+                TurnEndReason::Cancelled,
+                Some("turn cancelled".to_string()),
+            ))
+        }
+        Err(error) => return Err(error),
+    };
 
     // The loop always ends with a typed terminal: budget stops already
     // committed `checkpoint.created` + `operation.terminal` durably before
@@ -153,7 +170,7 @@ pub(crate) fn run_agent_loop(
     // ApprovalRequired is NOT a terminal: the operation is parked waiting
     // for approval and may resume, so no terminal is committed for it.
     if let AgentLoopOutcome::Completed(result) = &mut outcome {
-        if result.status == orca_core::event_schema::RunStatus::ApprovalRequired {
+        if result.status == RunStatus::ApprovalRequired {
             return Ok(outcome);
         }
         operation.refresh_child_budgets()?;

@@ -39134,6 +39134,68 @@ mod tests {
         host.shutdown().expect("shutdown queue interrupt host");
     }
 
+    /// Rejects a provider response the way the actor does once it has begun
+    /// terminalizing the generation: the generation is cancelled and the
+    /// commit is refused as interrupted.
+    #[derive(Debug)]
+    struct TerminalizingProviderResponseIngress {
+        cancel: CancelToken,
+    }
+
+    impl surface::RuntimeProviderResponseIngress for TerminalizingProviderResponseIngress {
+        fn commit_response(&self, _response: &mut RuntimeModelResponse) -> io::Result<()> {
+            self.cancel.cancel();
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "runtime generation is terminalizing",
+            ))
+        }
+
+        fn commit_provider_step(
+            &self,
+            _identity: &ModelResponseIdentity,
+            _step: &ProviderStep,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn commit_tool_results(&self, _results: &[ToolResult]) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_provider_response_that_loses_the_race_with_a_cancel_ends_the_turn_cancelled() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
+                "terminalization race",
+            )
+            .expect("start thread");
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new("hello").with_generation_handlers(|_, cancel| {
+                    HostedGenerationHandlers::default().with_provider_response_ingress(Arc::new(
+                        TerminalizingProviderResponseIngress { cancel },
+                    ))
+                }),
+                io::sink(),
+            )
+            .expect("start turn");
+
+        let terminal = operation
+            .wait_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("the turn settles");
+        assert_eq!(
+            terminal.outcome(),
+            &OperationOutcome::Completed(RunStatus::Cancelled),
+            "a response the actor refused because the turn was being cancelled is that cancellation"
+        );
+        host.shutdown().expect("shutdown host");
+    }
+
     fn recap_request_for_test(id: u64) -> crate::recap::RecapRequest {
         let mut thread_bytes = [1; 16];
         thread_bytes[6] = 0x71;
