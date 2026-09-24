@@ -20,7 +20,7 @@ use crate::transcript_state::ChatMessage;
 use crate::types::SideParentStatus;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct SessionAttachmentId(u64);
+pub struct SessionAttachmentId(u64);
 
 impl SessionAttachmentId {
     pub(crate) const fn new(value: u64) -> Self {
@@ -400,6 +400,30 @@ pub enum TuiEvent {
     SessionCompleted {
         status: String,
     },
+    RecapPending {
+        request_id: orca_runtime::recap::RecapRequestId,
+        attachment: SessionAttachmentId,
+        source: orca_runtime::recap::RecapSourceFence,
+        trigger: orca_runtime::recap::RecapTrigger,
+    },
+    RecapReady {
+        request_id: orca_runtime::recap::RecapRequestId,
+        attachment: SessionAttachmentId,
+        source: orca_runtime::recap::RecapSourceFence,
+        text: String,
+        usage: orca_runtime::recap::RecapUsage,
+    },
+    RecapFailed {
+        request_id: orca_runtime::recap::RecapRequestId,
+        attachment: SessionAttachmentId,
+        source: orca_runtime::recap::RecapSourceFence,
+        message: String,
+    },
+    RecapSkipped {
+        request_id: orca_runtime::recap::RecapRequestId,
+        attachment: SessionAttachmentId,
+        reason: orca_runtime::recap::RecapSkipReason,
+    },
     Compacted {
         before_messages: usize,
         after_messages: usize,
@@ -642,4 +666,9 @@ pub enum UserAction {
     CancelOperation {
         operation_id: SurfaceOperationId,
     },
+    RequestRecap,
+    RequestAutomaticRecap {
+        focus_cycle: u64,
+    },
+    CancelRecap,
 }

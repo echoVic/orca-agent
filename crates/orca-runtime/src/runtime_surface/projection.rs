@@ -864,6 +864,13 @@ pub enum ToolPatch {
 }
 
 impl super::commands::SurfaceSnapshot {
+    /// Build bounded, redacted evidence for the display-only recap worker.
+    /// This projection intentionally excludes system messages, reasoning,
+    /// images, raw tool output, and active streams.
+    pub fn recap_evidence(&self) -> crate::recap::RecapEvidence {
+        crate::recap::recap_evidence(self)
+    }
+
     /// Function intent contract:
     ///
     /// - Input: a recovered durable continuation capsule.

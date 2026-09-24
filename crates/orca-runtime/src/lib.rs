@@ -58,6 +58,7 @@ pub mod protocol;
 mod provider_retry;
 pub mod provider_stream;
 pub mod provider_turn;
+pub mod recap;
 mod runtime_actor;
 pub(crate) mod runtime_approval;
 pub mod runtime_capability;

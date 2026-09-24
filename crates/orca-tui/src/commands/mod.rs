@@ -3,6 +3,7 @@ pub enum SlashCommand {
     New,
     Model(Option<String>),
     Compact,
+    Recap,
     Resume,
     Fork(Option<String>),
     Side(Option<String>),
@@ -114,6 +115,7 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
         "model" => optional_single_argument(parts)
             .map(|model| SlashCommand::Model(model.map(str::to_string))),
         "compact" => no_arguments(parts).then_some(SlashCommand::Compact),
+        "recap" => no_arguments(parts).then_some(SlashCommand::Recap),
         "resume" => no_arguments(parts).then_some(SlashCommand::Resume),
         "fork" => Some(SlashCommand::Fork(optional_argument(parts))),
         "side" => Some(SlashCommand::Side(optional_argument(parts))),
@@ -182,6 +184,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/new", "Start a new conversation"),
         ("/model", "Switch model and reasoning effort"),
         ("/compact", "Compress conversation context"),
+        ("/recap", "Recap what this conversation has done so far"),
         ("/resume", "Resume a saved conversation"),
         ("/fork", "Fork this conversation"),
         ("/side", "Ask without disrupting the main conversation"),

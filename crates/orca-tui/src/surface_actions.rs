@@ -141,6 +141,24 @@ impl TuiSurfaceActions {
         crate::surface_client::read_snapshot(&self.thread)
     }
 
+    pub(crate) fn request_recap(
+        &self,
+        request: orca_runtime::recap::RecapRequest,
+    ) -> Result<orca_runtime::recap::RecapResult, String> {
+        self.thread
+            .request_recap(request)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn cancel_recap(
+        &self,
+        request_id: orca_runtime::recap::RecapRequestId,
+    ) -> Result<(), String> {
+        self.thread
+            .cancel_recap(request_id)
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn rename_current_session(
         &self,
         session_id: &str,

@@ -6,7 +6,7 @@ use crate::protocol::UserAction;
 const MANIFEST: &str = include_str!(
     "../../../docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json"
 );
-const CURRENT_ACTIONS: [(&str, &str); 46] = [
+const CURRENT_ACTIONS: [(&str, &str); 49] = [
     ("StartSideConversation", "host_session_lifecycle_mutation"),
     ("ToggleSideConversation", "host_session_lifecycle_mutation"),
     ("CloseSideConversation", "host_session_lifecycle_mutation"),
@@ -53,6 +53,9 @@ const CURRENT_ACTIONS: [(&str, &str); 46] = [
     ("Cancel", "host_lifecycle_mutation"),
     ("ResumeOperation", "recovery_mutation"),
     ("CancelOperation", "recovery_mutation"),
+    ("RequestRecap", "authoritative_read"),
+    ("RequestAutomaticRecap", "authoritative_read"),
+    ("CancelRecap", "read_only_cancel"),
 ];
 
 const FUTURE_ACTIONS: [&str; 0] = [];
@@ -105,6 +108,9 @@ fn current_user_action_name(action: &UserAction) -> &'static str {
         UserAction::Cancel => "Cancel",
         UserAction::ResumeOperation { .. } => "ResumeOperation",
         UserAction::CancelOperation { .. } => "CancelOperation",
+        UserAction::RequestRecap => "RequestRecap",
+        UserAction::RequestAutomaticRecap { .. } => "RequestAutomaticRecap",
+        UserAction::CancelRecap => "CancelRecap",
     }
 }
 

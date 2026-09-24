@@ -327,6 +327,20 @@ impl RuntimeSurfaceThreadHandle {
         self.runtime.surface()
     }
 
+    pub fn request_recap(
+        &self,
+        request: crate::recap::RecapRequest,
+    ) -> Result<crate::recap::RecapResult, RuntimeHostError> {
+        self.runtime.request_recap(request)
+    }
+
+    pub fn cancel_recap(
+        &self,
+        request_id: crate::recap::RecapRequestId,
+    ) -> Result<(), RuntimeHostError> {
+        self.runtime.cancel_recap(request_id)
+    }
+
     pub fn prompt_queue(
         &self,
         action: crate::prompt_queue::PromptQueueAction,

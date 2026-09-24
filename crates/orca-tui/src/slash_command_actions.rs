@@ -9,13 +9,38 @@ use crate::protocol::{GoalDraft, UserAction};
 use crate::session_picker_actions::open_session_picker;
 use crate::surface_actions::TuiHostActions;
 use crate::transcript_state::ChatMessage;
-use crate::types::{AppState, AppStatus, ConfigDialog};
+use crate::types::{AppState, AppStatus, ConfigDialog, RecapState};
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::RunConfig;
 
 pub(crate) enum SlashOutcome {
     Continue,
     Prefill(String),
+}
+
+/// `/recap`: the recap on screen opens in full; otherwise one is requested
+/// for the conversation on screen. Recaps are only made between turns, and
+/// nothing about them goes into the transcript.
+fn request_recap(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>) {
+    if state.status != AppStatus::Idle {
+        state.recap = RecapState::Notice("available once the current turn finishes".to_string());
+        return;
+    }
+    match state.visible_recap() {
+        RecapState::Ready { .. } => state.set_recap_detail_open(true),
+        RecapState::Requested => {}
+        // One is already on its way (maybe an automatic one): let it open in
+        // full when it lands instead of asking again.
+        RecapState::Pending { .. } => {
+            if let RecapState::Pending { trigger, .. } = &mut state.recap {
+                *trigger = orca_runtime::recap::RecapTrigger::Manual;
+            }
+        }
+        RecapState::Hidden | RecapState::Failed { .. } | RecapState::Notice(_) => {
+            state.recap = RecapState::Requested;
+            let _ = action_tx.send(UserAction::RequestRecap);
+        }
+    }
 }
 
 pub(crate) fn handle_slash_command(
@@ -258,6 +283,7 @@ fn dispatch_slash_command(
             state.enter_running();
             let _ = action_tx.send(UserAction::Compact);
         }
+        SlashCommand::Recap => request_recap(state, action_tx),
         SlashCommand::Resume => match open_session_picker(state) {
             Ok(true) => {}
             Ok(false) => state.push_message(ChatMessage::System {

@@ -69,6 +69,7 @@ mod presentation;
 mod protocol;
 mod queued_input;
 mod queued_input_actions;
+mod recap_view;
 mod renderer_event_router;
 mod renderer_frame;
 mod renderer_input_router;

@@ -90,6 +90,12 @@ impl<'a, 'text> RendererInputRouter<'a, 'text> {
             }
             BatchedInputEvent::Event(event) => {
                 if consume_focus_event(&event, self.presentation) {
+                    if matches!(event, Event::FocusGained) && self.state.can_request_auto_recap(now)
+                    {
+                        let _ = self.action_tx.try_send(UserAction::RequestAutomaticRecap {
+                            focus_cycle: self.state.mark_focus_cycle(),
+                        });
+                    }
                     return Ok(None);
                 }
                 if resolve_pending_insert_escape_before_routing(
@@ -211,7 +217,7 @@ impl<'a, 'text> RendererInputRouter<'a, 'text> {
 mod tests {
     use std::io;
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use crossbeam_channel as mpsc;
     use crossterm::event::{
@@ -351,6 +357,25 @@ mod tests {
         assert!(fixture.textarea.is_empty());
         assert!(fixture.vim.has_pending_command_for_test());
         assert!(fixture.action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn eligible_focus_return_requests_one_automatic_recap() {
+        let mut fixture = Fixture::new();
+        let now = Instant::now();
+        fixture.state.last_completed_at = Some(now - Duration::from_secs(181));
+
+        fixture
+            .route(BatchedInputEvent::Event(Event::FocusGained), now, || Ok(()))
+            .expect("focus routing");
+
+        assert!(matches!(
+            fixture
+                .action_rx
+                .try_recv()
+                .expect("automatic recap action"),
+            UserAction::RequestAutomaticRecap { .. }
+        ));
     }
 
     #[test]

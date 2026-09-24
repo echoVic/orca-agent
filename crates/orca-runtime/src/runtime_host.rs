@@ -3815,6 +3815,32 @@ impl RuntimeThreadHandle {
         receive_reply(reply_rx, "runtime thread")?
     }
 
+    /// Request a read-only display recap. The provider call runs in a worker
+    /// owned by the runtime actor and never mutates the surface ledger.
+    pub fn request_recap(
+        &self,
+        request: crate::recap::RecapRequest,
+    ) -> Result<crate::recap::RecapResult, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::RequestRecap {
+            request,
+            reply: reply_tx,
+        })?;
+        Ok(receive_reply(reply_rx, "runtime recap")?)
+    }
+
+    pub fn cancel_recap(
+        &self,
+        request_id: crate::recap::RecapRequestId,
+    ) -> Result<(), RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::CancelRecap {
+            request_id,
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime recap cancellation")?
+    }
+
     /// Read or mutate the runtime-owned prompt queue. Mutations are serialized
     /// by the thread actor and return the authoritative post-commit snapshot.
     pub fn prompt_queue(
@@ -5191,6 +5217,14 @@ enum ThreadCommand {
     },
     ReadSnapshot {
         reply: SyncSender<Result<RuntimeThreadSnapshot, RuntimeHostError>>,
+    },
+    RequestRecap {
+        request: crate::recap::RecapRequest,
+        reply: SyncSender<crate::recap::RecapResult>,
+    },
+    CancelRecap {
+        request_id: crate::recap::RecapRequestId,
+        reply: SyncSender<Result<(), RuntimeHostError>>,
     },
     GoalRuntime {
         reply: SyncSender<Result<GoalRuntimeHandle, RuntimeHostError>>,
@@ -11704,6 +11738,9 @@ struct ThreadActor {
     subagent_relay_failure_counts: HashMap<String, (String, u8)>,
     /// When the thread last started a turn for finished background agents.
     last_child_results_wake: Option<Instant>,
+    recap_cancellations: HashMap<crate::recap::RecapRequestId, CancelToken>,
+    recap_workers: HashMap<crate::recap::RecapRequestId, thread::JoinHandle<()>>,
+    recap_inflight_keys: HashMap<String, crate::recap::RecapRequestId>,
 }
 
 struct ResidentSurfaceSlot(Option<ResidentSurfaceState>);
@@ -16275,6 +16312,9 @@ impl ThreadActor {
             subagent_activity_dedupe: VecDeque::new(),
             subagent_relay_failure_counts: HashMap::new(),
             last_child_results_wake: None,
+            recap_cancellations: HashMap::new(),
+            recap_workers: HashMap::new(),
+            recap_inflight_keys: HashMap::new(),
         }
     }
 
@@ -17851,6 +17891,18 @@ impl ThreadActor {
                 }
             }
         }
+        // Recap workers are runtime-owned and may still be waiting on the
+        // provider when the actor is asked to close. Cancel first, then join
+        // each bounded worker before sealing the surface so no recap thread
+        // can outlive its runtime thread.
+        for cancel in self.recap_cancellations.values() {
+            cancel.cancel();
+        }
+        for (_, worker) in self.recap_workers.drain() {
+            let _ = worker.join();
+        }
+        self.recap_cancellations.clear();
+        self.recap_inflight_keys.clear();
         self.seal_resident_surface(subscription_seal_reason);
         if let Some(state) = self.state.as_ref() {
             state
@@ -18121,6 +18173,15 @@ impl ThreadActor {
                 ThreadCommand::ReadSnapshot { reply } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
+                ThreadCommand::RequestRecap { request, reply } => {
+                    let _ = reply.send(crate::recap::RecapResult::Skipped {
+                        request_id: request.request_id,
+                        reason: crate::recap::RecapSkipReason::Cancelled,
+                    });
+                }
+                ThreadCommand::CancelRecap { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
                 ThreadCommand::GoalRuntime { reply } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
@@ -18163,6 +18224,108 @@ impl ThreadActor {
         Self::drain_closed_thread_commands(&mut command_rx);
     }
 
+    fn start_recap_worker(
+        &mut self,
+        request: crate::recap::RecapRequest,
+        reply: SyncSender<crate::recap::RecapResult>,
+    ) {
+        self.reap_finished_recap_workers();
+        let provider_fingerprint = self.recap_provider_fingerprint();
+        let dedupe_key = crate::recap::dedupe_key(&request, &provider_fingerprint);
+        if self.recap_inflight_keys.contains_key(&dedupe_key) {
+            let _ = reply.send(crate::recap::RecapResult::Skipped {
+                request_id: request.request_id,
+                reason: crate::recap::RecapSkipReason::Duplicate,
+            });
+            return;
+        }
+        if request.evidence.input_tokens > crate::recap::RECAP_INPUT_TOKEN_LIMIT
+            || request.evidence.text.is_empty()
+        {
+            let _ = reply.send(crate::recap::RecapResult::Skipped {
+                request_id: request.request_id,
+                reason: crate::recap::RecapSkipReason::EmptyEvidence,
+            });
+            return;
+        }
+        let cancel = CancelToken::new();
+        self.recap_cancellations
+            .insert(request.request_id, cancel.clone());
+        self.recap_inflight_keys
+            .insert(dedupe_key.clone(), request.request_id);
+        let provider_kind = self.config.provider;
+        let provider_config = orca_provider::ProviderConfig {
+            api_key: self.config.api_key.clone(),
+            base_url: self.config.base_url.clone(),
+            model: self.config.model.as_option(),
+            reasoning_effort: self.config.reasoning_effort,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let request_id = request.request_id;
+        let worker = thread::spawn(move || {
+            let result = crate::recap::request_recap(
+                provider_kind,
+                &provider_config,
+                &request,
+                &cancel,
+                Instant::now() + crate::recap::RECAP_DEADLINE,
+            );
+            let _ = reply.send(result);
+        });
+        self.recap_workers.insert(request_id, worker);
+    }
+
+    /// Cancel one recap worker without waiting for it: it may be blocked on
+    /// the provider, and the actor must stay responsive meanwhile. The worker
+    /// sees the cancellation at its next poll and exits; the next reap joins
+    /// it. Its content key is released now, so a new request for the same
+    /// content starts a fresh worker instead of being skipped as a duplicate.
+    fn cancel_recap_worker(&mut self, request_id: crate::recap::RecapRequestId) {
+        if let Some(cancel) = self.recap_cancellations.remove(&request_id) {
+            cancel.cancel();
+        }
+        self.recap_inflight_keys
+            .retain(|_, inflight_id| *inflight_id != request_id);
+        self.reap_finished_recap_workers();
+    }
+
+    fn recap_provider_fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(format!(
+            "{:?}|{:?}|{:?}|{:?}",
+            self.config.provider,
+            self.config.base_url,
+            self.config.model,
+            self.config.reasoning_effort,
+        ));
+        if let Some(api_key) = self.config.api_key.as_deref() {
+            hasher.update(api_key.as_bytes());
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn reap_finished_recap_workers(&mut self) {
+        let finished = self
+            .recap_workers
+            .iter()
+            .filter_map(|(request_id, worker)| worker.is_finished().then_some(*request_id))
+            .collect::<Vec<_>>();
+        for request_id in finished {
+            if let Some(worker) = self.recap_workers.remove(&request_id) {
+                let _ = worker.join();
+            }
+            self.recap_cancellations.remove(&request_id);
+            self.recap_inflight_keys
+                .retain(|_, inflight_id| *inflight_id != request_id);
+        }
+    }
+
     fn handle_idle_command(&mut self, command: ThreadCommand) {
         let permitted_during_goal_blocking = matches!(
             &command,
@@ -18196,6 +18359,13 @@ impl ThreadActor {
             return;
         }
         match command {
+            ThreadCommand::RequestRecap { request, reply } => {
+                self.start_recap_worker(request, reply);
+            }
+            ThreadCommand::CancelRecap { request_id, reply } => {
+                self.cancel_recap_worker(request_id);
+                let _ = reply.send(Ok(()));
+            }
             ThreadCommand::PromptQueue { action, reply } => {
                 let result = self.apply_prompt_queue_action(action);
                 let should_drain = result
@@ -19167,6 +19337,13 @@ impl ThreadActor {
         }
         let generation = active.generation.context.fence();
         match command {
+            ThreadCommand::RequestRecap { request, reply } => {
+                self.start_recap_worker(request, reply);
+            }
+            ThreadCommand::CancelRecap { request_id, reply } => {
+                self.cancel_recap_worker(request_id);
+                let _ = reply.send(Ok(()));
+            }
             ThreadCommand::PromptQueue { action, reply } => {
                 let _ = reply.send(self.apply_prompt_queue_action(action));
             }
@@ -23798,8 +23975,7 @@ mod tests {
         const SUPERVISOR_RESPONSIVE_START_BUDGET: Duration = Duration::from_secs(5);
         let start_deadline = Instant::now() + SUPERVISOR_RESPONSIVE_START_BUDGET;
         let started_thread = loop {
-            let Some(remaining) = start_deadline.checked_duration_since(Instant::now())
-            else {
+            let Some(remaining) = start_deadline.checked_duration_since(Instant::now()) else {
                 panic!("blocked session listing stalled the host supervisor");
             };
             match start_rx.recv_timeout(remaining) {
@@ -38956,5 +39132,118 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         host.shutdown().expect("shutdown queue interrupt host");
+    }
+
+    fn recap_request_for_test(id: u64) -> crate::recap::RecapRequest {
+        let mut thread_bytes = [1; 16];
+        thread_bytes[6] = 0x71;
+        thread_bytes[8] = 0x81;
+        let mut incarnation_bytes = [2; 16];
+        incarnation_bytes[6] = 0x72;
+        incarnation_bytes[8] = 0x82;
+        let cursor = surface::SurfaceCursor {
+            thread_id: surface::SurfaceThreadId::try_from_bytes(thread_bytes).unwrap(),
+            incarnation: surface::SurfaceIncarnation::try_from_bytes(incarnation_bytes).unwrap(),
+            next_seq: surface::SequenceNumber::new(id),
+            source_revision: surface::CursorSourceRevision::Recorded {
+                durable_revision: surface::DurableRevision::try_new(id).unwrap(),
+            },
+        };
+        crate::recap::RecapRequest {
+            request_id: crate::recap::RecapRequestId(id),
+            source: crate::recap::RecapSourceFence {
+                marker: crate::recap::RecapContentMarker {
+                    thread_id: cursor.thread_id.clone(),
+                    incarnation: cursor.incarnation.clone(),
+                    completed_user_operations: 3,
+                    evidence_digest: surface::Sha256Digest::digest("recap evidence"),
+                },
+                cursor,
+            },
+            trigger: crate::recap::RecapTrigger::Manual,
+            evidence: crate::recap::RecapEvidence {
+                digest: "recap-evidence".to_string(),
+                text: "user: tidy the relay drain\nassistant: done".to_string(),
+                input_tokens: 12,
+                completed_user_operations: 3,
+            },
+        }
+    }
+
+    #[test]
+    fn cancelling_an_in_flight_recap_neither_blocks_the_thread_nor_holds_its_content() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        // A provider that takes every request and never answers, so each
+        // recap worker stays in flight until it is cancelled.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind silent provider");
+        let address = listener.local_addr().expect("silent provider address");
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for mut stream in listener.incoming().flatten() {
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = accepted_tx.send(());
+                held.push(stream);
+            }
+        });
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled);
+        config.provider = ProviderKind::DeepSeek;
+        config.api_key = Some("test-key".to_string());
+        config.base_url = Some(format!("http://{address}"));
+        let host = RuntimeHost::start().expect("start recap runtime");
+        let thread = host
+            .start_thread(config, "recap cancellation")
+            .expect("start recap thread");
+
+        let first = {
+            let thread = thread.clone();
+            std::thread::spawn(move || thread.request_recap(recap_request_for_test(1)))
+        };
+        accepted_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("first recap reached the provider");
+
+        let started = Instant::now();
+        thread
+            .cancel_recap(crate::recap::RecapRequestId(1))
+            .expect("cancel first recap");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancelling waited on the provider for {:?}",
+            started.elapsed()
+        );
+        // The thread answers other commands while the worker winds down.
+        thread.state().expect("thread stays responsive");
+        let first = first
+            .join()
+            .expect("first recap caller")
+            .expect("first recap reply");
+        assert!(
+            !matches!(first, crate::recap::RecapResult::Ready { .. }),
+            "a cancelled recap must not deliver a summary: {first:?}"
+        );
+
+        // The same content asked again is a new worker, not a duplicate of the
+        // cancelled one.
+        let second = {
+            let thread = thread.clone();
+            std::thread::spawn(move || thread.request_recap(recap_request_for_test(2)))
+        };
+        accepted_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("second recap reached the provider");
+        thread
+            .cancel_recap(crate::recap::RecapRequestId(2))
+            .expect("cancel second recap");
+        second
+            .join()
+            .expect("second recap caller")
+            .expect("second recap reply");
+        host.shutdown().expect("shutdown recap host");
     }
 }

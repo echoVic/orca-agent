@@ -31,6 +31,8 @@ pub(crate) struct ViewportState {
     pub(crate) frame_area: Option<Rect>,
     pub(crate) input_area: Option<Rect>,
     pub(crate) search_area: Option<Rect>,
+    pub(crate) recap_strip_area: Option<Rect>,
+    pub(crate) recap_detail_area: Option<Rect>,
     pub(crate) composer_mouse_selecting: bool,
     pub(crate) unseen_messages: usize,
 }
@@ -62,6 +64,8 @@ impl ViewportState {
             frame_area: None,
             input_area: None,
             search_area: None,
+            recap_strip_area: None,
+            recap_detail_area: None,
             composer_mouse_selecting: false,
             unseen_messages: 0,
         }

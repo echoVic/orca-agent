@@ -72,6 +72,241 @@ fn tool_call(
     }
 }
 
+fn recap_source(next_seq: u64) -> orca_runtime::recap::RecapSourceFence {
+    let cursor = crate::surface_projection::test_surface_cursor(next_seq);
+    orca_runtime::recap::RecapSourceFence {
+        marker: orca_runtime::recap::RecapContentMarker {
+            thread_id: cursor.thread_id.clone(),
+            incarnation: cursor.incarnation.clone(),
+            completed_user_operations: 1,
+            evidence_digest: orca_runtime::surface::Sha256Digest::digest(format!("{next_seq}")),
+        },
+        cursor,
+    }
+}
+
+#[test]
+fn child_focus_is_not_eligible_for_automatic_recap() {
+    let mut state = state();
+    let now = std::time::Instant::now();
+    state.status = AppStatus::Idle;
+    state.last_completed_at = Some(now - AppState::AUTO_RECAP_QUIET_PERIOD);
+    assert!(state.can_request_auto_recap(now));
+
+    state.set_conversation_target(ConversationTarget::subagent("child-1"));
+    assert!(!state.can_request_auto_recap(now));
+}
+
+#[test]
+fn recap_accepts_only_the_matching_attachment_and_content_marker() {
+    let mut state = state();
+    let attachment = crate::protocol::SessionAttachmentId::new(1);
+    state.active_session_attachment = Some(attachment);
+    let source = recap_source(1);
+    state.update(TuiEvent::RecapPending {
+        request_id: orca_runtime::recap::RecapRequestId(7),
+        attachment,
+        source: source.clone(),
+        trigger: orca_runtime::recap::RecapTrigger::Manual,
+    });
+    state.update(TuiEvent::RecapReady {
+        request_id: orca_runtime::recap::RecapRequestId(7),
+        attachment,
+        source: source.clone(),
+        text: "ready".to_string(),
+        usage: orca_runtime::recap::RecapUsage::Cached,
+    });
+    assert!(matches!(
+        state.recap,
+        crate::types::RecapState::Ready { .. }
+    ));
+
+    state.update(TuiEvent::SettingsUpdated {
+        model: "model".to_string(),
+        reasoning_effort: orca_core::config::ReasoningEffort::High,
+        approval_mode: ApprovalMode::FullAuto,
+    });
+    assert!(matches!(
+        state.recap,
+        crate::types::RecapState::Ready { .. }
+    ));
+
+    state.update(TuiEvent::RecapPending {
+        request_id: orca_runtime::recap::RecapRequestId(8),
+        attachment,
+        source: source.clone(),
+        trigger: orca_runtime::recap::RecapTrigger::Manual,
+    });
+    let mut stale = source;
+    stale.marker.evidence_digest = orca_runtime::surface::Sha256Digest::digest("new");
+    state.update(TuiEvent::RecapReady {
+        request_id: orca_runtime::recap::RecapRequestId(8),
+        attachment,
+        source: stale,
+        text: "stale".to_string(),
+        usage: orca_runtime::recap::RecapUsage::Cached,
+    });
+    assert!(matches!(
+        state.recap,
+        crate::types::RecapState::Pending { .. }
+    ));
+}
+
+#[test]
+fn recap_failure_is_visible_only_for_manual_trigger_and_never_enters_transcript() {
+    let mut state = state();
+    let attachment = crate::protocol::SessionAttachmentId::new(1);
+    state.active_session_attachment = Some(attachment);
+    let source = recap_source(2);
+    state.update(TuiEvent::RecapPending {
+        request_id: orca_runtime::recap::RecapRequestId(9),
+        attachment,
+        source: source.clone(),
+        trigger: orca_runtime::recap::RecapTrigger::Automatic,
+    });
+    state.update(TuiEvent::RecapFailed {
+        request_id: orca_runtime::recap::RecapRequestId(9),
+        attachment,
+        source: source.clone(),
+        message: "quiet failure".to_string(),
+    });
+    assert!(matches!(state.recap, crate::types::RecapState::Hidden));
+    assert!(state.transcript.messages.is_empty());
+
+    state.update(TuiEvent::RecapPending {
+        request_id: orca_runtime::recap::RecapRequestId(10),
+        attachment,
+        source: source.clone(),
+        trigger: orca_runtime::recap::RecapTrigger::Manual,
+    });
+    state.update(TuiEvent::RecapFailed {
+        request_id: orca_runtime::recap::RecapRequestId(10),
+        attachment,
+        source,
+        message: "manual failure".to_string(),
+    });
+    assert!(matches!(
+        state.recap,
+        crate::types::RecapState::Failed { .. }
+    ));
+    assert!(state.transcript.messages.is_empty());
+}
+
+fn pending_recap(
+    state: &mut AppState,
+    request_id: u64,
+    trigger: orca_runtime::recap::RecapTrigger,
+) -> orca_runtime::recap::RecapSourceFence {
+    let attachment = crate::protocol::SessionAttachmentId::new(1);
+    state.active_session_attachment = Some(attachment);
+    let source = recap_source(request_id);
+    state.update(TuiEvent::RecapPending {
+        request_id: orca_runtime::recap::RecapRequestId(request_id),
+        attachment,
+        source: source.clone(),
+        trigger,
+    });
+    source
+}
+
+#[test]
+fn a_manual_recap_opens_in_full_and_an_automatic_one_stays_in_the_strip() {
+    for (trigger, opened) in [
+        (orca_runtime::recap::RecapTrigger::Manual, true),
+        (orca_runtime::recap::RecapTrigger::Automatic, false),
+    ] {
+        let mut state = state();
+        let source = pending_recap(&mut state, 3, trigger);
+        state.update(TuiEvent::RecapReady {
+            request_id: orca_runtime::recap::RecapRequestId(3),
+            attachment: crate::protocol::SessionAttachmentId::new(1),
+            source,
+            text: "done".to_string(),
+            usage: orca_runtime::recap::RecapUsage::Cached,
+        });
+        assert_eq!(state.recap_detail_open(), opened, "{trigger:?}");
+        assert!(state.transcript.messages.is_empty());
+    }
+}
+
+#[test]
+fn a_skipped_manual_recap_says_why_and_a_skipped_automatic_one_goes_away() {
+    let skipped = |reason| TuiEvent::RecapSkipped {
+        request_id: orca_runtime::recap::RecapRequestId(4),
+        attachment: crate::protocol::SessionAttachmentId::new(1),
+        reason,
+    };
+
+    let mut app = state();
+    app.recap = crate::types::RecapState::Requested;
+    app.update(skipped(orca_runtime::recap::RecapSkipReason::EmptyEvidence));
+    assert_eq!(
+        app.recap,
+        crate::types::RecapState::Notice("nothing to recap yet".to_string())
+    );
+
+    let mut app = state();
+    pending_recap(&mut app, 4, orca_runtime::recap::RecapTrigger::Manual);
+    app.update(skipped(orca_runtime::recap::RecapSkipReason::Cancelled));
+    assert_eq!(app.recap, crate::types::RecapState::Hidden);
+
+    let mut app = state();
+    pending_recap(&mut app, 4, orca_runtime::recap::RecapTrigger::Automatic);
+    app.update(skipped(orca_runtime::recap::RecapSkipReason::EmptyEvidence));
+    assert_eq!(app.recap, crate::types::RecapState::Hidden);
+
+    // A skip for some other request leaves the one in flight alone.
+    let mut app = state();
+    pending_recap(&mut app, 5, orca_runtime::recap::RecapTrigger::Manual);
+    app.update(skipped(orca_runtime::recap::RecapSkipReason::EmptyEvidence));
+    assert!(matches!(
+        app.recap,
+        crate::types::RecapState::Pending { .. }
+    ));
+    assert!(app.transcript.messages.is_empty());
+}
+
+#[test]
+fn switching_between_main_and_a_side_conversation_drops_the_recap() {
+    let mut state = state();
+    pending_recap(&mut state, 6, orca_runtime::recap::RecapTrigger::Manual);
+    let side = |active| TuiEvent::SideConversationChanged {
+        active,
+        available: true,
+        parent_thread_id: "main-thread".to_string(),
+        parent_title: "Main".to_string(),
+        parent_status: crate::types::SideParentStatus::Idle,
+    };
+    state.update(side(false));
+    assert!(matches!(
+        state.recap,
+        crate::types::RecapState::Pending { .. }
+    ));
+    state.update(side(true));
+    assert_eq!(state.recap, crate::types::RecapState::Hidden);
+}
+
+#[test]
+fn automatic_recap_waits_for_background_work_and_an_empty_strip() {
+    let mut state = state();
+    let now = std::time::Instant::now();
+    state.status = AppStatus::Idle;
+    state.last_completed_at = Some(now - AppState::AUTO_RECAP_QUIET_PERIOD);
+    assert!(state.can_request_auto_recap(now));
+
+    state.apply_workflow_tasks_for_test(vec![workflow_task_summary("wf-1", "running")]);
+    assert!(!state.can_request_auto_recap(now));
+    state.apply_workflow_tasks_for_test(Vec::new());
+    assert!(state.can_request_auto_recap(now));
+
+    state.recap = crate::types::RecapState::Notice("shown".to_string());
+    assert!(!state.can_request_auto_recap(now));
+    state.recap = crate::types::RecapState::Hidden;
+
+    state.side_conversation_visible = true;
+    assert!(!state.can_request_auto_recap(now));
+}
+
 #[test]
 fn startup_warnings_are_announced_once_per_session() {
     let mut state = state();

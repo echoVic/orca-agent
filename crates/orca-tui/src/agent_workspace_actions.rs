@@ -466,6 +466,107 @@ mod tests {
         (state, rx)
     }
 
+    fn with_ready_recap(state: &mut AppState, text: &str) {
+        let attachment = crate::protocol::SessionAttachmentId::new(1);
+        state.active_session_attachment = Some(attachment);
+        let cursor = crate::surface_projection::test_surface_cursor(3);
+        state.recap = crate::types::RecapState::Ready {
+            attachment,
+            source: orca_runtime::recap::RecapSourceFence {
+                marker: orca_runtime::recap::RecapContentMarker {
+                    thread_id: cursor.thread_id.clone(),
+                    incarnation: cursor.incarnation.clone(),
+                    completed_user_operations: 3,
+                    evidence_digest: orca_runtime::surface::Sha256Digest::digest("dock"),
+                },
+                cursor,
+            },
+            text: text.to_string(),
+            usage: orca_runtime::recap::RecapUsage::Cached,
+            detail_open: false,
+        };
+    }
+
+    fn render_sized(state: &mut AppState, width: u16, height: u16) {
+        let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = tui_textarea::TextArea::default();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("test backend");
+        terminal
+            .draw(|frame| crate::ui::render(frame, state, &textarea, &theme))
+            .expect("draw");
+    }
+
+    #[test]
+    fn a_recap_under_the_agents_dock_takes_its_own_rows_and_leaves_theirs_alone() {
+        let (mut state, _rx) = conversation_with(vec![task("worker", 1_000)]);
+        with_ready_recap(
+            &mut state,
+            "Fixed the relay drain; the release tag is next.",
+        );
+        render_once(&mut state);
+
+        let agent_rows = clicks_on(&state, &AgentHitTarget::DockAgent("worker".to_string()));
+        assert_eq!(agent_rows.len(), 2);
+        let strip = state.viewport.recap_strip_area.expect("recap strip");
+        assert!(
+            agent_rows.iter().all(|(_, row)| *row < strip.y),
+            "the recap follows the dock: {agent_rows:?} {strip:?}"
+        );
+        assert!(
+            state
+                .agent_hit_areas
+                .iter()
+                .all(|hit| hit.rect.intersection(strip).is_empty()),
+            "no agent target under the recap"
+        );
+        for at in &agent_rows {
+            assert_eq!(
+                click(&mut state, *at),
+                MouseFlow::OpenAgent("worker".to_string())
+            );
+        }
+        assert!(!state.recap_detail_open());
+        assert_eq!(
+            click(&mut state, (strip.x + 3, strip.y)),
+            MouseFlow::Handled
+        );
+        assert!(state.recap_detail_open());
+    }
+
+    #[test]
+    fn a_short_terminal_drops_the_recap_before_any_agent_row() {
+        let (mut state, _rx) = conversation_with(vec![task("worker", 1_000)]);
+        with_ready_recap(
+            &mut state,
+            "Fixed the relay drain; the release tag is next.",
+        );
+        render_sized(&mut state, 100, 30);
+        let agent_rows = clicks_on(&state, &AgentHitTarget::DockAgent("worker".to_string()));
+        assert!(state.viewport.recap_strip_area.is_some());
+
+        // Shrink until the recap no longer fits: the agent rows stay, and at
+        // no height does the recap's click target cover one of theirs.
+        let mut height = 30;
+        while let Some(strip) = state.viewport.recap_strip_area {
+            assert!(
+                state
+                    .agent_hit_areas
+                    .iter()
+                    .all(|hit| hit.rect.intersection(strip).is_empty()),
+                "at {height} rows"
+            );
+            height -= 1;
+            render_sized(&mut state, 100, height);
+        }
+        assert_eq!(
+            clicks_on(&state, &AgentHitTarget::DockAgent("worker".to_string())).len(),
+            agent_rows.len(),
+            "at {height} rows"
+        );
+    }
+
     #[test]
     fn a_click_on_a_running_agent_in_the_dock_opens_its_transcript() {
         let (mut state, rx) = conversation_with(vec![task("worker", 1_000)]);

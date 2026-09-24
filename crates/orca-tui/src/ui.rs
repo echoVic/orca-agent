@@ -29,6 +29,7 @@ use crate::chrome::{GUTTER_CONTINUATION, GUTTER_WIDTH, TAIL_ROW};
 use crate::diagnostics::{DiagnosticContext, DiagnosticLevel, TuiDiagnostic};
 use crate::display_text::{compact_long_text, truncate_to_display_width};
 use crate::protocol::TaskTranscriptResult;
+use crate::recap_view;
 use crate::selection::{TranscriptSelection, apply_style_to_line_range};
 use crate::session_picker::SessionPickerRow;
 use crate::session_picker_actions::available_session_actions_with_health;
@@ -62,6 +63,8 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     state.viewport.frame_area = Some(frame.area());
     state.viewport.input_area = None;
     state.viewport.search_area = None;
+    state.viewport.recap_strip_area = None;
+    state.viewport.recap_detail_area = None;
     state.agent_hit_areas = Vec::new();
     state.begin_image_render_frame();
     if state.status == AppStatus::Setup {
@@ -108,7 +111,6 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
             .unzip();
     let queue_preview_lines = queued_preview_lines(state, frame.area().width, theme);
     let queue_preview_height = queue_preview_lines.len().min(3) as u16;
-    let desired_activity_height = 1_u16.saturating_add(activity_lines.len() as u16);
     let available_activity_height = frame
         .area()
         .height
@@ -118,11 +120,28 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         .saturating_sub(input_height)
         .saturating_sub(queue_preview_height)
         .saturating_sub(2); // status + at least one transcript row
-    let activity_height: u16 = if activity_lines.is_empty() || available_activity_height < 2 {
-        0
+    // The recap only gets the rows the activity rows leave over (after the
+    // spacer), so a short terminal drops it before any activity row.
+    let recap_lines = if state.panel_mode == PanelMode::Conversation {
+        recap_view::strip_lines(
+            state.visible_recap(),
+            frame.area().width,
+            usize::from(available_activity_height.saturating_sub(1))
+                .saturating_sub(activity_lines.len()),
+            theme,
+        )
     } else {
-        desired_activity_height.min(available_activity_height)
+        Vec::new()
     };
+    let desired_activity_height = 1_u16
+        .saturating_add(activity_lines.len() as u16)
+        .saturating_add(recap_lines.len() as u16);
+    let activity_height: u16 =
+        if activity_lines.is_empty() && recap_lines.is_empty() || available_activity_height < 2 {
+            0
+        } else {
+            desired_activity_height.min(available_activity_height)
+        };
     let chunks = main_layout(
         frame.area(),
         goal_height,
@@ -145,13 +164,21 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         render_plan_panel(frame, chunks[2], state, theme);
     }
     if activity_height > 0 {
-        render_activity(frame, chunks[3], &activity_lines);
-        // `render_activity` leaves the area's first row blank as a spacer.
         let area = chunks[3];
+        // `render_activity` leaves the area's first row blank as a spacer;
+        // the recap rows follow the activity rows. Both the drawing and the
+        // click targets below come from these two counts.
+        let visible_rows = usize::from(area.height.saturating_sub(1));
+        let activity_count = activity_lines.len().min(visible_rows);
+        let recap_count = recap_lines.len().min(visible_rows - activity_count);
+        let mut lines = activity_lines;
+        lines.truncate(activity_count);
+        lines.extend(recap_lines.into_iter().take(recap_count));
+        render_activity(frame, area, &lines);
         state.agent_hit_areas.extend(
             activity_targets
                 .into_iter()
-                .take(usize::from(area.height.saturating_sub(1)))
+                .take(activity_count)
                 .enumerate()
                 .filter_map(|(row, target)| {
                     Some(AgentHitArea {
@@ -160,6 +187,14 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
                     })
                 }),
         );
+        if recap_count > 0 {
+            state.viewport.recap_strip_area = Some(Rect::new(
+                area.x,
+                area.y + 1 + activity_count as u16,
+                area.width,
+                recap_count as u16,
+            ));
+        }
     }
     if queue_preview_height > 0 {
         frame.render_widget(Paragraph::new(queue_preview_lines), chunks[4]);
@@ -205,6 +240,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         render_jump_to_bottom_pill(frame, state, theme);
     }
     render_status(frame, chunks[7], state, theme);
+    if state.panel_mode == PanelMode::Conversation {
+        state.viewport.recap_detail_area =
+            recap_view::render_detail(frame, frame.area(), state.visible_recap(), theme);
+    }
 
     if state.user_input_dialog.is_none()
         && state.approval_dialog.is_none()
@@ -15438,6 +15477,7 @@ mod tests {
             ("ui.rs", include_str!("ui.rs")),
             ("chrome.rs", include_str!("chrome.rs")),
             ("shortcuts.rs", include_str!("shortcuts.rs")),
+            ("recap_view.rs", include_str!("recap_view.rs")),
         ] {
             // A Windows checkout has CRLF line endings; the test-module
             // marker must still end the production part.

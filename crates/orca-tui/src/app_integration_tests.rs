@@ -4208,6 +4208,72 @@ fn hosted_submission_start_failure_rejects_prompt_and_preserves_preloaded() {
 }
 
 #[test]
+fn the_recap_command_opens_reuses_or_requests_without_touching_the_transcript() {
+    use orca_runtime::recap::RecapTrigger;
+
+    let mut config = test_config(HistoryMode::Disabled);
+    let shared_config = Arc::new(Mutex::new(config.clone()));
+    let (action_tx, action_rx) = mpsc::unbounded();
+    let mut recap = |state: &mut AppState| {
+        handle_slash_command("/recap", &mut config, &shared_config, state, &action_tx);
+        action_rx.try_iter().collect::<Vec<_>>()
+    };
+    let attachment = crate::protocol::SessionAttachmentId::new(1);
+    let source = || {
+        let cursor = crate::surface_projection::test_surface_cursor(7);
+        orca_runtime::recap::RecapSourceFence {
+            marker: orca_runtime::recap::RecapContentMarker {
+                thread_id: cursor.thread_id.clone(),
+                incarnation: cursor.incarnation.clone(),
+                completed_user_operations: 3,
+                evidence_digest: orca_runtime::surface::Sha256Digest::digest("command"),
+            },
+            cursor,
+        }
+    };
+
+    // Nothing on screen: ask for one, once.
+    let (mut state, _) = test_state();
+    state.status = AppStatus::Idle;
+    assert!(matches!(recap(&mut state)[..], [UserAction::RequestRecap]));
+    assert_eq!(state.recap, crate::types::RecapState::Requested);
+    assert!(recap(&mut state).is_empty());
+
+    // An automatic one on its way becomes the answer to this command.
+    let (mut state, _) = test_state();
+    state.status = AppStatus::Idle;
+    state.active_session_attachment = Some(attachment);
+    state.update(TuiEvent::RecapPending {
+        request_id: orca_runtime::recap::RecapRequestId(7),
+        attachment,
+        source: source(),
+        trigger: RecapTrigger::Automatic,
+    });
+    assert!(recap(&mut state).is_empty());
+    state.update(TuiEvent::RecapReady {
+        request_id: orca_runtime::recap::RecapRequestId(7),
+        attachment,
+        source: source(),
+        text: "done".to_string(),
+        usage: orca_runtime::recap::RecapUsage::Cached,
+    });
+    assert!(state.recap_detail_open());
+
+    // One on screen: open it again without asking the model again.
+    state.set_recap_detail_open(false);
+    assert!(recap(&mut state).is_empty());
+    assert!(state.recap_detail_open());
+
+    // Mid-turn: say when it will work, and nothing else.
+    let (mut state, _) = test_state();
+    state.status = AppStatus::Running;
+    let messages = state.transcript.messages.len();
+    assert!(recap(&mut state).is_empty());
+    assert!(matches!(state.recap, crate::types::RecapState::Notice(_)));
+    assert_eq!(state.transcript.messages.len(), messages);
+}
+
+#[test]
 fn remember_slash_command_dispatches_scope_without_writing_memory() {
     with_orca_home(|home| {
         let mut config = test_config(HistoryMode::Record);

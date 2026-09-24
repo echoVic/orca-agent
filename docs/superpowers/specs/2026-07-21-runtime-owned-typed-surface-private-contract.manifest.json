@@ -270,7 +270,10 @@
       "Interrupt",
       "Cancel",
       "ResumeOperation",
-      "CancelOperation"
+      "CancelOperation",
+      "RequestRecap",
+      "RequestAutomaticRecap",
+      "CancelRecap"
     ],
     "required_tui_user_action_additions": [],
     "task_source_target_variants": [
@@ -4996,6 +4999,71 @@
       "MutationReply<CancelOperationOutput>+OperationWaiter",
       "recovery UI consumes CancelOperationOutput and waiter",
       "none"
+    ],
+    [
+      "RequestRecap",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:669",
+        "crates/orca-tui/src/slash_command_actions.rs:41",
+        "crates/orca-tui/src/hosted_controller.rs:817"
+      ],
+      "authoritative_read",
+      "UserAction::RequestRecap",
+      "ReadSnapshot + display-only recap worker",
+      "TuiSurfaceActions::request_recap",
+      [
+        "ReadSnapshot"
+      ],
+      [
+        "SurfaceCursor",
+        "RecapContentMarker"
+      ],
+      "TuiEvent::RecapPending|RecapReady|RecapFailed|RecapSkipped",
+      "No transcript or surface mutation",
+      "none"
+    ],
+    [
+      "RequestAutomaticRecap",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:670",
+        "crates/orca-tui/src/renderer_input_router.rs:95",
+        "crates/orca-tui/src/hosted_controller.rs:755"
+      ],
+      "authoritative_read",
+      "UserAction::RequestAutomaticRecap",
+      "FocusGained after idle eligibility gate",
+      "TuiSurfaceActions::request_recap",
+      [
+        "ReadSnapshot"
+      ],
+      [
+        "SurfaceCursor",
+        "RecapContentMarker"
+      ],
+      "TuiEvent::RecapPending|RecapReady|RecapFailed|RecapSkipped",
+      "No transcript or surface mutation",
+      "none"
+    ],
+    [
+      "CancelRecap",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:673",
+        "crates/orca-tui/src/hosted_controller.rs:330-336"
+      ],
+      "read_only_cancel",
+      "UserAction::CancelRecap",
+      "Cancel display-only recap worker; also sent implicitly before any action that supersedes the recap",
+      "RuntimeSurfaceThreadHandle::cancel_recap",
+      [],
+      [
+        "RecapRequestId"
+      ],
+      "no transcript event",
+      "Cancellation is fence-local and read-only",
+      "none"
     ]
   ],
   "tui_entrypoint_columns": [
@@ -7675,7 +7743,7 @@
   ],
   "phase_0a_manifest_invariants": [
     "source_facts has exactly 58 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 46 unique variants matching UserAction at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 49 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",

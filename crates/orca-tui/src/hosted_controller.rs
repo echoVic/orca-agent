@@ -1,5 +1,6 @@
 //! Hosted TUI action-receive and lifecycle controller ownership.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -67,6 +68,114 @@ fn poll_idle_surface_projection(
     )));
 }
 
+/// Bridge a runtime-owned recap worker to the renderer as typed, attachment-
+/// fenced events. The controller never exposes provider responses or a surface
+/// snapshot to the TUI.
+pub(crate) fn spawn_recap_request(
+    thread: RuntimeThreadHandle,
+    request: orca_runtime::recap::RecapRequest,
+    attachment: SessionAttachmentId,
+    event_tx: mpsc::Sender<TuiEvent>,
+    completion_tx: mpsc::Sender<orca_runtime::recap::RecapRequestId>,
+    auto_successes: Option<Arc<Mutex<HashSet<String>>>>,
+) {
+    let request_id = request.request_id;
+    let trigger = request.trigger;
+    let success_key = format!("{attachment:?}:{:?}", request.source.marker);
+    std::thread::spawn(move || {
+        let fallback_source = request.source.clone();
+        let result = crate::surface_actions::TuiSurfaceActions::new(thread.typed_surface())
+            .request_recap(request);
+        let event = match result {
+            Ok(orca_runtime::recap::RecapResult::Ready {
+                request_id,
+                source,
+                text,
+                usage,
+            }) => TuiEvent::RecapReady {
+                request_id,
+                attachment,
+                source,
+                text,
+                usage,
+            },
+            Ok(orca_runtime::recap::RecapResult::Failed {
+                request_id,
+                source,
+                error,
+            }) => TuiEvent::RecapFailed {
+                request_id,
+                attachment,
+                source,
+                message: error.as_str().to_string(),
+            },
+            Ok(orca_runtime::recap::RecapResult::Skipped { request_id, reason }) => {
+                TuiEvent::RecapSkipped {
+                    request_id,
+                    attachment,
+                    reason,
+                }
+            }
+            Err(message) => TuiEvent::RecapFailed {
+                request_id,
+                attachment,
+                source: fallback_source,
+                message,
+            },
+        };
+        if trigger == orca_runtime::recap::RecapTrigger::Automatic
+            && matches!(&event, TuiEvent::RecapReady { .. })
+            && let Some(auto_successes) = auto_successes
+            && let Ok(mut successes) = auto_successes.lock()
+        {
+            successes.insert(success_key);
+        }
+        let _ = event_tx.send(event);
+        let _ = completion_tx.send(request_id);
+    });
+}
+
+/// Actions after which a recap still being written would describe what is no
+/// longer on screen: a new turn, another session, rewritten context, or a
+/// switch of conversation. The renderer would drop its result anyway;
+/// withdrawing it also stops the provider call.
+fn supersedes_recap(action: &UserAction) -> bool {
+    matches!(
+        action,
+        UserAction::Submit(_)
+            | UserAction::SubmitWithMentions { .. }
+            | UserAction::SubmitNow { .. }
+            | UserAction::SubmitQueued { .. }
+            | UserAction::ImplementApprovedPlan { .. }
+            | UserAction::SubmitWorkflowNotification(_)
+            | UserAction::RunWorkflow { .. }
+            | UserAction::NewSession
+            | UserAction::ForkCurrentSession { .. }
+            | UserAction::ResumeSavedSession { .. }
+            | UserAction::ForkSavedSession { .. }
+            | UserAction::Compact
+            | UserAction::Backtrack
+            | UserAction::FocusChildThread { .. }
+            | UserAction::ReturnToParentThread
+            | UserAction::StartSideConversation { .. }
+            | UserAction::ToggleSideConversation
+            | UserAction::CloseSideConversation
+            | UserAction::CancelRecap
+    )
+}
+
+fn clear_completed_recap_request(
+    active_request_id: &mut Option<orca_runtime::recap::RecapRequestId>,
+    completed_request_id: orca_runtime::recap::RecapRequestId,
+) -> bool {
+    if *active_request_id == Some(completed_request_id) {
+        *active_request_id = None;
+        true
+    } else {
+        false
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hosted_tui_controller_loop(
     config: Arc<Mutex<RunConfig>>,
@@ -96,6 +205,15 @@ pub(crate) fn hosted_tui_controller_loop(
     let mut side_parent: Option<HostedSideParent> = None;
     let mut child_focus: Option<HostedChildFocus> = None;
     let mut last_idle_projection_cursor = None;
+    let mut next_recap_request_id = 1_u64;
+    let mut active_recap_request_id = None;
+    let (recap_completion_tx, recap_completion_rx) = mpsc::unbounded();
+    let mut last_auto_recap: Option<(
+        SessionAttachmentId,
+        orca_runtime::recap::RecapContentMarker,
+        u64,
+    )> = None;
+    let auto_recap_successes = Arc::new(Mutex::new(HashSet::<String>::new()));
 
     let startup_history_mode = config.lock().unwrap().history_mode.clone();
     if typed_history_startup_eligible(&startup_history_mode, &preloaded) {
@@ -158,6 +276,9 @@ pub(crate) fn hosted_tui_controller_loop(
                 Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
             }
         };
+        while let Ok(completed_request_id) = recap_completion_rx.try_recv() {
+            clear_completed_recap_request(&mut active_recap_request_id, completed_request_id);
+        }
         let side_disallowed = (side_parent.is_some() || child_focus.is_some())
             && matches!(
                 &action,
@@ -205,6 +326,13 @@ pub(crate) fn hosted_tui_controller_loop(
                     .to_string(),
             ));
             continue;
+        }
+        if action.as_ref().is_ok_and(supersedes_recap)
+            && let Some(request_id) = active_recap_request_id.take()
+            && let Some(runtime_thread) = thread.as_ref()
+        {
+            let _ = crate::surface_actions::TuiSurfaceActions::new(runtime_thread.typed_surface())
+                .cancel_recap(request_id);
         }
         match action {
             Ok(UserAction::FocusChildThread {
@@ -624,6 +752,137 @@ pub(crate) fn hosted_tui_controller_loop(
                     &control,
                 );
             }
+            Ok(UserAction::RequestAutomaticRecap { focus_cycle }) => {
+                if active_recap_request_id.is_some() {
+                    continue;
+                }
+                let request_id = orca_runtime::recap::RecapRequestId(next_recap_request_id);
+                next_recap_request_id = next_recap_request_id.wrapping_add(1).max(1);
+                let Some(runtime_thread) = thread.clone() else {
+                    continue;
+                };
+                let actions =
+                    crate::surface_actions::TuiSurfaceActions::new(runtime_thread.typed_surface());
+                let Ok(snapshot) = actions.read_snapshot() else {
+                    continue;
+                };
+                let evidence = snapshot.recap_evidence();
+                if evidence.completed_user_operations < 3 || evidence.text.is_empty() {
+                    continue;
+                }
+                let source = orca_runtime::recap::source_fence(&snapshot, &evidence);
+                if last_auto_recap.as_ref().is_some_and(
+                    |(attachment, marker, previous_focus_cycle)| {
+                        attachment == &session_attachment
+                            && marker == &source.marker
+                            && *previous_focus_cycle == focus_cycle
+                    },
+                ) {
+                    continue;
+                }
+                let success_key = format!("{session_attachment:?}:{:?}", source.marker);
+                if auto_recap_successes
+                    .lock()
+                    .is_ok_and(|successes| successes.contains(&success_key))
+                {
+                    continue;
+                }
+                let request = orca_runtime::recap::RecapRequest {
+                    request_id,
+                    source: source.clone(),
+                    trigger: orca_runtime::recap::RecapTrigger::Automatic,
+                    evidence,
+                };
+                let _ = event_tx.send(TuiEvent::RecapPending {
+                    request_id,
+                    attachment: session_attachment,
+                    source,
+                    trigger: orca_runtime::recap::RecapTrigger::Automatic,
+                });
+                last_auto_recap = Some((
+                    session_attachment,
+                    request.source.marker.clone(),
+                    focus_cycle,
+                ));
+                active_recap_request_id = Some(request_id);
+                spawn_recap_request(
+                    runtime_thread,
+                    request,
+                    session_attachment,
+                    event_tx.clone(),
+                    recap_completion_tx.clone(),
+                    Some(auto_recap_successes.clone()),
+                );
+            }
+            Ok(UserAction::RequestRecap) => {
+                if let Some(active_id) = active_recap_request_id.take()
+                    && let Some(runtime_thread) = thread.as_ref()
+                {
+                    let _ = crate::surface_actions::TuiSurfaceActions::new(
+                        runtime_thread.typed_surface(),
+                    )
+                    .cancel_recap(active_id);
+                }
+                let request_id = orca_runtime::recap::RecapRequestId(next_recap_request_id);
+                next_recap_request_id = next_recap_request_id.wrapping_add(1).max(1);
+                // No runtime thread yet means nothing has been said.
+                let Some(runtime_thread) = thread.clone() else {
+                    let _ = event_tx.send(TuiEvent::RecapSkipped {
+                        request_id,
+                        attachment: session_attachment,
+                        reason: orca_runtime::recap::RecapSkipReason::EmptyEvidence,
+                    });
+                    continue;
+                };
+                let actions =
+                    crate::surface_actions::TuiSurfaceActions::new(runtime_thread.typed_surface());
+                let snapshot = match actions.read_snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::RecapSkipped {
+                            request_id,
+                            attachment: session_attachment,
+                            reason: orca_runtime::recap::RecapSkipReason::Ineligible,
+                        });
+                        eprintln!("orca: unable to read recap source snapshot: {error}");
+                        continue;
+                    }
+                };
+                let evidence = snapshot.recap_evidence();
+                if evidence.text.is_empty() {
+                    let _ = event_tx.send(TuiEvent::RecapSkipped {
+                        request_id,
+                        attachment: session_attachment,
+                        reason: orca_runtime::recap::RecapSkipReason::EmptyEvidence,
+                    });
+                    continue;
+                }
+                let source = orca_runtime::recap::source_fence(&snapshot, &evidence);
+                let request = orca_runtime::recap::RecapRequest {
+                    request_id,
+                    source: source.clone(),
+                    trigger: orca_runtime::recap::RecapTrigger::Manual,
+                    evidence,
+                };
+                let _ = event_tx.send(TuiEvent::RecapPending {
+                    request_id,
+                    attachment: session_attachment,
+                    source,
+                    trigger: orca_runtime::recap::RecapTrigger::Manual,
+                });
+                active_recap_request_id = Some(request_id);
+                spawn_recap_request(
+                    runtime_thread,
+                    request,
+                    session_attachment,
+                    event_tx.clone(),
+                    recap_completion_tx.clone(),
+                    None,
+                );
+            }
+            // Withdrawn before this match, with everything else that
+            // supersedes a recap.
+            Ok(UserAction::CancelRecap) => {}
             Ok(UserAction::Backtrack) => {
                 handle_hosted_context_action(
                     HostedContextAction::Backtrack,
@@ -784,7 +1043,7 @@ mod tests {
     use crossbeam_channel as mpsc;
     use orca_core::config::HistoryMode;
 
-    use super::hosted_tui_controller_loop;
+    use super::{clear_completed_recap_request, hosted_tui_controller_loop};
     use crate::agent_runtime::TuiAgentRuntime;
     use crate::bridge;
     use crate::operation_controller::TuiSurfaceTaskControl;
@@ -808,7 +1067,122 @@ mod tests {
         }
     }
 
+    #[test]
+    fn completed_recap_clears_only_matching_active_request() {
+        let request_id = orca_runtime::recap::RecapRequestId(7);
+        let mut active = Some(request_id);
+        assert!(clear_completed_recap_request(&mut active, request_id));
+        assert_eq!(active, None);
+
+        let mut active = Some(request_id);
+        assert!(!clear_completed_recap_request(
+            &mut active,
+            orca_runtime::recap::RecapRequestId(8)
+        ));
+        assert_eq!(active, Some(request_id));
+    }
+
+    fn wait_for_turn_end(event_rx: &mpsc::Receiver<TuiEvent>) {
+        loop {
+            if let TuiEvent::SessionCompleted { .. } = next_controller_event(event_rx) {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn a_recap_is_requested_only_for_a_conversation_that_has_something_to_recap() {
+        // Recaps read the typed surface, which only a recorded session has.
+        let (_home, action_tx, event_rx, mut runtime) =
+            spawn_controller_with_history(HistoryMode::Record);
+
+        action_tx
+            .send(UserAction::RequestRecap)
+            .expect("recap action");
+        assert!(matches!(
+            next_controller_event(&event_rx),
+            TuiEvent::RecapSkipped {
+                reason: orca_runtime::recap::RecapSkipReason::EmptyEvidence,
+                ..
+            }
+        ));
+
+        action_tx
+            .send(UserAction::Submit("tidy the relay drain".to_string()))
+            .expect("submit action");
+        wait_for_turn_end(&event_rx);
+
+        // One finished turn is not enough for an automatic recap: the next
+        // event is the answer to the action after it.
+        action_tx
+            .send(UserAction::RequestAutomaticRecap { focus_cycle: 1 })
+            .expect("automatic recap action");
+        action_tx
+            .send(UserAction::StopTask {
+                task_id: "missing".to_string(),
+            })
+            .expect("stop action");
+        let next = loop {
+            match next_controller_event(&event_rx) {
+                TuiEvent::SurfaceProjectionSynced(_) => {}
+                event => break event,
+            }
+        };
+        assert!(
+            !matches!(next, TuiEvent::RecapPending { .. }),
+            "unexpected automatic recap: {next:?}"
+        );
+
+        action_tx
+            .send(UserAction::RequestRecap)
+            .expect("recap action");
+        let (request_id, source) = loop {
+            match next_controller_event(&event_rx) {
+                TuiEvent::RecapPending {
+                    request_id,
+                    source,
+                    trigger: orca_runtime::recap::RecapTrigger::Manual,
+                    ..
+                } => break (request_id, source),
+                TuiEvent::RecapSkipped { reason, .. } => panic!("recap skipped: {reason:?}"),
+                _ => {}
+            }
+        };
+        assert_eq!(source.marker.completed_user_operations, 1);
+        loop {
+            match next_controller_event(&event_rx) {
+                TuiEvent::RecapReady {
+                    request_id: ready_id,
+                    source: ready_source,
+                    text,
+                    ..
+                } => {
+                    assert_eq!(ready_id, request_id);
+                    assert_eq!(ready_source, source);
+                    assert!(!text.trim().is_empty());
+                    break;
+                }
+                TuiEvent::RecapFailed { message, .. } => panic!("recap failed: {message}"),
+                _ => {}
+            }
+        }
+
+        action_tx.send(UserAction::Cancel).expect("cancel action");
+        runtime.shutdown().expect("hosted controller shutdown");
+    }
+
     fn spawn_controller() -> (
+        crate::test_support::OrcaHomeGuard,
+        mpsc::Sender<UserAction>,
+        mpsc::Receiver<TuiEvent>,
+        TuiAgentRuntime,
+    ) {
+        spawn_controller_with_history(HistoryMode::Disabled)
+    }
+
+    fn spawn_controller_with_history(
+        history_mode: HistoryMode,
+    ) -> (
         crate::test_support::OrcaHomeGuard,
         mpsc::Sender<UserAction>,
         mpsc::Receiver<TuiEvent>,
@@ -816,7 +1190,7 @@ mod tests {
     ) {
         let _home = crate::test_support::isolate_orca_home();
         let mut config = crate::test_support::test_run_config();
-        config.history_mode = HistoryMode::Disabled;
+        config.history_mode = history_mode;
         let config = Arc::new(Mutex::new(config));
         let preloaded = Arc::new(Mutex::new(None));
         let (action_tx, action_rx) = mpsc::bounded(8);

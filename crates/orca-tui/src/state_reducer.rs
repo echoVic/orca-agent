@@ -20,8 +20,8 @@ use crate::surface_projection::{
 };
 use crate::transcript_state::ChatMessage;
 use crate::types::{
-    AppState, AppStatus, ApprovalDialog, PanelMode, PlanApprovalDialog, SessionPickerPhase,
-    SideConversationUiState, TaskTranscriptViewState,
+    AppState, AppStatus, ApprovalDialog, PanelMode, PlanApprovalDialog, RecapState,
+    SessionPickerPhase, SideConversationUiState, TaskTranscriptViewState,
 };
 use crate::user_input_dialog::UserInputDialog;
 
@@ -69,6 +69,9 @@ impl AppState {
                 parent_title,
                 parent_status,
             } => {
+                if active != self.side_conversation_visible {
+                    self.invalidate_recap();
+                }
                 if available {
                     self.side_conversation = Some(SideConversationUiState {
                         parent_thread_id,
@@ -86,6 +89,7 @@ impl AppState {
                 }
             }
             TuiEvent::ChildFocusChanged { task_id } => {
+                self.invalidate_recap();
                 // Only snapshot the current workflow task list when transitioning
                 // from Main into a child. For sibling switches (Child -> Child)
                 // reuse the existing background_workflow_tasks so the parent dock
@@ -106,6 +110,7 @@ impl AppState {
                 self.apply_surface_projection_state(*projection);
             }
             TuiEvent::NewSessionStarted => {
+                self.invalidate_recap();
                 self.task_transcript = None;
                 self.agent_dock_selected_task_id = None;
                 self.set_conversation_target(ConversationTarget::Main);
@@ -120,6 +125,7 @@ impl AppState {
                     return;
                 }
                 self.reset_session_projection();
+                self.invalidate_recap();
                 self.task_transcript = None;
                 self.apply_surface_projection_state(*projection);
             }
@@ -134,6 +140,7 @@ impl AppState {
                 }
                 let background_tasks = self.background_workflow_tasks.clone();
                 self.reset_session_projection();
+                self.invalidate_recap();
                 self.background_workflow_tasks = background_tasks;
                 self.set_conversation_target(ConversationTarget::subagent(task_id));
                 self.task_transcript = None;
@@ -187,6 +194,7 @@ impl AppState {
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::TurnStarted { .. } => {
+                self.invalidate_recap();
                 self.suppress_background_main_session_output = false;
                 self.enter_running();
             }
@@ -690,11 +698,114 @@ impl AppState {
                     expanded: false,
                 });
             }
+            TuiEvent::RecapPending {
+                request_id,
+                attachment,
+                source,
+                trigger,
+            } => {
+                self.begin_recap(request_id, attachment, source, trigger);
+            }
+            TuiEvent::RecapReady {
+                request_id,
+                attachment,
+                source,
+                text,
+                usage,
+            } => {
+                let matching_trigger = match &self.recap {
+                    RecapState::Pending {
+                        request_id: expected_id,
+                        attachment: expected_attachment,
+                        source: expected_source,
+                        trigger,
+                    } if *expected_id == request_id
+                        && *expected_attachment == attachment
+                        && *expected_source == source
+                        && self.active_session_attachment == Some(attachment) =>
+                    {
+                        Some(*trigger)
+                    }
+                    _ => None,
+                };
+                if let Some(trigger) = matching_trigger {
+                    // An explicit `/recap` opens the full text; one that
+                    // arrived on its own stays in the strip.
+                    self.recap = RecapState::Ready {
+                        attachment,
+                        source,
+                        text,
+                        usage,
+                        detail_open: trigger == orca_runtime::recap::RecapTrigger::Manual,
+                    };
+                }
+            }
+            TuiEvent::RecapFailed {
+                request_id,
+                attachment,
+                source,
+                message,
+            } => {
+                let matching_trigger = match &self.recap {
+                    RecapState::Pending {
+                        request_id: expected_id,
+                        attachment: expected_attachment,
+                        source: expected_source,
+                        trigger,
+                    } if *expected_id == request_id
+                        && *expected_attachment == attachment
+                        && *expected_source == source
+                        && self.active_session_attachment == Some(attachment) =>
+                    {
+                        Some(*trigger)
+                    }
+                    _ => None,
+                };
+                if matching_trigger == Some(orca_runtime::recap::RecapTrigger::Manual) {
+                    self.recap = RecapState::Failed {
+                        attachment,
+                        source,
+                        message,
+                    };
+                } else if matching_trigger == Some(orca_runtime::recap::RecapTrigger::Automatic) {
+                    self.recap = RecapState::Hidden;
+                }
+            }
+            TuiEvent::RecapSkipped {
+                request_id,
+                attachment,
+                reason,
+            } => {
+                let manual = match &self.recap {
+                    RecapState::Requested => true,
+                    RecapState::Pending {
+                        request_id: expected_id,
+                        attachment: expected_attachment,
+                        trigger,
+                        ..
+                    } if *expected_id == request_id && *expected_attachment == attachment => {
+                        *trigger == orca_runtime::recap::RecapTrigger::Manual
+                    }
+                    _ => return,
+                };
+                // Only an explicit `/recap` says why nothing came back; a
+                // cancelled or superseded request just goes away.
+                self.recap = match reason {
+                    orca_runtime::recap::RecapSkipReason::EmptyEvidence if manual => {
+                        RecapState::Notice("nothing to recap yet".to_string())
+                    }
+                    orca_runtime::recap::RecapSkipReason::Ineligible if manual => {
+                        RecapState::Notice("unavailable for this conversation".to_string())
+                    }
+                    _ => RecapState::Hidden,
+                };
+            }
             TuiEvent::MentionSearchDirty { .. }
             | TuiEvent::MentionCatalogDirty { .. }
             | TuiEvent::MentionRuntimeReady(_)
             | TuiEvent::ClipboardImagePasteCompleted { .. } => {}
             TuiEvent::CompactionStarted => {
+                self.invalidate_recap();
                 self.set_status(AppStatus::Compacting);
             }
             TuiEvent::SettingsUpdated {
@@ -724,6 +835,7 @@ impl AppState {
                 self.scroll_to_bottom();
             }
             TuiEvent::SessionCompleted { status } => {
+                self.invalidate_recap();
                 let was_backgrounded = self.suppress_background_main_session_output;
                 let fallback_diagnostic = if self.current_turn_has_diagnostic() {
                     None
@@ -809,6 +921,7 @@ impl AppState {
                 }
             }
             TuiEvent::Backtracked { prompt } => {
+                self.invalidate_recap();
                 self.remove_after_last_user();
                 self.push_message(ChatMessage::System {
                     text: format!("Backtracked to previous prompt: {}", prompt.trim()),

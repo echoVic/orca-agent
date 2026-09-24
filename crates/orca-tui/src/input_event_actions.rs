@@ -478,6 +478,7 @@ pub(crate) fn handle_mouse_event(
                 && state.plan_approval_dialog.is_none()
                 && state.status != AppStatus::WaitingApproval
                 && state.panel_mode == PanelMode::Conversation
+                && state.viewport.recap_detail_area.is_none()
                 && let Some(image) = state
                     .image_hit_areas
                     .iter()
@@ -577,6 +578,30 @@ pub(crate) fn handle_mouse_event(
                 if confirm {
                     return MouseFlow::SyntheticEnter;
                 }
+                return MouseFlow::Handled;
+            }
+
+            // The recap detail floats over the transcript, below the modal
+            // and composer popups above: a click inside it does nothing, one
+            // outside closes it, and neither reaches what lies underneath.
+            if let Some(detail) = state.viewport.recap_detail_area {
+                if !detail.contains(ratatui::layout::Position::new(mouse.column, mouse.row)) {
+                    state.set_recap_detail_open(false);
+                }
+                state.viewport.selection = None;
+                state.viewport.last_left_click = None;
+                return MouseFlow::Handled;
+            }
+            // A click on the recap strip opens the full text.
+            if matches!(
+                state.visible_recap(),
+                crate::types::RecapState::Ready { .. }
+            ) && state.viewport.recap_strip_area.is_some_and(|area| {
+                area.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+            }) {
+                state.set_recap_detail_open(true);
+                state.viewport.selection = None;
+                state.viewport.last_left_click = None;
                 return MouseFlow::Handled;
             }
 
@@ -853,11 +878,13 @@ mod tests {
         BatchedInputEvent, MouseFlow, coalesce_input_events, handle_resize_event,
         handle_scroll_lines, should_queue_input_event,
     };
-    use crate::protocol::UserAction;
+    use crate::protocol::{SessionAttachmentId, UserAction};
     use crate::theme::Theme;
     use crate::transcript_state::ChatMessage;
     use crate::transcript_view::TranscriptRenderContext;
-    use crate::types::{AppState, AppStatus, ApprovalDialog, ApprovalOption, PlanApprovalDialog};
+    use crate::types::{
+        AppState, AppStatus, ApprovalDialog, ApprovalOption, PlanApprovalDialog, RecapState,
+    };
 
     /// Test shim: most cases don't care about the composer, so route the real
     /// handler through a throwaway textarea.
@@ -1519,6 +1546,68 @@ mod tests {
             now,
         );
         assert!(state.viewport.selection.is_some());
+    }
+
+    fn ready_recap(state: &mut AppState, text: &str) {
+        let attachment = SessionAttachmentId::new(1);
+        state.active_session_attachment = Some(attachment);
+        let cursor = crate::surface_projection::test_surface_cursor(2);
+        state.recap = RecapState::Ready {
+            attachment,
+            source: orca_runtime::recap::RecapSourceFence {
+                cursor: cursor.clone(),
+                marker: orca_runtime::recap::RecapContentMarker {
+                    thread_id: cursor.thread_id.clone(),
+                    incarnation: cursor.incarnation.clone(),
+                    completed_user_operations: 3,
+                    evidence_digest: orca_runtime::surface::Sha256Digest::digest("recap"),
+                },
+            },
+            text: text.to_string(),
+            usage: orca_runtime::recap::RecapUsage::Cached,
+            detail_open: false,
+        };
+    }
+
+    #[test]
+    fn a_click_on_the_drawn_recap_strip_opens_the_detail_and_one_outside_it_closes_it() {
+        let mut state = state_with_transcript();
+        ready_recap(&mut state, "Fixed the relay drain; next: tag the release.");
+        render_once(&mut state, 80, 24);
+        let strip = state.viewport.recap_strip_area.expect("drawn recap strip");
+        assert!(state.viewport.recap_detail_area.is_none());
+
+        assert!(click_at(&mut state, strip.x + 4, strip.y));
+        assert!(state.recap_detail_open());
+        render_once(&mut state, 80, 24);
+        let detail = state
+            .viewport
+            .recap_detail_area
+            .expect("drawn recap detail");
+
+        // Inside the panel a click stays there; it neither closes the panel
+        // nor starts a transcript selection underneath.
+        assert!(click_at(&mut state, detail.x + 2, detail.y + 1));
+        assert!(state.recap_detail_open());
+        assert!(state.viewport.selection.is_none());
+
+        assert!(click_at(&mut state, 0, 0));
+        assert!(!state.recap_detail_open());
+        render_once(&mut state, 80, 24);
+        assert!(state.viewport.recap_detail_area.is_none());
+    }
+
+    #[test]
+    fn a_recap_from_another_attachment_is_neither_drawn_nor_clickable() {
+        let mut state = state_with_transcript();
+        ready_recap(&mut state, "from the side conversation");
+        state.active_session_attachment = Some(SessionAttachmentId::new(2));
+        render_once(&mut state, 80, 24);
+        assert!(state.viewport.recap_strip_area.is_none());
+        state.set_recap_detail_open(true);
+        render_once(&mut state, 80, 24);
+        assert!(state.viewport.recap_detail_area.is_none());
+        assert!(!state.recap_detail_open());
     }
 
     #[test]

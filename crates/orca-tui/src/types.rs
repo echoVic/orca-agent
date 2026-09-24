@@ -70,6 +70,36 @@ pub(crate) struct TaskTranscriptViewState {
     pub(crate) result: Option<TaskTranscriptResult>,
     pub(crate) scroll: u16,
 }
+
+/// What the recap strip under the transcript (and its detail panel) shows.
+/// Display-only: none of it reaches the transcript, scrollback or runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum RecapState {
+    #[default]
+    Hidden,
+    /// `/recap` was sent and the controller has not started a request yet.
+    Requested,
+    Pending {
+        request_id: orca_runtime::recap::RecapRequestId,
+        attachment: SessionAttachmentId,
+        source: orca_runtime::recap::RecapSourceFence,
+        trigger: orca_runtime::recap::RecapTrigger,
+    },
+    Ready {
+        attachment: SessionAttachmentId,
+        source: orca_runtime::recap::RecapSourceFence,
+        text: String,
+        usage: orca_runtime::recap::RecapUsage,
+        detail_open: bool,
+    },
+    Failed {
+        attachment: SessionAttachmentId,
+        source: orca_runtime::recap::RecapSourceFence,
+        message: String,
+    },
+    /// Why `/recap` could not run just now.
+    Notice(String),
+}
 #[derive(Debug, Clone, Default)]
 pub struct PendingWorkflowNotificationQueue {
     inner: Arc<Mutex<VecDeque<PendingWorkflowNotification>>>,
@@ -477,6 +507,8 @@ pub struct AppState {
     pub(crate) announced_subagent_batches: std::collections::HashSet<String>,
     pub(crate) announced_subagent_terminals: std::collections::HashSet<String>,
     pub(crate) task_transcript: Option<TaskTranscriptViewState>,
+    pub(crate) recap: RecapState,
+    pub(crate) focus_cycle: u64,
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
     pub(crate) turn_diagnostic_seen: bool,
@@ -517,6 +549,8 @@ impl ScrollAmount for i32 {
 }
 
 impl AppState {
+    const AUTO_RECAP_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(180);
+
     pub(crate) fn conversation_target(&self) -> &ConversationTarget {
         &self.conversation_target
     }
@@ -531,6 +565,86 @@ impl AppState {
 
     pub(crate) fn clear_task_transcript(&mut self) {
         self.task_transcript = None;
+    }
+
+    pub(crate) fn invalidate_recap(&mut self) {
+        self.recap = RecapState::Hidden;
+    }
+
+    /// Focus return is only an opportunity for automatic recap.  Keep the
+    /// renderer-side gate conservative; the hosted controller still checks
+    /// the runtime evidence count and content marker before starting a worker.
+    pub(crate) fn can_request_auto_recap(&self, now: std::time::Instant) -> bool {
+        self.status == AppStatus::Idle
+            && self.recap == RecapState::Hidden
+            && self.approval_dialog.is_none()
+            && self.plan_approval_dialog.is_none()
+            && self.config_dialog.is_none()
+            && self.full_access_confirmation.is_none()
+            && self.user_input_dialog.is_none()
+            && self.task_transcript.is_none()
+            && !self.side_conversation_visible
+            && self.conversation_target.task_id().is_none()
+            && !self
+                .workflow_tasks()
+                .iter()
+                .any(|task| task.status.is_active() || task.status.requires_attention())
+            && self
+                .last_completed_at
+                .and_then(|completed| now.checked_duration_since(completed))
+                .is_some_and(|elapsed| elapsed >= Self::AUTO_RECAP_QUIET_PERIOD)
+    }
+
+    pub(crate) fn mark_focus_cycle(&mut self) -> u64 {
+        self.focus_cycle = self.focus_cycle.wrapping_add(1).max(1);
+        self.focus_cycle
+    }
+
+    /// The recap to draw. One produced for another attachment -- a side
+    /// conversation, a focused child, a session since replaced -- never shows.
+    pub(crate) fn visible_recap(&self) -> &RecapState {
+        static HIDDEN: RecapState = RecapState::Hidden;
+        match &self.recap {
+            RecapState::Pending { attachment, .. }
+            | RecapState::Ready { attachment, .. }
+            | RecapState::Failed { attachment, .. }
+                if self.active_session_attachment != Some(*attachment) =>
+            {
+                &HIDDEN
+            }
+            recap => recap,
+        }
+    }
+
+    pub(crate) fn recap_detail_open(&self) -> bool {
+        matches!(
+            self.visible_recap(),
+            RecapState::Ready {
+                detail_open: true,
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn set_recap_detail_open(&mut self, open: bool) {
+        if let RecapState::Ready { detail_open, .. } = &mut self.recap {
+            *detail_open = open;
+        }
+    }
+
+    pub(crate) fn begin_recap(
+        &mut self,
+        request_id: orca_runtime::recap::RecapRequestId,
+        attachment: SessionAttachmentId,
+        source: orca_runtime::recap::RecapSourceFence,
+        trigger: orca_runtime::recap::RecapTrigger,
+    ) {
+        self.recap = RecapState::Pending {
+            request_id,
+            attachment,
+            source,
+            trigger,
+        };
     }
 
     pub(crate) fn begin_task_transcript_request(&mut self, request: TaskTranscriptRequest) {
@@ -725,6 +839,8 @@ impl AppState {
             announced_subagent_batches: std::collections::HashSet::new(),
             announced_subagent_terminals: std::collections::HashSet::new(),
             task_transcript: None,
+            recap: RecapState::Hidden,
+            focus_cycle: 0,
             pending_workflow_notifications: VecDeque::new(),
             suppress_background_main_session_output: false,
             turn_diagnostic_seen: false,

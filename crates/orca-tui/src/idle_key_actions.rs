@@ -70,6 +70,14 @@ pub(crate) fn handle_idle_key(
         return;
     }
 
+    // The recap detail is an overlay, not a mode: Esc closes it once the
+    // popups above have had theirs, and every other key keeps its meaning.
+    if key.code == KeyCode::Esc && state.recap_detail_open() {
+        vim_state.cancel_pending_command();
+        state.set_recap_detail_open(false);
+        return;
+    }
+
     if handle_composer_editor_shortcut(ev, key, state, config, textarea, vim_state, theme) {
         return;
     }

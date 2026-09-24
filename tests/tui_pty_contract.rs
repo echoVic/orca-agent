@@ -350,6 +350,20 @@ fn tui_escape_cancels_a_running_subagent_and_keeps_the_parent_usable() {
         !String::from_utf8_lossy(&output[cancel_start..]).contains("Mock slow stream completed."),
         "cancelled subagent emitted a post-terminal completion"
     );
+    // Under load the cancel can take longer than the pause above; a follow-up
+    // typed before it lands is queued, and an interrupt pauses the queue by
+    // design. Type the follow-up once the parent is visibly idle again.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while screen_contains(&output, "Esc interrupt") {
+        assert!(
+            Instant::now() < deadline,
+            "Esc did not return the parent to idle; reconstructed screen=\n{}",
+            reconstruct_screen(&output)
+        );
+        if let Some(chunk) = process.receive_output(Duration::from_millis(250)) {
+            output.extend_from_slice(&chunk);
+        }
+    }
 
     let follow_up_start = output.len();
     process
@@ -650,6 +664,67 @@ fn tui_side_toggle_keeps_transcripts_visible_without_resubmitting() {
 // change between frames, so a switch that leaves the top rows untouched will
 // not re-print them — checking only the post-switch delta would miss content
 // that is genuinely on screen. Rebuilding the grid reflects what the user sees.
+#[test]
+fn tui_recap_command_draws_the_strip_and_detail_and_esc_closes_the_detail() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "recap pty seed")
+        .expect("spawn recap TUI in PTY");
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        ASSISTANT_SENTINEL,
+        Duration::from_secs(10),
+        "TUI did not finish the seed turn",
+    );
+
+    process.write(b"/recap\r").expect("request a recap");
+    // An explicit /recap opens the full text over the transcript, and the
+    // strip under it carries the same recap.
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "Recap Mock runtime completed the headless harness contract. Esc close",
+        "TUI did not open the recap detail",
+    );
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "↳ Recap",
+        "TUI did not draw the recap strip",
+    );
+
+    process
+        .write(&[0x1b])
+        .expect("close the recap detail with Esc");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while screen_contains(&output, "Esc close") {
+        assert!(
+            Instant::now() < deadline,
+            "Esc did not close the recap detail; reconstructed screen=\n{}",
+            reconstruct_screen(&output)
+        );
+        if let Some(chunk) = process.receive_output(Duration::from_millis(250)) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+    assert!(
+        screen_contains(&output, "↳ Recap"),
+        "closing the detail must keep the strip; reconstructed screen=\n{}",
+        reconstruct_screen(&output)
+    );
+    assert!(
+        process.try_wait().expect("poll TUI after Esc").is_none(),
+        "Esc on the recap detail must not end the session"
+    );
+
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
 fn assert_screen_shows(process: &PtyProcess, output: &mut Vec<u8>, expected: &str, failure: &str) {
     // PTY contracts run in parallel and the mock child may not publish its
     // first activity frame until other test binaries release the CPU. Wait for
@@ -1156,11 +1231,25 @@ fn open_pty(columns: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) })
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    // Tests spawn their TUIs in parallel: an inheritable PTY would leak into
+    // every other test's child, and a detached subagent worker outliving that
+    // child would hold this terminal open so its reader never saw EOF. Each
+    // child still gets its own terminal: spawning dup2s it onto fds 0-2.
+    set_cloexec(&master)?;
+    set_cloexec(&slave)?;
+    Ok((master, slave))
+}
+
+fn set_cloexec(fd: &impl AsRawFd) -> io::Result<()> {
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn duplicate_fd(fd: &impl AsRawFd) -> io::Result<OwnedFd> {
-    let duplicate = unsafe { libc::dup(fd.as_raw_fd()) };
+    let duplicate = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
         return Err(io::Error::last_os_error());
     }
