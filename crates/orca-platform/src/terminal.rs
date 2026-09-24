@@ -653,3 +653,83 @@ pub fn native_pty_supported() -> bool {
         false
     }
 }
+
+/// Marks every descriptor above stdio that refers to a terminal
+/// close-on-exec, and returns how many it had to change.
+///
+/// A terminal library may keep its own duplicates of the controlling terminal
+/// (qwertty `dup`s stdin for its reader and resize stream). Left inheritable,
+/// every child the process spawns -- a detached subagent worker, an MCP
+/// server, a backgrounded shell command -- holds the terminal open, so it
+/// outlives the session and whatever reads that terminal to its end hangs.
+/// Stdio itself is left alone: children are given their streams explicitly.
+#[cfg(unix)]
+pub fn keep_terminal_descriptors_out_of_children() -> std::io::Result<usize> {
+    let mut changed = 0;
+    for entry in std::fs::read_dir("/dev/fd")? {
+        let Some(fd) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if fd <= 2 || unsafe { libc::isatty(fd) } != 1 {
+            continue;
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || flags & libc::FD_CLOEXEC != 0 {
+            continue;
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+/// Windows handles are only inherited when a spawn asks for it, so there is
+/// nothing to mark.
+#[cfg(not(unix))]
+pub fn keep_terminal_descriptors_out_of_children() -> std::io::Result<usize> {
+    Ok(0)
+}
+
+#[cfg(all(test, unix))]
+mod descriptor_tests {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    use super::keep_terminal_descriptors_out_of_children;
+
+    fn close_on_exec(fd: &OwnedFd) -> bool {
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    #[test]
+    fn inheritable_terminal_descriptors_become_close_on_exec() {
+        let (mut master, mut slave) = (-1, -1);
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "{}", std::io::Error::last_os_error());
+        let (master, slave) =
+            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        // A plain dup, as qwertty makes of stdin: inheritable.
+        let dup = unsafe { OwnedFd::from_raw_fd(libc::dup(slave.as_raw_fd())) };
+        assert!(!close_on_exec(&dup));
+
+        assert!(keep_terminal_descriptors_out_of_children().unwrap() >= 1);
+        assert!(close_on_exec(&dup));
+        assert!(close_on_exec(&slave));
+        drop(master);
+    }
+}

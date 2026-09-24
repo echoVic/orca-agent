@@ -61,7 +61,7 @@ static TYPED_PROVIDER_OUTCOME_WRITE_FAILURES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, usize>>,
 > = std::sync::OnceLock::new();
 
-const TASK_LEASE_DURATION_MS: i64 = 30_000;
+pub(crate) const TASK_LEASE_DURATION_MS: i64 = 30_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskLease {

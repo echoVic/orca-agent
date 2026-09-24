@@ -343,6 +343,14 @@ impl Drop for RestoreRegistration {
     }
 }
 
+/// qwertty reads the terminal through `dup`s of it that every spawned child
+/// would otherwise inherit, holding the terminal open past the session: a
+/// detached subagent worker kept a finished TUI's terminal alive this way.
+/// Failing to mark them only risks that leak, so it is not an error.
+fn keep_terminal_out_of_children() {
+    let _ = orca_platform::terminal::keep_terminal_descriptors_out_of_children();
+}
+
 struct QwerttyDriver {
     session: TokioTerminalSession,
     signals: qwertty::SignalStream,
@@ -357,6 +365,7 @@ impl QwerttyDriver {
         let signals = session.signals().map_err(qwertty_error)?;
         #[cfg(unix)]
         let resizes = session.resize_stream().map_err(qwertty_error)?;
+        keep_terminal_out_of_children();
         Ok((
             Self {
                 session,
@@ -478,7 +487,10 @@ impl TerminalDriver for QwerttyDriver {
     async fn resume(&mut self) -> io::Result<()> {
         #[cfg(unix)]
         {
-            self.session.resume(false).await.map_err(qwertty_error)
+            let resumed = self.session.resume(false).await.map_err(qwertty_error);
+            // Resuming re-registers the reader on a fresh duplicate.
+            keep_terminal_out_of_children();
+            resumed
         }
         #[cfg(windows)]
         {

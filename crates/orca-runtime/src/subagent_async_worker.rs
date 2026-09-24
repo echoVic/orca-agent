@@ -230,7 +230,17 @@ struct AsyncLeaseHeartbeat {
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(not(test))]
+const ASYNC_LEASE_HEARTBEAT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const ASYNC_LEASE_HEARTBEAT: Duration = Duration::from_millis(100);
+
 impl AsyncLeaseHeartbeat {
+    /// Keeps the worker's task and continuation leases alive, and ends the run
+    /// through `cancel` once they are lost: the task was stopped (a stop fences
+    /// the lease even when its worker could not be killed), finished, taken
+    /// over, or is gone with its session. No one would read what the run
+    /// produced after that, so it must not go on spending.
     fn start(
         task_registry: TaskRegistry,
         task_lease: crate::tasks::TaskLease,
@@ -238,26 +248,40 @@ impl AsyncLeaseHeartbeat {
         coordinator: ChildAgentCoordinator,
         continuation_lease: ContinuationLease,
         continuation_revision: Arc<Mutex<ContinuationRevision>>,
+        cancel: CancelToken,
     ) -> Self {
         let (stop, receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
+            let lease_duration = Duration::from_millis(crate::tasks::TASK_LEASE_DURATION_MS as u64);
+            let mut renewed_at = Instant::now();
             loop {
-                match receiver.recv_timeout(Duration::from_secs(5)) {
+                match receiver.recv_timeout(ASYNC_LEASE_HEARTBEAT) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                if task_registry
-                    .renew_task_lease(&task_lease, &agent_id)
-                    .is_err()
-                {
-                    break;
+                match task_registry.renew_task_lease(&task_lease, &agent_id) {
+                    Ok(()) => renewed_at = Instant::now(),
+                    // A write that fails while the lease still stands may be
+                    // transient; once the lease could have lapsed, it is lost.
+                    Err(crate::tasks::TaskLeaseError::Persistence(_))
+                        if renewed_at.elapsed() < lease_duration =>
+                    {
+                        continue;
+                    }
+                    Err(_) => {
+                        cancel.cancel();
+                        break;
+                    }
                 }
                 let Ok(mut revision) = continuation_revision.lock() else {
                     break;
                 };
                 let projection = match coordinator.renew(&continuation_lease, *revision) {
                     Ok(projection) => projection,
-                    Err(_) => break,
+                    Err(_) => {
+                        cancel.cancel();
+                        break;
+                    }
                 };
                 *revision = projection.revision;
             }
@@ -417,6 +441,7 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
     };
     let (checkpoint_observer, shared_revision) =
         build_checkpoint_observer(coordinator.clone(), continuation_lease.clone(), &prepared);
+    let cancel = CancelToken::new();
     let heartbeat = AsyncLeaseHeartbeat::start(
         task_registry.clone(),
         task_lease.clone(),
@@ -424,6 +449,7 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         coordinator.clone(),
         continuation_lease.clone(),
         Arc::clone(&shared_revision),
+        cancel.clone(),
     );
     let instructions = instructions::load_for_cwd_or_default(&cwd);
     let memory = memory::load_for_cwd(&cwd);
@@ -432,7 +458,6 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         CapabilitySet::for_approval_mode(config.approval_mode),
     );
     let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
-    let cancel = CancelToken::new();
     let child_request = ChildAgentRequest {
         prompt: request.prompt,
         subagent_type: request.subagent_type,
@@ -2057,6 +2082,167 @@ mod tests {
             restored.terminal,
             Some(AgentTerminal::Completed { .. })
         ));
+    }
+
+    static CHILD_PARKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Parks like a child waiting on a slow provider, until its run is
+    /// cancelled or a safety limit passes.
+    fn park_until_cancelled(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        runtime: &mut ChildAgentRuntime<'_, io::Sink>,
+        _cost: &mut crate::cost::CostTracker,
+    ) -> io::Result<crate::agent_child::ChildAgentResult> {
+        CHILD_PARKED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !runtime.cancel.is_cancelled() {
+            if Instant::now() > deadline {
+                return Err(io::Error::other("the parked child was never cancelled"));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(crate::agent_child::ChildAgentResult {
+            status: RunStatus::Cancelled,
+            final_message: None,
+            error: None,
+            budget_usage: None,
+        })
+    }
+
+    #[test]
+    fn a_stop_persisted_by_the_parent_ends_the_detached_run_without_a_kill() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let config = async_test_config(cwd.path().to_path_buf());
+        let mut request = subagent::create_subagent_request(&ToolRequest {
+            id: "parked-async".into(),
+            name: ToolName::Subagent,
+            action: ActionKind::Agent,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "Park", "prompt": "Wait for the provider", "mode": "async"
+                })
+                .to_string(),
+            ),
+        });
+        subagent::freeze_agent_request(
+            &config,
+            cwd.path(),
+            &orca_mcp::McpRegistry::default(),
+            &mut request,
+        )
+        .unwrap();
+        let session = format!("parked-detached-{}", uuid::Uuid::now_v7());
+        let registry = TaskRegistry::new_for_cwd(session.clone(), cwd.path());
+        let task = registry.create_subagent("Park".into(), None);
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let effective_cwd = cwd.path().display().to_string();
+        let compatibility_hash = compute_continuation_compatibility_hash(
+            &request.subagent_type,
+            request.model.as_deref(),
+            request.isolation,
+            &effective_cwd,
+            None,
+            &request
+                .frozen_agent
+                .as_ref()
+                .map(|frozen| frozen.delegation.clone())
+                .unwrap_or_default(),
+            &orca_mcp::McpRegistry::default(),
+            &[],
+            request.frozen_agent.as_ref(),
+        )
+        .unwrap();
+        let prepared = coordinator
+            .create(CreateContinuationInput {
+                continuation_id: None,
+                parent_task_id: None,
+                task_id: task.id.clone(),
+                prompt_id: AgentPromptId::new(),
+                compatibility: ContinuationCompatibility {
+                    subagent_type: request.subagent_type.identifier().to_string(),
+                    frozen_agent: request.frozen_agent.clone(),
+                    model: request.model.clone(),
+                    isolation: SubagentIsolation::None,
+                    effective_cwd,
+                    worktree: None,
+                    compatibility_hash,
+                },
+            })
+            .unwrap();
+        let binding = registry
+            .register_detached_subagent_binding(
+                &task.id,
+                &task.id,
+                prepared.attempt_id,
+                TaskRevision::try_new(1).unwrap(),
+                Some(crate::runtime_surface::SurfaceOperationFence {
+                    thread_id: crate::runtime_surface::SurfaceThreadId::try_from_bytes(
+                        *uuid::Uuid::now_v7().as_bytes(),
+                    )
+                    .unwrap(),
+                    thread_owner_epoch: crate::runtime_surface::ThreadOwnerEpoch::new(1),
+                    operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
+                        *uuid::Uuid::now_v7().as_bytes(),
+                    )
+                    .unwrap(),
+                    generation_id: crate::runtime_surface::SurfaceGenerationId::new(1),
+                }),
+            )
+            .unwrap();
+        // The worker runs on a thread here, so it adopts the test's own pid.
+        // Nothing below kills that pid: the stop is only persisted.
+        registry
+            .mark_worker_spawned(&task.id, std::process::id())
+            .unwrap();
+        let worker = {
+            let task_id = task.id.clone();
+            let cwd = cwd.path().to_path_buf();
+            let home = home.path().to_path_buf();
+            thread::spawn(move || {
+                // The test home is a per-thread override.
+                let _home = crate::history::redirect_test_orca_home(&home);
+                run_async_subagent_worker_with_executor(AsyncSubagentWorkerContext {
+                    input: AsyncSubagentWorkerInput {
+                        config: async_test_config(cwd.clone()),
+                        cwd: cwd.clone(),
+                        child_cwd: cwd,
+                        task_session_id: session,
+                        agent_id: task_id,
+                        request,
+                        child_depth: 1,
+                        worktree: None,
+                        permission_response_public_key: binding.permission_response_public_key,
+                        child_turn_id: TurnId::new(),
+                        activity_start_precommitted: false,
+                    },
+                    child_executor: park_until_cancelled,
+                })
+            })
+        };
+        // Stop it mid-run, once the child is waiting on its provider.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !CHILD_PARKED.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline && !worker.is_finished(),
+                "the worker never reached its child"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let stopped_at = Instant::now();
+        registry.signal_stop_tree(&task.id).unwrap();
+        while !worker.is_finished() {
+            assert!(
+                stopped_at.elapsed() < Duration::from_secs(5),
+                "the detached run kept going after its stop was persisted"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        worker.join().unwrap();
     }
 
     #[test]
