@@ -396,6 +396,13 @@ impl TuiSurfaceTaskControl {
             }
             hosted.queue_watcher_stop = Some(Arc::new(AtomicBool::new(false)));
         }
+        // The thread the view leaves is no longer shown: it must not start a
+        // turn of its own for finished agents until the view comes back.
+        if let Some(previous) = hosted.queue_runtime.as_ref()
+            && previous.thread_id() != runtime.thread_id()
+        {
+            previous.detach_prompt_queue_surface();
+        }
         hosted.queue_runtime = Some(runtime);
         *hosted
             .queue_event_tx
@@ -1890,6 +1897,72 @@ mod tests {
             thread.lifecycle_mut().finish_task(status);
             Ok(status.into())
         }
+    }
+
+    /// Counts the turns a thread runs and ends each at once.
+    struct CountingExecutor {
+        turns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl orca_runtime::runtime_host::ThreadOperationExecutor for CountingExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut orca_runtime::thread::RuntimeThread,
+            _request: &orca_runtime::runtime_host::HostedTurnRequest,
+            _generation: &orca_runtime::runtime_host::GenerationContext,
+            _events: &mut orca_core::event_schema::EventFactory,
+            _writer: &mut (dyn std::io::Write + Send),
+            _cancel: &orca_core::cancel::CancelToken,
+        ) -> std::io::Result<orca_runtime::runtime_host::ThreadOperationOutcome> {
+            self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let status = orca_core::event_schema::RunStatus::Success;
+            thread.lifecycle_mut().finish_task(status);
+            Ok(status.into())
+        }
+    }
+
+    #[test]
+    fn a_thread_the_view_moved_away_from_does_not_wake_for_its_finished_agents() {
+        let _guard = crate::test_support::lock_process_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let host = orca_runtime::runtime_host::RuntimeHost::start_with_executor(Arc::new(
+            CountingExecutor {
+                turns: Arc::clone(&turns),
+            },
+        ))
+        .expect("runtime host");
+        let main = host
+            .start_thread(config.clone(), "main")
+            .expect("main thread");
+        let other = host.start_thread(config, "other").expect("other thread");
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        crate::hosted_session::announce_runtime_ready(&main, &event_tx, &control);
+        // The view moves on, as it does for a side conversation.
+        crate::hosted_session::announce_runtime_ready(&other, &event_tx, &control);
+
+        let registry = main.task_registry();
+        let agent = registry.create_subagent("survey the crate".to_string(), None);
+        registry.mark_subagent_result_pending(&agent.id);
+        registry
+            .complete(&agent.id, "survey the crate: done".to_string())
+            .expect("finish the agent");
+        std::thread::sleep(Duration::from_millis(400));
+        let woken = turns.load(std::sync::atomic::Ordering::SeqCst);
+
+        main.shutdown().expect("main shutdown");
+        other.shutdown().expect("other shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+        assert_eq!(woken, 0, "main started a turn nobody would see");
     }
 
     #[test]

@@ -3962,20 +3962,28 @@ impl TaskRegistry {
     /// result — the ones [`Self::claim_subagent_results_for_parent`] claims
     /// for the root — read under the lock without claiming or cloning, so an
     /// idle thread can ask cheaply and often.
-    pub(crate) fn has_undelivered_root_subagent_results(&self) -> bool {
+    /// The finished root agents whose results the main conversation has not
+    /// received yet, by task id in a stable order.
+    pub(crate) fn undelivered_root_subagent_result_ids(&self) -> Vec<String> {
         self.with_tasks(|tasks| {
-            tasks.values().any(|record| {
-                record.task_type == TaskType::Subagent
-                    && is_terminal(record.status)
-                    && record.result_delivery == ResultDelivery::Pending
-                    && record
-                        .parent_task_id
-                        .as_deref()
-                        .and_then(|id| tasks.get(id))
-                        .is_none_or(|parent| parent.task_type != TaskType::Subagent)
-            })
+            let mut ids = tasks
+                .values()
+                .filter(|record| {
+                    record.task_type == TaskType::Subagent
+                        && is_terminal(record.status)
+                        && record.result_delivery == ResultDelivery::Pending
+                        && record
+                            .parent_task_id
+                            .as_deref()
+                            .and_then(|id| tasks.get(id))
+                            .is_none_or(|parent| parent.task_type != TaskType::Subagent)
+                })
+                .map(|record| record.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
         })
-        .unwrap_or(false)
+        .unwrap_or_default()
     }
 
     pub fn outstanding_subagent_results(&self) -> Vec<PendingSubagentResult> {

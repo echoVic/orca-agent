@@ -621,9 +621,12 @@ impl AppState {
         }
     }
 
+    /// Restarts a paused runtime queue. An interrupt pauses it even when it
+    /// is empty, since the user took over; left paused, every follow-up
+    /// queued later would wait for good and finished agents could not wake
+    /// the thread, so the user's next message restarts it either way.
     pub(crate) fn request_runtime_queue_start(&self) {
-        if self.queued_submission.pending_or_in_flight() && self.queued_submission.projection.paused
-        {
+        if self.queued_submission.projection.paused {
             let _ = self.event_tx.send(UserAction::PromptQueueControl(
                 orca_runtime::prompt_queue::PromptQueueAction::Start {
                     expected_revision: self.runtime_queue_revision(),
@@ -989,6 +992,44 @@ mod tests {
             snapshot,
         });
         assert!(state.queued_autosend_enabled());
+    }
+
+    #[test]
+    fn a_new_message_restarts_a_queue_an_interrupt_paused_even_when_it_is_empty() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "0.0.0-test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        // Esc paused the runtime queue with nothing in it.
+        let mut runtime = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
+            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
+        );
+        let snapshot = runtime
+            .apply(
+                orca_runtime::prompt_queue::PromptQueueAction::Pause {
+                    expected_revision: runtime.snapshot().revision,
+                },
+                1,
+            )
+            .unwrap();
+        assert!(snapshot.paused && snapshot.items.is_empty());
+        state.update(TuiEvent::PromptQueueUpdated(snapshot));
+
+        // The user carries on with a message of their own.
+        state.request_runtime_queue_start();
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(UserAction::PromptQueueControl(
+                    orca_runtime::prompt_queue::PromptQueueAction::Start { .. }
+                ))
+            ),
+            "the queue would stay paused, and follow-ups queued later would never send"
+        );
     }
 
     #[test]

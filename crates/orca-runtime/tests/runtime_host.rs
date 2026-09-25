@@ -2243,6 +2243,77 @@ fn a_finished_background_agent_does_not_wake_a_thread_nothing_observes() {
     host.shutdown().expect("shutdown runtime host");
 }
 
+fn wait_for_calls(executor: &ScriptedExecutor, calls: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while executor.call_count() < calls {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected {calls} turns, saw {}",
+            executor.call_count()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_wake_that_leaves_the_results_owed_is_not_repeated_until_another_agent_finishes() {
+    // Scripted turns never take the results in, like a session whose
+    // history can no longer record them: each wake would be a paid turn
+    // with nothing new in it.
+    let executor = Arc::new(ScriptedExecutor::new([
+        TestBehavior::EmitEvent {
+            message: "first wake".to_string(),
+            status: RunStatus::Success,
+        },
+        TestBehavior::EmitEvent {
+            message: "second wake".to_string(),
+            status: RunStatus::Success,
+        },
+    ]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+    attach_interactive_surface(&thread);
+
+    finish_background_agent(&thread, "survey the crate");
+    wait_for_calls(&executor, 1);
+    // Well past the 2s backoff between wakes.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        executor.call_count(),
+        1,
+        "the same undelivered results woke the thread again"
+    );
+
+    finish_background_agent(&thread, "check the docs");
+    wait_for_calls(&executor, 2);
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn a_finished_background_agent_waits_while_the_surface_shows_another_thread() {
+    let executor = Arc::new(ScriptedExecutor::new([TestBehavior::EmitEvent {
+        message: "back on main".to_string(),
+        status: RunStatus::Success,
+    }]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+    attach_interactive_surface(&thread);
+    // The TUI moved to a side conversation or a child's conversation.
+    thread.detach_prompt_queue_surface();
+
+    finish_background_agent(&thread, "survey the crate");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        executor.call_count(),
+        0,
+        "a turn nobody sees, with its approvals shown in the other view"
+    );
+
+    attach_interactive_surface(&thread);
+    wait_for_calls(&executor, 1);
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
 #[test]
 fn steer_a_finished_turn_never_applied_runs_as_the_next_turn() {
     let first_gate = ManualGate::new();

@@ -3150,6 +3150,9 @@ pub struct RuntimeThreadHandle {
     prompt_queue_observer: Arc<Mutex<Option<Arc<dyn EventObserver>>>>,
     prompt_queue_interaction_handlers: Arc<Mutex<PromptQueueInteractionHandlers>>,
     prompt_queue_dispatch_ready: Arc<AtomicBool>,
+    /// Whether an interactive surface shows this thread now: set with the
+    /// surface's event observer, cleared when the surface moves elsewhere.
+    prompt_queue_surface_attached: Arc<AtomicBool>,
 }
 
 /// Interaction handlers used when the durable prompt queue starts a legacy
@@ -3420,11 +3423,24 @@ impl RuntimeThreadHandle {
         }
     }
 
+    /// Observes the turns this thread starts on its own; an interactive
+    /// surface calls it when it shows the thread.
     pub fn set_prompt_queue_event_observer(&self, observer: Arc<dyn EventObserver>) {
         *self
             .prompt_queue_observer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+        self.prompt_queue_surface_attached
+            .store(true, Ordering::Release);
+    }
+
+    /// The surface moved to another thread (a side conversation, a child's
+    /// conversation): this one must not start a turn of its own to wake for
+    /// finished agents until a surface shows it again, since nobody would
+    /// see that turn and its approvals would appear in the other view.
+    pub fn detach_prompt_queue_surface(&self) {
+        self.prompt_queue_surface_attached
+            .store(false, Ordering::Release);
     }
 
     pub fn set_prompt_queue_interaction_handlers(&self, handlers: PromptQueueInteractionHandlers) {
@@ -5591,6 +5607,7 @@ async fn run_host_supervisor(
                         PromptQueueInteractionHandlers::default(),
                     )),
                     prompt_queue_dispatch_ready: Arc::new(AtomicBool::new(false)),
+                    prompt_queue_surface_attached: Arc::new(AtomicBool::new(false)),
                 };
                 let root_thread_id = agent_root_thread_id.unwrap_or_else(|| thread_id.clone());
                 thread.thread_extensions().insert(
@@ -11738,6 +11755,8 @@ struct ThreadActor {
     subagent_relay_failure_counts: HashMap<String, (String, u8)>,
     /// When the thread last started a turn for finished background agents.
     last_child_results_wake: Option<Instant>,
+    /// The results that wake was for, so it is not repeated for them.
+    last_child_results_wake_owed: Vec<String>,
     recap_cancellations: HashMap<crate::recap::RecapRequestId, CancelToken>,
     recap_workers: HashMap<crate::recap::RecapRequestId, thread::JoinHandle<()>>,
     recap_inflight_keys: HashMap<String, crate::recap::RecapRequestId>,
@@ -16312,6 +16331,7 @@ impl ThreadActor {
             subagent_activity_dedupe: VecDeque::new(),
             subagent_relay_failure_counts: HashMap::new(),
             last_child_results_wake: None,
+            last_child_results_wake_owed: Vec::new(),
             recap_cancellations: HashMap::new(),
             recap_workers: HashMap::new(),
             recap_inflight_keys: HashMap::new(),
@@ -16502,21 +16522,32 @@ impl ThreadActor {
         {
             return;
         }
-        if self
-            .last_child_results_wake
-            .is_some_and(|at| at.elapsed() < CHILD_RESULTS_WAKE_BACKOFF)
+        if !self
+            .handle
+            .prompt_queue_surface_attached
+            .load(Ordering::Acquire)
+            || self
+                .last_child_results_wake
+                .is_some_and(|at| at.elapsed() < CHILD_RESULTS_WAKE_BACKOFF)
             || self.surface_holds_the_thread()
         {
             return;
         }
-        let owed = self.state.as_ref().is_some_and(|state| {
-            state
-                .thread
-                .session()
-                .task_registry()
-                .has_undelivered_root_subagent_results()
-        });
-        if !owed {
+        let owed = self
+            .state
+            .as_ref()
+            .map(|state| {
+                state
+                    .thread
+                    .session()
+                    .task_registry()
+                    .undelivered_root_subagent_result_ids()
+            })
+            .unwrap_or_default();
+        // A wake whose turn left these same results undelivered (the session
+        // could not record them, the turn failed) would only repeat, a paid
+        // turn every few seconds: wait until another agent finishes.
+        if owed.is_empty() || owed == self.last_child_results_wake_owed {
             return;
         }
         let Some(observer) = self
@@ -16529,6 +16560,7 @@ impl ThreadActor {
             return;
         };
         self.last_child_results_wake = Some(Instant::now());
+        self.last_child_results_wake_owed = owed;
         let mut request =
             HostedTurnRequest::new(CHILD_RESULTS_WAKE_PROMPT).with_event_observer(observer);
         let interaction_handlers = self
@@ -38687,6 +38719,7 @@ mod tests {
                 PromptQueueInteractionHandlers::default(),
             )),
             prompt_queue_dispatch_ready: Arc::new(AtomicBool::new(false)),
+            prompt_queue_surface_attached: Arc::new(AtomicBool::new(false)),
         };
         let responder = std::thread::spawn(move || {
             while let Some(ThreadCommand::ShutdownThread {
