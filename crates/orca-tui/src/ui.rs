@@ -5188,6 +5188,7 @@ fn activity_rows(
             state.tick,
             state.agent_dock_selected_task_id.as_deref(),
             state.tasks_dock_visible(),
+            state.status == AppStatus::Idle,
             width,
         ));
     }
@@ -5277,18 +5278,21 @@ fn background_task_activity_lines(
     expanded: bool,
     width: u16,
 ) -> Vec<Line<'static>> {
-    background_task_activity_rows(tasks, theme, tick, selected_task_id, expanded, width)
+    background_task_activity_rows(tasks, theme, tick, selected_task_id, expanded, true, width)
         .into_iter()
         .map(|(line, _)| line)
         .collect()
 }
 
+/// `idle` is whether Enter can open a background approval now: opening one
+/// takes over the status line, so it waits for a running turn to end.
 fn background_task_activity_rows(
     tasks: &[BackgroundTaskSummary],
     theme: &Theme,
     tick: u64,
     selected_task_id: Option<&str>,
     expanded: bool,
+    idle: bool,
     width: u16,
 ) -> Vec<(Line<'static>, Option<AgentHitTarget>)> {
     let activity_row = |text: String, color: Color| -> Line<'static> {
@@ -5408,6 +5412,9 @@ fn background_task_activity_rows(
         }
     }
 
+    let pending_approval = tasks
+        .iter()
+        .any(crate::workflow_panel::is_pending_background_approval);
     let activity = tasks
         .iter()
         .filter(|task| task.task_type != TaskType::Subagent)
@@ -5449,18 +5456,28 @@ fn background_task_activity_rows(
         };
         lines.push((
             activity_row(format!("● {}", labels.join(" · ")), color),
-            None,
+            pending_approval.then_some(AgentHitTarget::BackgroundApproval),
         ));
     }
 
     // Trailing hint row: leading space matches `activity_row`'s left margin
-    // so the hint lines up with every other row in the dock.
+    // so the hint lines up with every other row in the dock. It lists only
+    // keys that do something now: Shift+Up/Down picks an agent, and Enter
+    // opens the picked agent, or else the first background approval.
     if expanded {
-        let hint = crate::chrome::hint_line(
-            theme,
-            usize::from(width).saturating_sub(1),
-            &[("↑↓", "select"), ("Enter", "open"), ("Esc", "close")],
-        );
+        let agent_selected = selected_task_id
+            .is_some_and(|selected| visible_subagents.iter().any(|task| task.id == selected));
+        let mut keys = Vec::with_capacity(3);
+        if !visible_subagents.is_empty() {
+            keys.push(("Shift+↑↓", "select"));
+        }
+        if agent_selected {
+            keys.push(("Enter", "open"));
+        } else if pending_approval && idle {
+            keys.push(("Enter", "approve"));
+        }
+        keys.push(("Esc", "close"));
+        let hint = crate::chrome::hint_line(theme, usize::from(width).saturating_sub(1), &keys);
         let mut spans = vec![Span::raw(" ")];
         spans.extend(hint.spans);
         lines.push((Line::from(spans), None));
@@ -12256,7 +12273,64 @@ mod tests {
             "cap is 6, not the full 7: {lines:?}"
         );
         assert!(lines.iter().any(|line| line.contains("+1 more")));
-        assert_eq!(lines.last().unwrap(), " ↑↓ select · Enter open · Esc close");
+        assert_eq!(lines.last().unwrap(), " Shift+↑↓ select · Esc close");
+    }
+
+    #[test]
+    fn the_tasks_dock_hint_lists_only_keys_that_do_something() {
+        let theme = Theme::named(ThemeName::Dark);
+        let mut agent = workflow_task_for_agent_dashboard(
+            "review",
+            "agent",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        agent.id = "agent".to_string();
+        agent.task_type = TaskType::Subagent;
+        agent.status = TaskStatus::Running;
+        let mut approval = workflow_task_for_agent_dashboard(
+            "deploy",
+            "agent",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        approval.id = "deploy".to_string();
+        approval.task_type = TaskType::MainSession;
+        approval.status = TaskStatus::ApprovalRequired;
+        approval.is_backgrounded = true;
+        approval.pending_tool_call = Some(orca_core::task_types::PendingToolCallSummary {
+            id: "deploy-call".to_string(),
+            name: "edit".to_string(),
+            action: orca_core::approval_types::ActionKind::Write,
+            target: None,
+            arguments: "{}".to_string(),
+        });
+        let hint = |tasks: &[BackgroundTaskSummary], selected: Option<&str>| {
+            lines_text(&background_task_activity_lines(
+                tasks, &theme, 0, selected, true, 100,
+            ))
+            .pop()
+            .unwrap()
+        };
+
+        assert_eq!(hint(&[], None), " Esc close");
+        assert_eq!(
+            hint(&[approval.clone()], None),
+            " Enter approve · Esc close"
+        );
+        assert_eq!(hint(&[agent.clone()], None), " Shift+↑↓ select · Esc close");
+        assert_eq!(
+            hint(&[agent.clone()], Some("agent")),
+            " Shift+↑↓ select · Enter open · Esc close"
+        );
+        assert_eq!(
+            hint(&[agent, approval.clone()], None),
+            " Shift+↑↓ select · Enter approve · Esc close"
+        );
+        // During a running turn Enter leaves the approval for later.
+        let running = background_task_activity_rows(&[approval], &theme, 0, None, true, false, 100)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect::<Vec<_>>();
+        assert_eq!(lines_text(&running).pop().unwrap(), " Esc close");
     }
 
     #[test]

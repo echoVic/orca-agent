@@ -17,6 +17,8 @@ pub(crate) enum AgentHitTarget {
     DockAgent(String),
     /// A row of the Agents panel's list, by index.
     WorkspaceRow(usize),
+    /// The tasks dock's row counting background approvals: the first one.
+    BackgroundApproval,
 }
 
 #[derive(Clone, Debug)]

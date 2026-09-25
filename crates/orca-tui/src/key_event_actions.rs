@@ -598,6 +598,144 @@ mod tests {
         assert!(action_rx.try_recv().is_err());
     }
 
+    fn background_task(
+        id: &str,
+        task_type: orca_core::task_types::TaskType,
+        status: orca_core::task_types::TaskStatus,
+    ) -> orca_core::task_types::BackgroundTaskSummary {
+        orca_core::task_types::BackgroundTaskSummary {
+            id: id.to_string(),
+            parent_task_id: None,
+            task_type,
+            status,
+            is_backgrounded: true,
+            lifetime: orca_core::task_types::TaskLifetime::Task,
+            description: id.to_string(),
+            created_at_ms: 1,
+            started_at_ms: Some(1),
+            completed_at_ms: None,
+            command: None,
+            agent_type: None,
+            server: None,
+            tool: None,
+            pending_tool_call: (status == orca_core::task_types::TaskStatus::ApprovalRequired)
+                .then(|| orca_core::task_types::PendingToolCallSummary {
+                    id: format!("{id}-call"),
+                    name: "edit".to_string(),
+                    action: orca_core::approval_types::ActionKind::Write,
+                    target: Some("README.md".to_string()),
+                    arguments: "{\"path\":\"README.md\"}".to_string(),
+                }),
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
+            subagent_child_thread_id: None,
+            subagent_batch_id: None,
+            subagent_batch_size: None,
+            subagent_turn: None,
+            last_activity_at_ms: Some(2),
+            continuation: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+            publication_revision: Some(3),
+        }
+    }
+
+    fn press(
+        key: KeyEvent,
+        state: &mut AppState,
+        action_tx: &mpsc::Sender<UserAction>,
+        composer_has_text: bool,
+    ) -> KeyEventFlow {
+        let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(false);
+        handle_key_event_preflight(
+            key,
+            state,
+            &config,
+            action_tx,
+            &mut vim,
+            composer_has_text,
+            || Ok(()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn enter_opens_a_backgrounded_sessions_pending_approval() {
+        use orca_core::task_types::{TaskStatus, TaskType};
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        // Another task comes first, so the approval is not simply the
+        // workflow panel's current selection.
+        state.replace_workflow_tasks_for_test(vec![
+            background_task("shell", TaskType::Shell, TaskStatus::Running),
+            background_task(
+                "deploy",
+                TaskType::MainSession,
+                TaskStatus::ApprovalRequired,
+            ),
+        ]);
+
+        let flow = press(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &action_tx,
+            false,
+        );
+
+        assert!(matches!(flow, KeyEventFlow::Continue));
+        assert_eq!(state.status, AppStatus::WaitingApproval);
+        let dialog = state.approval_dialog.as_ref().expect("approval dialog");
+        assert_eq!(dialog.background_task_id.as_deref(), Some("deploy"));
+        assert_eq!(dialog.tool, "edit");
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn enter_with_a_typed_message_sends_it_instead_of_opening_the_dock() {
+        use orca_core::task_types::{TaskStatus, TaskType};
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        let mut child = background_task("child", TaskType::Subagent, TaskStatus::Running);
+        child.publication_revision = Some(7);
+        state.replace_workflow_tasks_for_test(vec![
+            child,
+            background_task(
+                "deploy",
+                TaskType::MainSession,
+                TaskStatus::ApprovalRequired,
+            ),
+        ]);
+        // A click on the agent left it selected in the dock.
+        state.agent_dock_selected_task_id = Some("child".to_string());
+
+        let flow = press(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &action_tx,
+            true,
+        );
+
+        assert!(matches!(flow, KeyEventFlow::Unhandled));
+        assert!(state.approval_dialog.is_none());
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
+    }
+
     #[test]
     fn dock_navigation_opens_typed_child_transcript_and_escape_returns_to_agent_list() {
         let (action_tx, action_rx) = mpsc::unbounded();
@@ -1270,18 +1408,25 @@ where
         return Ok(KeyEventFlow::Continue);
     }
 
+    // Enter on an empty composer acts on the dock: it opens the agent picked
+    // with Shift+Up/Down, or else the approval a background task waits on. A
+    // typed message is always sent, whatever the dock last had selected.
     if state.panel_mode == PanelMode::Conversation
         && key.code == KeyCode::Enter
         && key.modifiers.is_empty()
+        && !composer_has_text
     {
         vim_state.cancel_pending_command();
-        let Some(task_id) = state.selected_agent_dock_task().map(|task| task.id.clone()) else {
-            return Ok(KeyEventFlow::Unhandled);
-        };
-        if !crate::agent_workspace_actions::open_agent_task(state, action_tx, &task_id) {
-            return Ok(KeyEventFlow::Unhandled);
+        if let Some(task_id) = state.selected_agent_dock_task().map(|task| task.id.clone()) {
+            if !crate::agent_workspace_actions::open_agent_task(state, action_tx, &task_id) {
+                return Ok(KeyEventFlow::Unhandled);
+            }
+            return Ok(KeyEventFlow::Continue);
         }
-        return Ok(KeyEventFlow::Continue);
+        if state.status == AppStatus::Idle && state.open_pending_background_approval_dialog() {
+            return Ok(KeyEventFlow::Continue);
+        }
+        return Ok(KeyEventFlow::Unhandled);
     }
 
     if key.code == KeyCode::BackTab

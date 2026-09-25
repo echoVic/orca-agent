@@ -499,6 +499,35 @@ mod tests {
     }
 
     #[test]
+    fn clicking_the_docks_approval_row_opens_the_pending_approval() {
+        let mut deploy = task("deploy", 1_000);
+        deploy.task_type = TaskType::MainSession;
+        deploy.status = TaskStatus::ApprovalRequired;
+        deploy.is_backgrounded = true;
+        deploy.pending_tool_call = Some(orca_core::task_types::PendingToolCallSummary {
+            id: "deploy-call".to_string(),
+            name: "edit".to_string(),
+            action: orca_core::approval_types::ActionKind::Write,
+            target: Some("README.md".to_string()),
+            arguments: "{}".to_string(),
+        });
+        let (mut state, _rx) = conversation_with(vec![deploy]);
+        state.tasks_dock_expanded = true;
+        render_once(&mut state);
+
+        let rows = clicks_on(&state, &AgentHitTarget::BackgroundApproval);
+        assert_eq!(rows.len(), 1, "{:?}", state.agent_hit_areas);
+        assert_eq!(click(&mut state, rows[0]), MouseFlow::Handled);
+        assert_eq!(
+            state
+                .approval_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.background_task_id.as_deref()),
+            Some("deploy")
+        );
+    }
+
+    #[test]
     fn a_recap_under_the_agents_dock_takes_its_own_rows_and_leaves_theirs_alone() {
         let (mut state, _rx) = conversation_with(vec![task("worker", 1_000)]);
         with_ready_recap(

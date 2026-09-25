@@ -663,6 +663,14 @@ pub(crate) fn handle_mouse_event(
                         MouseFlow::Handled
                     }
                     AgentHitTarget::Main => MouseFlow::ReturnToMain,
+                    AgentHitTarget::BackgroundApproval => {
+                        // Opening it takes over the status line, so not
+                        // over a running turn.
+                        if state.status == AppStatus::Idle {
+                            state.open_pending_background_approval_dialog();
+                        }
+                        MouseFlow::Handled
+                    }
                     AgentHitTarget::DockAgent(task_id) => {
                         state.agent_dock_selected_task_id = Some(task_id.clone());
                         MouseFlow::OpenAgent(task_id)

@@ -418,9 +418,28 @@ impl AppState {
     }
 
     pub fn open_selected_background_approval_dialog(&mut self) -> bool {
-        let Some(task) = self.selected_workflow_task() else {
+        let Some(task) = self.selected_workflow_task().cloned() else {
             return false;
         };
+        self.open_background_approval_dialog(&task)
+    }
+
+    /// Opens the approval a background task is waiting on, the first one when
+    /// several are: the tasks dock counts these without listing them as rows.
+    pub(crate) fn open_pending_background_approval_dialog(&mut self) -> bool {
+        let Some(task) = self
+            .workflow_tasks()
+            .iter()
+            .find(|task| is_pending_background_approval(task))
+            .cloned()
+        else {
+            return false;
+        };
+        self.workflow_panel.select_task_id(&task.id);
+        self.open_background_approval_dialog(&task)
+    }
+
+    fn open_background_approval_dialog(&mut self, task: &BackgroundTaskSummary) -> bool {
         if task.status != orca_core::task_types::TaskStatus::ApprovalRequired {
             return false;
         }
@@ -688,6 +707,14 @@ fn is_backgrounded_running_main_session(task: &BackgroundTaskSummary) -> bool {
     task.task_type == orca_core::task_types::TaskType::MainSession
         && task.status == orca_core::task_types::TaskStatus::Running
         && task.is_backgrounded
+}
+
+/// A task other than a subagent that waits on a tool approval; the tasks dock
+/// counts these on its approval row, and Enter or a click there opens one.
+pub(crate) fn is_pending_background_approval(task: &BackgroundTaskSummary) -> bool {
+    task.task_type != orca_core::task_types::TaskType::Subagent
+        && task.status == orca_core::task_types::TaskStatus::ApprovalRequired
+        && task.pending_tool_call.is_some()
 }
 
 fn is_backgrounded_approval_main_session(task: &BackgroundTaskSummary) -> bool {
