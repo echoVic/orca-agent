@@ -1258,6 +1258,39 @@ fn proposed_plan_tags_stream_as_dedicated_tui_message() {
 }
 
 #[test]
+fn a_plan_streamed_apart_from_the_message_opens_the_plan_approval() {
+    // The runtime splits a proposed plan out of the reply onto its own
+    // channel, so the message deltas never carry the plan's tags.
+    let mut state = state();
+    state.approval_mode = ApprovalMode::Plan;
+
+    state.update(TuiEvent::MessageDelta("Preface\n".to_string()));
+    state.update(TuiEvent::ProposedPlanDelta("# Plan\n- ins".to_string()));
+    state.update(TuiEvent::ProposedPlanDelta("pect\n".to_string()));
+    state.update(TuiEvent::MessageDelta("Postscript".to_string()));
+    state.update(TuiEvent::SessionCompleted {
+        status: "success".to_string(),
+    });
+
+    assert!(
+        state
+            .transcript
+            .messages
+            .iter()
+            .any(|message| matches!(message, ChatMessage::ProposedPlan(text) if text == "# Plan\n- inspect\n")),
+        "{:?}",
+        state.transcript.messages
+    );
+    assert_eq!(
+        state
+            .plan_approval_dialog
+            .as_ref()
+            .map(|dialog| dialog.plan.as_str()),
+        Some("# Plan\n- inspect\n")
+    );
+}
+
+#[test]
 fn failed_plan_update_marks_panel_stale_until_next_success() {
     let mut state = state();
 

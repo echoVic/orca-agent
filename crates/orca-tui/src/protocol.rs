@@ -273,6 +273,10 @@ pub enum TuiEvent {
     },
     ReasoningDelta(String),
     MessageDelta(String),
+    /// Text of the plan the model proposes, which the runtime streams apart
+    /// from its message; in Plan mode, a completed turn's plan opens the
+    /// plan approval.
+    ProposedPlanDelta(String),
     AssistantAttemptDiscarded,
     AssistantResponseCompleted(Option<String>, Option<String>),
     ToolRequested {

@@ -291,6 +291,12 @@ impl AppState {
                 }
                 self.handle_message_delta(&text);
             }
+            TuiEvent::ProposedPlanDelta(text) => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
+                self.push_proposed_plan_segment(ProposedPlanSegment::Plan(text));
+            }
             TuiEvent::AssistantAttemptDiscarded => {
                 if self.suppress_background_main_session_output {
                     return;

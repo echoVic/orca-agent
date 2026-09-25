@@ -884,7 +884,9 @@ impl TuiSurfaceProjection {
                     AssistantChannel::Reasoning => {
                         TuiEvent::ReasoningDelta(stream.text.as_str().to_string())
                     }
-                    AssistantChannel::Plan => TuiEvent::Notice(stream.text.as_str().to_string()),
+                    AssistantChannel::Plan => {
+                        TuiEvent::ProposedPlanDelta(stream.text.as_str().to_string())
+                    }
                 })
                 .collect::<Vec<_>>(),
         );
@@ -943,7 +945,7 @@ impl TuiSurfaceProjection {
                 Some(Ok(match stream.channel {
                     AssistantChannel::Message => TuiEvent::MessageDelta(suffix.to_string()),
                     AssistantChannel::Reasoning => TuiEvent::ReasoningDelta(suffix.to_string()),
-                    AssistantChannel::Plan => TuiEvent::Notice(suffix.to_string()),
+                    AssistantChannel::Plan => TuiEvent::ProposedPlanDelta(suffix.to_string()),
                 }))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -987,7 +989,7 @@ impl TuiSurfaceProjection {
                 && !streamed_item_ids.iter().any(|streamed| *streamed == id)
                 && !text.as_str().is_empty() =>
             {
-                Some(TuiEvent::Notice(text.as_str().to_string()))
+                Some(TuiEvent::ProposedPlanDelta(text.as_str().to_string()))
             }
             _ => None,
         }));
@@ -1037,7 +1039,7 @@ impl TuiSurfaceProjection {
                     if discarded_item_ids.iter().any(|discarded| *discarded == id)
                         && !text.as_str().is_empty() =>
                 {
-                    Some(TuiEvent::Notice(text.as_str().to_string()))
+                    Some(TuiEvent::ProposedPlanDelta(text.as_str().to_string()))
                 }
                 _ => None,
             }));
@@ -1125,7 +1127,9 @@ impl TuiSurfaceProjection {
                         AssistantChannel::Reasoning => {
                             projected.push(TuiEvent::ReasoningDelta(text.as_str().to_string()));
                         }
-                        AssistantChannel::Plan => {}
+                        AssistantChannel::Plan => {
+                            projected.push(TuiEvent::ProposedPlanDelta(text.as_str().to_string()));
+                        }
                     }
                 }
                 SurfaceEvent::Assistant(AssistantPatch::StreamDiscarded { stream_id, .. }) => {
@@ -1150,6 +1154,16 @@ impl TuiSurfaceProjection {
                     }
                     if discarded_attempt || !response_matches_streams {
                         projected.push(response_completed_event(response));
+                        // The completed response replaces the streamed one,
+                        // plan included.
+                        if let Some(plan) = response
+                            .plan_item
+                            .as_ref()
+                            .filter(|plan| !plan.text.as_str().is_empty())
+                        {
+                            projected
+                                .push(TuiEvent::ProposedPlanDelta(plan.text.as_str().to_string()));
+                        }
                     }
                 }
                 SurfaceEvent::Tool(ToolPatch::Requested { request }) => {
@@ -2952,6 +2966,69 @@ mod tests {
     }
 
     #[test]
+    fn a_completed_response_that_replaces_the_streamed_one_keeps_its_plan() {
+        let before = cursor(0, 1);
+        let fence = operation_fence(52);
+        let turn_id = SurfaceTurnId::new();
+        // Nothing was streamed for this response, so the completed one is
+        // projected in full.
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: ThreadOwnerEpoch::new(1),
+            durable_revision: DurableRevision::try_new(2).unwrap(),
+            commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(53)).unwrap(),
+        };
+        let event = SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: SurfaceEventId::try_from_bytes(uuid_v7_bytes(54)).unwrap(),
+            commit_class: commit_class.clone(),
+            scope: SurfaceScope::Generation { fence },
+            event: SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted {
+                response: SurfaceCompletedModelResponse {
+                    response_id: UuidV7::try_from_bytes(uuid_v7_bytes(55)).unwrap(),
+                    turn_id: turn_id.clone(),
+                    message_item: Some(SurfaceAssistantMessageItem {
+                        id: SurfaceItemId::new(),
+                        turn_id: turn_id.clone(),
+                        text: DisplayText::new("Preface"),
+                        pinned: false,
+                    }),
+                    reasoning_item: None,
+                    plan_item: Some(orca_runtime::surface::SurfaceAssistantPlanItem {
+                        id: SurfaceItemId::new(),
+                        turn_id,
+                        text: DisplayText::new("# Plan\n- inspect\n"),
+                        pinned: false,
+                    }),
+                    tool_calls: Vec::new(),
+                },
+            }),
+        };
+        let batch = SurfaceCommitBatch {
+            cursor_before: before.clone(),
+            cursor_after: SurfaceCursor {
+                next_seq: SequenceNumber::new(1),
+                source_revision: CursorSourceRevision::Recorded {
+                    durable_revision: DurableRevision::try_new(2).unwrap(),
+                },
+                ..before.clone()
+            },
+            commit_class,
+            event_count: 1,
+            batch_digest: Sha256Digest::new([0; 32]),
+            events: NonEmptyVec::try_new(vec![event]).unwrap(),
+        };
+        let mut projection = TuiSurfaceProjection::from_snapshot(before, &[]);
+
+        assert!(matches!(
+            projection.reduce_typed_batch(&batch).unwrap().as_slice(),
+            [
+                TuiEvent::AssistantResponseCompleted(Some(message), None),
+                TuiEvent::ProposedPlanDelta(plan),
+            ] if message == "Preface" && plan == "# Plan\n- inspect\n"
+        ));
+    }
+
+    #[test]
     fn completed_response_ignores_streams_from_earlier_responses_of_same_turn() {
         let fence = operation_fence(22);
         let turn_id = SurfaceTurnId::new();
@@ -3435,6 +3512,79 @@ mod tests {
             projection.hydrate_open_streams().as_slice(),
             [TuiEvent::ReasoningDelta(reasoning), TuiEvent::MessageDelta(message)]
                 if reasoning == "reason" && message == "answer"
+        ));
+    }
+
+    #[test]
+    fn an_open_plan_stream_hydrates_as_the_proposed_plan() {
+        let plan = SurfaceAssistantStream {
+            stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(41)).expect("plan stream id"),
+            fence: operation_fence(10),
+            turn_id: SurfaceTurnId::new(),
+            item_id: SurfaceItemId::new(),
+            channel: AssistantChannel::Plan,
+            next_offset: ByteOffset::new(17),
+            text: DisplayText::new("# Plan\n- inspect\n"),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let mut projection = TuiSurfaceProjection::from_snapshot(cursor(0, 1), &[plan]);
+
+        assert!(matches!(
+            projection.hydrate_open_streams().as_slice(),
+            [TuiEvent::ProposedPlanDelta(plan)] if plan == "# Plan\n- inspect\n"
+        ));
+    }
+
+    #[test]
+    fn a_live_plan_delta_projects_as_the_proposed_plan() {
+        let before = cursor(0, 1);
+        let stream_id = SurfaceStreamId::try_from_bytes(uuid_v7_bytes(42)).unwrap();
+        let plan = SurfaceAssistantStream {
+            stream_id: stream_id.clone(),
+            fence: operation_fence(10),
+            turn_id: SurfaceTurnId::new(),
+            item_id: SurfaceItemId::new(),
+            channel: AssistantChannel::Plan,
+            next_offset: ByteOffset::new(0),
+            text: DisplayText::new(""),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: orca_runtime::surface::ThreadOwnerEpoch::new(1),
+            durable_revision: DurableRevision::try_new(2).unwrap(),
+            commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(43)).unwrap(),
+        };
+        let after = SurfaceCursor {
+            next_seq: SequenceNumber::new(1),
+            source_revision: CursorSourceRevision::Recorded {
+                durable_revision: DurableRevision::try_new(2).unwrap(),
+            },
+            ..before.clone()
+        };
+        let batch = SurfaceCommitBatch {
+            cursor_before: before.clone(),
+            cursor_after: after,
+            commit_class: commit_class.clone(),
+            event_count: 1,
+            batch_digest: Sha256Digest::new([0; 32]),
+            events: NonEmptyVec::try_new(vec![SurfaceEventEnvelope {
+                ordinal: 0,
+                event_id: SurfaceEventId::try_from_bytes(uuid_v7_bytes(44)).unwrap(),
+                commit_class,
+                scope: SurfaceScope::Thread,
+                event: SurfaceEvent::Assistant(AssistantPatch::Delta {
+                    stream_id,
+                    offset: ByteOffset::new(0),
+                    text: DisplayText::new("# Plan\n"),
+                }),
+            }])
+            .unwrap(),
+        };
+        let mut projection = TuiSurfaceProjection::from_snapshot(before, &[plan]);
+
+        assert!(matches!(
+            projection.reduce_typed_batch(&batch).as_deref(),
+            Ok([TuiEvent::ProposedPlanDelta(plan)]) if plan == "# Plan\n"
         ));
     }
 
