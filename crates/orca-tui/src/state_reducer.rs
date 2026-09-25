@@ -581,6 +581,7 @@ impl AppState {
                     selected: 0,
                     options,
                     diff: preview,
+                    diff_scroll: 0,
                 });
             }
             TuiEvent::PermissionApprovalNeeded {
@@ -607,6 +608,7 @@ impl AppState {
                     selected: 0,
                     options,
                     diff: preview,
+                    diff_scroll: 0,
                 });
             }
             TuiEvent::UserInputRequested { key, questionnaire } => {

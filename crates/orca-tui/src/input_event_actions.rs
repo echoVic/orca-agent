@@ -1812,6 +1812,7 @@ mod tests {
                 ApprovalOption::Deny,
             ],
             diff: None,
+            diff_scroll: 0,
         });
         let now = Instant::now();
 

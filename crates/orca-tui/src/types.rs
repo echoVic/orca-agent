@@ -307,6 +307,9 @@ pub struct ApprovalDialog {
     pub selected: usize,
     pub options: Vec<ApprovalOption>,
     pub diff: Option<String>,
+    /// First diff line the preview shows: PgUp/PgDn page through a diff the
+    /// panel can't hold at once.
+    pub diff_scroll: usize,
 }
 
 impl ApprovalDialog {

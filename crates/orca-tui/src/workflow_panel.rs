@@ -464,6 +464,7 @@ impl AppState {
             selected: 0,
             options,
             diff: Some(preview),
+            diff_scroll: 0,
         });
         true
     }

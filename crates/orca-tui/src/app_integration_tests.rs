@@ -2130,6 +2130,7 @@ fn background_approval_resolution_sends_request_scoped_action() {
         selected: 0,
         options: vec![ApprovalOption::Once, ApprovalOption::Deny],
         diff: None,
+        diff_scroll: 0,
     });
     state.set_status(AppStatus::WaitingApproval);
 

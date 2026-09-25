@@ -96,7 +96,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         InputRegion::Approval => state
             .approval_dialog
             .as_ref()
-            .map(|dialog| approval_region_height(frame.area().width, dialog))
+            .map(|dialog| approval_region_height(frame.area(), dialog))
             .unwrap_or(0),
     }
     .min(frame.area().height.saturating_sub(3));
@@ -6037,16 +6037,27 @@ struct ApprovalDialogGeometry {
 /// composer slot so `render()` can size `chunks[6]` before the panel exists.
 /// `approval_dialog_geometry` then lays the actual content out within
 /// whatever height this reserves, truncating further if it must.
-fn approval_region_height(area_width: u16, dialog: &ApprovalDialog) -> u16 {
-    let _ = area_width;
+fn approval_region_height(frame: Rect, dialog: &ApprovalDialog) -> u16 {
     let tool_rows = u16::from(dialog.permission_kind.is_some());
     let target_rows = u16::from(dialog.target.is_some());
     let diff_line_count = dialog.diff.as_ref().map_or(0, |diff| diff.lines().count());
-    let diff_rows = diff_line_count.min(8) as u16;
-    let truncation_row = u16::from(diff_line_count > 8);
+    // A diff takes up to a third of the screen; PgUp/PgDn page through the
+    // rest of it.
+    let diff_cap = usize::from((frame.height / 3).max(8));
+    let diff_rows = diff_line_count.min(diff_cap) as u16;
+    let truncation_row = u16::from(diff_line_count > diff_cap);
     let option_rows = dialog.options.len() as u16;
-    (2 + tool_rows + target_rows + diff_rows + truncation_row + 1 + option_rows + 1 + 1)
-        .clamp(8, 18)
+    (2 + tool_rows + target_rows + diff_rows + truncation_row + 1 + option_rows + 1 + 1).max(8)
+}
+
+/// How many diff lines the approval panel shows at once, as last drawn.
+pub(crate) fn approval_preview_page(state: &AppState) -> usize {
+    match (state.approval_dialog.as_ref(), state.viewport.input_area) {
+        (Some(dialog), Some(area)) => approval_dialog_geometry(area, dialog)
+            .shown_diff_lines
+            .max(1),
+        _ => 1,
+    }
 }
 
 fn approval_dialog_geometry(area: Rect, dialog: &ApprovalDialog) -> ApprovalDialogGeometry {
@@ -6068,12 +6079,10 @@ fn approval_dialog_geometry(area: Rect, dialog: &ApprovalDialog) -> ApprovalDial
         .as_ref()
         .map(|diff| diff.lines().count())
         .unwrap_or(0);
-    let desired_diff_lines = source_diff_lines.min(12);
-    let diff_truncated =
-        source_diff_lines > desired_diff_lines || desired_diff_lines > available_diff_rows;
+    let diff_truncated = source_diff_lines > available_diff_rows;
     let truncation_row = usize::from(diff_truncated && available_diff_rows > 0);
     let shown_diff_lines =
-        desired_diff_lines.min(available_diff_rows.saturating_sub(truncation_row));
+        source_diff_lines.min(available_diff_rows.saturating_sub(truncation_row));
     let popup = area;
     // Border, then the tool/target header lines, then the bounded diff
     // block, then the blank separator before the first option.
@@ -6142,7 +6151,11 @@ fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog,
     if let Some(diff) = &dialog.diff {
         let rail = Span::styled("│ ".to_string(), theme.dim_style());
         let diff = crate::terminal_output::printable_output(diff);
-        for line in diff.lines().take(geometry.shown_diff_lines) {
+        let total = diff.lines().count();
+        let first = dialog
+            .diff_scroll
+            .min(total.saturating_sub(geometry.shown_diff_lines));
+        for line in diff.lines().skip(first).take(geometry.shown_diff_lines) {
             let color = if line.starts_with('+') {
                 theme.diff_add
             } else if line.starts_with('-') {
@@ -6161,10 +6174,16 @@ fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog,
             ]));
         }
         if geometry.truncation_row {
-            content.push(Line::from(Span::styled(
-                "… preview truncated",
-                theme.dim_style(),
-            )));
+            let position = if geometry.shown_diff_lines == 0 {
+                "… preview truncated".to_string()
+            } else {
+                format!(
+                    "… lines {}–{} of {total} · PgUp/PgDn scroll",
+                    first + 1,
+                    first + geometry.shown_diff_lines
+                )
+            };
+            content.push(Line::from(Span::styled(position, theme.dim_style())));
         }
     }
     content.push(Line::from(""));
@@ -8170,6 +8189,7 @@ mod tests {
             selected: 0,
             options: ApprovalDialog::options_for("bash", None),
             diff: None,
+            diff_scroll: 0,
         });
         let (backend, events) = RecordingBackend::new(50, 12);
         let mut terminal = ratatui::Terminal::new(backend).expect("test backend");
@@ -8433,6 +8453,7 @@ mod tests {
                 ApprovalOption::Deny,
             ],
             diff: None,
+            diff_scroll: 0,
         });
         let frame = frame_string(&mut state, 100, 30);
         assert!(frame.contains("╭ Approve · bash"), "{frame}");
@@ -8464,6 +8485,7 @@ mod tests {
             selected: 0,
             options: ApprovalDialog::options_for("web_search", None),
             diff: None,
+            diff_scroll: 0,
         });
         let frame = frame_string(&mut state, 100, 30);
         assert!(
@@ -8493,6 +8515,7 @@ mod tests {
                 ApprovalOption::Deny,
             ],
             diff: None,
+            diff_scroll: 0,
         });
         let frame = frame_string(&mut state, 100, 30);
         assert!(frame.contains("Network Permission Required"), "{frame}");
@@ -8514,6 +8537,7 @@ mod tests {
             selected: 0,
             options: ApprovalDialog::options_for("bash", Some("cargo test -p orca-tui")),
             diff: None,
+            diff_scroll: 0,
         });
         state
     }
@@ -8597,6 +8621,7 @@ mod tests {
             selected: 0,
             options: ApprovalDialog::options_for("bash", Some("cargo test -p orca-tui")),
             diff: Some(diff),
+            diff_scroll: 0,
         });
 
         let geometry = approval_dialog_geometry(area, state.approval_dialog.as_ref().unwrap());
@@ -10605,8 +10630,64 @@ mod tests {
         assert!(rendered.contains("2  Allow this exact call"));
         assert!(rendered.contains("3  Allow bash this session"));
         assert!(rendered.contains("4  Deny"));
-        assert!(rendered.contains("preview truncated"));
+        assert!(rendered.contains("of 20 · PgUp/PgDn scroll"));
         assert!(rendered.contains("↑↓ move · 1/2/3/4 pick"));
+    }
+
+    #[test]
+    fn a_diff_taller_than_the_approval_panel_pages_with_pgup_and_pgdn() {
+        let mut state = test_state();
+        state.update(TuiEvent::ApprovalNeeded {
+            key: interaction_key(TuiInteractionKind::Approval, "approval-diff"),
+            tool: "edit".to_string(),
+            target: Some("src/lib.rs".to_string()),
+            preview: Some(
+                (1..=40)
+                    .map(|index| format!("+added line {index}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        });
+        let (action_tx, _action_rx) = crossbeam_channel::unbounded();
+        let page_down = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageDown,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let page_up = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageUp,
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        let first = frame_string(&mut state, 80, 36);
+        assert!(first.contains("+added line 1 "), "{first}");
+        assert!(
+            first.contains("… lines 1–12 of 40 · PgUp/PgDn scroll"),
+            "{first}"
+        );
+        assert!(!first.contains("+added line 13 "), "{first}");
+
+        crate::approval_dialog_actions::handle_approval_dialog_key(
+            &page_down, &mut state, &action_tx,
+        );
+        let second = frame_string(&mut state, 80, 36);
+        assert!(second.contains("+added line 13 "), "{second}");
+        assert!(second.contains("… lines 13–24 of 40"), "{second}");
+
+        // The last page ends at the diff's end, and paging back returns.
+        for _ in 0..5 {
+            crate::approval_dialog_actions::handle_approval_dialog_key(
+                &page_down, &mut state, &action_tx,
+            );
+        }
+        let last = frame_string(&mut state, 80, 36);
+        assert!(last.contains("… lines 29–40 of 40"), "{last}");
+        for _ in 0..5 {
+            crate::approval_dialog_actions::handle_approval_dialog_key(
+                &page_up, &mut state, &action_tx,
+            );
+        }
+        let back = frame_string(&mut state, 80, 36);
+        assert!(back.contains("… lines 1–12 of 40"), "{back}");
     }
 
     #[test]
@@ -14712,6 +14793,7 @@ mod tests {
             selected: 0,
             options: ApprovalDialog::options_for("bash", None),
             diff: None,
+            diff_scroll: 0,
         });
         terminal
             .draw(|frame| render(frame, &mut state, &textarea, &theme))
@@ -15938,6 +16020,7 @@ mod tests {
             selected: 0,
             options: ApprovalDialog::options_for("bash", Some(target)),
             diff: None,
+            diff_scroll: 0,
         });
         assert_golden("approval", &frame_string(&mut state, 100, 30));
     }

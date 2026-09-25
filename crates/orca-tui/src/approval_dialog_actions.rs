@@ -55,6 +55,22 @@ pub(crate) fn handle_approval_dialog_key(
         Some(ShortcutAction::Approval(ApprovalShortcut::Deny)) => {
             resolve_approval_option(state, action_tx, ApprovalOption::Deny);
         }
+        Some(ShortcutAction::Approval(ApprovalShortcut::PreviewPageUp)) => {
+            let page = crate::ui::approval_preview_page(state);
+            if let Some(dialog) = &mut state.approval_dialog {
+                dialog.diff_scroll = dialog.diff_scroll.saturating_sub(page);
+            }
+        }
+        Some(ShortcutAction::Approval(ApprovalShortcut::PreviewPageDown)) => {
+            let page = crate::ui::approval_preview_page(state);
+            if let Some(dialog) = &mut state.approval_dialog {
+                let last_page = dialog
+                    .diff
+                    .as_deref()
+                    .map_or(0, |diff| diff.lines().count().saturating_sub(page));
+                dialog.diff_scroll = (dialog.diff_scroll + page).min(last_page);
+            }
+        }
         Some(_) | None => {}
     }
 }
@@ -103,6 +119,7 @@ mod tests {
             selected: 0,
             options: ApprovalDialog::options_for("bash", Some("curl https://api.example.invalid")),
             diff: None,
+            diff_scroll: 0,
         });
         let (action_tx, action_rx) = mpsc::unbounded();
         (state, action_tx, action_rx)

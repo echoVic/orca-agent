@@ -877,6 +877,7 @@ fn approval_dialog_resolves_numeric_and_legacy_keys_by_visible_options() {
         selected: 0,
         options: ApprovalDialog::options_for("edit", Some("src/main.rs")),
         diff: None,
+        diff_scroll: 0,
     };
 
     assert_eq!(dialog.option_for_key('1'), Some(ApprovalOption::Once));
@@ -904,6 +905,7 @@ fn approval_dialog_resolves_numeric_and_legacy_keys_by_visible_options() {
         selected: 0,
         options: ApprovalDialog::options_for("web_search", Some("query")),
         diff: None,
+        diff_scroll: 0,
     };
     assert_eq!(dynamic.option_for_key('2'), None);
     assert_eq!(

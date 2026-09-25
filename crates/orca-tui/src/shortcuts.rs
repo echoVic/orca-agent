@@ -142,6 +142,8 @@ pub enum ApprovalShortcut {
     Confirm,
     Approve,
     Deny,
+    PreviewPageUp,
+    PreviewPageDown,
 }
 
 const GLOBAL_BINDINGS: &[(GlobalShortcut, KeyBinding)] = &[
@@ -496,6 +498,14 @@ const APPROVAL_BINDINGS: &[(ApprovalShortcut, KeyBinding)] = &[
     (
         ApprovalShortcut::Deny,
         KeyBinding::new(KeyCode::Esc, KeyModifiers::NONE),
+    ),
+    (
+        ApprovalShortcut::PreviewPageUp,
+        KeyBinding::new(KeyCode::PageUp, KeyModifiers::NONE),
+    ),
+    (
+        ApprovalShortcut::PreviewPageDown,
+        KeyBinding::new(KeyCode::PageDown, KeyModifiers::NONE),
     ),
 ];
 
