@@ -1465,11 +1465,13 @@ fn highlight_match(text: &str, needle: &str, base: Style, theme: &Theme) -> Vec<
     if needle.is_empty() {
         return vec![Span::styled(text.to_string(), base)];
     }
-    let lower = text.to_lowercase();
-    let Some(start) = lower.find(needle) else {
+    let Some(range) = crate::transcript_search::case_insensitive_ranges(text, needle)
+        .into_iter()
+        .next()
+    else {
         return vec![Span::styled(text.to_string(), base)];
     };
-    let end = start + needle.len();
+    let (start, end) = (range.start, range.end);
     let hl = base.fg(theme.warning).add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
     if start > 0 {
@@ -10152,6 +10154,39 @@ mod tests {
         assert_eq!(
             plain_col, highlighted_col,
             "the provider/time column must start at the same place whether or not a query is active"
+        );
+    }
+
+    #[test]
+    fn a_title_whose_lowercase_changes_length_highlights_without_panicking() {
+        let theme = Theme::named(ThemeName::Dark);
+        let base = Style::default();
+        let highlighted = |title: &str, needle: &str| {
+            let spans = highlight_match(title, needle, base, &theme);
+            let whole: String = spans.iter().map(|span| span.content.as_ref()).collect();
+            assert_eq!(whole, title, "the title is drawn whole");
+            spans
+                .iter()
+                .find(|span| span.style != base)
+                .map(|span| span.content.to_string())
+        };
+        // "İ" lowercases to two characters, "ẞ" and the Kelvin sign to
+        // shorter ones: each shifts the byte offsets of what follows.
+        assert_eq!(
+            highlighted("İİİ plan the trip", "trip").as_deref(),
+            Some("trip")
+        );
+        assert_eq!(
+            highlighted("ẞtraße notes", "notes").as_deref(),
+            Some("notes")
+        );
+        assert_eq!(
+            highlighted("100 \u{212a} run", "k run").as_deref(),
+            Some("\u{212a} run")
+        );
+        assert_eq!(
+            highlighted("İstanbul trip", "i̇stanbul").as_deref(),
+            Some("İstanbul")
         );
     }
 

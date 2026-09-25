@@ -38,31 +38,40 @@ impl SearchQuery {
                 .map(|(start, matched)| start..start + matched.len())
                 .collect();
         }
-
-        let mut folded = String::new();
-        let mut boundaries = Vec::with_capacity(text.chars().count() + 1);
-        for (original_offset, character) in text.char_indices() {
-            boundaries.push((folded.len(), original_offset));
-            folded.extend(character.to_lowercase());
-        }
-        boundaries.push((folded.len(), text.len()));
-
-        folded
-            .match_indices(&self.needle)
-            .filter_map(|(start, matched)| {
-                let end = start + matched.len();
-                let original_start = boundaries
-                    .binary_search_by_key(&start, |(folded, _)| *folded)
-                    .ok()
-                    .map(|index| boundaries[index].1)?;
-                let original_end = boundaries
-                    .binary_search_by_key(&end, |(folded, _)| *folded)
-                    .ok()
-                    .map(|index| boundaries[index].1)?;
-                Some(original_start..original_end)
-            })
-            .collect()
+        case_insensitive_ranges(text, &self.needle)
     }
+}
+
+/// Byte ranges in `text` of each case-insensitive match of `needle`, which is
+/// already lowercase. The match is found in the lowercased text and mapped
+/// back to `text`'s own character boundaries: lowercasing can change a
+/// character's length ("İ" grows, "ẞ" shrinks), so the lowercased text's
+/// offsets are not `text`'s. A match that starts or ends inside one
+/// character's lowercase form has no range in `text` and is skipped.
+pub(crate) fn case_insensitive_ranges(text: &str, needle: &str) -> Vec<Range<usize>> {
+    let mut folded = String::new();
+    let mut boundaries = Vec::with_capacity(text.chars().count() + 1);
+    for (original_offset, character) in text.char_indices() {
+        boundaries.push((folded.len(), original_offset));
+        folded.extend(character.to_lowercase());
+    }
+    boundaries.push((folded.len(), text.len()));
+
+    folded
+        .match_indices(needle)
+        .filter_map(|(start, matched)| {
+            let end = start + matched.len();
+            let original_start = boundaries
+                .binary_search_by_key(&start, |(folded, _)| *folded)
+                .ok()
+                .map(|index| boundaries[index].1)?;
+            let original_end = boundaries
+                .binary_search_by_key(&end, |(folded, _)| *folded)
+                .ok()
+                .map(|index| boundaries[index].1)?;
+            Some(original_start..original_end)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
