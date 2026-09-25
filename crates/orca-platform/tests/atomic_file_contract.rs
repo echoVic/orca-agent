@@ -5,7 +5,9 @@ use std::path::Path;
 use orca_platform::fs::ExclusiveFileLock;
 #[cfg(unix)]
 use orca_platform::fs::open_nofollow_nonblocking;
-use orca_platform::fs::{AtomicWritePolicy, atomic_write, atomic_write_with, open_nofollow};
+use orca_platform::fs::{
+    AtomicWritePolicy, atomic_write, atomic_write_private, atomic_write_with, open_nofollow,
+};
 
 #[test]
 fn atomic_replace_never_leaves_a_partial_file_or_temp_artifact() {
@@ -129,6 +131,27 @@ fn replacement_preserves_existing_unix_permissions() {
     atomic_write(&path, b"new", AtomicWritePolicy::NoFollow).expect("replace");
 
     assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_private_write_leaves_the_file_readable_by_its_owner_only() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fresh = temp.path().join("fresh.json");
+    atomic_write_private(&fresh, b"secret", AtomicWritePolicy::NoFollow).expect("write");
+    assert_eq!(std::fs::metadata(&fresh).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::read(&fresh).unwrap(), b"secret");
+
+    // An earlier version anyone could read is replaced by an owner-only one.
+    let shared = temp.path().join("shared.json");
+    std::fs::write(&shared, b"old").expect("old file");
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o644))
+        .expect("set permissions");
+    atomic_write_private(&shared, b"secret", AtomicWritePolicy::NoFollow).expect("replace");
+    assert_eq!(std::fs::metadata(&shared).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::read(&shared).unwrap(), b"secret");
 }
 
 #[test]

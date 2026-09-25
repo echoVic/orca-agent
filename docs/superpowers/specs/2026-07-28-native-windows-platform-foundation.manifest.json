@@ -114,6 +114,13 @@
       "windows-test-portability"
     ],
     [
+      "auth-file-owner-only-mode-fixture",
+      "crates/orca-core/src/config/file.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "task-output-store-symlink-fixture",
       "crates/orca-runtime/tests/task_output_store.rs",
       "unix_std_api",

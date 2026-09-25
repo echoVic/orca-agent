@@ -23,6 +23,32 @@ pub fn atomic_write(
     })
 }
 
+/// Writes a file only its owner can read or write, such as one holding a
+/// credential: whatever mode an earlier version had, the file replacing it
+/// is owner-only, and so is it before any byte is written. Windows keeps the
+/// user profile's access control.
+pub fn atomic_write_private(
+    destination: &Path,
+    contents: &[u8],
+    policy: AtomicWritePolicy,
+) -> Result<(), PlatformError> {
+    atomic_write_with(destination, policy, |temporary| {
+        restrict_to_owner(temporary)?;
+        temporary.write_all(contents)
+    })
+}
+
+#[cfg(unix)]
+fn restrict_to_owner(file: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
 pub fn atomic_write_with<F>(
     destination: &Path,
     policy: AtomicWritePolicy,

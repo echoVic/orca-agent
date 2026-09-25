@@ -554,7 +554,13 @@ fn save_api_key_checked_to_dir(dir: &Path, api_key: &str) -> io::Result<PathBuf>
     map.insert("DEEPSEEK_API_KEY".to_string(), api_key.to_string());
 
     let content = serde_json::to_string_pretty(&map).map_err(io::Error::other)?;
-    fs::write(&path, content)?;
+    // The key must not be readable by other users of the machine.
+    orca_platform::fs::atomic_write_private(
+        &path,
+        content.as_bytes(),
+        orca_platform::fs::AtomicWritePolicy::NoFollow,
+    )
+    .map_err(|error| io::Error::other(format!("writing {}: {error}", path.display())))?;
     Ok(path)
 }
 
@@ -681,6 +687,22 @@ mod tests {
             saved.get("DEEPSEEK_API_KEY").map(String::as_str),
             Some("sk-test")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_saved_api_key_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().mode() & 0o777;
+
+        let path = save_api_key_checked_to_dir(dir.path(), "sk-test").unwrap();
+        assert_eq!(mode(&path), 0o600);
+
+        // A key file an older version left readable by everyone is tightened.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        save_api_key_checked_to_dir(dir.path(), "sk-rotated").unwrap();
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[test]
