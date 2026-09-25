@@ -325,8 +325,8 @@ fn workflow_source_command(name: &str, cwd: Option<PathBuf>) -> i32 {
     let cwd = cwd
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
-    let config_dir = orca_core::config::folder_trust::config_dir()
-        .unwrap_or_else(|| PathBuf::from(".orca"));
+    let config_dir =
+        orca_core::config::folder_trust::config_dir().unwrap_or_else(|| PathBuf::from(".orca"));
     let user_workflow_dir = config_dir.join("workflows");
     let path = match find_saved_workflow(&cwd, name, &user_workflow_dir) {
         Ok(path) => path,
@@ -732,7 +732,9 @@ fn spawn_workflow_worker(
 
     // The worker is long-lived and detached, so its stderr cannot be a pipe the launcher
     // closes: send it to a per-session log the launcher can quote when startup fails.
-    let worker_log = workflow_session_root(cwd).join(&session_id).join("worker.log");
+    let worker_log = workflow_session_root(cwd)
+        .join(&session_id)
+        .join("worker.log");
     let worker_stderr = worker_log
         .parent()
         .map(|parent| std::fs::create_dir_all(parent))

@@ -629,81 +629,77 @@ fn handle_inbound(
             | "orca.dev/session/queue/reorder"
             | "orca.dev/session/queue/pause"
             | "orca.dev/session/queue/start") => {
-                let result = decode_request::<AcpPromptQueueParams>(params)
-                    .and_then(|params| {
-                        let parse_id = |value: Option<String>| {
-                            crate::prompt_queue::QueuedSubmissionId::parse(
-                                value.unwrap_or_default(),
-                            )
+                let result = decode_request::<AcpPromptQueueParams>(params).and_then(|params| {
+                    let parse_id = |value: Option<String>| {
+                        crate::prompt_queue::QueuedSubmissionId::parse(value.unwrap_or_default())
                             .map_err(|message| {
                                 agent_client_protocol::Error::invalid_params().data(message)
                             })
-                        };
-                        let action = match method {
-                            "orca.dev/session/queue/list" => {
-                                crate::prompt_queue::PromptQueueAction::List
+                    };
+                    let action = match method {
+                        "orca.dev/session/queue/list" => {
+                            crate::prompt_queue::PromptQueueAction::List
+                        }
+                        "orca.dev/session/queue/add" => {
+                            crate::prompt_queue::PromptQueueAction::Add {
+                                input: params.input.into(),
                             }
-                            "orca.dev/session/queue/add" => {
-                                crate::prompt_queue::PromptQueueAction::Add {
-                                    input: params.input.into(),
-                                }
+                        }
+                        "orca.dev/session/queue/update" => {
+                            crate::prompt_queue::PromptQueueAction::Update {
+                                expected_revision: required_queue_revision(
+                                    params.expected_revision,
+                                )?,
+                                id: parse_id(params.queue_id)?,
+                                input: params.input.into(),
                             }
-                            "orca.dev/session/queue/update" => {
-                                crate::prompt_queue::PromptQueueAction::Update {
-                                    expected_revision: required_queue_revision(
-                                        params.expected_revision,
-                                    )?,
-                                    id: parse_id(params.queue_id)?,
-                                    input: params.input.into(),
-                                }
+                        }
+                        "orca.dev/session/queue/delete" => {
+                            crate::prompt_queue::PromptQueueAction::Delete {
+                                expected_revision: required_queue_revision(
+                                    params.expected_revision,
+                                )?,
+                                id: parse_id(params.queue_id)?,
                             }
-                            "orca.dev/session/queue/delete" => {
-                                crate::prompt_queue::PromptQueueAction::Delete {
-                                    expected_revision: required_queue_revision(
-                                        params.expected_revision,
-                                    )?,
-                                    id: parse_id(params.queue_id)?,
-                                }
+                        }
+                        "orca.dev/session/queue/reorder" => {
+                            crate::prompt_queue::PromptQueueAction::Reorder {
+                                expected_revision: required_queue_revision(
+                                    params.expected_revision,
+                                )?,
+                                ordered_ids: params
+                                    .ordered_ids
+                                    .into_iter()
+                                    .map(crate::prompt_queue::QueuedSubmissionId::parse)
+                                    .collect::<Result<Vec<_>, _>>()
+                                    .map_err(|message| {
+                                        agent_client_protocol::Error::invalid_params().data(message)
+                                    })?,
                             }
-                            "orca.dev/session/queue/reorder" => {
-                                crate::prompt_queue::PromptQueueAction::Reorder {
-                                    expected_revision: required_queue_revision(
-                                        params.expected_revision,
-                                    )?,
-                                    ordered_ids: params
-                                        .ordered_ids
-                                        .into_iter()
-                                        .map(crate::prompt_queue::QueuedSubmissionId::parse)
-                                        .collect::<Result<Vec<_>, _>>()
-                                        .map_err(|message| {
-                                            agent_client_protocol::Error::invalid_params()
-                                                .data(message)
-                                        })?,
-                                }
+                        }
+                        "orca.dev/session/queue/pause" => {
+                            crate::prompt_queue::PromptQueueAction::Pause {
+                                expected_revision: required_queue_revision(
+                                    params.expected_revision,
+                                )?,
                             }
-                            "orca.dev/session/queue/pause" => {
-                                crate::prompt_queue::PromptQueueAction::Pause {
-                                    expected_revision: required_queue_revision(
-                                        params.expected_revision,
-                                    )?,
-                                }
+                        }
+                        "orca.dev/session/queue/start" => {
+                            crate::prompt_queue::PromptQueueAction::Start {
+                                expected_revision: required_queue_revision(
+                                    params.expected_revision,
+                                )?,
                             }
-                            "orca.dev/session/queue/start" => {
-                                crate::prompt_queue::PromptQueueAction::Start {
-                                    expected_revision: required_queue_revision(
-                                        params.expected_revision,
-                                    )?,
-                                }
-                            }
-                            _ => unreachable!(),
-                        };
-                        agent
-                            .prompt_queue(&params.session_id, action)
-                            .and_then(|snapshot| {
-                                serde_json::to_value(snapshot)
-                                    .map_err(agent_client_protocol::Error::into_internal_error)
-                            })
-                    });
+                        }
+                        _ => unreachable!(),
+                    };
+                    agent
+                        .prompt_queue(&params.session_id, action)
+                        .and_then(|snapshot| {
+                            serde_json::to_value(snapshot)
+                                .map_err(agent_client_protocol::Error::into_internal_error)
+                        })
+                });
                 Ok(response_completion(facade, request_id, result))
             }
             _ => {
@@ -718,9 +714,7 @@ fn handle_inbound(
 /// Decode a request's `params`, reporting a client mistake as `-32602 Invalid params`
 /// (with the field-level cause) instead of `-32603 Internal error`. Four methods used the
 /// internal-error mapping, so a malformed request looked like an agent fault.
-fn decode_request<T: DeserializeOwned>(
-    params: Value,
-) -> Result<T, agent_client_protocol::Error> {
+fn decode_request<T: DeserializeOwned>(params: Value) -> Result<T, agent_client_protocol::Error> {
     decode::<T>(params)
         .map_err(|error| agent_client_protocol::Error::invalid_params().data(error.to_string()))
 }
@@ -732,7 +726,7 @@ mod decode_request_tests {
 
     #[test]
     fn malformed_params_report_invalid_params_not_internal_error() {
-        for params in [serde_json::json!("not-an-object"), serde_json::json!([]) ] {
+        for params in [serde_json::json!("not-an-object"), serde_json::json!([])] {
             let error = decode_request::<InitializeRequest>(params)
                 .expect_err("malformed params must be refused");
             assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);

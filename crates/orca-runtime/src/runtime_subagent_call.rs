@@ -2753,17 +2753,14 @@ fn settle_registry_task(
     // from the registry) leaves a window on slow filesystems where the parent
     // observes `Completed` before the receipt flush is visible.
     let receipt = output.child_budget_usage.or_else(|| {
-        (output.result.terminal().started
-            == orca_core::tool_types::ToolInvocationStarted::No)
+        (output.result.terminal().started == orca_core::tool_types::ToolInvocationStarted::No)
             .then_some(orca_core::budget::BudgetUsage::default())
     });
-    if let Some(reservation) = durable_reservation
-        .or_else(|| {
-            task_registry
-                .get(registry_task_id)
-                .and_then(|task| task.budget_reservation)
-        })
-        && let Some(usage) = receipt
+    if let Some(reservation) = durable_reservation.or_else(|| {
+        task_registry
+            .get(registry_task_id)
+            .and_then(|task| task.budget_reservation)
+    }) && let Some(usage) = receipt
         && let Err(error) = reservation.settle(usage)
     {
         let message = format!("child budget settlement failed: {error}");

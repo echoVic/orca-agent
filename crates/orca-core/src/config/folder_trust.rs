@@ -295,7 +295,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let project = home.path().join("not-created-yet/deeper");
         set_trust_with_config_dir(&project, home.path(), TrustLevel::Trusted).unwrap();
-        assert!(is_trusted_with_config_dir(&project, home.path()), "before mkdir");
+        assert!(
+            is_trusted_with_config_dir(&project, home.path()),
+            "before mkdir"
+        );
 
         fs::create_dir_all(&project).unwrap();
         assert!(
@@ -315,9 +318,12 @@ mod tests {
         // The shape an older version wrote for a path that did not exist yet.
         let legacy_key = absolutize(&project).to_string_lossy().into_owned();
         let mut store = TrustFile::default();
-        store
-            .folders
-            .insert(legacy_key, TrustEntry { level: TrustLevel::Trusted });
+        store.folders.insert(
+            legacy_key,
+            TrustEntry {
+                level: TrustLevel::Trusted,
+            },
+        );
         save_path(&trust_file_path_in(home.path()), &store).unwrap();
 
         fs::create_dir_all(&project).unwrap();

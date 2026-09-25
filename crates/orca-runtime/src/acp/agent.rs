@@ -31,9 +31,9 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::surface::{
     AcpRequestId, AssistantPatch, AttachResult, CanonicalMime, CanonicalPath, CanonicalUri,
-    DisplayText, FreshAttachRequest, MutationReply, NonEmptyText, NonEmptyVec, NotAdmittedReason,
-    OperationBudget, OperationIngressCorrelation, OperationKind, OperationRequestIntent,
-    FailureClass, OperationSettingsPreparation, OperationTerminal, ReplayabilityRequest,
+    DisplayText, FailureClass, FreshAttachRequest, MutationReply, NonEmptyText, NonEmptyVec,
+    NotAdmittedReason, OperationBudget, OperationIngressCorrelation, OperationKind,
+    OperationRequestIntent, OperationSettingsPreparation, OperationTerminal, ReplayabilityRequest,
     RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle, SequenceNumber,
     Sha256Digest, SurfaceAllowDeny, SurfaceAttachmentId, SurfaceAttachmentRole, SurfaceCapability,
     SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceImageDetail,

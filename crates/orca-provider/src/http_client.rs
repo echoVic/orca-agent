@@ -249,7 +249,9 @@ mod tests {
     fn gateway_5xx_codes_outside_the_old_allow_list_are_retryable() {
         // The retired allow-list was [429, 500, 502, 503, 504]; Cloudflare's 520-526 and
         // other gateway codes aborted the session instead of retrying (issue #68).
-        for status in [429, 500, 501, 502, 503, 504, 507, 520, 521, 522, 523, 524, 525, 526, 598] {
+        for status in [
+            429, 500, 501, 502, 503, 504, 507, 520, 521, 522, 523, 524, 525, 526, 598,
+        ] {
             assert!(is_retryable_status(status), "{status} must be retryable");
         }
         for status in [400, 401, 403, 404, 409, 413, 422, 499] {

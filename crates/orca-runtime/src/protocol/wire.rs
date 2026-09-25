@@ -1579,7 +1579,12 @@ mod tests {
 
     #[test]
     fn decode_reports_a_null_id_only_when_the_line_has_none() {
-        for line in ["{oops", "null", "[]", r#"{"method":"thread/start","params":{}}"#] {
+        for line in [
+            "{oops",
+            "null",
+            "[]",
+            r#"{"method":"thread/start","params":{}}"#,
+        ] {
             let error = Submission::decode(line).expect_err("unparsable line must be refused");
             assert_eq!(error.id, Value::Null, "unexpected id for {line}");
         }
