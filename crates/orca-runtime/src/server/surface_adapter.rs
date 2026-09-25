@@ -1823,6 +1823,14 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                         item_id: serde_json::Value::from(stream.item_id.to_string()),
                         delta: serde_json::Value::from(text.as_str().to_string()),
                     })?;
+                    // Remembered so the completed plan sends only the rest.
+                    if let Some(streamed) = projector.streams.get_mut(&serialized_id(stream_id)) {
+                        streamed.text = DisplayText::new(format!(
+                            "{}{}",
+                            streamed.text.as_str(),
+                            text.as_str()
+                        ));
+                    }
                 }
             }
         }
@@ -1915,10 +1923,22 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                     item_id.clone(),
                     serde_json::json!({ "type": "plan", "id": item_id, "text": "" }),
                 )?;
-                if !plan.text.as_str().is_empty() {
+                let streamed = projector
+                    .streams
+                    .values()
+                    .find(|stream| {
+                        stream.item_id == plan.id && stream.channel == AssistantChannel::Plan
+                    })
+                    .map_or("", |stream| stream.text.as_str());
+                let remaining = plan
+                    .text
+                    .as_str()
+                    .strip_prefix(streamed)
+                    .unwrap_or(plan.text.as_str());
+                if !remaining.is_empty() {
                     writer.write_server_event(ServerEvent::ItemPlanDelta {
                         item_id: serde_json::Value::from(plan.id.to_string()),
-                        delta: serde_json::Value::from(plan.text.as_str().to_string()),
+                        delta: serde_json::Value::from(remaining.to_string()),
                     })?;
                 }
                 writer.write_server_event(ServerEvent::ItemCompleted {

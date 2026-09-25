@@ -52,9 +52,13 @@ impl ProposedPlanStreamParser {
                     if !text.is_empty() {
                         out.push(ProposedPlanSegment::Agent(text));
                     }
-                } else if !self.buffer.is_empty() {
-                    self.plan_buffer.push_str(&self.buffer);
-                    self.buffer.clear();
+                } else {
+                    // The close tag may still be arriving: keep what could
+                    // start it for the next delta.
+                    let keep = pending_tag_prefix_len(&self.buffer, PROPOSED_PLAN_CLOSE);
+                    let take = self.buffer.len() - keep;
+                    self.plan_buffer.push_str(&self.buffer[..take]);
+                    self.buffer.drain(..take);
                 }
                 break;
             }
@@ -71,7 +75,7 @@ impl ProposedPlanStreamParser {
             let keep = if finish {
                 0
             } else {
-                pending_open_tag_prefix_len(&self.buffer)
+                pending_tag_prefix_len(&self.buffer, PROPOSED_PLAN_OPEN)
             };
             if self.buffer.len() > keep {
                 let take = self.buffer.len() - keep;
@@ -96,13 +100,14 @@ impl ProposedPlanStreamParser {
     }
 }
 
-fn pending_open_tag_prefix_len(text: &str) -> usize {
+/// Length of the longest end of `text` that `tag` starts with.
+fn pending_tag_prefix_len(text: &str, tag: &str) -> usize {
     for (index, _) in text.char_indices().rev() {
         let suffix = &text[index..];
-        if suffix.len() >= PROPOSED_PLAN_OPEN.len() {
+        if suffix.len() >= tag.len() {
             break;
         }
-        if PROPOSED_PLAN_OPEN.starts_with(suffix) {
+        if tag.starts_with(suffix) {
             return suffix.len();
         }
     }

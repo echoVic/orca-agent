@@ -6336,6 +6336,55 @@ enabled = true
     }
 
     #[test]
+    fn a_submitted_turn_streams_its_proposed_plan_once() {
+        let output = SharedVecWriter::default();
+        let input = EofAfterEventReader::new(
+            r#"{"id":9,"op":"submit","prompt":"mock_proposed_plan"}"#,
+            "turn_completed",
+            output.clone(),
+        );
+        run_with_io(
+            ServerConfig {
+                run_config: test_run_config(),
+            },
+            input,
+            output.clone(),
+        )
+        .expect("server clean EOF completion");
+
+        let events = parse_jsonl(&output.bytes());
+        let deltas = |kind: &str| {
+            events
+                .iter()
+                .filter(|event| event["event"] == kind)
+                .filter_map(|event| event["delta"].as_str())
+                .collect::<String>()
+        };
+        let completed = |kind: &str| {
+            events
+                .iter()
+                .find(|event| event["event"] == "item_completed" && event["item"]["type"] == kind)
+                .and_then(|event| event["item"]["text"].as_str())
+                .map(str::to_string)
+        };
+        // Each item's deltas add up to its completed text: the plan streamed
+        // while the reply did is not sent again when the reply completes.
+        assert_eq!(
+            deltas("item_plan_delta"),
+            "# Final plan\n- first\n- second\n"
+        );
+        assert_eq!(
+            completed("plan").as_deref(),
+            Some("# Final plan\n- first\n- second\n")
+        );
+        assert_eq!(deltas("item_message_delta"), "Preface\n\nPostscript");
+        assert_eq!(
+            completed("agent_message").as_deref(),
+            Some("Preface\n\nPostscript")
+        );
+    }
+
+    #[test]
     fn stateless_submit_clean_eof_waits_for_terminal_and_joins_the_actor() {
         let output = SharedVecWriter::default();
         let input = EofAfterEventReader::new(

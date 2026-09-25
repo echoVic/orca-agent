@@ -76,6 +76,53 @@ mod proposed_plan_tests {
         );
     }
 
+    fn joined(segments: &[ProposedPlanSegment]) -> (String, String) {
+        let mut agent = String::new();
+        let mut plan = String::new();
+        for segment in segments {
+            match segment {
+                ProposedPlanSegment::Agent(text) => agent.push_str(text),
+                ProposedPlanSegment::Plan(text) => plan.push_str(text),
+            }
+        }
+        (agent, plan)
+    }
+
+    #[test]
+    fn proposed_plan_parser_finds_a_close_tag_split_across_deltas() {
+        let text = "Intro\n<proposed_plan>\n# Plan\n- inspect\n</proposed_plan>\nOutro";
+        let mut whole = ProposedPlanStreamParser::default();
+        let mut expected = whole.push(text);
+        expected.extend(whole.finish());
+        assert_eq!(
+            joined(&expected),
+            (
+                "Intro\n\nOutro".to_string(),
+                "# Plan\n- inspect\n".to_string()
+            )
+        );
+
+        // A provider streams tokens: a tag can end any delta.
+        for split in 1..text.len() {
+            let mut parser = ProposedPlanStreamParser::default();
+            let mut segments = parser.push(&text[..split]);
+            segments.extend(parser.push(&text[split..]));
+            segments.extend(parser.finish());
+            assert_eq!(joined(&segments), joined(&expected), "split at {split}");
+        }
+        let mut parser = ProposedPlanStreamParser::default();
+        let mut segments = Vec::new();
+        for character in text.chars() {
+            segments.extend(parser.push(&character.to_string()));
+        }
+        segments.extend(parser.finish());
+        assert_eq!(
+            joined(&segments),
+            joined(&expected),
+            "one character at a time"
+        );
+    }
+
     #[test]
     fn proposed_plan_parser_handles_non_ascii_agent_text_without_panicking() {
         let mut parser = ProposedPlanStreamParser::default();

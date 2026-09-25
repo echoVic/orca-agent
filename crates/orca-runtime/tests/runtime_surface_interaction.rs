@@ -114,6 +114,8 @@ struct ReadonlyBatchCompletionExecutor;
 
 struct AssistantStreamingExecutor;
 
+struct ProposedPlanStreamingExecutor;
+
 struct RecoveredAssistantStreamingExecutor;
 
 struct AbandonedAssistantStreamExecutor;
@@ -436,6 +438,49 @@ impl ThreadOperationExecutor for AssistantStreamingExecutor {
                 steps: Vec::new(),
                 assistant_content: Some("hello".to_string()),
                 assistant_reasoning: Some("think".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            },
+            identity,
+        ))?;
+        thread.lifecycle_mut().finish_task(RunStatus::Success);
+        Ok(RunStatus::Success.into())
+    }
+}
+
+impl ThreadOperationExecutor for ProposedPlanStreamingExecutor {
+    fn run_turn(
+        &self,
+        thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let identity = ModelResponseIdentity::new(request.turn_id().clone());
+        let turn_request = request.thread_turn_request(generation);
+        let ingress = turn_request
+            .provider_response_ingress()
+            .expect("typed generation installs semantic ingress");
+        // As a provider streams tokens: both tags arrive split across deltas.
+        for delta in [
+            "Preface\n<propo",
+            "sed_plan>\n# Plan\n- inspect\n</proposed",
+            "_plan>\nPost",
+            "script",
+        ] {
+            ingress
+                .commit_provider_step(&identity, &ProviderStep::MessageDelta(delta.to_string()))?;
+        }
+        ingress.commit_response(&mut RuntimeModelResponse::from_parts(
+            ProviderResponse {
+                steps: Vec::new(),
+                assistant_content: Some(
+                    "Preface\n<proposed_plan>\n# Plan\n- inspect\n</proposed_plan>\nPostscript"
+                        .to_string(),
+                ),
+                assistant_reasoning: None,
                 tool_calls: Vec::new(),
                 usage: None,
             },
@@ -1037,6 +1082,78 @@ fn assistant_streams_are_durable_and_complete_into_exact_items() {
         item,
         SurfaceItem::AssistantReasoning { summary, content, .. }
             if summary.as_str().is_empty() && content.as_str() == "think"
+    )));
+    host.shutdown().unwrap();
+}
+
+#[test]
+fn a_proposed_plan_streams_on_its_own_channel_and_completes_with_the_message() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start_with_executor(Arc::new(ProposedPlanStreamingExecutor))
+        .expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "stream a proposed plan",
+        )
+        .expect("start recorded runtime thread");
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(&attachment.baseline.snapshot, "propose a plan"),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), operation_id)
+            .unwrap(),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+
+    // The reply streams as the message and the plan the response completes
+    // into, so a client keeps the plan where it streamed instead of seeing
+    // the raw reply discarded and rebuilt at completion.
+    let snapshot = fresh_snapshot(&surface);
+    let streams = snapshot
+        .assistant_streams
+        .iter()
+        .map(|stream| (stream.channel, stream.text.as_str(), stream.state))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        streams,
+        [
+            (
+                AssistantChannel::Message,
+                "Preface\n\nPostscript",
+                SurfaceAssistantStreamState::Completed
+            ),
+            (
+                AssistantChannel::Plan,
+                "# Plan\n- inspect\n",
+                SurfaceAssistantStreamState::Completed
+            ),
+        ]
+    );
+    assert!(snapshot.items.iter().any(|item| matches!(
+        item,
+        SurfaceItem::AssistantMessage { text, .. } if text.as_str() == "Preface\n\nPostscript"
+    )));
+    assert!(snapshot.items.iter().any(|item| matches!(
+        item,
+        SurfaceItem::AssistantPlan { text, .. } if text.as_str() == "# Plan\n- inspect\n"
     )));
     host.shutdown().unwrap();
 }
