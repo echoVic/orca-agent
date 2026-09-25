@@ -434,6 +434,8 @@ pub struct AppState {
     pub approval_mode: ApprovalMode,
     pub pre_plan_approval_mode: Option<ApprovalMode>,
     pub cwd: String,
+    /// The workspace's absolute path; `cwd` is how the status bar shows it.
+    pub(crate) workspace_path: String,
     pub(crate) surface_session: SurfaceSessionProjectionState,
     pub(crate) side_conversation: Option<SideConversationUiState>,
     pub(crate) side_conversation_visible: bool,
@@ -781,6 +783,7 @@ impl AppState {
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             approval_mode: ApprovalMode::default(),
             pre_plan_approval_mode: None,
+            workspace_path: cwd.clone(),
             cwd,
             surface_session: SurfaceSessionProjectionState::default(),
             side_conversation: None,

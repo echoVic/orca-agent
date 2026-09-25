@@ -211,17 +211,13 @@ fn run_tui_inner(
         workspace_status.cwd,
     );
     state.workspace_git = workspace_status.git;
+    state.workspace_path = workspace_root.display().to_string();
     state.approval_mode = config.approval_mode;
     state.reasoning_effort = config.reasoning_effort;
     state.first_run = first_run;
     state.first_run_error = first_run_error;
-    if let Some(page) = picker_page
-        && !page.sessions.is_empty()
-    {
-        state.status = AppStatus::SessionPicker;
-        state.session_picker_sessions = page.sessions;
-        state.session_picker_next_offset = page.next_offset;
-        state.session_picker_backfill_complete = page.backfill_complete;
+    if let Some(page) = picker_page {
+        crate::session_picker_actions::show_session_page(&mut state, page);
     }
 
     if needs_setup {

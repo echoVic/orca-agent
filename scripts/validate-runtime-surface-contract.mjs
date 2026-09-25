@@ -1344,7 +1344,7 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ],
   ["crates/orca-tui/src/session_picker_actions.rs:close_picker:state.session_picker_query.clear", 1],
   ["crates/orca-tui/src/session_picker_actions.rs:close_picker:state.session_picker_sessions.clear", 1],
-  ["crates/orca-tui/src/session_picker_actions.rs:open_session_picker:state.session_picker_query.clear", 1],
+  ["crates/orca-tui/src/session_picker_actions.rs:show_session_page:state.session_picker_query.clear", 1],
   ["crates/orca-tui/src/session_picker_actions.rs:load_next_session_page:seen.insert", 1],
   ["crates/orca-tui/src/shortcuts.rs:normalize_key_parts:modifiers.insert", 1],
   ["crates/orca-tui/src/streaming_markdown.rs:finish:self.current_block.clear", 1],

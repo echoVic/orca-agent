@@ -293,8 +293,7 @@ pub(crate) fn handle_scroll_lines(state: &mut AppState, lines: i32, now: Instant
             return;
         }
         if !upward
-            && state.filtered_session_indices().last().copied()
-                == Some(state.session_picker_selected)
+            && state.visible_session_order().last().copied() == Some(state.session_picker_selected)
         {
             load_next_session_page(state);
         }
@@ -1976,7 +1975,11 @@ mod tests {
         // Session picker: wheel moves the session selection.
         state.panel_mode = crate::types::PanelMode::Conversation;
         state.status = AppStatus::SessionPicker;
-        state.session_picker_sessions = vec![test_session_summary("a"), test_session_summary("b")];
+        // Pages arrive newest first, which is also the order the picker draws.
+        let a = test_session_summary("a");
+        let mut b = test_session_summary("b");
+        b.updated_at = a.updated_at - chrono::Duration::minutes(1);
+        state.session_picker_sessions = vec![a, b];
         state.session_picker_selected = 0;
         handle_scroll_lines(&mut state, 3, now);
         assert_eq!(state.session_picker_selected, 1);

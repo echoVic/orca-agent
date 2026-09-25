@@ -467,10 +467,12 @@ fn close_picker(state: &mut AppState) {
     state.session_picker_backfill_complete = true;
 }
 
-pub(crate) fn open_session_picker(state: &mut AppState) -> io::Result<bool> {
-    let page =
-        RuntimeSurfaceHostHandle::list_saved_session_page(0, SESSION_PICKER_PAGE_SIZE, None)?;
-    state.reset_queued_user_messages();
+/// Shows the picker on the first page of saved sessions, with the top row as
+/// drawn selected; `false` when there are none to show.
+pub(crate) fn show_session_page(
+    state: &mut AppState,
+    page: orca_runtime::history::SessionSummaryPage,
+) -> bool {
     state.session_picker_sessions = page.sessions;
     state.session_picker_query.clear();
     state.reset_session_selection_to_first_match();
@@ -479,10 +481,17 @@ pub(crate) fn open_session_picker(state: &mut AppState) -> io::Result<bool> {
     state.session_picker_next_offset = page.next_offset;
     state.session_picker_backfill_complete = page.backfill_complete;
     if state.session_picker_sessions.is_empty() {
-        return Ok(false);
+        return false;
     }
     state.status = AppStatus::SessionPicker;
-    Ok(true)
+    true
+}
+
+pub(crate) fn open_session_picker(state: &mut AppState) -> io::Result<bool> {
+    let page =
+        RuntimeSurfaceHostHandle::list_saved_session_page(0, SESSION_PICKER_PAGE_SIZE, None)?;
+    state.reset_queued_user_messages();
+    Ok(show_session_page(state, page))
 }
 
 pub(crate) fn load_next_session_page(state: &mut AppState) -> usize {
@@ -581,14 +590,14 @@ fn reload_session_picker(state: &mut AppState) {
 }
 
 fn load_next_page_if_at_end(state: &mut AppState) {
-    let filtered = state.filtered_session_indices();
+    let filtered = state.visible_session_order();
     if filtered.last().copied() == Some(state.session_picker_selected) {
         load_next_session_page(state);
     }
 }
 
 fn load_next_page_if_near_end(state: &mut AppState, distance: usize) {
-    let filtered = state.filtered_session_indices();
+    let filtered = state.visible_session_order();
     let position = filtered
         .iter()
         .position(|index| *index == state.session_picker_selected)
@@ -791,18 +800,18 @@ mod tests {
         handle_session_picker_key(&ctrl_t, &mut state, &tx, || Ok(())).unwrap();
         assert!(state.session_picker_show_tests);
         assert_eq!(state.filtered_session_indices(), vec![0, 1, 2]);
-        // Selection resets to the first VISIBLE session, derived from
-        // filtered_session_indices() rather than assumed to be a bare `0`.
+        // Selection resets to the first VISIBLE session, the top row as
+        // drawn, rather than assumed to be a bare `0`.
         assert_eq!(
             Some(state.session_picker_selected),
-            state.filtered_session_indices().first().copied()
+            state.visible_session_order().first().copied()
         );
 
         handle_session_picker_key(&ctrl_t, &mut state, &tx, || Ok(())).unwrap();
         assert!(!state.session_picker_show_tests);
         assert_eq!(
             Some(state.session_picker_selected),
-            state.filtered_session_indices().first().copied()
+            state.visible_session_order().first().copied()
         );
     }
 
@@ -847,11 +856,40 @@ mod tests {
 
         assert!(!state.session_picker_show_tests);
         assert_eq!(state.filtered_session_indices(), vec![1, 2]);
-        assert_eq!(
-            state.session_picker_selected, 1,
+        assert_ne!(
+            state.session_picker_selected, 0,
             "hiding tests must move the selection off the now-hidden mock session, \
              not leave it at raw index 0"
         );
+        assert_eq!(
+            Some(state.session_picker_selected),
+            state.visible_session_order().first().copied(),
+            "it lands on the top row as drawn"
+        );
+    }
+
+    #[test]
+    fn a_shown_page_starts_on_the_top_row_as_drawn() {
+        let (tx, _rx) = mpsc::unbounded();
+        let mut state = AppState::new(tx, "test".into(), "auto".into(), "~/work/orca".into());
+        state.workspace_path = "/Users/me/work/orca".to_string();
+        let mut other = session("other", "Other project, newest");
+        other.cwd = "/Users/me/work/other".to_string();
+        let mut here = session("here", "This project");
+        here.cwd = "/Users/me/work/orca".to_string();
+        here.updated_at = other.updated_at - chrono::Duration::minutes(5);
+
+        assert!(show_session_page(
+            &mut state,
+            orca_runtime::history::SessionSummaryPage {
+                sessions: vec![other, here],
+                next_offset: None,
+                backfill_complete: true,
+            },
+        ));
+
+        assert_eq!(state.status, AppStatus::SessionPicker);
+        assert_eq!(selected_session_selector(&state).as_deref(), Some("here"));
     }
 
     #[test]

@@ -815,6 +815,11 @@ fn session_search_filters_by_title_and_keeps_selection_valid() {
         session("b", "add JWT auth middleware"),
         session("c", "refactor parser entrypoint"),
     ];
+    // Pages arrive newest first, which is also the order the picker draws.
+    let newest = state.session_picker_sessions[0].updated_at;
+    for (age, session) in state.session_picker_sessions.iter_mut().enumerate() {
+        session.updated_at = newest - chrono::Duration::minutes(age as i64);
+    }
     state.session_picker_selected = 0;
 
     // No query → all match.

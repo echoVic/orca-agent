@@ -67,7 +67,7 @@ impl AppState {
         let mut groups: Vec<(String, bool, Vec<usize>)> = Vec::new();
         for index in self.filtered_session_indices() {
             let session = &self.session_picker_sessions[index];
-            let current = session.cwd == self.cwd;
+            let current = session.cwd == self.workspace_path;
             match groups.iter_mut().find(|(cwd, _, _)| *cwd == session.cwd) {
                 Some((_, _, members)) => members.push(index),
                 None => groups.push((session.cwd.clone(), current, vec![index])),
@@ -103,8 +103,22 @@ impl AppState {
         rows
     }
 
+    /// Session indices in the order the picker draws them: by project group,
+    /// newest first within each. Navigation walks this order, so the
+    /// highlight moves to the row below rather than to the next session by
+    /// time, which may sit in another group.
+    pub(crate) fn visible_session_order(&self) -> Vec<usize> {
+        self.session_picker_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                SessionPickerRow::Session(index) => Some(index),
+                SessionPickerRow::Group { .. } => None,
+            })
+            .collect()
+    }
+
     pub fn select_previous_session(&mut self) {
-        let filtered = self.filtered_session_indices();
+        let filtered = self.visible_session_order();
         if filtered.is_empty() {
             return;
         }
@@ -117,7 +131,7 @@ impl AppState {
     }
 
     pub fn select_next_session(&mut self) {
-        let filtered = self.filtered_session_indices();
+        let filtered = self.visible_session_order();
         if filtered.is_empty() {
             return;
         }
@@ -130,7 +144,7 @@ impl AppState {
     }
 
     pub fn select_session_page_up(&mut self) {
-        let filtered = self.filtered_session_indices();
+        let filtered = self.visible_session_order();
         if filtered.is_empty() {
             return;
         }
@@ -143,7 +157,7 @@ impl AppState {
     }
 
     pub fn select_session_page_down(&mut self) {
-        let filtered = self.filtered_session_indices();
+        let filtered = self.visible_session_order();
         if filtered.is_empty() {
             return;
         }
@@ -156,13 +170,13 @@ impl AppState {
     }
 
     pub fn select_first_session(&mut self) {
-        if let Some(&first) = self.filtered_session_indices().first() {
+        if let Some(&first) = self.visible_session_order().first() {
             self.session_picker_selected = first;
         }
     }
 
     pub fn select_last_session(&mut self) {
-        if let Some(&last) = self.filtered_session_indices().last() {
+        if let Some(&last) = self.visible_session_order().last() {
             self.session_picker_selected = last;
         }
     }
@@ -187,7 +201,7 @@ impl AppState {
     /// selection" (`Vec::get`), so this is a clean, panic-free sentinel.
     pub(crate) fn reset_session_selection_to_first_match(&mut self) {
         self.session_picker_selected = self
-            .filtered_session_indices()
+            .visible_session_order()
             .first()
             .copied()
             .unwrap_or(self.session_picker_sessions.len());
@@ -300,5 +314,63 @@ mod tests {
             matches!(&rows[3], SessionPickerRow::Group { label, current: false } if label == "other")
         );
         assert!(matches!(rows[4], SessionPickerRow::Session(0)));
+    }
+
+    #[test]
+    fn the_current_project_is_recognised_under_the_home_directory() {
+        // The status bar shows a workspace under $HOME as "~/…"; sessions
+        // record the absolute path.
+        let mut state = test_state_in("~/work/orca");
+        state.workspace_path = "/Users/me/work/orca".to_string();
+        state.session_picker_sessions = vec![
+            summary("other newest", "/Users/me/work/other", "deepseek", 1),
+            summary("orca", "/Users/me/work/orca", "deepseek", 30),
+        ];
+        let rows = state.session_picker_rows();
+        assert!(
+            matches!(&rows[0], SessionPickerRow::Group { label, current: true } if label == "orca"),
+            "{rows:?}"
+        );
+        assert!(matches!(rows[1], SessionPickerRow::Session(1)));
+    }
+
+    #[test]
+    fn the_selection_moves_through_the_rows_as_they_are_drawn() {
+        let mut state = test_state_in("/work/orca");
+        state.session_picker_sessions = vec![
+            summary("other A", "/work/other", "deepseek", 1),
+            summary("orca B", "/work/orca", "deepseek", 2),
+            summary("other C", "/work/other", "deepseek", 3),
+            summary("orca D", "/work/orca", "deepseek", 4),
+        ];
+        // Drawn: orca [B, D], then other [A, C].
+        let title = |state: &AppState| {
+            state.session_picker_sessions[state.session_picker_selected]
+                .title
+                .clone()
+        };
+
+        state.reset_session_selection_to_first_match();
+        assert_eq!(title(&state), "orca B");
+        let mut walked = vec![title(&state)];
+        for _ in 0..4 {
+            state.select_next_session();
+            walked.push(title(&state));
+        }
+        assert_eq!(
+            walked,
+            ["orca B", "orca D", "other A", "other C", "other C"]
+        );
+
+        state.select_previous_session();
+        assert_eq!(title(&state), "other A");
+        state.select_first_session();
+        assert_eq!(title(&state), "orca B");
+        state.select_last_session();
+        assert_eq!(title(&state), "other C");
+        state.select_session_page_up();
+        assert_eq!(title(&state), "orca B");
+        state.select_session_page_down();
+        assert_eq!(title(&state), "other C");
     }
 }
