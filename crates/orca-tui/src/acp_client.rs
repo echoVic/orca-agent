@@ -1008,6 +1008,19 @@ fn reject_action(client: &TuiClient, action: UserAction, message: &str) {
                 message: message.into(),
             });
         }
+        // An ACP agent gives no recap. The one the TUI asks for on its own
+        // when focus returns is dropped; `/recap` says it is unavailable here
+        // instead of waiting for a summary that never comes.
+        UserAction::RequestAutomaticRecap { .. } => {}
+        UserAction::RequestRecap => {
+            // It answers the `/recap` still only requested, which no request
+            // id or attachment names yet.
+            let _ = client.events.send(TuiEvent::RecapSkipped {
+                request_id: orca_runtime::recap::RecapRequestId(0),
+                attachment: crate::protocol::SessionAttachmentId::new(1),
+                reason: orca_runtime::recap::RecapSkipReason::Ineligible,
+            });
+        }
         _ => client.reject_operation(message.into()),
     }
 }
@@ -1295,6 +1308,36 @@ mod tests {
         ));
         *client.session.borrow_mut() = Some(SessionId::new(SESSION));
         (client, event_rx, ack_rx)
+    }
+
+    #[test]
+    fn recap_on_an_acp_attachment_is_unavailable_rather_than_an_error() {
+        let (client, events, _acks) = client();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = crate::types::AppState::new(tx, "test".into(), "acp".into(), "/tmp".into());
+
+        // The recap the TUI asks for on its own when focus returns is
+        // skipped quietly: the agent has no recap to give.
+        reject_action(
+            &client,
+            UserAction::RequestAutomaticRecap { focus_cycle: 1 },
+            "unavailable",
+        );
+        // `/recap` says so instead of waiting for a summary forever.
+        state.recap = crate::types::RecapState::Requested;
+        reject_action(&client, UserAction::RequestRecap, "unavailable");
+
+        for event in events.try_iter() {
+            assert!(
+                !matches!(event, TuiEvent::OperationRejected(_) | TuiEvent::Error(_)),
+                "{event:?}"
+            );
+            state.update(event);
+        }
+        assert!(matches!(
+            &state.recap,
+            crate::types::RecapState::Notice(message) if message == "unavailable for this conversation"
+        ));
     }
 
     // These are the negotiated observer.rs v1 fields, carried on ordinary SDK
