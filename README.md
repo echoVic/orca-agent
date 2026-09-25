@@ -50,60 +50,81 @@ re-parsing; legacy string commands use the resolved shell dialect.
 ```bash
 export DEEPSEEK_API_KEY=sk-...
 
-orca                                      # open the TUI
+orca                                      # open the terminal UI
 orca exec "fix the failing test"          # run headlessly
 printf '%s' "$INSTRUCTION" | orca exec   # keep arbitrary prompt text out of argv
 orca exec --verifier "cargo test" "fix it" # verify before finishing
 orca exec resume SESSION_ID "continue"    # resume a headless session
 orca exec resume --last "continue"        # resume the most recent session
 orca exec resume SID --resume-at MID "continue"  # resume up to a message boundary
-orca --mode=acp                           # connect an ACP client
 orca --resume [SESSION_ID]                # resume a saved conversation
 orca --fork SESSION_ID                    # fork a saved conversation
+orca --mode=acp                           # connect an ACP client
+orca doctor                               # check the key, trust, and sandbox locally
 ```
 
-The positional prompt form remains supported. When the prompt may contain
-tokens that a task later searches for or kills in the process table, pipe it on
-stdin so it is not exposed in `orca`'s command line.
+On Windows PowerShell, set the key with `$env:DEEPSEEK_API_KEY = "sk-..."`;
+the `orca` commands are the same. The positional prompt form remains
+supported. When the prompt may contain tokens that a task later searches for or
+kills in the process table, pipe it on stdin so it is not exposed in `orca`'s
+command line.
 
-Development builds also provide opt-in [shared ACP sessions](docs/acp-daemon.md)
-on Unix (`orca daemon`, `orca attach`, and `orca acp-bridge`),
+Orca also offers opt-in [shared ACP sessions](docs/acp-daemon.md) on Unix
+(`orca daemon`, `orca attach`, and `orca acp-bridge`),
 [file-defined subagents](docs/subagents.md), and
 [persistent terminal output pages](docs/architecture/adr/0006-unified-exec-terminal-service.md).
-These additions are available in v0.4.27 and later.
 
-On Windows PowerShell, set the key with `$env:DEEPSEEK_API_KEY = "sk-..."`;
-the `orca` commands are the same.
+### The terminal UI
 
-In the TUI, `@` searches files, skills, plugins, and MCP resources. Session
-commands are `/new`, `/resume`, `/fork [name]`, `/rename [name]`, `/status`,
-`/config`, and `/copy [N]`. `/config` opens an interactive session settings
-panel. Model and reasoning-effort choices from `/model` or `/config` are saved
-to the user `config.toml` and apply to new sessions; approval mode changes stay
-session-scoped and are never saved. Entering `full-auto` requires an explicit
-Full Access confirmation. Once the runtime commits it, the active task's next
-tool admission uses `TrustedHost` / `DangerFullAccess`; tools already running
-and delegated children already launched retain their original policy snapshot.
-`/status` reports the effective execution profile, shell sandbox, and active
-permission profile. The resume picker also supports fork, rename, archive,
-delete, and copying a session ID. `/history` is retired; `/clear` remains a hidden
-compatibility alias for `/new`. `Ctrl+L` clears only the displayed transcript
-and terminal scrollback, keeping the current conversation context. On exit,
-Orca prints the exact `orca --resume <SESSION_ID>` command for the session.
+Run `orca` in a project. The first run in a folder asks you to trust it or
+continue untrusted: trust lets Orca load the project's configuration,
+instructions, skills, agents, and workflows, and never enables or bypasses the
+OS sandbox. Then type a task and press `Enter`.
 
-Use `/plan` for read-only planning and `/goal` for a persistent objective.
-`/tasks` shows or hides the tasks dock under the conversation, where background
-turns, subagents, background commands, monitors, and workflow children appear;
-`/agents` opens the Agent Workspace with every task, its live conversation or
-transcript, and its controls; `/workflows` keeps the workflow-specific run
-tree. The [Terminal UI guide](https://orcaagent.dev/docs/#terminal-ui) covers
-the screen and its keys: inline approvals, queued and steered follow-ups
-(`Ctrl+Enter`), `/recap`, and side conversations. Use `/trust` to control
-whether Orca loads project-provided configuration and instructions; it does not
-enable or bypass OS sandbox enforcement. Automatic project memory is enabled
-for recorded sessions by default; use `/remember` for explicit user or project
-facts. See [Memory](docs/memory.md) for capture, recall, storage, privacy, and
-deletion.
+- **Mention and command.** `@` mentions files, skills, plugins, and MCP
+  resources; `$` inserts a skill; `/` opens the command menu; `?` lists every
+  key. `Ctrl+V` attaches a clipboard image.
+- **Follow along.** Replies are marked `●`, reasoning collapses to one
+  `⋯ thinking` line, and each tool call shows its output under a `│` rail.
+  `e` expands the latest collapsed output and `Shift+E` all of them. The
+  status bar shows the approval mode, the model and reasoning effort, the
+  context left, and usage.
+- **Steer a running turn.** `Esc` interrupts. `Enter` queues a follow-up for
+  the next turn, `Ctrl+Enter` sends it into the running turn (in terminals
+  with the kitty keyboard protocol), and `Ctrl+B` moves the turn to the
+  background.
+- **Approve tool calls.** A call that needs approval turns the input into an
+  approval panel: allow once, allow this exact call, allow the tool for the
+  session, or deny (`Esc`). `Shift+Tab` cycles `suggest` → `auto-edit` →
+  `full-auto` → `plan`. Entering `full-auto` asks for an explicit Full Access
+  confirmation; the running task picks it up at its next tool call, while tools
+  already running and subagents already launched keep their original policy.
+  Mode changes last for the session and are never saved.
+- **Background work.** `/tasks` shows the tasks dock under the conversation,
+  where background turns, subagents, commands, monitors, and workflow children
+  appear. `/agents` opens the Agent Workspace with each task's live
+  conversation or transcript and the controls it can safely take: stop,
+  resume, retry, or a follow-up. When background agents finish while you are
+  idle, Orca continues with their results. `/workflows` keeps the workflow run
+  tree.
+- **Plan, goals, and recap.** `/plan` investigates read-only and ends with a
+  plan to approve; `/goal` sets a persistent objective; `/recap` summarizes the
+  session, and Orca writes one itself when you return after a quiet spell;
+  `/side` opens a side conversation for a quick question.
+- **Sessions.** `/new`, `/resume` (grouped by project, with fork, rename,
+  archive, delete, and copy ID), `/fork [name]`, `/rename [name]`, `/model`,
+  `/config`, and `/copy [N]`. Model and reasoning-effort choices are saved to
+  the user `config.toml`, so new sessions use them too. `/status` reports the effective execution profile,
+  shell sandbox, and permission profile. `Ctrl+L` clears the screen but keeps
+  the conversation, and on exit Orca prints the `orca --resume <SESSION_ID>`
+  command.
+
+The [Terminal UI guide](https://orcaagent.dev/docs/#terminal-ui) walks through
+the screen and every key.
+
+Automatic project memory is on for recorded sessions; use `/remember` for
+explicit user or project facts. See [Memory](docs/memory.md) for capture,
+recall, storage, privacy, and deletion.
 
 ### Use Orca from Pilion Browser
 
@@ -166,37 +187,40 @@ then defaults. Run `orca --help` or `orca exec --help` for the full command
 surface. User configuration lives at `~/.orca/config.toml`; trusted projects
 can also provide `.orca/config.toml`, `AGENTS.md`, rules, skills, and workflows.
 
-DeepSeek thinking is enabled explicitly. Set `reasoning_effort` to `low`,
-`high`, or `max` (the default) in `config.toml`, or use
-`ORCA_REASONING_EFFORT`. `deepseek-flash` (DeepSeek-V4.1-Flash) and
-`deepseek-v4-pro` use a 1M-token context window and allow up to 384K output
-tokens. The retired `deepseek-v4-flash` and
-`deepseek-v4-flash-vision-exp` names remain accepted and normalize to
-`deepseek-flash`, including Flash pricing. JPEG, PNG, GIF, and WebP inputs are
-accepted from ACP clients and the TUI with every model selection. Explicit
-Flash selections consume images directly; `auto` and Pro use Flash for
-task-aware visual analysis before continuing with the selected coding model.
-In the TUI, use `Ctrl+V` to attach the current
-clipboard image (`Alt+V` is also available on Windows), drag or paste image
-paths and `file://` URLs, or select an image through `@file`. Each attachment
-appears as an atomic `[Image #N]` item that can be deleted, cleared, queued,
-edited, and restored after a rejected submission. `Cmd+V` works when the
-terminal forwards it as `Super+V`; terminals that consume `Cmd+V` should use
-`Ctrl+V`. Clipboard reads run in the background, and pressing Enter while one
-is pending waits for the image before submitting. Place the cursor on an image
-item and press Enter to open its preview; submitted images also render in the
-message area and can be clicked. The viewer supports `+`/`-` zoom, arrow-key
-panning, `0` to fit, and Esc to close. Kitty and Ghostty use the Kitty graphics
-protocol for native-pixel previews; iTerm2 and WezTerm use the inline-image
-protocol. Terminals without an image protocol, including Apple Terminal, fall
-back to low-resolution true-color cells. SSH sessions without a graphical
-clipboard should paste or mention a path on the remote host. Inline attachments
-share a 5 MiB total limit. Orca keeps the Chat Completions transport and fully
-replays any returned `reasoning_content` across tool turns as required by
-DeepSeek.
+An unset or `auto` model uses `deepseek-flash` (DeepSeek-V4.1-Flash). Choose
+`deepseek-v4-pro` with `/model`, `--model`, or `model = "deepseek-v4-pro"` in
+`config.toml`; releases before 0.5.0 routed `auto` to Pro. Both models use a
+1M-token context window and allow up to 384K output tokens. The retired
+`deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` names remain accepted
+and normalize to `deepseek-flash`, including Flash pricing. DeepSeek thinking is
+enabled explicitly: set `reasoning_effort` to `low`, `high`, or `max` (the
+default) in `config.toml`, or use `ORCA_REASONING_EFFORT`.
+
+JPEG, PNG, GIF, and WebP inputs are accepted from ACP clients and the TUI with
+every model selection. Flash consumes images directly; Pro uses Flash for
+task-aware visual analysis before continuing with Pro. In the TUI, use `Ctrl+V`
+to attach the current clipboard image (`Alt+V` is also available on Windows),
+drag or paste image paths and `file://` URLs, or select an image through
+`@file`. Each attachment appears as an atomic `[Image #N]` item that can be
+deleted, cleared, queued, edited, and restored after a rejected submission.
+`Cmd+V` works when the terminal forwards it as `Super+V`; terminals that
+consume `Cmd+V` should use `Ctrl+V`. Clipboard reads run in the background, and
+pressing Enter while one is pending waits for the image before submitting.
+Place the cursor on an image item and press Enter to open its preview;
+submitted images also render in the message area and can be clicked. The viewer
+supports `+`/`-` zoom, arrow-key panning, `0` to fit, and Esc to close. Kitty
+and Ghostty use the Kitty graphics protocol for native-pixel previews; iTerm2
+and WezTerm use the inline-image protocol. Terminals without an image protocol,
+including Apple Terminal, fall back to low-resolution true-color cells. SSH
+sessions without a graphical clipboard should paste or mention a path on the
+remote host. Inline attachments share a 5 MiB total limit. Orca keeps the Chat
+Completions transport and fully replays any returned `reasoning_content` across
+tool turns as required by DeepSeek.
 
 More detail:
 
+- [Documentation](https://orcaagent.dev/docs/) and the
+  [Terminal UI guide](https://orcaagent.dev/docs/#terminal-ui)
 - [Persistent Goal Mode](docs/goal-mode.md)
 - [Memory](docs/memory.md)
 - [Harness and app-server contract](docs/harness-contract.md)
@@ -230,6 +254,8 @@ More detail:
   cleanup before the Goal mutation commits. Alt+Up queue editing commits a
   revision-checked runtime delete, failed queue admission restores the prompt,
   and queued previews remain bounded instead of copying the full body per frame.
+- Detached background workers never hold the terminal open, and they end once
+  their task is gone or their lease is lost.
 - Session switches start the replacement before closing the current runtime.
   Rename, fork, archive, and delete commit through revision-checked and durable
   paths, and stale events from a previous attachment are ignored.

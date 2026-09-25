@@ -340,7 +340,7 @@ The default (and only production) provider is DeepSeek. Internal test providers 
 
 ### DeepSeek Provider
 
-- Default model: `auto` (main loop uses `deepseek-v4-pro`, auxiliary tasks use `deepseek-flash`)
+- Default model: `auto`, which routes the main loop to `deepseek-flash` (`deepseek-v4-pro` before 0.5.0); auxiliary tasks use `deepseek-flash`
 - Default base URL: `https://api.deepseek.com`
 - Transport: OpenAI-compatible Chat Completions (the Responses API is not required by the runtime)
 - Thinking mode: explicitly enabled on every request with `thinking.type = "enabled"`
@@ -351,10 +351,10 @@ The default (and only production) provider is DeepSeek. Internal test providers 
   `deepseek-flash`.
 - Multimodal input: every model selection accepts ordered text/image blocks
   from ACP plus TUI clipboard images, dragged or pasted paths/`file://` URLs,
-  and image file mentions. Explicit Flash selections receive images directly;
-  `auto` and Pro first persist a task-aware Flash vision analysis, strip
-  unsupported binary blocks from the coding-model request, and fail the
-  complete turn if analysis fails.
+  and image file mentions. Flash, including an unset or `auto` model (which
+  routes to `deepseek-flash`), receives images directly; Pro first persists a
+  task-aware Flash vision analysis, strips unsupported binary blocks from the
+  coding-model request, and fails the complete turn if analysis fails.
 - TUI clipboard input: background decoding produces fenced `[Image #N]`
   attachments that survive queueing, queue edits, and submission rejection;
   macOS, Linux, Windows, and WSL have native paths, while headless SSH sessions

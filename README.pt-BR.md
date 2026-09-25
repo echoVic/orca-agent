@@ -53,9 +53,14 @@ No Windows PowerShell, defina a chave com
 `$env:DEEPSEEK_API_KEY = "sk-..."`; os comandos `orca` são os mesmos.
 
 Na TUI, `@` pesquisa arquivos, Skills, Plugins e MCP Resources. Use `/plan`
-para planejamento somente leitura, `/goal` para um objetivo persistente,
-`/workflows` para trabalhos em segundo plano e `/trust` para gerenciar as
-permissões de sandbox da pasta atual.
+para planejamento somente leitura, `/goal` para um objetivo persistente, `/tasks`
+para mostrar o dock de tarefas com o trabalho em segundo plano, `/agents` para abrir
+o Agent Workspace e `/recap` para resumir a sessão. Chamadas de ferramenta que
+precisam de aprovação aparecem no lugar do campo de entrada, e `Shift+Tab` alterna
+o modo de aprovação. `/trust` decide se o Orca carrega a configuração e as
+instruções do projeto; ele não altera o sandbox do sistema operacional. Veja o
+[guia da Terminal UI](https://orcaagent.dev/docs/#terminal-ui) (em inglês e chinês)
+para a tela e todas as teclas.
 
 ### Usar o Orca a partir do Pilion Browser
 

@@ -53,8 +53,11 @@ Windows PowerShell에서는 `$env:DEEPSEEK_API_KEY = "sk-..."`로 키를 설정�
 이후 `orca` 명령은 동일합니다.
 
 TUI에서 `@`로 파일, Skills, Plugins, MCP Resources를 검색할 수 있습니다.
-`/plan`은 읽기 전용 계획, `/goal`은 지속 목표, `/workflows`는 백그라운드 작업,
-`/trust`는 현재 폴더의 샌드박스 권한을 관리합니다.
+`/plan`은 읽기 전용 계획, `/goal`은 지속 목표, `/tasks`는 백그라운드 작업을 보여 주는
+작업 dock, `/agents`는 Agent Workspace, `/recap`은 세션 요약입니다. 승인이 필요한 도구
+호출은 입력창 자리에 표시되며, `Shift+Tab`으로 승인 모드를 전환합니다. `/trust`는
+프로젝트 설정과 지침을 불러올지 결정하며 OS 샌드박스는 바꾸지 않습니다. 화면과 키 조작은
+[Terminal UI 가이드](https://orcaagent.dev/docs/#terminal-ui)(영어·중국어)를 참고하세요.
 
 ### Pilion Browser에서 Orca 사용하기
 

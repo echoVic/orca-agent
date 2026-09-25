@@ -53,8 +53,13 @@ Trên Windows PowerShell, đặt khóa bằng
 `$env:DEEPSEEK_API_KEY = "sk-..."`; các lệnh `orca` vẫn giữ nguyên.
 
 Trong TUI, `@` tìm kiếm tệp, Skills, Plugins và MCP Resources. Dùng `/plan`
-để lập kế hoạch chỉ đọc, `/goal` cho mục tiêu lâu dài, `/workflows` cho công việc
-nền và `/trust` để quản lý quyền sandbox của thư mục hiện tại.
+để lập kế hoạch chỉ đọc, `/goal` cho mục tiêu lâu dài, `/tasks` để hiện dock tác vụ
+chứa công việc nền, `/agents` để mở Agent Workspace và `/recap` để tóm tắt phiên.
+Lệnh gọi công cụ cần phê duyệt hiện ngay tại vị trí ô nhập; `Shift+Tab` chuyển chế độ
+phê duyệt. `/trust` quyết định Orca có nạp cấu hình và chỉ dẫn của dự án hay không; nó
+không thay đổi sandbox của hệ điều hành. Xem
+[hướng dẫn Terminal UI](https://orcaagent.dev/docs/#terminal-ui) (tiếng Anh và tiếng
+Trung) để biết màn hình và các phím.
 
 ### Dùng Orca từ Pilion Browser
 

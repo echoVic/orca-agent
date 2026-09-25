@@ -48,39 +48,44 @@ PowerShell 5.1 仅适用于不需要 AppContainer 隔离的显式配置。协议
 ```bash
 export DEEPSEEK_API_KEY=sk-...
 
-orca                                      # 打开 TUI
+orca                                      # 打开终端界面
 orca exec "修复失败的测试"                 # 无界面运行
+printf '%s' "$INSTRUCTION" | orca exec   # 提示词不出现在命令行参数里
 orca exec --verifier "cargo test" "修复它" # 完成前执行验证
 orca exec resume SESSION_ID "继续"        # 恢复无界面会话
 orca exec resume --last "继续"            # 恢复最近的会话
 orca exec resume SID --resume-at MID "继续"  # 恢复到消息边界为止
-orca --mode=acp                           # 连接 ACP 客户端
 orca --resume [SESSION_ID]                # 恢复保存的会话
 orca --fork SESSION_ID                    # 分叉保存的会话
+orca --mode=acp                           # 连接 ACP 客户端
+orca doctor                               # 在本地检查密钥、目录信任和沙箱
 ```
 
-Windows PowerShell 使用 `$env:DEEPSEEK_API_KEY = "sk-..."` 设置密钥；
-后续 `orca` 命令相同。
+Windows PowerShell 使用 `$env:DEEPSEEK_API_KEY = "sk-..."` 设置密钥；后续 `orca` 命令相同。
+仍然支持把提示词作为位置参数传入；如果提示词里有任务之后会在进程表中搜索或结束的内容，请通过 stdin 传入，
+这样它不会出现在 `orca` 的命令行里。
 
-在 TUI 中，`@` 可以搜索文件、Skills、Plugins 和 MCP Resources。会话指令包括
-`/new`、`/resume`、`/fork [名称]`、`/rename [名称]`、`/status` 和
-`/copy [N]`。`/config` 打开交互式会话设置面板。通过 `/model` 或 `/config`
-选择的模型和推理强度会保存到用户 `config.toml`，并应用到新会话；审批模式
-（approval mode）变更仅作用于当前会话，不会被保存。从其他模式进入 `full-auto`
-时必须明确确认 Full Access。runtime 提交成功后，当前任务的下一次工具准入会使用
-`TrustedHost` / `DangerFullAccess`；已经运行的工具和已经启动的委托 child
-继续使用各自原有的策略快照。`/status` 会显示实际 execution profile、shell sandbox
-与 active permission profile。`/resume` 选择器还可以分叉、重命名、归档、删除会话
-和复制 Session ID。`/history` 已移除；`/clear` 仅作为 `/new` 的隐藏兼容别名保留。
-`Ctrl+L` 只清除屏幕内容和终端回滚区，不会清除当前会话上下文。退出 TUI 时，
-Orca 会输出准确的 `orca --resume <SESSION_ID>` 恢复命令。
+Orca 还提供可选的[共享 ACP 会话](docs/acp-daemon.md)（Unix 上的 `orca daemon`、`orca attach` 和 `orca acp-bridge`）、
+[文件定义的子代理](docs/subagents.md)和[持久化终端输出分页](docs/architecture/adr/0006-unified-exec-terminal-service.md)。
 
-使用 `/plan` 进行只读规划，使用 `/goal` 管理持久目标。
-`/tasks` 显示或隐藏对话下方的任务 dock，后台轮次、子代理、后台命令、监控任务和 Workflow child 都会出现在这里；
-`/agents` 打开 Agent Workspace，列出所有任务及其实时对话或记录和可用操作；
-`/workflows` 则保留 Workflow 专用运行树。
-界面和按键（内联审批、排队与 `Ctrl+Enter` 插话、`/recap`、侧边对话）见[终端界面指南](https://orcaagent.dev/docs/#terminal-ui)。
-使用 `/trust` 管理当前目录的沙箱权限。
+### 终端界面
+
+在项目目录里运行 `orca`。第一次在某个目录运行时，Orca 会请你选择信任该目录或以不信任方式继续：
+信任后 Orca 才会加载项目自带的配置、指令、skills、agents 和 workflows，它不会开启、也不会绕过操作系统沙箱。
+之后输入任务并按 `Enter`。
+
+- **引用与命令。** `@` 引用文件、skills、插件和 MCP 资源；`$` 插入 skill；`/` 打开命令菜单；`?` 列出全部按键。`Ctrl+V` 粘贴剪贴板里的图片。
+- **查看进展。** 回复以 `●` 标记，思考过程折叠成一行 `⋯ thinking`，每个工具调用的输出显示在 `│` 竖线下方。`e` 展开最近一条折叠的输出，`Shift+E` 全部展开。状态栏显示审批模式、模型和推理强度、上下文剩余比例以及用量。
+- **引导运行中的轮次。** `Esc` 中断。`Enter` 把追加消息排进队列，等下一轮发送；`Ctrl+Enter` 把它直接送进正在运行的轮次（需要支持 kitty 键盘协议的终端）；`Ctrl+B` 把当前轮次放到后台。
+- **审批工具调用。** 需要审批的调用会把输入框变成审批面板：允许一次、允许这个调用（同一工具、同一目标以后不再询问）、本会话内允许该工具，或拒绝（`Esc`）。`Shift+Tab` 依次切换 `suggest` → `auto-edit` → `full-auto` → `plan`。进入 `full-auto` 前需要明确确认 Full Access；正在运行的任务会在下一次工具调用时生效，已经在运行的工具和已经启动的子代理继续使用原来的策略。模式变更只作用于当前会话，不会保存。
+- **后台工作。** `/tasks` 显示对话下方的任务 dock，后台轮次、子代理、命令、监控任务和 Workflow child 都在这里。`/agents` 打开 Agent Workspace，可以查看每个任务的实时对话或记录，并执行它能安全执行的操作：停止、恢复、重试或追加消息。你空闲时后台 agent 完成，Orca 会带着它们的结果继续对话。`/workflows` 保留 Workflow 运行树。
+- **计划、目标与回顾。** `/plan` 只读调查，最后给出待你批准的计划；`/goal` 设置持久目标；`/recap` 总结当前会话，你离开一段时间再回来时 Orca 也会自动写一份；`/side` 打开侧边对话，适合临时问个问题。
+- **会话。** `/new`、`/resume`（按项目分组，可分叉、重命名、归档、删除和复制 Session ID）、`/fork [名称]`、`/rename [名称]`、`/model`、`/config` 和 `/copy [N]`。模型和推理强度的选择会保存到用户 `config.toml`，新会话也会沿用。`/status` 显示实际的 execution profile、shell sandbox 和 permission profile。`Ctrl+L` 只清屏，不清除会话；退出时 Orca 会输出 `orca --resume <SESSION_ID>` 恢复命令。
+
+[终端界面指南](https://orcaagent.dev/docs/#terminal-ui)介绍了屏幕上的各个部分和全部按键。
+
+已记录的会话默认开启项目自动记忆；需要明确记住用户或项目事实时，使用 `/remember`。
+采集、召回、存储、隐私和删除见 [Memory](docs/memory.md)。
 
 ### 在 Pilion Browser 中使用 Orca
 
@@ -119,18 +124,24 @@ Orca 会输出准确的 `orca --resume <SESSION_ID>` 恢复命令。
 或 `orca exec --help` 查看完整命令。用户配置位于 `~/.orca/config.toml`；
 受信任的项目还可以提供 `.orca/config.toml`、`AGENTS.md`、规则、Skills 和工作流。
 
-Orca 会显式开启 DeepSeek 思考模式。可以在 `config.toml` 中将
-`reasoning_effort` 设为 `low`、`high` 或 `max`（默认），也可以使用
-`ORCA_REASONING_EFFORT`。`deepseek-flash`（DeepSeek-V4.1-Flash）和
-`deepseek-v4-pro` 均采用 100 万 token 上下文，并允许最多 384K 输出
-token。旧名称 `deepseek-v4-flash` 和 `deepseek-v4-flash-vision-exp`
-仍可作为兼容输入，Orca 会将其归一化为 `deepseek-flash`，并统一采用
-Flash 计费和图片能力。Orca 继续使用 Chat Completions，并按 DeepSeek
-要求在工具调用轮次完整回传服务端返回的 `reasoning_content`。
+未配置模型或模型为 `auto` 时，Orca 使用 `deepseek-flash`（DeepSeek-V4.1-Flash）。
+可以通过 `/model`、`--model`，或在 `config.toml` 中设置 `model = "deepseek-v4-pro"` 改用 Pro；
+0.5.0 之前的版本会把 `auto` 路由到 Pro。两个模型均采用 100 万 token 上下文，并允许最多 384K 输出 token。
+旧名称 `deepseek-v4-flash` 和 `deepseek-v4-flash-vision-exp` 仍可作为兼容输入，
+Orca 会将其归一化为 `deepseek-flash`，并统一采用 Flash 计费和图片能力。
+Orca 会显式开启 DeepSeek 思考模式：可以在 `config.toml` 中将 `reasoning_effort` 设为 `low`、`high` 或 `max`（默认），
+也可以使用 `ORCA_REASONING_EFFORT`。
+
+ACP 客户端和 TUI 都可以输入 JPEG、PNG、GIF 和 WebP 图片：Flash 直接读取图片，
+Pro 会先用 Flash 做面向任务的图片分析，再交给 Pro 继续。在 TUI 中用 `Ctrl+V` 粘贴剪贴板里的图片，
+也可以拖入或粘贴图片路径，或通过 `@` 选择图片文件。Orca 继续使用 Chat Completions，
+并按 DeepSeek 要求在工具调用轮次完整回传服务端返回的 `reasoning_content`。
 
 更多文档：
 
+- [文档站](https://orcaagent.dev/docs/)与[终端界面指南](https://orcaagent.dev/docs/#terminal-ui)
 - [持久 Goal 模式](docs/goal-mode.md)
+- [Memory](docs/memory.md)
 - [Harness 与 app-server 协议](docs/harness-contract.md)
 - [动态工作流设计](docs/claude-code-workflow-parity.md)
 - [生产路线图](docs/production-roadmap.md)
@@ -144,6 +155,7 @@ Flash 计费和图片能力。Orca 继续使用 Chat Completions，并按 DeepSe
 - 取消前台 turn 时，会同时停止它拥有的子智能体任务树，但不会误伤无关任务。
 - 使用 Esc 取消时会提交唯一的 child 终态并忽略该 attempt 的迟到活动，父会话恢复
   输入后，已停止的子代理不会继续向终端刷屏。
+- 后台分离运行的 worker 不会占住终端，任务不存在或租约丢失后会自行结束。
 - 切换会话时先启动新 Runtime，再关闭当前 Runtime。重命名、分叉、归档与删除
   经过 revision 校验和持久化提交，旧会话附件排队中的事件不会污染新会话。
 - Runtime Surface 与平台边界契约会在 CI 中验证，通过后才构建 macOS、Linux
