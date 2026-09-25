@@ -497,6 +497,15 @@ impl<'a> ThreadTurnContext<'a> {
             parts
                 .conversation
                 .replace_skill_context(agent_common::explicit_skill_context(&cwd, &prompt));
+            if let Some(note) =
+                agent_common::plan_mode_switch_note(parts.conversation, config.approval_mode)
+            {
+                let note = Message::pinned_system(note);
+                if let Some(writer) = parts.writer.as_deref_mut() {
+                    writer.append_message(&note)?;
+                }
+                parts.conversation.messages.push(note);
+            }
             let message = match request.prompt_placement() {
                 ThreadTurnPromptPlacement::BacktrackableUser => {
                     Message::user_with_images(prompt.clone(), images)
@@ -2418,6 +2427,65 @@ mod tests {
         } else {
             assert!(mode_context.is_none());
         }
+    }
+
+    #[test]
+    fn a_switch_into_or_out_of_plan_mode_is_noted_where_it_happens() {
+        let mut config = config(SubagentConfig::default());
+        config.history_mode = HistoryMode::Disabled;
+        let mut thread = RuntimeThread::start(&config, "mid-session plan").expect("thread");
+        let notes_before = |thread: &RuntimeThread, prompt: &str| {
+            let messages = &thread.session().conversation().messages;
+            let at = messages
+                .iter()
+                .position(
+                    |message| matches!(message, Message::User { content, .. } if content == prompt),
+                )
+                .expect("the turn's prompt");
+            messages[..at]
+                .iter()
+                .rev()
+                .take_while(|message| !matches!(message, Message::User { .. }))
+                .filter_map(|message| match message {
+                    Message::System { content, .. } if content.starts_with("[Plan mode") => {
+                        Some(content.lines().next().unwrap_or_default().to_string())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        config.approval_mode = ApprovalMode::AutoEdit;
+        thread
+            .run_request(&config, &ThreadTurnRequest::new("edit it"), Vec::new())
+            .expect("edit turn");
+        assert!(notes_before(&thread, "edit it").is_empty());
+
+        // The plan-mode instructions sit in the mode context ahead of the
+        // whole history, so a model that sees earlier edit turns after them
+        // takes plan mode for over: the switch is noted before the prompt.
+        config.approval_mode = ApprovalMode::Plan;
+        thread
+            .run_request(&config, &ThreadTurnRequest::new("plan it"), Vec::new())
+            .expect("plan turn");
+        assert_eq!(notes_before(&thread, "plan it"), ["[Plan mode on]"]);
+        thread
+            .run_request(&config, &ThreadTurnRequest::new("plan more"), Vec::new())
+            .expect("second plan turn");
+        assert!(notes_before(&thread, "plan more").is_empty());
+
+        config.approval_mode = ApprovalMode::AutoEdit;
+        thread
+            .run_request(
+                &config,
+                &ThreadTurnRequest::new("implement the approved plan"),
+                Vec::new(),
+            )
+            .expect("implementation turn");
+        assert_eq!(
+            notes_before(&thread, "implement the approved plan"),
+            ["[Plan mode off]"]
+        );
     }
 
     fn assert_controller_failure_persists_error(use_event_factory: bool) {

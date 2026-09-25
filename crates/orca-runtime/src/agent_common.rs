@@ -283,6 +283,54 @@ pub fn mode_context(approval_mode: ApprovalMode) -> Option<String> {
     (approval_mode == ApprovalMode::Plan).then(|| PLAN_MODE_INSTRUCTIONS.to_string())
 }
 
+const PLAN_MODE_ON: &str = "[Plan mode on]";
+const PLAN_MODE_OFF: &str = "[Plan mode off]";
+
+/// The note that records a switch into or out of plan mode where it happens
+/// in the conversation. The Plan Mode instructions live in the mode context,
+/// which sits ahead of the whole history: after a switch mid-session a model
+/// reads them before the turns that ran in another mode, and takes plan mode
+/// for over. `None` while the mode the conversation last noted still holds;
+/// a conversation with no note has never been told plan mode is on.
+pub(crate) fn plan_mode_switch_note(
+    conversation: &orca_core::conversation::Conversation,
+    approval_mode: ApprovalMode,
+) -> Option<String> {
+    let noted_plan = conversation
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            orca_core::conversation::Message::System { content, .. } => {
+                if content.starts_with(PLAN_MODE_ON) {
+                    Some(true)
+                } else if content.starts_with(PLAN_MODE_OFF) {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .unwrap_or(false);
+    let plan = approval_mode == ApprovalMode::Plan;
+    (plan != noted_plan).then(|| {
+        if plan {
+            format!(
+                "{PLAN_MODE_ON}\nPlan mode applies from this message on: follow the Plan Mode \
+                 instructions, investigate without changing anything, ask when a decision is \
+                 needed, and end with exactly one `<proposed_plan>` block for approval."
+            )
+        } else {
+            format!(
+                "{PLAN_MODE_OFF}\nPlan mode no longer applies from this message on: work in the \
+                 current approval mode and carry out what the user asks, including an approved \
+                 plan."
+            )
+        }
+    })
+}
+
 pub(crate) fn mode_context_with_shell_readiness(
     approval_mode: ApprovalMode,
     shell_context: Option<&str>,
