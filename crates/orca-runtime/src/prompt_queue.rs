@@ -67,7 +67,8 @@ impl ClientUserMessageId {
         Ok(Self(value))
     }
 
-    pub(crate) fn turn_id(&self) -> orca_core::thread_identity::TurnId {
+    /// The turn that answers this message once the runtime starts it.
+    pub fn turn_id(&self) -> orca_core::thread_identity::TurnId {
         orca_core::thread_identity::TurnId::parse(format!("turn_{}", self.0))
             .expect("runtime queue client message ids are UUIDv7")
     }

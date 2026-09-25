@@ -3010,9 +3010,8 @@ fn hosted_tui_runtime_queue_continues_after_busy_submission() {
             )
         });
 
-        let second_turn = harness
-            .recv_until(|event| matches!(event, TuiEvent::TurnStarted { turn, .. } if *turn >= 2));
-        assert!(matches!(second_turn, TuiEvent::TurnStarted { turn, .. } if turn >= 2));
+        // The runtime starts the queued message's turn by itself.
+        harness.recv_until(|event| matches!(event, TuiEvent::RuntimeTurnStarted { .. }));
         let echo = harness.recv_until(|event| {
                 matches!(event, TuiEvent::MessageDelta(text) if text.contains("mock_history_echo"))
             });

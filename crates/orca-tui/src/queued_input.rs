@@ -121,6 +121,18 @@ impl QueuedSubmissionState {
         self.error = None;
     }
 
+    fn message_for_turn(&self, turn_id: &str) -> Option<(String, Vec<ComposerImageAttachment>)> {
+        let item = self
+            .projection
+            .items
+            .iter()
+            .find(|item| item.client_user_message_id.turn_id().as_str() == turn_id)?;
+        Some(match self.composers_by_id.get(&item.id) {
+            Some(composer) => (composer.visible_text.clone(), composer.images.clone()),
+            None => (item.input.text.clone(), Vec::new()),
+        })
+    }
+
     fn remember_composer(&mut self, message: QueuedUserMessage) {
         self.pending_composers.push_back(PendingQueuedComposer {
             submission_text: message.submission_text,
@@ -529,6 +541,15 @@ impl AppState {
     ) {
         self.queued_submission
             .replace_runtime_projection(snapshot, None);
+    }
+
+    /// The queued message a turn the runtime started answers, as it was
+    /// typed here when this client queued it.
+    pub(crate) fn queued_message_for_turn(
+        &self,
+        turn_id: &str,
+    ) -> Option<(String, Vec<ComposerImageAttachment>)> {
+        self.queued_submission.message_for_turn(turn_id)
     }
 
     pub(crate) fn remember_runtime_queued_message(&mut self, message: QueuedUserMessage) {

@@ -1257,6 +1257,140 @@ fn proposed_plan_tags_stream_as_dedicated_tui_message() {
     }
 }
 
+fn answered(state: &mut AppState, prompt: &str, answer: &str) {
+    state.push_message(ChatMessage::User(prompt.to_string()));
+    state.update(TuiEvent::MessageDelta(answer.to_string()));
+    state.update(TuiEvent::AssistantResponseCompleted(
+        Some(answer.to_string()),
+        None,
+    ));
+    state.update(TuiEvent::SessionCompleted {
+        status: "success".to_string(),
+    });
+}
+
+fn transcript_lines(state: &AppState) -> Vec<String> {
+    state
+        .transcript
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            ChatMessage::User(text) => Some(format!("user: {text}")),
+            ChatMessage::Assistant(text) | ChatMessage::AssistantChunk { text, .. } => {
+                Some(format!("assistant: {}", text.trim()))
+            }
+            ChatMessage::System { text, .. } => Some(format!("notice: {text}")),
+            ChatMessage::ToolCall { name, .. } => Some(format!("tool: {name}")),
+            _ => None,
+        })
+        .collect()
+}
+
+fn queue_with(text: &str) -> orca_runtime::prompt_queue::PromptQueueSnapshot {
+    let item = orca_runtime::prompt_queue::QueuedSubmission {
+        id: orca_runtime::prompt_queue::QueuedSubmissionId::new(),
+        client_user_message_id: orca_runtime::prompt_queue::ClientUserMessageId::new(),
+        input: orca_runtime::prompt_queue::PromptQueueInput::text(text),
+        created_at_unix_ms: 1,
+        updated_at_unix_ms: 1,
+    };
+    orca_runtime::prompt_queue::PromptQueueSnapshot {
+        items: vec![item],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_queued_message_the_runtime_starts_reads_as_its_own_turn() {
+    let mut state = state();
+    answered(&mut state, "first", "First answer.");
+    let queue = queue_with("queued follow-up");
+    let turn_id = queue.items[0].client_user_message_id.turn_id().to_string();
+    state.update(TuiEvent::PromptQueueUpdated(queue));
+
+    state.update(TuiEvent::RuntimeTurnStarted { turn_id });
+    state.update(TuiEvent::MessageDelta("Second answer.".to_string()));
+    state.update(TuiEvent::AssistantResponseCompleted(
+        Some("Second answer.".to_string()),
+        None,
+    ));
+    state.update(TuiEvent::SessionCompleted {
+        status: "success".to_string(),
+    });
+
+    assert_eq!(
+        transcript_lines(&state),
+        [
+            "user: first",
+            "assistant: First answer.",
+            "user: queued follow-up",
+            "assistant: Second answer.",
+        ]
+    );
+}
+
+#[test]
+fn a_wake_for_finished_agents_keeps_the_answer_before_it() {
+    let mut state = state();
+    answered(&mut state, "first", "First answer.");
+
+    state.update(TuiEvent::RuntimeTurnStarted {
+        turn_id: "turn_wake".to_string(),
+    });
+    state.update(TuiEvent::MessageDelta("The agents found it.".to_string()));
+    state.update(TuiEvent::AssistantResponseCompleted(
+        Some("The agents found it.".to_string()),
+        None,
+    ));
+    state.update(TuiEvent::SessionCompleted {
+        status: "success".to_string(),
+    });
+
+    assert_eq!(
+        transcript_lines(&state),
+        [
+            "user: first",
+            "assistant: First answer.",
+            "notice: Background agents finished; continuing with their results.",
+            "assistant: The agents found it.",
+        ]
+    );
+}
+
+#[test]
+fn a_completed_response_replaces_only_the_text_it_streamed() {
+    let mut state = state();
+    state.push_message(ChatMessage::User("check it".to_string()));
+    state.update(TuiEvent::MessageDelta("Let me look.".to_string()));
+    state.update(TuiEvent::AssistantResponseCompleted(
+        Some("Let me look.".to_string()),
+        None,
+    ));
+    state.update(TuiEvent::ToolRequested {
+        id: "tool-1".to_string(),
+        name: "read".to_string(),
+        target: Some("README.md".to_string()),
+    });
+    state.update(TuiEvent::MessageDelta("It says hello.".to_string()));
+    state.update(TuiEvent::AssistantResponseCompleted(
+        Some("It says hello.".to_string()),
+        None,
+    ));
+    state.update(TuiEvent::SessionCompleted {
+        status: "success".to_string(),
+    });
+
+    assert_eq!(
+        transcript_lines(&state),
+        [
+            "user: check it",
+            "assistant: Let me look.",
+            "tool: read",
+            "assistant: It says hello.",
+        ]
+    );
+}
+
 #[test]
 fn a_plan_streamed_apart_from_the_message_opens_the_plan_approval() {
     // The runtime splits a proposed plan out of the reply onto its own

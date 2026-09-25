@@ -271,13 +271,18 @@ fn permission_kind(
 fn runtime_event_to_tui(event: &EventEnvelope) -> Option<TuiEvent> {
     let string = |key: &str| event.payload.get(key).and_then(|value| value.as_str());
     match event.event_type {
-        EventType::TurnStarted => Some(TuiEvent::TurnStarted {
-            turn: event
-                .payload
-                .get("turn")
-                .and_then(|value| value.as_u64())
-                .unwrap_or_default() as u32,
-            task: None,
+        EventType::TurnStarted => Some(match string("turn_id") {
+            Some(turn_id) => TuiEvent::RuntimeTurnStarted {
+                turn_id: turn_id.to_string(),
+            },
+            None => TuiEvent::TurnStarted {
+                turn: event
+                    .payload
+                    .get("turn")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or_default() as u32,
+                task: None,
+            },
         }),
         EventType::AssistantReasoningDelta => {
             Some(TuiEvent::ReasoningDelta(string("text")?.to_string()))
@@ -913,6 +918,31 @@ mod tests {
             runtime_event_to_tui(&completed_response),
             Some(TuiEvent::AssistantResponseCompleted(Some(message), Some(reasoning)))
                 if message == "final answer" && reasoning == "final reasoning"
+        ));
+    }
+
+    #[test]
+    fn a_turn_the_runtime_starts_is_announced_by_its_turn_id() {
+        let started = |payload| EventEnvelope {
+            version: "1".to_string(),
+            run_id: "run".to_string(),
+            seq: 1,
+            timestamp_ms: 0,
+            event_type: EventType::TurnStarted,
+            payload,
+        };
+        // Every round of a turn the runtime started names the turn, so the
+        // transcript can tell a new turn from its next tool round.
+        assert!(matches!(
+            runtime_event_to_tui(&started(serde_json::json!({
+                "turn_id": "turn_queued",
+                "turn": 2
+            }))),
+            Some(TuiEvent::RuntimeTurnStarted { turn_id }) if turn_id == "turn_queued"
+        ));
+        assert!(matches!(
+            runtime_event_to_tui(&started(serde_json::json!({ "turn": 2 }))),
+            Some(TuiEvent::TurnStarted { turn: 2, .. })
         ));
     }
 

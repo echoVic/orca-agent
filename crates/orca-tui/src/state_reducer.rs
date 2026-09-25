@@ -198,6 +198,27 @@ impl AppState {
                 self.suppress_background_main_session_output = false;
                 self.enter_running();
             }
+            TuiEvent::RuntimeTurnStarted { turn_id } => {
+                self.invalidate_recap();
+                self.suppress_background_main_session_output = false;
+                self.enter_running();
+                if self.runtime_turn_id.as_deref() != Some(turn_id.as_str()) {
+                    // Nobody typed this turn here: it answers the next queued
+                    // message, or wakes for agents that finished. Say which,
+                    // so its reply reads as a new one.
+                    self.finish_assistant_stream();
+                    match self.queued_message_for_turn(&turn_id) {
+                        Some((text, images)) => self.push_user_message_with_images(text, &images),
+                        None => self.push_message(ChatMessage::System {
+                            text: "Background agents finished; continuing with their results."
+                                .to_string(),
+                            expanded: false,
+                        }),
+                    }
+                    self.scroll_to_bottom();
+                    self.runtime_turn_id = Some(turn_id);
+                }
+            }
             TuiEvent::QueuedSubmissionStarted { id } => {
                 let _ = id;
                 self.enter_running();
@@ -1152,26 +1173,24 @@ impl AppState {
         message: Option<&str>,
         reasoning: Option<&str>,
     ) {
-        let last_user = self
-            .transcript
-            .messages
-            .iter()
-            .rposition(|item| matches!(item, ChatMessage::User(_)));
-        if let Some(last_user) = last_user {
-            let mut index = 0;
-            self.retain_messages(|item| {
-                let keep = index <= last_user
-                    || !matches!(
-                        item,
-                        ChatMessage::Reasoning { .. }
-                            | ChatMessage::Assistant(_)
-                            | ChatMessage::AssistantChunk { .. }
-                            | ChatMessage::ProposedPlan(_)
-                    );
-                index += 1;
-                keep
-            });
-        }
+        // The response's own streamed text is what trails the transcript:
+        // the text before the last tool row, notice, or message belongs to
+        // an earlier round or reply and stays.
+        let boundary = self.transcript.messages.iter().rposition(|item| {
+            !matches!(
+                item,
+                ChatMessage::Reasoning { .. }
+                    | ChatMessage::Assistant(_)
+                    | ChatMessage::AssistantChunk { .. }
+                    | ChatMessage::ProposedPlan(_)
+            )
+        });
+        let mut index = 0;
+        self.retain_messages(|_| {
+            let keep = boundary.is_some_and(|boundary| index <= boundary);
+            index += 1;
+            keep
+        });
         self.transcript.proposed_plan_parser = ProposedPlanStreamParser::default();
         // Streaming markdown may still hold an unfinished partial line from the
         // content being replaced; drop it so the completed response renders alone.

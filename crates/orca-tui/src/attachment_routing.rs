@@ -323,7 +323,9 @@ pub(crate) fn send_attached_event(
 
 fn side_parent_status_for_event(event: &TuiEvent) -> Option<SideParentStatus> {
     match event {
-        TuiEvent::TurnStarted { .. } => Some(SideParentStatus::Running),
+        TuiEvent::TurnStarted { .. } | TuiEvent::RuntimeTurnStarted { .. } => {
+            Some(SideParentStatus::Running)
+        }
         TuiEvent::ApprovalNeeded { .. }
         | TuiEvent::PermissionApprovalNeeded { .. }
         | TuiEvent::McpElicitationRequested { .. } => Some(SideParentStatus::NeedsApproval),
@@ -571,5 +573,15 @@ mod tests {
         assert_eq!(first_child.value(), 2);
         assert_eq!(second_child.value(), 3);
         assert_ne!(first_child, second_child);
+    }
+
+    #[test]
+    fn a_turn_the_runtime_starts_marks_the_side_parent_running() {
+        assert!(matches!(
+            super::side_parent_status_for_event(&TuiEvent::RuntimeTurnStarted {
+                turn_id: "turn_queued".to_string(),
+            }),
+            Some(SideParentStatus::Running)
+        ));
     }
 }

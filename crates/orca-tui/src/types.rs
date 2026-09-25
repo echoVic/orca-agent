@@ -454,6 +454,9 @@ pub struct AppState {
     pub approval_allowlist: std::collections::HashSet<String>,
     /// Parked background tool calls already resumed on the session's policy.
     pub(crate) continued_background_approvals: std::collections::HashSet<String>,
+    /// The turn the runtime last started by itself, so its later tool rounds
+    /// are not taken for a new turn.
+    pub(crate) runtime_turn_id: Option<String>,
     pub setup_step: u8,
     pub setup_selection: u8,
     /// Runtime-owned first-run disclosure state. The TUI may render and
@@ -805,6 +808,7 @@ impl AppState {
             interaction: InteractionState::default(),
             approval_allowlist: std::collections::HashSet::new(),
             continued_background_approvals: std::collections::HashSet::new(),
+            runtime_turn_id: None,
             setup_step: 0,
             setup_selection: 0,
             first_run: None,

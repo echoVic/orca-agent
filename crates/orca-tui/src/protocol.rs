@@ -379,6 +379,12 @@ pub enum TuiEvent {
     SavedSessionActionFailed(String),
     StartupWarning(String),
     Notice(String),
+    /// A round of a turn the runtime started by itself (the next queued
+    /// message, or a wake for background agents that finished); `turn_id`
+    /// names the turn, the same for each of its rounds.
+    RuntimeTurnStarted {
+        turn_id: String,
+    },
     /// A turn moved to the background parked on a tool call that needs an
     /// answer before it can continue.
     BackgroundApprovalNeeded {

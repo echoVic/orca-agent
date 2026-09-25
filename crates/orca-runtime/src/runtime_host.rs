@@ -39255,6 +39255,58 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_prompt_turn_announces_itself_by_its_queue_turn_id() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start prompt queue host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "queued turn identity",
+            )
+            .expect("start prompt queue thread");
+        let (events_tx, events_rx) = mpsc::channel();
+        thread.set_prompt_queue_event_observer(Arc::new(
+            move |event: &orca_core::event_schema::EventEnvelope| {
+                let _ = events_tx.send(event.clone());
+                Ok(())
+            },
+        ));
+        let running = thread
+            .start_turn(
+                HostedTurnRequest::new("mock_stream_delay_ms 250"),
+                io::sink(),
+            )
+            .expect("start active turn");
+        // A queued message whose turn runs a tool round before it answers.
+        let queued = thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text("task_list"),
+            })
+            .expect("queue follow-up");
+        let turn_id = serde_json::json!(queued.items[0].client_user_message_id.turn_id());
+        running.wait();
+
+        // A client showing the queue can tell which of its items a turn the
+        // runtime started answers, and a tool round from a new turn: every
+        // round opens with the item's turn id.
+        let mut rounds = Vec::new();
+        loop {
+            let event = events_rx
+                .recv_timeout(SURFACE_TEST_TIMEOUT)
+                .expect("queued turn events");
+            match event.event_type {
+                orca_core::event_schema::EventType::TurnStarted => {
+                    rounds.push(event.payload["turn_id"].clone());
+                }
+                orca_core::event_schema::EventType::SessionCompleted => break,
+                _ => {}
+            }
+        }
+        assert_eq!(rounds, [turn_id.clone(), turn_id]);
+        host.shutdown().expect("shutdown prompt queue host");
+    }
+
+    #[test]
     fn recorded_prompt_queue_recovers_stable_ids_after_cold_restart_bits_spec_ut() {
         let cwd = tempfile::tempdir().unwrap();
         let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
