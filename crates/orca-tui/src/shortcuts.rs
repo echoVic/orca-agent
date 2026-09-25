@@ -727,7 +727,7 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     ShortcutHint {
         scope: ShortcutScope::Idle,
         keys: "esc",
-        action: "backtrack only when input is empty",
+        action: "clear draft (up restores it); else backtrack",
     },
     ShortcutHint {
         scope: ShortcutScope::Idle,
@@ -806,8 +806,13 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     },
     ShortcutHint {
         scope: ShortcutScope::Approval,
-        keys: "4",
+        keys: "4 / esc",
         action: "deny",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Approval,
+        keys: "pgup/pgdn",
+        action: "page through a long preview",
     },
     ShortcutHint {
         scope: ShortcutScope::Approval,
