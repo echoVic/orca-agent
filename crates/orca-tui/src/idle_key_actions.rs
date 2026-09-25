@@ -349,6 +349,116 @@ mod tests {
         assert!(action_rx.try_recv().is_err(), "and does not backtrack");
     }
 
+    fn press_idle(
+        code: KeyCode,
+        state: &mut AppState,
+        textarea: &mut TextArea,
+        vim: &mut VimState,
+        action_tx: &mpsc::Sender<UserAction>,
+    ) {
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let key = KeyEvent::new(code, KeyModifiers::NONE);
+        handle_idle_key(
+            &Event::Key(key),
+            &key,
+            state,
+            &mut config,
+            &shared,
+            action_tx,
+            textarea,
+            vim,
+            &theme,
+        );
+    }
+
+    #[test]
+    fn a_draft_cleared_with_esc_is_one_up_arrow_away() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = crate::types::AppStatus::Idle;
+        state.record_prompt("an earlier prompt".to_string());
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let draft = "a long follow-up [Pasted Content 12 chars]";
+        let mut textarea = make_textarea_with_text(draft, &vim, &theme);
+        state.pending_pastes = vec![(
+            "[Pasted Content 12 chars]".to_string(),
+            "pasted body!".to_string(),
+        )];
+
+        press_idle(
+            KeyCode::Esc,
+            &mut state,
+            &mut textarea,
+            &mut vim,
+            &action_tx,
+        );
+        assert!(textarea.is_empty(), "Esc clears the draft");
+        assert!(state.pending_pastes.is_empty());
+        assert_eq!(
+            textarea.placeholder_text(),
+            "Draft cleared · ↑ brings it back"
+        );
+
+        press_idle(KeyCode::Up, &mut state, &mut textarea, &mut vim, &action_tx);
+        assert_eq!(crate::composer_textarea::textarea_text(&textarea), draft);
+        assert_eq!(
+            state.pending_pastes,
+            vec![(
+                "[Pasted Content 12 chars]".to_string(),
+                "pasted body!".to_string()
+            )],
+            "the pasted content comes back with its placeholder"
+        );
+    }
+
+    #[test]
+    fn sending_a_message_forgets_a_cleared_draft() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = crate::types::AppStatus::Idle;
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("the cleared draft", &vim, &theme);
+        press_idle(
+            KeyCode::Esc,
+            &mut state,
+            &mut textarea,
+            &mut vim,
+            &action_tx,
+        );
+
+        textarea = make_textarea_with_text("what I sent instead", &vim, &theme);
+        press_idle(
+            KeyCode::Enter,
+            &mut state,
+            &mut textarea,
+            &mut vim,
+            &action_tx,
+        );
+        assert!(textarea.is_empty(), "the message was sent");
+        state.status = crate::types::AppStatus::Idle;
+
+        press_idle(KeyCode::Up, &mut state, &mut textarea, &mut vim, &action_tx);
+        assert_eq!(
+            crate::composer_textarea::textarea_text(&textarea),
+            "what I sent instead",
+            "↑ walks the history again once the conversation moved on"
+        );
+    }
+
     #[test]
     fn esc_still_backtracks_when_the_composer_is_empty() {
         let (action_tx, action_rx) = mpsc::unbounded();

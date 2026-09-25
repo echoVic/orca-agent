@@ -1266,16 +1266,8 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     1,
   ],
   [
-    "crates/orca-tui/src/composer_input_actions.rs:clear_composer_input:state.mention_bindings.clear",
-    1,
-  ],
-  [
-    "crates/orca-tui/src/composer_input_actions.rs:clear_composer_input:state.pending_pastes.clear",
-    1,
-  ],
-  [
     "crates/orca-tui/src/composer_input_actions.rs:recall_previous_history:state.atomic_skill_tokens.clear",
-    1,
+    2,
   ],
   [
     "crates/orca-tui/src/composer_input_actions.rs:recall_next_history:state.atomic_skill_tokens.clear",

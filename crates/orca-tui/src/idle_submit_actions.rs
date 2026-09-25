@@ -238,6 +238,7 @@ fn reset_composer_after_submit(
     vim_state.reset_insert(textarea, theme);
     sync_vim_mode_label(state, vim_state);
     *textarea = make_textarea(vim_state, theme);
+    state.cleared_draft = None;
 }
 
 #[cfg(test)]

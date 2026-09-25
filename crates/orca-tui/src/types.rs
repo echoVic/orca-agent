@@ -461,6 +461,10 @@ pub struct AppState {
     pub show_shortcuts: bool,
     pub input_history: Vec<String>,
     pub(crate) pending_pastes: Vec<(String, String)>,
+    /// The draft Esc or Ctrl+U last cleared, with its pastes, images and
+    /// mentions: ↑ on the empty composer brings it back, and sending a
+    /// message forgets it.
+    pub(crate) cleared_draft: Option<crate::queued_input::QueuedComposerState>,
     pub(crate) composer_images: ComposerImageState,
     pub(crate) queued_submission: QueuedSubmissionState,
     pub history_cursor: Option<usize>,
@@ -805,6 +809,7 @@ impl AppState {
             show_shortcuts: false,
             input_history: load_input_history(),
             pending_pastes: Vec::new(),
+            cleared_draft: None,
             composer_images: ComposerImageState::default(),
             queued_submission: QueuedSubmissionState::default(),
             history_cursor: None,

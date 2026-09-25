@@ -64,6 +64,7 @@ pub(crate) fn enqueue_composer_follow_up(
     state.composer_images.clear_attachments();
     state.mention_bindings.clear();
     state.atomic_skill_tokens.clear();
+    state.cleared_draft = None;
     state.reset_history_navigation();
     vim_state.reset_insert(textarea, theme);
     sync_vim_mode_label(state, vim_state);
@@ -162,6 +163,7 @@ fn send_composer_follow_up(
     state.composer_images.clear_attachments();
     state.mention_bindings.clear();
     state.atomic_skill_tokens.clear();
+    state.cleared_draft = None;
     state.reset_history_navigation();
     vim_state.reset_insert(textarea, theme);
     sync_vim_mode_label(state, vim_state);
@@ -519,6 +521,52 @@ mod tests {
             "the dispatcher decides between steering and queueing; nothing else is sent"
         );
     }
+    #[test]
+    fn a_follow_up_sent_during_a_turn_forgets_a_cleared_draft() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = state_with_tx(action_tx.clone());
+        let theme = theme();
+        let mut vim = VimState::new(false);
+        let mut config = crate::test_support::test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let ctrl_u = KeyEvent::new(KeyCode::Char('u'), crossterm::event::KeyModifiers::CONTROL);
+        let enter = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+
+        let mut textarea = make_textarea_with_text("a draft to drop", &vim, &theme);
+        handle_running_key(
+            &Event::Key(ctrl_u),
+            &ctrl_u,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert!(
+            state.cleared_draft.is_some(),
+            "Ctrl+U keeps what it cleared"
+        );
+
+        textarea = make_textarea_with_text("the follow-up I sent", &vim, &theme);
+        assert!(handle_running_key(
+            &Event::Key(enter),
+            &enter,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        assert!(
+            state.cleared_draft.is_none(),
+            "a sent follow-up leaves nothing for ↑ to bring back"
+        );
+    }
+
     #[test]
     fn plain_enter_queues_without_reordering() {
         let (action_tx, action_rx) = mpsc::unbounded();

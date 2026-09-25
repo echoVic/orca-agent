@@ -39,15 +39,22 @@ pub(crate) fn clear_composer_input(
         return false;
     }
 
+    let visible_text = textarea_text(textarea);
+    let images = state.composer_images.attachments_for_text(&visible_text);
+    state.cleared_draft = Some(crate::queued_input::QueuedComposerState {
+        visible_text,
+        mention_bindings: std::mem::take(&mut state.mention_bindings),
+        pending_pastes: std::mem::take(&mut state.pending_pastes),
+        images,
+    });
     state.slash_menu = None;
     state.mention.clear_projection();
-    state.pending_pastes.clear();
     state.composer_images.clear_attachments();
-    state.mention_bindings.clear();
     state.atomic_skill_tokens.clear();
     state.reset_history_navigation();
     vim_state.cancel_pending_command();
     *textarea = make_textarea(vim_state, theme);
+    textarea.set_placeholder_text("Draft cleared · ↑ brings it back");
     true
 }
 
@@ -127,6 +134,16 @@ pub(crate) fn recall_previous_history(
 ) {
     if key.code == KeyCode::Up && textarea.lines().len() > 1 {
         textarea.input(Input::from(ev.clone()));
+    } else if textarea.is_empty()
+        && let Some(cleared) = state.cleared_draft.take()
+    {
+        // The draft Esc or Ctrl+U just cleared comes back before the history.
+        *textarea = make_textarea_with_text(&cleared.visible_text, vim_state, theme);
+        state.mention_bindings = cleared.mention_bindings;
+        state.pending_pastes = cleared.pending_pastes;
+        state.composer_images.restore(cleared.images);
+        state.atomic_skill_tokens.clear();
+        state.reset_history_navigation();
     } else {
         let draft = textarea_text(textarea);
         if let Some(history) = state.history_previous(draft) {
