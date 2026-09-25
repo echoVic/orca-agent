@@ -304,22 +304,10 @@ const copy = {
     },
     tui: {
       user: "fix the failing auth test",
-      reasoning: "reasoning",
       reason1: "locating the failing case, checking the token-expiry comparison…",
       reason2Prefix: "expiry uses",
       reason2Middle: "; the boundary second is wrongly valid — should be",
-      approve: "⚑ approval · edit src/auth/token.rs",
-      approved: "approved",
-      grepResult: "→ 3 assertions matched",
-      readResult: "→ read 86 lines",
-      editResult: "→ 1 change written",
-      bashResult: "→ running 4 tests…",
-      ok: "✓ test auth::token_expiry ... ok · 4 passed",
-      done: "✓ done · 1 file changed · cargo test passed · exit 0",
-      footerBacktrack: "backtrack",
-      footerGoal: "goal",
-      footerExit: "exit",
-      statusContext: "context",
+      reply: "Fixed: token_valid now rejects the expiry second itself, and cargo test auth passes.",
     },
   },
   zh: {
@@ -576,22 +564,10 @@ const copy = {
     },
     tui: {
       user: "修复失败的 auth 测试",
-      reasoning: "推理",
-      reason1: "定位失败用例，检查 token 过期时间比较…",
-      reason2Prefix: "过期判断使用了",
-      reason2Middle: "；边界秒被错误地视为有效，应该改为",
-      approve: "⚑ 审批 · edit src/auth/token.rs",
-      approved: "已批准",
-      grepResult: "→ 匹配到 3 个断言",
-      readResult: "→ 读取 86 行",
-      editResult: "→ 写入 1 处修改",
-      bashResult: "→ 正在运行 4 个测试…",
-      ok: "✓ test auth::token_expiry ... ok · 4 passed",
-      done: "✓ 完成 · 修改 1 个文件 · cargo test 通过 · exit 0",
-      footerBacktrack: "回退",
-      footerGoal: "目标",
-      footerExit: "退出",
-      statusContext: "上下文",
+      reason1: "定位失败用例，检查 token 过期时间的比较…",
+      reason2Prefix: "过期判断用的是",
+      reason2Middle: "，边界那一秒被当成有效，应改为",
+      reply: "已修复：token_valid 现在会拒绝过期的那一秒，cargo test auth 通过。",
     },
   },
 } as const;
@@ -695,99 +671,130 @@ async function copyCommandText(command: string) {
 }
 
 type TuiBlock = {
-  kind: "user" | "reason" | "tool" | "approve" | "ok" | "done";
+  kind: "user" | "reason" | "tool" | "reply";
   content: ReactNode;
+  /** Share of the context window in use once this block has streamed. */
   ctx: number;
+  /** What the activity line says while the next block is on its way. */
+  activity: string;
+  /** A tool call waiting on approval: the approval panel takes the input's
+      place, and the row gives way to the tool's result once it is allowed. */
+  awaitsApproval?: boolean;
+  /** How long the block stays the latest before the next one streams, in ms. */
+  hold?: number;
 };
 
+const approvalOptions = [
+  { key: "1", label: "Allow once", detail: "run it now" },
+  { key: "2", label: "Allow this exact call", detail: "remember only this exact call" },
+  { key: "3", label: "Allow edit this session", detail: "skip approval for this tool until you quit" },
+  { key: "4", label: "Deny", detail: "ask Orca for another way" },
+];
+const approvalLabelWidth = Math.max(...approvalOptions.map((option) => option.label.length));
+
+// The terminal UI itself is English in every locale; only the conversation
+// (the user's message, the model's thinking and reply) follows the page.
 function makeTuiBlocks(t: (typeof copy)[Locale]): TuiBlock[] {
+  const tool = (
+    glyph: string,
+    name: string,
+    arg: string,
+    lines: { rail: "│" | "└"; text: string }[],
+    edited = false,
+  ) => (
+    <div className="tool">
+      <div className="th">
+        <span className={edited ? "st edited" : "st"}>{glyph}</span> <span className="nm">{name}</span>{" "}
+        <span className="arg">{arg}</span>
+      </div>
+      {lines.map((line) => (
+        <div key={line.text} className="res">
+          <span className="rail">{line.rail}</span> {line.text}
+        </div>
+      ))}
+    </div>
+  );
   return [
-    { kind: "user", ctx: 12, content: <><span className="who">you ›</span> {t.tui.user}</> },
     {
-      kind: "reason",
-      ctx: 21,
+      kind: "user",
+      ctx: 2,
+      activity: "thinking",
       content: (
-        <div className="tb-reason">
-          <span className="lbl">{t.tui.reasoning}</span>
-          {t.tui.reason1}
-        </div>
-      ),
-    },
-    {
-      kind: "tool",
-      ctx: 30,
-      content: (
-        <div className="tb-tool">
-          <div className="th">
-            <span className="ic" />
-            grep <span className="arg">"assert_eq" tests/auth.rs</span>
-          </div>
-          <div className="res">{t.tui.grepResult}</div>
-        </div>
-      ),
-    },
-    {
-      kind: "tool",
-      ctx: 38,
-      content: (
-        <div className="tb-tool">
-          <div className="th">
-            <span className="ic" />
-            read_file <span className="arg">src/auth/token.rs</span>
-          </div>
-          <div className="res">{t.tui.readResult}</div>
-        </div>
+        <>
+          <span className="mark">›</span> {t.tui.user}
+        </>
       ),
     },
     {
       kind: "reason",
-      ctx: 47,
+      ctx: 3,
+      activity: 'grep "assert_eq" tests/auth.rs',
       content: (
-        <div className="tb-reason">
-          <span className="lbl">{t.tui.reasoning}</span>
-          {t.tui.reason2Prefix} <span style={{ color: "var(--warn)" }}>&lt;=</span>
-          {t.tui.reason2Middle} <span style={{ color: "var(--accent-2)" }}>&lt;</span>.
-        </div>
-      ),
-    },
-    {
-      kind: "approve",
-      ctx: 53,
-      content: (
-        <div className="tb-approve">
-          {t.tui.approve}
-          <span className="chip">{t.tui.approved}</span>
-        </div>
+        <>
+          <span className="mark">⋯</span> thinking · {t.tui.reason1}
+        </>
       ),
     },
     {
       kind: "tool",
-      ctx: 61,
+      ctx: 4,
+      activity: "read src/auth/token.rs",
+      content: tool("✓", "grep", '"assert_eq" tests/auth.rs', [{ rail: "│", text: "3 matches" }]),
+    },
+    {
+      kind: "tool",
+      ctx: 5,
+      activity: "thinking",
+      content: tool("✓", "read", "src/auth/token.rs", [
+        { rail: "│", text: "pub fn token_valid(now: u64, expiry: u64) -> bool {" },
+        { rail: "└", text: "+84 lines · e to expand" },
+      ]),
+    },
+    {
+      kind: "reason",
+      ctx: 6,
+      activity: "edit src/auth/token.rs",
       content: (
-        <div className="tb-tool">
-          <div className="th">
-            <span className="ic" />
-            edit <span className="arg">src/auth/token.rs</span>
-          </div>
-          <div className="res">{t.tui.editResult}</div>
-        </div>
+        <>
+          <span className="mark">⋯</span> thinking · {t.tui.reason2Prefix}{" "}
+          <span className="warn">&lt;=</span>
+          {t.tui.reason2Middle} <span className="good">&lt;</span>
+        </>
       ),
     },
     {
       kind: "tool",
-      ctx: 72,
+      ctx: 6,
+      activity: "edit src/auth/token.rs",
+      awaitsApproval: true,
+      hold: 2600,
+      content: tool("⠦", "edit", "src/auth/token.rs", []),
+    },
+    {
+      kind: "tool",
+      ctx: 7,
+      activity: "bash cargo test auth",
+      content: tool("✎", "edit", "src/auth/token.rs", [{ rail: "│", text: "edited src/auth/token.rs" }], true),
+    },
+    {
+      kind: "tool",
+      ctx: 9,
+      activity: "thinking",
+      content: tool("✓", "bash", "cargo test auth", [
+        { rail: "│", text: "test auth::token_expiry ... ok" },
+        { rail: "└", text: "+3 lines · e to expand" },
+      ]),
+    },
+    {
+      kind: "reply",
+      ctx: 10,
+      activity: "",
       content: (
-        <div className="tb-tool">
-          <div className="th">
-            <span className="ic" />
-            bash <span className="arg">cargo test auth</span>
-          </div>
-          <div className="res">{t.tui.bashResult}</div>
-        </div>
+        <>
+          <span className="mark">●</span> {t.tui.reply}
+        </>
       ),
     },
-    { kind: "ok", ctx: 78, content: <div className="tb-ok">{t.tui.ok}</div> },
-    { kind: "done", ctx: 80, content: <div className="tb-done">{t.tui.done}</div> },
   ];
 }
 
@@ -870,11 +877,6 @@ function renderCodeTab(tab: CodeTab, t: (typeof copy)[Locale]) {
   return tabs[tab];
 }
 
-function ctxBar(pct: number) {
-  const filled = Math.round(pct / 10);
-  return "█".repeat(filled) + "░".repeat(10 - filled);
-}
-
 function useTuiAnimation(tuiBlocks: TuiBlock[], tuiUserMsg: string) {
   const [visibleCount, setVisibleCount] = useState(0);
   const [typed, setTyped] = useState("");
@@ -921,7 +923,7 @@ function useTuiAnimation(tuiBlocks: TuiBlock[], tuiUserMsg: string) {
           n += 1;
           setVisibleCount(n);
           if (n < tuiBlocks.length) {
-            timers.push(window.setTimeout(reveal, 560));
+            timers.push(window.setTimeout(reveal, tuiBlocks[n - 1].hold ?? 560));
           } else {
             timers.push(window.setTimeout(run, 4200));
           }
@@ -940,8 +942,13 @@ function useTuiAnimation(tuiBlocks: TuiBlock[], tuiUserMsg: string) {
     };
   }, [tuiBlocks, tuiUserMsg]);
 
-  const ctx = visibleCount > 0 ? tuiBlocks[visibleCount - 1].ctx : 8;
-  return { visibleCount, typed, phase, ctx };
+  const last = visibleCount > 0 ? tuiBlocks[visibleCount - 1] : undefined;
+  const ctx = last?.ctx ?? 1;
+  // The activity line runs from sending the message until the reply lands.
+  const running = phase === "streaming" && visibleCount < tuiBlocks.length;
+  const activity = last?.activity ?? "thinking";
+  const awaitingApproval = running && last?.awaitsApproval === true;
+  return { visibleCount, typed, phase, ctx, running, activity, awaitingApproval };
 }
 
 function App() {
@@ -1142,35 +1149,68 @@ function App() {
             <span />
             <span className="terminal-title">orca · TUI — ~/projects/api</span>
           </div>
-          <div className="tui-status">
-            <span>
-              <span className="accent">orca</span>{" "}
-              <span className="dim">deepseek-v4-pro</span> ·{" "}
-              <span className="dim">full-auto</span>
-            </span>
-            <span className="tui-ctx">
-              {t.tui.statusContext} <span className="bar">{ctxBar(tui.ctx)}</span> {tui.ctx}%
-            </span>
-          </div>
           <div className="tui-body" aria-hidden="true">
-            {tuiBlocks.slice(0, tui.visibleCount).map((block, index) => (
-              <div key={index} className={`tb tb-${block.kind}`}>
-                {block.content}
+            {tuiBlocks.slice(0, tui.visibleCount).map((block, index) =>
+              block.awaitsApproval && index < tui.visibleCount - 1 ? null : (
+                <div key={index} className={`tb tb-${block.kind}${block.awaitsApproval ? " pending" : ""}`}>
+                  {block.content}
+                </div>
+              ),
+            )}
+          </div>
+          {tui.awaitingApproval ? (
+            <div className="tui-activity waiting" aria-hidden="true">
+              ● Waiting for your approval
+            </div>
+          ) : (
+            tui.running && (
+              <div className="tui-activity" aria-hidden="true">
+                <span className="run">⠼ Running {tui.visibleCount * 2 + 1}s</span> · {tui.activity}{" "}
+                <span className="dim">· Esc interrupt</span>
               </div>
-            ))}
-          </div>
-          <div className="tui-composer">
-            <span className="prompt">›</span>
-            <span className="input">{tui.phase === "typing" ? tui.typed : ""}</span>
-            <span className="tui-cur" />
-          </div>
-          <div className="tui-foot">
-            <span>
-              <span className="key">esc</span> {t.tui.footerBacktrack} ·{" "}
-              <span className="key">/goal</span> {t.tui.footerGoal} ·{" "}
-              <span className="key">^c</span> {t.tui.footerExit}
+            )
+          )}
+          {tui.awaitingApproval ? (
+            <div className="tui-approval" aria-hidden="true">
+              <div className="ttl">Approve · edit</div>
+              <div>src/auth/token.rs</div>
+              <div className="diff">
+                <span className="rail">│</span> <span className="del">-{"    "}now &lt;= expiry</span>
+              </div>
+              <div className="diff">
+                <span className="rail">│</span> <span className="add">+{"    "}now &lt; expiry</span>
+              </div>
+              {approvalOptions.map((option, index) => (
+                <div key={option.key} className={index === 0 ? "opt sel" : "opt"}>
+                  <span className="mk">{index === 0 ? "›" : " "}</span> {option.key}{"  "}
+                  <span className="lbl">{option.label.padEnd(approvalLabelWidth)}</span>
+                  {"  "}
+                  <span className="dim">{option.detail}</span>
+                </div>
+              ))}
+              <div className="hint">
+                <span className="key">↑↓</span> move · <span className="key">1/2/3/4</span> pick ·{" "}
+                <span className="key">Enter</span> confirm · <span className="key">Esc</span> deny
+              </div>
+            </div>
+          ) : (
+            <div className="tui-composer">
+              <span className="prompt">›</span>
+              {tui.phase === "typing" && tui.typed ? (
+                <span className="input">{tui.typed}</span>
+              ) : (
+                <span className="placeholder">Message Orca…&nbsp; / commands · @ files · $ skills</span>
+              )}
+              <span className="tui-cur" />
+            </div>
+          )}
+          <div className="tui-status">
+            <span className="mode">
+              <span className="key">⇧Tab</span> suggest
             </span>
-            <span className="dim">1M · {releaseVersion}</span>
+            <span className="model">
+              deepseek-flash · max · ctx {100 - tui.ctx}% · <span className="key">?</span> help
+            </span>
           </div>
         </div>
       </section>

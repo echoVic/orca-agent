@@ -527,46 +527,13 @@ pre {
   letter-spacing: 0.02em;
 }
 
-/* TUI status bar */
-.tui-status {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 9px 16px;
-  border-bottom: 1px solid var(--border-soft);
-  background: var(--accent-soft);
-  font-family: var(--font-mono);
-  font-size: 0.7rem;
-  color: var(--muted);
-}
-
-.tui-status .accent {
-  color: var(--accent);
-  font-weight: 600;
-}
-
-.tui-status .dim {
-  color: var(--faint);
-}
-
-.tui-ctx {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-}
-
-.tui-ctx .bar {
-  letter-spacing: 1px;
-  color: var(--accent);
-}
-
-/* TUI body */
+/* TUI body: the conversation reads like the terminal UI, one line per row
+   with a mark in the gutter. */
 .tui-body {
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
   min-height: 320px;
   padding: 16px 18px;
   font-family: var(--font-mono);
@@ -587,110 +554,189 @@ pre {
   }
 }
 
-.tb-user .who {
+.tb .mark {
+  display: inline-block;
+  width: 1.4em;
+  color: var(--faint);
+}
+
+/* A message that wraps continues under its text, not under the mark. */
+.tb-user,
+.tb-reply {
+  padding-left: 1.4em;
+}
+
+.tb-user .mark,
+.tb-reply .mark {
+  margin-left: -1.4em;
+}
+
+.tb-user .mark {
   color: var(--accent);
   font-weight: 600;
 }
 
-.tb-reason {
-  margin: 2px 0;
-  padding: 4px 0 4px 12px;
-  border-left: 2px solid color-mix(in oklch, var(--accent) 45%, transparent);
-  color: var(--muted);
-  font-size: 0.76rem;
+.tb-reply .mark {
+  color: var(--accent-2);
 }
 
-.tb-reason .lbl {
-  display: block;
-  margin-bottom: 2px;
-  color: var(--accent);
-  font-size: 0.62rem;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+.tb-reason {
+  padding-left: 1.4em;
+  color: var(--faint);
+  font-size: 0.76rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tb-reason .mark {
+  width: 1.4em;
+  margin-left: -1.4em;
+}
+
+.tb-reason .warn {
+  color: var(--warn);
+}
+
+.tb-reason .good {
+  color: var(--accent-2);
 }
 
 .tb-tool {
-  margin: 2px 0;
-  padding: 8px 11px;
-  border: 1px solid var(--border-soft);
-  border-radius: 8px;
-  background: color-mix(in oklch, var(--surface) 60%, transparent);
-  font-size: 0.74rem;
+  padding-left: 1.4em;
+  font-size: 0.76rem;
 }
 
 .tb-tool .th {
-  display: flex;
-  align-items: center;
-  gap: 7px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tb-tool .st {
+  color: var(--accent-2);
+}
+
+.tb-tool .st.edited {
   color: oklch(78% 0.1 290);
 }
 
-.tb-tool .th .ic {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: oklch(78% 0.1 290);
+.tb-tool .nm {
+  color: var(--fg);
+  font-weight: 600;
 }
 
 .tb-tool .arg {
-  color: var(--fg);
+  color: var(--muted);
 }
 
 .tb-tool .res {
-  margin-top: 3px;
-  padding-left: 13px;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tb-tool .rail {
+  color: var(--border);
+}
+
+.tb-tool.pending .st {
+  color: var(--warn);
+}
+
+.tb-reply {
+  color: var(--fg);
+}
+
+/* TUI activity line, composer, and status bar */
+.tui-activity {
+  padding: 4px 18px 8px;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tui-activity .run,
+.tui-activity.waiting {
+  color: var(--warn);
+}
+
+.tui-activity .dim {
   color: var(--faint);
 }
 
-.tb-approve {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  margin: 2px 0;
-  padding: 7px 11px;
-  border: 1px solid color-mix(in oklch, var(--warn) 35%, transparent);
+/* While a tool call waits on approval, the approval panel takes the place
+   of the input, as it does in the terminal UI. */
+.tui-approval {
+  margin: 0 12px 10px;
+  padding: 7px 12px;
+  border: 1px solid color-mix(in oklch, var(--warn) 45%, transparent);
   border-radius: 8px;
-  background: color-mix(in oklch, var(--warn) 12%, transparent);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.6;
+  color: var(--fg);
+  animation: tb-in 0.34s ease forwards;
+}
+
+.tui-approval > div {
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tui-approval .ttl {
   color: var(--warn);
-  font-size: 0.74rem;
+  font-weight: 600;
 }
 
-.tb-approve .chip {
-  margin-left: auto;
-  padding: 1px 8px;
-  border-radius: 999px;
-  background: color-mix(in oklch, var(--accent-2) 18%, transparent);
-  color: var(--accent-2);
-  font-size: 0.64rem;
+.tui-approval .rail {
+  color: var(--border);
 }
 
-.tb-ok {
-  display: flex;
-  align-items: center;
-  gap: 7px;
+.tui-approval .del {
+  color: oklch(70% 0.15 25);
+}
+
+.tui-approval .add {
   color: var(--accent-2);
 }
 
-.tb-done {
-  margin-top: 4px;
-  padding: 7px 11px;
-  border: 1px solid color-mix(in oklch, var(--accent-2) 30%, transparent);
-  border-radius: 8px;
-  background: color-mix(in oklch, var(--accent-2) 12%, transparent);
-  color: var(--accent-2);
-  font-size: 0.74rem;
+.tui-approval .opt.sel .mk {
+  color: var(--accent);
+  font-weight: 600;
 }
 
-/* TUI composer + footer */
+.tui-approval .opt.sel .lbl {
+  background: color-mix(in oklch, var(--accent) 18%, transparent);
+  font-weight: 600;
+}
+
+.tui-approval .dim,
+.tui-approval .hint {
+  color: var(--faint);
+}
+
+.tui-approval .key {
+  color: var(--accent);
+}
+
 .tui-composer {
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 11px 16px;
+  padding: 10px 16px;
   border-top: 1px solid var(--border-soft);
+  border-bottom: 1px solid var(--border-soft);
   background: var(--bg-deep);
   font-family: var(--font-mono);
   font-size: 0.8rem;
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 .tui-composer .prompt {
@@ -703,8 +749,16 @@ pre {
   white-space: pre;
 }
 
+.tui-composer .placeholder {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--faint);
+}
+
 .tui-cur {
   display: inline-block;
+  flex: none;
   width: 7px;
   height: 15px;
   background: var(--accent);
@@ -722,20 +776,30 @@ pre {
   }
 }
 
-.tui-foot {
+.tui-status {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   padding: 7px 16px;
-  border-top: 1px solid var(--border-soft);
   background: color-mix(in oklch, var(--surface) 40%, transparent);
   font-family: var(--font-mono);
-  font-size: 0.64rem;
+  font-size: 0.66rem;
   color: var(--faint);
+  white-space: nowrap;
 }
 
-.tui-foot .key {
+.tui-status > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tui-status .mode {
+  color: var(--muted);
+}
+
+.tui-status .key {
   color: var(--accent);
 }
 
