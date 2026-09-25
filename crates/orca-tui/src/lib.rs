@@ -10,6 +10,7 @@ mod approval_actions;
 mod approval_dialog_actions;
 mod approval_mode_actions;
 mod attachment_routing;
+mod background_approval_actions;
 mod background_tasks;
 pub mod bridge;
 mod capability_backend;

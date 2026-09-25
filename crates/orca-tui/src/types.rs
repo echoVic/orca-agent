@@ -452,6 +452,8 @@ pub struct AppState {
     /// Tool / "tool\u{0}target" keys the user chose to always allow this
     /// session. Checked when a new approval arrives so the dialog is skipped.
     pub approval_allowlist: std::collections::HashSet<String>,
+    /// Parked background tool calls already resumed on the session's policy.
+    pub(crate) continued_background_approvals: std::collections::HashSet<String>,
     pub setup_step: u8,
     pub setup_selection: u8,
     /// Runtime-owned first-run disclosure state. The TUI may render and
@@ -802,6 +804,7 @@ impl AppState {
             user_input_dialog: None,
             interaction: InteractionState::default(),
             approval_allowlist: std::collections::HashSet::new(),
+            continued_background_approvals: std::collections::HashSet::new(),
             setup_step: 0,
             setup_selection: 0,
             first_run: None,

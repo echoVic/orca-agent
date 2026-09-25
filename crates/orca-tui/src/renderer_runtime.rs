@@ -169,6 +169,9 @@ impl RendererRuntimeEventOwner {
                 );
             }
         }
+        crate::background_approval_actions::continue_allowed_background_approvals(
+            state, config, action_tx,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
