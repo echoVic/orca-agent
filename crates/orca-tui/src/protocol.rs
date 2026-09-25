@@ -379,6 +379,12 @@ pub enum TuiEvent {
     SavedSessionActionFailed(String),
     StartupWarning(String),
     Notice(String),
+    /// A turn moved to the background parked on a tool call that needs an
+    /// answer before it can continue.
+    BackgroundApprovalNeeded {
+        call_id: Option<String>,
+        tool: Option<String>,
+    },
     MentionSearchDirty {
         generation: orca_file_search::SessionGeneration,
     },

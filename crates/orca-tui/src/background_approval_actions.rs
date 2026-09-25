@@ -71,6 +71,7 @@ mod tests {
         BackgroundTaskSummary, PendingToolCallSummary, TaskLifetime, TaskStatus, TaskType,
     };
 
+    use crate::protocol::TuiEvent;
     use crate::types::AppStatus;
 
     fn parked(action: ActionKind, tool: &str) -> BackgroundTaskSummary {
@@ -214,6 +215,60 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    fn system_lines(state: &AppState) -> Vec<String> {
+        state
+            .transcript
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::System { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn parked_state(mode: ApprovalMode) -> (AppState, mpsc::Sender<UserAction>) {
+        let (tx, _rx) = mpsc::unbounded();
+        let mut state = AppState::new(tx.clone(), "test".into(), "mock".into(), "/tmp".into());
+        state.approval_mode = mode;
+        state.status = AppStatus::Idle;
+        state.replace_workflow_tasks_for_test(vec![parked(ActionKind::Write, "edit")]);
+        (state, tx)
+    }
+
+    fn approval_needed() -> TuiEvent {
+        TuiEvent::BackgroundApprovalNeeded {
+            call_id: Some("deploy-call".to_string()),
+            tool: Some("edit".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_continued_tool_call_is_not_announced_as_waiting_afterwards() {
+        let config = crate::test_support::test_run_config();
+        let continued =
+            "Background session continues with edit README.md: auto-edit runs it without asking.";
+        let waiting = "Background session needs approval for edit before it can continue.";
+
+        // Continued before the background session reports the approval.
+        let (mut state, tx) = parked_state(ApprovalMode::AutoEdit);
+        continue_allowed_background_approvals(&mut state, &config, &tx);
+        state.update(approval_needed());
+        assert_eq!(system_lines(&state), [continued]);
+
+        // Reported first: the continuation follows it.
+        let (mut state, tx) = parked_state(ApprovalMode::AutoEdit);
+        state.update(approval_needed());
+        continue_allowed_background_approvals(&mut state, &config, &tx);
+        assert_eq!(system_lines(&state), [waiting, continued]);
+
+        // One the user answers is announced.
+        let (mut state, tx) = parked_state(ApprovalMode::Suggest);
+        continue_allowed_background_approvals(&mut state, &config, &tx);
+        state.update(approval_needed());
+        assert_eq!(system_lines(&state), [waiting]);
     }
 
     #[test]

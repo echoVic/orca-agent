@@ -704,6 +704,29 @@ impl AppState {
                     expanded: false,
                 });
             }
+            TuiEvent::BackgroundApprovalNeeded { call_id, tool } => {
+                // Already continued under the session's policy, and said so:
+                // announcing it as waiting now would contradict that.
+                if call_id
+                    .as_ref()
+                    .is_some_and(|id| self.continued_background_approvals.contains(id))
+                {
+                    return;
+                }
+                let text = match tool {
+                    Some(tool) => {
+                        format!(
+                            "Background session needs approval for {tool} before it can continue."
+                        )
+                    }
+                    None => "Background session needs approval before it can continue.".to_string(),
+                };
+                self.finish_assistant_stream();
+                self.push_message(ChatMessage::System {
+                    text,
+                    expanded: false,
+                });
+            }
             TuiEvent::RecapPending {
                 request_id,
                 attachment,

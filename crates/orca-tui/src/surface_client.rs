@@ -2768,14 +2768,16 @@ fn publish_background_approval_notice(
     }) else {
         return true;
     };
-    let notice = match task.tool.as_deref() {
-        Some(tool) => {
-            format!("Background session needs approval for {tool} before it can continue.")
-        }
-        None => "Background session needs approval before it can continue.".to_string(),
-    };
     *approval_notice_sent = true;
-    send_background_presentation_event(event_tx, controller, cancellation, TuiEvent::Notice(notice))
+    send_background_presentation_event(
+        event_tx,
+        controller,
+        cancellation,
+        TuiEvent::BackgroundApprovalNeeded {
+            call_id: task.pending_tool_call.map(|call| call.id),
+            tool: task.tool,
+        },
+    )
 }
 
 fn send_background_presentation_event(
@@ -3545,7 +3547,9 @@ mod tests {
         assert!(
             background_monitor_events.iter().all(|event| matches!(
                 event,
-                TuiEvent::Notice(_) | TuiEvent::SurfaceProjectionSynced(_)
+                TuiEvent::Notice(_)
+                    | TuiEvent::BackgroundApprovalNeeded { .. }
+                    | TuiEvent::SurfaceProjectionSynced(_)
             )),
             "background observer must not project a later foreground operation: \
              {background_monitor_events:?}"

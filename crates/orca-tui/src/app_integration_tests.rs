@@ -6133,8 +6133,8 @@ fn backgrounded_hosted_tui_notifies_approval_required_in_user_language() {
         let mut seen = Vec::new();
         for _ in 0..20 {
             match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                TuiEvent::Notice(message) if message.starts_with("Background session") => {
-                    notice = Some(message);
+                event @ TuiEvent::BackgroundApprovalNeeded { .. } => {
+                    notice = Some(event);
                     break;
                 }
                 TuiEvent::Notice(message) => {
@@ -6156,10 +6156,22 @@ fn backgrounded_hosted_tui_notifies_approval_required_in_user_language() {
         action_tx.send(UserAction::Cancel).unwrap();
         handle.join().unwrap();
 
-        assert_eq!(
-            notice.unwrap_or_else(|| panic!("missing background notice; saw {seen:?}")),
-            "Background session needs approval for task_list before it can continue."
-        );
+        let notice = notice.unwrap_or_else(|| panic!("missing background notice; saw {seen:?}"));
+        assert!(matches!(
+            &notice,
+            TuiEvent::BackgroundApprovalNeeded {
+                call_id: Some(_),
+                ..
+            }
+        ));
+        let (tx, _rx) = mpsc::unbounded();
+        let mut state = AppState::new(tx, "test".into(), "mock".into(), "/tmp".into());
+        state.update(notice);
+        assert!(matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::System { text, .. })
+                if text == "Background session needs approval for task_list before it can continue."
+        ));
     });
 }
 
