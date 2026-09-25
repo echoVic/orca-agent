@@ -2339,6 +2339,7 @@ fn push_agent_transcript_text<'a>(
     content: &str,
     color: Color,
 ) {
+    let content = crate::terminal_output::printable_output(content);
     let mut content_lines = content.lines();
     if let Some(first) = content_lines.next() {
         lines.push(Line::from(vec![
@@ -3529,8 +3530,9 @@ fn append_message_lines(
             let used = GUTTER_WIDTH + 2 + UnicodeWidthStr::width(tool_display_name(name));
             if let Some(target) = target {
                 let budget = width.saturating_sub(used + 2 + 24).max(8);
+                let target = crate::terminal_output::printable_output(target);
                 spans.push(Span::styled(
-                    format!("  {}", truncate_to_display_width(target, budget)),
+                    format!("  {}", truncate_to_display_width(&target, budget)),
                     theme.muted_style(),
                 ));
             }
@@ -3975,6 +3977,7 @@ fn append_tool_output_lines(
     // Flushing to the immutable scrollback (`force_expand`) commits the entire output so
     // nothing is hidden behind a stub that `e` can no longer reveal. The live pane caps the
     // `e`-expanded view at 40 rows and the collapsed view at 2.
+    let output = crate::terminal_output::printable_output(output);
     let total = output.lines().count();
     let shown = if force_expand {
         usize::MAX
@@ -6096,14 +6099,20 @@ fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog,
             ),
         ]));
     }
+    // The command or path being approved is drawn as text: an escape sequence
+    // in it must not be able to redraw what the user is agreeing to.
     if let Some(target) = dialog.target.as_deref() {
         content.push(Line::from(Span::styled(
-            truncate_to_display_width(target, inner_width),
+            truncate_to_display_width(
+                &crate::terminal_output::printable_output(target),
+                inner_width,
+            ),
             Style::default().fg(theme.text),
         )));
     }
     if let Some(diff) = &dialog.diff {
         let rail = Span::styled("│ ".to_string(), theme.dim_style());
+        let diff = crate::terminal_output::printable_output(diff);
         for line in diff.lines().take(geometry.shown_diff_lines) {
             let color = if line.starts_with('+') {
                 theme.diff_add
@@ -8880,6 +8889,67 @@ mod tests {
     }
 
     #[test]
+    fn escape_sequences_in_tool_rows_never_reach_the_terminal() {
+        let has_control = |lines: &[String]| {
+            lines
+                .iter()
+                .any(|line| line.chars().any(|character| character.is_control()))
+        };
+        let result = shell_result(
+            "before\u{1b}]2;TITLE\u{7}after\n\u{1b}[7;31mRED\u{1b}[0m done\n",
+            0,
+        );
+        let shell = message_text(
+            None,
+            &tool_call("bash", Some("printf x"), "completed", Some(&result), true),
+        );
+        assert_eq!(shell[1], "    │ beforeafter");
+        assert_eq!(shell[2], "    │ RED done");
+        assert!(!has_control(&shell), "{shell:?}");
+
+        let file = message_text(
+            None,
+            &tool_call(
+                "read",
+                Some("notes.txt"),
+                "completed",
+                Some("title\u{1b}[2J\u{1b}[Hbody"),
+                true,
+            ),
+        );
+        assert_eq!(file[1], "    │ titlebody");
+        assert!(!has_control(&file), "{file:?}");
+
+        // A command that would erase itself on screen shows in full.
+        let target = message_text(
+            None,
+            &tool_call(
+                "bash",
+                Some("rm -rf build\u{1b}[2K\u{1b}[1Gls"),
+                "completed",
+                None,
+                false,
+            ),
+        );
+        assert_eq!(target[0], "    ✓ bash  rm -rf buildls");
+    }
+
+    #[test]
+    fn escape_sequences_in_an_agent_transcript_never_reach_the_terminal() {
+        let mut lines = Vec::new();
+        push_agent_transcript_text(
+            &mut lines,
+            "tool ✓ ",
+            "before\u{1b}]2;TITLE\u{7}after\nnext\u{7}",
+            Color::Green,
+        );
+        assert_eq!(
+            lines_text(&lines),
+            vec!["tool ✓ beforeafter".to_string(), "       next".to_string()]
+        );
+    }
+
+    #[test]
     fn a_collapsed_tool_row_keeps_one_long_line_to_one_row() {
         let long = "x".repeat(300);
         let text = message_text(
@@ -10366,6 +10436,46 @@ mod tests {
         // isn't a dynamic-target tool), so the hint lists them in order.
         assert!(rendered.contains("1/2/3/4 pick"));
         assert!(!rendered.contains("legacy"));
+    }
+
+    #[test]
+    fn an_approval_shows_the_whole_command_even_if_it_carries_escape_sequences() {
+        let mut state = test_state();
+        state.update(TuiEvent::ApprovalNeeded {
+            key: interaction_key(TuiInteractionKind::Approval, "approval-1"),
+            tool: "bash".to_string(),
+            target: Some("rm -rf ~\u{1b}[2K\u{1b}[1Gecho hi".to_string()),
+            preview: Some("$ rm -rf ~\u{1b}[2K\u{1b}[1Gecho hi".to_string()),
+        });
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert!(
+            rows.iter().any(|row| row.contains("rm -rf ~echo hi")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("$ rm -rf ~echo hi")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().all(|row| !row.chars().any(char::is_control)),
+            "{rows:#?}"
+        );
     }
 
     #[test]

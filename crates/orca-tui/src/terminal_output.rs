@@ -3,6 +3,8 @@
 //! cursors, deadlines); a reader wants the output itself, plus only the parts
 //! of the envelope that change what the output means.
 
+use std::borrow::Cow;
+
 use serde::Deserialize;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -56,6 +58,127 @@ pub(crate) fn terminal_output_display(content: &str) -> Option<TerminalOutputDis
         output: payload.output,
         note: (!notes.is_empty()).then(|| notes.join(" · ")),
     })
+}
+
+/// What a terminal would have shown for `text`, as plain characters. Command
+/// output and file contents are drawn through this: an escape sequence
+/// (colours, cursor moves, a title, a hyperlink, a clipboard write) is dropped
+/// instead of being handed to the user's terminal, a carriage return or
+/// backspace overwrites the line the way it would on screen, tabs become
+/// spaces, and any other control character is dropped.
+pub(crate) fn printable_output(text: &str) -> Cow<'_, str> {
+    if !text
+        .chars()
+        .any(|character| character != '\n' && character.is_control())
+    {
+        return Cow::Borrowed(text);
+    }
+    let mut printed = String::with_capacity(text.len());
+    let mut line: Vec<char> = Vec::new();
+    let mut column = 0_usize;
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\n' => {
+                printed.extend(line.drain(..));
+                printed.push('\n');
+                column = 0;
+            }
+            '\r' => column = 0,
+            '\u{8}' => column = column.saturating_sub(1),
+            '\t' => {
+                column = (column / TAB_WIDTH + 1) * TAB_WIDTH;
+                if line.len() < column {
+                    line.resize(column, ' ');
+                }
+            }
+            '\u{1b}' => skip_escape_sequence(&mut characters),
+            '\u{9b}' => skip_control_sequence(&mut characters),
+            '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => {
+                skip_control_string(&mut characters)
+            }
+            character if character.is_control() => {}
+            character => {
+                if column < line.len() {
+                    line[column] = character;
+                } else {
+                    line.push(character);
+                }
+                column += 1;
+            }
+        }
+    }
+    printed.extend(line);
+    Cow::Owned(printed)
+}
+
+const TAB_WIDTH: usize = 8;
+
+type Characters<'a> = std::iter::Peekable<std::str::Chars<'a>>;
+
+/// After an ESC.
+fn skip_escape_sequence(characters: &mut Characters<'_>) {
+    match characters.next() {
+        Some('[') => skip_control_sequence(characters),
+        Some(']' | 'P' | 'X' | '^' | '_') => skip_control_string(characters),
+        // Intermediates, then one final character: ESC ( B.
+        Some(' '..='/') => {
+            while let Some(&next) = characters.peek() {
+                if next.is_control() {
+                    return;
+                }
+                characters.next();
+                if !(' '..='/').contains(&next) {
+                    return;
+                }
+            }
+        }
+        // Two-character sequences such as ESC 7 end with the one taken.
+        _ => {}
+    }
+}
+
+/// A CSI's parameters and intermediates, then its final character.
+fn skip_control_sequence(characters: &mut Characters<'_>) {
+    while let Some(&next) = characters.peek() {
+        match next {
+            ' '..='?' => {
+                characters.next();
+            }
+            '@'..='~' => {
+                characters.next();
+                return;
+            }
+            _ => return,
+        }
+    }
+}
+
+/// An OSC, DCS, SOS, PM or APC payload, up to its BEL or ST. One left open
+/// ends at the line break, so a stray sequence cannot hide the rest of the
+/// output.
+fn skip_control_string(characters: &mut Characters<'_>) {
+    while let Some(&next) = characters.peek() {
+        match next {
+            '\u{7}' | '\u{9c}' => {
+                characters.next();
+                return;
+            }
+            '\n' => return,
+            '\u{1b}' => {
+                let mut after = characters.clone();
+                after.next();
+                if after.peek() == Some(&'\\') {
+                    characters.next();
+                    characters.next();
+                }
+                return;
+            }
+            _ => {
+                characters.next();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +257,44 @@ mod tests {
             })),
             Some("earlier output omitted · exit 1".into())
         );
+    }
+
+    #[test]
+    fn output_is_drawn_as_text_never_as_terminal_commands() {
+        for (output, shown) in [
+            ("plain text\nsecond line\n", "plain text\nsecond line\n"),
+            // A title change, a hyperlink, colours, erase + cursor moves.
+            ("before\x1b]2;TITLE\x07after", "beforeafter"),
+            ("\x1b]8;;https://x.test\x1b\\link\x1b]8;;\x1b\\", "link"),
+            ("\x1b[7;31mRED\x1b[0m done", "RED done"),
+            ("rm -rf build\x1b[2K\x1b[1Gls", "rm -rf buildls"),
+            // The 8-bit CSI, a DCS payload, and designations like ESC ( B.
+            ("\u{9b}31mred", "red"),
+            ("\x1bPq#0;2;0;0;0\x1b\\after", "after"),
+            ("\x1b(Bplain\x1b7", "plain"),
+            // An unterminated clipboard write never reaches the terminal.
+            ("x\x1b]52;c;QUJD", "x"),
+            ("bell\x07 nul\x00 del\x7f", "bell nul del"),
+        ] {
+            assert_eq!(printable_output(output), shown, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn carriage_returns_tabs_and_backspaces_show_what_a_terminal_would() {
+        for (output, shown) in [
+            (
+                "downloading 10%\rdownloading 100%\ndone",
+                "downloading 100%\ndone",
+            ),
+            ("abcdef\rXY", "XYcdef"),
+            ("line\r\nnext\r\n", "line\nnext\n"),
+            ("a\tb", "a       b"),
+            ("12345678\tx", "12345678        x"),
+            ("ab\x08c", "ac"),
+        ] {
+            assert_eq!(printable_output(output), shown, "{output:?}");
+        }
     }
 
     #[test]
