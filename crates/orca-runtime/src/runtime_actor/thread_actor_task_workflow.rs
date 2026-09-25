@@ -430,14 +430,29 @@ impl ThreadActor {
                 message: "typed provider task registry record disappeared".to_string(),
             });
         }
-        let outcome = typed
-            .outcome
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
-                message: "typed provider task outcome disappeared before completion".to_string(),
-            })?;
+        let outcome = {
+            let mut outcome = typed
+                .outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let outcome = outcome
+                .as_mut()
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "typed provider task outcome disappeared before completion"
+                        .to_string(),
+                })?;
+            // Name the tool calls the way the completion commits them, in the
+            // shared outcome, so the response kept for the approval and the
+            // continuation after it use the same names.
+            if let Some(response) = outcome.response.as_mut() {
+                rename_tool_calls_held_by_earlier_responses(&snapshot, response).map_err(
+                    |error| RuntimeHostError::ThreadStartFailed {
+                        message: format!("typed provider response tool calls are invalid: {error}"),
+                    },
+                )?;
+            }
+            outcome.clone()
+        };
         if typed
             .task_registry
             .typed_provider_outcome(typed.task_id.as_str())

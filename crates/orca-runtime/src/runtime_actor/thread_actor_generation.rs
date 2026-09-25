@@ -1981,18 +1981,7 @@ impl ThreadActor {
         // reducer, and hand the renamed response back so the conversation and
         // the tool results use the same names (issue #67).
         let mut response = response.clone();
-        let response_id = crate::runtime_actor::generation_context::validated_response_id(
-            &response,
-            "provider response",
-        )?;
-        let turn_id = response.identity.turn_id.clone();
-        response.rename_repeated_tool_call_ids(|id| {
-            snapshot.tools.iter().any(|tool| {
-                tool.request.tool_call_id.as_str() == id
-                    && (tool.request.source_response_id.as_ref() != Some(&response_id)
-                        || tool.request.turn_id != turn_id)
-            })
-        });
+        rename_tool_calls_held_by_earlier_responses(&snapshot, &mut response)?;
         let events = self
             .generation_context_controller
             .provider_response_events(&snapshot, &fence, &response)?;

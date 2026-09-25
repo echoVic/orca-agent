@@ -76,6 +76,7 @@ use crate::runtime_actor::commit::{
 };
 use crate::runtime_actor::generation_context::{
     GenerationContextController, build_background_provider_response_events,
+    rename_tool_calls_held_by_earlier_responses,
 };
 use crate::runtime_actor::goal::{
     ActiveGoalControl, GoalBlockingCompletion, GoalOperationController, GoalSurfaceWorkerResult,
@@ -7627,9 +7628,18 @@ fn reconcile_durable_provider_outcomes_on_start(
                 outcome,
             ))
         });
-        let Some((task, background_fence, operation, outcome)) = durable else {
+        let Some((task, background_fence, operation, mut outcome)) = durable else {
             return Ok(());
         };
+        // Recorded before the completion named its tool calls: name them the
+        // way the completion commits (or committed) them.
+        if let Some(response) = outcome.response.as_mut() {
+            rename_tool_calls_held_by_earlier_responses(&snapshot, response).map_err(|error| {
+                RuntimeHostError::ThreadStartFailed {
+                    message: format!("recovered provider response tool calls are invalid: {error}"),
+                }
+            })?;
+        }
         let operation_id = operation.operation_id.clone();
         if outcome.status == TaskStatus::ApprovalRequired {
             if matches!(
@@ -26206,6 +26216,64 @@ mod tests {
         );
     }
 
+    /// Reserves and admits a user turn from the current snapshot: its operation
+    /// and first generation.
+    fn admit_surface_turn(
+        handle: &surface::RuntimeSurfaceHandle,
+        attachment: &surface::FreshSurfaceAttachment,
+        prompt: &str,
+    ) -> (surface::SurfaceOperationId, surface::SurfaceOperationFence) {
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            handle,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(&snapshot, prompt),
+                )
+                .expect("reserve surface turn"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit surface turn"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = admitted
+        else {
+            panic!("surface turn was queued");
+        };
+        (reserved.operation_id, first_generation)
+    }
+
+    /// Runs a user turn in the foreground until it succeeds.
+    fn run_surface_turn_to_success(
+        handle: &surface::RuntimeSurfaceHandle,
+        attachment: &surface::FreshSurfaceAttachment,
+        prompt: &str,
+    ) {
+        let (operation_id, _) = admit_surface_turn(handle, attachment, prompt);
+        assert!(matches!(
+            attachment
+                .client
+                .wait_operation_terminal(surface_request_id(), operation_id)
+                .expect("wait surface turn"),
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+    }
+
     fn detach_surface_attachment(
         handle: &surface::RuntimeSurfaceHandle,
         attachment: &surface::FreshSurfaceAttachment,
@@ -28299,7 +28367,7 @@ mod tests {
             "completed" => {
                 "mock_stream_delay_ms 100 test_provider_completion_notify_delay_ms=30000"
             }
-            "approval" => {
+            "approval" | "approval-reused-id" => {
                 "mock_stream_tool_delay_ms 100 task_list test_provider_completion_notify_delay_ms=30000"
             }
             "approval-finalizing" => "mock_stream_tool_delay_ms 500 task_list",
@@ -28307,12 +28375,24 @@ mod tests {
             "approval-denied" => "mock_stream_tool_delay_ms 100 task_list",
             _ => panic!("unknown durable provider outcome mode: {mode}"),
         };
+        let mut intent_snapshot = attachment.baseline.snapshot.clone();
+        if mode == "approval-reused-id" {
+            // An earlier turn commits the mock's fixed tool call id, which the
+            // durable (not yet completed) response reuses.
+            run_surface_turn_to_success(&surface, &attachment, "task_list");
+            intent_snapshot = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+        }
         let reserved = committed_surface_value(
             attachment
                 .client
                 .reserve_operation(
                     surface_request_id(),
-                    surface_user_turn_intent(&attachment.baseline.snapshot, prompt),
+                    surface_user_turn_intent(&intent_snapshot, prompt),
                 )
                 .expect("reserve durable provider outcome"),
         );
@@ -28743,6 +28823,55 @@ mod tests {
                     surface::RespondInteractionDisposition::AlreadyResolved { .. }
                 ));
             }
+            "approval-reused-id" => {
+                assert!(matches!(
+                    operation.phase,
+                    surface::OperationPhase::Suspended {
+                        cause: surface::SuspensionCause::ProviderSuspended { .. }
+                    }
+                ));
+                let interaction = snapshot
+                    .interactions
+                    .iter()
+                    .find(|interaction| {
+                        interaction.fence.operation_id == operation_id
+                            && interaction.kind
+                                == surface::SurfaceInteractionKind::BackgroundApproval
+                    })
+                    .expect("recovery parks the reused-id response for approval");
+                let surface::SurfaceInteractionRequest::BackgroundApproval { tool, .. } =
+                    &interaction.request
+                else {
+                    panic!("recovered interaction is not a background approval");
+                };
+                assert!(
+                    tool.tool_call_id.as_str().starts_with("mock-tool-1@"),
+                    "recovery renames the reused id: {}",
+                    tool.tool_call_id.as_str()
+                );
+                let responder = fresh_background_approval_attachment(&thread.surface());
+                foreground_background_approval_task(&responder, &interaction.interaction_id);
+                let _ = committed_surface_value(
+                    responder
+                        .client
+                        .respond_interaction_by_id(
+                            surface_request_id(),
+                            interaction.interaction_id.clone(),
+                            surface::SurfaceClientInteractionAnswer::BackgroundApproval {
+                                decision: surface::SurfaceAllowDeny::Allow,
+                            },
+                        )
+                        .expect("approve the recovered tool call"),
+                );
+                assert!(matches!(
+                    responder
+                        .client
+                        .wait_operation_terminal(surface_request_id(), operation_id.clone())
+                        .expect("wait recovered turn"),
+                    surface::WaitOperationTerminalResult::Terminal { value }
+                        if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+                ));
+            }
             "approval-denied" => {
                 let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
                 let snapshot = loop {
@@ -28802,6 +28931,7 @@ mod tests {
             "approval-finalizing",
             "approval-resolved",
             "approval-denied",
+            "approval-reused-id",
         ] {
             for phase in ["seed", "recover"] {
                 let phase = format!("{phase}-{mode}");
@@ -29034,6 +29164,96 @@ mod tests {
             surface::RespondInteractionDisposition::AlreadyResolved { .. }
         ));
         host.shutdown().expect("shutdown approval retry host");
+    }
+
+    #[test]
+    fn a_backgrounded_turn_that_reuses_an_earlier_tool_call_id_suspends_and_resumes() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start reused tool id host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "reused tool call id",
+            )
+            .expect("start reused tool id thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+
+        // The mock names every tool call "mock-tool-1": the first turn
+        // commits that id to the surface.
+        run_surface_turn_to_success(&surface, &attachment, "task_list");
+
+        // The second reuses it, and is moved to the background mid-request.
+        let (second, generation) = admit_surface_turn(
+            &surface,
+            &attachment,
+            "mock_stream_tool_delay_ms 500 task_list",
+        );
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .transfer_background(
+                    surface_request_id(),
+                    surface::BackgroundTarget::ActiveGeneration { fence: generation },
+                )
+                .expect("transfer second turn"),
+        );
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let interaction = loop {
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            let parked = snapshot.interactions.iter().find(|interaction| {
+                interaction.fence.operation_id == second
+                    && interaction.kind == surface::SurfaceInteractionKind::BackgroundApproval
+            });
+            if let Some(parked) = parked {
+                break parked.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the backgrounded turn never parked: its completion could not be committed"
+            );
+            std::thread::yield_now();
+        };
+        let surface::SurfaceInteractionRequest::BackgroundApproval { tool, .. } =
+            &interaction.request
+        else {
+            panic!("parked on something other than a background approval");
+        };
+        assert!(
+            tool.tool_call_id.as_str().starts_with("mock-tool-1@"),
+            "the reused id is renamed: {}",
+            tool.tool_call_id.as_str()
+        );
+
+        detach_surface_attachment(&surface, &attachment);
+        let responder = fresh_background_approval_attachment(&surface);
+        foreground_background_approval_task(&responder, &interaction.interaction_id);
+        let _ = committed_surface_value(
+            responder
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    interaction.interaction_id.clone(),
+                    surface::SurfaceClientInteractionAnswer::BackgroundApproval {
+                        decision: surface::SurfaceAllowDeny::Allow,
+                    },
+                )
+                .expect("approve the parked tool call"),
+        );
+        assert!(matches!(
+            responder
+                .client
+                .wait_operation_terminal(surface_request_id(), second)
+                .expect("wait resumed turn"),
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+        host.shutdown().expect("shutdown reused tool id host");
     }
 
     #[test]

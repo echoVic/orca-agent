@@ -660,6 +660,29 @@ fn normalize_provider_response(
     })
 }
 
+/// Renames the tool calls of `response` whose ids the session already holds
+/// from an *earlier* response. A provider only owes id uniqueness within one
+/// response (and some derive ids deterministically, or a relay mints them),
+/// but the surface keys a tool by its id for the whole session (issue #67).
+/// The rename depends only on the tools the snapshot holds, which it never
+/// drops, so the same response names its calls the same way on every replay,
+/// in the foreground, in a background completion, and in recovery.
+pub(crate) fn rename_tool_calls_held_by_earlier_responses(
+    snapshot: &surface::SurfaceSnapshot,
+    response: &mut RuntimeModelResponse,
+) -> io::Result<()> {
+    let response_id = validated_response_id(response, "provider response")?;
+    let turn_id = response.identity.turn_id.clone();
+    response.rename_repeated_tool_call_ids(|id| {
+        snapshot.tools.iter().any(|tool| {
+            tool.request.tool_call_id.as_str() == id
+                && (tool.request.source_response_id.as_ref() != Some(&response_id)
+                    || tool.request.turn_id != turn_id)
+        })
+    });
+    Ok(())
+}
+
 pub(crate) fn validated_response_id(
     response: &RuntimeModelResponse,
     label: &str,
