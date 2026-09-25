@@ -29167,6 +29167,72 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_sync_agents_transcript_is_read_from_its_child_session() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let host = RuntimeHost::start().expect("start finished agent host");
+        let thread = host
+            .start_thread(config, "finished agent transcript")
+            .expect("start finished agent thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        run_surface_turn_to_success(&surface, &attachment, "subagent sync mock_usage");
+
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let agent = loop {
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            if let Some(agent) = snapshot.tasks.iter().find(|task| {
+                task.task_type == surface::SurfaceTaskType::Subagent
+                    && task.status == surface::SurfaceTaskStatus::Completed
+            }) {
+                break agent.clone();
+            }
+            assert!(Instant::now() < deadline, "the agent never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let transcript = attachment
+            .client
+            .read_task_transcript(surface_request_id(), agent.task_id.clone(), agent.revision)
+            .expect("read the agent's transcript");
+        match transcript {
+            // A sync agent keeps no continuation: its child thread's recorded
+            // conversation is the transcript.
+            surface::SurfaceReadResult::Found { value, .. } => {
+                assert!(value.complete);
+                // It opens with the task, as the parent delegated it, not the
+                // role context the runtime pins ahead of it.
+                assert!(matches!(
+                    value.items.iter().find(|item| matches!(
+                        item,
+                        surface::TaskTranscriptItem::User { .. }
+                    )),
+                    Some(surface::TaskTranscriptItem::User { content })
+                        if content.as_str() == "mock_usage"
+                ));
+                assert!(
+                    value
+                        .items
+                        .iter()
+                        .any(|item| matches!(item, surface::TaskTranscriptItem::Assistant { .. }))
+                );
+            }
+            surface::SurfaceReadResult::NotFound { error, .. }
+            | surface::SurfaceReadResult::Invalid { error, .. }
+            | surface::SurfaceReadResult::Stale { error, .. }
+            | surface::SurfaceReadResult::Unavailable { error, .. } => {
+                panic!("transcript read failed: {}", error.message.as_str())
+            }
+        }
+        host.shutdown().expect("shutdown finished agent host");
+    }
+
+    #[test]
     fn a_backgrounded_turn_that_reuses_an_earlier_tool_call_id_suspends_and_resumes() {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start reused tool id host");

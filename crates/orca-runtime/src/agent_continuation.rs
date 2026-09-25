@@ -774,6 +774,59 @@ pub(crate) fn project_checkpoint_transcript(
     Ok(items)
 }
 
+/// Projects the recorded conversation of an agent that ran on its own child
+/// thread without a continuation (a sync agent) into bounded display items.
+/// Its session is the only record of what it did.
+pub(crate) fn project_conversation_transcript(messages: &[Message]) -> Vec<ChildTranscriptItem> {
+    let mut items = Vec::new();
+    for message in messages {
+        match message {
+            Message::System { .. } => {}
+            Message::User { content, .. }
+                if content.starts_with(crate::agent_controller::DELEGATED_CHILD_CONTEXT) => {}
+            Message::User { content, .. } => items.push(ChildTranscriptItem::User {
+                content: bound_transcript_text(content),
+            }),
+            Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                if let Some(content) = content {
+                    items.push(ChildTranscriptItem::Assistant {
+                        content: bound_transcript_text(content),
+                    });
+                }
+                items.extend(
+                    tool_calls
+                        .iter()
+                        .map(|tool_call| ChildTranscriptItem::ToolCall {
+                            id: tool_call.id.clone(),
+                            name: bound_transcript_text(&tool_call.function_name),
+                        }),
+                );
+            }
+            Message::Tool {
+                tool_call_id,
+                content,
+                terminal,
+                ..
+            } => items.push(ChildTranscriptItem::ToolResult {
+                id: tool_call_id.clone(),
+                content: bound_transcript_text(content),
+                status: terminal
+                    .as_ref()
+                    .map_or(ToolStatus::Indeterminate, |terminal| terminal.status),
+            }),
+        }
+        if items.len() >= TRANSCRIPT_ITEM_COUNT_LIMIT {
+            items.truncate(TRANSCRIPT_ITEM_COUNT_LIMIT);
+            break;
+        }
+    }
+    items
+}
+
 fn bound_transcript_text(value: &str) -> String {
     if value.len() <= TRANSCRIPT_ITEM_TEXT_LIMIT {
         return value.to_string();

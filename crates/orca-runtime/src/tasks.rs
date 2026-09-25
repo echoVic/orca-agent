@@ -1299,6 +1299,50 @@ pub(crate) struct TaskTranscriptRecord {
     pub(crate) items: Vec<ChildTranscriptItem>,
 }
 
+/// The transcript of a finished agent that kept no continuation (a sync
+/// agent): the conversation its child thread recorded.
+fn finished_child_session_transcript(
+    record: TaskRecord,
+) -> Result<TaskTranscriptRecord, TaskTranscriptReadError> {
+    let finished = matches!(
+        record.status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Stopped | TaskStatus::Cancelled
+    );
+    let Some(child_thread_id) = record
+        .subagent_child_thread_id
+        .as_deref()
+        .filter(|_| finished)
+    else {
+        return Err(TaskTranscriptReadError::Unavailable);
+    };
+    let session = crate::thread_store::SessionStore::new()
+        .load_session(child_thread_id)
+        .map_err(|_| TaskTranscriptReadError::Unavailable)?;
+    let items = crate::agent_continuation::project_conversation_transcript(&session.messages);
+    let usage = BudgetUsage {
+        turns: session
+            .messages
+            .iter()
+            .filter(|message| matches!(message, orca_core::conversation::Message::Assistant { .. }))
+            .count() as u32,
+        tool_calls: items
+            .iter()
+            .filter(|item| matches!(item, ChildTranscriptItem::ToolCall { .. }))
+            .count() as u32,
+        ..BudgetUsage::default()
+    };
+    Ok(TaskTranscriptRecord {
+        task_id: record.id,
+        parent_task_id: record.parent_task_id,
+        publication_revision: record.publication_revision,
+        checkpoint_revision: 0,
+        turn: usage.turns,
+        usage,
+        complete: true,
+        items,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskTranscriptReadError {
     NotFound,
@@ -2693,7 +2737,7 @@ impl TaskRegistry {
             return Err(TaskTranscriptReadError::BindingMismatch);
         }
         let Some(task_projection) = record.continuation_projection() else {
-            return Err(TaskTranscriptReadError::Unavailable);
+            return finished_child_session_transcript(record);
         };
         if task_projection.indeterminate || record.continuation_indeterminate {
             return Err(TaskTranscriptReadError::Unavailable);

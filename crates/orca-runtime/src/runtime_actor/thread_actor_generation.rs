@@ -410,11 +410,15 @@ fn task_transcript_record_matches_surface_task(
 ) -> bool {
     // The surface task is the authority for the public fence.  The registry
     // publication revision is a separate repairable-mirror counter and is
-    // intentionally not part of this comparison.
+    // intentionally not part of this comparison.  The surface leaves a child
+    // un-nested while its parent is not one of its tasks (see
+    // `resolve_subagent_parent_task_id`); a parent it does name must match.
     task.task_id == *task_id
         && record.task_id == task_id.as_str()
-        && record.parent_task_id.as_deref()
-            == task.parent_task_id.as_ref().map(|parent| parent.as_str())
+        && task
+            .parent_task_id
+            .as_ref()
+            .is_none_or(|parent| record.parent_task_id.as_deref() == Some(parent.as_str()))
 }
 
 /// Resolves the child hierarchy from the repairable task mirror. A child may
@@ -5660,6 +5664,26 @@ mod task_transcript_query_tests {
             &task_id,
             &surface_task("other-child", Some("parent"), 1),
             &transcript_record("child", Some("parent"), 1),
+        ));
+    }
+
+    #[test]
+    fn transcript_binding_accepts_a_child_the_surface_left_un_nested() {
+        // A foreground turn's own task is not a surface task, so the surface
+        // shows the agent it launched un-nested while the registry records
+        // the parent: that finished agent's transcript must stay readable.
+        let task_id = surface::SurfaceTaskId::try_new("child").expect("task id");
+
+        assert!(task_transcript_record_matches_surface_task(
+            &task_id,
+            &surface_task("child", None, 1),
+            &transcript_record("child", Some("parent"), 1),
+        ));
+        // A parent the surface does name must be the record's.
+        assert!(!task_transcript_record_matches_surface_task(
+            &task_id,
+            &surface_task("child", Some("parent"), 1),
+            &transcript_record("child", None, 1),
         ));
     }
 

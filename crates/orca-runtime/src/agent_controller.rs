@@ -20,6 +20,11 @@ use crate::runtime_host::{
 };
 use crate::runtime_surface::DisplayText;
 
+/// The role context pinned ahead of a delegated child's task. It is the
+/// child's first message; a transcript of the child starts after it.
+pub(crate) const DELEGATED_CHILD_CONTEXT: &str = "You are a delegated child agent. Work only on this \
+    delegated task and keep all tool activity in this thread.";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AgentRunMode {
     Sync,
@@ -357,8 +362,7 @@ impl AgentController {
         let thread_id = child.thread_id().to_string();
         if let Err(error) = child.mutate(
             crate::runtime_host::RuntimeThreadMutation::AddPinnedContext(format!(
-                "You are a delegated child agent. Work only on this delegated task and keep all \
-                 tool activity in this thread.{}",
+                "{DELEGATED_CHILD_CONTEXT}{}",
                 request.subagent_type.system_prompt_suffix()
             )),
         ) {
