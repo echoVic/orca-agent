@@ -50,7 +50,7 @@ pub(crate) const CHILD_CONVERSATION_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const AGENT_CHECKPOINT_PAYLOAD_SCHEMA_VERSION: u32 = 1;
 
 /// Fixed execution-lease lifetime used by child continuation attempts.
-const CONTINUATION_LEASE_DURATION_MS: i64 = 30_000;
+pub(crate) const CONTINUATION_LEASE_DURATION_MS: i64 = 30_000;
 const CONTINUATION_NOT_FOUND_CODE: &str = "continuation_not_found";
 const CONTINUATION_PARENT_MISMATCH_CODE: &str = "continuation_parent_mismatch";
 const CONTINUATION_ACTIVE_CODE: &str = "continuation_active";

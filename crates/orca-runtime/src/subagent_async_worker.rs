@@ -252,38 +252,57 @@ impl AsyncLeaseHeartbeat {
     ) -> Self {
         let (stop, receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let lease_duration = Duration::from_millis(crate::tasks::TASK_LEASE_DURATION_MS as u64);
-            let mut renewed_at = Instant::now();
+            let task_lease_duration =
+                Duration::from_millis(crate::tasks::TASK_LEASE_DURATION_MS as u64);
+            let continuation_lease_duration = Duration::from_millis(
+                crate::agent_continuation::CONTINUATION_LEASE_DURATION_MS as u64,
+            );
+            let mut task_renewed_at = Instant::now();
+            let mut continuation_renewed_at = Instant::now();
             loop {
                 match receiver.recv_timeout(ASYNC_LEASE_HEARTBEAT) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
                 match task_registry.renew_task_lease(&task_lease, &agent_id) {
-                    Ok(()) => renewed_at = Instant::now(),
-                    // A write that fails while the lease still stands may be
-                    // transient; once the lease could have lapsed, it is lost.
-                    Err(crate::tasks::TaskLeaseError::Persistence(_))
-                        if renewed_at.elapsed() < lease_duration =>
-                    {
+                    Ok(()) => task_renewed_at = Instant::now(),
+                    Err(error) => {
+                        let storage_error =
+                            matches!(error, crate::tasks::TaskLeaseError::Persistence(_));
+                        if renewal_failure_ends_run(
+                            storage_error,
+                            task_renewed_at.elapsed(),
+                            task_lease_duration,
+                        ) {
+                            cancel.cancel();
+                            break;
+                        }
                         continue;
-                    }
-                    Err(_) => {
-                        cancel.cancel();
-                        break;
                     }
                 }
                 let Ok(mut revision) = continuation_revision.lock() else {
                     break;
                 };
-                let projection = match coordinator.renew(&continuation_lease, *revision) {
-                    Ok(projection) => projection,
-                    Err(_) => {
-                        cancel.cancel();
-                        break;
+                match coordinator.renew(&continuation_lease, *revision) {
+                    Ok(projection) => {
+                        *revision = projection.revision;
+                        continuation_renewed_at = Instant::now();
                     }
-                };
-                *revision = projection.revision;
+                    Err(error) => {
+                        let storage_error = matches!(
+                            error,
+                            crate::agent_continuation::AgentContinuationError::Persistence { .. }
+                        );
+                        if renewal_failure_ends_run(
+                            storage_error,
+                            continuation_renewed_at.elapsed(),
+                            continuation_lease_duration,
+                        ) {
+                            cancel.cancel();
+                            break;
+                        }
+                    }
+                }
             }
         });
         Self {
@@ -298,6 +317,13 @@ impl AsyncLeaseHeartbeat {
             let _ = worker.join();
         }
     }
+}
+
+/// Whether a failed lease renewal ends the run. A storage error while the
+/// lease may still stand is retried at the next beat; any other error, or a
+/// storage error once the lease could have lapsed, means the lease is lost.
+fn renewal_failure_ends_run(storage_error: bool, since_renewed: Duration, lease: Duration) -> bool {
+    !storage_error || since_renewed >= lease
 }
 
 pub fn run_async_subagent_worker(input: AsyncSubagentWorkerInput) -> i32 {
@@ -2110,12 +2136,19 @@ mod tests {
         })
     }
 
-    #[test]
-    fn a_stop_persisted_by_the_parent_ends_the_detached_run_without_a_kill() {
-        let home = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
-        let _home = crate::history::redirect_test_orca_home(home.path());
-        let config = async_test_config(cwd.path().to_path_buf());
+    /// A detached async subagent's request, task and continuation, as the
+    /// parent prepares them before spawning the worker.
+    struct PreparedDetachedSubagent {
+        request: subagent::SubagentRequest,
+        session: String,
+        registry: TaskRegistry,
+        task_id: String,
+        coordinator: ChildAgentCoordinator,
+        prepared: crate::agent_continuation::PreparedContinuation,
+    }
+
+    fn prepare_detached_subagent(cwd: &Path, description: &str) -> PreparedDetachedSubagent {
+        let config = async_test_config(cwd.to_path_buf());
         let mut request = subagent::create_subagent_request(&ToolRequest {
             id: "parked-async".into(),
             name: ToolName::Subagent,
@@ -2123,23 +2156,23 @@ mod tests {
             target: None,
             raw_arguments: Some(
                 serde_json::json!({
-                    "description": "Park", "prompt": "Wait for the provider", "mode": "async"
+                    "description": description, "prompt": "Wait for the provider", "mode": "async"
                 })
                 .to_string(),
             ),
         });
         subagent::freeze_agent_request(
             &config,
-            cwd.path(),
+            cwd,
             &orca_mcp::McpRegistry::default(),
             &mut request,
         )
         .unwrap();
         let session = format!("parked-detached-{}", uuid::Uuid::now_v7());
-        let registry = TaskRegistry::new_for_cwd(session.clone(), cwd.path());
-        let task = registry.create_subagent("Park".into(), None);
+        let registry = TaskRegistry::new_for_cwd(session.clone(), cwd);
+        let task = registry.create_subagent(description.into(), None);
         let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
-        let effective_cwd = cwd.path().display().to_string();
+        let effective_cwd = cwd.display().to_string();
         let compatibility_hash = compute_continuation_compatibility_hash(
             &request.subagent_type,
             request.model.as_deref(),
@@ -2173,6 +2206,122 @@ mod tests {
                 },
             })
             .unwrap();
+        PreparedDetachedSubagent {
+            request,
+            session,
+            registry,
+            task_id: task.id,
+            coordinator,
+            prepared,
+        }
+    }
+
+    fn find_dir_named(root: &Path, name: &str) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(root).ok()?.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.file_name().is_some_and(|file_name| file_name == name) {
+                return Some(path);
+            }
+            if let Some(found) = find_dir_named(&path, name) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_storage_hiccup_while_renewing_the_continuation_lease_keeps_the_run_going() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let PreparedDetachedSubagent {
+            registry,
+            task_id,
+            coordinator,
+            prepared,
+            ..
+        } = prepare_detached_subagent(cwd.path(), "Beat");
+        let task_lease = registry.acquire_task_lease(&task_id).unwrap();
+        registry
+            .mark_running_with_lease(&task_lease, &task_id)
+            .unwrap();
+        let continuation_lease = coordinator.acquire(&prepared).unwrap();
+        let revision = Arc::new(Mutex::new(continuation_lease.revision));
+        let cancel = CancelToken::new();
+        let heartbeat = AsyncLeaseHeartbeat::start(
+            registry.clone(),
+            task_lease,
+            task_id.clone(),
+            coordinator.clone(),
+            continuation_lease,
+            Arc::clone(&revision),
+            cancel.clone(),
+        );
+        thread::sleep(ASYNC_LEASE_HEARTBEAT * 2);
+
+        // For a few beats the continuation records' directory is not one, so
+        // reading and writing a record fails the way a storage error does.
+        let continuations =
+            find_dir_named(home.path(), "continuations").expect("the continuation store");
+        let parked = continuations.with_file_name("continuations.away");
+        std::fs::rename(&continuations, &parked).unwrap();
+        std::fs::write(&continuations, b"not a directory").unwrap();
+        thread::sleep(ASYNC_LEASE_HEARTBEAT * 4);
+        std::fs::remove_file(&continuations).unwrap();
+        std::fs::rename(&parked, &continuations).unwrap();
+        let before = revision.lock().unwrap().get();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while revision.lock().unwrap().get() == before
+            && !cancel.is_cancelled()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let cancelled = cancel.is_cancelled();
+        let after = revision.lock().unwrap().get();
+        heartbeat.stop();
+
+        assert!(!cancelled, "a transient storage error ended a healthy run");
+        assert!(
+            after > before,
+            "the lease is renewed again once storage is back: {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn a_lease_renewal_failure_ends_the_run_only_once_the_lease_may_have_lapsed() {
+        let lease = Duration::from_secs(30);
+        for (storage_error, since_renewed, ends) in [
+            (true, Duration::from_secs(5), false),
+            (true, Duration::from_millis(29_999), false),
+            (true, Duration::from_secs(30), true),
+            (false, Duration::from_secs(1), true),
+        ] {
+            assert_eq!(
+                renewal_failure_ends_run(storage_error, since_renewed, lease),
+                ends,
+                "{storage_error} after {since_renewed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stop_persisted_by_the_parent_ends_the_detached_run_without_a_kill() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let PreparedDetachedSubagent {
+            request,
+            session,
+            registry,
+            task_id,
+            prepared,
+            ..
+        } = prepare_detached_subagent(cwd.path(), "Park");
+        let task = registry.get(&task_id).unwrap();
         let binding = registry
             .register_detached_subagent_binding(
                 &task.id,
