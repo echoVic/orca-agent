@@ -2117,7 +2117,7 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
     let selected_index = state.agent_selected_index().min(rows.len() - 1);
     let selected = rows[selected_index];
     let summary = agent_workspace_summary_line(&rows, theme);
-    let hint = agent_workspace_action_hint(selected, theme);
+    let hint = agent_workspace_action_hint(selected, theme, state.status == AppStatus::Idle);
     let focus_lines =
         agent_workspace_focus_lines(selected, theme, inner.width as usize, state.tick);
     let fixed_height = 2_u16;
@@ -2276,7 +2276,8 @@ fn render_agent_transcript(frame: &mut Frame, area: Rect, state: &AppState, them
             }
         }
         // A running agent has no checkpoint until its first step settles;
-        // until then its live activity is all there is to show.
+        // until then its live activity is all there is to show. A child on a
+        // thread of this process keeps no checkpoints at all.
         Some(TaskTranscriptResult::Unavailable(_))
             if task.is_some_and(|task| task.status.is_active()) =>
         {
@@ -2285,8 +2286,13 @@ fn render_agent_transcript(frame: &mut Frame, area: Rect, state: &AppState, them
                 Style::default().fg(theme.muted),
             )));
             lines.push(Line::from(""));
+            let heading = if task.is_some_and(|task| task.subagent_child_thread_id.is_some()) {
+                " Live activity"
+            } else {
+                " No transcript checkpoint yet · one appears after the agent's first step"
+            };
             lines.push(Line::from(Span::styled(
-                " No transcript checkpoint yet · one appears after the agent's first step",
+                heading,
                 Style::default().fg(theme.warning),
             )));
             lines.push(Line::from(""));
@@ -2379,12 +2385,16 @@ fn agent_workspace_summary_line<'a>(rows: &[AgentWorkspaceRow<'_>], theme: &Them
     Line::from(spans)
 }
 
-fn agent_workspace_action_hint<'a>(row: AgentWorkspaceRow<'_>, theme: &Theme) -> Line<'a> {
+fn agent_workspace_action_hint<'a>(
+    row: AgentWorkspaceRow<'_>,
+    theme: &Theme,
+    idle: bool,
+) -> Line<'a> {
     let mut text = " Esc close · ↑↓ select".to_string();
     match row {
         AgentWorkspaceRow::Subagent { task, .. } => {
             if task.publication_revision.is_some() {
-                if task.subagent_child_thread_id.is_some() {
+                if crate::agent_workspace_actions::opens_live_conversation(task, idle) {
                     text.push_str(" · Enter open conversation");
                 } else {
                     text.push_str(" · Enter transcript");
@@ -12955,6 +12965,61 @@ mod tests {
         assert!(rendered.contains("bash"));
         assert!(rendered.contains("17 tests passed"));
         assert!(rendered.contains("Esc back"));
+    }
+
+    #[test]
+    fn a_child_running_on_this_process_shows_live_activity_not_a_promised_checkpoint() {
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Agents;
+        let mut task = workflow_task_for_agent_dashboard(
+            "auth review",
+            "auth",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        task.id = "auth-child".to_string();
+        task.task_type = TaskType::Subagent;
+        task.status = TaskStatus::Running;
+        task.subagent_child_thread_id = Some("child-thread".to_string());
+        task.workflow_agents.clear();
+        task.publication_revision = Some(9);
+        state.replace_workflow_tasks_for_test(vec![task]);
+        let request = crate::protocol::TaskTranscriptRequest {
+            task_id: "auth-child".to_string(),
+            expected_revision: 9,
+        };
+        state.begin_task_transcript_request(request.clone());
+        state.update(TuiEvent::TaskTranscriptResult {
+            request,
+            result: crate::protocol::TaskTranscriptResult::unavailable("no checkpoint"),
+        });
+
+        let frame = frame_string(&mut state, 100, 20);
+        assert!(frame.contains("Live activity"), "{frame}");
+        assert!(!frame.contains("checkpoint"), "{frame}");
+    }
+
+    #[test]
+    fn the_agents_panel_offers_a_conversation_only_when_one_would_open() {
+        let theme = Theme::named(ThemeName::Dark);
+        let mut child = workflow_task_for_agent_dashboard(
+            "child",
+            "agent",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        child.task_type = TaskType::Subagent;
+        child.status = TaskStatus::Running;
+        child.publication_revision = Some(3);
+        child.subagent_child_thread_id = Some("child-thread".to_string());
+        let hint = |task: &BackgroundTaskSummary, idle: bool| {
+            let row = AgentWorkspaceRow::Subagent { task, parent: None };
+            agent_workspace_action_hint(row, &theme, idle).to_string()
+        };
+
+        assert!(hint(&child, true).contains("Enter open conversation"));
+        assert!(hint(&child, false).contains("Enter transcript"));
+        let mut finished = child.clone();
+        finished.status = TaskStatus::Completed;
+        assert!(hint(&finished, true).contains("Enter transcript"));
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use crossbeam_channel as mpsc;
 use crossterm::event::KeyCode;
-use orca_core::task_types::{TaskStatus, TaskType};
+use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 
 use crate::agent_workspace::AgentWorkspaceRow;
 use crate::protocol::{TaskTranscriptRequest, UserAction};
-use crate::types::{AppState, PanelMode};
+use crate::types::{AppState, AppStatus, PanelMode};
 
 /// Opens a subagent the way Enter on it does: a child on a thread of this
 /// process takes over the conversation view, any other one opens its
@@ -25,7 +25,7 @@ pub(crate) fn open_agent_task(
     let Some(expected_revision) = task.publication_revision else {
         return false;
     };
-    if task.subagent_child_thread_id.is_some() {
+    if opens_live_conversation(task, state.status == AppStatus::Idle) {
         let _ = action_tx.send(UserAction::FocusChildThread {
             task_id: task_id.to_string(),
             expected_revision,
@@ -41,6 +41,15 @@ pub(crate) fn open_agent_task(
     state.begin_task_transcript_request(request.clone());
     let _ = action_tx.send(UserAction::ReadTaskTranscript(request));
     true
+}
+
+/// Whether opening this agent switches the view to its live conversation:
+/// only a child still running on a thread of this process, and only while no
+/// turn runs here. The switch belongs to the controller a running turn
+/// holds, so it would wait for the turn and then find the child finished;
+/// any other agent opens its panel, which a running turn does not hold up.
+pub(crate) fn opens_live_conversation(task: &BackgroundTaskSummary, idle: bool) -> bool {
+    task.subagent_child_thread_id.is_some() && task.status.is_active() && idle
 }
 
 /// Leaves whatever agent is open for the main conversation: a focused child
@@ -653,6 +662,48 @@ mod tests {
             !open_agent_task(&mut state, &tx, "unpublished"),
             "an agent the surface has not published has nothing to open"
         );
+    }
+
+    #[test]
+    fn a_child_the_running_turn_waits_on_opens_its_activity_right_away() {
+        // Switching the view to the child needs the controller the running
+        // turn holds; queued behind the turn, the switch would only find the
+        // child finished.
+        let mut child = task("child", 1_000);
+        child.subagent_child_thread_id = Some("child-thread".to_string());
+        let (mut state, rx) = conversation_with(vec![child]);
+        state.status = crate::types::AppStatus::Running;
+        let tx = state.event_tx.clone();
+
+        assert!(open_agent_task(&mut state, &tx, "child"));
+
+        assert_eq!(state.panel_mode, PanelMode::Agents);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserAction::ReadTaskTranscript(TaskTranscriptRequest {
+                task_id,
+                expected_revision: 7,
+            })) if task_id == "child"
+        ));
+        assert!(rx.try_recv().is_err(), "no child focus is queued");
+    }
+
+    #[test]
+    fn a_finished_child_opens_its_panel_not_a_conversation_that_is_gone() {
+        let mut child = task("child", 1_000);
+        child.subagent_child_thread_id = Some("child-thread".to_string());
+        child.status = TaskStatus::Completed;
+        let (mut state, rx) = conversation_with(vec![child]);
+        let tx = state.event_tx.clone();
+
+        assert!(open_agent_task(&mut state, &tx, "child"));
+
+        assert_eq!(state.panel_mode, PanelMode::Agents);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserAction::ReadTaskTranscript(TaskTranscriptRequest { task_id, .. }))
+                if task_id == "child"
+        ));
     }
 
     #[test]
