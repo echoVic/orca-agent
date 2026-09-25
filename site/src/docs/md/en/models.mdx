@@ -21,6 +21,14 @@ Orca normalizes both to `deepseek-flash` before routing, persistence, cache
 identity, and cost estimation. They are not shown as separate models in the
 interactive selector.
 
+## Default model
+
+When no model is configured, or the model is `auto`, Orca uses
+`deepseek-flash`. Earlier versions routed `auto` to `deepseek-v4-pro`; set
+`model = "deepseek-v4-pro"` in configuration, or pass `--model deepseek-v4-pro`,
+to keep Pro as the default. The welcome screen and the status bar show the
+model a session actually uses.
+
 ## Persistent selection
 
 Set the model in user configuration or through the environment:

@@ -1,0 +1,179 @@
+# 终端界面
+
+不带任务直接运行 `orca` 会打开交互式终端界面（TUI）。本页介绍屏幕上各部分是什么，以及常用的按键。输入框为空时按 `?`（或 `F1` / `Ctrl+K`）可以随时查看完整的按键列表。
+
+## 首次在一个目录里运行
+
+第一次在某个目录打开 Orca 时，它会先请你确认这个工作区的安全边界：工作区路径、API key 从哪里读取、目录信任状态，以及 `orca doctor` 的检查摘要。
+
+~~~text
+╭ Welcome ─────────────────────────────────────────────────────────╮
+│ Before the first run, review this workspace security boundary.   │
+│ Workspace: ~/projects/api                                        │
+│ Folder trust: untrusted                                          │
+│                                                                  │
+│ › T  Trust workspace                                             │
+│   U  Continue untrusted                                          │
+│   E  Exit                                                        │
+╰──────────────────────────────────────────────────────────────────╯
+~~~
+
+信任一个目录，意味着允许 Orca 加载该项目自带的配置、指令、skills、agents 和 workflows。它不会开启、也不会绕过操作系统沙箱。详见[审批模式](approval-modes.md)和[配置说明](configuration.md)。
+
+## 屏幕布局
+
+对话从上往下排列，输入框和状态栏在最下方：
+
+~~~text
+ ›  fix the failing auth test
+    ⋯ thinking · the boundary second is still treated as valid…
+    ✓ read  src/auth/token.rs
+    │ pub fn token_valid(now: u64, expiry: u64) -> bool {
+    └ +2 lines · e to expand
+    ✎ edit  src/auth/token.rs
+    │ edited src/auth/token.rs
+ ●  token_valid now rejects the expiry second; the auth test passes.
+────────────────────────────────────────────────────────────────────────────
+ ›  Message Orca…  / commands · @ files · $ skills
+────────────────────────────────────────────────────────────────────────────
+ ⇧Tab suggest      deepseek-flash · max · ctx 97% · 8.7k · $0.0031 · ? help
+~~~
+
+| 标记 | 含义 |
+| --- | --- |
+| `›` | 你发的消息。 |
+| `●` | Orca 的回复。 |
+| `⋯ thinking` | 模型的思考过程，折叠成一行。 |
+| `✓` `✎` `✗` | 工具调用：成功、改了文件、失败。输出显示在 `│` 竖线下方。 |
+| `ℹ` | Orca 的提示信息。较长的提示会像工具输出一样折叠。 |
+
+折叠的行末尾会显示 `+N lines · e to expand`。按 `e` 展开最近的一条，按 `Shift+E` 全部展开，也可以直接点击该行。
+
+状态栏左侧是审批模式（`⇧Tab` 切换）；右侧依次是模型和推理强度、上下文窗口剩余比例、目前的 token 用量和费用，以及帮助提示。终端足够宽时，中间还会显示当前目录和 git 分支；终端变窄时，先隐藏 token 用量和费用，再隐藏上下文比例，最后隐藏模型。
+
+## 输入消息
+
+| 按键 | 作用 |
+| --- | --- |
+| `Enter` | 发送消息。 |
+| `Shift+Enter` / `Alt+Enter` | 换行。 |
+| `@` | 引用文件、skill、插件或 MCP 资源。 |
+| `$` | 插入 skill。 |
+| `/` | 打开命令菜单。 |
+| `↑` / `↓` | 输入框为空时，翻看之前发过的消息。 |
+| `Ctrl+V` | 粘贴剪贴板里的图片。 |
+| `Esc` | 清空草稿。在发出下一条消息之前，按 `↑` 可以找回。 |
+
+输入框为空时按 `Esc`，会收回你的上一条消息：对话回到这条消息之前，消息内容回到输入框里，方便修改后重发。
+
+## Orca 工作时
+
+轮次运行时，输入框上方会显示一行活动状态：
+
+~~~text
+ ⠼ Running 12s · edit src/auth/token.rs · Esc interrupt
+ Queued 1 · Ctrl+Enter send now · Alt+Up edit latest
+ ↳ then run the whole test suite
+~~~
+
+- `Esc`（或 `Ctrl+G`）中断当前轮次。
+- `Enter` 把消息加入队列。当前轮次结束后，排队的消息按顺序发出，并作为你的下一条消息显示在对话里。中断会暂停队列；再发一条消息会恢复队列，也可以用 `/queue` 查看、暂停或启动队列。
+- `Ctrl+Enter` 立即发送：正在运行的轮次会在当前这一步结束后读到这条消息。如果当前轮次接不了，这条消息会排到队列最前面。这个功能需要终端支持 kitty 键盘协议，例如 Ghostty、kitty、WezTerm。
+- `Alt+↑` 修改最近一条排队的消息。
+- 输入框为空时按 `Ctrl+B`，把当前轮次放到后台继续运行，你可以先开始别的事情。
+
+## 审批
+
+工具调用需要你批准时，输入区域会变成审批面板：
+
+~~~text
+╭ Approve · edit ──────────────────────────────────────────────────────────╮
+│ src/auth/token.rs                                                        │
+│                                                                          │
+│ › 1  Allow once               run it now                                 │
+│   2  Allow this exact call    remember only this exact call              │
+│   3  Allow edit this session  skip approval for this tool until you quit │
+│   4  Deny                     ask Orca for another way                   │
+│                                                                          │
+│ ↑↓ move · 1/2/3/4 pick · Enter confirm · Esc deny                        │
+╰──────────────────────────────────────────────────────────────────────────╯
+~~~
+
+按数字键选择，或用 `↑`/`↓` 移动后按 `Enter` 确认。`Esc` 表示拒绝。如果调用没有具体目标（比如搜索），就不会出现选项 2。预览内容比面板长时，用 `PgUp`/`PgDn` 翻页查看。
+
+`Shift+Tab` 依次切换审批模式：suggest → auto-edit → full-auto → plan。切到 full-auto 前会先请你确认。各模式允许做什么，见[审批模式](approval-modes.md)。
+
+## 后台任务与任务 dock
+
+后台运行的轮次、agent 和长时间运行的命令，会显示在对话下方的任务 dock 里：
+
+~~~text
+ ◆ Tasks · 1 active · 1 needs approval
+ ● 1 needs approval
+ Enter approve · Esc close
+~~~
+
+- `/tasks` 显示或隐藏 dock，`Esc` 关闭。
+- 放到后台的轮次会停在第一个需要你答复的工具调用上。在 dock 里按 `Enter`（输入框需为空）或点击那一行，就能打开这个审批。如果按你当前的审批模式这个工具本来不用问，轮次会自己继续，并给出提示。
+- 你空闲时后台 agent 完成了，Orca 会带着它们的结果继续对话。
+
+`/agents` 打开 Agent Workspace，列出所有任务及其状态。选中一个后按 `Enter`：
+
+- 运行中的 agent：打开它的实时对话；如果另一个轮次正在运行，则显示它的实时活动；
+- 已完成的 agent：打开它的记录；
+- 可恢复的 agent：还可以按 `r` 恢复、`R` 重试，或用 `/task-follow-up` 追加指示。
+
+## Plan 模式
+
+`/plan`（或用 `Shift+Tab` 切到 plan）进入只读规划模式。Orca 只调查、不做任何修改，可能会先问你几个问题，然后给出计划：
+
+~~~text
+ ●  Here is the plan.
+  Proposed Plan
+  Token expiry fix
+  • reject the expiry second in token_valid
+  • add a regression test for the boundary
+╭ Plan ready ──────────────────────────────────────────────────────────╮
+│ The plan is ready. Choose whether to start implementation.           │
+│                                                                      │
+│ › 1  Yes, implement this plan  Switch to suggest and start coding.   │
+│   2  No, stay in Plan mode     Continue planning with feedback.      │
+│                                                                      │
+│ ↑↓ move · Enter confirm · PgUp/PgDn review plan                      │
+╰──────────────────────────────────────────────────────────────────────╯
+~~~
+
+选 1 会切回进入 plan 之前的模式（如果对话一开始就在 plan 模式，则切到 auto-edit），并开始实现。选 2 留在 plan 模式，你可以继续提意见。对话进行到一半也可以切到 plan 模式；`/plan off` 退出。
+
+Orca 提问时，用数字键或 `↑`/`↓` 加 `Enter` 回答；`←`/`→` 在问题之间切换，`Ctrl+T` 可以改为在对话里直接回答。
+
+## Recap
+
+`/recap` 会在输入框上方用一条摘要概括目前为止的对话：
+
+~~~text
+ ↳ Recap  Fixed the token expiry check and added a boundary test; the full
+          suite still needs a run on your machine.
+~~~
+
+完整内容在面板里打开，`Esc` 关闭，点击摘要条可以再次打开。安静约三分钟后你回到终端时，Orca 会自动生成一条 recap。TUI 通过 ACP 连接到 daemon 会话时不提供 recap。
+
+## 侧边对话
+
+`/side` 打开一个侧边对话，用来问一些不想影响主对话的问题。`Ctrl+/` 在两者之间切换，`Ctrl+C` 关闭侧边对话。详见[侧边对话](side-conversations.md)。
+
+## 浏览对话
+
+| 按键 | 作用 |
+| --- | --- |
+| `PgUp` / `PgDn` | 翻一页。 |
+| `Ctrl+U` / `Ctrl+D` | 输入框为空时，翻半页。 |
+| `Ctrl+Home` / `Ctrl+End` | 跳到最上面或最下面。 |
+| `Ctrl+F` | 输入框为空时，在对话中查找。 |
+| `Ctrl+L` | 清屏。对话本身会保留。 |
+
+## 会话
+
+`/resume` 打开会话选择器。会话按项目分组，当前项目排在最前面，输入文字可以筛选。选择器里还可以分叉、重命名、归档或删除会话。`/new` 开始新对话，`/fork` 分叉当前对话，`/rename` 重命名。退出时 Orca 会打印这个会话的 `orca --resume <SESSION_ID>` 命令。
+
+从命令行恢复会话，见[会话续传](session-commands.md)。

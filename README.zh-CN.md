@@ -75,9 +75,12 @@ Windows PowerShell 使用 `$env:DEEPSEEK_API_KEY = "sk-..."` 设置密钥；
 `Ctrl+L` 只清除屏幕内容和终端回滚区，不会清除当前会话上下文。退出 TUI 时，
 Orca 会输出准确的 `orca --resume <SESSION_ID>` 恢复命令。
 
-使用 `/plan` 进行只读规划，使用 `/goal` 管理持久目标。`/tasks` 是统一任务工作区，
-集中展示普通子代理、后台命令、监控任务和 Workflow child；`/agents` 是它的别名，
-`/workflows` 则保留 Workflow 专用运行树。使用 `/trust` 管理当前目录的沙箱权限。
+使用 `/plan` 进行只读规划，使用 `/goal` 管理持久目标。
+`/tasks` 显示或隐藏对话下方的任务 dock，后台轮次、子代理、后台命令、监控任务和 Workflow child 都会出现在这里；
+`/agents` 打开 Agent Workspace，列出所有任务及其实时对话或记录和可用操作；
+`/workflows` 则保留 Workflow 专用运行树。
+界面和按键（内联审批、排队与 `Ctrl+Enter` 插话、`/recap`、侧边对话）见[终端界面指南](https://orcaagent.dev/docs/#terminal-ui)。
+使用 `/trust` 管理当前目录的沙箱权限。
 
 ### 在 Pilion Browser 中使用 Orca
 
@@ -103,7 +106,7 @@ Orca 会输出准确的 `orca --resume <SESSION_ID>` 恢复命令。
   JSONL 流中携带类型化终端对象。
 - 运行没有固定轮次上限的持久目标（Goal 累计 token 预算耗尽时会禁用自动续跑），
   并通过子智能体和 JavaScript 工作流处理长任务。Conversation 最多保留 4 行
-  子代理实时摘要，每个 child 最多持久化 8 条活动历史；`/tasks` 可进入实时
+  子代理实时摘要，每个 child 最多持久化 8 条活动历史；`/agents` 可进入实时对话和
   transcript，并按 child 的可恢复状态提供 stop、resume、retry 和 follow-up。
 - 直接、嵌套、Workflow、托管、续跑和恢复的子代理共用每棵根任务树的持久执行
   作用域。默认 32 个执行 lease 是容量上限而非派单目标；超出的已接受任务排队且

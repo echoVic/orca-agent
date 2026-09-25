@@ -95,6 +95,7 @@ const navEn: NavGroup[] = [
   {
     label: "Interactive TUI",
     items: [
+      { id: "terminal-ui", title: "Terminal UI", file: "terminal-ui" },
       { id: "session-commands", title: "Session Commands", file: "session-commands" },
       { id: "mention-search", title: "Mention Search", file: "mention-search" },
       { id: "side-conversations", title: "Side Conversations", file: "side-conversations" },
@@ -143,6 +144,7 @@ const navZh: NavGroup[] = [
   {
     label: "交互式 TUI",
     items: [
+      { id: "terminal-ui", title: "终端界面", file: "terminal-ui" },
       { id: "session-commands", title: "会话命令", file: "session-commands" },
       { id: "mention-search", title: "Mention 搜索", file: "mention-search" },
       { id: "side-conversations", title: "侧边对话", file: "side-conversations" },

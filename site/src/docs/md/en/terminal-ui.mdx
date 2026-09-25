@@ -1,0 +1,229 @@
+# Terminal UI
+
+Running `orca` with no task opens the interactive terminal UI. This page walks
+through what is on screen and the keys that drive it. For the complete key
+list at any time, press `?` (or `F1` / `Ctrl+K`) while the input is empty.
+
+## First run in a folder
+
+The first time Orca opens a folder it asks you to review the workspace
+boundary: the workspace path, where the API key is read from, the folder-trust
+decision, and a summary of `orca doctor`.
+
+~~~text
+╭ Welcome ─────────────────────────────────────────────────────────╮
+│ Before the first run, review this workspace security boundary.   │
+│ Workspace: ~/projects/api                                        │
+│ Folder trust: untrusted                                          │
+│                                                                  │
+│ › T  Trust workspace                                             │
+│   U  Continue untrusted                                          │
+│   E  Exit                                                        │
+╰──────────────────────────────────────────────────────────────────╯
+~~~
+
+Trusting a folder lets Orca load that project's configuration, instructions,
+skills, agents, and workflows. It does not enable or bypass the OS sandbox.
+See [Approval modes](approval-modes.md) and [Configuration](configuration.md).
+
+## The screen
+
+A conversation reads top to bottom, with the input and the status bar at the
+bottom:
+
+~~~text
+ ›  fix the failing auth test
+    ⋯ thinking · the boundary second is still treated as valid…
+    ✓ read  src/auth/token.rs
+    │ pub fn token_valid(now: u64, expiry: u64) -> bool {
+    └ +2 lines · e to expand
+    ✎ edit  src/auth/token.rs
+    │ edited src/auth/token.rs
+ ●  token_valid now rejects the expiry second; the auth test passes.
+────────────────────────────────────────────────────────────────────────────
+ ›  Message Orca…  / commands · @ files · $ skills
+────────────────────────────────────────────────────────────────────────────
+ ⇧Tab suggest      deepseek-flash · max · ctx 97% · 8.7k · $0.0031 · ? help
+~~~
+
+| Mark | Meaning |
+| --- | --- |
+| `›` | Your message. |
+| `●` | Orca's reply. |
+| `⋯ thinking` | The model's reasoning, collapsed to one line. |
+| `✓` `✎` `✗` | A tool call that succeeded, edited a file, or failed, with its output under a `│` rail. |
+| `ℹ` | A notice from Orca. Long notices collapse like tool output. |
+
+A collapsed row ends with `+N lines · e to expand`. Press `e` to expand the
+latest one, `Shift+E` to expand all of them, or click a row.
+
+The status bar shows the approval mode on the left (`⇧Tab` cycles it). On the
+right are the model and reasoning effort, how much of the context window is
+left, the tokens and cost so far, and the help hint. A wide terminal also shows
+the folder and git branch in the middle; as the terminal narrows, the tokens
+and cost drop out first, then the context, then the model.
+
+## Writing a message
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Send the message. |
+| `Shift+Enter` / `Alt+Enter` | Insert a newline. |
+| `@` | Mention a file, skill, plugin, or MCP resource. |
+| `$` | Insert a skill. |
+| `/` | Open the command menu. |
+| `↑` / `↓` | Browse earlier messages when the input is empty. |
+| `Ctrl+V` | Attach an image from the clipboard. |
+| `Esc` | Clear the draft. `↑` brings it back until you send another message. |
+
+With an empty input, `Esc` takes back your last message: the conversation
+rewinds to before it and the message returns to the input so you can edit it.
+
+## While Orca works
+
+A running turn shows an activity line above the input:
+
+~~~text
+ ⠼ Running 12s · edit src/auth/token.rs · Esc interrupt
+ Queued 1 · Ctrl+Enter send now · Alt+Up edit latest
+ ↳ then run the whole test suite
+~~~
+
+- `Esc` (or `Ctrl+G`) interrupts the turn.
+- `Enter` queues your message. Queued messages run in order once the turn
+  finishes, and each appears in the conversation as your next message.
+  Interrupting pauses the queue; sending a new message resumes it, and
+  `/queue` lists, pauses, or starts it.
+- `Ctrl+Enter` sends the message now: the running turn reads it after its
+  current step. If the turn cannot take it, it jumps to the front of the queue.
+  This needs a terminal with the kitty keyboard protocol, such as Ghostty,
+  kitty, or WezTerm.
+- `Alt+↑` edits the latest queued message.
+- `Ctrl+B` with an empty input moves the turn to the background, where it keeps
+  running while you start something else.
+
+## Approvals
+
+When a tool call needs your approval, the input area turns into an approval
+panel:
+
+~~~text
+╭ Approve · edit ──────────────────────────────────────────────────────────╮
+│ src/auth/token.rs                                                        │
+│                                                                          │
+│ › 1  Allow once               run it now                                 │
+│   2  Allow this exact call    remember only this exact call              │
+│   3  Allow edit this session  skip approval for this tool until you quit │
+│   4  Deny                     ask Orca for another way                   │
+│                                                                          │
+│ ↑↓ move · 1/2/3/4 pick · Enter confirm · Esc deny                        │
+╰──────────────────────────────────────────────────────────────────────────╯
+~~~
+
+Press a number, or move with `↑`/`↓` and press `Enter`. `Esc` denies. When the
+call has no specific target (a search, for example), option 2 is not offered.
+If a preview is longer than the panel, `PgUp`/`PgDn` page through it.
+
+`Shift+Tab` cycles the approval mode: suggest → auto-edit → full-auto → plan.
+Entering full-auto asks for confirmation first. See
+[Approval modes](approval-modes.md) for what each mode allows.
+
+## Background work and the tasks dock
+
+Background turns, agents, and long-running commands appear in the tasks dock
+under the conversation:
+
+~~~text
+ ◆ Tasks · 1 active · 1 needs approval
+ ● 1 needs approval
+ Enter approve · Esc close
+~~~
+
+- `/tasks` shows or hides the dock; `Esc` closes it.
+- A turn moved to the background stops at the first tool call that needs an
+  answer. Press `Enter` in the dock (with an empty input), or click the row, to
+  open that approval. When your current approval mode would run the tool
+  without asking, the turn continues by itself and says so.
+- When background agents finish while you are idle, Orca continues the
+  conversation with their results.
+
+`/agents` opens the Agent Workspace, which lists every task with its status.
+Select one and press `Enter`:
+
+- a running agent opens its live conversation, or its live activity while
+  another turn is running;
+- a finished agent opens its transcript;
+- a resumable agent also offers `r` to resume, `R` to retry, and
+  `/task-follow-up` to send it a follow-up.
+
+## Plan mode
+
+`/plan` (or `Shift+Tab` to plan) switches to read-only planning. Orca
+investigates without changing anything, may ask you questions, and then
+proposes a plan:
+
+~~~text
+ ●  Here is the plan.
+  Proposed Plan
+  Token expiry fix
+  • reject the expiry second in token_valid
+  • add a regression test for the boundary
+╭ Plan ready ──────────────────────────────────────────────────────────╮
+│ The plan is ready. Choose whether to start implementation.           │
+│                                                                      │
+│ › 1  Yes, implement this plan  Switch to suggest and start coding.   │
+│   2  No, stay in Plan mode     Continue planning with feedback.      │
+│                                                                      │
+│ ↑↓ move · Enter confirm · PgUp/PgDn review plan                      │
+╰──────────────────────────────────────────────────────────────────────╯
+~~~
+
+Choosing 1 switches back to the mode you were in before planning (auto-edit
+when the conversation started in plan mode) and starts the implementation.
+Choosing 2 keeps you in plan mode so you can send feedback. You can switch to
+plan mode in the middle of a conversation; `/plan off` leaves it.
+
+When Orca asks questions, answer with the number keys or `↑`/`↓` and `Enter`;
+`←`/`→` move between questions, and `Ctrl+T` lets you answer in the chat
+instead.
+
+## Recap
+
+`/recap` summarizes the conversation so far in a strip above the input:
+
+~~~text
+ ↳ Recap  Fixed the token expiry check and added a boundary test; the full
+          suite still needs a run on your machine.
+~~~
+
+The full text opens in a panel; `Esc` closes it and clicking the strip opens it
+again. When you come back to the terminal after about three quiet minutes,
+Orca writes a recap on its own. Recap is not available when the TUI is
+attached to a daemon session over ACP.
+
+## Side conversations
+
+`/side` opens a side conversation for a quick question that should not change
+the main one. `Ctrl+/` switches between the two, and `Ctrl+C` closes the side
+conversation. See [Side conversations](side-conversations.md).
+
+## Moving around the conversation
+
+| Key | Action |
+| --- | --- |
+| `PgUp` / `PgDn` | Scroll one page. |
+| `Ctrl+U` / `Ctrl+D` | Scroll half a page when the input is empty. |
+| `Ctrl+Home` / `Ctrl+End` | Jump to the top or the bottom. |
+| `Ctrl+F` | Find in the conversation when the input is empty. |
+| `Ctrl+L` | Clear the screen. The conversation itself is kept. |
+
+## Sessions
+
+`/resume` opens the session picker. Conversations are grouped by project, with
+the current project first; type to filter. The picker can also fork, rename,
+archive, or delete a conversation. `/new` starts a new conversation, `/fork`
+forks the current one, and `/rename` renames it. When you quit, Orca prints the
+`orca --resume <SESSION_ID>` command for the conversation.
+
+See [Conversation continuity](session-commands.md) for resuming from the
+command line.

@@ -47,6 +47,10 @@ configuration, and built-in defaults.
 
 ## Change mode in the TUI
 
+`Shift+Tab` cycles the mode: suggest → auto-edit → full-auto → plan. Entering
+full-auto asks for an explicit Full Access confirmation first. The status bar
+shows the active mode on its left (`⇧Tab suggest`).
+
 Use /mode to inspect the active mode or set one explicitly:
 
 ~~~text
@@ -59,8 +63,40 @@ Use /mode to inspect the active mode or set one explicitly:
 ~~~
 
 The settings change is applied through the runtime, not by editing a local
-prompt. When a task is waiting on an approval, resolve that approval based on
-the displayed tool, target, and scope rather than changing mode as a shortcut.
+prompt. A mode change applies to this session only and is not saved. When a
+task is waiting on an approval, resolve that approval based on the displayed
+tool, target, and scope rather than changing mode as a shortcut.
+
+## Answer an approval
+
+When a tool call needs approval, the TUI shows an approval panel in place of
+the input:
+
+| Choice | Effect |
+| --- | --- |
+| `1` Allow once | Run this call. |
+| `2` Allow this exact call | Run it, and allow the same tool with the same target again without asking. Not offered when the call has no specific target. |
+| `3` Allow the tool this session | Run it, and stop asking for this tool until you quit. |
+| `4` Deny | Do not run it; Orca looks for another way. `Esc` also denies. |
+
+`PgUp`/`PgDn` page through a preview that is longer than the panel.
+
+## Approvals for background turns
+
+A turn moved to the background with `Ctrl+B` stops at the first tool call that
+needs an answer, and the tasks dock shows `needs approval`. Press `Enter` in
+the dock (with an empty input), or click the row, to open the approval. When
+the current mode and permission rules would run that tool without asking, the
+turn continues by itself and the conversation notes it.
+
+## Plan mode
+
+In plan mode Orca investigates read-only, may ask clarifying questions, and
+finishes with a proposed plan. A **Plan ready** dialog then offers to implement
+it, which switches back to the mode you were in before planning (auto-edit when
+the session started in plan mode), or to stay in plan mode and refine it. You
+can switch to plan mode in the middle of a conversation. See
+[Terminal UI](terminal-ui.md).
 
 ## Trust remains separate
 

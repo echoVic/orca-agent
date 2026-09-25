@@ -16,6 +16,13 @@ DeepSeek-V4.1-Flash，支持图像理解并采用 Flash 价格。旧名称
 输入，但 Orca 会在路由、持久化、缓存标识和成本估算前将二者归一化为
 `deepseek-flash`，交互式选择器不再将其展示为独立模型。
 
+## 默认模型
+
+没有配置模型，或模型为 `auto` 时，Orca 使用 `deepseek-flash`。
+旧版本会把 `auto` 路由到 `deepseek-v4-pro`；如果想继续默认使用 Pro，
+在配置里设置 `model = "deepseek-v4-pro"`，或传入 `--model deepseek-v4-pro`。
+欢迎页和状态栏显示的是会话实际使用的模型。
+
 ## 持久化选择
 
 可以在用户配置或环境变量中设置模型：

@@ -91,10 +91,14 @@ compatibility alias for `/new`. `Ctrl+L` clears only the displayed transcript
 and terminal scrollback, keeping the current conversation context. On exit,
 Orca prints the exact `orca --resume <SESSION_ID>` command for the session.
 
-Use `/plan` for read-only planning, `/goal` for a persistent objective, and
-`/tasks` for the unified workspace containing subagents, background commands,
-monitors, and workflow children. `/agents` is an alias for `/tasks`, while
-`/workflows` keeps the workflow-specific run tree. Use `/trust` to control
+Use `/plan` for read-only planning and `/goal` for a persistent objective.
+`/tasks` shows or hides the tasks dock under the conversation, where background
+turns, subagents, background commands, monitors, and workflow children appear;
+`/agents` opens the Agent Workspace with every task, its live conversation or
+transcript, and its controls; `/workflows` keeps the workflow-specific run
+tree. The [Terminal UI guide](https://orcaagent.dev/docs/#terminal-ui) covers
+the screen and its keys: inline approvals, queued and steered follow-ups
+(`Ctrl+Enter`), `/recap`, and side conversations. Use `/trust` to control
 whether Orca loads project-provided configuration and instructions; it does not
 enable or bypass OS sandbox enforcement. Automatic project memory is enabled
 for recorded sessions by default; use `/remember` for explicit user or project
@@ -139,9 +143,9 @@ deletion.
   accepted overflow queues without creating a worker, and parents waiting for
   children yield their lease before re-entering the fair queue.
 - Keeps up to four active child summaries visible in the conversation and up to
-  eight durable activity entries per child. `/tasks` opens live transcripts and
-  exposes only controls the selected child can safely perform: stop, resume,
-  retry, or a revision-fenced follow-up.
+  eight durable activity entries per child. `/agents` opens live conversations
+  and transcripts and exposes only controls the selected child can safely
+  perform: stop, resume, retry, or a revision-fenced follow-up.
 - Learns a bounded set of durable project facts after successfully committed
   turns and retrieves only prompt-relevant facts on later turns.
 - Runs with no implicit turn ceiling; optional `[budget]` limits
