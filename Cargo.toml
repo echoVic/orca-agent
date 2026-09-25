@@ -90,4 +90,4 @@ uuid = { workspace = true }
 
 [target.'cfg(windows)'.dev-dependencies]
 orca-windows-sandbox = { path = "crates/orca-windows-sandbox" }
-# release v0.5.0
+# release v0.5.0 (README refresh)
