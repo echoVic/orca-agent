@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.32";
+export const releaseVersion = "v0.5.0";
 
 export const releases = [
+  {
+    version: "v0.5.0",
+    date: "2026-09-26",
+    title: "A redesigned terminal UI",
+    body: "Redesigns the interactive terminal UI: approvals appear in place of the input, background work lives in a tasks dock, /recap summarizes a session, and Ctrl+Enter steers a follow-up into the running turn. An unset or auto model now routes to deepseek-flash, background agents continue the conversation when they finish, and runtime fixes make background turns, plan mode, and detached workers dependable.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.0",
+  },
   {
     version: "v0.4.32",
     date: "2026-09-18",

@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.0":
+        "Redesigns the interactive terminal UI with approvals in place of the input, a tasks dock for background work, session recap, collapsible tool output, and Ctrl+Enter to steer a follow-up into the running turn. An unset or auto model now routes to deepseek-flash; background agents continue the conversation when they finish; and fixes cover background approvals, reused tool call ids, proposed plans in streamed replies, detached workers, and an owner-only API key file.",
       "v0.4.32":
         "Twenty-seven hardening fixes across protocol edge cases, trust-store concurrency, sandbox guards, ACP error reporting, provider 5xx retries, workflow restart recovery, and terminal-bench adapter reliability. Headless runs now cancel on SIGINT/SIGTERM; trajectories persist on every exit path; the reasoning-effort lever enables A/B benchmark arms; and the untrusted-workspace warning explains instead of failing.",
       "v0.4.31":
@@ -674,6 +676,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.0":
+        "重新设计交互式终端界面：审批直接出现在输入框的位置，后台工作集中在任务 dock，新增会话回顾（/recap）和可折叠的工具输出，Ctrl+Enter 可以把追加消息送进正在运行的轮次。未指定或 auto 的模型改为默认使用 deepseek-flash；后台 agent 完成后会自动继续对话；并修复了后台审批、重复的工具调用 id、流式回复中的计划、分离运行的 worker，以及 API key 文件的权限（现在只有所有者可读）。",
       "v0.4.32":
         "二十七项加固修复覆盖协议边界、信任存储并发、沙箱守卫、ACP 错误上报、提供商 5xx 重试、工作流重启恢复和 terminal-bench 适配器可靠性。无头运行现在在 SIGINT/SIGTERM 时取消；轨迹在所有退出路径上持久化；reasoning-effort 杠杆支持 A/B 基准；不可信工作区改为提示而非直接失败。",
       "v0.4.31":
