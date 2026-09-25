@@ -559,15 +559,23 @@ impl OperationContext {
     /// artifacts under the per-test home.
     #[cfg(test)]
     pub(crate) fn for_tests(spec: BudgetSpec, operation_id: &str) -> Self {
-        let unique = format!(
-            "{operation_id}-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0)
-        );
-        Self::open(spec, &unique, false).expect("open test operation context")
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        Self::open(spec, &test_journal_id(operation_id, nanos), false)
+            .expect("open test operation context")
     }
+}
+
+/// A test context's journal name. The clock alone does not make it unique:
+/// threads released together read the same value, and two contexts sharing
+/// a journal fail to open ("journal record 2 has ordinal 1; expected 3").
+#[cfg(test)]
+fn test_journal_id(operation_id: &str, nanos: u128) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{operation_id}-{}-{nanos}-{sequence}", std::process::id())
 }
 
 /// The session checkpoint reason string: the legacy cost string stays
@@ -613,6 +621,15 @@ fn unix_ms() -> u64 {
 mod tests {
     use super::*;
     use orca_core::budget::StopReason;
+
+    #[test]
+    fn test_contexts_opened_at_the_same_instant_get_their_own_journals() {
+        // Threads a barrier releases together can read the same clock value.
+        assert_ne!(
+            test_journal_id("turn-loop-input-test", 7),
+            test_journal_id("turn-loop-input-test", 7)
+        );
+    }
 
     #[test]
     fn child_reservations_distinguish_replayed_and_reused_provider_call_ids() {
