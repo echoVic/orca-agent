@@ -102,7 +102,11 @@ async function main() {
       if (!metadata.dist?.integrity?.startsWith("sha512-")) throw new Error(`npm registry integrity missing for ${spec}`);
       if (!suffix) {
         const expectedAliases = Object.fromEntries(TARGETS.map(([alias]) => [`@blade-ai/orca-${alias}`, `npm:@blade-ai/orca@${version}-${alias}`]));
-        if (JSON.stringify(metadata.optionalDependencies) !== JSON.stringify(expectedAliases)) throw new Error(`wrong optional-dependency aliases for ${spec}`);
+        // The registry does not keep key order (it returns keys by length, then bytes), so compare as a map.
+        const aliases = metadata.optionalDependencies ?? {};
+        const sameAliases = Object.keys(aliases).length === Object.keys(expectedAliases).length
+          && Object.entries(expectedAliases).every(([alias, target]) => aliases[alias] === target);
+        if (!sameAliases) throw new Error(`wrong optional-dependency aliases for ${spec}`);
       }
       const fileName = await retry(`npm pack ${spec}`, args, () => run("npm", ["pack", spec, "--pack-destination", npmDir]));
       const tarball = path.join(npmDir, fileName.split(/\r?\n/).at(-1));

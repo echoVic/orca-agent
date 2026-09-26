@@ -91,6 +91,13 @@ if (a[0] === "view") {
   const version = a[1].slice(a[1].lastIndexOf("@") + 1);
   const metadata = JSON.parse(readFileSync(path.join(fixture, "metadata", version + ".json")));
   if (process.env.ORCA_VERIFY_SCENARIO === "bad-integrity") metadata.dist.integrity = "sha512-bad";
+  // The registry returns object keys by length, then bytes, not in publish order.
+  if (process.env.ORCA_VERIFY_SCENARIO === "registry-key-order" && metadata.optionalDependencies) {
+    metadata.optionalDependencies = Object.fromEntries(Object.entries(metadata.optionalDependencies).sort(([a], [b]) => a.length - b.length || (a < b ? -1 : 1)));
+  }
+  if (process.env.ORCA_VERIFY_SCENARIO === "wrong-alias" && metadata.optionalDependencies) {
+    metadata.optionalDependencies["@blade-ai/orca-linux-x64"] = "npm:@blade-ai/orca@0.0.0-linux-x64";
+  }
   process.stdout.write(JSON.stringify(metadata));
 } else if (a[0] === "pack") {
   const version = a[1].slice(a[1].lastIndexOf("@") + 1), out = a[a.indexOf("--pack-destination") + 1];
@@ -119,12 +126,15 @@ if (a[0] === "view") {
   }
   const success = invoke();
   if (!success.ok || !success.output.includes("Published release verified")) throw new Error(`positive verification failed: ${success.output}`);
+  const reordered = invoke("registry-key-order");
+  if (!reordered.ok || !reordered.output.includes("Published release verified")) throw new Error(`registry key order was rejected: ${reordered.output}`);
   for (const [scenario, expected] of [
     ["missing-asset", "missing asset"],
     ["wrong-target", "does not match main"],
     ["checksum-failure", "Checksum failure"],
     ["mismatched-npm-asset", "GitHub/npm tarball mismatch"],
     ["bad-integrity", "registry integrity mismatch"],
+    ["wrong-alias", "wrong optional-dependency aliases"],
     ["install-failure", "Command failed"],
   ]) {
     const result = invoke(scenario);
