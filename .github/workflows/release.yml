@@ -282,7 +282,8 @@ jobs:
           status="$(curl -sS -o exchange.json -w '%{http_code}' -X POST \
             -H "Authorization: Bearer ${id_token}" \
             "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/@blade-ai%2forca")"
-          if [[ "$status" != 200 ]] || ! jq -e '(.token // "") | length > 0' exchange.json >/dev/null; then
+          # npm answers a successful exchange with 201 Created.
+          if [[ ! "$status" =~ ^2[0-9][0-9]$ ]] || ! jq -e '(.token // "") | length > 0' exchange.json >/dev/null; then
             echo "npm refused the trusted-publishing exchange (HTTP ${status}): $(jq -r '.message // .error // empty' exchange.json 2>/dev/null)" >&2
             echo "Configure a trusted publisher for @blade-ai/orca: GitHub Actions, echoVic/orca-agent, workflow release.yml." >&2
             rm -f exchange.json

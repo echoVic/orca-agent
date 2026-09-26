@@ -22,6 +22,9 @@ test("npm trust is proven before any public asset exists", () => {
   assert.match(trust, /permissions:\n\s+id-token: write/);
   assert.match(trust, /audience=npm:registry\.npmjs\.org/);
   assert.match(trust, /oidc\/token\/exchange\/package\/@blade-ai%2forca/);
+  // A successful exchange is 201 Created, not 200.
+  assert.doesNotMatch(trust, /"\$status" != 200/);
+  assert.match(trust, /\^2\[0-9\]\[0-9\]\$/);
 });
 
 test("npm publishes with an npm that performs the OIDC exchange", () => {
