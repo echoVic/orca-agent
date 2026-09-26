@@ -113,9 +113,18 @@ version already exists or points elsewhere, stop and choose a new version.
 The `release.yml` workflow is the sole publisher. It triggers on the tag push
 and:
 1. Verifies the tagged SHA already passed the required `main` checks
-2. Builds binaries for all six targets, including native Windows x64 and ARM64
-3. Creates a GitHub Release with binary assets
-4. Stages, smoke-tests, and publishes npm packages
+2. Proves npm trusted publishing works for this workflow (`npm-trust`)
+3. Builds binaries for all six targets, including native Windows x64 and ARM64
+4. Creates a GitHub Release with binary assets
+5. Stages, smoke-tests, and publishes npm packages
+
+npm publishing uses trusted publishing (OIDC); there is no `NPM_TOKEN`
+secret. On npmjs.com, `@blade-ai/orca` must list a trusted publisher for
+GitHub Actions with repository `echoVic/orca-agent` and workflow `release.yml`.
+`npm-trust` performs the same token exchange as `npm publish` before any public
+asset exists, so a missing or wrong trusted publisher fails the run cleanly.
+Fix the configuration on npmjs.com, then re-run the failed jobs
+(`gh run rerun <run-id> --failed`); never re-tag.
 
 Monitor progress:
 
@@ -141,4 +150,5 @@ node scripts/release/verify-published.mjs \
 | Forgot site update | Push a follow-up commit to `site/src/` — pages workflow re-deploys automatically |
 | Local main differs from origin/main | Stop and reconcile with a non-destructive fast-forward or reviewed PR |
 | Version tag already exists or points elsewhere | Do not move it; select a new patch version |
+| `npm-trust` fails | Add or correct the trusted publisher on npmjs.com, then re-run the failed jobs |
 | `summaries` missing new version in Changelog.tsx | TypeScript build fails — add entry to both EN and ZH summaries objects |

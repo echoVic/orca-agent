@@ -265,25 +265,34 @@ jobs:
             dist/orca-${{ matrix.target }}.${{ matrix.archive }}
             dist/orca-${{ matrix.target }}.${{ matrix.archive }}.sha256
 
-  npm-auth:
+  npm-trust:
     if: github.ref_type == 'tag'
     needs: [version]
     runs-on: ubuntu-latest
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    permissions:
+      id-token: write
     steps:
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
-      - name: Require live npm credentials
+      - name: Require npm trusted publishing for this workflow
+        shell: bash
         run: |
-          test -n "$NODE_AUTH_TOKEN" || { echo "NPM_TOKEN is required" >&2; exit 1; }
-          npm whoami
+          # The exchange npm publish performs (npm >= 11.5.1), done before any public asset exists.
+          id_token="$(curl -fsS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm:registry.npmjs.org" | jq -r '.value // empty')"
+          test -n "$id_token" || { echo "GitHub did not issue an OIDC token" >&2; exit 1; }
+          status="$(curl -sS -o exchange.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${id_token}" \
+            "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/@blade-ai%2forca")"
+          if [[ "$status" != 200 ]] || ! jq -e '(.token // "") | length > 0' exchange.json >/dev/null; then
+            echo "npm refused the trusted-publishing exchange (HTTP ${status}): $(jq -r '.message // .error // empty' exchange.json 2>/dev/null)" >&2
+            echo "Configure a trusted publisher for @blade-ai/orca: GitHub Actions, echoVic/orca-agent, workflow release.yml." >&2
+            rm -f exchange.json
+            exit 1
+          fi
+          rm -f exchange.json
 
   release:
     if: github.ref_type == 'tag'
-    needs: [build, version, npm-auth]
+    needs: [build, version, npm-trust]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -308,20 +317,25 @@ jobs:
 
   npm:
     if: github.ref_type == 'tag'
-    needs: [build, version, release, npm-auth]
+    needs: [build, version, release]
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      id-token: write
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22.14.0
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Use an npm that supports trusted publishing
+        # Node 22.14.0 bundles npm 10.9.2; the OIDC exchange arrived in npm 11.5.1.
+        run: |
+          npm install -g npm@11.20.0
+          npm --version
       - uses: actions/download-artifact@v5
         with:
           path: dist/artifacts

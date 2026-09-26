@@ -8,7 +8,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/echoVic/blade-deepseek.git"
+    "url": "git+https://github.com/echoVic/orca-agent.git"
   },
   "engines": {
     "node": ">=16"
