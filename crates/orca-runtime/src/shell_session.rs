@@ -1297,9 +1297,8 @@ impl Drop for RuntimeShellSessionManager {
 
 impl ShellSession {
     fn is_workspace_owned(&self) -> bool {
-        self.tasks
-            .get(&self.task_id)
-            .is_some_and(|task| task.lifetime == TaskLifetime::Workspace)
+        // `Drop` asks this, so the read must not panic.
+        self.tasks.lifetime(&self.task_id) == Some(TaskLifetime::Workspace)
     }
 
     fn join_readers(&mut self) {

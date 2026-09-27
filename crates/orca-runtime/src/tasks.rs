@@ -4299,18 +4299,31 @@ impl TaskRegistry {
     ///
     /// This changes ownership only; it grants no permission.
     pub fn mark_task_lifetime(&self, id: &str, lifetime: TaskLifetime) -> bool {
-        self.with_tasks(|tasks| {
-            let Some(record) = tasks.get_mut(id) else {
-                return false;
-            };
+        // Persisted like any other change: a record reloaded from the
+        // session's task file must keep its owner.
+        self.mutate_task(id, |record| {
             if is_terminal(record.status) {
-                return false;
+                return Ok((false, false));
             }
             record.lifetime = lifetime;
-            record.publication_revision = record.publication_revision.saturating_add(1);
-            true
+            Ok((true, true))
         })
         .unwrap_or(false)
+    }
+
+    /// Who owns the task's work, or `None` when that cannot be read. Unlike
+    /// [`Self::get`] it never panics: `Drop` impls ask for it, and a panic
+    /// there while another unwinds aborts the process.
+    pub fn lifetime(&self, id: &str) -> Option<TaskLifetime> {
+        if let Ok(Some(lifetime)) = self.with_tasks(|tasks| tasks.get(id).map(|task| task.lifetime))
+        {
+            return Some(lifetime);
+        }
+        self.persistence
+            .as_ref()?
+            .load_record_by_id(id, self.recover_persisted_active_tasks, &self.session_id)
+            .ok()?
+            .map(|record| record.lifetime)
     }
 
     pub fn requires_attention(&self) -> bool {
@@ -10292,6 +10305,45 @@ while :; do :; done
             registry.pending_child_message_count(&child.id),
             MAX_QUEUED_CHILD_MESSAGES
         );
+    }
+
+    #[test]
+    fn a_workspace_lifetime_survives_a_refresh_from_disk() {
+        // It was set in memory only, so the next read of the session's
+        // task file (the relay poll lists tasks every 50ms) put back
+        // `Task`, and closing the session stopped the service anyway.
+        let temp = tempfile::tempdir().unwrap();
+        let registry =
+            TaskRegistry::new_persistent("session-1".to_string(), temp.path().join("tasks"))
+                .unwrap();
+        let service = registry.create_subagent("dev server".to_string(), None);
+        registry.mark_running(&service.id).unwrap();
+
+        assert!(registry.mark_task_lifetime(&service.id, TaskLifetime::Workspace));
+        let _ = registry.list();
+        assert_eq!(
+            registry.get(&service.id).map(|task| task.lifetime),
+            Some(TaskLifetime::Workspace)
+        );
+        assert_eq!(
+            registry.lifetime(&service.id),
+            Some(TaskLifetime::Workspace)
+        );
+    }
+
+    #[test]
+    fn reading_a_lifetime_never_panics() {
+        // `ShellSession::drop` asks for it; a panic there while another
+        // panic unwinds aborts the process.
+        let registry = TaskRegistry::new("lifetime-poisoned".to_string());
+        let task = registry.create_subagent("service".to_string(), None);
+        let poisoner = registry.clone();
+        let _ = std::thread::spawn(move || {
+            let _ = poisoner.with_tasks(|_| panic!("poison the registry"));
+        })
+        .join();
+
+        assert_eq!(registry.lifetime(&task.id), None);
     }
 
     #[test]
