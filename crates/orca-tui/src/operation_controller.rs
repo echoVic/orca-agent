@@ -103,7 +103,14 @@ impl TuiSurfaceTaskControl {
         if cancel_surface_if_active_checked(&mut hosted)? {
             return Ok(true);
         }
-        let queue_runtime = hosted.queue_runtime.clone();
+        // With a child in view the queue is bound to the child's thread, and
+        // focusing a child never takes over cancellation: the child is
+        // stopped from the Agents panel, where its task records the stop.
+        let queue_runtime = hosted
+            .focused_child_surface
+            .is_none()
+            .then(|| hosted.queue_runtime.clone())
+            .flatten();
         drop(hosted);
         let queue_snapshot = queue_runtime.as_ref().and_then(|runtime| {
             runtime.is_busy().then(|| {
@@ -1963,6 +1970,88 @@ mod tests {
             None => unsafe { std::env::remove_var("ORCA_HOME") },
         }
         assert_eq!(woken, 0, "main started a turn nobody would see");
+    }
+
+    #[test]
+    fn interrupting_while_a_child_is_in_view_leaves_the_childs_turn_running() {
+        // Showing a child binds the queue to its thread, and Ctrl+C then
+        // cancelled the child's own generation directly, although focusing
+        // a child never takes over cancellation; the child stops from the
+        // Agents panel, where its task records it.
+        let _guard = crate::test_support::lock_process_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = orca_core::config::HistoryMode::Record;
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let host = orca_runtime::runtime_host::RuntimeHost::start_with_executor(Arc::new(
+            WaitForCancelExecutor {
+                entered: entered_tx,
+            },
+        ))
+        .expect("runtime host");
+        let child = host
+            .start_thread(config, "child in view")
+            .expect("child thread");
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let _ = control.bind_prompt_queue_runtime(child.clone(), &event_tx);
+        let operation = child
+            .start_turn(
+                orca_runtime::runtime_host::HostedTurnRequest::new("child work"),
+                std::io::sink(),
+            )
+            .expect("start the child turn");
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the child turn is running");
+        let surface = child.surface();
+        let attachment = match surface.attach_fresh(orca_runtime::surface::FreshAttachRequest {
+            request_id: orca_runtime::surface::SurfaceRequestId::new(),
+            role: orca_runtime::surface::SurfaceAttachmentRole::Tui,
+            requested_capabilities: std::collections::BTreeSet::from([
+                orca_runtime::surface::SurfaceCapability::ReadSnapshot,
+            ]),
+            interaction_capabilities: Default::default(),
+        }) {
+            orca_runtime::surface::AttachResult::FreshAttached { attachment } => attachment,
+            orca_runtime::surface::AttachResult::Denied { reason } => {
+                panic!("attach to the child: denied {reason:?}")
+            }
+            orca_runtime::surface::AttachResult::Unavailable { reason } => {
+                panic!("attach to the child: unavailable {reason:?}")
+            }
+            _ => panic!("attach to the child"),
+        };
+        // A turn started outside the typed surface has no surface operation;
+        // the one a focused child's live turn has is stood in for here.
+        let operation_id = orca_runtime::surface::SurfaceOperationId::try_from_bytes(
+            *uuid::Uuid::now_v7().as_bytes(),
+        )
+        .expect("operation id");
+        control
+            .install_focused_child_surface(attachment.client.clone(), operation_id)
+            .expect("focus the child");
+
+        assert!(
+            !control.interrupt_current().expect("interrupt"),
+            "nothing of the parent's is running to interrupt"
+        );
+        assert!(
+            operation.wait_timeout(Duration::from_millis(300)).is_none(),
+            "the child's turn keeps running"
+        );
+
+        let _ = child.interrupt_active();
+        let _ = operation.wait_timeout(Duration::from_secs(10));
+        child.shutdown().expect("child shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
     }
 
     #[test]
