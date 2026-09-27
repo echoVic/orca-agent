@@ -380,6 +380,46 @@ fn blank_boundary_freezes_tail_revision_and_new_block_uses_new_tail() {
 }
 
 #[test]
+fn reasoning_from_the_next_model_call_starts_its_own_row() {
+    // A tool shown in a panel (the plan, subagents, task reads) leaves no
+    // row between two model calls, and the second call's reasoning was
+    // appended to the first's, with no break between them.
+    let mut state = state();
+    state.push_message(ChatMessage::User("prompt".to_string()));
+    state.update(TuiEvent::ReasoningDelta("first call".to_string()));
+    state.update(TuiEvent::ToolRequested {
+        id: "plan-1".to_string(),
+        name: "update_plan".to_string(),
+        target: None,
+    });
+    state.update(TuiEvent::ReasoningDelta("second ".to_string()));
+    state.update(TuiEvent::ReasoningDelta("call".to_string()));
+    assert!(matches!(
+        state.transcript.messages.as_slice(),
+        [
+            ChatMessage::User(_),
+            ChatMessage::Reasoning { text: first, .. },
+            ChatMessage::Reasoning { text: second, .. },
+        ] if first == "first call" && second == "second call"
+    ));
+
+    // A completed response replaces only its own call's rows.
+    state.update(TuiEvent::AssistantResponseCompleted(
+        Some("answer\n\n".to_string()),
+        Some("second call, final".to_string()),
+    ));
+    assert!(matches!(
+        state.transcript.messages.as_slice(),
+        [
+            ChatMessage::User(_),
+            ChatMessage::Reasoning { text: first, .. },
+            ChatMessage::Reasoning { text: second, .. },
+            ChatMessage::AssistantChunk { text, .. },
+        ] if first == "first call" && second == "second call, final" && text == "answer\n\n"
+    ));
+}
+
+#[test]
 fn reconcile_assistant_response_replaces_frozen_chunks_and_open_tail() {
     let mut state = state();
     state.push_message(ChatMessage::User("prompt".to_string()));

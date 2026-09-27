@@ -289,10 +289,12 @@ impl AppState {
                 }
                 self.finish_assistant_stream();
                 let last = self.transcript.messages.len().saturating_sub(1);
-                if matches!(
-                    self.transcript.messages.last(),
-                    Some(ChatMessage::Reasoning { .. })
-                ) {
+                if last >= self.transcript.call_start
+                    && matches!(
+                        self.transcript.messages.last(),
+                        Some(ChatMessage::Reasoning { .. })
+                    )
+                {
                     self.mutate_message(last, |message| {
                         let ChatMessage::Reasoning { text: existing, .. } = message else {
                             unreachable!();
@@ -334,7 +336,10 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
+                // A tool call ends the model call that made it; what streams
+                // next comes from the following call.
                 if is_panel_owned_tool_progress_name(&name) {
+                    self.transcript.call_start = self.transcript.messages.len();
                     return;
                 }
                 if let Some(index) = self.receiving_tool_call_message_index(&id) {
@@ -1192,15 +1197,7 @@ impl AppState {
         // The response's own streamed text is what trails the transcript:
         // the text before the last tool row, notice, or message belongs to
         // an earlier round or reply and stays.
-        let boundary = self.transcript.messages.iter().rposition(|item| {
-            !matches!(
-                item,
-                ChatMessage::Reasoning { .. }
-                    | ChatMessage::Assistant(_)
-                    | ChatMessage::AssistantChunk { .. }
-                    | ChatMessage::ProposedPlan(_)
-            )
-        });
+        let boundary = self.current_call_boundary();
         let mut index = 0;
         self.retain_messages(|_| {
             let keep = boundary.is_some_and(|boundary| index <= boundary);
@@ -1222,8 +1219,11 @@ impl AppState {
         }
     }
 
-    pub(crate) fn discard_current_assistant_attempt(&mut self) {
-        let boundary = self.transcript.messages.iter().rposition(|message| {
+    /// The last message before the current model call's streamed output:
+    /// the last row that is not reasoning or a reply, or the end of an
+    /// earlier call that left no row.
+    fn current_call_boundary(&self) -> Option<usize> {
+        let last_row = self.transcript.messages.iter().rposition(|message| {
             !matches!(
                 message,
                 ChatMessage::Reasoning { .. }
@@ -1232,6 +1232,16 @@ impl AppState {
                     | ChatMessage::ProposedPlan(_)
             )
         });
+        let earlier_call = self
+            .transcript
+            .call_start
+            .min(self.transcript.messages.len())
+            .checked_sub(1);
+        last_row.max(earlier_call)
+    }
+
+    pub(crate) fn discard_current_assistant_attempt(&mut self) {
+        let boundary = self.current_call_boundary();
         let mut index = 0_usize;
         self.retain_messages(|message| {
             let keep = boundary.is_some_and(|boundary| index <= boundary)

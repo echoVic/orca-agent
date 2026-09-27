@@ -1165,6 +1165,7 @@ impl AppState {
         self.reset_message_tracking();
         self.transcript.finalized_count = 0;
         self.transcript.flushed_count = 0;
+        self.transcript.call_start = self.transcript.messages.len();
         self.viewport.unseen_messages = 0;
         self.invalidate_selection();
     }
@@ -1182,6 +1183,7 @@ impl AppState {
         self.clear_pending_edit_highlights();
         self.transcript.finalized_count = 0;
         self.transcript.flushed_count = 0;
+        self.transcript.call_start = 0;
         self.viewport.unseen_messages = 0;
         self.invalidate_selection();
     }
@@ -1261,6 +1263,7 @@ impl AppState {
         self.transcript.render_cache.truncate(len);
         self.transcript.finalized_count = self.transcript.finalized_count.min(len);
         self.transcript.flushed_count = self.transcript.flushed_count.min(len);
+        self.transcript.call_start = self.transcript.call_start.min(len);
         self.prune_applied_diff_highlights();
         if did_truncate {
             self.rebuild_tool_call_indices();
@@ -1352,8 +1355,10 @@ impl AppState {
         let mut retained_tail = None;
         let finalized_count = self.transcript.finalized_count.min(messages.len());
         let flushed_count = self.transcript.flushed_count.min(messages.len());
+        let call_start = self.transcript.call_start.min(messages.len());
         let mut retained_finalized = 0;
         let mut retained_flushed = 0;
+        let mut retained_before_call = 0;
         let mut retained_mask = Vec::with_capacity(messages.len());
         let mut removed_tool_revisions = Vec::new();
         for (index, (message, revision)) in messages.into_iter().zip(revisions).enumerate() {
@@ -1365,6 +1370,7 @@ impl AppState {
                 }
                 retained_finalized += usize::from(index < finalized_count);
                 retained_flushed += usize::from(index < flushed_count);
+                retained_before_call += usize::from(index < call_start);
                 self.transcript.messages.push(message);
                 self.transcript.message_revisions.push(revision);
             } else if matches!(message, ChatMessage::ToolCall { .. }) {
@@ -1382,6 +1388,7 @@ impl AppState {
         }
         self.transcript.finalized_count = retained_finalized;
         self.transcript.flushed_count = retained_flushed;
+        self.transcript.call_start = retained_before_call;
         if retained_mask.iter().any(|retain| !retain) {
             for revision in removed_tool_revisions {
                 self.remove_applied_highlight_revision(revision);

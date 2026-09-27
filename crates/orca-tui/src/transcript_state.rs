@@ -61,6 +61,10 @@ pub(crate) struct TranscriptState {
     pub(crate) search: TranscriptSearchState,
     pub(crate) finalized_count: usize,
     pub(crate) flushed_count: usize,
+    /// Where the current model call's reasoning and reply start: the
+    /// messages before it came from earlier calls, even when no row, such as
+    /// a tool shown only in a panel, separates them.
+    pub(crate) call_start: usize,
     pub(crate) proposed_plan_parser: ProposedPlanStreamParser,
     pub(crate) assistant_stream: StreamingMarkdownAssembler,
     pub(crate) assistant_stream_tail: Option<usize>,
