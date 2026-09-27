@@ -156,7 +156,10 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_pro
     execution_profile: orca_core::capability::ExecutionProfile,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
-    let shell_timeout = std::time::Duration::from_secs(shell_timeout_secs.max(1));
+    // 0 is the default and sets no administrator cap, so an external tool runs
+    // until it exits or is cancelled, like a shell command.
+    let shell_timeout =
+        (shell_timeout_secs > 0).then(|| std::time::Duration::from_secs(shell_timeout_secs));
     let should_cancel = &should_cancel as &dyn Fn() -> bool;
     if !tool_uses_mcp_registry(&request.name) {
         if external_tools.is_empty() {
@@ -854,6 +857,79 @@ done
 
         assert_eq!(resolved.tool.name(), "glob");
         assert_eq!(resolved.spec.capabilities.action_kind(), ActionKind::Read);
+    }
+
+    #[test]
+    fn external_tool_runs_to_completion_without_an_administrator_cap() {
+        // `shell_timeout_secs = 0` is the default and sets no cap; it must
+        // not become a one-second limit on every external tool.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let external_tools = vec![ExternalToolConfig {
+            name: "slow_lookup".to_string(),
+            description: "takes a moment".to_string(),
+            action_kind: ActionKind::Read,
+            command: if cfg!(windows) {
+                "Start-Sleep -Milliseconds 1500; [Console]::Out.Write('done')".to_string()
+            } else {
+                "sleep 1.5; printf done".to_string()
+            },
+            schema: serde_json::json!({}),
+        }];
+        let request = ToolRequest {
+            id: "slow".to_string(),
+            name: ToolName::External("slow_lookup".to_string()),
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+
+        let result = execute_with_mcp_and_external(
+            &request,
+            temp_dir.path(),
+            &McpRegistry::default(),
+            &external_tools,
+            0,
+        );
+
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        assert_eq!(result.output.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn external_tool_stops_at_the_administrator_cap() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let external_tools = vec![ExternalToolConfig {
+            name: "slow_lookup".to_string(),
+            description: "takes too long".to_string(),
+            action_kind: ActionKind::Read,
+            command: if cfg!(windows) {
+                "Start-Sleep -Seconds 10".to_string()
+            } else {
+                "sleep 10".to_string()
+            },
+            schema: serde_json::json!({}),
+        }];
+        let request = ToolRequest {
+            id: "slow".to_string(),
+            name: ToolName::External("slow_lookup".to_string()),
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+
+        let result = execute_with_mcp_and_external(
+            &request,
+            temp_dir.path(),
+            &McpRegistry::default(),
+            &external_tools,
+            1,
+        );
+
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("external tool 'slow_lookup' timed out after 1s")
+        );
     }
 
     #[test]

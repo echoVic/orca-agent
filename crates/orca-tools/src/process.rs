@@ -287,7 +287,18 @@ pub fn wait_for_child_output_with_timeout_or_cancel(
     timeout: Duration,
     should_cancel: impl Fn() -> bool,
 ) -> io::Result<CommandOutput> {
-    wait_for_child_output_with_timeout_or_cancel_and_limit(
+    wait_for_child_output_or_cancel(child, process_job, Some(timeout), should_cancel)
+}
+
+/// Waits for the child and collects its output. With no `timeout` there is
+/// no deadline: the child runs until it exits or `should_cancel` stops it.
+pub fn wait_for_child_output_or_cancel(
+    child: Child,
+    process_job: ProcessJob,
+    timeout: Option<Duration>,
+    should_cancel: impl Fn() -> bool,
+) -> io::Result<CommandOutput> {
+    wait_for_child_output_with_limit(
         child,
         process_job,
         timeout,
@@ -297,9 +308,25 @@ pub fn wait_for_child_output_with_timeout_or_cancel(
 }
 
 pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
-    mut child: Child,
+    child: Child,
     process_job: ProcessJob,
     timeout: Duration,
+    should_cancel: impl Fn() -> bool,
+    max_retained_bytes_per_stream: usize,
+) -> io::Result<CommandOutput> {
+    wait_for_child_output_with_limit(
+        child,
+        process_job,
+        Some(timeout),
+        should_cancel,
+        max_retained_bytes_per_stream,
+    )
+}
+
+fn wait_for_child_output_with_limit(
+    mut child: Child,
+    process_job: ProcessJob,
+    timeout: Option<Duration>,
     should_cancel: impl Fn() -> bool,
     max_retained_bytes_per_stream: usize,
 ) -> io::Result<CommandOutput> {
@@ -436,7 +463,7 @@ where
     let status = wait_for_child_and_readers(
         &mut child,
         &process_job,
-        timeout,
+        Some(timeout),
         should_cancel,
         || stdout_handle.is_finished() && stderr_handle.is_finished(),
         reader_stop.as_ref(),
@@ -467,14 +494,16 @@ where
 fn wait_for_child_and_readers(
     child: &mut Child,
     process_job: &ProcessJob,
-    timeout: Duration,
+    timeout: Option<Duration>,
     should_cancel: impl Fn() -> bool,
     readers_finished: impl Fn() -> bool,
     reader_stop: &AtomicBool,
 ) -> io::Result<(ExitStatus, CommandTermination)> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .unwrap_or_else(Instant::now);
+    let deadline = timeout.map(|timeout| {
+        Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now)
+    });
     let mut status = None;
 
     loop {
@@ -502,7 +531,7 @@ fn wait_for_child_and_readers(
             reader_stop.store(true, Ordering::Release);
             return Ok((status.expect("cancelled child status"), termination));
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             if status.is_none() {
                 status = try_observe_child_exit(child, process_job, reader_stop)?;
             }

@@ -66,7 +66,8 @@ pub trait Tool: Send + Sync {
 pub struct ToolContext<'a> {
     pub cwd: &'a Path,
     pub output_truncation: ToolOutputTruncation,
-    pub shell_timeout: Duration,
+    /// How long an external tool may run; `None` sets no limit.
+    pub shell_timeout: Option<Duration>,
     pub additional_working_directories: Vec<PathBuf>,
     pub mcp_registry: Option<&'a McpRegistry>,
     pub mcp_elicitation_handler: Option<&'a dyn McpElicitationHandler>,
@@ -79,7 +80,7 @@ impl<'a> ToolContext<'a> {
         Self {
             cwd,
             output_truncation: ToolOutputTruncation::bytes(MAX_TOOL_OUTPUT_BYTES),
-            shell_timeout: Duration::from_secs(120),
+            shell_timeout: Some(Duration::from_secs(120)),
             additional_working_directories: Vec::new(),
             mcp_registry: None,
             mcp_elicitation_handler: None,
@@ -93,7 +94,7 @@ impl<'a> ToolContext<'a> {
         self
     }
 
-    pub fn with_shell_timeout(mut self, shell_timeout: Duration) -> Self {
+    pub fn with_shell_timeout(mut self, shell_timeout: Option<Duration>) -> Self {
         self.shell_timeout = shell_timeout;
         self
     }

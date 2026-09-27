@@ -116,18 +116,20 @@ pub fn execute_external_tool_with_policy_or_cancel(
         request,
         cwd,
         output_truncation,
-        shell_timeout,
+        Some(shell_timeout),
         orca_core::capability::ExecutionProfile::TrustedHost,
         should_cancel,
     )
 }
 
+/// Runs an external tool. With no `shell_timeout` the tool runs until it exits
+/// or is cancelled.
 pub fn execute_external_tool_with_policy_or_cancel_with_profile(
     config: &ExternalToolConfig,
     request: &ToolRequest,
     cwd: &Path,
     output_truncation: ToolOutputTruncation,
-    shell_timeout: Duration,
+    shell_timeout: Option<Duration>,
     execution_profile: orca_core::capability::ExecutionProfile,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
@@ -224,7 +226,7 @@ pub fn execute_external_tool_with_policy_or_cancel_with_profile(
         );
     }
 
-    let output = match process::wait_for_child_output_with_timeout_or_cancel(
+    let output = match process::wait_for_child_output_or_cancel(
         child,
         process_job,
         shell_timeout,
@@ -282,6 +284,8 @@ pub fn execute_external_tool_with_policy_or_cancel_with_profile(
         (false, false) => format!("{stdout}\n{stderr}"),
     };
     let message = if output.timed_out {
+        // Only a set timeout can expire.
+        let shell_timeout = shell_timeout.unwrap_or_default();
         if detail.is_empty() {
             format!(
                 "external tool '{}' timed out after {}s",
