@@ -2832,7 +2832,7 @@ mod tests {
             "edit",
             "billing/pages.py",
             Some(orca_runtime::surface::SurfaceFileChange::UnifiedDiff {
-                path: CanonicalPath::try_new(std::env::temp_dir().join("billing/pages.py"))
+                path: CanonicalPath::try_new(std::env::temp_dir().join("billing").join("pages.py"))
                     .unwrap(),
                 text: DisplayText::new(diff),
                 digest: Sha256Digest::digest(diff),
