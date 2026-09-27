@@ -397,6 +397,10 @@ pub struct SurfaceAssistantPlanItem {
     pub id: SurfaceItemId,
     pub turn_id: SurfaceTurnId,
     pub text: DisplayText,
+    /// Where the plan sat in its reply: the byte length of the message text
+    /// before it. A plan recorded without it is shown after the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_offset: Option<ByteOffset>,
     pub pinned: bool,
 }
 
@@ -432,6 +436,10 @@ pub enum SurfaceItem {
         id: SurfaceItemId,
         turn_id: SurfaceTurnId,
         text: DisplayText,
+        /// Where the plan sat in its reply: the byte length of the message text
+        /// before it. A plan recorded without it is shown after the message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_offset: Option<ByteOffset>,
         pinned: bool,
     },
     ToolResultMessage {

@@ -100,6 +100,22 @@ impl ProposedPlanStreamParser {
     }
 }
 
+/// The message text of `content` that comes before its first proposed plan,
+/// or `None` when it has no complete plan.
+pub fn message_text_before_plan(content: &str) -> Option<String> {
+    let mut parser = ProposedPlanStreamParser::default();
+    let mut segments = parser.push(content);
+    segments.extend(parser.finish());
+    let mut before = String::new();
+    for segment in segments {
+        match segment {
+            ProposedPlanSegment::Agent(text) => before.push_str(&text),
+            ProposedPlanSegment::Plan(_) => return Some(before),
+        }
+    }
+    None
+}
+
 /// Length of the longest end of `text` that `tag` starts with.
 fn pending_tag_prefix_len(text: &str, tag: &str) -> usize {
     for (index, _) in text.char_indices().rev() {

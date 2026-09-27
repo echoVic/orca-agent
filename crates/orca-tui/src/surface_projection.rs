@@ -588,21 +588,50 @@ fn history_messages_from_surface_items(
             index += 1;
         }
         let assistant_items = &items[start..index];
-        for item in assistant_items
-            .iter()
-            .filter(|item| matches!(item, SurfaceItem::AssistantReasoning { .. }))
-            .chain(
-                assistant_items
-                    .iter()
-                    .filter(|item| matches!(item, SurfaceItem::AssistantMessage { .. })),
-            )
-            .chain(
-                assistant_items
-                    .iter()
-                    .filter(|item| matches!(item, SurfaceItem::AssistantPlan { .. })),
-            )
-        {
-            if let Some(message) = history_message_from_surface_item(item, tools) {
+        let of_kind = |kind: fn(&SurfaceItem) -> bool| {
+            assistant_items
+                .iter()
+                .filter(move |item| kind(item))
+                .collect::<Vec<_>>()
+        };
+        let reasoning = of_kind(|item| matches!(item, SurfaceItem::AssistantReasoning { .. }));
+        let replies = of_kind(|item| matches!(item, SurfaceItem::AssistantMessage { .. }));
+        let plans = of_kind(|item| matches!(item, SurfaceItem::AssistantPlan { .. }));
+        // A plan that recorded where it sat in its reply goes back there;
+        // otherwise it follows the message.
+        let placed = match (replies.as_slice(), plans.as_slice()) {
+            (
+                [SurfaceItem::AssistantMessage { text, .. }],
+                [
+                    SurfaceItem::AssistantPlan {
+                        message_offset: Some(offset),
+                        ..
+                    },
+                ],
+            ) => usize::try_from(offset.get())
+                .ok()
+                .filter(|offset| text.as_str().is_char_boundary(*offset))
+                .map(|offset| text.as_str().split_at(offset)),
+            _ => None,
+        };
+        // Each entry is an item to show, or with `Some`, part of a reply.
+        let mut ordered: Vec<(&SurfaceItem, Option<&str>)> =
+            reasoning.iter().map(|item| (*item, None)).collect();
+        match placed {
+            Some((before, after)) => ordered.extend([
+                (replies[0], Some(before)),
+                (plans[0], None),
+                (replies[0], Some(after)),
+            ]),
+            None => ordered.extend(replies.iter().chain(&plans).map(|item| (*item, None))),
+        }
+        for (item, part) in ordered {
+            let message = match part {
+                Some(text) => (!text.trim().is_empty())
+                    .then(|| crate::transcript_state::ChatMessage::Assistant(text.to_string())),
+                None => history_message_from_surface_item(item, tools),
+            };
+            if let Some(message) = message {
                 messages.push(message);
             }
         }
@@ -2862,6 +2891,58 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_plan_sits_where_it_was_in_its_reply() {
+        use crate::transcript_state::ChatMessage;
+        let turn_id = SurfaceTurnId::new();
+        let message = |text: &str| SurfaceItem::AssistantMessage {
+            id: SurfaceItemId::new(),
+            turn_id: turn_id.clone(),
+            text: DisplayText::new(text),
+            pinned: false,
+        };
+        let plan = |offset: Option<u64>| SurfaceItem::AssistantPlan {
+            id: SurfaceItemId::new(),
+            turn_id: turn_id.clone(),
+            text: DisplayText::new("# Plan\n- inspect\n"),
+            message_offset: offset.map(orca_runtime::surface::ByteOffset::new),
+            pinned: false,
+        };
+
+        let middle = history_messages_from_surface_items(
+            &[message("Preface\n\nPostscript"), plan(Some(8))],
+            &[],
+        );
+        assert!(
+            matches!(
+                middle.as_slice(),
+                [ChatMessage::Assistant(before), ChatMessage::ProposedPlan(_), ChatMessage::Assistant(after)]
+                    if before == "Preface\n" && after == "\nPostscript"
+            ),
+            "{middle:?}"
+        );
+
+        let first =
+            history_messages_from_surface_items(&[message("Postscript"), plan(Some(0))], &[]);
+        assert!(
+            matches!(
+                first.as_slice(),
+                [ChatMessage::ProposedPlan(_), ChatMessage::Assistant(after)] if after == "Postscript"
+            ),
+            "{first:?}"
+        );
+
+        // An offset the message cannot hold leaves the plan after the message.
+        let unfit = history_messages_from_surface_items(&[message("Short"), plan(Some(99))], &[]);
+        assert!(
+            matches!(
+                unfit.as_slice(),
+                [ChatMessage::Assistant(text), ChatMessage::ProposedPlan(_)] if text == "Short"
+            ),
+            "{unfit:?}"
+        );
+    }
+
+    #[test]
     fn typed_history_projection_preserves_visible_items_and_redacts_secrets() {
         let turn_id = SurfaceTurnId::new();
         let items = vec![
@@ -2912,6 +2993,7 @@ mod tests {
                 id: SurfaceItemId::new(),
                 turn_id,
                 text: DisplayText::new("plan"),
+                message_offset: None,
                 pinned: false,
             },
         ];
@@ -3096,6 +3178,7 @@ mod tests {
                         id: SurfaceItemId::new(),
                         turn_id,
                         text: DisplayText::new("# Plan\n- inspect\n"),
+                        message_offset: None,
                         pinned: false,
                     }),
                     tool_calls: Vec::new(),

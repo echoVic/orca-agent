@@ -4112,6 +4112,7 @@ fn apply_item_patch(
                     id,
                     turn_id,
                     text,
+                    message_offset,
                     pinned,
                 } => batch.events.as_slice().iter().any(|event| {
                     matches!(
@@ -4121,6 +4122,7 @@ fn apply_item_patch(
                                 value.id == *id
                                     && value.turn_id == *turn_id
                                     && value.text == *text
+                                    && value.message_offset == *message_offset
                                     && value.pinned == *pinned)
                     )
                 }),
@@ -4460,6 +4462,7 @@ fn apply_assistant_patch(
                         id: item.id.clone(),
                         turn_id: item.turn_id.clone(),
                         text: item.text.clone(),
+                        message_offset: item.message_offset,
                         pinned: item.pinned,
                     }),
             ];

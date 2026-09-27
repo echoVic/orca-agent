@@ -1151,9 +1151,13 @@ fn a_proposed_plan_streams_on_its_own_channel_and_completes_with_the_message() {
         item,
         SurfaceItem::AssistantMessage { text, .. } if text.as_str() == "Preface\n\nPostscript"
     )));
+    // The plan item records where the plan sat, so a resumed transcript can
+    // put it back between "Preface" and "Postscript".
     assert!(snapshot.items.iter().any(|item| matches!(
         item,
-        SurfaceItem::AssistantPlan { text, .. } if text.as_str() == "# Plan\n- inspect\n"
+        SurfaceItem::AssistantPlan { text, message_offset, .. }
+            if text.as_str() == "# Plan\n- inspect\n"
+                && *message_offset == Some(orca_runtime::surface::ByteOffset::new("Preface\n".len() as u64))
     )));
     host.shutdown().unwrap();
 }

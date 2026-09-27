@@ -643,9 +643,26 @@ fn normalize_provider_response(
                     id,
                     turn_id: completed.identity.turn_id.clone(),
                     text: surface_persisted_display_text(&text),
+                    message_offset: None,
                     pinned: false,
                 });
             }
+        }
+    }
+
+    // A plan cut from the middle of a reply records where it sat, so a
+    // resumed transcript can put it back there rather than after the message.
+    // A plan that ends the reply records nothing: it already shows last.
+    if let (Some(plan), Some(message)) = (plan_item.as_mut(), message_item.as_ref())
+        && let Some(before) = completed
+            .assistant_content
+            .as_deref()
+            .and_then(orca_core::proposed_plan::message_text_before_plan)
+    {
+        let before = surface_persisted_display_text(&before);
+        let message = message.text.as_str();
+        if message.starts_with(before.as_str()) && before.as_str().len() < message.len() {
+            plan.message_offset = Some(surface::ByteOffset::new(before.as_str().len() as u64));
         }
     }
 
@@ -892,10 +909,11 @@ fn response_items_match(
             snapshot.items.iter().any(|item| {
                 matches!(
                     item,
-                    surface::SurfaceItem::AssistantPlan { id, turn_id, text, pinned }
+                    surface::SurfaceItem::AssistantPlan { id, turn_id, text, message_offset, pinned }
                         if id == &expected.id
                             && turn_id == &expected.turn_id
                             && text == &expected.text
+                            && message_offset == &expected.message_offset
                             && pinned == &expected.pinned
                 )
             })
@@ -1166,6 +1184,36 @@ mod tests {
                 Some("python3 -m unittest".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn a_plan_records_its_offset_only_when_message_text_follows_it() {
+        let offset_for = |content: &str| {
+            let response = crate::model_response::RuntimeModelResponse::new(
+                orca_core::provider_types::ProviderResponse {
+                    steps: Vec::new(),
+                    assistant_content: Some(content.to_string()),
+                    assistant_reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+                orca_core::thread_identity::TurnId::new(),
+            );
+            normalize_provider_response(&response, "provider response")
+                .unwrap()
+                .completed_response
+                .plan_item
+                .expect("plan item")
+                .message_offset
+                .map(surface::ByteOffset::get)
+        };
+        let plan = "<proposed_plan>\n# Plan\n</proposed_plan>";
+
+        assert_eq!(offset_for(&format!("Preface\n{plan}\nPostscript")), Some(8));
+        assert_eq!(offset_for(&format!("{plan}\nPostscript")), Some(0));
+        // A plan that ends the reply already shows after the message, so
+        // it records nothing an older Orca could not read back.
+        assert_eq!(offset_for(&format!("Preface\n{plan}")), None);
     }
 
     #[test]

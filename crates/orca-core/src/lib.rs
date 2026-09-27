@@ -34,7 +34,27 @@ pub mod workspace_identity;
 
 #[cfg(test)]
 mod proposed_plan_tests {
-    use crate::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
+    use crate::proposed_plan::{
+        ProposedPlanSegment, ProposedPlanStreamParser, message_text_before_plan,
+    };
+
+    #[test]
+    fn message_text_before_plan_is_the_reply_up_to_its_first_plan() {
+        let plan = "<proposed_plan>\n# Plan\n</proposed_plan>";
+        assert_eq!(
+            message_text_before_plan(&format!("Intro\n{plan}\nOutro")).as_deref(),
+            Some("Intro\n")
+        );
+        assert_eq!(
+            message_text_before_plan(&format!("{plan}\nOutro")).as_deref(),
+            Some("")
+        );
+        assert_eq!(message_text_before_plan("No plan here"), None);
+        assert_eq!(
+            message_text_before_plan("Intro <proposed_plan> never closed"),
+            None
+        );
+    }
 
     #[test]
     fn proposed_plan_parser_handles_split_tags_and_preserves_agent_text() {

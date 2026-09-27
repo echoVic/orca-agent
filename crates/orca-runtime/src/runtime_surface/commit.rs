@@ -16169,6 +16169,7 @@ mod tests {
                 id: retained_plan_id.clone(),
                 turn_id: retained_turn_id,
                 text: super::super::DisplayText::new("retained plan"),
+                message_offset: None,
                 pinned: false,
             },
         ]);
