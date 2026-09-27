@@ -316,10 +316,7 @@ impl JsonlThreadStore {
 
 pub fn delete_session(selector: &str) -> io::Result<PathBuf> {
     let path = if is_latest_selector(selector) {
-        list_sessions_with_archived(1, true)?
-            .into_iter()
-            .next()
-            .map(|session| session.path)
+        latest_session_path(true)?
     } else {
         find_session_path(selector, true)?
     }
@@ -340,10 +337,7 @@ pub fn delete_session(selector: &str) -> io::Result<PathBuf> {
 
 pub fn archive_session(selector: &str) -> io::Result<PathBuf> {
     let path = if is_latest_selector(selector) {
-        list_sessions(1)?
-            .into_iter()
-            .next()
-            .map(|session| session.path)
+        latest_session_path(false)?
     } else {
         find_session_path(selector, false)?
     }
@@ -516,10 +510,7 @@ pub fn list_sessions_with_archived(
 
 pub fn load_session(selector: &str) -> io::Result<SessionTranscript> {
     let path = if is_latest_selector(selector) {
-        list_sessions(1)?
-            .into_iter()
-            .next()
-            .map(|s| s.path)
+        latest_session_path(false)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no saved sessions"))?
     } else {
         find_session_path(selector, true)?.ok_or_else(|| {
@@ -540,10 +531,7 @@ pub fn load_session_until(
     boundary_message_id: &str,
 ) -> io::Result<SessionTranscript> {
     let path = if is_latest_selector(selector) {
-        list_sessions(1)?
-            .into_iter()
-            .next()
-            .map(|s| s.path)
+        latest_session_path(false)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no saved sessions"))?
     } else {
         find_session_path(selector, true)?.ok_or_else(|| {
@@ -931,10 +919,7 @@ pub(crate) fn resolve_session_path(
     include_archived: bool,
 ) -> io::Result<Option<PathBuf>> {
     if is_latest_selector(selector) {
-        return Ok(list_sessions_with_archived(1, include_archived)?
-            .into_iter()
-            .next()
-            .map(|session| session.path));
+        return latest_session_path(include_archived);
     }
     find_session_path(selector, include_archived)
 }
@@ -966,6 +951,27 @@ fn collect_matching_paths(
 
 pub(crate) fn is_latest_selector(selector: &str) -> bool {
     matches!(selector, "latest" | "last")
+}
+
+/// The most recently updated conversation, which is what `latest` and
+/// `last` name. The threads subagents and workflow children ran in are
+/// skipped: they are often written after the conversation that started them.
+fn latest_session_path(include_archived: bool) -> io::Result<Option<PathBuf>> {
+    let mut offset = 0;
+    loop {
+        let page = list_session_page(offset, 32, include_archived, None)?;
+        if let Some(session) = page
+            .sessions
+            .iter()
+            .find(|session| !session.is_child_thread())
+        {
+            return Ok(Some(session.path.clone()));
+        }
+        match page.next_offset {
+            Some(next) if next > offset => offset = next,
+            _ => return Ok(None),
+        }
+    }
 }
 
 pub(crate) fn collect_session_files(dir: &Path, on_file: &mut dyn FnMut(&Path)) -> io::Result<()> {

@@ -145,6 +145,15 @@ pub struct SessionSummary {
     pub storage_identity: String,
 }
 
+impl SessionSummary {
+    /// A thread a subagent or workflow child ran in: it records the thread
+    /// that started it, and unlike a fork it is not a conversation of its
+    /// own to resume.
+    pub fn is_child_thread(&self) -> bool {
+        self.parent_id.is_some() && !self.forked
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionTranscript {
     pub meta: SessionMeta,

@@ -34,12 +34,14 @@ impl AppState {
     /// Indices into `session_picker_sessions` whose title matches the current
     /// query (case-insensitive substring) and, unless
     /// `session_picker_show_tests` is set, are not test-suite sessions.
-    /// Empty query matches every title.
+    /// Empty query matches every title. The threads subagents ran in are
+    /// never listed; their transcripts open from `/agents`.
     pub fn filtered_session_indices(&self) -> Vec<usize> {
         let needle = self.session_picker_query.to_lowercase();
         self.session_picker_sessions
             .iter()
             .enumerate()
+            .filter(|(_, session)| !session.is_child_thread())
             .filter(|(_, session)| self.session_picker_show_tests || !is_test_session(session))
             .filter(|(_, session)| {
                 needle.is_empty() || session.title.to_lowercase().contains(&needle)
@@ -56,7 +58,7 @@ impl AppState {
         }
         self.session_picker_sessions
             .iter()
-            .filter(|session| is_test_session(session))
+            .filter(|session| !session.is_child_thread() && is_test_session(session))
             .count()
     }
 
@@ -276,6 +278,22 @@ mod tests {
         assert_eq!(state.hidden_test_session_count(), 1);
         state.session_picker_show_tests = true;
         assert_eq!(state.filtered_session_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn subagent_threads_are_not_listed_but_forks_are() {
+        // Each subagent's thread was listed as a conversation to resume.
+        let mut state = test_state_in("/work/orca");
+        let mut child = summary("explore the provider", "/work/orca", "deepseek", 1);
+        child.parent_id = Some("id-main".into());
+        let mut fork = summary("main, forked", "/work/orca", "deepseek", 3);
+        fork.parent_id = Some("id-main".into());
+        fork.forked = true;
+        state.session_picker_sessions =
+            vec![child, summary("main", "/work/orca", "deepseek", 5), fork];
+        state.session_picker_show_tests = true;
+
+        assert_eq!(state.filtered_session_indices(), vec![1, 2]);
     }
 
     #[test]

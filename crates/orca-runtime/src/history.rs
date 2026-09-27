@@ -1076,6 +1076,30 @@ mod tests {
     }
 
     #[test]
+    fn the_latest_session_is_a_conversation_not_a_subagent_thread() {
+        // A subagent's thread records its parent and was often written
+        // after it, so `--last` resumed the subagent instead.
+        let result = with_isolated_home(|| {
+            let cwd = std::env::current_dir()?;
+            let parent = SessionWriter::start(&cwd, "mock", None, "the conversation")?;
+            let parent_id = parent.session_id().expect("parent id");
+            let mut child = create_meta(&cwd, "mock", None, "subagent work");
+            child.parent_id = Some(parent_id.clone());
+            child.created_at += chrono::Duration::seconds(5);
+            SessionWriter::start_from_meta(child)?;
+
+            assert!(
+                list_sessions(10)?
+                    .iter()
+                    .any(SessionSummary::is_child_thread)
+            );
+            assert_eq!(load_session("latest")?.meta.session_id, parent_id);
+            Ok::<(), io::Error>(())
+        });
+        result.expect("latest resolves to the parent conversation");
+    }
+
+    #[test]
     fn load_session_preserves_latest_completion_status_and_redacted_error() {
         let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
