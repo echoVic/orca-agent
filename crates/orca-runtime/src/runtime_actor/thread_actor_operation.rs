@@ -7936,6 +7936,13 @@ impl ThreadActor {
                 }
                 let resolved = resolve_surface_input(input)
                     .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                // Hand the input to the turn before recording it: a turn that
+                // has already decided to end refuses it, and the client hears
+                // the turn is idle rather than see its steer never answered.
+                let steer_text = resolved.canonical_text.as_str().to_string();
+                if !active.steer_handle.push(steer_text.clone()) {
+                    return Ok(jsonl_idle_turn_control(request_id, legacy_turn_id, &action));
+                }
                 let persisted = surface_input_for_persisted_presentation(&resolved);
                 let input_item_id = surface::SurfaceItemId::new();
                 let batch = self.surface_event_batch_with_commit_id(
@@ -7969,9 +7976,13 @@ impl ThreadActor {
                     )],
                     None,
                 );
-                self.commit_surface_generation_batch_with_retry(fence, &batch)
-                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-                active.steer_handle.push(resolved.canonical_text.as_str());
+                if self
+                    .commit_surface_generation_batch_with_retry(fence, &batch)
+                    .is_err()
+                {
+                    active.steer_handle.retract(&steer_text);
+                    return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+                }
                 Ok(Self::committed_jsonl_turn_control(
                     request_id,
                     operation.operation_id,

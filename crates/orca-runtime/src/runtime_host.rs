@@ -1114,6 +1114,8 @@ impl GenerationContext {
         config: RunConfig,
         execution_policy: RuntimeExecutionPolicyHandle,
     ) -> Self {
+        // The previous generation closed the handle when its turn ended.
+        steer_handle.reopen();
         Self {
             fence,
             steer_handle,
@@ -16398,9 +16400,10 @@ impl ThreadActor {
     }
 
     /// Steer input the finished operation accepted but never showed the
-    /// model, because it arrived after the turn's last model request. It goes
-    /// to the front of the prompt queue, in the order it was sent, so the next
-    /// turn answers it instead of the operation dropping it.
+    /// model, because its turn failed or was stopped first. (A turn that ends
+    /// on its own refuses input it can no longer answer.) It goes to the
+    /// front of the prompt queue, in the order it was sent, so the next turn
+    /// answers it instead of the operation dropping it.
     fn requeue_unapplied_steer_inputs(&mut self, active: &ActiveOperation) {
         for text in active.steer_handle.drain().into_iter().rev() {
             let Ok(added) =
@@ -20448,8 +20451,7 @@ impl ThreadActor {
                     && !active.generation.join.is_finished()
                     && !active.generation.cancel.is_cancelled()
                     && !active.resume_queued;
-                let result = if accepts {
-                    active.steer_handle.push(input);
+                let result = if accepts && active.steer_handle.push(input) {
                     SteerOperationResult::Accepted { generation }
                 } else {
                     SteerOperationResult::Rejected {

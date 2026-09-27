@@ -214,7 +214,15 @@ impl From<RuntimeTurnStartError> for AgentLoopResult {
 
 #[derive(Clone, Debug, Default)]
 pub struct ThreadSteerHandle {
-    pending: Arc<Mutex<Vec<String>>>,
+    state: Arc<Mutex<SteerState>>,
+}
+
+#[derive(Debug, Default)]
+struct SteerState {
+    pending: Vec<String>,
+    /// Set once the turn has decided to end: later input is refused rather
+    /// than accepted and never shown to the model.
+    closed: bool,
 }
 
 pub(crate) struct AgentLoopContext<'a> {
@@ -875,27 +883,58 @@ impl<'a> RuntimeTaskActor<'a> {
 }
 
 impl ThreadSteerHandle {
-    pub fn push(&self, input: impl Into<String>) {
-        self.pending
-            .lock()
-            .expect("thread steer handle lock")
-            .push(input.into());
+    fn state(&self) -> std::sync::MutexGuard<'_, SteerState> {
+        self.state.lock().expect("thread steer handle lock")
+    }
+
+    /// Hands `input` to the running turn: `false` when the turn has already
+    /// decided to end and would never show it to the model.
+    pub fn push(&self, input: impl Into<String>) -> bool {
+        let mut state = self.state();
+        if state.closed {
+            return false;
+        }
+        state.pending.push(input.into());
+        true
     }
 
     pub fn drain(&self) -> Vec<String> {
-        self.pending
-            .lock()
-            .expect("thread steer handle lock")
-            .drain(..)
-            .collect()
+        self.state().pending.drain(..).collect()
     }
 
     pub fn has_pending(&self) -> bool {
-        !self
-            .pending
-            .lock()
-            .expect("thread steer handle lock")
-            .is_empty()
+        !self.state().pending.is_empty()
+    }
+
+    /// For a turn about to end on its own: `true` while input is pending,
+    /// which the turn answers first; otherwise refuses any later input. Both
+    /// happen under one lock, so no input slips in between.
+    pub(crate) fn close_unless_pending(&self) -> bool {
+        let mut state = self.state();
+        if state.pending.is_empty() {
+            state.closed = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Refuses later input; what is already pending stays for the operation.
+    pub(crate) fn close(&self) {
+        self.state().closed = true;
+    }
+
+    /// Accepts input again, for the operation's next generation.
+    pub(crate) fn reopen(&self) {
+        self.state().closed = false;
+    }
+
+    /// Takes back `input` if the turn has not drained it yet.
+    pub(crate) fn retract(&self, input: &str) {
+        let mut state = self.state();
+        if let Some(index) = state.pending.iter().rposition(|pending| pending == input) {
+            state.pending.remove(index);
+        }
     }
 }
 

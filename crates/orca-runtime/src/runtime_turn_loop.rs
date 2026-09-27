@@ -501,14 +501,25 @@ fn deliver_child_results<W: io::Write>(
 /// one that arrived while the model was writing its last reply, after the
 /// turn's final model request. Another iteration applies it before calling
 /// the model again, so the turn answers it instead of ending over it.
+///
+/// A turn that ends refuses later input in the same step, so a steer is
+/// either answered in this turn or refused, never accepted and left over.
 fn steer_awaits_answer(
     terminal: &orca_core::budget::OperationTerminal,
     steer: Option<&ThreadSteerHandle>,
 ) -> bool {
-    matches!(
+    let Some(steer) = steer else {
+        return false;
+    };
+    if matches!(
         terminal,
         orca_core::budget::OperationTerminal::Completed { .. }
-    ) && steer.is_some_and(ThreadSteerHandle::has_pending)
+    ) {
+        steer.close_unless_pending()
+    } else {
+        steer.close();
+        false
+    }
 }
 
 fn settle_children_before_return<W: io::Write>(
@@ -994,11 +1005,9 @@ mod tests {
             usage: BudgetUsage::default(),
         };
         let steer = ThreadSteerHandle::default();
-        assert!(!steer_awaits_answer(&completed, Some(&steer)));
         assert!(!steer_awaits_answer(&completed, None));
 
-        steer.push("one more thing");
-        assert!(steer_awaits_answer(&completed, Some(&steer)));
+        assert!(steer.push("one more thing"));
         let failed = OperationTerminal::Failed {
             class: FailureClass::Provider,
             message: "down".to_string(),
@@ -1007,6 +1016,27 @@ mod tests {
             !steer_awaits_answer(&failed, Some(&steer)),
             "a failed turn ends; the operation requeues the steer instead"
         );
+        assert!(steer_awaits_answer(&completed, Some(&steer)));
+    }
+
+    #[test]
+    fn a_turn_that_ends_refuses_steer_input_until_the_next_generation() {
+        use orca_core::budget::{BudgetUsage, OperationTerminal};
+
+        let completed = OperationTerminal::Completed {
+            usage: BudgetUsage::default(),
+        };
+        let steer = ThreadSteerHandle::default();
+        assert!(!steer_awaits_answer(&completed, Some(&steer)));
+
+        // Input that arrives after the turn decided to end would never reach
+        // the model; the sender hears so instead of it running as a later turn.
+        assert!(!steer.push("too late"));
+        assert!(!steer.has_pending());
+
+        steer.reopen();
+        assert!(steer.push("for the next generation"));
+        assert_eq!(steer.drain(), vec!["for the next generation".to_string()]);
     }
 
     #[test]
