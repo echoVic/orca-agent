@@ -256,5 +256,11 @@ decision = "allow"
 正式实现前先做三个小实验。代码用完就扔，结论补进本文：
 
 1. **DeepSeek 是否接受 tool 消息带图片**：决定第 4 节用哪种映射方式。
+   - **结论：选 `in-tool`**（图片直接放进 tool 消息）。模型用 `deepseek-flash`（即 `FLASH_MODEL`；`canonical_model_name` 对这个名字是恒等映射，原样上线）。
+   - 请求 A（图片放进 tool 消息）：200，回答 "The screenshot shows a solid **red** square (a red background with no other elements)."，一次命中。
+   - 请求 B（图片放在工具块之后的用户消息）：200；第一次回答提到 "a solid red field" 但又说没看到方块，含糊，按规则重发一次，第二次 "The square is red."，干净命中。
+   - A、B 都能看到图片、都返回 200，按判定规则（A 返回 200 且答出 red）选 `in-tool`：图片本来就是这次工具调用的结果，直接放进 tool 消息更直接，也少拼一条消息。
+   - 对照请求（tool 消息纯文本、全程不带图片）先返回两次 400，但都和图片无关：① `deepseek-flash` 默认开思考模式，assistant 的 `tool_calls` 消息必须把 `reasoning_content` 一起回放；② `screenshot` 工具的 `parameters` 不能是空对象 `{}`，DeepSeek 要求至少 `{"type":"object","properties":{}}`。补上这两处后对照请求返回 200（模型如实说没收到图片，要求重新截图），说明上面的结论只关于图片，和推理/工具调用配对规则无关。
+   - 图片块沿用 Orca 现有序列化形状（`deepseek_http.rs` 的 `ApiContentBlock::ImageUrl`/`ApiImageUrl`），比大纲里的示例多一个 `detail` 字段（未指定时默认 `"high"`）：`{"type":"image_url","image_url":{"url":"data:image/png;base64,...","detail":"high"}}`。
 2. **Flash 的坐标准确度**：在几个常见应用里比较模型给出的点击坐标和真实位置，决定像素坐标作为备用能做到什么程度。如果很差，就只保留元素编号路径，像素坐标仅用于画布类界面并在提示里说明。
 3. **只用公开接口时后台投递的成功率**：分别测试 AppKit、Electron、Catalyst 三类应用。如果某类应用用公开接口投递不进后台，第一版对这类应用直接走前台回退，而不是引入私有接口；是否引入私有接口另行决策。
