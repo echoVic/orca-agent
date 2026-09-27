@@ -74,8 +74,11 @@ async function main() {
     const release = await retry("GitHub Release verification", args, () => json("gh", ["release", "view", tag, "--repo", args.repo, "--json", "tagName,url,isDraft,isPrerelease,assets"], "GitHub Release"));
     if (release.tagName !== tag || release.isDraft) throw new Error(`GitHub Release ${tag} is missing, mismatched, or draft`);
     const tagSha = run("gh", ["api", `repos/${args.repo}/commits/${tag}`, "--jq", ".sha"]);
-    const mainSha = run("gh", ["api", `repos/${args.repo}/commits/main`, "--jq", ".sha"]);
-    if (tagSha !== mainSha) throw new Error(`Release tag target ${tagSha} does not match main ${mainSha}`);
+    // The release job already required the tag to be main's head. Main may
+    // gain commits before this check runs or is rerun, so here the tag only
+    // has to be in main's history.
+    const relation = run("gh", ["api", `repos/${args.repo}/compare/${tagSha}...main`, "--jq", ".status"]);
+    if (relation !== "identical" && relation !== "ahead") throw new Error(`Release tag target ${tagSha} is not in the history of main (${relation})`);
 
     const expectedAssets = [
       ...TARGETS.flatMap(([, triple, , extension]) => [`orca-${triple}.${extension}`, `orca-${triple}.${extension}.sha256`]),
@@ -147,7 +150,7 @@ async function main() {
     if (installed.version !== version) throw new Error(`clean install resolved ${installed.version}, expected ${version}`);
     const smoke = run(path.join(installDir, "node_modules", ".bin", args.bin), ["--version"], { cwd: installDir });
     if (!smoke.includes(`${args.bin} ${version}`)) throw new Error(`Unexpected installed binary output: ${smoke}`);
-    console.log(`Published release verified: ${tag} ${mainSha}`);
+    console.log(`Published release verified: ${tag} ${tagSha}`);
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }

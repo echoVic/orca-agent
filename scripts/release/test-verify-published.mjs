@@ -75,7 +75,9 @@ if (a[0] === "release" && a[1] === "view") {
   if (process.env.ORCA_VERIFY_SCENARIO === "missing-asset") assets = assets.filter(a => !a.name.includes("linux-x64.tgz"));
   console.log(JSON.stringify({ tagName: "v${version}", url: "https://example.test", isDraft: false, assets }));
 } else if (a[0] === "api") {
-  console.log(process.env.ORCA_VERIFY_SCENARIO === "wrong-target" && a[1].endsWith("/v${version}") ? "tag-sha" : "main-sha");
+  const scenario = process.env.ORCA_VERIFY_SCENARIO;
+  if (a[1].includes("/compare/")) console.log(scenario === "wrong-target" ? "diverged" : scenario === "main-ahead" ? "ahead" : "identical");
+  else console.log((scenario === "wrong-target" || scenario === "main-ahead") && a[1].endsWith("/v${version}") ? "tag-sha" : "main-sha");
 } else if (a[0] === "release" && a[1] === "download") {
   const out = a[a.indexOf("--dir") + 1];
   for (const name of readdirSync(path.join(fixture, "release"))) copyFileSync(path.join(fixture, "release", name), path.join(out, name));
@@ -128,9 +130,12 @@ if (a[0] === "view") {
   if (!success.ok || !success.output.includes("Published release verified")) throw new Error(`positive verification failed: ${success.output}`);
   const reordered = invoke("registry-key-order");
   if (!reordered.ok || !reordered.output.includes("Published release verified")) throw new Error(`registry key order was rejected: ${reordered.output}`);
+  // Main may gain commits after the tag, before the check runs or is rerun.
+  const mainAhead = invoke("main-ahead");
+  if (!mainAhead.ok || !mainAhead.output.includes("Published release verified")) throw new Error(`a commit on main after the tag was rejected: ${mainAhead.output}`);
   for (const [scenario, expected] of [
     ["missing-asset", "missing asset"],
-    ["wrong-target", "does not match main"],
+    ["wrong-target", "not in the history of main"],
     ["checksum-failure", "Checksum failure"],
     ["mismatched-npm-asset", "GitHub/npm tarball mismatch"],
     ["bad-integrity", "registry integrity mismatch"],
