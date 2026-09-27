@@ -674,6 +674,26 @@ mod tests {
     }
 
     #[test]
+    fn a_question_mark_in_the_session_picker_filter_is_text() {
+        // `?` opened help underneath the picker instead of reaching its
+        // filter, and "a?b" filtered for "ab".
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        state.status = AppStatus::SessionPicker;
+
+        let flow = press(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut state,
+            &action_tx,
+            false,
+        );
+
+        assert!(matches!(flow, KeyEventFlow::Unhandled));
+        assert!(!state.show_shortcuts);
+    }
+
+    #[test]
     fn enter_opens_a_backgrounded_sessions_pending_approval() {
         use orca_core::task_types::{TaskStatus, TaskType};
         let (action_tx, action_rx) = mpsc::unbounded();
@@ -1367,6 +1387,14 @@ where
 
     if let Some(ShortcutAction::Global(shortcut)) = resolve_shortcut(ShortcutContext::Global, key) {
         if composer_editor_shortcut_is_active(key, composer_has_text, vim_state) {
+            return Ok(KeyEventFlow::Unhandled);
+        }
+        // The session picker's filter is a text field too: a printable key
+        // types into it rather than toggling help.
+        if state.status == AppStatus::SessionPicker
+            && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+            && matches!(key.code, KeyCode::Char(_))
+        {
             return Ok(KeyEventFlow::Unhandled);
         }
         vim_state.cancel_pending_command();
