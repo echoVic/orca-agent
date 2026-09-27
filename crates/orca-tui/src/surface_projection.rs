@@ -543,7 +543,7 @@ impl AppState {
 pub(crate) fn history_messages_from_surface_snapshot(
     snapshot: &orca_runtime::surface::SurfaceSnapshot,
 ) -> Vec<crate::transcript_state::ChatMessage> {
-    history_messages_from_surface_items(&snapshot.items)
+    history_messages_from_surface_items(&snapshot.items, &snapshot.tools)
 }
 
 #[cfg(test)]
@@ -569,12 +569,13 @@ pub(crate) fn test_surface_cursor(next_seq: u64) -> SurfaceCursor {
 
 fn history_messages_from_surface_items(
     items: &[SurfaceItem],
+    tools: &[orca_runtime::surface::SurfaceToolView],
 ) -> Vec<crate::transcript_state::ChatMessage> {
     let mut messages = Vec::new();
     let mut index = 0;
     while index < items.len() {
         let Some(turn_id) = assistant_item_turn_id(&items[index]) else {
-            if let Some(message) = history_message_from_surface_item(&items[index]) {
+            if let Some(message) = history_message_from_surface_item(&items[index], tools) {
                 messages.push(message);
             }
             index += 1;
@@ -601,7 +602,7 @@ fn history_messages_from_surface_items(
                     .filter(|item| matches!(item, SurfaceItem::AssistantPlan { .. })),
             )
         {
-            if let Some(message) = history_message_from_surface_item(item) {
+            if let Some(message) = history_message_from_surface_item(item, tools) {
                 messages.push(message);
             }
         }
@@ -622,6 +623,7 @@ fn assistant_item_turn_id(item: &SurfaceItem) -> Option<&orca_runtime::surface::
 
 fn history_message_from_surface_item(
     item: &SurfaceItem,
+    tools: &[orca_runtime::surface::SurfaceToolView],
 ) -> Option<crate::transcript_state::ChatMessage> {
     match item {
         SurfaceItem::UserMessage { input, .. } => match input {
@@ -680,14 +682,28 @@ fn history_message_from_surface_item(
             ..
         } => {
             let output = (!content.as_str().is_empty()).then(|| content.as_str().to_string());
+            // The item holds only the result; the tool's name, target, and
+            // diff live on its tool view, which a resumed thread still has.
+            let tool = tools
+                .iter()
+                .find(|tool| &tool.request.tool_call_id == tool_call_id);
+            let (diff, kind) = file_change_diff(
+                tool.and_then(|tool| tool.result.as_ref())
+                    .and_then(|result| result.file_change.as_ref()),
+            );
             Some(crate::transcript_state::ChatMessage::ToolCall {
                 id: tool_call_id.as_str().to_string(),
-                name: format!("tool:{}", tool_call_id.as_str()),
-                target: None,
+                name: tool.map_or_else(
+                    || format!("tool:{}", tool_call_id.as_str()),
+                    |tool| tool.request.name.as_str().to_string(),
+                ),
+                target: tool
+                    .and_then(|tool| tool.request.target.as_ref())
+                    .map(|target| target.as_str().to_string()),
                 status: tool_result_status(terminal.kind).to_string(),
                 output,
-                diff: None,
-                kind: None,
+                diff,
+                kind,
                 expanded: false,
             })
         }
@@ -1193,16 +1209,7 @@ impl TuiSurfaceProjection {
                     chunk: chunk.as_str().to_string(),
                 }),
                 SurfaceEvent::Tool(ToolPatch::Completed { result }) => {
-                    let (diff, kind) = match &result.file_change {
-                        Some(SurfaceFileChange::UnifiedDiff { text, .. }) => (
-                            Some(text.as_str().to_string()),
-                            Some("file_change".to_string()),
-                        ),
-                        Some(SurfaceFileChange::PreviewOmitted { .. }) => {
-                            (None, Some("file_change".to_string()))
-                        }
-                        None => (None, None),
-                    };
+                    let (diff, kind) = file_change_diff(result.file_change.as_ref());
                     projected.push(TuiEvent::ToolCompleted {
                         id: result.tool_call_id.as_str().to_string(),
                         name: result.name.as_str().to_string(),
@@ -1950,6 +1957,18 @@ fn surface_thread_id_text(thread_id: &orca_runtime::surface::SurfaceThreadId) ->
         bytes[14],
         bytes[15],
     )
+}
+
+/// A tool row's diff and kind from the file change its result recorded.
+fn file_change_diff(file_change: Option<&SurfaceFileChange>) -> (Option<String>, Option<String>) {
+    match file_change {
+        Some(SurfaceFileChange::UnifiedDiff { text, .. }) => (
+            Some(text.as_str().to_string()),
+            Some("file_change".to_string()),
+        ),
+        Some(SurfaceFileChange::PreviewOmitted { .. }) => (None, Some("file_change".to_string())),
+        None => (None, None),
+    }
 }
 
 fn tool_result_status(kind: SurfaceToolResultKind) -> &'static str {
@@ -2762,6 +2781,86 @@ mod tests {
         assert!(projection.goal.is_none());
     }
 
+    fn completed_tool_view(
+        id: &str,
+        name: &str,
+        target: &str,
+        file_change: Option<orca_runtime::surface::SurfaceFileChange>,
+    ) -> orca_runtime::surface::SurfaceToolView {
+        let terminal = orca_runtime::surface::SurfaceToolTerminal {
+            kind: SurfaceToolResultKind::Success,
+            source: orca_runtime::surface::ToolTerminalSource::Observed,
+            invocation_started: orca_runtime::surface::ToolInvocationStarted::Yes,
+        };
+        orca_runtime::surface::SurfaceToolView {
+            request: orca_runtime::surface::SurfaceToolRequest {
+                tool_call_id: orca_runtime::surface::SurfaceToolCallId::try_new(id).unwrap(),
+                source_response_id: None,
+                turn_id: SurfaceTurnId::new(),
+                name: NonEmptyText::try_new(name).unwrap(),
+                action: orca_runtime::surface::SurfaceToolAction::Write,
+                target: Some(DisplayText::new(target)),
+                raw_arguments: DisplayText::new("{}"),
+                arguments_digest: Sha256Digest::digest("{}"),
+            },
+            state: orca_runtime::surface::SurfaceToolViewState::Completed,
+            invocation_started: None,
+            arguments_bytes: orca_runtime::surface::ByteCount::new(2),
+            output_bytes: orca_runtime::surface::ByteCount::new(0),
+            streamed_output: DisplayText::new(""),
+            streamed_output_truncated: false,
+            result: Some(orca_runtime::surface::SurfaceToolResult {
+                tool_call_id: orca_runtime::surface::SurfaceToolCallId::try_new(id).unwrap(),
+                name: NonEmptyText::try_new(name).unwrap(),
+                terminal,
+                output: Some(DisplayText::new("done")),
+                error: None,
+                exit_code: None,
+                truncated: false,
+                file_change,
+            }),
+            capability_calls: Vec::new(),
+            terminal_leases: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_resumed_tool_row_keeps_its_name_target_and_diff() {
+        let diff = "--- a/billing/pages.py\n+++ b/billing/pages.py\n-a\n+b\n";
+        let tools = vec![completed_tool_view(
+            "call-edit",
+            "edit",
+            "billing/pages.py",
+            Some(orca_runtime::surface::SurfaceFileChange::UnifiedDiff {
+                path: CanonicalPath::try_new(std::env::temp_dir().join("billing/pages.py"))
+                    .unwrap(),
+                text: DisplayText::new(diff),
+                digest: Sha256Digest::digest(diff),
+            }),
+        )];
+        let items = vec![SurfaceItem::ToolResultMessage {
+            id: SurfaceItemId::new(),
+            turn_id: SurfaceTurnId::new(),
+            tool_call_id: orca_runtime::surface::SurfaceToolCallId::try_new("call-edit").unwrap(),
+            content: DisplayText::new("edited billing/pages.py"),
+            terminal: tools[0].result.as_ref().unwrap().terminal.clone(),
+            pinned: false,
+        }];
+
+        let messages = history_messages_from_surface_items(&items, &tools);
+
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [crate::transcript_state::ChatMessage::ToolCall { name, target, diff: Some(shown), .. }]
+                    if name == "edit"
+                        && target.as_deref() == Some("billing/pages.py")
+                        && shown == diff
+            ),
+            "got {messages:?}"
+        );
+    }
+
     #[test]
     fn typed_history_projection_preserves_visible_items_and_redacts_secrets() {
         let turn_id = SurfaceTurnId::new();
@@ -2817,7 +2916,7 @@ mod tests {
             },
         ];
 
-        let messages = history_messages_from_surface_items(&items);
+        let messages = history_messages_from_surface_items(&items, &[]);
         assert!(matches!(
             messages.as_slice(),
             [
