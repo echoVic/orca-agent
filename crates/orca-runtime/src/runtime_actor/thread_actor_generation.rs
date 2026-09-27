@@ -39,9 +39,6 @@ fn validate_relay_activity_envelope(
     Err(io::Error::new(io::ErrorKind::InvalidData, relay_error))
 }
 
-/// The task and subagent patches that settle a detached child the way the
-/// task registry recorded its end. The registry's result is the payload the
-/// worker handed its parent; the surface shows the text inside it.
 /// Whether a detached child's surface task can take the outcome the task
 /// registry settled it with, along the transitions the reducer allows.
 fn registry_outcome_settles(task_status: surface::SurfaceTaskStatus, outcome: TaskStatus) -> bool {
@@ -56,10 +53,16 @@ fn registry_outcome_settles(task_status: surface::SurfaceTaskStatus, outcome: Ta
     }
 }
 
+/// The task and subagent patches that settle a detached child the way the
+/// task registry recorded its end. The registry's result is the payload the
+/// worker handed its parent; the surface shows the text inside it.
+/// `continuation` is the registry's as it stands after the child ended,
+/// which resume and retry read.
 fn settled_subagent_batch(
     task: &surface::SurfaceTask,
     subagent: &surface::SurfaceSubagent,
     record: &crate::tasks::TaskRecord,
+    continuation: Option<surface::SurfaceSubagentContinuation>,
     settled_at: surface::UnixMillis,
 ) -> io::Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>> {
     let (task_status, status, activity) = match record.status {
@@ -147,7 +150,7 @@ fn settled_subagent_batch(
                     .map(surface_usage_totals)
                     .or_else(|| subagent.usage.clone()),
                 subagent_activity_history: activity_history,
-                continuation: subagent.continuation.clone(),
+                continuation,
             }),
         ),
     ])
@@ -1833,7 +1836,15 @@ impl ThreadActor {
                 continue;
             }
             let settled_at = surface::UnixMillis::new(settled_at_ms.unwrap_or(now_ms));
-            let Ok(batch) = settled_subagent_batch(task, subagent, &record, settled_at) else {
+            let continuation = task_registry
+                .continuation_projection(task.task_id.as_str())
+                .ok()
+                .flatten()
+                .map(surface_subagent_continuation)
+                .or_else(|| subagent.continuation.clone());
+            let Ok(batch) =
+                settled_subagent_batch(task, subagent, &record, continuation, settled_at)
+            else {
                 continue;
             };
             let batch = self.surface_event_batch_with_commit_id(batch, None);
@@ -5954,8 +5965,24 @@ mod task_transcript_query_tests {
             ),
         };
 
-        let events = settled_subagent_batch(&task, &subagent, &record, surface::UnixMillis::new(9))
-            .expect("a completed record settles");
+        // The registry's continuation, not the one the last progress frame
+        // carried: settled from the registry, agents lost resume and retry.
+        let continuation = surface::SurfaceSubagentContinuation {
+            continuation_id: surface::NonEmptyText::try_new("continuation-1").unwrap(),
+            attempt_id: surface::NonEmptyText::try_new("attempt-1").unwrap(),
+            checkpoint_id: Some(surface::NonEmptyText::try_new("checkpoint-3").unwrap()),
+            revision: 3,
+            resumable: true,
+            indeterminate: false,
+        };
+        let events = settled_subagent_batch(
+            &task,
+            &subagent,
+            &record,
+            Some(continuation.clone()),
+            surface::UnixMillis::new(9),
+        )
+        .expect("a completed record settles");
 
         let [(task_scope, task_event), (subagent_scope, subagent_event)] = events.as_slice() else {
             panic!(
@@ -5989,11 +6016,13 @@ mod task_transcript_query_tests {
                 status: surface::SurfaceSubagentTerminalStatus::Completed,
                 output: Some(output),
                 subagent_activity_history,
+                continuation: Some(settled_continuation),
                 ..
             }) if expected_revision.get() == 17
                 && next_revision.get() == 18
                 && *settled_owner == owner
                 && output.as_str() == "the report"
+                && *settled_continuation == continuation
                 && subagent_activity_history
                     .last()
                     .is_some_and(|entry| entry.activity == "completed")
@@ -6002,8 +6031,14 @@ mod task_transcript_query_tests {
         let running = registry.create_subagent("still running".to_string(), None);
         let running = registry.get(&running.id).expect("running record");
         assert!(
-            settled_subagent_batch(&task, &subagent, &running, surface::UnixMillis::new(9))
-                .is_err(),
+            settled_subagent_batch(
+                &task,
+                &subagent,
+                &running,
+                None,
+                surface::UnixMillis::new(9)
+            )
+            .is_err(),
             "an active record settles nothing"
         );
     }
