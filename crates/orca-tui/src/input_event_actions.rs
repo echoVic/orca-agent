@@ -278,8 +278,17 @@ pub(crate) fn handle_scroll_lines(state: &mut AppState, lines: i32, now: Instant
     let steps = ((lines.unsigned_abs() as usize) / 3).max(1);
     let upward = lines < 0;
 
-    // The wheel drives whichever list currently has focus: the session
-    // picker, an open popup menu, the workflows panel — or the transcript.
+    // The wheel drives whichever list currently has focus: the help panel
+    // drawn over everything, the session picker, an open popup menu, the
+    // workflows panel — or the transcript.
+    if state.show_shortcuts {
+        let max = crate::ui::shortcuts_max_scroll(state);
+        state.shortcuts_scroll = state
+            .shortcuts_scroll
+            .saturating_add_signed(lines as isize)
+            .min(max);
+        return;
+    }
     if state.plan_approval_dialog.is_some() {
         if upward {
             state.scroll_up(steps);
@@ -1046,6 +1055,27 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_an_open_help_panel_instead_of_the_transcript() {
+        let mut state = test_state();
+        for n in 0..60 {
+            state.push_message(ChatMessage::System {
+                text: format!("note {n}"),
+                expanded: false,
+            });
+        }
+        state.viewport.frame_area = Some(Rect::new(0, 0, 90, 20));
+        render_once(&mut state, 90, 20);
+        let transcript_offset = state.viewport.scroll_offset;
+        state.show_shortcuts = true;
+
+        handle_scroll_lines(&mut state, 3, Instant::now());
+        assert_eq!(state.shortcuts_scroll, 3);
+        handle_scroll_lines(&mut state, -6, Instant::now());
+        assert_eq!(state.shortcuts_scroll, 0);
+        assert_eq!(state.viewport.scroll_offset, transcript_offset);
     }
 
     #[test]

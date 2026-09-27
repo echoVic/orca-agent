@@ -674,6 +674,45 @@ mod tests {
     }
 
     #[test]
+    fn arrows_scroll_a_help_panel_taller_than_the_window() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        state.viewport.frame_area = Some(ratatui::layout::Rect::new(0, 0, 90, 20));
+        state.show_shortcuts = true;
+        let max = crate::ui::shortcuts_max_scroll(&state);
+        assert!(max > 0, "the help panel must overflow a 20-row window");
+
+        press(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut state,
+            &action_tx,
+            false,
+        );
+        assert_eq!(state.shortcuts_scroll, 1);
+        for _ in 0..50 {
+            press(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                &mut state,
+                &action_tx,
+                false,
+            );
+        }
+        assert_eq!(
+            state.shortcuts_scroll, max,
+            "scrolling stops at the last row"
+        );
+        press(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut state,
+            &action_tx,
+            false,
+        );
+        assert_eq!(state.shortcuts_scroll, max - 1);
+        assert!(state.show_shortcuts);
+    }
+
+    #[test]
     fn a_question_mark_in_the_session_picker_filter_is_text() {
         // `?` opened help underneath the picker instead of reaching its
         // filter, and "a?b" filtered for "ab".
@@ -1408,6 +1447,21 @@ where
         vim_state.cancel_pending_command();
         state.show_shortcuts = false;
         return Ok(KeyEventFlow::Continue);
+    }
+
+    if state.show_shortcuts && key.modifiers.is_empty() {
+        let step = match key.code {
+            KeyCode::Up => Some(-1),
+            KeyCode::Down => Some(1),
+            KeyCode::PageUp => Some(-10),
+            KeyCode::PageDown => Some(10),
+            _ => None,
+        };
+        if let Some(step) = step {
+            let max = crate::ui::shortcuts_max_scroll(state);
+            state.shortcuts_scroll = state.shortcuts_scroll.saturating_add_signed(step).min(max);
+            return Ok(KeyEventFlow::Continue);
+        }
     }
 
     // Esc dismisses an active mouse selection before any other Esc meaning

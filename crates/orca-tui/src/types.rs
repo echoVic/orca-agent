@@ -470,6 +470,8 @@ pub struct AppState {
     pub(crate) first_run: Option<FirstRunState>,
     pub(crate) first_run_error: Option<String>,
     pub show_shortcuts: bool,
+    /// First help row shown when the panel is taller than the window.
+    pub(crate) shortcuts_scroll: usize,
     pub input_history: Vec<String>,
     pub(crate) pending_pastes: Vec<(String, String)>,
     /// The draft Esc or Ctrl+U last cleared, with its pastes, images and
@@ -821,6 +823,7 @@ impl AppState {
             first_run: None,
             first_run_error: None,
             show_shortcuts: false,
+            shortcuts_scroll: 0,
             input_history: load_input_history(),
             pending_pastes: Vec::new(),
             cleared_draft: None,
@@ -1471,6 +1474,7 @@ impl AppState {
 
     pub fn toggle_shortcuts(&mut self) {
         self.show_shortcuts = !self.show_shortcuts;
+        self.shortcuts_scroll = 0;
     }
 
     pub fn advance_tick(&mut self) {

@@ -5559,20 +5559,51 @@ fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
     Span::styled(format!(" · ctx {percent}%"), Style::default().fg(color))
 }
 
-fn render_shortcuts(frame: &mut Frame, state: &AppState, theme: &Theme) {
-    let area = frame.area();
+/// The help panel's rows and how many of them fit in `area`.
+fn shortcuts_layout(
+    state: &AppState,
+    theme: &Theme,
+    area: Rect,
+) -> (u16, usize, Vec<Line<'static>>, usize) {
     let width = 78u16.min(area.width.saturating_sub(4));
     // The true content width inside the panel's left/right border-and-padding
     // cells; `shortcut_lines` sizes its wrapped action column to fit exactly.
     let inner_width = usize::from(width.saturating_sub(4));
     let scopes = active_shortcut_scopes(state);
-    let mut lines = shortcuts::shortcut_lines(&scopes, theme, inner_width);
+    let body = shortcuts::shortcut_lines(&scopes, theme, inner_width);
+    // Borders take two rows; a blank row and the hint row follow the body.
+    let visible = usize::from(area.height.saturating_sub(4))
+        .saturating_sub(4)
+        .min(body.len());
+    (width, inner_width, body, visible)
+}
+
+/// The furthest the help panel scrolls in the current window.
+pub(crate) fn shortcuts_max_scroll(state: &AppState) -> usize {
+    let area = state.viewport.frame_area.unwrap_or_default();
+    let (_, _, body, visible) = shortcuts_layout(
+        state,
+        &Theme::named(orca_core::config::ThemeName::Dark),
+        area,
+    );
+    body.len().saturating_sub(visible)
+}
+
+fn render_shortcuts(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    let area = frame.area();
+    let (width, inner_width, body, visible) = shortcuts_layout(state, theme, area);
+    let overflow = body.len() > visible;
+    let scroll = state
+        .shortcuts_scroll
+        .min(body.len().saturating_sub(visible));
+    let mut lines: Vec<Line<'static>> = body.into_iter().skip(scroll).take(visible).collect();
     lines.push(Line::from(""));
-    lines.push(crate::chrome::hint_line(
-        theme,
-        inner_width,
-        &[("?", "or Esc close")],
-    ));
+    let hints: &[(&str, &str)] = if overflow {
+        &[("↑↓", "scroll"), ("?", "or Esc close")]
+    } else {
+        &[("?", "or Esc close")]
+    };
+    lines.push(crate::chrome::hint_line(theme, inner_width, hints));
     let popup = crate::chrome::dialog_rect(
         area,
         width,
@@ -7761,6 +7792,43 @@ mod tests {
                 .iter()
                 .any(|cell| { cell.modifier.contains(Modifier::REVERSED) && cell.symbol() == " " })
         );
+    }
+
+    fn help_screen(state: &mut AppState, width: u16, height: u16) -> String {
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea = TextArea::from([""]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("test backend");
+        terminal
+            .draw(|frame| render(frame, state, &textarea, &theme))
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn help_in_a_short_window_scrolls_and_keeps_its_close_hint() {
+        // Under ~36 rows the panel was clipped: the last shortcuts and the
+        // way to close it were off screen, with no way to scroll.
+        let mut state = test_state();
+        state.show_shortcuts = true;
+
+        let top = help_screen(&mut state, 90, 20);
+        assert!(top.contains("Esc close"), "{top}");
+        assert!(top.contains("scroll"), "{top}");
+        assert!(!top.contains("ctrl+shift+o"), "{top}");
+
+        state.shortcuts_scroll = usize::MAX;
+        let bottom = help_screen(&mut state, 90, 20);
+        assert!(bottom.contains("ctrl+shift+o"), "{bottom}");
+        assert!(bottom.contains("Esc close"), "{bottom}");
     }
 
     #[test]
