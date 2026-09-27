@@ -1035,6 +1035,15 @@ fn trim_key_candidate(key: &str) -> &str {
 }
 
 fn is_sensitive_key(key: &str) -> bool {
+    // A key is a config, env, or JSON name. A path or a code span before a
+    // colon (`auth/token.py`: …) is prose naming a file, not a credential.
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'$'))
+    {
+        return false;
+    }
     let key = key.to_ascii_lowercase();
     key.contains("api_key")
         || key.contains("apikey")
@@ -2406,6 +2415,30 @@ mod tests {
             "token=<redacted>"
         );
         assert_eq!(payload["raw_arguments"]["nested"][0], "api_key=<redacted>");
+    }
+
+    #[test]
+    fn a_path_or_code_span_before_a_colon_is_not_a_secret_key() {
+        // Model prose names files and functions; the word after the colon
+        // there is code, not a credential.
+        for text in [
+            "The bug was in `auth/token.py`: `token_valid` returned the wrong value.",
+            "See crates/auth/token.rs: refresh_token handles expiry.",
+        ] {
+            assert_eq!(redact_sensitive_text(text), text);
+        }
+        assert_eq!(
+            redact_sensitive_text("api_key: abc123"),
+            "api_key: <redacted>"
+        );
+        assert_eq!(
+            redact_sensitive_text("db.password=hunter2"),
+            "db.password=<redacted>"
+        );
+        assert_eq!(
+            redact_sensitive_text(r#"{"refresh_token": "abc"}"#),
+            r#"{"refresh_token": "<redacted>"}"#
+        );
     }
 
     #[test]

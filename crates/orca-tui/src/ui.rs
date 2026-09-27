@@ -6759,6 +6759,21 @@ fn render_markdown(input: &str, width: usize, theme: &Theme) -> Vec<Line<'static
                     Style::default().fg(theme.markdown_inline_code),
                 ));
             }
+            // A terminal renders no HTML; show it as the text it is.
+            Event::InlineHtml(html) => {
+                let style = *style_stack.last().unwrap_or(&Style::default());
+                current_spans.push(Span::styled(html.to_string(), style));
+            }
+            Event::Html(html) => {
+                let style = *style_stack.last().unwrap_or(&Style::default());
+                for (index, line) in html.trim_end_matches('\n').split('\n').enumerate() {
+                    if index > 0 {
+                        flush_line(&mut current_spans, &mut lines);
+                    }
+                    current_spans.push(Span::styled(line.to_string(), style));
+                }
+                flush_line(&mut current_spans, &mut lines);
+            }
             Event::SoftBreak | Event::HardBreak => {
                 flush_line(&mut current_spans, &mut lines);
             }
@@ -9564,6 +9579,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn inline_html_in_a_reply_is_shown_as_text() {
+        // A terminal renders no HTML: `<redacted>` or `<div>` in prose must
+        // stay visible instead of vanishing from the sentence.
+        let theme = Theme::named(ThemeName::Dark);
+        let lines = render_markdown("the key is <redacted> here", 80, &theme);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        assert_eq!(text, "the key is <redacted> here");
     }
 
     #[test]
