@@ -202,17 +202,27 @@ impl TuiSurfaceTaskControl {
     ) -> io::Result<SubmitNowOutcome> {
         let (surface, runtime) = {
             let hosted = self.lock_hosted();
-            (hosted.surface_active.clone(), hosted.queue_runtime.clone())
+            // A child in view has the queue bound to its thread; its turn is
+            // not the one Ctrl+Enter speaks to.
+            let runtime = hosted
+                .focused_child_surface
+                .is_none()
+                .then(|| hosted.queue_runtime.clone())
+                .flatten();
+            (hosted.surface_active.clone(), runtime)
         };
-        let Some(surface) = surface else {
-            return Ok(SubmitNowOutcome::NoActiveOperation);
-        };
+        // Steering needs only the running turn, which the runtime may have
+        // started itself (a queued message, or a wake after background agents
+        // finish) without a TUI operation.
         if bindings.is_empty()
             && images.is_empty()
             && runtime.is_some_and(|runtime| steer_running_turn(&runtime, &prompt))
         {
             return Ok(SubmitNowOutcome::Steered);
         }
+        let Some(surface) = surface else {
+            return Ok(SubmitNowOutcome::NoActiveOperation);
+        };
         let queued = surface
             .client
             .prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::Add {
@@ -2047,6 +2057,62 @@ mod tests {
         let _ = child.interrupt_active();
         let _ = operation.wait_timeout(Duration::from_secs(10));
         child.shutdown().expect("child shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn ctrl_enter_steers_a_turn_the_runtime_started_on_its_own() {
+        // A queued message or a wake after background agents finish runs
+        // without a TUI operation, and Ctrl+Enter then only queued the text
+        // for later instead of sending it into the running turn.
+        let _guard = crate::test_support::lock_process_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let host = orca_runtime::runtime_host::RuntimeHost::start_with_executor(Arc::new(
+            WaitForCancelExecutor {
+                entered: entered_tx,
+            },
+        ))
+        .expect("runtime host");
+        let thread = host
+            .start_thread(config, "runtime-started turn")
+            .expect("runtime thread");
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let _ = control.bind_prompt_queue_runtime(thread.clone(), &event_tx);
+        let operation = thread
+            .start_turn(
+                orca_runtime::runtime_host::HostedTurnRequest::new("woken"),
+                std::io::sink(),
+            )
+            .expect("start the turn");
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the turn is running");
+
+        let outcome = control
+            .submit_now(
+                "also check the tests".to_string(),
+                orca_runtime::mentions::MentionBindings::default(),
+                Vec::new(),
+            )
+            .expect("submit now");
+
+        assert!(
+            matches!(outcome, super::SubmitNowOutcome::Steered),
+            "Ctrl+Enter must steer the running turn"
+        );
+        let _ = thread.interrupt_active();
+        let _ = operation.wait_timeout(Duration::from_secs(10));
+        thread.shutdown().expect("thread shutdown");
         host.shutdown().expect("host shutdown");
         match previous {
             Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
