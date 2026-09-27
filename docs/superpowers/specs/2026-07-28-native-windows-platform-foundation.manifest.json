@@ -299,7 +299,7 @@
       "task-test-shells",
       "crates/orca-runtime/src/tasks.rs",
       "unix_shell_spawn",
-      7,
+      9,
       "windows-test-portability"
     ],
     [

@@ -5193,7 +5193,34 @@ impl TaskRegistry {
     }
 
     pub fn request_stop(&self, id: &str) -> Result<(), String> {
-        let stopped_record = self.mark_stop_requested_record(id)?;
+        self.request_stop_waiting_for_worker(id, false)
+    }
+
+    /// `request_stop` for a detached agent. It shows as running before its
+    /// launch records a worker, so no pid yet also means the worker is
+    /// still starting; an in-process child never has one.
+    pub fn request_stop_detached(&self, id: &str) -> Result<(), String> {
+        self.request_stop_waiting_for_worker(id, true)
+    }
+
+    fn request_stop_waiting_for_worker(&self, id: &str, detached: bool) -> Result<(), String> {
+        let mut stopped_record = self.mark_stop_requested_record(id)?;
+        // A worker still launching (pid 0) is handed over within moments.
+        // Wait for it and stop it, rather than fail and leave the stop to a
+        // worker that would never report who stopped it.
+        let handoff_deadline = std::time::Instant::now() + WORKER_HANDOFF_WAIT;
+        while stopped_record.task_type == TaskType::Subagent
+            && (stopped_record.worker_pid == Some(0)
+                || (detached && stopped_record.worker_pid.is_none()))
+            && std::time::Instant::now() < handoff_deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+            match self.get(id) {
+                Some(record) if is_terminal(record.status) => return Ok(()),
+                Some(record) => stopped_record = record,
+                None => return Err(format!("task '{id}' not found")),
+            }
+        }
         let target = self
             .with_tasks(|tasks| {
                 let Some(pid) = (stopped_record.task_type == TaskType::Subagent)
@@ -6535,6 +6562,9 @@ fn terminate_worker(worker: &mut OwnedWorker) {
 }
 
 #[cfg(unix)]
+/// How long a stop waits for a launching worker to be handed over.
+const WORKER_HANDOFF_WAIT: Duration = Duration::from_secs(5);
+
 const SUBAGENT_WORKER_PROCESS_PREFIX: &str = "orca-subagent-worker-";
 
 #[cfg(unix)]
@@ -9644,6 +9674,62 @@ while :; do :; done
         recovered.request_stop(&task.id).unwrap();
 
         let stopped = recovered.get(&task.id).unwrap();
+        assert_eq!(stopped.status, TaskStatus::Stopped);
+        assert_eq!(stopped.worker_pid, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_during_worker_launch_waits_for_the_worker_and_stops_it() {
+        let registry = TaskRegistry::new("session-launch-stop".to_string());
+        let task = registry.create_subagent("launching async work".to_string(), None);
+        // The launch records a starting worker (pid 0) before it spawns one.
+        registry.mark_worker_spawned(&task.id, 0).unwrap();
+        let launcher = registry.clone();
+        let task_id = task.id.clone();
+        let handoff = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            let child = Command::new("sh")
+                .arg("-c")
+                .arg("sleep 30")
+                .spawn()
+                .expect("spawn launching worker fixture");
+            launcher.adopt_subagent_worker(&task_id, child)
+        });
+
+        registry.request_stop(&task.id).unwrap();
+
+        handoff.join().unwrap().unwrap();
+        let stopped = registry.get(&task.id).unwrap();
+        assert_eq!(stopped.status, TaskStatus::Stopped);
+        assert_eq!(stopped.worker_pid, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_stop_before_the_launch_records_a_worker_waits_for_it() {
+        let registry = TaskRegistry::new("session-detached-stop".to_string());
+        let task = registry.create_subagent("detached async work".to_string(), None);
+        // The agent already shows as running before its launch records any
+        // worker, even the starting pid 0.
+        let launcher = registry.clone();
+        let task_id = task.id.clone();
+        let handoff = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            launcher.mark_worker_spawned(&task_id, 0)?;
+            thread::sleep(Duration::from_millis(100));
+            let child = Command::new("sh")
+                .arg("-c")
+                .arg("sleep 30")
+                .spawn()
+                .expect("spawn detached worker fixture");
+            launcher.adopt_subagent_worker(&task_id, child)
+        });
+
+        registry.request_stop_detached(&task.id).unwrap();
+
+        handoff.join().unwrap().unwrap();
+        let stopped = registry.get(&task.id).unwrap();
         assert_eq!(stopped.status, TaskStatus::Stopped);
         assert_eq!(stopped.worker_pid, None);
     }

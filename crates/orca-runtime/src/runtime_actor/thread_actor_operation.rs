@@ -2247,7 +2247,7 @@ impl ThreadActor {
 
             let task_registry = self.handle.task_registry();
             task_registry
-                .request_stop(task.task_id.as_str())
+                .request_stop_detached(task.task_id.as_str())
                 .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
             let stopped_record = task_registry
                 .get(task.task_id.as_str())
