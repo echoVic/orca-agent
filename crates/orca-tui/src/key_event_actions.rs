@@ -1268,6 +1268,9 @@ mod tests {
             "/tmp".to_string(),
         );
         state.status = AppStatus::Idle;
+        state.push_message(crate::transcript_state::ChatMessage::User(
+            "take this back".to_string(),
+        ));
         let mut config = test_run_config();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let mut vim = VimState::new(false);

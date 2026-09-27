@@ -447,16 +447,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn esc_still_backtracks_when_the_composer_is_empty() {
-        let (action_tx, action_rx) = mpsc::unbounded();
-        let mut state = AppState::new(
-            action_tx.clone(),
-            "test".to_string(),
-            "mock".to_string(),
-            "/tmp".to_string(),
-        );
-        state.status = crate::types::AppStatus::Idle;
+    fn press_esc_with_empty_composer(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>) {
         let mut config = test_run_config();
         let shared = Arc::new(Mutex::new(config.clone()));
         let theme = Theme::named(ThemeName::Dark);
@@ -467,16 +458,52 @@ mod tests {
         handle_idle_key(
             &Event::Key(key),
             &key,
-            &mut state,
+            state,
             &mut config,
             &shared,
-            &action_tx,
+            action_tx,
             &mut textarea,
             &mut vim,
             &theme,
         );
+    }
+
+    #[test]
+    fn esc_still_backtracks_when_the_composer_is_empty() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = crate::types::AppStatus::Idle;
+        state.push_message(crate::transcript_state::ChatMessage::User(
+            "take this back".to_string(),
+        ));
+
+        press_esc_with_empty_composer(&mut state, &action_tx);
 
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Backtrack)));
+    }
+
+    #[test]
+    fn esc_before_any_message_does_nothing() {
+        // It asked the runtime anyway, which answered with a red "Request
+        // could not be applied" card for a reflexive Esc on the welcome screen.
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = crate::types::AppStatus::Idle;
+
+        press_esc_with_empty_composer(&mut state, &action_tx);
+
+        assert!(action_rx.try_recv().is_err());
+        assert!(state.transcript.messages.is_empty());
     }
 
     #[test]

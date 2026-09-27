@@ -46,7 +46,15 @@ pub(crate) fn handle_idle_navigation_shortcut(
             state.scroll_down(page);
         }
         IdleShortcut::Backtrack => {
-            let _ = action_tx.send(UserAction::Backtrack);
+            // With no message sent there is nothing to take back, and Esc is
+            // often pressed just to dismiss something.
+            let has_prompt =
+                state.transcript.messages.iter().any(|message| {
+                    matches!(message, crate::transcript_state::ChatMessage::User(_))
+                });
+            if has_prompt {
+                let _ = action_tx.send(UserAction::Backtrack);
+            }
         }
         IdleShortcut::ExpandToolOutput => {
             if state.toggle_latest_expandable() {
