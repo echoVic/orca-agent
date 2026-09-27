@@ -151,8 +151,19 @@ mod unix {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-            let listener = UnixListener::bind(&path)?;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            // A client could connect between binding the socket and
+            // restricting it, and then refused it as unsafe. Bind under a
+            // staging name in the private directory, restrict it, and move it
+            // into place, so the socket appears at its path already 0600.
+            let staging = path.with_extension("binding");
+            match fs::remove_file(&staging) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let listener = UnixListener::bind(&staging)?;
+            fs::set_permissions(&staging, fs::Permissions::from_mode(0o600))?;
+            fs::rename(&staging, &path)?;
             let meta = validate_socket(&path)?;
             lock.file_mut().set_len(0)?;
             writeln!(lock.file_mut(), "{}", std::process::id())?;
