@@ -548,7 +548,9 @@ pub fn message_tokens_with_counter(msg: &Message, counter: &impl TokenCounter) -
             }
             tokens
         }
-        Message::Tool { content, .. } => counter.count_text(content) + 4,
+        Message::Tool {
+            content, images, ..
+        } => counter.count_text(content) + 4 + images.iter().map(image_tokens).sum::<usize>(),
     }
 }
 
@@ -1102,7 +1104,9 @@ fn partition_for_compaction(
         messages[unit.range.clone()]
             .iter()
             .map(|message| match message {
-                Message::User { images, .. } => images.iter().map(image_tokens).sum::<usize>(),
+                Message::User { images, .. } | Message::Tool { images, .. } => {
+                    images.iter().map(image_tokens).sum::<usize>()
+                }
                 _ => 0,
             })
             .sum::<usize>()
@@ -2065,7 +2069,7 @@ mod cache_aware_tests;
 mod tests {
     use super::*;
     use orca_core::cancel::CancelToken;
-    use orca_core::conversation::RawToolCall;
+    use orca_core::conversation::{ImageSource, RawToolCall};
     use orca_core::provider_types::{ProviderResponse, ProviderStep};
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -2473,6 +2477,35 @@ mod tests {
         conv.replace_goal_state(Some("goal".to_string()));
 
         assert_eq!(conversation_tokens_with_counter(&conv, &FixedCounter), 11);
+    }
+
+    #[test]
+    fn tool_images_count_toward_message_tokens() {
+        let without_image = Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: "took a screenshot".to_string(),
+            images: Vec::new(),
+            terminal: None,
+            pinned: false,
+        };
+        let with_image = Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: "took a screenshot".to_string(),
+            images: vec![ImageInput {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".to_string(),
+                    data: "aGVsbG8=".to_string(),
+                },
+                detail: ImageDetail::High,
+            }],
+            terminal: None,
+            pinned: false,
+        };
+
+        assert_eq!(
+            message_tokens_with_counter(&with_image, &FixedCounter),
+            message_tokens_with_counter(&without_image, &FixedCounter) + 2048
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ use orca_core::model::{FLASH_MODEL, canonical_model_name};
 use orca_core::provider_types::{
     ProviderError, ProviderErrorKind, ProviderReplayState, ProviderResponse, ProviderStep, Usage,
 };
+use orca_core::tool_images::keep_newest_tool_images;
 use orca_core::tool_types::{ToolName, ToolRequest};
 
 use crate::ProviderConfig;
@@ -974,6 +975,12 @@ fn replayable_reasoning_content(
         .map(str::to_string)
 }
 
+/// Caps the tool images placed in a single DeepSeek request; every image past
+/// the newest `MAX_REQUEST_TOOL_IMAGES` is replaced with
+/// `SUPERSEDED_TOOL_IMAGE_NOTE`. This limits requests only — persisted
+/// history keeps every image regardless of how many a given request sends.
+const MAX_REQUEST_TOOL_IMAGES: usize = 3;
+
 pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
     let mut messages: Vec<ApiMessage> = Vec::new();
     let needs_normalization = conversation.messages.iter().any(|message| {
@@ -996,6 +1003,7 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
         normalized_messages = {
             let mut messages = conversation.messages.clone();
             normalize_tool_boundaries(&mut messages);
+            keep_newest_tool_images(&mut messages, MAX_REQUEST_TOOL_IMAGES);
             messages
         };
         &normalized_messages
@@ -1072,11 +1080,12 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
             Message::Tool {
                 tool_call_id,
                 content,
+                images,
                 ..
             } => ApiMessage {
                 role: "tool".to_string(),
                 content: Some(content.clone()),
-                images: Vec::new(),
+                images: images.clone(),
                 reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: Some(tool_call_id.clone()),
@@ -1135,6 +1144,7 @@ mod tests {
     use super::*;
     use crate::context::TokenCounter;
     use orca_core::approval_types::ActionKind;
+    use orca_core::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE;
     use orca_core::tool_types::ToolName;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1218,6 +1228,113 @@ mod tests {
         assert_eq!(value[0]["content"][2]["image_url"]["detail"], "low");
         assert_eq!(value[0]["content"][3]["type"], "file");
         assert_eq!(value[0]["content"][3]["file_id"], "file-api-example");
+    }
+
+    #[test]
+    fn tool_images_are_sent_inside_the_tool_message() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("take a screenshot".to_string());
+        conversation.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "call_1".to_string(),
+                function_name: "screenshot".to_string(),
+                arguments: "{}".to_string(),
+            }],
+        );
+        conversation.messages.push(Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: "took a screenshot".to_string(),
+            images: vec![ImageInput {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".to_string(),
+                    data: "aGVsbG8=".to_string(),
+                },
+                detail: ImageDetail::High,
+            }],
+            terminal: None,
+            pinned: false,
+        });
+
+        let value = serde_json::to_value(conversation_to_api_messages(&conversation))
+            .expect("serialize tool image message");
+
+        assert_eq!(value[2]["role"], "tool");
+        assert_eq!(value[2]["tool_call_id"], "call_1");
+        assert_eq!(value[2]["content"][0]["type"], "text");
+        assert_eq!(value[2]["content"][0]["text"], "took a screenshot");
+        assert_eq!(value[2]["content"][1]["type"], "image_url");
+        assert_eq!(
+            value[2]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+        assert_eq!(value[2]["content"][1]["image_url"]["detail"], "high");
+    }
+
+    #[test]
+    fn only_the_three_newest_tool_images_are_sent() {
+        fn image(label: &str) -> ImageInput {
+            ImageInput {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".to_string(),
+                    data: label.to_string(),
+                },
+                detail: ImageDetail::High,
+            }
+        }
+        fn tool_call(id: &str) -> RawToolCall {
+            RawToolCall {
+                id: id.to_string(),
+                function_name: "screenshot".to_string(),
+                arguments: "{}".to_string(),
+            }
+        }
+
+        let mut conversation = Conversation::new();
+        conversation.add_user("take three screenshots".to_string());
+        conversation.add_assistant(None, None, vec![tool_call("call_1")]);
+        conversation.messages.push(Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: "first".to_string(),
+            images: vec![image("a"), image("b")],
+            terminal: None,
+            pinned: false,
+        });
+        conversation.add_assistant(None, None, vec![tool_call("call_2")]);
+        conversation.messages.push(Message::Tool {
+            tool_call_id: "call_2".to_string(),
+            content: "second".to_string(),
+            images: vec![image("c")],
+            terminal: None,
+            pinned: false,
+        });
+        conversation.add_assistant(None, None, vec![tool_call("call_3")]);
+        conversation.messages.push(Message::Tool {
+            tool_call_id: "call_3".to_string(),
+            content: "third".to_string(),
+            images: vec![image("d"), image("e")],
+            terminal: None,
+            pinned: false,
+        });
+
+        let value = serde_json::to_value(conversation_to_api_messages(&conversation))
+            .expect("serialize trimmed tool images");
+
+        // call_1 loses both images (5 total - 3 kept = 2 dropped); its text
+        // gets the superseded note and it carries no content blocks.
+        assert_eq!(
+            value[2]["content"],
+            format!("first\n{SUPERSEDED_TOOL_IMAGE_NOTE}")
+        );
+        // call_2 and call_3 keep all of their images (1 + 2 = 3 total kept).
+        assert_eq!(value[4]["content"][0]["text"], "second");
+        assert_eq!(value[4]["content"][1]["type"], "image_url");
+        assert_eq!(value[4]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(value[6]["content"][0]["text"], "third");
+        assert_eq!(value[6]["content"][1]["type"], "image_url");
+        assert_eq!(value[6]["content"][2]["type"], "image_url");
+        assert_eq!(value[6]["content"].as_array().unwrap().len(), 3);
     }
 
     fn make_tc(name: &str, arguments: &str) -> ApiToolCallResponse {

@@ -45,6 +45,20 @@ The transport is either stdio or sse. A stdio server needs a command; an SSE
 server needs a url. Keep credentials in the environment where possible, and
 grant only the capabilities the integration needs.
 
+## Images from tools
+
+Flash and `auto` see the images an MCP tool returns, inline on the tool
+message. `deepseek-v4-pro` cannot see images at all, so it gets a text note
+in their place instead. Only PNG, JPEG, GIF, and WebP are accepted, decoded
+size up to 5 MiB each; anything else is dropped with a note explaining why.
+
+Each request carries at most the 3 newest tool images in the conversation;
+older ones are replaced with a note. This limits what goes out over the wire
+only — the full history stays on disk.
+
+Resuming a session does not reload earlier tool images, regardless of which
+model resumes it. The resumed conversation keeps the note in their place.
+
 ## Operate safely
 
 1. Start with a read-only capability set.
