@@ -143,8 +143,9 @@ impl CompactWrappedLine {
     }
 }
 
-/// `line` wrapped exactly as ratatui's `Paragraph` with `Wrap { trim: false }`
-/// would, with no hang — the form the tests compare against ratatui.
+/// `line` wrapped as ratatui's `Paragraph` with `Wrap { trim: false }` would,
+/// with no hang — the form the tests compare against ratatui. The one
+/// difference: trailing whitespace alone on a row takes one row, not two.
 #[cfg(test)]
 fn wrap_line_ratatui_compatible(line: &Line<'_>, width: u16) -> CompactWrappedLine {
     wrap_line(line, width, 0)
@@ -276,9 +277,9 @@ fn wrap_line(line: &Line<'_>, width: u16, continuation_indent: u16) -> CompactWr
         non_whitespace_previous = !is_whitespace;
     }
 
-    if pending_line.is_empty() && pending_word.is_empty() && !pending_whitespace.is_empty() {
-        wrapped.push_row(Vec::new());
-    }
+    // ratatui pushes an empty row here before the trailing whitespace's own
+    // row, which trimming needs and `trim: false` does not: it gave a line of
+    // spaces two rows.
     pending_line.extend(pending_whitespace);
     pending_line.append(&mut pending_word);
     if !pending_line.is_empty() {
@@ -1882,6 +1883,17 @@ mod tests {
         );
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn a_blank_line_of_spaces_takes_one_row() {
+        // A code block's blank line is its indent alone; ratatui's
+        // `trim: false` wrapper gives such a line an extra empty row, so every
+        // blank line in a code block showed twice.
+        for text in [" ", "      ", "\t"] {
+            assert_eq!(wrapped_rows(text, 20).len(), 1, "{text:?}");
+        }
+        assert_eq!(wrapped_rows("ab  ", 2), vec!["ab", " "]);
     }
 
     #[test]
