@@ -1002,6 +1002,16 @@ mod tests {
         })
     }
 
+    /// A config whose threads work in `cwd`, as a parent's children do in
+    /// production, not in the test process's directory, whose `.orca` can
+    /// hold anything a developer left there.
+    fn config_in(cwd: &std::path::Path, subagents: SubagentConfig) -> RunConfig {
+        RunConfig {
+            cwd: Some(cwd.to_path_buf()),
+            ..config(subagents)
+        }
+    }
+
     fn config(subagents: SubagentConfig) -> RunConfig {
         RunConfig {
             app_version: "0.0.0-test".to_string(),
@@ -2306,7 +2316,7 @@ mod tests {
     #[test]
     fn threaded_sync_subagent_without_surface_ingress_uses_legacy_observer_path() {
         let cwd = tempfile::tempdir().expect("temp cwd");
-        let config = config(SubagentConfig::default());
+        let config = config_in(cwd.path(), SubagentConfig::default());
         let mut events = EventFactory::new("threaded-sync-missing-ingress".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = subagent_request("threaded-sync-missing-ingress");
@@ -2369,7 +2379,7 @@ mod tests {
     #[test]
     fn hosted_async_subagent_uses_the_controller_when_no_parent_fence_exists() {
         let cwd = tempfile::tempdir().expect("temp cwd");
-        let config = config(SubagentConfig::default());
+        let config = config_in(cwd.path(), SubagentConfig::default());
         let mut events = EventFactory::new("hosted-async-durable-route".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = tool_types::ToolRequest {
@@ -2460,7 +2470,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let mut subagents = SubagentConfig::default();
         subagents.max_depth = 1;
-        let config = config(subagents);
+        let config = config_in(cwd.path(), subagents);
         let mut events = EventFactory::new("threaded-sync-launch-failure".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = subagent_request("threaded-sync-launch-failure");
@@ -2532,7 +2542,7 @@ mod tests {
     fn threaded_sync_registry_stop_interrupts_the_hosted_child() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let cwd_path = cwd.path().to_path_buf();
-        let config = config(SubagentConfig::default());
+        let config = config_in(cwd.path(), SubagentConfig::default());
         let request = tool_types::ToolRequest {
             raw_arguments: Some(
                 serde_json::json!({"mode": "sync",
@@ -2659,7 +2669,7 @@ mod tests {
         let release_marker = cwd.path().join("release-sibling");
         let mut subagents = SubagentConfig::default();
         subagents.limits.max_running = 2;
-        let config = config(subagents);
+        let config = config_in(cwd.path(), subagents);
         let requests = vec![
             hosted_request(
                 "stop-one",
@@ -2758,7 +2768,7 @@ mod tests {
         let mut subagents = SubagentConfig::default();
         subagents.limits.max_running = 1;
         subagents.limits.max_queued = 8;
-        let config = config(subagents);
+        let config = config_in(cwd.path(), subagents);
         let requests = (0..3)
             .map(|index| {
                 hosted_request(
@@ -2852,7 +2862,7 @@ mod tests {
         let mut subagents = SubagentConfig::default();
         subagents.limits.max_running = 2;
         subagents.limits.max_queued = 16;
-        let config = config(subagents);
+        let config = config_in(cwd.path(), subagents);
         let markers = (0..4)
             .map(|index| cwd.path().join(format!("release-{index}")))
             .collect::<Vec<_>>();
@@ -2995,7 +3005,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let mut subagents = SubagentConfig::default();
         subagents.limits.max_running = 2;
-        let config = config(subagents);
+        let config = config_in(cwd.path(), subagents);
         let requests = vec![
             hosted_request("cancel-a", "cancel child a", "mock_stream_delay_ms 10000"),
             hosted_request("cancel-b", "cancel child b", "mock_stream_delay_ms 10000"),
@@ -3057,7 +3067,7 @@ mod tests {
     #[test]
     fn hosted_sync_schema_request_uses_the_observable_runtime_route() {
         let cwd = tempfile::tempdir().expect("temp cwd");
-        let config = config(SubagentConfig::default());
+        let config = config_in(cwd.path(), SubagentConfig::default());
         let mut events = EventFactory::new("hosted-schema-route".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = tool_types::ToolRequest {
@@ -3146,7 +3156,7 @@ mod tests {
     #[test]
     fn invalid_hosted_resume_is_rejected_before_admission() {
         let cwd = tempfile::tempdir().expect("temp cwd");
-        let config = config(SubagentConfig::default());
+        let config = config_in(cwd.path(), SubagentConfig::default());
         let mut events = EventFactory::new("hosted-resume-rejection".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = tool_types::ToolRequest {
@@ -3295,7 +3305,7 @@ mod tests {
     #[test]
     fn hosted_terminal_commit_failure_returns_indeterminate_result() {
         let cwd = tempfile::tempdir().expect("temp cwd");
-        let config = config(SubagentConfig::default());
+        let config = config_in(cwd.path(), SubagentConfig::default());
         let mut events = EventFactory::new("hosted-terminal-failure".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = hosted_request(
@@ -3367,7 +3377,7 @@ mod tests {
     #[test]
     fn hosted_child_thread_binding_uses_the_canonical_task_identity() {
         let cwd = tempfile::tempdir().expect("temp cwd");
-        let config = config(SubagentConfig::default());
+        let config = config_in(cwd.path(), SubagentConfig::default());
         let mut events = EventFactory::new("hosted-canonical-binding".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = hosted_request(
