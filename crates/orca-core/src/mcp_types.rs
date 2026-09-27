@@ -164,9 +164,12 @@ pub enum McpContent {
     Text {
         text: String,
     },
+    // Both fields default so a block missing one still parses; `tool_image`
+    // then rejects it with a note instead of the whole result failing.
     Image {
+        #[serde(default)]
         data: String,
-        #[serde(rename = "mimeType")]
+        #[serde(default, rename = "mimeType")]
         mime_type: String,
     },
     #[serde(other)]

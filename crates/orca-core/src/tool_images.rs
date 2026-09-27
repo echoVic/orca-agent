@@ -48,6 +48,9 @@ impl ToolImageRejected {
     /// style as other tool output notices.
     pub fn note(&self) -> String {
         match self {
+            Self::UnsupportedType(media_type) if media_type.is_empty() => {
+                "[image omitted: missing media type]".to_string()
+            }
             Self::UnsupportedType(media_type) => {
                 format!("[image omitted: unsupported type {media_type}]")
             }
@@ -64,8 +67,9 @@ impl ToolImageRejected {
 /// Validates a tool-supplied image and, on success, wraps it as the
 /// `ImageInput` a tool result carries.
 ///
-/// Rejects any media type outside `TOOL_IMAGE_MEDIA_TYPES`, base64 that fails
-/// to decode, and a decoded payload larger than `MAX_TOOL_IMAGE_BYTES`.
+/// Rejects any media type outside `TOOL_IMAGE_MEDIA_TYPES` (a missing one
+/// arrives as `""`), base64 that fails to decode or decodes to nothing, and a
+/// decoded payload larger than `MAX_TOOL_IMAGE_BYTES`.
 pub fn tool_image(media_type: &str, base64_data: String) -> Result<ImageInput, ToolImageRejected> {
     if !TOOL_IMAGE_MEDIA_TYPES.contains(&media_type) {
         return Err(ToolImageRejected::UnsupportedType(media_type.to_string()));
@@ -73,6 +77,9 @@ pub fn tool_image(media_type: &str, base64_data: String) -> Result<ImageInput, T
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(&base64_data)
         .map_err(|_| ToolImageRejected::InvalidBase64)?;
+    if decoded.is_empty() {
+        return Err(ToolImageRejected::InvalidBase64);
+    }
     if decoded.len() > MAX_TOOL_IMAGE_BYTES {
         return Err(ToolImageRejected::TooLarge {
             bytes: decoded.len(),
@@ -177,6 +184,20 @@ mod tests {
         assert_eq!(
             rejected.note(),
             "[image omitted: unsupported type image/svg+xml]"
+        );
+    }
+
+    #[test]
+    fn tool_image_rejects_invalid_base64_with_a_note() {
+        let rejected = tool_image("image/png", "not base64!".to_string()).unwrap_err();
+        assert_eq!(rejected.note(), "[image omitted: invalid base64 data]");
+    }
+
+    #[test]
+    fn tool_image_rejects_data_that_decodes_to_nothing() {
+        assert_eq!(
+            tool_image("image/png", String::new()),
+            Err(ToolImageRejected::InvalidBase64)
         );
     }
 

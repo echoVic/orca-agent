@@ -1434,6 +1434,27 @@ mod tests {
         assert!(result.images.is_empty());
     }
 
+    #[test]
+    fn an_mcp_image_without_a_media_type_leaves_a_note_instead_of_failing_the_call() {
+        let (registry, tool_ref) = registry_with_call_tool_result(serde_json::json!({
+            "content": [
+                {"type": "text", "text": "screenshot taken"},
+                {"type": "image", "data": BASE64_1X1_PNG}
+            ],
+            "isError": false
+        }));
+
+        let result = registry
+            .call_tool(&tool_ref, serde_json::json!({}))
+            .expect("a malformed image block must not fail the call");
+
+        assert_eq!(
+            result.output,
+            "screenshot taken\n[image omitted: missing media type]"
+        );
+        assert!(result.images.is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn cancelled_stdio_tool_call_reconnects_before_returning() {
