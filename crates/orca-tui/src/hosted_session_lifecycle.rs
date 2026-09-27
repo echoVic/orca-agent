@@ -56,6 +56,9 @@ pub(crate) fn ensure_hosted_thread(
     Ok(())
 }
 
+/// What `/new` names a conversation until its first prompt names it.
+pub(crate) const NEW_CONVERSATION_TITLE: &str = "New conversation";
+
 pub(crate) fn start_new_hosted_session(
     thread: &mut Option<RuntimeThreadHandle>,
     host: &RuntimeHostHandle,
@@ -69,7 +72,7 @@ pub(crate) fn start_new_hosted_session(
     next_config.history_mode = HistoryMode::Record;
     next_config.prompt.clear();
     next_config.show_session_picker = false;
-    let request = RuntimeThreadStartRequest::new(next_config.clone(), "New conversation");
+    let request = RuntimeThreadStartRequest::new(next_config.clone(), NEW_CONVERSATION_TITLE);
     let started = host
         .start_thread_with_request(request)
         .map_err(|error| format!("failed to start a new conversation: {error}"))?;

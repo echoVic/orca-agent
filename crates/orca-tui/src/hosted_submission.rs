@@ -14,11 +14,42 @@ use crate::hosted_runtime::{
     send_submission_error_with_images,
 };
 use crate::hosted_session::announce_runtime_ready;
-use crate::hosted_session_lifecycle::ensure_hosted_thread;
+use crate::hosted_session_lifecycle::{NEW_CONVERSATION_TITLE, ensure_hosted_thread};
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::protocol::TuiEvent;
 use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::TuiSurfaceActions;
+
+/// Names a conversation `/new` started after its first prompt, as a
+/// conversation started by a prompt is named. A conversation that already
+/// has a prompt, or a title the user gave it, keeps its title.
+fn title_new_conversation(
+    runtime_thread: &RuntimeThreadHandle,
+    prompt: &str,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) {
+    let Some(session_id) = runtime_thread.session_id() else {
+        return;
+    };
+    let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+    let Ok(snapshot) = actions.read_snapshot() else {
+        return;
+    };
+    let untitled = snapshot.thread.title.as_str() == NEW_CONVERSATION_TITLE
+        && !snapshot
+            .items
+            .iter()
+            .any(|item| matches!(item, orca_runtime::surface::SurfaceItem::UserMessage { .. }));
+    if !untitled {
+        return;
+    }
+    // The prompt runs whether or not the title can be saved.
+    if let Ok(projection) =
+        actions.rename_current_session(session_id, &history::title_from_prompt(prompt))
+    {
+        let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
+    }
+}
 
 pub(crate) fn queue_busy_submission(
     runtime_thread: &RuntimeThreadHandle,
@@ -79,6 +110,9 @@ pub(crate) fn handle_hosted_queued_prompt(
         announce_runtime_ready(runtime_thread, event_tx, control);
     }
     let runtime_thread = thread.as_ref().expect("queued prompt thread initialized");
+    if !thread_was_missing {
+        title_new_conversation(runtime_thread, submitted.prompt(), event_tx);
+    }
     let roots = cfg
         .runtime_workspace_roots
         .clone()
@@ -158,6 +192,9 @@ pub(crate) fn handle_hosted_submitted_turn(
         announce_runtime_ready(runtime_thread, event_tx, control);
     }
     let runtime_thread = thread.as_ref().expect("hosted thread initialized");
+    if !thread_was_missing && rejection_prompt.is_some() {
+        title_new_conversation(runtime_thread, &title_seed, event_tx);
+    }
     let workspace_roots = cfg
         .runtime_workspace_roots
         .clone()

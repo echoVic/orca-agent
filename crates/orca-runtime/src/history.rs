@@ -474,7 +474,9 @@ pub(crate) fn prospective_session_path(session_id: &str, timestamp: DateTime<Utc
     ))
 }
 
-fn title_from_prompt(prompt: &str) -> String {
+/// A conversation's title as its first prompt gives it: the prompt on one
+/// line, cut at 80 characters.
+pub fn title_from_prompt(prompt: &str) -> String {
     let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
         return "(empty prompt)".to_string();

@@ -3565,6 +3565,54 @@ fn picker_fork_replaces_source_transcript() {
 }
 
 #[test]
+fn a_new_conversation_takes_its_title_from_its_first_prompt() {
+    // `/new` saved the conversation as "New conversation", and it kept that
+    // title in /resume whatever was asked in it.
+    with_orca_home(|_| {
+        let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+        harness.send(UserAction::Submit("first conversation".to_string()));
+        harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+
+        harness.send(UserAction::NewSession);
+        let mut current_id = None;
+        loop {
+            match harness
+                .event_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("new-session event")
+            {
+                TuiEvent::SessionProjectionReset(projection) => {
+                    current_id = projection.session_id;
+                }
+                TuiEvent::NewSessionStarted => break,
+                _ => {}
+            }
+        }
+        let current_id = current_id.expect("new conversation id");
+        harness.send(UserAction::Submit(
+            "  explain   the retry\nloop in the provider  ".to_string(),
+        ));
+        harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+
+        let title = history::load_session(&current_id)
+            .expect("new conversation transcript")
+            .meta
+            .title;
+        assert_eq!(title, "explain the retry loop in the provider");
+
+        // Only the first prompt names it.
+        harness.send(UserAction::Submit("and the backoff?".to_string()));
+        harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+        let title = history::load_session(&current_id)
+            .expect("new conversation transcript")
+            .meta
+            .title;
+        assert_eq!(title, "explain the retry loop in the provider");
+        harness.shutdown();
+    });
+}
+
+#[test]
 fn picker_resume_requires_authoritative_session_reset() {
     with_orca_home(|_| {
         let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
