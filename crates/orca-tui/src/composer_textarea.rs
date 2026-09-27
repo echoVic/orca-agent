@@ -214,6 +214,7 @@ pub(crate) fn make_setup_textarea<'a>(theme: &Theme) -> TextArea<'a> {
     textarea.set_block(
         ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
+            .border_type(crate::chrome::BORDER)
             .title(" API Key ")
             .border_style(ratatui::style::Style::default().fg(theme.border)),
     );

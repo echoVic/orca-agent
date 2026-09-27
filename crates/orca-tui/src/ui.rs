@@ -14935,6 +14935,32 @@ mod tests {
     }
 
     #[test]
+    fn the_api_key_field_has_the_rounded_border_every_panel_has() {
+        let mut state = test_state();
+        state.status = AppStatus::Setup;
+        state.setup_step = 1;
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = crate::composer_textarea::make_setup_textarea(&theme);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 20)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("API Key"), "{rendered}");
+        for corner in ["┌", "┐", "└", "┘"] {
+            assert!(!rendered.contains(corner), "square corner {corner}");
+        }
+    }
+
+    #[test]
     fn setup_cursor_uses_masked_api_key_cell() {
         let mut state = test_state();
         state.status = AppStatus::Setup;
