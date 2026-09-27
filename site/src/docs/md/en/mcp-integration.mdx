@@ -47,10 +47,13 @@ grant only the capabilities the integration needs.
 
 ## Images from tools
 
-Flash and `auto` see the images an MCP tool returns, inline on the tool
-message. `deepseek-v4-pro` cannot see images at all, so it gets a text note
-in their place instead. Only PNG, JPEG, GIF, and WebP are accepted, decoded
-size up to 5 MiB each; anything else is dropped with a note explaining why.
+`deepseek-flash` and `auto`, which uses it, are the only models that see the
+images an MCP tool returns, inline on the tool message. `deepseek-v4-pro` and
+custom models, even ones declared with `supports_images = true`, get a note in
+their place saying the model cannot see them. Only PNG, JPEG, GIF, and WebP are
+accepted, decoded size up to 5 MiB each; anything else is dropped with a note
+explaining why. One MCP response, images included, is limited to 16 MiB; a
+larger one fails the call.
 
 Each request carries at most the 3 newest tool images in the conversation;
 older ones are replaced with a note. This limits what goes out over the wire
