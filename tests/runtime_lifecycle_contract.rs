@@ -1297,6 +1297,18 @@ fn task_actor_executes_normal_tool_with_runtime_policy() {
     let _ = task_registry;
 }
 
+/// A bash call as a provider sends it: the command in its JSON arguments,
+/// which is all the shell tool reads.
+fn sandboxed_bash_request(command: String) -> ToolRequest {
+    ToolRequest {
+        id: "tool-1".to_string(),
+        name: ToolName::Bash,
+        action: ActionKind::Shell,
+        raw_arguments: Some(serde_json::json!({ "command": command }).to_string()),
+        target: Some(command),
+    }
+}
+
 #[test]
 fn tool_actor_context_allows_bash_writes_to_additional_working_directories() {
     if !sandbox_seatbelt_available() {
@@ -1314,20 +1326,18 @@ fn tool_actor_context_allows_bash_writes_to_additional_working_directories() {
     let outside_file = outside.join("blocked.txt");
     let mut context = RuntimeToolActorContext::new("run-tools");
     let task_registry = TaskRegistry::new("run-tools".to_string());
-    let request = ToolRequest {
-        id: "tool-1".to_string(),
-        name: ToolName::Bash,
-        action: ActionKind::Shell,
-        target: Some(format!(
-            "printf allowed > {} && printf blocked > {}",
-            extra_file.display(),
-            outside_file.display()
-        )),
-        raw_arguments: None,
-    };
+    let request = sandboxed_bash_request(format!(
+        "printf allowed > {} && printf blocked > {}",
+        extra_file.display(),
+        outside_file.display()
+    ));
 
+    // Auto-edit runs commands in the workspace sandbox; full-auto, the
+    // fixture's default, runs them with full access.
+    let mut config = test_run_config();
+    config.approval_mode = ApprovalMode::AutoEdit;
     let result = context.execute_normal_tool_with_roots_and_cancel(
-        &test_run_config(),
+        &config,
         &request,
         &workspace,
         std::slice::from_ref(&extra),
@@ -1340,7 +1350,14 @@ fn tool_actor_context_allows_bash_writes_to_additional_working_directories() {
         None,
     );
 
-    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+    assert_eq!(
+        result.status,
+        orca_core::tool_types::ToolStatus::Failed,
+        "output={:?} error={:?} outside_exists={}",
+        result.output,
+        result.error,
+        outside_file.exists()
+    );
     assert_eq!(std::fs::read_to_string(extra_file).unwrap(), "allowed");
     assert!(!outside_file.exists());
 }
@@ -1385,13 +1402,7 @@ fn tool_actor_context_retries_bash_after_filesystem_permission_grant() {
     let mut config = test_run_config();
     config.cwd = Some(workspace.clone());
     let task_registry = TaskRegistry::new("run-tools".to_string());
-    let request = ToolRequest {
-        id: "tool-1".to_string(),
-        name: ToolName::Bash,
-        action: ActionKind::Shell,
-        target: Some(format!("printf granted > {}", outside_file.display())),
-        raw_arguments: None,
-    };
+    let request = sandboxed_bash_request(format!("printf granted > {}", outside_file.display()));
 
     let result = context.execute_normal_tool_with_roots_and_cancel(
         &config,
@@ -1451,13 +1462,7 @@ fn tool_actor_context_retries_workspace_git_write_after_permission_grant() {
     let mut config = test_run_config();
     config.cwd = Some(repo.path().to_path_buf());
     let task_registry = TaskRegistry::new("run-tools".to_string());
-    let request = ToolRequest {
-        id: "tool-1".to_string(),
-        name: ToolName::Bash,
-        action: ActionKind::Shell,
-        target: Some(format!("printf locked > {}", index_lock.display())),
-        raw_arguments: None,
-    };
+    let request = sandboxed_bash_request(format!("printf locked > {}", index_lock.display()));
 
     let result = context.execute_normal_tool_with_roots_and_cancel(
         &config,
@@ -1496,17 +1501,12 @@ fn tool_actor_context_reports_git_index_lock_sandbox_denial() {
     let mut context = RuntimeToolActorContext::new("run-tools");
     let mut config = test_run_config();
     config.cwd = Some(workspace.clone());
+    config.approval_mode = ApprovalMode::AutoEdit;
     let task_registry = TaskRegistry::new("run-tools".to_string());
-    let request = ToolRequest {
-        id: "tool-1".to_string(),
-        name: ToolName::Bash,
-        action: ActionKind::Shell,
-        target: Some(format!(
-            "printf 'fatal: Unable to create '\\''{}'\\'': Operation not permitted\\n' >&2; exit 128",
-            index_lock.display()
-        )),
-        raw_arguments: None,
-    };
+    let request = sandboxed_bash_request(format!(
+        "printf 'fatal: Unable to create '\\''{}'\\'': Operation not permitted\\n' >&2; exit 128",
+        index_lock.display()
+    ));
 
     let result = context.execute_normal_tool_with_roots_and_cancel(
         &config,
