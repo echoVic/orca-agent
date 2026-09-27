@@ -1188,12 +1188,18 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
         )
     };
     let hidden_suffix = if hidden > 0 {
-        format!(" · {hidden} test sessions hidden")
+        format!(
+            " · {} hidden",
+            counted(hidden, "test session", "test sessions")
+        )
     } else {
         String::new()
     };
     let count_text = if state.session_picker_backfill_complete {
-        format!("{} sessions{hidden_suffix}", filtered.len())
+        format!(
+            "{}{hidden_suffix}",
+            counted(filtered.len(), "session", "sessions")
+        )
     } else {
         format!(
             "{} of {loaded} · indexing history…{hidden_suffix}",
@@ -2403,7 +2409,7 @@ fn agent_workspace_summary_line<'a>(rows: &[AgentWorkspaceRow<'_>], theme: &Them
     ];
     if attention > 0 {
         spans.push(Span::styled(
-            format!(" · {attention} needs approval"),
+            format!(" · {} approval", counted(attention, "needs", "need")),
             Style::default().fg(theme.approval),
         ));
     }
@@ -2900,7 +2906,7 @@ fn workflow_progress_label(task: &BackgroundTaskSummary) -> String {
     let total_phases = task.phase_count.unwrap_or_default();
     let Some(progress) = task.workflow_progress else {
         return match task.phase_count {
-            Some(count) => format!("{count} phases"),
+            Some(count) => counted(count, "phase", "phases"),
             None => "phases -".to_string(),
         };
     };
@@ -3976,11 +3982,13 @@ fn append_proposed_plan_lines(
 
 /// "1 line", "3 lines".
 fn line_count(count: usize) -> String {
-    if count == 1 {
-        "1 line".to_string()
-    } else {
-        format!("{count} lines")
-    }
+    counted(count, "line", "lines")
+}
+
+/// `count` and the word that agrees with it: "1 line", "2 lines",
+/// "1 needs", "2 need".
+fn counted(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
 }
 
 /// Short, human tool names for transcript rows. Unknown names pass through;
@@ -4116,7 +4124,7 @@ fn append_workflow_draft_preview_lines(
     };
     let agents = draft
         .estimated_agent_count
-        .map(|count| format!("{count} agents"))
+        .map(|count| counted(count as usize, "agent", "agents"))
         .unwrap_or_else(|| "dynamic agent count".to_string());
     lines.push(Line::from(vec![
         Span::styled(
@@ -4270,9 +4278,15 @@ fn render_composer(
     // Transient "copied N chars" feedback sits on the right end of the top rule.
     if let Some(notice) = state.copy_notice_at(std::time::Instant::now()) {
         let text = if notice.local_only {
-            format!(" copied {} chars (local clipboard only) ", notice.chars)
+            format!(
+                " copied {} (local clipboard only) ",
+                counted(notice.chars, "char", "chars")
+            )
         } else {
-            format!(" copied {} chars to clipboard ", notice.chars)
+            format!(
+                " copied {} to clipboard ",
+                counted(notice.chars, "char", "chars")
+            )
         };
         let text_width = UnicodeWidthStr::width(text.as_str()) as u16;
         if text_width + 2 < area.width {
@@ -5383,8 +5397,9 @@ fn background_task_activity_rows(
         lines.push((
             activity_row(
                 format!(
-                    "◆ Tasks · {} active · {} needs approval",
-                    overall.active_count, overall.attention_count
+                    "◆ Tasks · {} active · {} approval",
+                    overall.active_count,
+                    counted(overall.attention_count, "needs", "need")
                 ),
                 if overall.requires_attention() {
                     theme.approval
@@ -10320,7 +10335,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("2 sessions · 1 test sessions hidden"));
+        assert!(rendered.contains("2 sessions · 1 test session hidden"));
         assert!(rendered.contains("Ctrl+T"));
         // The current project ("tmp", from cwd "/tmp") groups first and is
         // labeled, ahead of the other project's group.
@@ -10404,7 +10419,8 @@ mod tests {
         state.session_picker_backfill_complete = true;
         let complete = render_header(&mut state);
         assert!(!complete.contains("indexing history…"));
-        assert!(complete.contains("1 sessions"));
+        assert!(complete.contains("1 session"));
+        assert!(!complete.contains("1 sessions"));
     }
 
     /// Cells for one row of a rendered session-picker frame, used to compare
@@ -12672,7 +12688,7 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(lines[0], " ◆ Tasks · 7 active · 0 needs approval");
+        assert_eq!(lines[0], " ◆ Tasks · 7 active · 0 need approval");
         assert!(lines.iter().any(|line| line.contains("agent 6")));
         assert!(
             !lines.iter().any(|line| line.contains("agent 7")),
@@ -12810,7 +12826,7 @@ mod tests {
 
     #[test]
     fn workflow_progress_label_summarizes_agents_and_phases() {
-        let task = BackgroundTaskSummary {
+        let mut task = BackgroundTaskSummary {
             id: "task-1".to_string(),
             parent_task_id: None,
             task_type: TaskType::Workflow,
@@ -12864,6 +12880,9 @@ mod tests {
             workflow_progress_label(&task),
             "agents 2/5, running 2, failed 1, phases 1/3"
         );
+        task.workflow_progress = None;
+        task.phase_count = Some(1);
+        assert_eq!(workflow_progress_label(&task), "1 phase");
     }
 
     #[test]
@@ -16130,6 +16149,21 @@ mod tests {
         assert!(collapsed_text.contains("scan → review → report"));
         assert!(collapsed_text.contains("4 agents · concurrency 3 · read only likely"));
         assert!(!collapsed_text.contains("export default"));
+        let one_agent = output.replace("\"estimatedAgentCount\":4", "\"estimatedAgentCount\":1");
+        let mut single = Vec::new();
+        assert!(append_workflow_draft_preview_lines(
+            &mut single,
+            &one_agent,
+            false,
+            false,
+            &theme,
+        ));
+        assert!(
+            single
+                .iter()
+                .any(|line| line.to_string().contains("│ 1 agent · concurrency 3")),
+            "{single:?}"
+        );
 
         let mut expanded = Vec::new();
         assert!(append_workflow_draft_preview_lines(
