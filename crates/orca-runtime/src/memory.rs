@@ -1037,6 +1037,7 @@ mod tests {
             Message::Tool {
                 tool_call_id: "tool".to_string(),
                 content: "private tool output must not persist".to_string(),
+                images: Vec::new(),
                 terminal: None,
                 pinned: false,
             },

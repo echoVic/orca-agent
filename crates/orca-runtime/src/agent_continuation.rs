@@ -608,6 +608,7 @@ impl StoredChildMessage {
                 content,
                 terminal,
                 pinned,
+                ..
             } => Self::Tool {
                 tool_call_id: tool_call_id.clone(),
                 content: content.clone(),
@@ -650,6 +651,7 @@ impl StoredChildMessage {
             } => Message::Tool {
                 tool_call_id: tool_call_id.clone(),
                 content: content.clone(),
+                images: Vec::new(),
                 terminal: terminal.clone(),
                 pinned: *pinned,
             },

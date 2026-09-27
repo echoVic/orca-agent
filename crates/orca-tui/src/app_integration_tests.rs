@@ -7610,6 +7610,7 @@ fn repaired_indeterminate_history_tool_renders_state_inspection_warning() {
     let message = chat_message_from_history(Message::Tool {
         tool_call_id: request.id,
         content: "legacy missing result".to_string(),
+        images: Vec::new(),
         terminal: Some(result.terminal().clone()),
         pinned: false,
     })

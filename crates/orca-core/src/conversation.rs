@@ -131,6 +131,7 @@ pub enum Message {
     Tool {
         tool_call_id: String,
         content: String,
+        images: Vec<ImageInput>,
         terminal: Option<ToolTerminal>,
         pinned: bool,
     },
@@ -198,6 +199,15 @@ impl Message {
             | Self::User { content, .. }
             | Self::Tool { content, .. } => Some(content),
             Self::Assistant { content, .. } => content.as_deref(),
+        }
+    }
+
+    /// The images a user or tool message carries; every other message kind
+    /// has none.
+    pub fn images(&self) -> &[ImageInput] {
+        match self {
+            Self::User { images, .. } | Self::Tool { images, .. } => images,
+            Self::System { .. } | Self::Assistant { .. } => &[],
         }
     }
 }
@@ -567,6 +577,7 @@ impl Conversation {
         self.messages.push(Message::Tool {
             tool_call_id,
             content,
+            images: Vec::new(),
             terminal: None,
             pinned: false,
         });
@@ -576,6 +587,7 @@ impl Conversation {
         self.messages.push(Message::Tool {
             tool_call_id: result.id.clone(),
             content,
+            images: result.images.clone(),
             terminal: Some(result.terminal().clone()),
             pinned: false,
         });
@@ -751,6 +763,7 @@ pub fn repaired_missing_tool_result(tool_call: &RawToolCall) -> Message {
     Message::Tool {
         tool_call_id: tool_call.id.clone(),
         content: format!("ERROR: {MISSING_TOOL_TERMINAL_ERROR}"),
+        images: Vec::new(),
         terminal: Some(result.terminal().clone()),
         pinned: false,
     }
@@ -1015,6 +1028,36 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_result_keeps_its_images_on_the_tool_message() {
+        let request = ToolRequest {
+            id: "call_1".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let png = ImageInput {
+            source: ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
+            detail: ImageDetail::High,
+        };
+        let result = ToolResult::completed(&request, "took a screenshot".to_string(), false)
+            .with_images(vec![png.clone()]);
+        let mut conv = Conversation::new();
+
+        conv.add_tool_result_with_terminal(&result, "took a screenshot".to_string());
+
+        match conv.messages.last().unwrap() {
+            Message::Tool { images, .. } => {
+                assert_eq!(images, &[png]);
+            }
+            other => panic!("expected Tool message, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn last_user_message_returns_most_recent() {
         let mut conv = Conversation::new();
         conv.add_user("first".to_string());
@@ -1123,9 +1166,10 @@ mod tests {
                 Message::Tool {
                     tool_call_id,
                     content,
+                    images,
                     terminal,
                     pinned,
-                } => format!("tool|{pinned}|{tool_call_id}|{content}|{terminal:?}"),
+                } => format!("tool|{pinned}|{tool_call_id}|{content}|{images:?}|{terminal:?}"),
             })
             .collect()
     }
@@ -1433,6 +1477,7 @@ mod tests {
             Message::Tool {
                 tool_call_id: "call_1".to_string(),
                 content: "ok".to_string(),
+                images: Vec::new(),
                 terminal: None,
                 pinned: false,
             },
@@ -1473,18 +1518,21 @@ mod tests {
             Message::Tool {
                 tool_call_id: "orphan".to_string(),
                 content: "discard me".to_string(),
+                images: Vec::new(),
                 terminal: None,
                 pinned: false,
             },
             Message::Tool {
                 tool_call_id: "call_2".to_string(),
                 content: "existing second".to_string(),
+                images: Vec::new(),
                 terminal: None,
                 pinned: false,
             },
             Message::Tool {
                 tool_call_id: "call_2".to_string(),
                 content: "duplicate second".to_string(),
+                images: Vec::new(),
                 terminal: None,
                 pinned: false,
             },
@@ -1531,6 +1579,7 @@ mod tests {
             Message::Tool {
                 tool_call_id: "call_1".to_string(),
                 content: "first result".to_string(),
+                images: Vec::new(),
                 terminal: None,
                 pinned: false,
             },

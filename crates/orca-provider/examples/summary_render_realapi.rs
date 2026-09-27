@@ -30,6 +30,7 @@ fn tool(content: String) -> Message {
     Message::Tool {
         tool_call_id: "call_1".to_string(),
         content,
+        images: Vec::new(),
         terminal: None,
         pinned: false,
     }

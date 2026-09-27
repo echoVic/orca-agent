@@ -1089,6 +1089,7 @@ mod tests {
         let tool = Message::Tool {
             tool_call_id: "call_1".into(),
             content: "ok".into(),
+            images: Vec::new(),
             terminal: None,
             pinned: false,
         };

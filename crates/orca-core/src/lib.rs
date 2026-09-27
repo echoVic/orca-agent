@@ -27,6 +27,7 @@ pub mod subagent_types;
 pub mod task_types;
 pub mod thread_identity;
 pub mod thread_item_projection;
+pub mod tool_images;
 pub mod tool_types;
 pub mod verification;
 pub mod workflow_types;

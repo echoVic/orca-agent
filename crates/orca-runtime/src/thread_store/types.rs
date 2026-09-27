@@ -632,6 +632,7 @@ impl From<&Message> for StoredMessage {
                 content,
                 terminal,
                 pinned,
+                ..
             } => Self::Tool {
                 tool_call_id: tool_call_id.clone(),
                 content: content.clone(),
@@ -674,6 +675,7 @@ impl From<StoredMessage> for Message {
             } => Self::Tool {
                 tool_call_id,
                 content,
+                images: Vec::new(),
                 terminal: terminal.terminal(),
                 pinned,
             },

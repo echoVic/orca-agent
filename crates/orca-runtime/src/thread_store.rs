@@ -361,6 +361,7 @@ mod tests {
                 types::StoredMessage::from(&Message::Tool {
                     tool_call_id: request.id.clone(),
                     content: "deployed".to_string(),
+                    images: Vec::new(),
                     terminal: Some(result.terminal().clone()),
                     pinned: false,
                 }),
@@ -444,6 +445,7 @@ mod tests {
                     types::StoredMessage::from(&Message::Tool {
                         tool_call_id: request.id.clone(),
                         content: "done".to_string(),
+                        images: Vec::new(),
                         terminal: Some(result.terminal().clone()),
                         pinned: false,
                     }),
@@ -494,6 +496,7 @@ mod tests {
             Message::Tool {
                 tool_call_id: request.id.clone(),
                 content: format!("ERROR: {MISSING_TOOL_TERMINAL_ERROR}"),
+                images: Vec::new(),
                 terminal: Some(result.terminal().clone()),
                 pinned: false,
             },
@@ -574,6 +577,7 @@ mod tests {
                 Message::Tool {
                     tool_call_id: request.id.clone(),
                     content: format!("ERROR: {MISSING_TOOL_TERMINAL_ERROR}"),
+                    images: Vec::new(),
                     terminal: Some(result.terminal().clone()),
                     pinned: false,
                 },

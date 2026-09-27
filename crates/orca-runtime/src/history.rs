@@ -677,6 +677,7 @@ mod tests {
             writer.append_message(&Message::Tool {
                 tool_call_id: "call_1".to_string(),
                 content: format!("TOKEN={tool_secret}"),
+                images: Vec::new(),
                 terminal: Some(tool_result.terminal().clone()),
                 pinned: false,
             })?;

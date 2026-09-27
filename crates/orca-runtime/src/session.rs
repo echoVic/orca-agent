@@ -91,6 +91,7 @@ pub(crate) fn record_tool_result_for_agent(
     let message = Message::Tool {
         tool_call_id: result.id.clone(),
         content: result_content.clone(),
+        images: Vec::new(),
         terminal: Some(result.terminal().clone()),
         pinned: false,
     };

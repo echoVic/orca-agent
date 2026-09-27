@@ -4,6 +4,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::approval_types::ActionKind;
+use crate::conversation::ImageInput;
 
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
@@ -758,6 +759,8 @@ pub struct ToolResult {
     pub output: Option<String>,
     #[serde(flatten)]
     terminal: ToolTerminal,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageInput>,
     #[serde(skip)]
     pub file_change_preview: Option<Arc<FileChangePreview>>,
 }
@@ -817,6 +820,7 @@ impl ToolResult {
                 ToolTerminalSource::Observed,
                 ToolInvocationStarted::Yes,
             ),
+            images: Vec::new(),
             file_change_preview: None,
         }
     }
@@ -835,6 +839,7 @@ impl ToolResult {
                 ToolTerminalSource::Observed,
                 ToolInvocationStarted::Yes,
             ),
+            images: Vec::new(),
             file_change_preview: None,
         }
     }
@@ -868,6 +873,7 @@ impl ToolResult {
                 ToolTerminalSource::Observed,
                 ToolInvocationStarted::Yes,
             ),
+            images: Vec::new(),
             file_change_preview: None,
         }
     }
@@ -911,6 +917,7 @@ impl ToolResult {
                 ToolTerminalSource::Observed,
                 started,
             ),
+            images: Vec::new(),
             file_change_preview: None,
         }
     }
@@ -929,6 +936,7 @@ impl ToolResult {
                 ToolTerminalSource::Observed,
                 ToolInvocationStarted::No,
             ),
+            images: Vec::new(),
             file_change_preview: None,
         }
     }
@@ -947,6 +955,7 @@ impl ToolResult {
                 ToolTerminalSource::Observed,
                 ToolInvocationStarted::No,
             ),
+            images: Vec::new(),
             file_change_preview: None,
         }
     }
@@ -978,6 +987,7 @@ impl ToolResult {
                 ToolTerminalSource::Observed,
                 started,
             ),
+            images: Vec::new(),
             file_change_preview: None,
         }
     }
@@ -1020,12 +1030,18 @@ impl ToolResult {
                 ToolTerminalSource::Observed,
                 started,
             ),
+            images: Vec::new(),
             file_change_preview: None,
         }
     }
 
     pub fn with_file_change_preview(mut self, preview: FileChangePreview) -> Self {
         self.file_change_preview = Some(Arc::new(preview));
+        self
+    }
+
+    pub fn with_images(mut self, images: Vec<ImageInput>) -> Self {
+        self.images = images;
         self
     }
 
@@ -1188,6 +1204,34 @@ mod tests {
         assert!(value.get("file_change_preview").is_none());
         let restored: ToolResult = serde_json::from_value(value).expect("deserialize tool result");
         assert!(restored.file_change_preview.is_none());
+    }
+
+    #[test]
+    fn a_tool_result_without_images_serializes_as_before() {
+        let request = ToolRequest {
+            id: "call-1".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let result = ToolResult::completed(&request, "file contents".to_string(), false);
+
+        let value = serde_json::to_value(&result).expect("serialize tool result");
+        assert!(value.get("images").is_none());
+
+        let legacy = serde_json::json!({
+            "id": "call-legacy",
+            "name": "read_file",
+            "output": "file contents",
+            "status": "completed",
+            "error": null,
+            "exit_code": 0,
+            "truncated": false
+        });
+        let decoded: ToolResult =
+            serde_json::from_value(legacy).expect("deserialize a pre-images tool result");
+        assert!(decoded.images.is_empty());
     }
 
     #[test]

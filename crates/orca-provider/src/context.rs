@@ -1482,6 +1482,7 @@ pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
                 content,
                 terminal,
                 pinned,
+                ..
             } => {
                 let (rendered, compacted) = render_tool_output(content);
                 if compacted {
@@ -1490,6 +1491,7 @@ pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
                 Message::Tool {
                     tool_call_id: tool_call_id.clone(),
                     content: rendered,
+                    images: Vec::new(),
                     terminal: terminal.clone(),
                     pinned: *pinned,
                 }
@@ -3731,6 +3733,7 @@ mod tests {
         let messages = vec![Message::Tool {
             tool_call_id: "call_1".to_string(),
             content: big_output,
+            images: Vec::new(),
             terminal: None,
             pinned: false,
         }];
@@ -3757,6 +3760,7 @@ mod tests {
         let messages = vec![Message::Tool {
             tool_call_id: "call_1".to_string(),
             content: big_output,
+            images: Vec::new(),
             terminal: None,
             pinned: false,
         }];
@@ -3815,6 +3819,7 @@ mod tests {
         let messages = vec![Message::Tool {
             tool_call_id: "call_1".to_string(),
             content: small.clone(),
+            images: Vec::new(),
             terminal: None,
             pinned: false,
         }];
@@ -3834,6 +3839,7 @@ mod tests {
         let messages = vec![Message::Tool {
             tool_call_id: "call_1".to_string(),
             content: already.clone(),
+            images: Vec::new(),
             terminal: None,
             pinned: false,
         }];
@@ -3936,6 +3942,7 @@ mod tests {
         let messages = vec![Message::Tool {
             tool_call_id: "call_1".to_string(),
             content: big_output,
+            images: Vec::new(),
             terminal: None,
             pinned: false,
         }];
@@ -3956,12 +3963,14 @@ mod tests {
             Message::Tool {
                 tool_call_id: "call_1".to_string(),
                 content: big_output,
+                images: Vec::new(),
                 terminal: None,
                 pinned: false,
             },
             Message::Tool {
                 tool_call_id: "call_2".to_string(),
                 content: "tiny".to_string(),
+                images: Vec::new(),
                 terminal: None,
                 pinned: false,
             },
