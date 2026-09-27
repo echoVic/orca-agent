@@ -3996,8 +3996,8 @@ fn append_tool_output_lines(
     theme: &Theme,
 ) {
     // Flushing to the immutable scrollback (`force_expand`) commits the entire output so
-    // nothing is hidden behind a stub that `e` can no longer reveal. The live pane caps the
-    // `e`-expanded view at 40 rows and the collapsed view at 2.
+    // nothing is hidden behind a stub that Ctrl+O can no longer reveal. The live pane caps
+    // the expanded view at 40 rows and the collapsed view at 2.
     let output = crate::terminal_output::printable_output(output);
     let total = output.lines().count();
     let shown = if force_expand {
@@ -4029,7 +4029,9 @@ fn append_tool_output_lines(
         return;
     }
     let hidden = total.saturating_sub(shown);
-    let tail = if hidden > 0 {
+    let tail = if expanded && hidden > 0 {
+        format!("{shown} of {total} lines shown · ctrl+o to collapse")
+    } else if hidden > 0 {
         format!("+{} · ctrl+o to expand", line_count(hidden))
     } else if clipped {
         "ctrl+o to expand".to_string()
@@ -8915,6 +8917,29 @@ mod tests {
         assert_eq!(
             expanded.last().unwrap(),
             "    └ 4 lines · ctrl+o to collapse"
+        );
+    }
+
+    #[test]
+    fn expanded_output_past_the_cap_says_how_much_is_shown() {
+        // It used to say "+20 lines · expand" while Ctrl+O collapsed it.
+        let output = (1..=60)
+            .map(|n| format!("l{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = message_text(
+            None,
+            &tool_call(
+                "read_file",
+                Some("src/main.rs"),
+                "completed",
+                Some(&output),
+                true,
+            ),
+        );
+        assert_eq!(
+            text.last().unwrap(),
+            "    └ 40 of 60 lines shown · ctrl+o to collapse"
         );
     }
 
