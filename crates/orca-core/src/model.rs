@@ -190,6 +190,19 @@ pub fn builtin_model_definition(model: &str) -> ModelDefinition {
     ModelDefinition { supports_images }
 }
 
+/// Whether `model`, the routed model a request goes to, may receive images
+/// inside tool messages. Only `deepseek-flash` may (`auto` has already
+/// resolved to it by then).
+///
+/// Spike 1 verified in-tool images on DeepSeek's API for `deepseek-flash`
+/// only. A custom model declared `supports_images = true` can see the images a
+/// user attaches, but OpenAI-compatible Chat Completions endpoints reject
+/// image parts in `tool` messages, so once a tool returned an image every
+/// request would fail. Such models get a note in place of tool images.
+pub fn accepts_tool_images(model: &str) -> bool {
+    canonical_model_name(model) == FLASH_MODEL
+}
+
 /// Model used for auxiliary/background tasks (compaction, memory extraction).
 /// Always returns the cheapest model to minimize cost on utility work.
 pub fn auxiliary_model() -> &'static str {
@@ -473,5 +486,13 @@ mod tests {
             assert_eq!(decision.actual_model, FLASH_MODEL);
             assert_eq!(decision.reason, ModelRouteReason::DefaultFlash);
         }
+    }
+
+    #[test]
+    fn only_deepseek_flash_accepts_tool_images() {
+        assert!(accepts_tool_images(FLASH_MODEL));
+        assert!(accepts_tool_images(LEGACY_FLASH_MODEL));
+        assert!(!accepts_tool_images(PRO_MODEL));
+        assert!(!accepts_tool_images("provider/multimodal-model"));
     }
 }

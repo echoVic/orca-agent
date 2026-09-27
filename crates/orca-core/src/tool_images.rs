@@ -28,9 +28,10 @@ pub const MAX_TOOL_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 pub const RESUMED_TOOL_IMAGE_NOTE: &str = "[image omitted: not kept across session resume]";
 
 /// Appended to a tool message's content when its images were dropped because
-/// the active model cannot see images at all.
-pub const TOOL_IMAGE_UNAVAILABLE_NOTE: &str =
-    "[image omitted: the current model cannot see images]";
+/// the model the request goes to cannot take them: it cannot see images at
+/// all, or it is not known to accept images inside tool messages. It also asks
+/// the model not to hunt for the image some other way.
+pub const TOOL_IMAGE_UNAVAILABLE_NOTE: &str = "[image omitted: the current model cannot see images from tools; do not try to get the image another way; tell the user if you need it]";
 
 /// Appended to a tool message's content when an older image was dropped to
 /// stay within the per-request image budget.
@@ -102,12 +103,15 @@ pub fn tool_image(media_type: &str, base64_data: String) -> Result<ImageInput, T
     })
 }
 
-/// Clears every tool message's images, leaving one explanatory line behind.
+/// Clears every tool message's images and appends `note` once to each tool
+/// message that had any. User message images are untouched. Returns the
+/// number of images dropped.
 ///
-/// Used in two places: recovering a session (tool images are not persisted,
-/// so a resumed conversation can never show them again) and preparing a
-/// request for a model that cannot see images at all. User message images
-/// are untouched either way. Returns the number of images dropped.
+/// Callers use it wherever tool images must go no further. Tool images are
+/// stored as assets with each tool result, but a resumed session never reloads
+/// them (`RESUMED_TOOL_IMAGE_NOTE`), and a request to a model that cannot take
+/// images in tool messages carries a note instead, on both the main and the
+/// child-agent turn path (`TOOL_IMAGE_UNAVAILABLE_NOTE`).
 pub fn drop_tool_images(messages: &mut [Message], note: &str) -> usize {
     let mut dropped = 0usize;
     for message in messages.iter_mut() {

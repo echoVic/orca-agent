@@ -377,7 +377,7 @@ fn a_child_agent_on_a_model_that_cannot_see_images_gets_a_note() {
         let sent = child_agent_model_conversation(
             &setup.conversation,
             &HookOutcome::default(),
-            model_turn.decision.image_route,
+            &model_turn,
         );
 
         assert!(
@@ -403,14 +403,103 @@ fn a_child_agent_on_a_model_that_cannot_see_images_gets_a_note() {
     assert!(images.is_empty());
     assert!(content.ends_with(TOOL_IMAGE_UNAVAILABLE_NOTE));
 
-    let Message::Tool {
-        content, images, ..
-    } = sent_tool_message(FLASH_MODEL)
-    else {
-        panic!("expected a tool message");
+    for model in [FLASH_MODEL, AUTO_MODEL] {
+        let Message::Tool {
+            content, images, ..
+        } = sent_tool_message(model)
+        else {
+            panic!("expected a tool message");
+        };
+        assert_eq!(images.len(), 1, "{model} keeps its tool image");
+        assert!(!content.contains(TOOL_IMAGE_UNAVAILABLE_NOTE));
+    }
+}
+
+#[test]
+fn a_child_agent_on_a_custom_vision_model_gets_a_note_instead_of_tool_images() {
+    const CUSTOM_MODEL: &str = "provider/multimodal-model";
+    let mut runtime_config = config(Some(CUSTOM_MODEL));
+    runtime_config.model = ModelSelection::parse_with_models(
+        Some(CUSTOM_MODEL.to_string()),
+        std::collections::BTreeMap::from([(
+            CUSTOM_MODEL.to_string(),
+            orca_core::model::ModelDefinition {
+                supports_images: Some(true),
+            },
+        )]),
+    )
+    .expect("custom model selection");
+    let image = ImageInput {
+        source: ImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: "AA==".to_string(),
+        },
+        detail: ImageDetail::High,
     };
-    assert_eq!(images.len(), 1);
-    assert!(!content.contains(TOOL_IMAGE_UNAVAILABLE_NOTE));
+    let mut setup = child_loop_setup(&runtime_config);
+    setup.conversation.messages.push(Message::user_with_images(
+        "compare with this".to_string(),
+        vec![image.clone()],
+    ));
+    setup.conversation.messages.push(Message::Assistant {
+        content: None,
+        reasoning_content: None,
+        tool_calls: vec![RawToolCall {
+            id: "call-screenshot".to_string(),
+            function_name: "mcp__screen__capture".to_string(),
+            arguments: "{}".to_string(),
+        }],
+        pinned: false,
+    });
+    setup.conversation.messages.push(Message::Tool {
+        tool_call_id: "call-screenshot".to_string(),
+        content: "screenshot taken\n[1 image attached]".to_string(),
+        images: vec![image],
+        terminal: None,
+        pinned: false,
+    });
+    let request = ChildAgentRequest::new(
+        "inspect repo".to_string(),
+        SubagentType::General,
+        None,
+        2,
+        false,
+    );
+    let model_turn = route_child_agent_model(
+        &runtime_config,
+        &request,
+        &setup,
+        &mut CostTracker::new(None),
+    );
+    assert_eq!(
+        model_turn.decision.image_route,
+        orca_core::model::ImageRouteDecision::Direct
+    );
+
+    let sent =
+        child_agent_model_conversation(&setup.conversation, &HookOutcome::default(), &model_turn);
+
+    assert!(
+        sent.messages
+            .iter()
+            .any(|message| matches!(message, Message::User { images, .. } if images.len() == 1)),
+        "the user image still reaches the model"
+    );
+    let Some(Message::Tool {
+        content, images, ..
+    }) = sent.messages.last()
+    else {
+        panic!("the tool message must stay last");
+    };
+    assert!(images.is_empty());
+    assert!(content.ends_with(TOOL_IMAGE_UNAVAILABLE_NOTE));
+    assert!(
+        matches!(
+            setup.conversation.messages.last(),
+            Some(Message::Tool { images, .. }) if images.len() == 1
+        ),
+        "the child's own conversation keeps its image"
+    );
 }
 
 #[test]

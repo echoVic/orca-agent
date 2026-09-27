@@ -6,7 +6,7 @@ use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
-use orca_core::model::{ImageRouteDecision, ModelRouteContext};
+use orca_core::model::{ImageRouteDecision, ModelRouteContext, accepts_tool_images};
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_images::{TOOL_IMAGE_UNAVAILABLE_NOTE, drop_tool_images};
@@ -61,16 +61,24 @@ pub fn route_child_agent_model(
 /// The conversation a child sends to its model: its own conversation plus the
 /// pre-model hook context.
 ///
-/// Child turns skip `prepare_image_conversation`, so unless the route is
-/// `Direct`, this copy carries a note in place of each tool image. The child's
-/// own conversation keeps its images.
+/// Child turns skip `prepare_image_conversation`, so this applies its rule for
+/// tool images: unless the route is `Direct` and the routed model accepts
+/// images in tool messages, every tool message that carried images loses them
+/// and gets one `TOOL_IMAGE_UNAVAILABLE_NOTE` instead. The child's own
+/// conversation keeps its images.
 pub(crate) fn child_agent_model_conversation(
     conversation: &Conversation,
     pre_model_outcome: &HookOutcome,
-    image_route: ImageRouteDecision,
+    model_turn: &RuntimeModelTurn,
 ) -> Conversation {
     let mut model_conversation = conversation_with_hook_context(conversation, pre_model_outcome);
-    if image_route != ImageRouteDecision::Direct {
+    let model_takes_tool_images = model_turn.decision.image_route == ImageRouteDecision::Direct
+        && model_turn
+            .provider_config
+            .model
+            .as_deref()
+            .is_some_and(accepts_tool_images);
+    if !model_takes_tool_images {
         drop_tool_images(
             &mut model_conversation.messages,
             TOOL_IMAGE_UNAVAILABLE_NOTE,
@@ -112,11 +120,8 @@ pub fn run_child_agent_provider_turn(
             };
         }
     };
-    let model_conversation = child_agent_model_conversation(
-        &setup.conversation,
-        &pre_model_outcome,
-        model_turn.decision.image_route,
-    );
+    let model_conversation =
+        child_agent_model_conversation(&setup.conversation, &pre_model_outcome, model_turn);
 
     let response = orca_provider::call_streaming(
         config.provider,
@@ -186,11 +191,8 @@ pub fn run_child_agent_provider_turn_observed(
             };
         }
     };
-    let model_conversation = child_agent_model_conversation(
-        &setup.conversation,
-        &pre_model_outcome,
-        model_turn.decision.image_route,
-    );
+    let model_conversation =
+        child_agent_model_conversation(&setup.conversation, &pre_model_outcome, model_turn);
 
     let mut activity_error = None;
     let response = orca_provider::call_streaming(

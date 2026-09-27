@@ -3,7 +3,7 @@ use orca_core::config::ProviderKind;
 use orca_core::conversation::{
     Conversation, IMAGE_ANALYSIS_MESSAGE_PREFIX, ImageInput, ImageSource, Message,
 };
-use orca_core::model::{ImageRouteDecision, VISION_MODEL};
+use orca_core::model::{ImageRouteDecision, VISION_MODEL, accepts_tool_images};
 use orca_core::provider_types::{ProviderResponse, Usage};
 use orca_core::tool_images::{TOOL_IMAGE_UNAVAILABLE_NOTE, drop_tool_images};
 use orca_provider::ProviderConfig;
@@ -63,6 +63,15 @@ pub(crate) fn prepare_image_conversation(
                     Message::System { content, .. } if analysis_key_from_message(content).is_some()
                 )
             });
+            // A model that sees user images may still reject images inside
+            // tool messages, so only models known to accept them keep theirs.
+            if !provider_config
+                .model
+                .as_deref()
+                .is_some_and(accepts_tool_images)
+            {
+                drop_tool_images(&mut direct.messages, TOOL_IMAGE_UNAVAILABLE_NOTE);
+            }
             return Ok(PreparedImageConversation {
                 conversation: direct,
                 persisted_analyses: Vec::new(),
@@ -317,6 +326,8 @@ mod tests {
     use super::*;
     use orca_core::config::ReasoningEffort;
     use orca_core::conversation::{ImageDetail, ImageSource};
+    use orca_core::model::{FLASH_MODEL, ModelDefinition, ModelRouteContext, ModelSelection};
+    use orca_core::subagent_types::SubagentType;
 
     fn config() -> ProviderConfig {
         ProviderConfig {
@@ -443,6 +454,111 @@ mod tests {
             conversation.messages.last(),
             Some(Message::Tool { images, .. }) if images.len() == 1
         ));
+    }
+
+    /// Routes a conversation holding a user image and a tool image the way a
+    /// turn does (`route_model_turn` puts the routed model into the provider
+    /// config), then returns the route and the conversation prepared for it.
+    fn route_and_prepare(selection: &ModelSelection) -> (ImageRouteDecision, Conversation) {
+        let mut conversation = Conversation::new();
+        conversation.add_user_with_images("compare with this".to_string(), vec![image()]);
+        conversation.messages.push(Message::Assistant {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![orca_core::conversation::RawToolCall {
+                id: "call-screenshot".to_string(),
+                function_name: "mcp__screen__capture".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            pinned: false,
+        });
+        conversation.messages.push(Message::Tool {
+            tool_call_id: "call-screenshot".to_string(),
+            content: "screenshot taken\n[1 image attached]".to_string(),
+            images: vec![image()],
+            terminal: None,
+            pinned: false,
+        });
+        let decision = selection.route(ModelRouteContext {
+            subagent_type: &SubagentType::General,
+            subagent_model: None,
+            has_images: conversation_has_images(&conversation),
+        });
+        let mut provider_config = config();
+        provider_config.model = Some(decision.actual_model.clone());
+
+        let prepared = prepare_image_conversation(
+            &conversation,
+            decision.image_route,
+            ProviderKind::Mock,
+            &provider_config,
+            &CancelToken::new(),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                conversation.messages.last(),
+                Some(Message::Tool { images, .. }) if images.len() == 1
+            ),
+            "the live conversation keeps its tool image"
+        );
+        (decision.image_route, prepared.conversation)
+    }
+
+    #[test]
+    fn a_custom_vision_model_gets_a_note_instead_of_tool_images() {
+        const CUSTOM_MODEL: &str = "provider/multimodal-model";
+        let selection = ModelSelection::parse_with_models(
+            Some(CUSTOM_MODEL.to_string()),
+            std::collections::BTreeMap::from([(
+                CUSTOM_MODEL.to_string(),
+                ModelDefinition {
+                    supports_images: Some(true),
+                },
+            )]),
+        )
+        .unwrap();
+
+        let (route, sent) = route_and_prepare(&selection);
+
+        assert_eq!(route, ImageRouteDecision::Direct);
+        assert!(matches!(
+            &sent.messages[0],
+            Message::User { images, .. } if images.len() == 1
+        ));
+        let Some(Message::Tool {
+            content, images, ..
+        }) = sent.messages.last()
+        else {
+            panic!("the tool message must stay last");
+        };
+        assert!(images.is_empty());
+        assert!(content.ends_with(TOOL_IMAGE_UNAVAILABLE_NOTE));
+    }
+
+    #[test]
+    fn deepseek_flash_and_auto_keep_tool_images() {
+        for selection in [
+            ModelSelection::parse(Some(FLASH_MODEL.to_string())).unwrap(),
+            ModelSelection::parse(None).unwrap(),
+        ] {
+            let (route, sent) = route_and_prepare(&selection);
+
+            assert_eq!(route, ImageRouteDecision::Direct);
+            assert!(matches!(
+                &sent.messages[0],
+                Message::User { images, .. } if images.len() == 1
+            ));
+            let Some(Message::Tool {
+                content, images, ..
+            }) = sent.messages.last()
+            else {
+                panic!("the tool message must stay last");
+            };
+            assert_eq!(images.len(), 1);
+            assert!(!content.contains(TOOL_IMAGE_UNAVAILABLE_NOTE));
+        }
     }
 
     #[test]
