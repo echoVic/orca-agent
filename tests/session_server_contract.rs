@@ -5194,15 +5194,14 @@ fn server_mode_command_exec_sandbox_policy_overrides_thread_active_permission_pr
 }
 
 #[test]
-fn server_mode_command_exec_external_sandbox_bypasses_workspace_sandbox() {
-    if !sandbox_seatbelt_available() {
-        return;
-    }
-
+fn server_mode_command_exec_refuses_an_external_sandbox_on_the_host() {
+    // An external sandbox is one the caller says it provides. Orca cannot
+    // enforce it, and SECURITY.md rules out falling back to a host shell, so
+    // the command is refused rather than run unsandboxed.
     let workspace = tempdir().expect("workspace");
     let outside = tempdir().expect("outside");
     let outside_file = outside.path().join("allowed.txt");
-    let command = format!("printf allowed > {}", outside_file.display());
+    let command = platform_write_file_command(&outside_file, "allowed");
 
     let mut child = orca_command()
         .args([
@@ -5229,18 +5228,18 @@ fn server_mode_command_exec_external_sandbox_bypasses_workspace_sandbox() {
         writeln!(stdin, "{request}").expect("write externalSandbox command/exec");
         stdin.flush().expect("flush externalSandbox command/exec");
     }
-    child.close_stdin();
 
-    let completed = child.expect_event("cmd", "command_exec_completed");
-    assert_eq!(completed["exitCode"], 0);
-    assert_eq!(
-        std::fs::read_to_string(&outside_file).expect("outside output"),
-        "allowed"
+    let error = child.expect_event("cmd", "error");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("refusing host execution")),
+        "{error}"
     );
-
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stderr.is_empty());
+    assert!(!outside_file.exists(), "the command must not run");
 }
 
 #[test]
