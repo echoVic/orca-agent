@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.2":
+        "A * in a bash permission rule now matches /, so a deny rule such as rm -rf * also catches rm -rf /tmp/build; rules for file paths are unchanged. A plan inside a reply keeps its place when a session is resumed or a background turn returns to the foreground. Stopping a background agent while its worker starts now stops it and shows \"stopped by user\"; a late turn/steer gets an idle reply instead of running later as a turn; and the post-publish release checks wait up to 15 minutes for npm.",
       "v0.5.1":
         "Shell commands run under Seatbelt again on macOS 26, and the macOS workspace sandbox reads outside the workspace as on Linux while writes stay confined. External tools run until they finish instead of stopping after one second. Edits show their diff in the approval and the tool row; Ctrl+O expands output so a message can start with \"e\"; the welcome screen, help, and Full Access dialog fit small windows; and fixes cover background agents, orca attach, the ACP daemon, and the session picker.",
       "v0.5.0":
@@ -678,6 +680,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.2":
+        "bash 权限规则中的 * 现在也匹配 /，所以 rm -rf * 这样的拒绝规则也能拦住 rm -rf /tmp/build；文件路径类规则不变。恢复会话或把后台轮次切回前台时，回复中间的计划会留在原来的位置。后台 agent 的 worker 还在启动时按停止，现在能正常停下并显示“stopped by user”；来得太晚的 turn/steer 会得到 idle 回复，而不是之后作为新的一轮执行；发布后的校验最多等待 15 分钟，以应对 npm 的传播延迟。",
       "v0.5.1":
         "macOS 26 上的 Shell 命令重新在 Seatbelt 沙箱中运行；macOS 工作区沙箱与 Linux 一致，可以读取工作区以外的文件，写入仍限制在工作区内。外部工具会一直运行到结束，不再在一秒后被停止。编辑在审批面板和工具行中显示 diff；Ctrl+O 展开输出，消息可以以“e”开头；欢迎页、帮助面板和 Full Access 确认框适配小窗口；并修复了后台 agent、orca attach、ACP 守护进程和会话选择器的问题。",
       "v0.5.0":

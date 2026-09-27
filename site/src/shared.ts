@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.1";
+export const releaseVersion = "v0.5.2";
 
 export const releases = [
+  {
+    version: "v0.5.2",
+    date: "2026-09-27",
+    title: "Permission rule, plan placement, and background agent fixes",
+    body: "A * in a bash permission rule now matches /, so deny rules catch commands with paths. A plan inside a reply keeps its place when a session is resumed or a background turn returns to the foreground. Stopping a background agent while its worker starts now works and says so, a late turn/steer is refused instead of running later as a turn, and the post-publish release checks wait out npm propagation.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.2",
+  },
   {
     version: "v0.5.1",
     date: "2026-09-27",
