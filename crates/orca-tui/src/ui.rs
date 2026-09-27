@@ -1643,14 +1643,21 @@ pub(crate) fn render_live_messages(
             .clear_matches(state.transcript.render_cache.content_generation());
         // The welcome screen renders through its own cache so its text is
         // selectable and copyable exactly like transcript content.
-        let lines = build_welcome_lines(state, theme, width);
+        let lines = build_welcome_lines(state, theme, width, visible_height);
         let welcome_message = [ChatMessage::System {
             text: String::new(),
             expanded: false,
         }];
-        // Sentinel revision: never collides with allocated ones, and the
-        // explicit invalidate below forces a rebuild whenever we redraw.
-        let welcome_revisions = [u64::MAX];
+        // Invalidating only makes the cache look at the entry again; it
+        // rebuilds it when the revision or the width differs. So the revision
+        // is the content itself: the mode, the model, and the layout (which
+        // follows the height) change at any width.
+        let welcome_revisions = [{
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            lines.hash(&mut hasher);
+            hasher.finish()
+        }];
         state.transcript.welcome_render_cache.invalidate(0);
         state.transcript.welcome_render_cache.prepare(
             &welcome_message,
@@ -3142,19 +3149,23 @@ const WELCOME_WHALE_ART: [&str; 14] = [
 ];
 
 /// Art column width the whale silhouette is padded to in the two-column
-/// layout, and the threshold below which the art is dropped entirely.
+/// layout.
 const WELCOME_ART_WIDTH: usize = 36;
 /// Gap between the padded art column and the right (wordmark/status) column.
 const WELCOME_COLUMN_GAP: usize = 4;
-/// Minimum transcript width that fits the whale and the right column side by side.
-const WELCOME_TWO_COLUMN_MIN_WIDTH: usize = 80;
 /// Below this width the whale art is dropped; only the right column renders.
 const WELCOME_TEXT_ONLY_MAX_WIDTH: usize = 44;
 
-/// The wordmark/status/tips column shown beside (or, below `WELCOME_TWO_COLUMN_MIN_WIDTH`,
-/// beneath) the whale art. Indexed 1:1 with `WELCOME_WHALE_ART` so each row can be zipped
-/// with its matching art row in the two-column layout.
-fn welcome_right_column(state: &AppState, theme: &Theme) -> Vec<Vec<Span<'static>>> {
+/// The wordmark/status/tips column shown beside (or beneath) the whale art. Row `n`
+/// sits beside art row `n` in the two-column layout. `text_width` bounds the cwd, the
+/// one row that shrinks to fit; `wordmark` picks the ASCII-art wordmark over a one-line
+/// title for windows too short for it.
+fn welcome_right_column(
+    state: &AppState,
+    theme: &Theme,
+    text_width: usize,
+    wordmark: bool,
+) -> Vec<Vec<Span<'static>>> {
     let whale = theme.accent_style();
     let muted = theme.muted_style();
     let text = Style::default().fg(theme.text);
@@ -3168,6 +3179,7 @@ fn welcome_right_column(state: &AppState, theme: &Theme) -> Vec<Vec<Span<'static
         .map(GitIdentity::label)
         .map(|git| format!(" · {git}"))
         .unwrap_or_default();
+    let cwd_width = 48.min(text_width.saturating_sub(8 + UnicodeWidthStr::width(branch.as_str())));
     let first_tip = if state
         .first_run
         .as_ref()
@@ -3185,16 +3197,20 @@ fn welcome_right_column(state: &AppState, theme: &Theme) -> Vec<Vec<Span<'static
             Span::styled(" to continue a saved conversation", text),
         ]
     };
-    vec![
-        vec![],
-        vec![Span::styled("   ___                ", whale)],
-        vec![Span::styled("  / _ \\ _ __ ___ __ _ ", whale)],
-        vec![Span::styled(" | | | | '__/ __/ _` |", whale)],
-        vec![Span::styled(" | |_| | | | (_| (_| |", whale)],
-        vec![
-            Span::styled("  \\___/|_|  \\___\\__,_|", whale),
-            Span::styled(format!("  v{}", state.app_version), muted),
-        ],
+    let version = Span::styled(format!("  v{}", state.app_version), muted);
+    let mut rows = vec![vec![]];
+    if wordmark {
+        rows.extend([
+            vec![Span::styled("   ___                ", whale)],
+            vec![Span::styled("  / _ \\ _ __ ___ __ _ ", whale)],
+            vec![Span::styled(" | | | | '__/ __/ _` |", whale)],
+            vec![Span::styled(" | |_| | | | (_| (_| |", whale)],
+            vec![Span::styled("  \\___/|_|  \\___\\__,_|", whale), version],
+        ]);
+    } else {
+        rows.push(vec![Span::styled("Orca", whale), version]);
+    }
+    rows.extend([
         vec![],
         vec![
             Span::styled("model   ", muted),
@@ -3204,7 +3220,7 @@ fn welcome_right_column(state: &AppState, theme: &Theme) -> Vec<Vec<Span<'static
         ],
         vec![
             Span::styled("cwd     ", muted),
-            Span::styled(compact_cwd(&state.cwd, 48), text),
+            Span::styled(compact_cwd(&state.cwd, cwd_width), text),
             Span::styled(branch, muted),
         ],
         vec![],
@@ -3220,17 +3236,21 @@ fn welcome_right_column(state: &AppState, theme: &Theme) -> Vec<Vec<Span<'static
             Span::styled("$ ", muted),
             Span::styled("skills", text),
         ],
-        vec![],
-        vec![],
-    ]
+    ]);
+    rows
 }
 
 /// Builds the welcome screen: the braille whale mark beside the wordmark, current
-/// model/directory status and two contextual tips. `width` picks the layout: two
-/// columns when there's room for both side by side, the art stacked above the text
-/// when there's room for the art alone, and text-only once the transcript is too
-/// narrow for the art to read as a whale.
-fn build_welcome_lines<'a>(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'a>> {
+/// model/directory status and two contextual tips. The layout is the first that fits
+/// the transcript's `width` x `height`: the text beside the whale, the whale above it,
+/// the text alone, and the text under a one-line title. Nothing wraps beside the whale,
+/// and nothing is cut off the top of a short window.
+fn build_welcome_lines<'a>(
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'a>> {
     let art_style = |index: usize| {
         if index < 2 {
             Style::default().fg(theme.plan_mode)
@@ -3238,11 +3258,18 @@ fn build_welcome_lines<'a>(state: &AppState, theme: &Theme, width: usize) -> Vec
             theme.accent_style()
         }
     };
-    let right = welcome_right_column(state, theme);
+    let row_width = |row: &[Span]| {
+        row.iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum::<usize>()
+    };
+    // A blank row above and below every layout.
+    let art_height = WELCOME_WHALE_ART.len() + 2;
+    let column = 2 + WELCOME_ART_WIDTH + WELCOME_COLUMN_GAP;
 
     let mut lines = vec![Line::from("")];
-    if width >= WELCOME_TWO_COLUMN_MIN_WIDTH {
-        let column = 2 + WELCOME_ART_WIDTH + WELCOME_COLUMN_GAP;
+    let beside = welcome_right_column(state, theme, width.saturating_sub(column), true);
+    if height >= art_height && beside.iter().all(|row| column + row_width(row) <= width) {
         for (index, art_row) in WELCOME_WHALE_ART.iter().enumerate() {
             let padded = format!("  {art_row:<WELCOME_ART_WIDTH$}");
             let mut spans = vec![Span::styled(padded, art_style(index))];
@@ -3250,19 +3277,26 @@ fn build_welcome_lines<'a>(state: &AppState, theme: &Theme, width: usize) -> Vec
             spans.push(Span::raw(" ".repeat(
                 column.saturating_sub(art_width.max(2 + WELCOME_ART_WIDTH)),
             )));
-            spans.extend(right[index].clone());
+            spans.extend(beside.get(index).cloned().unwrap_or_default());
             lines.push(Line::from(spans));
         }
     } else {
-        if width > WELCOME_TEXT_ONLY_MAX_WIDTH {
+        let text_width = width.saturating_sub(2);
+        let mut rows = welcome_right_column(state, theme, text_width, true);
+        let stacked = width > WELCOME_TEXT_ONLY_MAX_WIDTH && height >= art_height + rows.len();
+        if stacked {
             for (index, art_row) in WELCOME_WHALE_ART.iter().enumerate() {
                 lines.push(Line::from(Span::styled(
                     format!("  {art_row}"),
                     art_style(index),
                 )));
             }
+        } else if height < rows.len() + 1 {
+            rows = welcome_right_column(state, theme, text_width, false);
         }
-        for row in right.into_iter() {
+        // The column's first row is blank to line the wordmark up with the
+        // art; without the art beside it, it only separates the art above.
+        for row in rows.into_iter().skip(usize::from(!stacked)) {
             let mut spans = vec![Span::raw("  ")];
             spans.extend(row);
             lines.push(Line::from(spans));
@@ -9820,7 +9854,7 @@ mod tests {
         );
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
-        let rendered = build_welcome_lines(&state, &theme, 100)
+        let rendered = build_welcome_lines(&state, &theme, 100, 40)
             .into_iter()
             .map(|line| {
                 line.spans
@@ -9845,7 +9879,7 @@ mod tests {
         );
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
-        let rendered = build_welcome_lines(&state, &theme, 100)
+        let rendered = build_welcome_lines(&state, &theme, 100, 40)
             .into_iter()
             .map(|line| {
                 line.spans
@@ -9874,11 +9908,66 @@ mod tests {
     }
 
     fn welcome_text(state: &AppState, width: usize) -> Vec<String> {
+        welcome_text_in(state, width, 40)
+    }
+
+    fn welcome_text_in(state: &AppState, width: usize, height: usize) -> Vec<String> {
         lines_text(&build_welcome_lines(
             state,
             &Theme::named(ThemeName::Dark),
             width,
+            height,
         ))
+    }
+
+    fn untrusted_welcome_state() -> AppState {
+        let mut state = test_state();
+        state.cwd = "~/Documents/GitHub/blade-deepseek".into();
+        state.workspace_git = Some(GitIdentity::Branch("main".into()));
+        state.first_run = Some(orca_runtime::onboarding::FirstRunState {
+            workspace_trusted: false,
+            ..first_run_fixture()
+        });
+        state
+    }
+
+    #[test]
+    fn text_beside_the_whale_never_wraps() {
+        // From 80 to about 90 columns the status rows and tips beside the
+        // whale were wider than the space left for them and wrapped under it.
+        let state = untrusted_welcome_state();
+        for width in 30..=120 {
+            for row in welcome_text_in(&state, width, 60) {
+                let row_width = UnicodeWidthStr::width(row.trim_end());
+                if row.contains('⣿') || row.contains("cwd     ") {
+                    assert!(row_width <= width, "{width} columns: {row:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_window_drops_the_whale_instead_of_clipping_the_welcome() {
+        let state = untrusted_welcome_state();
+        for (width, height) in [(100, 14), (70, 20), (81, 26), (52, 9)] {
+            let text = welcome_text_in(&state, width, height);
+            assert!(text.len() <= height, "{width}x{height}: {text:?}");
+            assert!(
+                !text.iter().any(|row| row.contains('⣿')),
+                "{width}x{height}: {text:?}"
+            );
+            for expected in ["model   ", "cwd     ", "› /trust", "› ? keys", "v0.0.0"] {
+                assert!(
+                    text.iter().any(|row| row.contains(expected)),
+                    "{width}x{height} lacks {expected:?}: {text:?}"
+                );
+            }
+        }
+        let text_only = welcome_text_in(&state, 70, 20);
+        assert!(
+            text_only.iter().any(|row| row.contains("___")),
+            "{text_only:?}"
+        );
     }
 
     #[test]
@@ -9925,6 +10014,22 @@ mod tests {
         let tiny = welcome_text(&state, 40);
         assert!(!tiny.iter().any(|row| row.contains('⣿')), "{tiny:?}");
         assert!(tiny.iter().any(|row| row.contains("___")), "{tiny:?}");
+    }
+
+    #[test]
+    fn the_welcome_redraws_when_its_content_or_height_changes() {
+        // It was cached by width alone: Shift+Tab left the old mode on it,
+        // and a shorter window kept a layout that no longer fit.
+        let mut state = untrusted_welcome_state();
+        state.approval_mode = ApprovalMode::Suggest;
+        assert!(frame_string(&mut state, 90, 30).contains("max · suggest"));
+        state.approval_mode = ApprovalMode::FullAuto;
+        let screen = frame_string(&mut state, 90, 30);
+        assert!(screen.contains("max · full-auto"), "{screen}");
+
+        let short = frame_string(&mut state, 90, 16);
+        assert!(!short.contains("___"), "{short}");
+        assert!(short.contains("Orca  v"), "{short}");
     }
 
     #[test]
