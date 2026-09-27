@@ -544,8 +544,12 @@ impl ServerTestClient {
         self.drain_events_until_protocol_event(id, event_name, true)
     }
 
+    /// Closes stdin and gives the child the normal exit time to finish, as
+    /// `wait_with_output` does. Only drop settles for the short grace: a
+    /// slow Windows runner can take longer than that to end even `cat`,
+    /// and the forced kill then reads as a failed exit.
     pub fn shutdown(&mut self) -> io::Result<ExitStatus> {
-        self.shutdown_with_grace(DROP_GRACE_TIMEOUT)
+        self.shutdown_with_grace(DEFAULT_EXIT_TIMEOUT)
     }
 
     pub fn wait_with_output(self) -> io::Result<Output> {
