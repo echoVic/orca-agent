@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.0";
+export const releaseVersion = "v0.5.1";
 
 export const releases = [
+  {
+    version: "v0.5.1",
+    date: "2026-09-27",
+    title: "Fixes for the new terminal UI and the macOS sandbox",
+    body: "Shell commands run under the macOS sandbox again on macOS 26, and the workspace sandbox lets commands read outside the workspace as on Linux. External tools are no longer stopped after one second. Edits show their diff in the approval and the tool row, Ctrl+O expands output, the welcome screen, help, and Full Access dialog fit small windows, and fixes cover background agents, orca attach, and the session picker.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.1",
+  },
   {
     version: "v0.5.0",
     date: "2026-09-26",

@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.1":
+        "Shell commands run under Seatbelt again on macOS 26, and the macOS workspace sandbox reads outside the workspace as on Linux while writes stay confined. External tools run until they finish instead of stopping after one second. Edits show their diff in the approval and the tool row; Ctrl+O expands output so a message can start with \"e\"; the welcome screen, help, and Full Access dialog fit small windows; and fixes cover background agents, orca attach, the ACP daemon, and the session picker.",
       "v0.5.0":
         "Redesigns the interactive terminal UI with approvals in place of the input, a tasks dock for background work, session recap, collapsible tool output, and Ctrl+Enter to steer a follow-up into the running turn. An unset or auto model now routes to deepseek-flash; background agents continue the conversation when they finish; and fixes cover background approvals, reused tool call ids, proposed plans in streamed replies, detached workers, and an owner-only API key file.",
       "v0.4.32":
@@ -676,6 +678,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.1":
+        "macOS 26 上的 Shell 命令重新在 Seatbelt 沙箱中运行；macOS 工作区沙箱与 Linux 一致，可以读取工作区以外的文件，写入仍限制在工作区内。外部工具会一直运行到结束，不再在一秒后被停止。编辑在审批面板和工具行中显示 diff；Ctrl+O 展开输出，消息可以以“e”开头；欢迎页、帮助面板和 Full Access 确认框适配小窗口；并修复了后台 agent、orca attach、ACP 守护进程和会话选择器的问题。",
       "v0.5.0":
         "重新设计交互式终端界面：审批直接出现在输入框的位置，后台工作集中在任务 dock，新增会话回顾（/recap）和可折叠的工具输出，Ctrl+Enter 可以把追加消息送进正在运行的轮次。未指定或 auto 的模型改为默认使用 deepseek-flash；后台 agent 完成后会自动继续对话；并修复了后台审批、重复的工具调用 id、流式回复中的计划、分离运行的 worker，以及 API key 文件的权限（现在只有所有者可读）。",
       "v0.4.32":
