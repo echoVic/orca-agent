@@ -31,6 +31,7 @@ use orca_core::conversation::{
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::subagent_config::FrozenAgentConfig;
 use orca_core::subagent_types::SubagentType;
+use orca_core::tool_images::RESUMED_TOOL_IMAGE_NOTE;
 use orca_core::tool_types::{ToolResultKind, ToolStatus, ToolTerminal, ToolTerminalSource};
 use orca_mcp::McpRegistry;
 use orca_platform::fs::{AtomicWritePolicy, ExclusiveFileLock, atomic_write};
@@ -606,15 +607,25 @@ impl StoredChildMessage {
             Message::Tool {
                 tool_call_id,
                 content,
+                images,
                 terminal,
                 pinned,
-                ..
-            } => Self::Tool {
-                tool_call_id: tool_call_id.clone(),
-                content: content.clone(),
-                terminal: terminal.clone(),
-                pinned: *pinned,
-            },
+            } => {
+                // A checkpoint keeps no tool images. Say so in the text, as a
+                // resumed session does, so the restored "[N image(s)
+                // attached]" marker is not read as an image still present.
+                let mut content = content.clone();
+                if !images.is_empty() {
+                    content.push('\n');
+                    content.push_str(RESUMED_TOOL_IMAGE_NOTE);
+                }
+                Self::Tool {
+                    tool_call_id: tool_call_id.clone(),
+                    content,
+                    terminal: terminal.clone(),
+                    pinned: *pinned,
+                }
+            }
             Message::System { .. } => {
                 unreachable!("system messages are filtered before child snapshot conversion")
             }
@@ -4232,6 +4243,55 @@ mod tests {
         assert_eq!(
             coordinator.prepare_resume(exact_parent).unwrap_err(),
             AgentContinuationError::CompatibilityMismatch
+        );
+    }
+
+    #[test]
+    fn a_restored_child_tool_message_notes_the_image_it_lost() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("capture the screen".to_string());
+        conversation.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "call-screenshot".to_string(),
+                function_name: "mcp__screen__capture".to_string(),
+                arguments: "{}".to_string(),
+            }],
+        );
+        conversation.messages.push(Message::Tool {
+            tool_call_id: "call-screenshot".to_string(),
+            content: "screenshot taken\n[1 image attached]".to_string(),
+            images: vec![ImageInput {
+                source: orca_core::conversation::ImageSource::Base64 {
+                    media_type: "image/png".to_string(),
+                    data: "AA==".to_string(),
+                },
+                detail: orca_core::conversation::ImageDetail::High,
+            }],
+            terminal: None,
+            pinned: false,
+        });
+
+        let snapshot = ChildConversationSnapshot::capture_unchecked(&conversation, 1);
+        let stored: ChildConversationSnapshot =
+            serde_json::from_value(serde_json::to_value(&snapshot).expect("store snapshot"))
+                .expect("load snapshot");
+        let mut restored = Conversation::new();
+        stored
+            .restore_into(&mut restored)
+            .expect("restore snapshot");
+
+        let Some(Message::Tool {
+            content, images, ..
+        }) = restored.messages.last()
+        else {
+            panic!("the tool message must stay last");
+        };
+        assert!(images.is_empty());
+        assert_eq!(
+            content,
+            &format!("screenshot taken\n[1 image attached]\n{RESUMED_TOOL_IMAGE_NOTE}")
         );
     }
 

@@ -23,7 +23,8 @@ pub const TOOL_IMAGE_MEDIA_TYPES: [&str; 4] =
 pub const MAX_TOOL_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 /// Appended to a tool message's content when its images were dropped because
-/// a resumed session cannot recover them.
+/// they are not reloaded: in a resumed session, or in the restored
+/// conversation of a continued child agent.
 pub const RESUMED_TOOL_IMAGE_NOTE: &str = "[image omitted: not kept across session resume]";
 
 /// Appended to a tool message's content when its images were dropped because
