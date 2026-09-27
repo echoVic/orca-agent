@@ -655,24 +655,29 @@ impl AppState {
                 self.interaction.pending_mcp_elicitation_mode = Some(mode.clone());
                 self.interaction.pending_submission = None;
                 self.finish_assistant_stream();
-                let mut lines = vec![format!("MCP {server_name} requests input: {message}")];
-                match mode {
+                let (lines, expanded) = match mode {
                     TuiMcpElicitationMode::Form => {
-                        lines.push("Mode: form".to_string());
+                        let mut lines =
+                            vec![format!("MCP {server_name} requests input: {message}")];
                         if let Some(schema) = requested_schema_json {
                             lines.push(format!("Schema: {schema}"));
                         }
+                        (lines, false)
                     }
+                    // The link is what the user acts on: the notice shows in
+                    // full, where collapsed it hid the link.
                     TuiMcpElicitationMode::Url => {
-                        lines.push("Mode: url".to_string());
-                        if let Some(url) = url {
-                            lines.push(format!("URL: {url}"));
-                        }
+                        let mut lines = vec![format!(
+                            "MCP {server_name} asks you to open a link: {message}"
+                        )];
+                        lines.extend(url);
+                        lines.push("Press Enter when you are done.".to_string());
+                        (lines, true)
                     }
-                }
+                };
                 self.push_message(ChatMessage::System {
                     text: lines.join("\n"),
-                    expanded: false,
+                    expanded,
                 });
             }
             TuiEvent::SubmissionRejected {

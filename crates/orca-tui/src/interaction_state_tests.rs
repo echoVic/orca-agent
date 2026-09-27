@@ -190,12 +190,15 @@ fn mcp_elicitation_requested_event_tracks_pending_runtime_interaction_id() {
         state.interaction.pending_mcp_elicitation_mode,
         Some(TuiMcpElicitationMode::Url)
     );
+    // The link is what the user acts on, so the notice is shown in full:
+    // collapsed, it hid the URL on its third line.
     assert!(matches!(
         state.transcript.messages.last(),
-        Some(ChatMessage::System { text: message, .. })
-            if message.contains("MCP github requests input: Authorize GitHub")
-                && message.contains("Mode: url")
-                && message.contains("URL: https://github.com/login/device")
+        Some(ChatMessage::System { text: message, expanded: true })
+            if message.starts_with("MCP github asks you to open a link: Authorize GitHub\n")
+                && message.contains("\nhttps://github.com/login/device\n")
+                && message.ends_with("Press Enter when you are done.")
+                && !message.contains("Mode:")
     ));
 }
 
