@@ -2227,6 +2227,66 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_rule_asks_in_full_auto_when_the_provider_names_no_target() {
+        // Rules match a call's target, which a streaming provider never
+        // sends; the invocation derives it from the arguments, so a prompt
+        // rule still asks before the command runs in full-auto.
+        let cwd = tempfile::tempdir().expect("cwd");
+        let marker = cwd.path().join("pushed");
+        let mut config = config_with_permission_rules(PermissionRules {
+            rules: vec![PermissionRule::new("bash", "touch *", Decision::Prompt)],
+        });
+        config.approval_mode = ApprovalMode::FullAuto;
+        let request = ToolRequest {
+            id: "prompted-shell".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: None,
+            raw_arguments: Some(r#"{"command":"touch pushed"}"#.to_string()),
+        };
+        let policy = policy_for_tool_execution(&config);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = orca_core::cancel::CancelToken::new();
+        let task_registry = TaskRegistry::new("prompt-rule-full-auto".to_string());
+        let mut background_workflows = Vec::new();
+        let mut permission_overlay = TurnPermissionOverlay::default();
+        let mut events = EventFactory::new("prompt-rule-full-auto".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Text);
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string());
+
+        let completion = actor
+            .execute_with_event_error(
+                &config,
+                &mut events,
+                &mut sink,
+                &request,
+                ToolExecutionContext::new(cwd.path(), 0, true, &policy)
+                    .with_services(&instructions, &memory, &registry, &hooks)
+                    .with_runtime(
+                        &mut cost_tracker,
+                        &cancel,
+                        &task_registry,
+                        &mut background_workflows,
+                        None,
+                    )
+                    .with_permission_overlay(&mut permission_overlay),
+                unused_child_executor,
+                unused_child_executor,
+                false,
+                None,
+                false,
+            )
+            .expect("an asked approval completes the call");
+
+        assert_eq!(completion.status, RunStatus::ApprovalRequired);
+        assert!(!marker.exists(), "the command must not run before approval");
+    }
+
+    #[test]
     fn denied_approval_preserves_terminal_after_resolved_event_io_error() {
         let cwd = tempfile::tempdir().expect("cwd");
         let mut config = config_with_permission_rules(PermissionRules {
