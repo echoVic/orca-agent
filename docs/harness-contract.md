@@ -128,6 +128,19 @@ target before it enters model history. Bound MCP Resources are read through the 
 registry used during discovery. Plain text input never infers a Mention: unbound `@...` text remains
 literal, even when it names an existing file. Explicit `$skill` prompts remain supported.
 
+### Steering a running turn
+
+`turn/steer` hands text to a turn that is still running:
+
+```json
+{"id":"steer","method":"turn/steer","params":{"threadId":"thread-id-from-response","turnId":"turn-id-from-turn-started","input":[{"type":"text","text":"also run the tests"}]}}
+```
+
+The reply is a `turn_controlled` event with `"action":"steer"`. `"status":"steered"` means the
+turn reads the input before its next model request, and the input joins the turn as a user
+message. `"status":"idle"` means the input was not applied: the turn was not running, or it had
+already decided to end and could no longer answer it. Send it with `turn/start` instead.
+
 ## Event Envelope
 
 Every JSONL line is one event:
