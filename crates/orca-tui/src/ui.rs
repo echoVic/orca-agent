@@ -927,41 +927,57 @@ fn render_full_access_confirmation(frame: &mut Frame, state: &AppState, theme: &
             Style::default().fg(theme.text),
         ),
     ];
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for (text, style) in notices {
-        lines.extend(
+    let notice: Vec<Line<'static>> = notices
+        .into_iter()
+        .flat_map(|(text, style)| {
             wrap_text(text, inner_width)
                 .into_iter()
-                .map(|row| Line::from(Span::styled(row, style))),
-        );
-    }
-    lines.push(Line::from(""));
-    lines.push(crate::chrome::option_line(
-        theme,
-        confirmation.selected == 0,
-        "",
-        labels[0],
-        label_width,
-        "",
-        inner_width,
-    ));
-    lines.push(crate::chrome::option_line(
-        theme,
-        confirmation.selected == 1,
-        "",
-        labels[1],
-        label_width,
-        "",
-        inner_width,
-    ));
-    lines.push(Line::from(""));
-    lines.push(crate::chrome::hint_line(
+                .map(move |row| Line::from(Span::styled(row, style)))
+        })
+        .collect();
+    let choices = [0, 1].map(|index| {
+        crate::chrome::option_line(
+            theme,
+            confirmation.selected == index,
+            "",
+            labels[index],
+            label_width,
+            "",
+            inner_width,
+        )
+    });
+    let hint = crate::chrome::hint_line(
         theme,
         inner_width,
         &[("↑↓", "move"), ("Enter", "confirm"), ("Esc", "cancel")],
-    ));
+    );
 
-    let popup = crate::chrome::dialog_rect(area, width, lines.len() as u16, 14);
+    // The choices and their keys always show. A window too short for all of
+    // it loses the blank rows first, then the end of the notice, marked `…`.
+    // Rows inside the borders of a dialog with a free row above and below:
+    let room = usize::from(area.height.saturating_sub(4));
+    let spaced = notice.len() + choices.len() + 3 <= room;
+    let notice_room = room.saturating_sub(choices.len() + 1);
+    let mut lines: Vec<Line<'static>> = if notice.len() <= notice_room {
+        notice
+    } else {
+        let mut shown: Vec<_> = notice
+            .into_iter()
+            .take(notice_room.saturating_sub(1))
+            .collect();
+        shown.push(Line::from(Span::styled("…", theme.muted_style())));
+        shown
+    };
+    if spaced {
+        lines.push(Line::from(""));
+    }
+    lines.extend(choices);
+    if spaced {
+        lines.push(Line::from(""));
+    }
+    lines.push(hint);
+
+    let popup = crate::chrome::dialog_rect(area, width, lines.len() as u16, area.height);
     frame.render_widget(Clear, popup);
     let block = crate::chrome::panel_block(theme, "Enable Full Access?", theme.error);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
@@ -7863,6 +7879,29 @@ mod tests {
         let bottom = help_screen(&mut state, 90, 20);
         assert!(bottom.contains("ctrl+shift+o"), "{bottom}");
         assert!(bottom.contains("Esc close"), "{bottom}");
+    }
+
+    #[test]
+    fn full_access_confirmation_keeps_both_choices_in_a_small_window() {
+        // Capped at 14 rows, the dialog cut off "Cancel", the default, and
+        // its keys, leaving "Continue with Full Access" alone on screen.
+        let mut state = test_state();
+        state.full_access_confirmation = Some(crate::types::FullAccessConfirmation {
+            selected: 1,
+            model: None,
+            reasoning_effort: None,
+        });
+        for (width, height) in [(52, 14), (40, 24), (60, 16), (84, 12)] {
+            let screen = frame_string(&mut state, width, height);
+            for expected in ["Continue with Full Access", "› Cancel", "Enter confirm"] {
+                assert!(
+                    screen.contains(expected),
+                    "{width}x{height} lacks {expected:?}\n{screen}"
+                );
+            }
+        }
+        let narrow = frame_string(&mut state, 40, 24);
+        assert!(narrow.contains("policy they started with."), "{narrow}");
     }
 
     #[test]
