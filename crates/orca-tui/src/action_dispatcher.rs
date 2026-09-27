@@ -378,12 +378,16 @@ fn route_action(
         UserAction::StopTask { task_id } => {
             match controller.stop_background_task(&task_id, event_tx) {
                 Ok(Some(projection)) => {
+                    let label = crate::background_tasks::task_notice_label(
+                        &projection.workflow_tasks,
+                        &task_id,
+                    );
                     let _ =
                         event_tx.try_send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
                     if !deliver_dispatcher_outcome(
                         event_tx,
                         &mut pending.event,
-                        TuiEvent::Notice(format!("Task stop requested for {task_id}.")),
+                        TuiEvent::Notice(format!("Stopping {label}.")),
                     ) {
                         return false;
                     }

@@ -1,6 +1,6 @@
 use crossbeam_channel as mpsc;
 
-use orca_core::task_types::TaskStatus;
+use orca_core::task_types::{BackgroundTaskSummary, TaskStatus};
 use orca_runtime::runtime_host::RuntimeThreadHandle;
 
 use crate::operation_controller::TuiSurfaceTaskControl;
@@ -95,10 +95,9 @@ fn stop_task_for_tui(
     };
     match actions.stop_task(task_id, control, event_tx) {
         Ok(projection) => {
+            let label = task_notice_label(&projection.workflow_tasks, task_id);
             let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
-            let _ = event_tx.send(TuiEvent::Notice(format!(
-                "Task stop requested for {task_id}."
-            )));
+            let _ = event_tx.send(TuiEvent::Notice(format!("Stopping {label}.")));
             true
         }
         Err(error) => {
@@ -123,9 +122,10 @@ fn foreground_task_for_tui(
 
     match actions.foreground_task(task_id, control, event_tx) {
         Ok(projection) => {
+            let label = task_notice_label(&projection.workflow_tasks, task_id);
             let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
             let _ = event_tx.send(TuiEvent::Notice(format!(
-                "Task {task_id} returned to foreground."
+                "Brought {label} back to the foreground."
             )));
             true
         }
@@ -152,11 +152,14 @@ fn submit_background_approval_response_for_tui(
 
     match actions.resolve_background_approval(approval_id, approved, control, event_tx) {
         Ok((task_id, projection)) => {
+            let label = task_notice_label(&projection.workflow_tasks, &task_id);
             let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
-            let decision = if approved { "approved" } else { "denied" };
-            let _ = event_tx.send(TuiEvent::Notice(format!(
-                "Background approval {decision} for {task_id}."
-            )));
+            let notice = if approved {
+                format!("Approved; {label} continues in the background.")
+            } else {
+                format!("Denied; {label} stops.")
+            };
+            let _ = event_tx.send(TuiEvent::Notice(notice));
             true
         }
         Err(error) => {
@@ -196,6 +199,30 @@ pub(crate) fn notify_recovered_background_approvals_for_tui(
     count
 }
 
+/// How a notice names a task: its name, or else its description, on one
+/// line and quoted. Never its id.
+pub(crate) fn task_notice_label(tasks: &[BackgroundTaskSummary], task_id: &str) -> String {
+    tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .map(|task| {
+            task.name
+                .as_deref()
+                .unwrap_or(task.description.as_str())
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|label| !label.is_empty())
+        .map(|label| {
+            format!(
+                "\"{}\"",
+                crate::display_text::truncate_to_display_width(&label, 48)
+            )
+        })
+        .unwrap_or_else(|| "the task".to_string())
+}
+
 pub(crate) fn is_terminal_task_status(status: TaskStatus) -> bool {
     matches!(
         status,
@@ -206,6 +233,35 @@ pub(crate) fn is_terminal_task_status(status: TaskStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary(id: &str, name: Option<&str>, description: &str) -> BackgroundTaskSummary {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "type": "main_session",
+            "status": "approval_required",
+            "description": description,
+            "createdAtMs": 1,
+            "name": name,
+        }))
+        .expect("task summary")
+    }
+
+    #[test]
+    fn a_task_notice_names_the_task_not_its_id() {
+        // Notices read "Background approval approved for task-0199c1e2-…".
+        let tasks = [
+            summary("task-0199c1e2", None, "deploy the site\n  to staging"),
+            summary("task-7a41", Some("reviewer"), "review the diff"),
+        ];
+        assert_eq!(
+            task_notice_label(&tasks, "task-0199c1e2"),
+            "\"deploy the site to staging\""
+        );
+        assert_eq!(task_notice_label(&tasks, "task-7a41"), "\"reviewer\"");
+        assert_eq!(task_notice_label(&tasks, "task-gone"), "the task");
+        let long = [summary("task-long", None, &"word ".repeat(40))];
+        assert!(task_notice_label(&long, "task-long").chars().count() <= 50);
+    }
 
     #[test]
     fn missing_thread_background_approval_releases_prearmed_activation() {

@@ -2369,9 +2369,8 @@ fn resumed_tui_projects_reconciled_terminal_legacy_task_as_non_actionable() {
             {
                 TuiEvent::Error(_) => errors += 1,
                 TuiEvent::Notice(message)
-                    if message.contains(&task_id)
-                        && (message.contains("stop requested")
-                            || message.contains("returned to foreground")) =>
+                    if message.starts_with("Stopping ")
+                        || message.contains("back to the foreground") =>
                 {
                     panic!("terminal task action fabricated success notice: {message}");
                 }
@@ -2445,7 +2444,7 @@ fn background_approval_action_denial_stops_task_and_refreshes_tasks() {
                             && task.pending_tool_call.is_none()
                     });
                 }
-                TuiEvent::Notice(message) if message.contains("Background approval denied") => {
+                TuiEvent::Notice(message) if message.starts_with("Denied; ") => {
                     denied_notice = true;
                 }
                 event => seen.push(format!("{event:?}")),
@@ -3335,7 +3334,14 @@ fn hosted_side_background_task_foreground_uses_surface_projection() {
                 false
             }
             TuiEvent::Notice(message)
-                if message == &format!("Task {} returned to foreground.", task.id) =>
+                if message
+                    == &format!(
+                        "Brought {} back to the foreground.",
+                        crate::background_tasks::task_notice_label(
+                            std::slice::from_ref(&task),
+                            &task.id
+                        )
+                    ) =>
             {
                 true
             }
