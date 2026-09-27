@@ -144,7 +144,9 @@ loading, an unextended client must clear its local transcript before loading.
   Bound mentions restore the unsent draft instead of silently dropping bindings.
   Permission commitment is acknowledged only after a successful prompt response;
   a lost transport leaves delivery unconfirmed. Reconnect retries are bounded to
-  five with backoff, replace the transcript, and never resend prompts.
+  five with backoff, replace the transcript, and never resend prompts. When
+  they run out, or the first attach fails, the TUI exits with status 1 and
+  prints why.
   Workflow, queue, goal, approval-mode/plan mutation, child/side session, history
   mutation, and context-management actions remain explicitly unsupported.
 - Arbitrary terminal/client resource state is not migrated between owners.

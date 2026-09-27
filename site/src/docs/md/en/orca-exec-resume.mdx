@@ -1,7 +1,8 @@
 # Resume a Headless Run
 
 Use orca exec resume when a recorded headless run needs another turn. The
-selector is a session ID, an unambiguous prefix, or latest.
+selector is a session ID, an unambiguous prefix, or latest. latest is the most
+recently updated conversation; the threads subagents ran in do not count.
 
 ~~~bash
 orca exec resume SESSION_ID "Continue from the last checkpoint"

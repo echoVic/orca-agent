@@ -1,6 +1,6 @@
 # 恢复无头运行
 
-当已记录的无头运行需要继续时，使用 orca exec resume。选择器可以是会话 ID、无歧义前缀或 latest。
+当已记录的无头运行需要继续时，使用 orca exec resume。选择器可以是会话 ID、无歧义前缀或 latest。latest 指最近更新的对话，子代理运行时所在的线程不算在内。
 
 ~~~bash
 orca exec resume SESSION_ID "从上一个检查点继续"
