@@ -164,6 +164,11 @@ pub enum McpContent {
     Text {
         text: String,
     },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
     #[serde(other)]
     Other,
 }

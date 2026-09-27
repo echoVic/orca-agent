@@ -6,11 +6,13 @@ use std::sync::Mutex;
 use serde_json::Value;
 
 use crate::transport::{self, McpElicitationHandler, McpTransport};
+use orca_core::conversation::ImageInput;
 use orca_core::mcp_types::{
     CallToolResult, McpContent, McpResource, McpResourceTemplate, McpServerConfig, McpTool,
     McpToolRef, McpTransportKind, ReadResourceResult, ResourceTemplatesListResult,
     ResourcesListResult, ToolsListResult,
 };
+use orca_core::tool_images::tool_image;
 
 #[derive(Clone, Default)]
 pub struct McpRegistry {
@@ -651,22 +653,41 @@ impl McpRegistry {
         )?;
         let result: CallToolResult = serde_json::from_value(result)
             .map_err(|error| format!("invalid MCP tool result: {error}"))?;
-        let output = result
-            .content
-            .into_iter()
-            .filter_map(|content| match content {
-                McpContent::Text { text } => Some(text),
-                McpContent::Other => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+
+        let mut texts = Vec::new();
+        let mut rejected_notes = Vec::new();
+        let mut images = Vec::new();
+        for content in result.content {
+            match content {
+                McpContent::Text { text } => texts.push(text),
+                McpContent::Image { data, mime_type } => match tool_image(&mime_type, data) {
+                    Ok(image) => images.push(image),
+                    Err(rejected) => rejected_notes.push(rejected.note()),
+                },
+                McpContent::Other => {}
+            }
+        }
+
+        let mut parts = Vec::new();
+        if !texts.is_empty() {
+            parts.push(texts.join("\n"));
+        }
+        parts.extend(rejected_notes);
+        if !images.is_empty() {
+            parts.push(if images.len() == 1 {
+                "[1 image attached]".to_string()
+            } else {
+                format!("[{} images attached]", images.len())
+            });
+        }
 
         Ok(McpCallOutput {
-            output: if output.is_empty() {
+            output: if parts.is_empty() {
                 "(MCP tool returned no text content)".to_string()
             } else {
-                output
+                parts.join("\n")
             },
+            images,
             is_error: result.is_error,
         })
     }
@@ -1059,6 +1080,7 @@ fn should_reconnect_after_mcp_error(transport: &McpTransportKind, error: &str) -
 #[derive(Debug)]
 pub struct McpCallOutput {
     pub output: String,
+    pub images: Vec<ImageInput>,
     pub is_error: bool,
 }
 
@@ -1287,6 +1309,127 @@ mod tests {
             !worker_active_at_return,
             "call_tool_or_cancel returned before its transport worker finished"
         );
+    }
+
+    /// A tiny, valid 1x1 PNG (base64-encoded). Mirrors the constant
+    /// `orca_core::tool_images`'s own tests define, per that module's note
+    /// that each caller should define its own rather than share one.
+    const BASE64_1X1_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    /// Builds a registry with a single MCP server ("screen") whose only tool
+    /// ("capture") always returns `content` from `call_tool`.
+    fn registry_with_call_tool_result(content: Value) -> (McpRegistry, McpToolRef) {
+        struct StaticCallToolTransport {
+            content: Value,
+        }
+
+        impl McpTransport for StaticCallToolTransport {
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"capabilities": {}}))
+            }
+
+            fn list_tools(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": []}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                Ok(self.content.clone())
+            }
+
+            fn list_resources(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"resources": []}))
+            }
+
+            fn list_resource_templates(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"resourceTemplates": []}))
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Ok(serde_json::json!({"contents": []}))
+            }
+        }
+
+        let tool = McpTool {
+            server: "screen".to_string(),
+            name: "capture".to_string(),
+            schema_name: "mcp__screen__capture".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let registry = McpRegistry {
+            inner: Arc::new(McpRegistryInner {
+                clients: HashMap::from([(
+                    "screen".to_string(),
+                    Arc::new(McpClient {
+                        config: McpServerConfig {
+                            name: "screen".to_string(),
+                            ..Default::default()
+                        },
+                        server_name: "screen".to_string(),
+                        capabilities: McpServerCapabilities::default(),
+                        transport: Mutex::new(Box::new(StaticCallToolTransport { content })),
+                    }),
+                )]),
+                tools: vec![tool.clone()],
+                lookup: HashMap::from([(
+                    tool.schema_name.clone(),
+                    McpToolRef {
+                        server: tool.server,
+                        tool: tool.name,
+                        schema_name: tool.schema_name,
+                    },
+                )]),
+                errors: Vec::new(),
+            }),
+        };
+        let tool_ref = registry
+            .resolve_tool("mcp__screen__capture")
+            .expect("tool ref for screen capture");
+        (registry, tool_ref)
+    }
+
+    #[test]
+    fn an_image_from_an_mcp_tool_reaches_the_tool_output() {
+        let (registry, tool_ref) = registry_with_call_tool_result(serde_json::json!({
+            "content": [
+                {"type": "text", "text": "screenshot taken"},
+                {"type": "image", "data": BASE64_1X1_PNG, "mimeType": "image/png"}
+            ],
+            "isError": false
+        }));
+
+        let result = registry
+            .call_tool(&tool_ref, serde_json::json!({}))
+            .expect("tool result");
+
+        assert_eq!(result.output, "screenshot taken\n[1 image attached]");
+        assert_eq!(result.images.len(), 1);
+        assert!(matches!(
+            &result.images[0].source,
+            orca_core::conversation::ImageSource::Base64 { media_type, .. }
+                if media_type == "image/png"
+        ));
+    }
+
+    #[test]
+    fn an_unsupported_mcp_image_leaves_a_note() {
+        let (registry, tool_ref) = registry_with_call_tool_result(serde_json::json!({
+            "content": [
+                {"type": "text", "text": "screenshot taken"},
+                {"type": "image", "data": "PHN2Zz4=", "mimeType": "image/svg+xml"}
+            ],
+            "isError": false
+        }));
+
+        let result = registry
+            .call_tool(&tool_ref, serde_json::json!({}))
+            .expect("tool result");
+
+        assert_eq!(
+            result.output,
+            "screenshot taken\n[image omitted: unsupported type image/svg+xml]"
+        );
+        assert!(result.images.is_empty());
     }
 
     #[cfg(unix)]

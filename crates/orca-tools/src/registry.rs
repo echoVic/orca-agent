@@ -2299,8 +2299,12 @@ fn mcp_call_result_to_tool_result(
     cancellation_observed: bool,
 ) -> ToolResult {
     match call_result {
-        Ok(result) if result.is_error => ToolResult::failed(request, result.output, None),
-        Ok(result) => ToolResult::completed(request, result.output, false),
+        Ok(result) if result.is_error => {
+            ToolResult::failed(request, result.output, None).with_images(result.images)
+        }
+        Ok(result) => {
+            ToolResult::completed(request, result.output, false).with_images(result.images)
+        }
         Err(error) if cancellation_observed && error == MCP_TOOL_CALL_CANCELLED => {
             ToolResult::cancelled(request, error, None)
         }
@@ -2397,6 +2401,42 @@ mod tests {
                 "error={error:?}, cancellation_observed={cancellation_observed}"
             );
         }
+    }
+
+    /// A tiny, valid 1x1 PNG (base64-encoded). Per `orca_core::tool_images`'s
+    /// own note, each module that needs a sample image defines its own
+    /// constant rather than reuse one across crates.
+    const BASE64_1X1_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    #[test]
+    fn an_mcp_result_with_images_completes_with_them() {
+        let request = request(ToolName::Mcp("mcp__screen__capture".to_string()), "{}");
+        let image = orca_core::tool_images::tool_image("image/png", BASE64_1X1_PNG.to_string())
+            .expect("sample image");
+
+        let success = mcp_call_result_to_tool_result(
+            &request,
+            Ok(McpCallOutput {
+                output: "screenshot taken\n[1 image attached]".to_string(),
+                images: vec![image.clone()],
+                is_error: false,
+            }),
+            false,
+        );
+        assert_eq!(success.status, orca_core::tool_types::ToolStatus::Completed);
+        assert_eq!(success.images.len(), 1);
+
+        let failed = mcp_call_result_to_tool_result(
+            &request,
+            Ok(McpCallOutput {
+                output: "boom\n[1 image attached]".to_string(),
+                images: vec![image],
+                is_error: true,
+            }),
+            false,
+        );
+        assert_eq!(failed.status, orca_core::tool_types::ToolStatus::Failed);
+        assert_eq!(failed.images.len(), 1);
     }
 
     #[test]
