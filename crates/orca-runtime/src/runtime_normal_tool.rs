@@ -324,7 +324,29 @@ fn execute_bash(
             }
         }
     }
-    terminal_output_result(invocation, Ok(aggregate))
+    // A sandbox denial reads like any other failure in the process output, so
+    // say what it likely is, as `command/exec` does: a git index.lock EPERM is
+    // not a stale lock to delete. The hint is parsed from that output, so it
+    // is labelled as such and grants nothing.
+    let sandbox_diagnostic = aggregate
+        .as_ref()
+        .filter(|output| output.status == "failed")
+        .filter(|_| {
+            crate::server::bash_sandbox_for_cwd(&invocation.config, &cwd).is_ok_and(|sandbox| {
+                !matches!(
+                    sandbox.mode,
+                    crate::shell_session::ShellSandboxMode::DangerFullAccess
+                )
+            })
+        })
+        .and_then(|output| crate::sandbox_denial::diagnose_sandbox_denial(&cwd, "", &output.output))
+        .map(|diagnostic| {
+            format!(
+                "non-authoritative, read from the process output: {}",
+                diagnostic.message
+            )
+        });
+    terminal_output_result_with_diagnostic(invocation, Ok(aggregate), sandbox_diagnostic)
 }
 
 fn deny_blocked_network_request(
@@ -799,6 +821,14 @@ fn terminal_output_result(
     invocation: &RuntimeNormalToolInvocation,
     output: std::io::Result<Option<TerminalServiceOutput>>,
 ) -> ToolResult {
+    terminal_output_result_with_diagnostic(invocation, output, None)
+}
+
+fn terminal_output_result_with_diagnostic(
+    invocation: &RuntimeNormalToolInvocation,
+    output: std::io::Result<Option<TerminalServiceOutput>>,
+    sandbox_diagnostic: Option<String>,
+) -> ToolResult {
     let output = match output {
         Ok(Some(output)) => output,
         Ok(None) => {
@@ -822,7 +852,7 @@ fn terminal_output_result(
     } else {
         "terminal_observed"
     };
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "task_id": output.task_id,
         "state": output.status,
         "return_reason": return_reason,
@@ -838,6 +868,9 @@ fn terminal_output_result(
         "terminal": output.effective_terminal,
         "eof": output.eof,
     });
+    if let Some(diagnostic) = sandbox_diagnostic {
+        payload["sandbox_diagnostic"] = serde_json::Value::String(diagnostic);
+    }
     let serialized = match serde_json::to_string(&payload) {
         Ok(serialized) => serialized,
         Err(error) => {
