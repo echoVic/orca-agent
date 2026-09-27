@@ -35,6 +35,13 @@ pub const TOOL_IMAGE_UNAVAILABLE_NOTE: &str =
 /// stay within the per-request image budget.
 pub const SUPERSEDED_TOOL_IMAGE_NOTE: &str = "[image omitted: superseded by a newer one]";
 
+/// The most tool images a single request carries: only the newest this many
+/// are sent, and every older one is replaced with `SUPERSEDED_TOOL_IMAGE_NOTE`.
+/// Compaction snapshots keep the same newest images, since a superseded image
+/// is never sent again; each tool result's own history record keeps all of its
+/// images.
+pub const MAX_REQUEST_TOOL_IMAGES: usize = 3;
+
 /// Why a candidate tool image could not become an `ImageInput`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolImageRejected {
@@ -125,8 +132,9 @@ pub fn drop_tool_images(messages: &mut [Message], note: &str) -> usize {
 /// image is dropped and its message gets `SUPERSEDED_TOOL_IMAGE_NOTE`
 /// appended once. Returns the number of images dropped.
 ///
-/// Request-only: call this right before sending a request, never while
-/// recovering or persisting a session, since the drop is not reversible.
+/// The drop is not reversible, so call this only on a copy: the request about
+/// to be sent, or the messages of a compaction snapshot. Never call it on the
+/// live conversation or on a tool result's own history record.
 pub fn keep_newest_tool_images(messages: &mut [Message], keep: usize) -> usize {
     let total: usize = messages
         .iter()
@@ -313,6 +321,48 @@ mod tests {
             } => {
                 assert_eq!(images, &[sample_image("d"), sample_image("e")]);
                 assert_eq!(content, "third");
+            }
+            other => panic!("expected Tool message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keep_newest_tool_images_drops_a_partly_kept_messages_oldest_images_first() {
+        let mut messages = vec![
+            Message::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: "first".to_string(),
+                images: vec![sample_image("a"), sample_image("b"), sample_image("c")],
+                terminal: None,
+                pinned: false,
+            },
+            Message::Tool {
+                tool_call_id: "call_2".to_string(),
+                content: "second".to_string(),
+                images: vec![sample_image("d")],
+                terminal: None,
+                pinned: false,
+            },
+        ];
+
+        let dropped = keep_newest_tool_images(&mut messages, 3);
+
+        assert_eq!(dropped, 1);
+        match &messages[0] {
+            Message::Tool {
+                images, content, ..
+            } => {
+                assert_eq!(images, &[sample_image("b"), sample_image("c")]);
+                assert_eq!(content, &format!("first\n{SUPERSEDED_TOOL_IMAGE_NOTE}"));
+            }
+            other => panic!("expected Tool message, got {other:?}"),
+        }
+        match &messages[1] {
+            Message::Tool {
+                images, content, ..
+            } => {
+                assert_eq!(images, &[sample_image("d")]);
+                assert_eq!(content, "second");
             }
             other => panic!("expected Tool message, got {other:?}"),
         }

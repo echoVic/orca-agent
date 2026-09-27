@@ -2,8 +2,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 
 use base64::Engine;
-use orca_core::conversation::{ImageDetail, ImageInput, ImageSource, Message};
+use orca_core::conversation::{Conversation, ImageDetail, ImageInput, ImageSource, Message};
 use orca_core::thread_identity::TurnId;
+use orca_core::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE;
 
 use super::assets;
 use super::reader::INDEX_BUDGET;
@@ -452,6 +453,100 @@ fn history_without_tool_images_loads_unchanged() {
         };
         assert!(images.is_empty());
         assert_eq!(content, "legacy output");
+    });
+}
+
+#[test]
+fn a_compaction_snapshot_keeps_only_the_newest_tool_images() {
+    crate::history::with_redirected_orca_home("tool-image-snapshot", |home| {
+        let mut writer = SessionWriter::start(home, "mock", None, "snapshot tool images").unwrap();
+        writer.enter_turn(TurnId::new());
+        // Five distinct images: the older result holds two, the newer three.
+        let images = (1..=5)
+            .map(|index| tool_result_image(4096 + index))
+            .collect::<Vec<_>>();
+        let tool_message =
+            |tool_call_id: &str, content: &str, images: &[ImageInput]| Message::Tool {
+                tool_call_id: tool_call_id.to_string(),
+                content: content.to_string(),
+                images: images.to_vec(),
+                terminal: None,
+                pinned: false,
+            };
+        let older = tool_message("call_1", "first screenshots", &images[..2]);
+        let newer = tool_message("call_2", "second screenshots", &images[2..]);
+        writer.append_message(&older).unwrap();
+        writer.append_message(&newer).unwrap();
+        let mut conversation = Conversation::new();
+        conversation.messages.extend([older, newer]);
+        let identity = crate::session::ManualCompactionPersistenceIdentity {
+            operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .expect("generated UUID is v7"),
+            snapshot_id: uuid::Uuid::now_v7().to_string(),
+        };
+
+        writer
+            .append_manual_compaction_snapshot(&identity, 2, "local_truncation", &conversation)
+            .unwrap();
+
+        // The conversation passed in keeps every image and gains no note.
+        let live_images = conversation
+            .messages
+            .iter()
+            .flat_map(|message| message.images().iter().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(live_images, images);
+        assert!(conversation.messages.iter().all(|message| {
+            !matches!(message, Message::Tool { content, .. } if content.contains(SUPERSEDED_TOOL_IMAGE_NOTE))
+        }));
+
+        let records = read_records(writer.path()).unwrap();
+        // Each tool result's own record still holds its images: all five.
+        let recorded_images = records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::Message {
+                    message: StoredMessage::Tool { images, .. },
+                    ..
+                } => Some(images.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(recorded_images, images);
+
+        // The snapshot keeps only the newest three; the older message says why.
+        let snapshot = records
+            .into_iter()
+            .find_map(|record| match record {
+                SessionRecord::ManualCompactionSnapshot(snapshot) => Some(snapshot),
+                _ => None,
+            })
+            .expect("a compaction snapshot");
+        let [
+            StoredMessage::Tool {
+                content: older_content,
+                images: older_images,
+                ..
+            },
+            StoredMessage::Tool {
+                content: newer_content,
+                images: newer_images,
+                ..
+            },
+        ] = snapshot.messages.as_slice()
+        else {
+            panic!("expected the two tool messages in the snapshot");
+        };
+        assert!(older_images.is_empty());
+        assert_eq!(
+            older_content,
+            &format!("first screenshots\n{SUPERSEDED_TOOL_IMAGE_NOTE}")
+        );
+        assert_eq!(newer_images.as_slice(), &images[2..]);
+        assert_eq!(newer_content, "second screenshots");
     });
 }
 

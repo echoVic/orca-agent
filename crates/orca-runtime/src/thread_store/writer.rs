@@ -14,7 +14,9 @@ use orca_core::event_schema::{EventEnvelope, EventPublicationStore, EventType};
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::thread_identity::{ConversationItemId, TurnId};
 use orca_core::thread_item_projection::CompletedModelResponse;
-use orca_core::tool_images::{RESUMED_TOOL_IMAGE_NOTE, drop_tool_images};
+use orca_core::tool_images::{
+    MAX_REQUEST_TOOL_IMAGES, RESUMED_TOOL_IMAGE_NOTE, drop_tool_images, keep_newest_tool_images,
+};
 use orca_core::tool_types::ToolResult;
 use orca_platform::fs::{
     AtomicWritePolicy, ExclusiveFileLock, atomic_write_with, open_nofollow_nonblocking,
@@ -1530,6 +1532,16 @@ impl SessionWriter {
         )
     }
 
+    /// Writes the post-compaction conversation as one atomic record.
+    ///
+    /// The record keeps only the newest `MAX_REQUEST_TOOL_IMAGES` tool images;
+    /// older ones become `SUPERSEDED_TOOL_IMAGE_NOTE`, as in the next request.
+    /// Nothing a model could see is lost: a superseded tool image is never sent
+    /// again, resume drops tool images anyway, and each tool result's own
+    /// record keeps its images. Without the trim, a screenshot-heavy
+    /// conversation could push this one record past `MAX_SESSION_LINE_BYTES`,
+    /// and every later compaction would fail the same way. The trim applies to
+    /// a copy; `conversation` is not changed.
     pub(crate) fn append_manual_compaction_snapshot(
         &mut self,
         identity: &crate::session::ManualCompactionPersistenceIdentity,
@@ -1548,17 +1560,15 @@ impl SessionWriter {
                 "injected manual compaction snapshot failure",
             ));
         }
+        let mut messages = conversation.messages.clone();
+        keep_newest_tool_images(&mut messages, MAX_REQUEST_TOOL_IMAGES);
         let record = SessionRecord::ManualCompactionSnapshot(ManualCompactionSnapshotRecord {
             snapshot_id: identity.snapshot_id.clone(),
             operation_id: identity.operation_id.clone(),
             strategy: strategy.to_string(),
             compacted_at: Utc::now(),
             before_messages,
-            messages: conversation
-                .messages
-                .iter()
-                .map(StoredMessage::from)
-                .collect(),
+            messages: messages.iter().map(StoredMessage::from).collect(),
             rolling_summary: conversation.rolling_summary.clone(),
             summary_state: conversation.summary.clone(),
         });

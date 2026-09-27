@@ -12,7 +12,7 @@ use orca_core::model::{FLASH_MODEL, canonical_model_name};
 use orca_core::provider_types::{
     ProviderError, ProviderErrorKind, ProviderReplayState, ProviderResponse, ProviderStep, Usage,
 };
-use orca_core::tool_images::keep_newest_tool_images;
+use orca_core::tool_images::{MAX_REQUEST_TOOL_IMAGES, keep_newest_tool_images};
 use orca_core::tool_types::{ToolName, ToolRequest};
 
 use crate::ProviderConfig;
@@ -974,12 +974,6 @@ fn replayable_reasoning_content(
         .filter(|text| !text.is_empty() && *text != "(reasoning omitted)")
         .map(str::to_string)
 }
-
-/// Caps the tool images placed in a single DeepSeek request; every image past
-/// the newest `MAX_REQUEST_TOOL_IMAGES` is replaced with
-/// `SUPERSEDED_TOOL_IMAGE_NOTE`. This limits requests only — persisted
-/// history keeps every image regardless of how many a given request sends.
-const MAX_REQUEST_TOOL_IMAGES: usize = 3;
 
 pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
     let mut messages: Vec<ApiMessage> = Vec::new();
