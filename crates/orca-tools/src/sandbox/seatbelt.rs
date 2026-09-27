@@ -337,6 +337,10 @@ fn build_workspace_write_profile(context: WorkspaceWriteProfileContext<'_>) -> S
         allowed_unix_socket_roots,
     } = context;
     let mut profile = SeatbeltProfileBuilder::new();
+    // The workspace sandbox limits writes, not reads, as on Linux: tools read
+    // their own config and installs anywhere (~/.gitconfig, ~/.cargo, a
+    // login shell's ~/.profile). The denied roots below still override it.
+    profile.push_rule("(allow file-read*)");
     // macOS 26 aborts a process that may not read "/" (exit 134).
     profile.push_rule("(allow file-read* (literal \"/\"))");
     profile.push_rule(SYSTEM_SYMLINK_LOOKUP_RULE);
@@ -810,6 +814,70 @@ mod tests {
     }
 
     #[test]
+    fn workspace_write_sandbox_reads_outside_the_workspace_and_writes_temp_dirs() {
+        // Reads were limited to the workspace and system directories, so
+        // `git` died on an unreadable ~/.gitconfig, `cargo` under ~/.cargo was
+        // "command not found", and a login shell could not read ~/.profile.
+        // Linux's workspace sandbox reads everywhere but the denied roots.
+        if !available() {
+            return;
+        }
+        let home = dirs::home_dir().expect("home");
+        let outside = TempDir::new_in(&home).unwrap();
+        let config = outside.path().join("config");
+        std::fs::write(&config, "user config\n").unwrap();
+        let workspace = TempDir::new_in(&home).unwrap();
+        let command = format!(
+            "cat '{}' && touch \"$TMPDIR/orca-seatbelt-probe\" /tmp/orca-seatbelt-probe && echo temp-ok",
+            config.display()
+        );
+
+        let output = crate::sandbox::bash_command(&command, workspace.path())
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file("/tmp/orca-seatbelt-probe");
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "user config\ntemp-ok\n"
+        );
+    }
+
+    #[test]
+    fn workspace_write_sandbox_still_cannot_read_the_ssh_directory() {
+        if !available() {
+            return;
+        }
+        let Some(ssh) = dirs::home_dir().map(|home| home.join(".ssh")) else {
+            return;
+        };
+        if !ssh.is_dir() {
+            return;
+        }
+        let workspace = TempDir::new_in(dirs::home_dir().unwrap()).unwrap();
+
+        let output =
+            crate::sandbox::bash_command(&format!("ls '{}'", ssh.display()), workspace.path())
+                .output()
+                .unwrap();
+
+        assert!(
+            !output.status.success(),
+            "~/.ssh was listed inside the sandbox"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Operation not permitted"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn sandbox_profile_allows_workspace_and_null_device() {
         let workspace = TempDir::new().unwrap();
         let content = workspace_write_profile(WorkspaceWriteProfileContext {
@@ -825,7 +893,7 @@ mod tests {
         });
         assert!(content.contains("(version 1)"));
         assert!(content.contains(&workspace.path().display().to_string()));
-        assert!(!content.contains("\n(allow file-read*)\n"));
+        assert!(content.contains("\n(allow file-read*)\n"));
         assert!(content.contains(r#"(allow file-read* file-write* (literal "/dev/null"))"#));
     }
 
