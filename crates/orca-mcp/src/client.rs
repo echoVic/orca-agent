@@ -1075,6 +1075,8 @@ fn should_reconnect_after_mcp_error(transport: &McpTransportKind, error: &str) -
         || error.contains("reader stopped")
         || error.contains("server closed stdout")
         || error.contains("failed to write MCP request")
+        // An oversized stdio response stops the reader and kills the server.
+        || error.contains("MCP response exceeded maximum line size")
 }
 
 #[derive(Debug)]
@@ -2463,6 +2465,225 @@ done
             .expect("second call should reconnect");
 
         assert_eq!(second.output, "reconnected");
+        let runs = std::fs::read_to_string(state_dir.join("run-count")).expect("run count");
+        assert_eq!(runs, "2");
+    }
+
+    /// Builds a valid RGBA PNG whose pixel rows are stored uncompressed
+    /// (deflate "stored" blocks), so its size tracks `width * height` the way
+    /// a detailed screenshot's does.
+    #[cfg(unix)]
+    fn uncompressed_png(width: u32, height: u32) -> Vec<u8> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let table = (0..256u32)
+                .map(|entry| {
+                    (0..8).fold(entry, |crc, _| {
+                        if crc & 1 == 1 {
+                            0xEDB8_8320 ^ (crc >> 1)
+                        } else {
+                            crc >> 1
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            !bytes.iter().fold(!0u32, |crc, byte| {
+                table[((crc ^ u32::from(*byte)) & 0xFF) as usize] ^ (crc >> 8)
+            })
+        }
+        fn push_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            let length = u32::try_from(data.len()).expect("PNG chunk length");
+            png.extend_from_slice(&length.to_be_bytes());
+            let start = png.len();
+            png.extend_from_slice(kind);
+            png.extend_from_slice(data);
+            let crc = crc32(&png[start..]);
+            png.extend_from_slice(&crc.to_be_bytes());
+        }
+
+        let mut rows = Vec::new();
+        for y in 0..height {
+            rows.push(0); // filter type: none
+            for x in 0..width {
+                rows.extend_from_slice(&[x as u8, y as u8, (x ^ y) as u8, 0xFF]);
+            }
+        }
+        let mut zlib = vec![0x78, 0x01];
+        let blocks = rows.chunks(usize::from(u16::MAX)).collect::<Vec<_>>();
+        for (index, block) in blocks.iter().enumerate() {
+            // BFINAL on the last block; BTYPE 00 means stored.
+            zlib.push(u8::from(index + 1 == blocks.len()));
+            let length = u16::try_from(block.len()).expect("stored block length");
+            zlib.extend_from_slice(&length.to_le_bytes());
+            zlib.extend_from_slice(&(!length).to_le_bytes());
+            zlib.extend_from_slice(block);
+        }
+        let (a, b) = rows.iter().fold((1u32, 0u32), |(a, b), byte| {
+            let a = (a + u32::from(*byte)) % 65_521;
+            (a, (b + a) % 65_521)
+        });
+        zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&width.to_be_bytes());
+        header.extend_from_slice(&height.to_be_bytes());
+        // 8-bit RGBA, deflate, adaptive filtering, no interlace.
+        header.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        push_chunk(&mut png, b"IHDR", &header);
+        push_chunk(&mut png, b"IDAT", &zlib);
+        push_chunk(&mut png, b"IEND", &[]);
+        png
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_screenshot_sized_png_arrives_through_the_stdio_transport() {
+        use base64::Engine as _;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("screenshot_mcp_server.sh");
+        let response_file = temp_dir.path().join("screenshot-response.jsonl");
+        // 1024x768 RGBA stored uncompressed: about 3 MiB, the size of a
+        // detailed Retina screenshot.
+        let png = uncompressed_png(1024, 768);
+        assert!(png.len() > 3 * 1024 * 1024, "PNG is {} bytes", png.len());
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "content": [
+                    {"type": "text", "text": "screenshot taken"},
+                    {"type": "image", "data": &data, "mimeType": "image/png"}
+                ],
+                "isError": false
+            }
+        });
+        std::fs::write(&response_file, format!("{response}\n")).expect("write MCP response");
+        std::fs::write(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"screen","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"capture","description":"captures the screen","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      cat "$1"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let mut config = stdio_fixture_config("screen", &server);
+        config
+            .args
+            .push(response_file.to_string_lossy().into_owned());
+        config.tool_timeout_ms = Some(STDIO_TEST_STARTUP_TIMEOUT_MS);
+        let registry = initialize_registry(&[config]);
+        assert!(registry.errors().is_empty(), "{:?}", registry.errors());
+        let tool_ref = registry
+            .resolve_tool("mcp__screen__capture")
+            .expect("screen capture tool ref");
+
+        let result = registry
+            .call_tool(&tool_ref, serde_json::json!({}))
+            .expect("a screenshot-sized image fits in one MCP response");
+
+        assert_eq!(result.output, "screenshot taken\n[1 image attached]");
+        assert_eq!(result.images.len(), 1);
+        assert!(matches!(
+            &result.images[0].source,
+            orca_core::conversation::ImageSource::Base64 { media_type, data: sent }
+                if media_type == "image/png" && *sent == data
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_client_reconnects_after_an_oversized_tool_response() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp_dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        let oversized = temp_dir.path().join("oversized-response.jsonl");
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "x".repeat(crate::transport::MAX_STDIO_RESPONSE_LINE_BYTES)
+                }],
+                "isError": false
+            }
+        });
+        std::fs::write(&oversized, format!("{response}\n")).expect("write oversized response");
+        let server = temp_dir.path().join("oversized_mcp_server.sh");
+        std::fs::write(
+            &server,
+            r#"#!/bin/sh
+state_dir="$1"
+run_file="$state_dir/run-count"
+run_count=0
+if [ -f "$run_file" ]; then
+  run_count=$(cat "$run_file")
+fi
+run_count=$((run_count + 1))
+printf '%s' "$run_count" > "$run_file"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"oversized","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"capture","description":"captures the screen","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      if [ "$run_count" -eq 1 ]; then
+        cat "$2"
+      else
+        printf '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"reconnected"}],"isError":false}}\n'
+      fi
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let mut config = stdio_fixture_config("oversized", &server);
+        config.args.extend([
+            state_dir.to_string_lossy().into_owned(),
+            oversized.to_string_lossy().into_owned(),
+        ]);
+        config.tool_timeout_ms = Some(STDIO_TEST_STARTUP_TIMEOUT_MS);
+        let registry = initialize_registry(&[config]);
+        assert!(registry.errors().is_empty(), "{:?}", registry.errors());
+        let tool_ref = registry
+            .resolve_tool("mcp__oversized__capture")
+            .expect("registered MCP tool");
+
+        let first = registry.call_tool(&tool_ref, serde_json::json!({}));
+        let second = registry.call_tool(&tool_ref, serde_json::json!({}));
+
+        let first = first.expect_err("an oversized response fails its call");
+        assert!(
+            first.contains("MCP response exceeded maximum line size"),
+            "unexpected oversized response error: {first}"
+        );
+        assert_eq!(
+            second
+                .expect("the next call must reach a reconnected server")
+                .output,
+            "reconnected"
+        );
         let runs = std::fs::read_to_string(state_dir.join("run-count")).expect("run count");
         assert_eq!(runs, "2");
     }

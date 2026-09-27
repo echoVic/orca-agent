@@ -20,8 +20,11 @@ use orca_platform::process::ProcessJob;
 use orca_platform::shell::resolve_program;
 
 const STDIO_RESPONSE_QUEUE_CAPACITY: usize = 8;
-const MAX_STDIO_RESPONSE_LINE_BYTES: usize = 1024 * 1024;
-const MAX_SSE_RESPONSE_BYTES: usize = 1024 * 1024;
+// The largest single MCP response either transport accepts: room for two
+// 5 MiB tool images (base64 adds a third) plus text, and far below the 64 MiB
+// session record limit a tool result is written under.
+pub(crate) const MAX_STDIO_RESPONSE_LINE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SSE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 struct SseElicitationEnvelope {
     request: Value,
