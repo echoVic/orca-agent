@@ -726,6 +726,10 @@ impl AppState {
                 }
                 self.push_message(ChatMessage::Diagnostic(diagnostic));
             }
+            // The renderer exits on it before it gets here.
+            TuiEvent::BackendExited(reason) => {
+                self.exit_message = Some(reason);
+            }
             TuiEvent::Error(msg) => {
                 self.finish_assistant_stream();
                 self.clear_receiving_tool_progress();

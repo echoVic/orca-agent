@@ -412,6 +412,10 @@ pub enum TuiEvent {
     OperationRejected(String),
     Diagnostic(TuiDiagnostic),
     Error(String),
+    /// The ACP attachment behind the TUI ended for good: it could not attach,
+    /// or gave up reconnecting. Nothing would answer input any more, so the
+    /// TUI exits and prints why.
+    BackendExited(String),
     CompactionStarted,
     SessionCompleted {
         status: String,

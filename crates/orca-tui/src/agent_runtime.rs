@@ -34,7 +34,9 @@ impl TuiAgentRuntime {
                 if let Err(error) =
                     crate::acp_client::run(options, cwd, actions, events.clone(), acks, stop)
                 {
-                    let _ = events.send(TuiEvent::Error(error.to_string()));
+                    let _ = events.send(TuiEvent::BackendExited(format!(
+                        "the ACP attachment ended: {error}. Run `orca attach` to connect again."
+                    )));
                 }
             })?;
         Ok(Self {

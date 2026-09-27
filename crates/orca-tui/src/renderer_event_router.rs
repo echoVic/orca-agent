@@ -86,6 +86,10 @@ impl<'a, 'text> RendererIterationEventRouter<'a, 'text> {
                 self.initial_prompt,
             )
             .route(input, now, clear_terminal),
+            IterationEvent::Runtime(TuiEvent::BackendExited(reason)) => {
+                self.state.exit_message = Some(reason);
+                Ok(Some(1))
+            }
             IterationEvent::Runtime(tui_event) => {
                 self.runtime.handle(
                     tui_event,
@@ -230,6 +234,29 @@ mod tests {
             [ChatMessage::System { text: message, .. }] if message == "routed notice"
         ));
         assert!(fixture.action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_attachment_that_ended_for_good_exits_with_its_reason() {
+        // Once `orca attach` gave up reconnecting, the TUI stayed open with
+        // nothing behind it: a sent message spun as "running" forever.
+        let mut fixture = Fixture::new();
+
+        let exit = fixture
+            .route(
+                IterationEvent::Runtime(TuiEvent::BackendExited(
+                    "ACP reconnect limit reached".to_string(),
+                )),
+                Instant::now(),
+                || panic!("an exit does not clear the terminal"),
+            )
+            .expect("runtime event routing");
+
+        assert_eq!(exit, Some(1));
+        assert_eq!(
+            fixture.state.exit_message.as_deref(),
+            Some("ACP reconnect limit reached")
+        );
     }
 
     #[test]

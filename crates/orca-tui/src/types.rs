@@ -531,6 +531,8 @@ pub struct AppState {
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
     pub(crate) turn_diagnostic_seen: bool,
+    /// Why the TUI exits on its own, printed once the terminal is restored.
+    pub(crate) exit_message: Option<String>,
     pub tick: u64,
     pub(crate) edit_highlights: EditHighlightState,
     /// Current vim mode label for the status bar (e.g. `"NORMAL"`), kept in
@@ -869,6 +871,7 @@ impl AppState {
             pending_workflow_notifications: VecDeque::new(),
             suppress_background_main_session_output: false,
             turn_diagnostic_seen: false,
+            exit_message: None,
             tick: 0,
             viewport: ViewportState::default(),
             edit_highlights: EditHighlightState::default(),

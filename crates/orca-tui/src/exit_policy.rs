@@ -8,6 +8,8 @@ use orca_core::config::HistoryMode;
 pub(crate) struct TuiExit {
     pub(crate) code: i32,
     pub(crate) session_id: Option<String>,
+    /// Why the TUI exited on its own, if it did.
+    pub(crate) message: Option<String>,
 }
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 

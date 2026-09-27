@@ -139,6 +139,9 @@ pub(crate) fn run_tui_attached(
 fn run_tui_backend(config: RunConfig, remote: Option<crate::acp_client::AttachOptions>) -> i32 {
     match run_tui_inner(config, remote) {
         Ok(exit) => {
+            if let Some(message) = exit.message.as_deref() {
+                eprintln!("orca: {message}");
+            }
             if let Some(hint) = exit_resume_hint(exit.session_id.as_deref()) {
                 let _ = io::stdout().lock().write_all(hint.as_bytes());
             }
@@ -361,6 +364,7 @@ fn run_tui_inner(
             state.current_session_id().map(ToOwned::to_owned),
             &config.history_mode,
         ),
+        message: state.exit_message.take(),
     })
 }
 
