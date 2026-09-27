@@ -2267,10 +2267,15 @@ mod tests {
         let continuations =
             find_dir_named(home.path(), "continuations").expect("the continuation store");
         let parked = continuations.with_file_name("continuations.away");
+        let blocker = continuations.with_file_name("continuations.blocker");
+        // Swap the directory and the file by renames alone. While the path is
+        // missing a renewal reads the records as gone, which ends the run by
+        // design, so the gap is kept to the instant between two renames.
+        std::fs::write(&blocker, b"not a directory").unwrap();
         std::fs::rename(&continuations, &parked).unwrap();
-        std::fs::write(&continuations, b"not a directory").unwrap();
+        std::fs::rename(&blocker, &continuations).unwrap();
         thread::sleep(ASYNC_LEASE_HEARTBEAT * 4);
-        std::fs::remove_file(&continuations).unwrap();
+        std::fs::rename(&continuations, &blocker).unwrap();
         std::fs::rename(&parked, &continuations).unwrap();
         let before = revision.lock().unwrap().get();
         let deadline = Instant::now() + Duration::from_secs(10);
