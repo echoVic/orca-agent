@@ -78,6 +78,7 @@ fn resolve_approval(
         if approved {
             state.enter_running();
         } else {
+            state.denied_approval_stops_turn = true;
             state.set_status(AppStatus::Idle);
         }
     }
@@ -125,6 +126,75 @@ mod tests {
             permission_decision_for(ApprovalOption::Deny),
             TuiPermissionDecision::Deny
         );
+    }
+
+    fn state_awaiting_a_tool_approval() -> AppState {
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            event_tx,
+            "test".to_string(),
+            "model".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = AppStatus::WaitingApproval;
+        state.approval_dialog = Some(crate::types::ApprovalDialog {
+            id: "approval-1".to_string(),
+            interaction: Some(crate::protocol::TuiInteractionKey::new(
+                orca_core::cancel::OperationIdAllocator::new().allocate(),
+                "approval-1",
+                TuiInteractionKind::Approval,
+            )),
+            tool: "edit".to_string(),
+            target: Some("billing/pages.py".to_string()),
+            permission_kind: None,
+            background_task_id: None,
+            selected: 0,
+            options: crate::types::ApprovalDialog::options_for("edit", Some("billing/pages.py")),
+            diff: None,
+            diff_scroll: 0,
+        });
+        state
+    }
+
+    fn approval_unavailable_card() -> crate::protocol::TuiEvent {
+        crate::protocol::TuiEvent::Diagnostic(
+            crate::diagnostics::TuiDiagnostic::from_surface_terminal(
+                &orca_runtime::surface::OperationTerminal::Failed {
+                    class: orca_runtime::surface::FailureClass::LegacyApprovalRequired,
+                    message: orca_runtime::surface::SafeDiagnosticText::try_new("denied in TUI")
+                        .unwrap(),
+                },
+            )
+            .expect("a failed terminal has a diagnostic"),
+        )
+    }
+
+    #[test]
+    fn a_turn_stopped_by_your_denial_ends_with_a_note_not_an_error_card() {
+        let mut state = state_awaiting_a_tool_approval();
+        let (action_tx, _action_rx) = mpsc::unbounded();
+
+        resolve_approval_option(&mut state, &action_tx, ApprovalOption::Deny);
+        state.update(approval_unavailable_card());
+
+        let last = state.transcript.messages.last().expect("a closing message");
+        assert!(
+            matches!(last, crate::transcript_state::ChatMessage::System { text, .. }
+                if text.starts_with("Denied.")),
+            "got {last:?}"
+        );
+    }
+
+    #[test]
+    fn an_approval_nobody_could_answer_still_shows_the_error_card() {
+        let mut state = state_awaiting_a_tool_approval();
+
+        state.update(approval_unavailable_card());
+
+        assert!(matches!(
+            state.transcript.messages.last(),
+            Some(crate::transcript_state::ChatMessage::Diagnostic(_))
+        ));
     }
 
     #[test]

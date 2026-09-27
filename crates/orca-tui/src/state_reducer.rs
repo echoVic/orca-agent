@@ -701,6 +701,19 @@ impl AppState {
             TuiEvent::Diagnostic(diagnostic) => {
                 self.finish_assistant_stream();
                 self.clear_receiving_tool_progress();
+                // The runtime ends a turn whose approval was denied the same
+                // way as one nobody could approve; after the user's own "no"
+                // that is their answer, not an error.
+                if self.denied_approval_stops_turn
+                    && diagnostic.code() == "permission.approval_unavailable"
+                {
+                    self.denied_approval_stops_turn = false;
+                    self.push_message(ChatMessage::System {
+                        text: "Denied. Tell Orca what to do instead.".to_string(),
+                        expanded: false,
+                    });
+                    return;
+                }
                 self.push_message(ChatMessage::Diagnostic(diagnostic));
             }
             TuiEvent::Error(msg) => {
@@ -887,6 +900,7 @@ impl AppState {
                 self.scroll_to_bottom();
             }
             TuiEvent::SessionCompleted { status } => {
+                self.denied_approval_stops_turn = false;
                 self.invalidate_recap();
                 let was_backgrounded = self.suppress_background_main_session_output;
                 let fallback_diagnostic = if self.current_turn_has_diagnostic() {

@@ -457,6 +457,9 @@ pub struct AppState {
     pub approval_allowlist: std::collections::HashSet<String>,
     /// Parked background tool calls already resumed on the session's policy.
     pub(crate) continued_background_approvals: std::collections::HashSet<String>,
+    /// The user just denied an approval, so the turn's "approval required"
+    /// stop is their answer, not a failure to ask.
+    pub(crate) denied_approval_stops_turn: bool,
     /// The turn the runtime last started by itself, so its later tool rounds
     /// are not taken for a new turn.
     pub(crate) runtime_turn_id: Option<String>,
@@ -811,6 +814,7 @@ impl AppState {
             interaction: InteractionState::default(),
             approval_allowlist: std::collections::HashSet::new(),
             continued_background_approvals: std::collections::HashSet::new(),
+            denied_approval_stops_turn: false,
             runtime_turn_id: None,
             setup_step: 0,
             setup_selection: 0,
