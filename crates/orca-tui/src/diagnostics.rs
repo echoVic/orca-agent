@@ -57,6 +57,18 @@ impl TuiDiagnostic {
         }
     }
 
+    /// Input the TUI itself turned down, such as a slash command it could
+    /// not parse. Its wording is the TUI's own, so it is never classified.
+    pub(crate) fn invalid_input(detail: impl Into<String>) -> Self {
+        Self::new(
+            DiagnosticLevel::Error,
+            "input.invalid",
+            "Input was not accepted",
+            detail,
+            Some("Correct the input and submit it again."),
+        )
+    }
+
     pub(crate) fn from_message(context: DiagnosticContext, message: impl Into<String>) -> Self {
         let message = message.into();
         let lower = message.to_ascii_lowercase();

@@ -96,13 +96,31 @@ pub fn parse_with_cwd(input: &str, cwd: &Path) -> Option<SlashCommand> {
     None
 }
 
+/// Why `input`, a slash command that did not parse, was not run: how to
+/// write a built-in command given the wrong arguments, or that there is no
+/// such command.
 pub fn invalid_slash_command_message(input: &str) -> String {
     let command = input.trim().split_whitespace().next().unwrap_or("/");
-    if command == "/workflow" {
-        "invalid workflow command. Use /workflow:<name> [args].".to_string()
-    } else {
-        format!("unknown slash command `{command}`. Type / to view available commands.")
-    }
+    let usage = match command {
+        "/workflow" => "/workflow:<name> [args]",
+        "/model" => "/model or /model <name>",
+        "/mode" => "/mode or /mode suggest|auto-edit|full-auto|plan",
+        "/plan" => "/plan or /plan off",
+        "/queue" => "/queue, /queue pause, or /queue start",
+        "/trust" => "/trust, /trust add, or /trust remove",
+        "/remember" => "/remember <note>",
+        "/goal" => "/goal edit <objective>",
+        "/task-follow-up" => "/task-follow-up <task-id> <message>",
+        _ if builtin_command_names().contains(command.trim_start_matches('/')) => {
+            return format!("{command} takes no arguments.");
+        }
+        _ => {
+            return format!(
+                "unknown slash command `{command}`. Type / to view available commands."
+            );
+        }
+    };
+    format!("Use {usage}.")
 }
 
 fn parse_static(input: &str) -> Option<SlashCommand> {
@@ -441,6 +459,42 @@ mod tests {
     #[test]
     fn clear_alias_is_reserved_from_dynamic_command_collisions() {
         assert!(builtin_command_names().contains("clear"));
+    }
+
+    #[test]
+    fn a_known_command_with_the_wrong_arguments_says_how_to_write_it() {
+        // `/recap now` said "unknown slash command `/recap`".
+        assert_eq!(
+            invalid_slash_command_message("/recap now"),
+            "/recap takes no arguments."
+        );
+        assert_eq!(
+            invalid_slash_command_message("/workflows all"),
+            "/workflows takes no arguments."
+        );
+        assert_eq!(
+            invalid_slash_command_message("/model a b"),
+            "Use /model or /model <name>."
+        );
+        assert_eq!(
+            invalid_slash_command_message("/queue clear"),
+            "Use /queue, /queue pause, or /queue start."
+        );
+        assert_eq!(
+            invalid_slash_command_message("/trust everything"),
+            "Use /trust, /trust add, or /trust remove."
+        );
+        assert_eq!(
+            invalid_slash_command_message("/remember"),
+            "Use /remember <note>."
+        );
+        assert_eq!(
+            invalid_slash_command_message("/goal edit"),
+            "Use /goal edit <objective>."
+        );
+        assert!(
+            invalid_slash_command_message("/recapp").contains("unknown slash command `/recapp`")
+        );
     }
 
     #[test]

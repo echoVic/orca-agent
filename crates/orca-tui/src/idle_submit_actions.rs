@@ -103,9 +103,11 @@ pub(crate) fn handle_idle_submit(
     }
 
     if state.status != AppStatus::WaitingUserInput && text.starts_with('/') {
-        state.push_message(ChatMessage::Error(commands::invalid_slash_command_message(
-            &text,
-        )));
+        state.push_message(ChatMessage::Diagnostic(
+            crate::diagnostics::TuiDiagnostic::invalid_input(
+                commands::invalid_slash_command_message(&text),
+            ),
+        ));
         state.pending_pastes.clear();
         state.composer_images.clear_attachments();
         state.mention_bindings.clear();
@@ -414,8 +416,9 @@ mod tests {
         assert!(action_rx.try_recv().is_err());
         assert!(matches!(
             state.transcript.messages.last(),
-            Some(ChatMessage::Error(message))
-                if message.contains("/workflow:<name>")
+            Some(ChatMessage::Diagnostic(diagnostic))
+                if diagnostic.code() == "input.invalid"
+                    && diagnostic.detail().contains("/workflow:<name>")
         ));
     }
 
@@ -446,7 +449,9 @@ mod tests {
         assert!(action_rx.try_recv().is_err());
         assert!(matches!(
             state.transcript.messages.last(),
-            Some(ChatMessage::Error(message)) if message.contains("unknown slash command")
+            Some(ChatMessage::Diagnostic(diagnostic))
+                if diagnostic.code() == "input.invalid"
+                    && diagnostic.detail().contains("unknown slash command")
         ));
     }
 

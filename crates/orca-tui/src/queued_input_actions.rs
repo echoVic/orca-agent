@@ -295,8 +295,10 @@ pub(crate) fn handle_running_key(
                     ) {
                         reset_after_running_slash(state, textarea, vim_state, theme, outcome);
                     } else {
-                        state.push_message(crate::transcript_state::ChatMessage::Error(
-                            commands::invalid_slash_command_message(&text),
+                        state.push_message(crate::transcript_state::ChatMessage::Diagnostic(
+                            crate::diagnostics::TuiDiagnostic::invalid_input(
+                                commands::invalid_slash_command_message(&text),
+                            ),
                         ));
                         reset_after_running_slash(
                             state,
@@ -932,7 +934,9 @@ mod tests {
         assert!(state.queued_pending_visible_text().is_empty());
         assert!(matches!(
             state.transcript.messages.last(),
-            Some(ChatMessage::Error(message)) if message.contains("unknown slash command")
+            Some(ChatMessage::Diagnostic(diagnostic))
+                if diagnostic.code() == "input.invalid"
+                    && diagnostic.detail().contains("unknown slash command")
         ));
         assert!(action_rx.try_recv().is_err());
     }
