@@ -17,7 +17,7 @@ pub(crate) const MARK_IDLE: &str = " ";
 /// Transcript gutter: one leading space, a one-cell glyph, two spaces.
 pub(crate) const GUTTER_WIDTH: usize = 4;
 pub(crate) const GUTTER_CONTINUATION: &str = "    ";
-/// Opens the row that closes a collapsible message (`└ +N lines · e to
+/// Opens the row that closes a collapsible message (`└ +N lines · ctrl+o to
 /// expand`). The renderer draws it and the hit test looks for it, so both
 /// read it from here.
 pub(crate) const TAIL_ROW: &str = "    └ ";

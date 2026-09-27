@@ -29,7 +29,7 @@
     ⋯ thinking · the boundary second is still treated as valid…
     ✓ read  src/auth/token.rs
     │ pub fn token_valid(now: u64, expiry: u64) -> bool {
-    └ +2 lines · e to expand
+    └ +2 lines · ctrl+o to expand
     ✎ edit  src/auth/token.rs
     │ edited src/auth/token.rs
  ●  token_valid now rejects the expiry second; the auth test passes.
@@ -47,7 +47,7 @@
 | `✓` `✎` `✗` | 工具调用：成功、改了文件、失败。输出显示在 `│` 竖线下方。 |
 | `ℹ` | Orca 的提示信息。较长的提示会像工具输出一样折叠。 |
 
-折叠的行末尾会显示 `+N lines · e to expand`。按 `e` 展开最近的一条，按 `Shift+E` 全部展开，也可以直接点击该行。
+折叠的行末尾会显示 `+N lines · ctrl+o to expand`。按 `Ctrl+O` 展开最近的一条，按 `Ctrl+Shift+O` 全部展开，也可以直接点击该行。
 
 状态栏左侧是审批模式（`⇧Tab` 切换）；右侧依次是模型和推理强度、上下文窗口剩余比例、目前的 token 用量和费用，以及帮助提示。终端足够宽时，中间还会显示当前目录和 git 分支；终端变窄时，先隐藏 token 用量和费用，再隐藏上下文比例，最后隐藏模型。
 

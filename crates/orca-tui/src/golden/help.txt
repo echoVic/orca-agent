@@ -29,7 +29,7 @@
                 │   ctrl+u                    clear input, or scroll half page when empty    │
                 │   ctrl+d                    delete forward, or scroll when input is empty  │
                 │   esc                       clear draft (up restores it); else backtrack   │
-                │   e · Shift+E               expand latest tool output · expand all         │
+                │   ctrl+o · ctrl+shift+o     expand latest tool output · expand all         │
                 │                                                                            │
                 │ ? or Esc close                                                             │
                 ╰────────────────────────────────────────────────────────────────────────────╯

@@ -1,28 +1,17 @@
 use crossbeam_channel as mpsc;
 
-use crossterm::event::{Event, KeyEvent};
+use crossterm::event::Event;
 use tui_textarea::{Input, TextArea};
 
-use orca_core::config::RunConfig;
-
-use crate::composer_input_actions::apply_composer_key_input;
-use crate::composer_textarea::textarea_text;
 use crate::protocol::UserAction;
 use crate::shortcuts::IdleShortcut;
-use crate::theme::Theme;
 use crate::types::AppState;
-use crate::vim::VimState;
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_idle_navigation_shortcut(
     shortcut: IdleShortcut,
     ev: &Event,
-    key: &KeyEvent,
     state: &mut AppState,
-    config: &RunConfig,
     textarea: &mut TextArea,
-    vim_state: &mut VimState,
-    theme: &Theme,
     action_tx: &mpsc::Sender<UserAction>,
 ) {
     match shortcut {
@@ -60,19 +49,13 @@ pub(crate) fn handle_idle_navigation_shortcut(
             let _ = action_tx.send(UserAction::Backtrack);
         }
         IdleShortcut::ExpandToolOutput => {
-            if textarea_text(textarea).trim().is_empty() && state.toggle_latest_expandable() {
-                vim_state.cancel_pending_command();
+            if state.toggle_latest_expandable() {
                 state.scroll_to_bottom();
-            } else {
-                apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme);
             }
         }
         IdleShortcut::ExpandAll => {
-            if textarea_text(textarea).trim().is_empty() && state.toggle_all_expandable() {
-                vim_state.cancel_pending_command();
+            if state.toggle_all_expandable() {
                 state.scroll_to_bottom();
-            } else {
-                apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme);
             }
         }
         IdleShortcut::Submit

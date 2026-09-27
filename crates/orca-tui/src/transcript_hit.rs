@@ -217,7 +217,7 @@ mod tests {
             "    ℹ one line",
             "    ℹ one",
             "    ℹ one",
-            "    └ +2 lines · click or e to expand",
+            "    └ +2 lines · click or ctrl+o to expand",
         ];
         let areas = collapsible_hit_areas(
             &messages,
@@ -256,7 +256,7 @@ mod tests {
 
         let rows = [
             "    ℹ word word word…",
-            "    └ +4 lines · click or e to expand",
+            "    └ +4 lines · click or ctrl+o to expand",
         ];
         let areas = collapsible_hit_areas(
             std::slice::from_ref(&one_line),

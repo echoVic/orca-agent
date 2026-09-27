@@ -36,7 +36,7 @@ bottom:
     ⋯ thinking · the boundary second is still treated as valid…
     ✓ read  src/auth/token.rs
     │ pub fn token_valid(now: u64, expiry: u64) -> bool {
-    └ +2 lines · e to expand
+    └ +2 lines · ctrl+o to expand
     ✎ edit  src/auth/token.rs
     │ edited src/auth/token.rs
  ●  token_valid now rejects the expiry second; the auth test passes.
@@ -54,8 +54,8 @@ bottom:
 | `✓` `✎` `✗` | A tool call that succeeded, edited a file, or failed, with its output under a `│` rail. |
 | `ℹ` | A notice from Orca. Long notices collapse like tool output. |
 
-A collapsed row ends with `+N lines · e to expand`. Press `e` to expand the
-latest one, `Shift+E` to expand all of them, or click a row.
+A collapsed row ends with `+N lines · ctrl+o to expand`. Press `Ctrl+O` to
+expand the latest one, `Ctrl+Shift+O` to expand all of them, or click a row.
 
 The status bar shows the approval mode on the left (`⇧Tab` cycles it). On the
 right are the model and reasoning effort, how much of the context window is

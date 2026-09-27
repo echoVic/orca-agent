@@ -747,7 +747,7 @@ function makeTuiBlocks(t: (typeof copy)[Locale]): TuiBlock[] {
       activity: "thinking",
       content: tool("✓", "read", "src/auth/token.rs", [
         { rail: "│", text: "pub fn token_valid(now: u64, expiry: u64) -> bool {" },
-        { rail: "└", text: "+84 lines · e to expand" },
+        { rail: "└", text: "+84 lines · ctrl+o to expand" },
       ]),
     },
     {
@@ -782,7 +782,7 @@ function makeTuiBlocks(t: (typeof copy)[Locale]): TuiBlock[] {
       activity: "thinking",
       content: tool("✓", "bash", "cargo test auth", [
         { rail: "│", text: "test auth::token_expiry ... ok" },
-        { rail: "└", text: "+3 lines · e to expand" },
+        { rail: "└", text: "+3 lines · ctrl+o to expand" },
       ]),
     },
     {

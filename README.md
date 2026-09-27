@@ -86,8 +86,8 @@ OS sandbox. Then type a task and press `Enter`.
   key. `Ctrl+V` attaches a clipboard image.
 - **Follow along.** Replies are marked `●`, reasoning collapses to one
   `⋯ thinking` line, and each tool call shows its output under a `│` rail.
-  `e` expands the latest collapsed output and `Shift+E` all of them. The
-  status bar shows the approval mode, the model and reasoning effort, the
+  `Ctrl+O` expands the latest collapsed output and `Ctrl+Shift+O` all of them.
+  The status bar shows the approval mode, the model and reasoning effort, the
   context left, and usage.
 - **Steer a running turn.** `Esc` interrupts. `Enter` queues a follow-up for
   the next turn, `Ctrl+Enter` sends it into the running turn (in terminals

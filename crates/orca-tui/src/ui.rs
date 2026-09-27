@@ -3767,7 +3767,7 @@ fn append_system_lines(
     lines.push(Line::from(vec![
         Span::styled(TAIL_ROW.to_string(), theme.dim_style()),
         Span::styled(
-            format!("+{hidden} lines · click or e to expand"),
+            format!("+{} · click or ctrl+o to expand", line_count(hidden)),
             theme.muted_style(),
         ),
     ]));
@@ -3924,6 +3924,15 @@ fn append_proposed_plan_lines(
     lines.push(Line::from(""));
 }
 
+/// "1 line", "3 lines".
+fn line_count(count: usize) -> String {
+    if count == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{count} lines")
+    }
+}
+
 /// Short, human tool names for transcript rows. Unknown names pass through;
 /// `tool:<id>` placeholders (history without a recorded name) become "tool".
 pub(crate) fn tool_display_name(name: &str) -> &str {
@@ -4021,11 +4030,11 @@ fn append_tool_output_lines(
     }
     let hidden = total.saturating_sub(shown);
     let tail = if hidden > 0 {
-        format!("+{hidden} lines · e to expand")
+        format!("+{} · ctrl+o to expand", line_count(hidden))
     } else if clipped {
-        "e to expand".to_string()
+        "ctrl+o to expand".to_string()
     } else if expanded && total > 2 {
-        format!("{total} lines · e to collapse")
+        format!("{total} lines · ctrl+o to collapse")
     } else {
         return;
     };
@@ -8892,7 +8901,7 @@ mod tests {
         assert_eq!(text[0], "    ✓ read  src/main.rs");
         assert_eq!(text[1], "    │ l1");
         assert_eq!(text[2], "    │ l2");
-        assert_eq!(text[3], "    └ +2 lines · e to expand");
+        assert_eq!(text[3], "    └ +2 lines · ctrl+o to expand");
         let expanded = message_text(
             None,
             &tool_call(
@@ -8903,7 +8912,10 @@ mod tests {
                 true,
             ),
         );
-        assert_eq!(expanded.last().unwrap(), "    └ 4 lines · e to collapse");
+        assert_eq!(
+            expanded.last().unwrap(),
+            "    └ 4 lines · ctrl+o to collapse"
+        );
     }
 
     fn shell_result(output: &str, exit_code: i64) -> String {
@@ -8937,7 +8949,7 @@ mod tests {
         assert_eq!(text[0], "    ✓ bash  ls -la");
         assert_eq!(text[1], "    │ total 432");
         assert_eq!(text[2], "    │ drwxr-xr-x  41 me  staff  1312 .");
-        assert_eq!(text[3], "    └ +1 lines · e to expand");
+        assert_eq!(text[3], "    └ +1 line · ctrl+o to expand");
         assert!(
             text.iter().all(|line| !line.contains("deadline_source")),
             "{text:?}"
@@ -9028,7 +9040,7 @@ mod tests {
         assert_eq!(text.len(), 3, "{text:?}");
         assert!(UnicodeWidthStr::width(text[1].as_str()) <= 80, "{text:?}");
         assert!(text[1].ends_with('…'), "{text:?}");
-        assert_eq!(text[2], "    └ e to expand");
+        assert_eq!(text[2], "    └ ctrl+o to expand");
 
         let expanded = message_text(
             None,
@@ -9323,7 +9335,10 @@ mod tests {
         );
         assert_eq!(
             collapsed[1],
-            format!("    └ +{} lines · click or e to expand", rows - 1)
+            format!(
+                "    └ +{} · click or ctrl+o to expand",
+                line_count(rows - 1)
+            )
         );
 
         let expanded = lines_text(&build_lines_for_message_after(

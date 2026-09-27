@@ -6,7 +6,7 @@
     ✓ list_skills
     │ baoyu-comic [user] - Knowledge comic creator
     │ ego-browser [user] - Browser automation
-    └ +2 lines · e to expand
+    └ +2 lines · ctrl+o to expand
     ✓ read_skill  ego-browser
     │ # ego-browser
     │ source: user
@@ -14,7 +14,7 @@
  ●  有  ego-browser skill， 我 读 一 下 它 的 使 用 说 明 。
 
     ℹ Resumed saved conversation.
-    └ +2 lines · click or e to expand
+    └ +2 lines · click or ctrl+o to expand
 
     ✗ Provider limit reached  [provider.rate_limit]
       cause  DeepSeek provider error: 429 rate limit exceeded

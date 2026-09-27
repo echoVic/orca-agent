@@ -135,20 +135,8 @@ pub(crate) fn handle_idle_key(
                 clear_composer_input(textarea, state, vim_state, theme);
                 return;
             }
-            // `e`/`E` are also vim motions (word-end); deferred to
-            // `handle_idle_navigation_shortcut`, which only cancels a
-            // pending vim command once it has actually consumed the key as
-            // an expand shortcut rather than passed it through as text/vim
-            // input.
-            if !matches!(
-                shortcut,
-                IdleShortcut::ExpandToolOutput | IdleShortcut::ExpandAll
-            ) {
-                vim_state.cancel_pending_command();
-            }
-            handle_idle_navigation_shortcut(
-                shortcut, ev, key, state, config, textarea, vim_state, theme, action_tx,
-            );
+            vim_state.cancel_pending_command();
+            handle_idle_navigation_shortcut(shortcut, ev, state, textarea, action_tx);
         }
         Some(_) | None => {
             apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme);
@@ -163,7 +151,7 @@ mod tests {
     use crate::protocol::TuiEvent;
     use crate::test_support::test_run_config;
     use crossterm::event::KeyModifiers;
-    use orca_core::config::{ThemeName, VimInsertEscapeSequence};
+    use orca_core::config::ThemeName;
 
     fn agent_task(id: &str) -> orca_core::task_types::BackgroundTaskSummary {
         orca_core::task_types::BackgroundTaskSummary {
@@ -628,11 +616,10 @@ mod tests {
         assert!(!vim.has_pending_command_for_test());
     }
 
-    #[test]
-    fn configured_first_character_does_not_steal_consumed_idle_shortcut() {
+    fn idle_state_with_a_collapsed_tool_row() -> AppState {
         let (action_tx, _action_rx) = mpsc::unbounded();
         let mut state = AppState::new(
-            action_tx.clone(),
+            action_tx,
             "test".to_string(),
             "mock".to_string(),
             "/tmp".to_string(),
@@ -642,131 +629,91 @@ mod tests {
             name: "grep".to_string(),
             target: None,
         });
-        let mut config = test_run_config();
-        config.vim_mode = true;
-        config.vim_insert_escape = Some(VimInsertEscapeSequence::parse("ee").unwrap());
-        let shared = Arc::new(Mutex::new(config.clone()));
-        let theme = Theme::named(ThemeName::Dark);
-        let mut vim = VimState::with_insert_escape(true, config.vim_insert_escape.clone());
-        vim.mode = crate::vim::VimMode::Insert;
-        let mut textarea = TextArea::default();
-        let key = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        state
+    }
 
-        handle_idle_key(
-            &Event::Key(key),
-            &key,
-            &mut state,
-            &mut config,
-            &shared,
-            &action_tx,
-            &mut textarea,
-            &mut vim,
-            &theme,
-        );
-
-        assert!(textarea.is_empty());
-        assert!(!vim.has_pending_insert_escape_for_test());
+    fn tool_row_expanded(state: &AppState) -> bool {
         let crate::transcript_state::ChatMessage::ToolCall { expanded, .. } =
             &state.transcript.messages[0]
         else {
             panic!("expected tool call");
         };
-        assert!(*expanded);
+        *expanded
     }
 
-    #[test]
-    fn shift_e_expands_all_when_composer_is_empty() {
+    fn type_into(state: &mut AppState, textarea: &mut TextArea<'static>, key: KeyEvent) {
         let (action_tx, _action_rx) = mpsc::unbounded();
-        let mut state = AppState::new(
-            action_tx.clone(),
-            "test".to_string(),
-            "mock".to_string(),
-            "/tmp".to_string(),
-        );
-        state.update(TuiEvent::ToolRequested {
-            id: "tool-1".to_string(),
-            name: "grep".to_string(),
-            target: None,
-        });
         let mut config = test_run_config();
         let shared = Arc::new(Mutex::new(config.clone()));
         let theme = Theme::named(ThemeName::Dark);
         let mut vim = VimState::new(false);
-        let mut textarea = TextArea::default();
-        let key = KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT);
-
         handle_idle_key(
             &Event::Key(key),
             &key,
-            &mut state,
+            state,
             &mut config,
             &shared,
             &action_tx,
-            &mut textarea,
+            textarea,
             &mut vim,
             &theme,
         );
-
-        assert!(
-            textarea.is_empty(),
-            "an empty composer must consume Shift+E as the expand-all shortcut, not type it"
-        );
-        let crate::transcript_state::ChatMessage::ToolCall { expanded, .. } =
-            &state.transcript.messages[0]
-        else {
-            panic!("expected tool call");
-        };
-        assert!(*expanded);
     }
 
     #[test]
-    fn shift_e_types_a_capital_e_when_the_composer_already_has_text() {
-        // Same gate as plain `e` (`nonempty_composer_keeps_vim_count_when_e_matches_expand_shortcut`
-        // above): a non-empty draft means the keystroke is text, not a shortcut.
-        let (action_tx, _action_rx) = mpsc::unbounded();
-        let mut state = AppState::new(
-            action_tx.clone(),
-            "test".to_string(),
-            "mock".to_string(),
-            "/tmp".to_string(),
-        );
-        state.update(TuiEvent::ToolRequested {
-            id: "tool-1".to_string(),
-            name: "grep".to_string(),
-            target: None,
-        });
-        let mut config = test_run_config();
-        let shared = Arc::new(Mutex::new(config.clone()));
-        let theme = Theme::named(ThemeName::Dark);
-        let mut vim = VimState::new(false);
+    fn a_message_can_start_with_e_while_output_is_collapsed() {
+        // `e` and `E` used to expand output instead of typing, so "explain…"
+        // lost its first letter whenever a row could expand.
+        for letter in ['e', 'E'] {
+            let mut state = idle_state_with_a_collapsed_tool_row();
+            let mut textarea = TextArea::default();
+            let modifiers = if letter.is_ascii_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+
+            type_into(
+                &mut state,
+                &mut textarea,
+                KeyEvent::new(KeyCode::Char(letter), modifiers),
+            );
+
+            assert_eq!(textarea_text(&textarea), letter.to_string());
+            assert!(!tool_row_expanded(&state));
+        }
+    }
+
+    #[test]
+    fn ctrl_o_expands_the_latest_output_even_with_a_draft() {
+        let mut state = idle_state_with_a_collapsed_tool_row();
         let mut textarea = TextArea::from(["draft"]);
-        let key = KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT);
 
-        handle_idle_key(
-            &Event::Key(key),
-            &key,
+        type_into(
             &mut state,
-            &mut config,
-            &shared,
-            &action_tx,
             &mut textarea,
-            &mut vim,
-            &theme,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
         );
 
-        assert!(
-            textarea_text(&textarea).contains('E'),
-            "a non-empty composer must type the character, not consume it as a shortcut; got {:?}",
-            textarea_text(&textarea)
+        assert!(tool_row_expanded(&state));
+        assert_eq!(textarea_text(&textarea), "draft");
+    }
+
+    #[test]
+    fn ctrl_shift_o_expands_all_output() {
+        let mut state = idle_state_with_a_collapsed_tool_row();
+        let mut textarea = TextArea::default();
+
+        type_into(
+            &mut state,
+            &mut textarea,
+            KeyEvent::new(
+                KeyCode::Char('O'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
         );
-        let crate::transcript_state::ChatMessage::ToolCall { expanded, .. } =
-            &state.transcript.messages[0]
-        else {
-            panic!("expected tool call");
-        };
-        assert!(
-            !*expanded,
-            "a non-empty composer must not trigger the expand-all shortcut"
-        );
+
+        assert!(tool_row_expanded(&state));
+        assert!(textarea.is_empty());
     }
 }

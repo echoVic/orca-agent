@@ -373,13 +373,18 @@ const IDLE_BINDINGS: &[(IdleShortcut, KeyBinding)] = &[
         IdleShortcut::Backtrack,
         KeyBinding::new(KeyCode::Esc, KeyModifiers::NONE),
     ),
+    // Not printable keys: `e`/`E` swallowed the first letter of a message
+    // whenever a row could expand.
     (
         IdleShortcut::ExpandToolOutput,
-        KeyBinding::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        KeyBinding::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
     ),
     (
         IdleShortcut::ExpandAll,
-        KeyBinding::new(KeyCode::Char('E'), KeyModifiers::SHIFT),
+        KeyBinding::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+        ),
     ),
 ];
 
@@ -731,7 +736,7 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     },
     ShortcutHint {
         scope: ShortcutScope::Idle,
-        keys: "e · Shift+E",
+        keys: "ctrl+o · ctrl+shift+o",
         action: "expand latest tool output · expand all",
     },
     ShortcutHint {
@@ -941,31 +946,49 @@ mod tests {
     #[test]
     fn idle_shortcuts_resolve_tool_output_expand() {
         assert_eq!(
-            idle_shortcut(key(KeyCode::Char('e'), KeyModifiers::NONE)),
+            idle_shortcut(key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
             Some(IdleShortcut::ExpandToolOutput)
+        );
+        // Legacy terminals send Ctrl+O as the C0 byte 0x0f.
+        assert_eq!(
+            idle_shortcut(key(KeyCode::Char('\u{f}'), KeyModifiers::NONE)),
+            Some(IdleShortcut::ExpandToolOutput)
+        );
+        // A letter is text: a message can start with it.
+        assert_eq!(
+            idle_shortcut(key(KeyCode::Char('e'), KeyModifiers::NONE)),
+            None
         );
     }
 
     #[test]
     fn idle_shortcuts_resolve_expand_all() {
         assert_eq!(
-            idle_shortcut(key(KeyCode::Char('E'), KeyModifiers::SHIFT)),
+            idle_shortcut(key(
+                KeyCode::Char('O'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
             Some(IdleShortcut::ExpandAll)
         );
-        // Some terminals report the shifted letter without also setting the
-        // modifier bit; `normalize_key_parts` must still resolve it.
         assert_eq!(
-            idle_shortcut(key(KeyCode::Char('E'), KeyModifiers::NONE)),
+            idle_shortcut(key(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
             Some(IdleShortcut::ExpandAll)
+        );
+        assert_eq!(
+            idle_shortcut(key(KeyCode::Char('E'), KeyModifiers::SHIFT)),
+            None
         );
     }
 
     #[test]
-    fn expand_hint_documents_both_e_and_shift_e() {
+    fn expand_hint_documents_ctrl_o_and_ctrl_shift_o() {
         let hint = shortcut_hints()
-            .find(|hint| hint.scope == ShortcutScope::Idle && hint.keys.contains('E'))
-            .expect("an Idle-scope hint mentioning E");
-        assert_eq!(hint.keys, "e · Shift+E");
+            .find(|hint| hint.scope == ShortcutScope::Idle && hint.keys.contains("ctrl+o"))
+            .expect("an Idle-scope hint for ctrl+o");
+        assert_eq!(hint.keys, "ctrl+o · ctrl+shift+o");
         assert_eq!(hint.action, "expand latest tool output · expand all");
     }
 
