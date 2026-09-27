@@ -14,6 +14,7 @@ use orca_core::event_schema::{EventEnvelope, EventPublicationStore, EventType};
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::thread_identity::{ConversationItemId, TurnId};
 use orca_core::thread_item_projection::CompletedModelResponse;
+use orca_core::tool_images::{RESUMED_TOOL_IMAGE_NOTE, drop_tool_images};
 use orca_core::tool_types::ToolResult;
 use orca_platform::fs::{
     AtomicWritePolicy, ExclusiveFileLock, atomic_write_with, open_nofollow_nonblocking,
@@ -771,6 +772,13 @@ pub(crate) fn transcript_from_records(
     let usage = (has_usage_baseline || has_foreground_usage || has_background_usage)
         .then_some(aggregate_usage);
 
+    // Tool images are persisted as assets (like user images), but unlike
+    // user images they are not meant to reappear once a session is resumed.
+    // Drop them here, once, so every caller of this function (`load_session`,
+    // `load_session_until`, and the fork/resume-at boundaries built on top of
+    // them) replays the same truncated history.
+    drop_tool_images(&mut messages, RESUMED_TOOL_IMAGE_NOTE);
+
     Ok(SessionTranscript {
         meta,
         messages,
@@ -1395,6 +1403,7 @@ impl SessionWriter {
             StoredMessage::Tool {
                 tool_call_id: result.id.clone(),
                 content,
+                images: result.images.clone(),
                 terminal: super::types::StoredToolTerminal::from_terminal(Some(result.terminal())),
                 pinned,
             },

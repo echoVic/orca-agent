@@ -383,6 +383,8 @@ pub(crate) enum StoredMessage {
     Tool {
         tool_call_id: String,
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageInput>,
         #[serde(flatten)]
         terminal: StoredToolTerminal,
         #[serde(default)]
@@ -548,6 +550,8 @@ enum StoredMessageWire {
     Tool {
         tool_call_id: String,
         content: String,
+        #[serde(default)]
+        images: Vec<ImageInput>,
         #[serde(flatten)]
         terminal: StoredToolTerminalWire,
         #[serde(default)]
@@ -585,6 +589,7 @@ impl<'de> Deserialize<'de> for StoredMessage {
             StoredMessageWire::Tool {
                 tool_call_id,
                 content,
+                images,
                 terminal,
                 pinned,
             } => {
@@ -592,6 +597,7 @@ impl<'de> Deserialize<'de> for StoredMessage {
                 Ok(Self::Tool {
                     tool_call_id,
                     content,
+                    images,
                     terminal: StoredToolTerminal { terminal },
                     pinned,
                 })
@@ -630,12 +636,13 @@ impl From<&Message> for StoredMessage {
             Message::Tool {
                 tool_call_id,
                 content,
+                images,
                 terminal,
                 pinned,
-                ..
             } => Self::Tool {
                 tool_call_id: tool_call_id.clone(),
                 content: content.clone(),
+                images: images.clone(),
                 terminal: StoredToolTerminal::from_terminal(terminal.as_ref()),
                 pinned: *pinned,
             },
@@ -670,12 +677,13 @@ impl From<StoredMessage> for Message {
             StoredMessage::Tool {
                 tool_call_id,
                 content,
+                images,
                 terminal,
                 pinned,
             } => Self::Tool {
                 tool_call_id,
                 content,
-                images: Vec::new(),
+                images,
                 terminal: terminal.terminal(),
                 pinned,
             },

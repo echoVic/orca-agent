@@ -10,7 +10,8 @@ use super::reader::INDEX_BUDGET;
 use super::retention::{SessionRetentionPolicy, retain_sessions};
 use super::types::{SessionRecord, StoredMessage, StoredSessionHealth};
 use super::writer::{
-    MAX_SESSION_LINE_BYTES, read_session_meta, read_transcript, scan_session, write_record_line,
+    MAX_SESSION_LINE_BYTES, read_records, read_session_meta, read_transcript, scan_session,
+    write_record_line,
 };
 use super::{JsonlThreadStore, SessionWriter};
 
@@ -332,6 +333,125 @@ fn retention_is_opt_in_archived_only_and_accounts_for_images() {
         assert!(active.path().exists());
         assert!(!assets::directory(&archived_path).exists());
         assert!(retain_sessions(&SessionRetentionPolicy::default(), true).is_err());
+    });
+}
+
+fn tool_result_image(size: usize) -> ImageInput {
+    ImageInput {
+        source: ImageSource::Base64 {
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(vec![42; size]),
+        },
+        detail: ImageDetail::High,
+    }
+}
+
+fn find_stored_tool_message(records: Vec<SessionRecord>) -> Option<StoredMessage> {
+    records.into_iter().find_map(|record| match record {
+        SessionRecord::Message {
+            message: message @ StoredMessage::Tool { .. },
+            ..
+        } => Some(message),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_tool_image_is_stored_as_an_asset_not_inline() {
+    crate::history::with_redirected_orca_home("tool-image-asset", |home| {
+        let mut writer = SessionWriter::start(home, "mock", None, "tool image").unwrap();
+        writer.enter_turn(TurnId::new());
+        let image = tool_result_image(4096);
+        writer
+            .append_message(&Message::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: "screenshot taken".to_string(),
+                images: vec![image.clone()],
+                terminal: None,
+                pinned: false,
+            })
+            .unwrap();
+
+        let ImageSource::Base64 { data, .. } = &image.source else {
+            panic!("expected a base64 image source");
+        };
+        let raw = fs::read_to_string(writer.path()).unwrap();
+        assert!(!raw.contains(data.as_str()));
+
+        // Read back through the reader with images loaded (unbudgeted).
+        let tool_message =
+            find_stored_tool_message(read_records(writer.path()).unwrap()).expect("tool message");
+        let Message::Tool { images, .. } = Message::from(tool_message) else {
+            unreachable!("find_stored_tool_message only returns Tool records");
+        };
+        assert_eq!(images, vec![image]);
+    });
+}
+
+#[test]
+fn a_resumed_session_drops_tool_images_with_a_note() {
+    crate::history::with_redirected_orca_home("tool-image-resume", |home| {
+        let store = JsonlThreadStore::new();
+        let mut writer = SessionWriter::start(home, "mock", None, "resume tool image").unwrap();
+        writer.enter_turn(TurnId::new());
+        writer
+            .append_message(&Message::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: "screenshot taken".to_string(),
+                images: vec![tool_result_image(4096)],
+                terminal: None,
+                pinned: false,
+            })
+            .unwrap();
+        let id = writer.session_id().unwrap();
+
+        let transcript = store.load_session(&id).unwrap();
+        let tool_message = transcript
+            .messages
+            .into_iter()
+            .find(|message| matches!(message, Message::Tool { .. }))
+            .expect("a tool message");
+        let Message::Tool {
+            images, content, ..
+        } = tool_message
+        else {
+            unreachable!("matched a Tool message above");
+        };
+        assert!(images.is_empty());
+        assert!(content.ends_with("\n[image omitted: not kept across session resume]"));
+    });
+}
+
+#[test]
+fn history_without_tool_images_loads_unchanged() {
+    crate::history::with_redirected_orca_home("tool-image-legacy", |home| {
+        let writer = SessionWriter::start(home, "mock", None, "legacy tool").unwrap();
+        let mut file = OpenOptions::new().append(true).open(writer.path()).unwrap();
+        // Hand-written, pre-images-field record: no "images" key at all.
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "conversation.message",
+                "message": {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "legacy output"
+                }
+            })
+        )
+        .unwrap();
+
+        let tool_message =
+            find_stored_tool_message(read_records(writer.path()).unwrap()).expect("tool message");
+        let StoredMessage::Tool {
+            images, content, ..
+        } = tool_message
+        else {
+            unreachable!("find_stored_tool_message only returns Tool records");
+        };
+        assert!(images.is_empty());
+        assert_eq!(content, "legacy output");
     });
 }
 
