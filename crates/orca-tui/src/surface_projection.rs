@@ -952,12 +952,56 @@ impl TuiSurfaceProjection {
             .collect()
     }
 
+    /// The plan stream of `message`'s reply, and where the plan sat in the
+    /// reply, when the plan's completed item recorded it. A response completes
+    /// into its message, then any reasoning and plan, so the plan belongs to
+    /// the message it follows before anything else does.
+    fn plan_inside_reply<'a>(
+        &self,
+        message: &SurfaceAssistantStream,
+        streams: &[&'a SurfaceAssistantStream],
+    ) -> Option<(&'a SurfaceAssistantStream, usize)> {
+        if message.channel != AssistantChannel::Message {
+            return None;
+        }
+        let reply = self.completed_items.iter().position(|item| {
+            matches!(
+                item,
+                SurfaceItem::AssistantMessage { id, text, .. }
+                    if *id == message.item_id && *text == message.text
+            )
+        })?;
+        let (plan_id, at) = self.completed_items[reply + 1..]
+            .iter()
+            .take_while(|item| {
+                matches!(
+                    item,
+                    SurfaceItem::AssistantReasoning { .. } | SurfaceItem::AssistantPlan { .. }
+                )
+            })
+            .find_map(|item| match item {
+                SurfaceItem::AssistantPlan {
+                    id,
+                    message_offset: Some(at),
+                    ..
+                } => Some((id, *at)),
+                _ => None,
+            })?;
+        let at = usize::try_from(at.get())
+            .ok()
+            .filter(|at| message.text.as_str().is_char_boundary(*at))?;
+        let plan = streams.iter().copied().find(|stream| {
+            stream.channel == AssistantChannel::Plan && stream.item_id == *plan_id
+        })?;
+        Some((plan, at))
+    }
+
     pub(crate) fn hydrate_after_delivery_watermark(
         &self,
         operation_id: &SurfaceOperationId,
         watermark: &TuiStreamDeliveryWatermark,
     ) -> Result<Vec<TuiEvent>, SurfaceProjectionError> {
-        let mut projected = self
+        let streams = self
             .assistant_stream_order
             .iter()
             .filter_map(|stream_id| self.assistant_streams.get(stream_id))
@@ -965,35 +1009,58 @@ impl TuiSurfaceProjection {
                 &stream.fence.operation_id == operation_id
                     && stream.state != SurfaceAssistantStreamState::Discarded
             })
-            .filter_map(|stream| {
-                let offset = watermark
-                    .get(&stream.stream_id)
-                    .copied()
-                    .unwrap_or_else(|| ByteOffset::new(0));
-                let Ok(offset_usize) = usize::try_from(offset.get()) else {
-                    return Some(Err(SurfaceProjectionError::InvalidDeliveryWatermark {
-                        stream_id: stream.stream_id.clone(),
-                        offset,
-                    }));
-                };
-                let text = stream.text.as_str();
-                if offset_usize > text.len() || !text.is_char_boundary(offset_usize) {
-                    return Some(Err(SurfaceProjectionError::InvalidDeliveryWatermark {
-                        stream_id: stream.stream_id.clone(),
-                        offset,
-                    }));
-                }
-                let suffix = &text[offset_usize..];
-                if suffix.is_empty() {
-                    return None;
-                }
-                Some(Ok(match stream.channel {
-                    AssistantChannel::Message => TuiEvent::MessageDelta(suffix.to_string()),
-                    AssistantChannel::Reasoning => TuiEvent::ReasoningDelta(suffix.to_string()),
-                    AssistantChannel::Plan => TuiEvent::ProposedPlanDelta(suffix.to_string()),
-                }))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Vec<_>>();
+        // Where each stream's undelivered bytes start.
+        let delivered = |stream: &SurfaceAssistantStream| {
+            let offset = watermark
+                .get(&stream.stream_id)
+                .copied()
+                .unwrap_or_else(|| ByteOffset::new(0));
+            usize::try_from(offset.get())
+                .ok()
+                .filter(|offset| stream.text.as_str().is_char_boundary(*offset))
+                .ok_or_else(|| SurfaceProjectionError::InvalidDeliveryWatermark {
+                    stream_id: stream.stream_id.clone(),
+                    offset,
+                })
+        };
+        let mut projected = Vec::new();
+        let mut placed_plans = Vec::new();
+        for stream in &streams {
+            if placed_plans.contains(&&stream.stream_id) {
+                continue;
+            }
+            let from = delivered(stream)?;
+            let text = stream.text.as_str();
+            // A plan cut from the middle of a reply has a stream of its own,
+            // so replaying stream by stream would show it after the whole
+            // message. Its completed item says where it sat: split there.
+            if let Some((plan, at)) = self.plan_inside_reply(stream, &streams) {
+                let replay = [
+                    TuiEvent::MessageDelta(text[from.min(at)..at].to_string()),
+                    TuiEvent::ProposedPlanDelta(plan.text.as_str()[delivered(plan)?..].to_string()),
+                    TuiEvent::MessageDelta(text[from.max(at)..].to_string()),
+                ];
+                projected.extend(replay.into_iter().filter(|event| {
+                    !matches!(
+                        event,
+                        TuiEvent::MessageDelta(text) | TuiEvent::ProposedPlanDelta(text)
+                            if text.is_empty()
+                    )
+                }));
+                placed_plans.push(&plan.stream_id);
+                continue;
+            }
+            let suffix = &text[from..];
+            if suffix.is_empty() {
+                continue;
+            }
+            projected.push(match stream.channel {
+                AssistantChannel::Message => TuiEvent::MessageDelta(suffix.to_string()),
+                AssistantChannel::Reasoning => TuiEvent::ReasoningDelta(suffix.to_string()),
+                AssistantChannel::Plan => TuiEvent::ProposedPlanDelta(suffix.to_string()),
+            });
+        }
         let Some(turn_ids) = self.operation_turn_ids.get(operation_id) else {
             return Ok(projected);
         };
@@ -3887,6 +3954,124 @@ mod tests {
             [TuiEvent::ReasoningDelta(reasoning), TuiEvent::MessageDelta(message)]
                 if reasoning == "reason" && message == "answer"
         ));
+    }
+
+    #[test]
+    fn foreground_hydration_puts_a_plan_back_inside_its_reply() {
+        let fence = operation_fence(50);
+        let turn_id = SurfaceTurnId::new();
+        let message_id = SurfaceItemId::new();
+        let plan_id = SurfaceItemId::new();
+        let reply = "Preface\n\nPostscript";
+        let plan_text = "# Plan\n- inspect\n";
+        let stream = |seed: u8, item_id: &SurfaceItemId, channel, text: &str, delivered: usize| {
+            SurfaceAssistantStream {
+                stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(seed)).expect("stream id"),
+                fence: fence.clone(),
+                turn_id: turn_id.clone(),
+                item_id: item_id.clone(),
+                channel,
+                next_offset: ByteOffset::new(delivered as u64),
+                text: DisplayText::new(&text[..delivered]),
+                state: SurfaceAssistantStreamState::Completed,
+            }
+        };
+        let message = stream(
+            51,
+            &message_id,
+            AssistantChannel::Message,
+            reply,
+            reply.len(),
+        );
+        let plan = stream(
+            52,
+            &plan_id,
+            AssistantChannel::Plan,
+            plan_text,
+            plan_text.len(),
+        );
+        let projection = TuiSurfaceProjection {
+            cursor: cursor(0, 1),
+            assistant_streams: BTreeMap::from([
+                (message.stream_id.clone(), message.clone()),
+                (plan.stream_id.clone(), plan.clone()),
+            ]),
+            assistant_stream_order: vec![message.stream_id.clone(), plan.stream_id.clone()],
+            completed_items: vec![
+                SurfaceItem::AssistantMessage {
+                    id: message_id.clone(),
+                    turn_id: turn_id.clone(),
+                    text: DisplayText::new(reply),
+                    pinned: false,
+                },
+                SurfaceItem::AssistantPlan {
+                    id: plan_id.clone(),
+                    turn_id: turn_id.clone(),
+                    text: DisplayText::new(plan_text),
+                    message_offset: Some(ByteOffset::new("Preface\n".len() as u64)),
+                    pinned: false,
+                },
+            ],
+            operation_turn_ids: BTreeMap::from([(
+                fence.operation_id.clone(),
+                vec![turn_id.clone()],
+            )]),
+            focused_operation: None,
+            pending_turn_started: None,
+            goal: None,
+            reducer_state: None,
+        };
+        // What the TUI had shown before the turn went to the background.
+        let shown = |message_bytes: usize, plan_bytes: usize| {
+            TuiSurfaceProjection::from_snapshot(
+                cursor(0, 1),
+                &[
+                    stream(
+                        51,
+                        &message_id,
+                        AssistantChannel::Message,
+                        reply,
+                        message_bytes,
+                    ),
+                    stream(52, &plan_id, AssistantChannel::Plan, plan_text, plan_bytes),
+                ],
+            )
+            .delivery_watermark(&fence.operation_id)
+        };
+        let replay = |watermark| {
+            projection
+                .hydrate_after_delivery_watermark(&fence.operation_id, &watermark)
+                .expect("valid delivery watermark")
+        };
+
+        let nothing_shown = replay(TuiStreamDeliveryWatermark::new());
+        assert!(
+            matches!(
+                nothing_shown.as_slice(),
+                [TuiEvent::MessageDelta(before), TuiEvent::ProposedPlanDelta(plan), TuiEvent::MessageDelta(after)]
+                    if before == "Preface\n" && plan == plan_text && after == "\nPostscript"
+            ),
+            "{nothing_shown:?}"
+        );
+
+        let preface_shown = replay(shown("Preface\n".len(), 0));
+        assert!(
+            matches!(
+                preface_shown.as_slice(),
+                [TuiEvent::ProposedPlanDelta(plan), TuiEvent::MessageDelta(after)]
+                    if plan == plan_text && after == "\nPostscript"
+            ),
+            "{preface_shown:?}"
+        );
+
+        let plan_shown = replay(shown("Preface\n\nPost".len(), plan_text.len()));
+        assert!(
+            matches!(
+                plan_shown.as_slice(),
+                [TuiEvent::MessageDelta(rest)] if rest == "script"
+            ),
+            "{plan_shown:?}"
+        );
     }
 
     #[test]
