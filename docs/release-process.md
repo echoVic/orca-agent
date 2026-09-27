@@ -142,6 +142,12 @@ node scripts/release/verify-published.mjs \
   --bin orca
 ```
 
+npm can take over ten minutes to serve a new version everywhere, so the
+checks retry for up to 15 minutes. To rerun the release's checks without
+re-tagging, including the Windows smokes, dispatch
+`gh workflow run verify-release.yml -f version=X.Y.Z`. Once a release is
+public, a rerun of its own workflow still uses the tagged commit's scripts.
+
 ## Common mistakes
 
 | Mistake | Fix |

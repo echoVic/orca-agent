@@ -107,6 +107,11 @@ if (a[0] === "view") {
   copyFileSync(path.join(fixture, "npm", name), path.join(out, name)); console.log(name);
 } else if (a[0] === "install") {
   if (process.env.ORCA_VERIFY_SCENARIO === "install-failure") process.exit(44);
+  // Right after a publish the registry can still answer ETARGET for a while.
+  if (process.env.ORCA_VERIFY_SCENARIO === "install-lag") {
+    const marker = path.join(fixture, "install-attempted");
+    try { readFileSync(marker); } catch { writeFileSync(marker, ""); process.exit(45); }
+  }
   const spec = a.at(-1), version = spec.slice(spec.lastIndexOf("@") + 1), cwd = process.cwd();
   const packageDir = path.join(cwd, "node_modules", "@blade-ai", "orca"), binDir = path.join(cwd, "node_modules", ".bin");
   mkdirSync(packageDir, { recursive: true }); mkdirSync(binDir, { recursive: true });
@@ -115,9 +120,9 @@ if (a[0] === "view") {
 } else process.exit(43);
 `);
 
-  function invoke(scenario = "ok") {
+  function invoke(scenario = "ok", retries = 1) {
     try {
-      const output = execFileSync(process.execPath, [script, "--version", version, "--repo", "echoVic/blade-deepseek", "--retries", "1", "--retry-delay-ms", "0"], {
+      const output = execFileSync(process.execPath, [script, "--version", version, "--repo", "echoVic/blade-deepseek", "--retries", String(retries), "--retry-delay-ms", "0"], {
         cwd: repoRoot,
         env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, ORCA_VERIFY_FIXTURE: fixture, ORCA_VERIFY_SCENARIO: scenario },
         encoding: "utf8",
@@ -133,6 +138,8 @@ if (a[0] === "view") {
   // Main may gain commits after the tag, before the check runs or is rerun.
   const mainAhead = invoke("main-ahead");
   if (!mainAhead.ok || !mainAhead.output.includes("Published release verified")) throw new Error(`a commit on main after the tag was rejected: ${mainAhead.output}`);
+  const lagged = invoke("install-lag", 2);
+  if (!lagged.ok || !lagged.output.includes("Published release verified")) throw new Error(`a clean install was not retried while the registry caught up: ${lagged.output}`);
   for (const [scenario, expected] of [
     ["missing-asset", "missing asset"],
     ["wrong-target", "not in the history of main"],

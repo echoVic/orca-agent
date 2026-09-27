@@ -16,7 +16,9 @@ const TARGETS = [
 ];
 
 function parseArgs(argv) {
-  const args = { version: null, repo: "echoVic/orca-agent", packageName: "@blade-ai/orca", bin: "orca", retries: 12, retryDelayMs: 10000 };
+  // npm can take over ten minutes after a publish to serve every version to
+  // `npm view`, `npm pack`, and `npm install` alike, so wait up to 15 minutes.
+  const args = { version: null, repo: "echoVic/orca-agent", packageName: "@blade-ai/orca", bin: "orca", retries: 60, retryDelayMs: 15000 };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--version") args.version = argv[++index];
@@ -145,7 +147,7 @@ async function main() {
     const installDir = path.join(tempDir, "install");
     mkdirSync(installDir);
     writeFileSync(path.join(installDir, "package.json"), `${JSON.stringify({ private: true }, null, 2)}\n`);
-    run("npm", ["install", "--save-exact", `${args.packageName}@${version}`], { cwd: installDir });
+    await retry(`npm install ${args.packageName}@${version}`, args, () => run("npm", ["install", "--save-exact", `${args.packageName}@${version}`], { cwd: installDir }));
     const installed = JSON.parse(readFileSync(path.join(installDir, "node_modules", "@blade-ai", "orca", "package.json"), "utf8"));
     if (installed.version !== version) throw new Error(`clean install resolved ${installed.version}, expected ${version}`);
     const smoke = run(path.join(installDir, "node_modules", ".bin", args.bin), ["--version"], { cwd: installDir });

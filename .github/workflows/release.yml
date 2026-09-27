@@ -483,7 +483,15 @@ jobs:
           New-Item -ItemType Directory -Force -Path $root | Out-Null
           Set-Content -Path (Join-Path $root "package.json") -Value '{"private":true}'
           Push-Location $root
-          npm install --ignore-scripts --save-exact "@blade-ai/orca@${{ needs.version.outputs.version }}"
+          # npm can take minutes after a publish to serve the new version.
+          $attempts = 60
+          for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+            npm install --ignore-scripts --save-exact "@blade-ai/orca@${{ needs.version.outputs.version }}"
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq $attempts) { throw "npm install failed $attempts times" }
+            Write-Host "npm install attempt $attempt/$attempts failed; retrying in 15s"
+            Start-Sleep -Seconds 15
+          }
           node (Join-Path $root "node_modules/@blade-ai/orca/bin/orca.js") --version
           Pop-Location
       - name: Smoke the published PowerShell installer
