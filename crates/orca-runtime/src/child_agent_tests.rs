@@ -11,24 +11,26 @@ use orca_core::cancel::CancelToken;
 use orca_core::config::{
     HistoryMode, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig, WorkflowConfig,
 };
-use orca_core::conversation::{Message, RawToolCall};
+use orca_core::conversation::{ImageDetail, ImageInput, ImageSource, Message, RawToolCall};
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::mcp_types::McpServerConfig;
-use orca_core::model::{AUTO_MODEL, FLASH_MODEL, ModelSelection};
+use orca_core::model::{AUTO_MODEL, FLASH_MODEL, ModelSelection, PRO_MODEL};
 use orca_core::provider_types::{
     ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep, Usage,
 };
 use orca_core::subagent_config::SubagentConfig;
 use orca_core::subagent_types::SubagentType;
 use orca_core::thread_identity::TurnId;
+use orca_core::tool_images::TOOL_IMAGE_UNAVAILABLE_NOTE;
 use orca_core::tool_types::{ToolInvocationStarted, ToolName, ToolRequest, ToolResult, ToolStatus};
 use orca_mcp::McpRegistry;
 
+use crate::child_agent_provider_turn::child_agent_model_conversation;
 use crate::child_agent_response_folding::fold_child_agent_tool_result_and_close_siblings;
-use crate::hooks::HookRunner;
+use crate::hooks::{HookOutcome, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
 
@@ -315,7 +317,8 @@ fn route_child_agent_model_updates_provider_config_and_cost_model() {
     // tracker's pricing rather than merely leaving it unchanged.
     let mut tracker = CostTracker::new(Some(orca_core::model::PRO_MODEL));
 
-    let provider_config = route_child_agent_model(&runtime_config, &request, &setup, &mut tracker);
+    let provider_config =
+        route_child_agent_model(&runtime_config, &request, &setup, &mut tracker).provider_config;
     let totals = tracker.add_usage(Usage {
         input_tokens: 1_000,
         output_tokens: 1_000,
@@ -325,6 +328,89 @@ fn route_child_agent_model_updates_provider_config_and_cost_model() {
     assert_eq!(provider_config.model.as_deref(), Some(FLASH_MODEL));
     let expected_flash_cost = (1_000.0 * 0.14 + 1_000.0 * 0.28) / 1_000_000.0;
     assert!((totals.estimated_cost_usd - expected_flash_cost).abs() < 1e-12);
+}
+
+#[test]
+fn a_child_agent_on_a_model_that_cannot_see_images_gets_a_note() {
+    // Routes a child whose conversation holds one tool image and returns the
+    // tool message the child sends to that model.
+    fn sent_tool_message(model: &str) -> Message {
+        let runtime_config = config(Some(model));
+        let mut setup = child_loop_setup(&runtime_config);
+        setup.conversation.messages.push(Message::Assistant {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![RawToolCall {
+                id: "call-screenshot".to_string(),
+                function_name: "mcp__screen__capture".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            pinned: false,
+        });
+        setup.conversation.messages.push(Message::Tool {
+            tool_call_id: "call-screenshot".to_string(),
+            content: "screenshot taken\n[1 image attached]".to_string(),
+            images: vec![ImageInput {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".to_string(),
+                    data: "AA==".to_string(),
+                },
+                detail: ImageDetail::High,
+            }],
+            terminal: None,
+            pinned: false,
+        });
+        let request = ChildAgentRequest::new(
+            "inspect repo".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let model_turn = route_child_agent_model(
+            &runtime_config,
+            &request,
+            &setup,
+            &mut CostTracker::new(None),
+        );
+
+        let sent = child_agent_model_conversation(
+            &setup.conversation,
+            &HookOutcome::default(),
+            model_turn.decision.image_route,
+        );
+
+        assert!(
+            matches!(
+                setup.conversation.messages.last(),
+                Some(Message::Tool { images, .. }) if images.len() == 1
+            ),
+            "the child's own conversation keeps its image"
+        );
+        sent.messages
+            .into_iter()
+            .rev()
+            .find(|message| matches!(message, Message::Tool { .. }))
+            .expect("the child sends its tool message")
+    }
+
+    let Message::Tool {
+        content, images, ..
+    } = sent_tool_message(PRO_MODEL)
+    else {
+        panic!("expected a tool message");
+    };
+    assert!(images.is_empty());
+    assert!(content.ends_with(TOOL_IMAGE_UNAVAILABLE_NOTE));
+
+    let Message::Tool {
+        content, images, ..
+    } = sent_tool_message(FLASH_MODEL)
+    else {
+        panic!("expected a tool message");
+    };
+    assert_eq!(images.len(), 1);
+    assert!(!content.contains(TOOL_IMAGE_UNAVAILABLE_NOTE));
 }
 
 #[test]
@@ -346,7 +432,7 @@ fn run_child_agent_provider_turn_applies_model_hooks_around_provider_call() {
         &instructions,
         &memory,
     );
-    let provider_config = route_child_agent_model(
+    let model_turn = route_child_agent_model(
         &runtime_config,
         &request,
         &setup,
@@ -364,7 +450,7 @@ fn run_child_agent_provider_turn_applies_model_hooks_around_provider_call() {
         &setup,
         std::env::temp_dir().as_path(),
         &hooks,
-        &provider_config,
+        &model_turn,
         &cancel,
     );
 
@@ -399,7 +485,7 @@ fn run_child_agent_provider_turn_returns_child_failure_for_model_hook_errors() {
         &instructions,
         &memory,
     );
-    let provider_config = route_child_agent_model(
+    let model_turn = route_child_agent_model(
         &runtime_config,
         &request,
         &setup,
@@ -417,7 +503,7 @@ fn run_child_agent_provider_turn_returns_child_failure_for_model_hook_errors() {
         &setup,
         std::env::temp_dir().as_path(),
         &pre_hooks,
-        &provider_config,
+        &model_turn,
         &cancel,
     );
 
@@ -447,7 +533,7 @@ fn run_child_agent_provider_turn_returns_child_failure_for_model_hook_errors() {
         &setup,
         std::env::temp_dir().as_path(),
         &post_hooks,
-        &provider_config,
+        &model_turn,
         &cancel,
     );
 

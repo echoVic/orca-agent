@@ -10,6 +10,7 @@ use orca_provider::{ProviderConfig, context};
 use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
+use crate::image_routing::conversation_has_images;
 use crate::lifecycle::{AgentLoopResult, RuntimeTaskActor, RuntimeTurnContext};
 use crate::operation_context::OperationContext;
 use crate::runtime_model_route::{RuntimeModelRouteInput, RuntimeModelRouteStep};
@@ -150,13 +151,7 @@ impl RuntimeTurnOpeningStep {
             actor: input.actor,
             model: input.model,
             turn_context: turn_context.clone(),
-            has_images: input.conversation.messages.iter().any(|message| {
-                matches!(
-                    message,
-                    orca_core::conversation::Message::User { images, .. }
-                        if !images.is_empty()
-                )
-            }),
+            has_images: conversation_has_images(input.conversation),
             model_override: input.model_override,
             provider_config: input.provider_config,
             cost_tracker: input.cost_tracker,

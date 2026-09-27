@@ -2120,6 +2120,103 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_image_makes_the_turn_image_bearing() {
+        fn image_route_for(model: &str) -> orca_core::model::ImageRouteDecision {
+            let mut lifecycle = RuntimeSessionLifecycle::new("tool-image-route".to_string());
+            let mut actor = RuntimeTaskActor::new(&mut lifecycle);
+            let mut events = EventFactory::new("tool-image-route".to_string());
+            let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+            let provider_config = ProviderConfig {
+                api_key: Some("test-key".to_string()),
+                base_url: None,
+                model: None,
+                reasoning_effort: orca_core::config::ReasoningEffort::Max,
+                tools_override: Some(Vec::new()),
+                mcp_registry: None,
+                external_tools: Vec::new(),
+                max_output_tokens: None,
+            };
+            let context_config = context::ContextConfig::for_model_with_runtime(
+                Some(model),
+                &ModelRuntimeConfig::default(),
+                orca_core::config::ReasoningEffort::default(),
+            );
+            let hooks = HookRunner::default();
+            // Only the tool message carries an image; the user message is text.
+            let mut conversation = Conversation::new();
+            conversation.add_user("capture the screen".to_string());
+            conversation.messages.push(Message::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![orca_core::conversation::RawToolCall {
+                    id: "call-screenshot".to_string(),
+                    function_name: "mcp__screen__capture".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                pinned: false,
+            });
+            conversation.messages.push(Message::Tool {
+                tool_call_id: "call-screenshot".to_string(),
+                content: "screenshot taken\n[1 image attached]".to_string(),
+                images: vec![orca_core::conversation::ImageInput {
+                    source: orca_core::conversation::ImageSource::Base64 {
+                        media_type: "image/png".to_string(),
+                        data: "AA==".to_string(),
+                    },
+                    detail: orca_core::conversation::ImageDetail::High,
+                }],
+                terminal: None,
+                pinned: false,
+            });
+            let mut cost_tracker = CostTracker::new(None);
+            let model = ModelSelection::parse(Some(model.to_string())).expect("model");
+            let subagent_type = SubagentType::General;
+            let turn_context = RuntimeTurnContext::new(
+                Path::new("."),
+                "capture the screen",
+                0,
+                false,
+                &subagent_type,
+            );
+
+            let result = RuntimeTurnOpeningStep::new()
+                .open(RuntimeTurnOpeningInput {
+                    actor: &mut actor,
+                    operation: &mut crate::operation_context::OperationContext::for_tests(
+                        orca_core::budget::BudgetSpec::default(),
+                        "tool-image-route",
+                    ),
+                    provider: ProviderKind::Mock,
+                    context_config: &context_config,
+                    provider_config: &provider_config,
+                    turn_context,
+                    hooks: &hooks,
+                    events: &mut events,
+                    sink: &mut sink,
+                    conversation: &mut conversation,
+                    history_writer: None,
+                    model: &model,
+                    model_override: None,
+                    cost_tracker: &mut cost_tracker,
+                })
+                .expect("open turn");
+            match result {
+                RuntimeTurnOpeningResult::Continue { image_route, .. } => image_route,
+                RuntimeTurnOpeningResult::Return(_) => panic!("opening should continue"),
+            }
+        }
+
+        assert_eq!(
+            image_route_for(orca_core::model::FLASH_MODEL),
+            orca_core::model::ImageRouteDecision::Direct
+        );
+        assert_eq!(
+            image_route_for(orca_core::model::PRO_MODEL),
+            orca_core::model::ImageRouteDecision::DescribeThenContinue
+        );
+    }
+
+    #[test]
     fn model_route_step_returns_provider_config_and_emits_event() {
         let mut lifecycle = RuntimeSessionLifecycle::new("model-route-step".to_string());
         let mut actor = RuntimeTaskActor::new(&mut lifecycle);

@@ -261,19 +261,19 @@ where
         }
 
         let child_cancel = CancelToken::new();
-        let mut turn_provider_config =
+        let mut model_turn =
             route_child_agent_model(config, context.request, &setup, context.child_cost_tracker);
         if summary_only {
             prepare_investigation_summary_turn(
                 &mut setup,
-                &mut turn_provider_config,
+                &mut model_turn.provider_config,
                 &mut summary_prompt_added,
             );
         }
 
-        let measurement = context::measure_prompt(&setup.conversation, &turn_provider_config);
-        let request_config = context::with_request_reply_budget(
-            &turn_provider_config,
+        let measurement = context::measure_prompt(&setup.conversation, &model_turn.provider_config);
+        model_turn.provider_config = context::with_request_reply_budget(
+            &model_turn.provider_config,
             &setup.context_config,
             measurement.tokens,
         );
@@ -284,7 +284,7 @@ where
             &setup,
             context.cwd,
             context.hooks,
-            &request_config,
+            &model_turn,
             &child_cancel,
         ) {
             ChildAgentProviderTurn::Response(response) => response,
@@ -542,19 +542,19 @@ where
         }
 
         let child_cancel = CancelToken::new();
-        let mut turn_provider_config =
+        let mut model_turn =
             route_child_agent_model(config, context.request, &setup, context.child_cost_tracker);
         if summary_only {
             prepare_investigation_summary_turn(
                 &mut setup,
-                &mut turn_provider_config,
+                &mut model_turn.provider_config,
                 &mut summary_prompt_added,
             );
         }
 
-        let measurement = context::measure_prompt(&setup.conversation, &turn_provider_config);
-        let request_config = context::with_request_reply_budget(
-            &turn_provider_config,
+        let measurement = context::measure_prompt(&setup.conversation, &model_turn.provider_config);
+        model_turn.provider_config = context::with_request_reply_budget(
+            &model_turn.provider_config,
             &setup.context_config,
             measurement.tokens,
         );
@@ -565,7 +565,7 @@ where
             &setup,
             context.cwd,
             context.hooks,
-            &request_config,
+            &model_turn,
             &child_cancel,
             observer,
         ) {

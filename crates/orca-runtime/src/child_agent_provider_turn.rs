@@ -3,12 +3,13 @@ use std::path::Path;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
+use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
-use orca_core::model::ModelRouteContext;
+use orca_core::model::{ImageRouteDecision, ModelRouteContext};
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
-use orca_provider::ProviderConfig;
+use orca_core::tool_images::{TOOL_IMAGE_UNAVAILABLE_NOTE, drop_tool_images};
 
 use crate::child_agent_loop_setup::ChildAgentLoopSetup;
 use crate::child_agent_types::{
@@ -19,8 +20,9 @@ use crate::compaction::{
     RuntimeCompactionPolicy, RuntimeCompactionRetryDecision, RuntimeCompactionStep,
 };
 use crate::cost::CostTracker;
-use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
-use crate::lifecycle::RuntimeTurnContext;
+use crate::hooks::{HookContext, HookOutcome, HookRunner, conversation_with_hook_context};
+use crate::image_routing::conversation_has_images;
+use crate::lifecycle::{RuntimeModelTurn, RuntimeTurnContext};
 
 #[derive(Debug)]
 pub enum ChildAgentProviderErrorDecision {
@@ -41,16 +43,40 @@ pub fn route_child_agent_model(
     request: &ChildAgentRequest,
     setup: &ChildAgentLoopSetup,
     child_cost_tracker: &mut CostTracker,
-) -> ProviderConfig {
-    let route_decision = config.model.route(ModelRouteContext {
+) -> RuntimeModelTurn {
+    let decision = config.model.route(ModelRouteContext {
         subagent_type: &request.subagent_type,
         subagent_model: None,
-        has_images: false,
+        has_images: conversation_has_images(&setup.conversation),
     });
-    child_cost_tracker.set_model(Some(&route_decision.actual_model));
+    child_cost_tracker.set_model(Some(&decision.actual_model));
     let mut provider_config = setup.provider_config.clone();
-    provider_config.model = Some(route_decision.actual_model);
-    provider_config
+    provider_config.model = Some(decision.actual_model.clone());
+    RuntimeModelTurn {
+        decision,
+        provider_config,
+    }
+}
+
+/// The conversation a child sends to its model: its own conversation plus the
+/// pre-model hook context.
+///
+/// Child turns skip `prepare_image_conversation`, so unless the route is
+/// `Direct`, this copy carries a note in place of each tool image. The child's
+/// own conversation keeps its images.
+pub(crate) fn child_agent_model_conversation(
+    conversation: &Conversation,
+    pre_model_outcome: &HookOutcome,
+    image_route: ImageRouteDecision,
+) -> Conversation {
+    let mut model_conversation = conversation_with_hook_context(conversation, pre_model_outcome);
+    if image_route != ImageRouteDecision::Direct {
+        drop_tool_images(
+            &mut model_conversation.messages,
+            TOOL_IMAGE_UNAVAILABLE_NOTE,
+        );
+    }
+    model_conversation
 }
 
 pub fn run_child_agent_provider_turn(
@@ -58,7 +84,7 @@ pub fn run_child_agent_provider_turn(
     setup: &ChildAgentLoopSetup,
     cwd: &Path,
     hooks: &HookRunner,
-    provider_config: &ProviderConfig,
+    model_turn: &RuntimeModelTurn,
     cancel: &CancelToken,
 ) -> ChildAgentProviderTurn {
     let pre_model_outcome = match hooks.run(
@@ -86,13 +112,16 @@ pub fn run_child_agent_provider_turn(
             };
         }
     };
-    let model_conversation =
-        conversation_with_hook_context(&setup.conversation, &pre_model_outcome);
+    let model_conversation = child_agent_model_conversation(
+        &setup.conversation,
+        &pre_model_outcome,
+        model_turn.decision.image_route,
+    );
 
     let response = orca_provider::call_streaming(
         config.provider,
         &model_conversation,
-        provider_config,
+        &model_turn.provider_config,
         cancel,
         &mut |_| {},
     );
@@ -128,7 +157,7 @@ pub fn run_child_agent_provider_turn_observed(
     setup: &ChildAgentLoopSetup,
     cwd: &Path,
     hooks: &HookRunner,
-    provider_config: &ProviderConfig,
+    model_turn: &RuntimeModelTurn,
     cancel: &CancelToken,
     observer: Option<&dyn ChildAgentActivityPublisher>,
 ) -> ChildAgentProviderTurn {
@@ -157,14 +186,17 @@ pub fn run_child_agent_provider_turn_observed(
             };
         }
     };
-    let model_conversation =
-        conversation_with_hook_context(&setup.conversation, &pre_model_outcome);
+    let model_conversation = child_agent_model_conversation(
+        &setup.conversation,
+        &pre_model_outcome,
+        model_turn.decision.image_route,
+    );
 
     let mut activity_error = None;
     let response = orca_provider::call_streaming(
         config.provider,
         &model_conversation,
-        provider_config,
+        &model_turn.provider_config,
         cancel,
         &mut |_| {
             if let Some(observer) = observer {

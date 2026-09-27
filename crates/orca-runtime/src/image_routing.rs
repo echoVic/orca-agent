@@ -5,6 +5,7 @@ use orca_core::conversation::{
 };
 use orca_core::model::{ImageRouteDecision, VISION_MODEL};
 use orca_core::provider_types::{ProviderResponse, Usage};
+use orca_core::tool_images::{TOOL_IMAGE_UNAVAILABLE_NOTE, drop_tool_images};
 use orca_provider::ProviderConfig;
 use sha2::{Digest as _, Sha256};
 
@@ -27,6 +28,16 @@ struct PendingImageAnalysis {
     query: String,
     outline: Option<String>,
     images: Vec<ImageInput>,
+}
+
+/// Whether any message carries an image, either one the user attached or one a
+/// tool returned. Either kind makes the turn image-bearing: a model that can
+/// see images receives them, and any other model gets text in their place.
+pub(crate) fn conversation_has_images(conversation: &Conversation) -> bool {
+    conversation
+        .messages
+        .iter()
+        .any(|message| !message.images().is_empty())
 }
 
 pub(crate) fn prepare_image_conversation(
@@ -61,8 +72,11 @@ pub(crate) fn prepare_image_conversation(
         ImageRouteDecision::DescribeThenContinue => {}
     }
 
-    let pending = pending_analyses(conversation);
+    // Only user images are described. A tool image never reaches the vision
+    // model; the text model gets a note in its place.
     let mut prepared = conversation.clone();
+    drop_tool_images(&mut prepared.messages, TOOL_IMAGE_UNAVAILABLE_NOTE);
+    let pending = pending_analyses(&prepared);
     let mut persisted_analyses = Vec::with_capacity(pending.len());
     let mut usage = None;
     for analysis in pending {
@@ -379,6 +393,56 @@ mod tests {
         )
         .unwrap();
         assert!(second.persisted_analyses.is_empty());
+    }
+
+    #[test]
+    fn a_model_that_cannot_see_images_gets_a_note_instead_of_tool_images() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("capture the screen".to_string());
+        conversation.messages.push(Message::Assistant {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![orca_core::conversation::RawToolCall {
+                id: "call-screenshot".to_string(),
+                function_name: "mcp__screen__capture".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            pinned: false,
+        });
+        conversation.messages.push(Message::Tool {
+            tool_call_id: "call-screenshot".to_string(),
+            content: "screenshot taken\n[1 image attached]".to_string(),
+            images: vec![image()],
+            terminal: None,
+            pinned: false,
+        });
+
+        let prepared = prepare_image_conversation(
+            &conversation,
+            ImageRouteDecision::DescribeThenContinue,
+            ProviderKind::Mock,
+            &config(),
+            &CancelToken::new(),
+        )
+        .unwrap();
+
+        let Some(Message::Tool {
+            content, images, ..
+        }) = prepared.conversation.messages.last()
+        else {
+            panic!("the tool message must stay last");
+        };
+        assert!(images.is_empty());
+        assert!(content.ends_with(orca_core::tool_images::TOOL_IMAGE_UNAVAILABLE_NOTE));
+        assert!(prepared.usage.is_none());
+        assert!(
+            prepared.persisted_analyses.is_empty(),
+            "tool images must never be sent for description"
+        );
+        assert!(matches!(
+            conversation.messages.last(),
+            Some(Message::Tool { images, .. }) if images.len() == 1
+        ));
     }
 
     #[test]

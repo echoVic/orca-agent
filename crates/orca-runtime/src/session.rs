@@ -91,7 +91,7 @@ pub(crate) fn record_tool_result_for_agent(
     let message = Message::Tool {
         tool_call_id: result.id.clone(),
         content: result_content.clone(),
-        images: Vec::new(),
+        images: result.images.clone(),
         terminal: Some(result.terminal().clone()),
         pinned: false,
     };
@@ -1152,6 +1152,45 @@ mod tests {
                 .render()
                 .contains("[Plan reminder]")
         );
+    }
+
+    #[test]
+    fn a_tool_results_images_are_recorded_on_its_tool_message() {
+        let request = ToolRequest {
+            id: "call-screenshot".to_string(),
+            name: ToolName::Mcp("mcp__screen__capture".to_string()),
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+        let image = orca_core::conversation::ImageInput {
+            source: orca_core::conversation::ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "AA==".to_string(),
+            },
+            detail: orca_core::conversation::ImageDetail::High,
+        };
+        let result = ToolResult::completed(
+            &request,
+            "screenshot taken\n[1 image attached]".to_string(),
+            false,
+        )
+        .with_images(vec![image.clone()]);
+        let mut conversation = Conversation::new();
+
+        record_tool_result_for_agent(&mut conversation, None, &result, false)
+            .expect("record tool result");
+
+        let Some(Message::Tool {
+            tool_call_id,
+            images,
+            ..
+        }) = conversation.messages.last()
+        else {
+            panic!("the tool result must become the last message");
+        };
+        assert_eq!(tool_call_id, "call-screenshot");
+        assert_eq!(images, &vec![image]);
     }
 
     #[test]
