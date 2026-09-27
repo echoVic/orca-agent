@@ -17344,6 +17344,7 @@ impl ThreadActor {
                     _ = subagent_relay_poll.tick() => {
                         self.drain_subagent_relays_while_idle();
                         self.drain_detached_permission_requests(None);
+                        rearm_subagent_relay_poll(&mut subagent_relay_poll);
                     }
                     _ = wait_for_surface_transition_retry(surface_retry_at) => {
                         self.retry_pending_surface_transition(None);
@@ -17627,6 +17628,7 @@ impl ThreadActor {
                 _ = subagent_relay_poll.tick() => {
                     self.drain_subagent_relays_for_active(&mut active);
                     self.drain_detached_permission_requests(Some(&active));
+                    rearm_subagent_relay_poll(&mut subagent_relay_poll);
                     self.active = Some(active);
                 }
                 wake = capability_change_rx.recv(), if !capability_change_rx.is_closed() => {
@@ -23211,6 +23213,15 @@ fn subagent_relay_poll_interval() -> tokio::time::Interval {
     interval
 }
 
+/// Rearms the detached-child poll once its drain has run, a whole period
+/// from now. The interval ticks at fixed times, so a drain as long as the
+/// period left the next tick already due, and the actor loops, which poll
+/// their arms in order, took it again every turn and never reached the
+/// commands behind it.
+fn rearm_subagent_relay_poll(poll: &mut tokio::time::Interval) {
+    poll.reset();
+}
+
 async fn wait_for_surface_transition_retry(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -23256,6 +23267,33 @@ fn send_thread_shutdown(
             }
             Err(TrySendError::Closed(_)) => return Err(RuntimeHostError::ThreadUnavailable),
         }
+    }
+}
+
+#[cfg(test)]
+mod relay_poll_tests {
+    use super::rearm_subagent_relay_poll;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_slow_relay_drain_does_not_leave_the_next_poll_due() {
+        // The poll ticks at fixed times. A drain as long as the period left
+        // the next tick already due, and the actor loops, which poll their
+        // arms in order, chose it again every turn and never reached the
+        // commands behind it.
+        let mut poll = tokio::time::interval(Duration::from_millis(100));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        poll.tick().await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        rearm_subagent_relay_poll(&mut poll);
+
+        assert!(
+            tokio::time::timeout(Duration::ZERO, poll.tick())
+                .await
+                .is_err(),
+            "the next poll must wait a whole period after a slow drain"
+        );
     }
 }
 
