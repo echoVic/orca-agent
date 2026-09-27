@@ -6561,10 +6561,10 @@ fn terminate_worker(worker: &mut OwnedWorker) {
     orca_tools::process::kill_child_tree(&mut worker.child);
 }
 
-#[cfg(unix)]
 /// How long a stop waits for a launching worker to be handed over.
 const WORKER_HANDOFF_WAIT: Duration = Duration::from_secs(5);
 
+#[cfg(unix)]
 const SUBAGENT_WORKER_PROCESS_PREFIX: &str = "orca-subagent-worker-";
 
 #[cfg(unix)]
