@@ -791,19 +791,10 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         .as_ref()
         .and_then(|ingress| ingress.parent_fence())
         .is_some();
-    let custom_agent = matches!(
-        request.subagent_type,
-        orca_core::subagent_types::SubagentType::Custom(_)
-    ) || request.resume_from.as_deref().is_some_and(|selector| {
-        crate::agent_continuation::ChildAgentCoordinator::new(task_registry.clone())
-            .and_then(|coordinator| coordinator.prepared(selector))
-            .is_ok_and(|source| source.compatibility.frozen_agent.is_some())
-    });
     if request.mode == SubagentMode::Async
         && !task_registry.is_process_local()
         && has_parent_fence
         && activity_ingress.is_some()
-        && (agent_controller.is_none() || has_parent_fence || custom_agent)
     {
         let launch = launch_async_subagent(AsyncSubagentLaunchContext {
             config: &child_config,
