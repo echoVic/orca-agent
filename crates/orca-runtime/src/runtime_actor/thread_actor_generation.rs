@@ -2076,6 +2076,7 @@ impl ThreadActor {
     pub(super) fn surface_completed_tool_result(
         tool: &surface::SurfaceToolView,
         result: &orca_core::tool_types::ToolResult,
+        cwd: &surface::CanonicalPath,
     ) -> io::Result<(surface::SurfaceToolResult, surface::DisplayText)> {
         if tool.request.name.as_str() != result.name.as_str() {
             return Err(io::Error::new(
@@ -2159,7 +2160,13 @@ impl ThreadActor {
                     None
                 },
                 truncated: result.truncated,
-                file_change: None,
+                file_change: result.file_change_preview.as_deref().and_then(|preview| {
+                    surface_file_change(
+                        preview,
+                        tool.request.target.as_ref().map(|target| target.as_str()),
+                        cwd,
+                    )
+                }),
             },
             content,
         ))
@@ -2221,7 +2228,8 @@ impl ThreadActor {
                     "tool completion differs from the active committed provider tool",
                 ));
             }
-            let (completed, content) = Self::surface_completed_tool_result(tool, result)?;
+            let (completed, content) =
+                Self::surface_completed_tool_result(tool, result, &snapshot.thread.cwd)?;
             let terminal = completed.terminal.clone();
             events.push((
                 scope.clone(),
@@ -2461,7 +2469,8 @@ impl ThreadActor {
                 "recovered tool completion has a stale fence or invocation projection revision",
             ));
         }
-        let (completed, content) = Self::surface_completed_tool_result(tool, result)?;
+        let (completed, content) =
+            Self::surface_completed_tool_result(tool, result, &snapshot.thread.cwd)?;
         if !matches!(
             &completed.terminal,
             surface::SurfaceToolTerminal {
@@ -5572,6 +5581,103 @@ impl ThreadActor {
             ),
         );
         Ok(())
+    }
+}
+
+/// The surface form of the diff an edit or write produced, placed at the file
+/// it changed: the tool's target (the path argument), resolved against the
+/// thread's working directory.
+fn surface_file_change(
+    preview: &orca_core::tool_types::FileChangePreview,
+    target: Option<&str>,
+    cwd: &surface::CanonicalPath,
+) -> Option<surface::SurfaceFileChange> {
+    use orca_core::tool_types::FileChangePreview;
+    let named = match preview {
+        FileChangePreview::UnifiedDiff { .. } => target?,
+        FileChangePreview::Omitted { path, .. } => target.unwrap_or(path),
+    };
+    let mut resolved = std::path::PathBuf::new();
+    for component in cwd.as_path().join(named).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    let path = surface::CanonicalPath::try_new(resolved).ok()?;
+    Some(match preview {
+        FileChangePreview::UnifiedDiff { text, .. } => surface::SurfaceFileChange::UnifiedDiff {
+            path,
+            digest: surface::Sha256Digest::digest(text),
+            text: surface::DisplayText::new(text.clone()),
+        },
+        FileChangePreview::Omitted {
+            max_input_bytes, ..
+        } => surface::SurfaceFileChange::PreviewOmitted {
+            path,
+            input_bytes: surface::ByteCount::new(0),
+            maximum_bytes: surface::ByteCount::new(
+                u64::try_from(*max_input_bytes).unwrap_or(u64::MAX),
+            ),
+        },
+    })
+}
+
+#[cfg(test)]
+mod file_change_tests {
+    use super::surface_file_change;
+    use crate::runtime_surface as surface;
+    use orca_core::tool_types::FileChangePreview;
+
+    fn workspace() -> surface::CanonicalPath {
+        surface::CanonicalPath::try_new(std::env::temp_dir().join("orca-file-change-ws"))
+            .expect("canonical workspace")
+    }
+
+    #[test]
+    fn an_edit_diff_reaches_the_surface_at_the_file_it_changed() {
+        let cwd = workspace();
+        let preview = FileChangePreview::UnifiedDiff {
+            text: "--- a/billing/pages.py\n+++ b/billing/pages.py\n@@ -1 +1 @@\n-a\n+b\n"
+                .to_string(),
+            truncated: false,
+        };
+
+        let change = surface_file_change(&preview, Some("billing/pages.py"), &cwd)
+            .expect("a completed edit carries its diff");
+
+        let surface::SurfaceFileChange::UnifiedDiff { path, text, digest } = change else {
+            panic!("expected a unified diff");
+        };
+        assert_eq!(path.as_path(), cwd.as_path().join("billing/pages.py"));
+        assert!(text.as_str().contains("+b"));
+        assert_eq!(digest, surface::Sha256Digest::digest(text.as_str()));
+    }
+
+    #[test]
+    fn an_omitted_preview_still_names_the_file() {
+        let cwd = workspace();
+        let preview = FileChangePreview::Omitted {
+            path: "./data/../big.bin".to_string(),
+            max_input_bytes: 1024,
+        };
+
+        let change = surface_file_change(&preview, Some("big.bin"), &cwd)
+            .expect("an omitted preview is still a file change");
+
+        let surface::SurfaceFileChange::PreviewOmitted {
+            path,
+            maximum_bytes,
+            ..
+        } = change
+        else {
+            panic!("expected an omitted preview");
+        };
+        assert_eq!(path.as_path(), cwd.as_path().join("big.bin"));
+        assert_eq!(maximum_bytes.get(), 1024);
     }
 }
 

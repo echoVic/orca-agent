@@ -3706,6 +3706,7 @@ mod tests {
         let mut actor = ToolExecutionActor::new(events.run_id().to_string());
         let execution = actor.handle_approval(ToolApprovalGateContext {
             config: &config,
+            cwd: std::path::Path::new("."),
             events: &mut events,
             sink: &mut sink,
             tool_request: &request,

@@ -228,6 +228,8 @@ pub(crate) trait RecoveredToolInvocationCommitter {
 
 pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
     pub(crate) config: &'a RunConfig,
+    /// Where the tool runs, so an edit's approval can show its diff.
+    pub(crate) cwd: &'a Path,
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) tool_request: &'a tool_types::ToolRequest,
@@ -283,6 +285,19 @@ impl ToolExecutionCompletion {
         let mut completion = Self::from_pair(pair);
         completion.event_error = event_error;
         completion
+    }
+}
+
+/// The diff an edit or write would make, for its approval to show.
+fn file_change_preview_text(request: &tool_types::ToolRequest, cwd: &Path) -> Option<String> {
+    let preview = match request.name {
+        tool_types::ToolName::Edit => orca_tools::edit::preview(request, cwd),
+        tool_types::ToolName::WriteFile => orca_tools::write_file::preview(request, cwd),
+        _ => None,
+    }?;
+    match preview {
+        tool_types::FileChangePreview::UnifiedDiff { text, .. } => Some(text),
+        tool_types::FileChangePreview::Omitted { .. } => None,
     }
 }
 
@@ -1064,6 +1079,7 @@ impl ToolExecutionActor {
         if !approval_already_resolved {
             let approval_execution = self.handle_approval(ToolApprovalGateContext {
                 config,
+                cwd,
                 events,
                 sink,
                 tool_request,
@@ -1306,6 +1322,7 @@ impl ToolExecutionActor {
     ) -> ApprovalGateExecution {
         let ToolApprovalGateContext {
             config,
+            cwd,
             events,
             sink,
             tool_request,
@@ -1355,7 +1372,10 @@ impl ToolExecutionActor {
                         );
                     }
                 }
-                RuntimeApprovalDecision::Ask(approval) => {
+                RuntimeApprovalDecision::Ask(mut approval) => {
+                    if approval.preview.is_none() {
+                        approval.preview = file_change_preview_text(&invocation.effective, cwd);
+                    }
                     if event_error.is_some() {
                         return failed_approval_gate_before_start(
                             events,
@@ -2087,6 +2107,85 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_approval_shows_the_diff_it_would_make() {
+        struct Recording(std::sync::Mutex<Option<String>>);
+        impl crate::runtime_approval::RuntimeApprovalHandler for Recording {
+            fn resolve_interactive(
+                &self,
+                approval: &orca_core::approval_types::ApprovalRequest,
+                _request: &ToolRequest,
+            ) -> io::Result<orca_core::approval_types::ApprovalResolution> {
+                *self.0.lock().unwrap() = approval.preview.clone();
+                Ok(orca_core::approval_types::ApprovalResolution {
+                    id: approval.id.clone(),
+                    decision: orca_core::approval_types::ApprovalDecision::Deny,
+                    reason: "denied in test".to_string(),
+                })
+            }
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            workspace.path().join("pages.py"),
+            "return total // per_page\n",
+        )
+        .expect("fixture");
+        let mut config = config_with_permission_rules(PermissionRules::default());
+        config.approval_mode = ApprovalMode::Suggest;
+        config.cwd = Some(workspace.path().to_path_buf());
+        let mut events = EventFactory::new("edit-preview".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = ToolRequest {
+            id: "edit-1".to_string(),
+            name: ToolName::Edit,
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(
+                r#"{"path":"pages.py","old_text":"total // per_page","new_text":"-(-total // per_page)"}"#
+                    .to_string(),
+            ),
+        };
+        let invocation = crate::tool_invocation::prepare_tool_invocation(
+            &request,
+            0,
+            &McpRegistry::default(),
+            &config,
+        );
+        let policy = policy_for_tool_execution(&config);
+        let mut overlay = TurnPermissionOverlay::default();
+        let handler = Recording(std::sync::Mutex::new(None));
+        let cancel = orca_core::cancel::CancelToken::new();
+
+        let _ = ToolExecutionActor::new(events.run_id().to_string()).handle_approval(
+            ToolApprovalGateContext {
+                config: &config,
+                cwd: workspace.path(),
+                events: &mut events,
+                sink: &mut sink,
+                tool_request: &request,
+                invocation: &invocation,
+                policy: &policy,
+                permission_overlay: &mut overlay,
+                approval_handler: Some(&handler),
+                cancel: &cancel,
+                emit_deltas: false,
+                provider_response_ingress: None,
+            },
+        );
+
+        let preview = handler
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the approval carries a diff");
+        assert!(preview.contains("-return total // per_page"), "{preview}");
+        assert!(
+            preview.contains("+return -(-total // per_page)"),
+            "{preview}"
+        );
+    }
+
+    #[test]
     fn approval_gate_consumes_matching_preapproved_tool_call_once() {
         let config = config_with_permission_rules(PermissionRules::default());
         let mut events = EventFactory::new("preapproved-tool".to_string());
@@ -2109,6 +2208,7 @@ mod tests {
 
         let execution = actor.handle_approval(ToolApprovalGateContext {
             config: &config,
+            cwd: std::path::Path::new("."),
             events: &mut events,
             sink: &mut sink,
             tool_request: &request,

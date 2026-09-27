@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use orca_core::tool_types::{ToolRequest, ToolResult};
+use orca_core::tool_types::{FileChangePreview, ToolRequest, ToolResult};
 
 use crate::file_admission::{
     MAX_EDIT_FILE_BYTES, build_file_change_preview, read_text_file_with_limit,
@@ -17,75 +17,91 @@ pub fn execute_or_cancel(
     cwd: &Path,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
-    let (path_str, old, new) = match parse_edit_args(request) {
-        Ok(args) => args,
+    let plan = match plan_edit(request, cwd, &should_cancel) {
+        Ok(plan) => plan,
         Err(error) => return ToolResult::failed(request, error, None),
     };
+    if should_cancel() {
+        return ToolResult::failed(request, "file edit cancelled", None);
+    }
+    let preview = build_file_change_preview(
+        &plan.relative_path,
+        Some(&plan.contents),
+        Some(&plan.updated),
+    );
+    if let Err(error) = fs::write(&plan.path, &plan.updated) {
+        return ToolResult::failed(
+            request,
+            format!("failed to write {}: {error}", plan.path.display()),
+            None,
+        );
+    }
 
-    let path = match resolve_workspace_path(cwd, Some(&path_str)) {
-        Ok(p) => p,
-        Err(error) => return ToolResult::failed(request, error, None),
-    };
+    ToolResult::completed(request, format!("edited {}", plan.relative_path), false)
+        .with_file_change_preview(preview)
+}
+
+/// The diff this edit would make, without writing it, for an approval to
+/// show. `None` when the edit could not apply.
+pub fn preview(request: &ToolRequest, cwd: &Path) -> Option<FileChangePreview> {
+    let plan = plan_edit(request, cwd, &|| false).ok()?;
+    Some(build_file_change_preview(
+        &plan.relative_path,
+        Some(&plan.contents),
+        Some(&plan.updated),
+    ))
+}
+
+struct PlannedEdit {
+    path: std::path::PathBuf,
+    relative_path: String,
+    contents: String,
+    updated: String,
+}
+
+fn plan_edit(
+    request: &ToolRequest,
+    cwd: &Path,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<PlannedEdit, String> {
+    let (path_str, old, new) = parse_edit_args(request)?;
+    let path = resolve_workspace_path(cwd, Some(&path_str))?;
     if !is_inside_workspace(cwd, &path) {
-        return ToolResult::failed(request, "edit target is outside the workspace", None);
+        return Err("edit target is outside the workspace".to_string());
     }
-
     if old.is_empty() {
-        return ToolResult::failed(request, "edit old text cannot be empty", None);
+        return Err("edit old text cannot be empty".to_string());
     }
-
-    let contents = match read_text_file_with_limit(&path, MAX_EDIT_FILE_BYTES, &should_cancel) {
-        Ok(contents) => contents,
-        Err(error) => {
-            return ToolResult::failed(
-                request,
-                format!("failed to read {}: {error}", path.display()),
-                None,
-            );
-        }
-    };
-
+    let contents = read_text_file_with_limit(&path, MAX_EDIT_FILE_BYTES, should_cancel)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     let matches = contents.matches(&*old).count();
     if matches == 0 {
-        return ToolResult::failed(request, "edit old text was not found", None);
+        return Err("edit old text was not found".to_string());
     }
     if matches > 1 {
-        return ToolResult::failed(request, "edit old text matched multiple locations", None);
+        return Err("edit old text matched multiple locations".to_string());
     }
-
     let updated_bytes = contents
         .len()
         .saturating_sub(old.len())
         .saturating_add(new.len());
     if updated_bytes > MAX_EDIT_FILE_BYTES {
-        return ToolResult::failed(
-            request,
-            format!(
-                "edited file would be too large ({updated_bytes} bytes; maximum {MAX_EDIT_FILE_BYTES} bytes)"
-            ),
-            None,
-        );
+        return Err(format!(
+            "edited file would be too large ({updated_bytes} bytes; maximum {MAX_EDIT_FILE_BYTES} bytes)"
+        ));
     }
     let updated = contents.replacen(&*old, &new, 1);
-    if should_cancel() {
-        return ToolResult::failed(request, "file edit cancelled", None);
-    }
     let relative_path = path
         .strip_prefix(cwd)
         .unwrap_or(&path)
         .display()
         .to_string();
-    let preview = build_file_change_preview(&relative_path, Some(&contents), Some(&updated));
-    if let Err(error) = fs::write(&path, &updated) {
-        return ToolResult::failed(
-            request,
-            format!("failed to write {}: {error}", path.display()),
-            None,
-        );
-    }
-
-    ToolResult::completed(request, format!("edited {relative_path}"), false)
-        .with_file_change_preview(preview)
+    Ok(PlannedEdit {
+        path,
+        relative_path,
+        contents,
+        updated,
+    })
 }
 
 fn parse_edit_args(request: &ToolRequest) -> Result<(String, String, String), String> {
@@ -313,6 +329,37 @@ mod tests {
                 .len(),
             EXPECTED_EDIT_LIMIT_BYTES + 1
         );
+    }
+
+    #[test]
+    fn preview_shows_the_diff_an_edit_would_make_without_writing() {
+        let dir = temp_dir("dry-run");
+        let file = dir.join("pages.py");
+        fs::write(&file, "return total // per_page\n").expect("write fixture");
+        let raw = r#"{"path":"pages.py","old_text":"total // per_page","new_text":"-(-total // per_page)"}"#;
+        let req = make_request(None, Some(raw));
+
+        let preview = preview(&req, &dir).expect("a valid edit has a preview");
+
+        let FileChangePreview::UnifiedDiff { text, .. } = preview else {
+            panic!("a small edit renders a unified diff");
+        };
+        assert!(text.contains("-return total // per_page"));
+        assert!(text.contains("+return -(-total // per_page)"));
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "return total // per_page\n",
+            "a preview must not change the file"
+        );
+    }
+
+    #[test]
+    fn preview_of_an_edit_that_cannot_apply_is_none() {
+        let dir = temp_dir("dry-run-miss");
+        fs::write(dir.join("pages.py"), "a\n").expect("write fixture");
+        let raw = r#"{"path":"pages.py","old_text":"missing","new_text":"b"}"#;
+
+        assert!(preview(&make_request(None, Some(raw)), &dir).is_none());
     }
 
     #[test]

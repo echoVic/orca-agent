@@ -1,37 +1,68 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use orca_core::tool_types::{ToolRequest, ToolResult};
+use orca_core::tool_types::{FileChangePreview, ToolRequest, ToolResult};
 
 use crate::file_admission::{
     FileAdmissionError, MAX_DIFF_INPUT_BYTES, build_file_change_preview, read_text_file_with_limit,
 };
 
 pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
-    let raw = match &request.raw_arguments {
-        Some(r) => r,
-        None => return ToolResult::failed(request, "missing arguments", None),
+    let plan = match plan_write(request, cwd) {
+        Ok(plan) => plan,
+        Err(error) => return ToolResult::failed(request, error, None),
     };
 
-    let args: serde_json::Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(e) => return ToolResult::failed(request, format!("invalid arguments: {e}"), None),
-    };
+    if let Some(parent) = plan.path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            return ToolResult::failed(request, format!("failed to create directories: {e}"), None);
+        }
+    }
 
-    let path_str = match args["path"].as_str() {
-        Some(p) => p,
-        None => return ToolResult::failed(request, "missing required parameter: path", None),
-    };
+    match fs::write(&plan.path, &plan.content) {
+        Ok(()) => ToolResult::completed(
+            request,
+            format!(
+                "wrote {} bytes to {}",
+                plan.content.len(),
+                plan.display_path
+            ),
+            false,
+        )
+        .with_file_change_preview(plan.preview),
+        Err(e) => ToolResult::failed(request, format!("failed to write file: {e}"), None),
+    }
+}
 
-    let content = match args["content"].as_str() {
-        Some(c) => c,
-        None => return ToolResult::failed(request, "missing required parameter: content", None),
-    };
+/// The diff this write would make, without writing it or creating its
+/// directory, for an approval to show. `None` when the write could not apply.
+pub fn preview(request: &ToolRequest, cwd: &Path) -> Option<FileChangePreview> {
+    plan_write(request, cwd).ok().map(|plan| plan.preview)
+}
 
-    let canonical_cwd = match cwd.canonicalize() {
-        Ok(p) => p,
-        Err(e) => return ToolResult::failed(request, format!("cannot resolve cwd: {e}"), None),
-    };
+struct PlannedWrite {
+    path: PathBuf,
+    display_path: String,
+    content: String,
+    preview: FileChangePreview,
+}
+
+fn plan_write(request: &ToolRequest, cwd: &Path) -> Result<PlannedWrite, String> {
+    let raw = request
+        .raw_arguments
+        .as_deref()
+        .ok_or_else(|| "missing arguments".to_string())?;
+    let args: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("invalid arguments: {e}"))?;
+    let path_str = args["path"]
+        .as_str()
+        .ok_or_else(|| "missing required parameter: path".to_string())?;
+    let content = args["content"]
+        .as_str()
+        .ok_or_else(|| "missing required parameter: content".to_string())?;
+    let canonical_cwd = cwd
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve cwd: {e}"))?;
 
     let joined = canonical_cwd.join(path_str);
 
@@ -48,17 +79,7 @@ pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
     }
 
     if !normalized.starts_with(&canonical_cwd) {
-        return ToolResult::failed(
-            request,
-            format!("path escapes workspace: {}", path_str),
-            None,
-        );
-    }
-
-    if let Some(parent) = normalized.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            return ToolResult::failed(request, format!("failed to create directories: {e}"), None);
-        }
+        return Err(format!("path escapes workspace: {}", path_str));
     }
 
     let before = read_text_file_with_limit(&normalized, MAX_DIFF_INPUT_BYTES, || false);
@@ -69,30 +90,22 @@ pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
         Err(error) if error.is_not_found() && content.len() <= MAX_DIFF_INPUT_BYTES => {
             build_file_change_preview(path_str, None, Some(content))
         }
-        Ok(_) | Err(FileAdmissionError::TooLarge { .. }) => {
-            orca_core::tool_types::FileChangePreview::Omitted {
-                path: path_str.to_string(),
-                max_input_bytes: MAX_DIFF_INPUT_BYTES,
-            }
-        }
-        Err(_) => orca_core::tool_types::FileChangePreview::Omitted {
+        Ok(_) | Err(FileAdmissionError::TooLarge { .. }) => FileChangePreview::Omitted {
+            path: path_str.to_string(),
+            max_input_bytes: MAX_DIFF_INPUT_BYTES,
+        },
+        Err(_) => FileChangePreview::Omitted {
             path: path_str.to_string(),
             max_input_bytes: MAX_DIFF_INPUT_BYTES,
         },
     };
 
-    match fs::write(&normalized, content) {
-        Ok(()) => {
-            let bytes = content.len();
-            ToolResult::completed(
-                request,
-                format!("wrote {} bytes to {}", bytes, path_str),
-                false,
-            )
-            .with_file_change_preview(preview)
-        }
-        Err(e) => ToolResult::failed(request, format!("failed to write file: {e}"), None),
-    }
+    Ok(PlannedWrite {
+        path: normalized,
+        display_path: path_str.to_string(),
+        content: content.to_string(),
+        preview,
+    })
 }
 
 #[cfg(test)]
@@ -101,6 +114,29 @@ mod tests {
     use orca_core::approval_types::ActionKind;
     use orca_core::tool_types::{FileChangePreview, ToolName, ToolStatus};
     use tempfile::TempDir;
+
+    #[test]
+    fn preview_shows_a_new_file_without_creating_it_or_its_directory() {
+        let dir = TempDir::new().unwrap();
+        let req = make_request("docs/notes.md", "# Notes\n");
+
+        let preview = preview(&req, dir.path()).expect("a valid write has a preview");
+
+        let FileChangePreview::UnifiedDiff { text, .. } = preview else {
+            panic!("a small write renders a unified diff");
+        };
+        assert!(text.contains("+# Notes"));
+        assert!(
+            !dir.path().join("docs").exists(),
+            "a preview must not create directories"
+        );
+    }
+
+    #[test]
+    fn preview_of_a_path_outside_the_workspace_is_none() {
+        let dir = TempDir::new().unwrap();
+        assert!(preview(&make_request("../escape.txt", "x"), dir.path()).is_none());
+    }
 
     fn make_request(path: &str, content: &str) -> ToolRequest {
         ToolRequest {
