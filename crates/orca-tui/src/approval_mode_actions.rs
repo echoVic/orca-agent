@@ -6,15 +6,10 @@ pub(crate) fn cycle_approval_mode(
     state: &mut AppState,
     action_tx: &crossbeam_channel::Sender<UserAction>,
 ) {
+    // The status bar shows the new mode once the runtime applies it, and a
+    // rejected change reports itself.
     let next = state.approval_mode.next();
-    let dispatched = request_settings_change(state, action_tx, None, None, Some(next));
-    if dispatched {
-        state.push_message(crate::transcript_state::ChatMessage::System {
-            text: format!("Approval mode change requested: {}.", next.as_str()),
-            expanded: false,
-        });
-        state.scroll_to_bottom();
-    }
+    request_settings_change(state, action_tx, None, None, Some(next));
 }
 
 #[cfg(test)]
@@ -52,6 +47,25 @@ mod tests {
                 .approval_mode,
             Some(ApprovalMode::AutoEdit)
         );
+    }
+
+    #[test]
+    fn a_mode_change_leaves_the_conversation_alone() {
+        // Each Shift+Tab wrote "Approval mode change requested: …" into the
+        // conversation, and the first one replaced the welcome screen. The
+        // status bar already shows the mode once the runtime applies it.
+        let (action_tx, _action_rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "model".to_string(),
+            "/tmp".to_string(),
+        );
+        state.approval_mode = ApprovalMode::Suggest;
+
+        cycle_approval_mode(&mut state, &action_tx);
+
+        assert!(state.transcript.messages.is_empty());
     }
 
     #[test]
