@@ -487,6 +487,7 @@ pub(crate) fn handle_mouse_event(
                 && state.status != AppStatus::WaitingApproval
                 && state.panel_mode == PanelMode::Conversation
                 && state.viewport.recap_detail_area.is_none()
+                && !crate::ui::composer_popup_contains(state, mouse.column, mouse.row)
                 && let Some(image) = state
                     .image_hit_areas
                     .iter()
@@ -586,6 +587,13 @@ pub(crate) fn handle_mouse_event(
                 if confirm {
                     return MouseFlow::SyntheticEnter;
                 }
+                return MouseFlow::Handled;
+            }
+            // The rest of a popup, its border and hint row, is still the
+            // popup: a click there must not reach the row drawn underneath.
+            if crate::ui::composer_popup_contains(state, mouse.column, mouse.row) {
+                state.viewport.selection = None;
+                state.viewport.last_left_click = None;
                 return MouseFlow::Handled;
             }
 
@@ -2079,6 +2087,57 @@ mod tests {
             ),
             MouseFlow::SyntheticEnter
         );
+    }
+
+    #[test]
+    fn a_click_on_a_popups_border_or_hint_row_stays_in_the_popup() {
+        // Only item rows were hit-tested; a click on the border or the hint
+        // row fell through to the transcript row drawn underneath.
+        let mut state = test_state();
+        for _ in 0..12 {
+            state.push_message(tool_call(
+                "bash",
+                Some("a"),
+                "completed",
+                Some("l1\nl2\nl3\nl4"),
+                false,
+            ));
+        }
+        render_once(&mut state, 60, 24);
+        state.slash_menu = Some(crate::types::SlashMenu {
+            items: vec![
+                crate::types::SlashMenuItem {
+                    command: "/help".to_string(),
+                    description: "help".to_string(),
+                },
+                crate::types::SlashMenuItem {
+                    command: "/model".to_string(),
+                    description: "model".to_string(),
+                },
+            ],
+            selected: 0,
+            sub_menu: None,
+        });
+        state.viewport.frame_area = Some(Rect::new(0, 0, 60, 24));
+        state.viewport.input_area = Some(Rect::new(0, 20, 60, 3));
+
+        // The popup spans rows 15..20: its top border is row 15, its hint
+        // row 18, and a transcript row lies under each.
+        for row in [15, 18] {
+            click_at(&mut state, 5, row);
+        }
+
+        assert!(
+            state.transcript.messages.iter().all(|message| matches!(
+                message,
+                ChatMessage::ToolCall {
+                    expanded: false,
+                    ..
+                }
+            )),
+            "no row under the popup may toggle"
+        );
+        assert_eq!(state.slash_menu.as_ref().map(|menu| menu.selected), Some(0));
     }
 
     #[test]

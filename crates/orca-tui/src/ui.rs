@@ -5826,6 +5826,34 @@ pub(crate) fn mention_menu_hit_index(state: &AppState, column: u16, row: u16) ->
     })
 }
 
+/// Whether `column`/`row` land anywhere on the popup over the composer (the
+/// slash menu, or else the mention popup), border and hint row included.
+pub(crate) fn composer_popup_contains(state: &AppState, column: u16, row: u16) -> bool {
+    let (Some(frame_area), Some(input_area)) =
+        (state.viewport.frame_area, state.viewport.input_area)
+    else {
+        return false;
+    };
+    let geometry = if let Some(menu) = state.slash_menu.as_ref() {
+        let (len, selected) = match &menu.sub_menu {
+            Some(sub) => (sub.items.len(), sub.selected),
+            None => (menu.items.len(), menu.selected),
+        };
+        popup_geometry(frame_area, input_area, len, selected, true)
+    } else if state.mention.phase.is_some() {
+        popup_geometry(
+            frame_area,
+            input_area,
+            state.mention.candidates.len(),
+            state.mention.selected,
+            mention_popup_status(state).is_some(),
+        )
+    } else {
+        None
+    };
+    geometry.is_some_and(|geometry| geometry.area.contains(Position::new(column, row)))
+}
+
 /// Row offset within a bordered single-column list popup, if `column`/`row`
 /// land inside its content area.
 fn hit_bordered_list_row(popup: Rect, column: u16, row: u16) -> Option<usize> {
