@@ -263,7 +263,15 @@ fn subagent_activity_projection(
             None,
         ),
         SubagentActivityPayload::PhaseChanged { phase, turn } => (
-            surface::DisplayText::new(format!("phase: {phase:?}")),
+            surface::DisplayText::new(match phase {
+                surface::SurfaceSubagentPhase::Starting => "starting",
+                surface::SurfaceSubagentPhase::Thinking => "thinking",
+                surface::SurfaceSubagentPhase::Tool => "running a tool",
+                surface::SurfaceSubagentPhase::Checkpointing => "saving a checkpoint",
+                surface::SurfaceSubagentPhase::Completed => "completed",
+                surface::SurfaceSubagentPhase::Failed => "failed",
+                surface::SurfaceSubagentPhase::Cancelled => "cancelled",
+            }),
             *turn,
             None,
         ),
@@ -5678,6 +5686,31 @@ mod file_change_tests {
         };
         assert_eq!(path.as_path(), cwd.as_path().join("big.bin"));
         assert_eq!(maximum_bytes.get(), 1024);
+    }
+}
+
+#[cfg(test)]
+mod subagent_activity_tests {
+    use super::subagent_activity_projection;
+    use crate::child_agent_types::SubagentActivityPayload;
+    use crate::runtime_surface as surface;
+
+    #[test]
+    fn a_phase_reads_as_words() {
+        // Agents showed "phase: Thinking", the phase's debug name.
+        let (activity, turn, _) =
+            subagent_activity_projection(&SubagentActivityPayload::PhaseChanged {
+                phase: surface::SurfaceSubagentPhase::Thinking,
+                turn: Some(2),
+            });
+        assert_eq!(activity.as_str(), "thinking");
+        assert_eq!(turn, Some(2));
+        let (activity, _, _) =
+            subagent_activity_projection(&SubagentActivityPayload::PhaseChanged {
+                phase: surface::SurfaceSubagentPhase::Tool,
+                turn: None,
+            });
+        assert_eq!(activity.as_str(), "running a tool");
     }
 }
 

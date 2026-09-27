@@ -2465,29 +2465,31 @@ fn agent_workspace_list_item<'a>(
     let (name, status, detail, color, running) = match row {
         AgentWorkspaceRow::Subagent { task, .. } => {
             let name = task.name.as_deref().unwrap_or(task.description.as_str());
-            let detail = task
-                .subagent_current_activity
-                .as_deref()
-                .unwrap_or("waiting for activity");
+            let detail = match live_activity(task) {
+                Some(activity) => format!("subagent · {activity}"),
+                None if is_live(task) => "subagent · waiting for activity".to_string(),
+                None => "subagent".to_string(),
+            };
             (
                 name.to_string(),
                 task_status_label(task.status).to_string(),
-                format!("subagent · {detail}"),
+                detail,
                 task_status_color(task.status, theme),
                 task.status == TaskStatus::Running,
             )
         }
         AgentWorkspaceRow::BackgroundTask { task, .. } => {
             let name = task.name.as_deref().unwrap_or(task.description.as_str());
-            let detail = task
-                .subagent_current_activity
-                .as_deref()
-                .or(task.tool.as_deref())
-                .unwrap_or("waiting for activity");
+            let kind = task_type_label(task);
+            let detail = match live_activity(task).or(task.tool.as_deref()) {
+                Some(activity) if is_live(task) => format!("{kind} · {activity}"),
+                _ if is_live(task) => format!("{kind} · waiting for activity"),
+                _ => kind.to_string(),
+            };
             (
                 name.to_string(),
                 task_status_label(task.status).to_string(),
-                format!("{} · {detail}", task_type_label(task)),
+                detail,
                 task_status_color(task.status, theme),
                 task.status == TaskStatus::Running,
             )
@@ -2556,7 +2558,7 @@ fn agent_workspace_focus_lines<'a>(
                 line(format!(" Focus {name}"), theme.text),
                 line(format!(" {}", metadata.join(" · ")), theme.muted),
             ];
-            if let Some(activity) = task.subagent_current_activity.as_deref() {
+            if let Some(activity) = live_activity(task) {
                 let marker = if task.status == TaskStatus::Running {
                     spinner_frame(tick)
                 } else {
@@ -2620,7 +2622,7 @@ fn agent_workspace_focus_lines<'a>(
                 line(format!(" Focus {name}"), theme.text),
                 line(format!(" {}", metadata.join(" · ")), theme.muted),
             ];
-            if let Some(activity) = task.subagent_current_activity.as_deref() {
+            if let Some(activity) = live_activity(task) {
                 lines.push(line(format!(" now {activity}"), theme.warning));
             }
             lines
@@ -3065,6 +3067,20 @@ fn workflow_agent_status_color(status: WorkflowAgentStatus, theme: &Theme) -> Co
     }
 }
 
+/// Whether a task can still be doing something: running, queued, paused,
+/// stopping, or waiting on an approval.
+fn is_live(task: &BackgroundTaskSummary) -> bool {
+    task.status.is_active() || task.status.requires_attention()
+}
+
+/// What an agent is doing now. A finished one is doing nothing, whatever it
+/// last reported.
+fn live_activity(task: &BackgroundTaskSummary) -> Option<&str> {
+    is_live(task)
+        .then_some(task.subagent_current_activity.as_deref())
+        .flatten()
+}
+
 fn subagent_progress_label(task: &BackgroundTaskSummary) -> String {
     subagent_progress_label_with_activity_limit(task, Some(32))
 }
@@ -3074,7 +3090,7 @@ fn subagent_progress_label_with_activity_limit(
     activity_limit: Option<usize>,
 ) -> String {
     let mut parts = Vec::new();
-    if let Some(activity) = task.subagent_current_activity.as_deref() {
+    if let Some(activity) = live_activity(task) {
         parts.push(
             activity_limit
                 .map(|limit| clamp_label(activity, limit))
@@ -5476,7 +5492,7 @@ fn background_task_activity_rows(
                 activity_row(format!("  {marker} {name} · {status}"), color),
                 target.clone(),
             ));
-            let detail = if task.subagent_current_activity.is_some() {
+            let detail = if live_activity(task).is_some() || !is_live(task) {
                 subagent_progress_label_with_activity_limit(task, Some(64))
             } else {
                 let mut detail = vec!["waiting for activity".to_string()];
@@ -12575,6 +12591,38 @@ mod tests {
         let text = activity_line(&state, &theme).expect("task attention remains visible");
 
         assert_eq!(text, " ● 1 background task running · 1 needs approval");
+    }
+
+    #[test]
+    fn a_finished_agent_shows_no_current_activity() {
+        // The last activity an agent reported stayed on screen after it
+        // finished: "reviewer · completed · subagent · phase: Thinking" and
+        // "● now phase: Thinking".
+        let mut state = test_state();
+        state.status = AppStatus::Idle;
+        let mut done = workflow_task_for_agent_dashboard(
+            "reviewer",
+            "rev",
+            orca_core::workflow_types::WorkflowAgentStatus::Completed,
+        );
+        done.task_type = TaskType::Subagent;
+        done.status = TaskStatus::Completed;
+        done.workflow_agents.clear();
+        done.subagent_current_activity = Some("bash: cargo test".to_string());
+        let mut running = done.clone();
+        running.id = "task-running".to_string();
+        running.name = Some("builder".to_string());
+        running.status = TaskStatus::Running;
+        running.subagent_current_activity = Some("read: build.rs".to_string());
+        state.replace_workflow_tasks_for_test(vec![done, running]);
+        state.panel_mode = PanelMode::Agents;
+
+        let screen = frame_string(&mut state, 100, 24);
+        assert!(!screen.contains("cargo test"), "{screen}");
+        assert!(screen.contains("read: build.rs"), "{screen}");
+        assert!(!screen.contains("waiting for activity"), "{screen}");
+        let progress = subagent_progress_label(&state.workflow_tasks()[0]);
+        assert!(!progress.contains("cargo test"), "{progress}");
     }
 
     #[test]

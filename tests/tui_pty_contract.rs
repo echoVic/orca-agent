@@ -237,7 +237,7 @@ fn tui_shows_a_background_agents_progress_while_the_parent_turn_waits_on_it() {
     assert_screen_shows(
         &process,
         &mut output,
-        "phase: Thinking",
+        "thinking,",
         "the background agent's progress did not reach the screen while the parent turn ran",
     );
 
