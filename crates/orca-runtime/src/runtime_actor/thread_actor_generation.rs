@@ -42,6 +42,20 @@ fn validate_relay_activity_envelope(
 /// The task and subagent patches that settle a detached child the way the
 /// task registry recorded its end. The registry's result is the payload the
 /// worker handed its parent; the surface shows the text inside it.
+/// Whether a detached child's surface task can take the outcome the task
+/// registry settled it with, along the transitions the reducer allows.
+fn registry_outcome_settles(task_status: surface::SurfaceTaskStatus, outcome: TaskStatus) -> bool {
+    match task_status {
+        surface::SurfaceTaskStatus::Running => true,
+        // A task waiting on an approval, paused, or stopping can still end
+        // stopped, failed or cancelled, but not completed.
+        surface::SurfaceTaskStatus::ApprovalRequired
+        | surface::SurfaceTaskStatus::Paused
+        | surface::SurfaceTaskStatus::Stopping => outcome != TaskStatus::Completed,
+        _ => false,
+    }
+}
+
 fn settled_subagent_batch(
     task: &surface::SurfaceTask,
     subagent: &surface::SurfaceSubagent,
@@ -1811,14 +1825,7 @@ impl ThreadActor {
             else {
                 continue;
             };
-            // Only along transitions the reducer allows: a stopping task can
-            // still end stopped, failed or cancelled, but not completed.
-            let settles = match task.status {
-                surface::SurfaceTaskStatus::Running => true,
-                surface::SurfaceTaskStatus::Stopping => record.status != TaskStatus::Completed,
-                _ => false,
-            };
-            if !settles {
+            if !registry_outcome_settles(task.status, record.status) {
                 continue;
             }
             let settled_at_ms = record.completed_at_ms.or(record.last_activity_at_ms);
@@ -5691,7 +5698,42 @@ mod file_change_tests {
 
 #[cfg(test)]
 mod subagent_activity_tests {
-    use super::subagent_activity_projection;
+    use super::{registry_outcome_settles, subagent_activity_projection};
+    use orca_core::task_types::TaskStatus;
+
+    #[test]
+    fn a_child_stopped_while_it_waited_on_an_approval_settles() {
+        // A detached child parked on a permission and then stopped stayed
+        // "running" on the surface forever: only Running and Stopping tasks
+        // took the registry's outcome.
+        use surface::SurfaceTaskStatus as Surface;
+        for waiting in [
+            Surface::ApprovalRequired,
+            Surface::Paused,
+            Surface::Stopping,
+        ] {
+            for outcome in [
+                TaskStatus::Stopped,
+                TaskStatus::Cancelled,
+                TaskStatus::Failed,
+            ] {
+                assert!(
+                    registry_outcome_settles(waiting, outcome),
+                    "{waiting:?} {outcome:?}"
+                );
+            }
+            // The reducer never takes such a task straight to Completed.
+            assert!(!registry_outcome_settles(waiting, TaskStatus::Completed));
+        }
+        assert!(registry_outcome_settles(
+            Surface::Running,
+            TaskStatus::Completed
+        ));
+        assert!(!registry_outcome_settles(
+            Surface::Completed,
+            TaskStatus::Stopped
+        ));
+    }
     use crate::child_agent_types::SubagentActivityPayload;
     use crate::runtime_surface as surface;
 
