@@ -143,10 +143,9 @@ def failing_tests(output: str) -> set[str]:
         if stripped.startswith("test ") and " FAILED" in stripped:
             names.add(stripped.split()[1])
             continue
-        if "FAIL [" in stripped and "]" in stripped:
-            after = stripped.split("]", 1)[1].strip()
-            if after:
-                names.add(after.split()[0].rstrip("."))
+        if stripped.startswith(("FAIL [", "TIMEOUT [")) and "]" in stripped:
+            if name := nextest_test_name(stripped):
+                names.add(name)
             continue
         if stripped.startswith("----"):
             in_failures = False
@@ -234,13 +233,24 @@ def tests_by_target(output: str, only_passing: bool = True) -> dict[str, set[str
     return by_target
 
 
+def nextest_test_name(line: str) -> str | None:
+    """The test in a nextest status line: `PASS [ 0.3s] (1/2) <binary-id> <test>`."""
+    tokens = line.split("]", 1)[1].split()
+    if tokens and re.fullmatch(r"\(\d+/\d+\)", tokens[0]):
+        tokens = tokens[1:]
+    return tokens[-1] if len(tokens) >= 2 else None
+
+
 def passing_tests(output: str) -> set[str]:
-    """Test names the runner reported as passing (`test <name> ... ok`)."""
+    """Test names the runner reported as passing (libtest `... ok`, nextest `PASS`)."""
     names: set[str] = set()
     for line in output.splitlines():
         stripped = line.strip()
         if stripped.startswith("test ") and stripped.endswith(" ... ok"):
             names.add(stripped.split()[1])
+        elif stripped.startswith("PASS [") and "]" in stripped:
+            if name := nextest_test_name(stripped):
+                names.add(name)
     return {name for name in names if name and ":" not in name}
 
 
@@ -263,6 +273,29 @@ def shell_command(
             flags += ["-e", f"{key}={value}"]
         return ["docker", "exec", "-i", *flags, container, "sh", "-c", f"cd {workdir} && {command}"]
     return ["bash", "-lc", f"cd {tree} && {command}"]
+
+
+def agent_invocation(
+    prompt: str,
+    tree: Path,
+    container: str | None,
+    workdir: str,
+    env_passthrough: dict[str, str] | None = None,
+) -> tuple[list[str], str]:
+    """The `orca exec` command and the stdin that carries its prompt.
+
+    The prompt is a commit message: inside a shell string its backticks and
+    `$(...)` would run on the host, and JSON quoting turned newlines and
+    non-ASCII text into escapes. `orca exec` reads the prompt from stdin.
+    """
+    command = shell_command(
+        "orca exec --mode full-auto --output-format jsonl --no-history",
+        tree,
+        container,
+        workdir,
+        env_passthrough=env_passthrough,
+    )
+    return command, prompt
 
 
 def api_key() -> str | None:
@@ -557,8 +590,8 @@ def run(
     # Popen + communicate (not subprocess.run) so a timed-out agent still yields its
     # partial trajectory: `run()` discards captured output when it kills the child, and
     # two of the runs here hit the wall-clock budget before this was fixed.
-    agent_command = shell_command(
-        f"orca exec --mode full-auto --output-format jsonl --no-history -- {json.dumps(prompt)}",
+    agent_command, agent_stdin = agent_invocation(
+        prompt,
         tree,
         container,
         container_workdir,
@@ -570,13 +603,14 @@ def run(
     )
     agent_process = subprocess.Popen(
         agent_command,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         env=env,
     )
     try:
-        agent_stdout, agent_stderr = agent_process.communicate(timeout=timeout)
+        agent_stdout, agent_stderr = agent_process.communicate(input=agent_stdin, timeout=timeout)
         agent_code = agent_process.returncode
     except subprocess.TimeoutExpired:
         agent_process.kill()

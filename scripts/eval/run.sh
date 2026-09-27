@@ -73,7 +73,7 @@ harbor run -d "$DATASET" \
   -n "$CONCURRENCY" \
   --environment-build-timeout-multiplier 2.0 \
   --mounts "$MOUNTS" \
-  "${ARGS[@]}" \
+  ${ARGS[@]+"${ARGS[@]}"} \
   -q -y
 
 python3 scripts/eval/triage.py "jobs/$JOB" --json "jobs/$JOB/triage.json"
