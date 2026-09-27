@@ -281,12 +281,20 @@ pub fn enforcement_decision() -> &'static SandboxEnforcementDecision {
     SEATBELT_ENFORCEMENT.get_or_init(|| probe_enforcement(Path::new(SEATBELT_EXECUTABLE)))
 }
 
+/// macOS 26 checks every component a path lookup walks through, including
+/// the system symlinks `/var`, `/tmp`, and `/etc` in front of `/private`.
+/// Temp directories and sockets are usually named through them.
+const SYSTEM_SYMLINK_LOOKUP_RULE: &str =
+    "(allow file-read-metadata (literal \"/var\") (literal \"/tmp\") (literal \"/etc\"))";
+
+/// The smallest restrictive profile a trivial process runs under. macOS 26
+/// aborts a process that may not read "/", so that literal is allowed.
+const ENFORCEMENT_PROBE_POLICY: &str = "(version 1) (deny default) (allow process*) (allow sysctl-read) (allow file-read* (literal \"/\")) (allow file-read* (literal \"/dev/null\"))";
+
 fn probe_enforcement(executable: &Path) -> SandboxEnforcementDecision {
     let output = Command::new(executable)
         .arg("-p")
-        .arg(
-            "(version 1) (deny default) (allow process*) (allow sysctl-read) (allow file-read* (literal \"/dev/null\"))",
-        )
+        .arg(ENFORCEMENT_PROBE_POLICY)
         .arg("true")
         .output();
     let evidence =
@@ -300,10 +308,20 @@ fn probe_enforcement(executable: &Path) -> SandboxEnforcementDecision {
 }
 
 pub fn platform_default_read_roots() -> Vec<PathBuf> {
-    ["/bin", "/sbin", "/usr", "/System", "/Library", "/etc"]
-        .into_iter()
-        .map(PathBuf::from)
-        .collect()
+    // `/bin/sh` is a shim that reads `/private/var/select/sh` to pick the
+    // shell it runs.
+    [
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/System",
+        "/Library",
+        "/etc",
+        "/private/var/select",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
 }
 
 fn build_workspace_write_profile(context: WorkspaceWriteProfileContext<'_>) -> SeatbeltProfile {
@@ -319,6 +337,9 @@ fn build_workspace_write_profile(context: WorkspaceWriteProfileContext<'_>) -> S
         allowed_unix_socket_roots,
     } = context;
     let mut profile = SeatbeltProfileBuilder::new();
+    // macOS 26 aborts a process that may not read "/" (exit 134).
+    profile.push_rule("(allow file-read* (literal \"/\"))");
+    profile.push_rule(SYSTEM_SYMLINK_LOOKUP_RULE);
     let cwd_param = profile.path_parameter("WORKSPACE", cwd);
     append_read_allow_rules(&mut profile, &[cwd.to_path_buf()]);
     append_path_ancestor_metadata_rules(&mut profile, cwd);
@@ -374,6 +395,7 @@ fn build_read_only_profile(context: ReadOnlyProfileContext<'_>) -> SeatbeltProfi
         profile.push_rule("(allow file-read*)");
     }
     profile.push_rule("(allow file-read* (literal \"/\"))");
+    profile.push_rule(SYSTEM_SYMLINK_LOOKUP_RULE);
     append_read_allow_rules(&mut profile, &[cwd.to_path_buf()]);
     append_path_ancestor_metadata_rules(&mut profile, cwd);
     append_read_allow_rules(&mut profile, readable_roots);
@@ -420,8 +442,11 @@ fn append_unix_socket_allow_rules(
         return;
     }
     profile.push_rule("(allow system-socket (socket-domain AF_UNIX))");
-    for root in allowed_unix_socket_roots {
-        let path = profile.path_parameter("UNIX_SOCKET_ROOT", root);
+    for root in allowed_unix_socket_roots
+        .iter()
+        .flat_map(|root| root_and_resolved(root))
+    {
+        let path = profile.path_parameter("UNIX_SOCKET_ROOT", &root);
         profile.push_rule(format!(
             "(allow network-bind (local unix-socket (literal {path})))"
         ));
@@ -434,14 +459,31 @@ fn append_unix_socket_allow_rules(
         profile.push_rule(format!(
             "(allow network-outbound (remote unix-socket (subpath {path})))"
         ));
+        append_path_ancestor_metadata_rules(profile, &root);
     }
 }
 
 fn append_read_allow_rules(profile: &mut SeatbeltProfileBuilder, readable_roots: &[PathBuf]) {
     for root in readable_roots {
-        let path = profile.path_parameter("READABLE_ROOT", root);
-        profile.push_rule(format!("(allow file-read* (subpath {path}))"));
+        for root in root_and_resolved(root) {
+            let path = profile.path_parameter("READABLE_ROOT", &root);
+            profile.push_rule(format!("(allow file-read* (subpath {path}))"));
+            append_path_ancestor_metadata_rules(profile, &root);
+        }
     }
+}
+
+/// A root as written and as the kernel resolves it. Seatbelt matches resolved
+/// paths, and macOS 26 also checks every component a lookup walks through, so
+/// a root behind a symlink (`/tmp`, `/etc`) needs both spellings.
+fn root_and_resolved(root: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![root.to_path_buf()];
+    if let Ok(resolved) = root.canonicalize()
+        && resolved != root
+    {
+        roots.push(resolved);
+    }
+    roots
 }
 
 fn append_path_ancestor_metadata_rules(profile: &mut SeatbeltProfileBuilder, path: &Path) {
@@ -463,6 +505,7 @@ fn append_write_allow_rules(profile: &mut SeatbeltProfileBuilder, prefix: &str, 
 fn append_write_allow_rule(profile: &mut SeatbeltProfileBuilder, prefix: &str, root: &Path) {
     let path = profile.path_parameter(prefix, root);
     profile.push_rule(format!("(allow file-write* (subpath {path}))"));
+    append_path_ancestor_metadata_rules(profile, root);
 }
 
 fn append_metadata_write_allow_rules(profile: &mut SeatbeltProfileBuilder, roots: &[PathBuf]) {
@@ -784,6 +827,28 @@ mod tests {
         assert!(content.contains(&workspace.path().display().to_string()));
         assert!(!content.contains("\n(allow file-read*)\n"));
         assert!(content.contains(r#"(allow file-read* file-write* (literal "/dev/null"))"#));
+    }
+
+    #[test]
+    fn every_restrictive_profile_lets_a_process_read_the_root_directory() {
+        // macOS 26 aborts any process (SIGABRT, exit 134) that may not read
+        // "/", which made the probe fail and removed the shell tool.
+        let workspace = TempDir::new().unwrap();
+        let workspace_profile = workspace_write_profile(WorkspaceWriteProfileContext {
+            cwd: workspace.path(),
+            readable_roots: &[],
+            additional_roots: &[],
+            metadata_writable_roots: &[],
+            denied_roots: &[],
+            network_access: false,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+            allowed_unix_socket_roots: &[],
+        });
+        let root = r#"(allow file-read* (literal "/"))"#;
+        assert!(workspace_profile.contains(root), "{workspace_profile}");
+        assert!(ENFORCEMENT_PROBE_POLICY.contains(root));
+        assert!(ENFORCEMENT_PROBE_POLICY.contains("(deny default)"));
     }
 
     #[test]
