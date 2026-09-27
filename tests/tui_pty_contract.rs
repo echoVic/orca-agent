@@ -198,12 +198,52 @@ fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
     );
     let rendered = String::from_utf8_lossy(&output);
     assert!(
-        rendered.matches("Task stop requested").count() <= 3,
+        rendered.matches("Stopping ").count() <= 3,
         "subagent stop notice was rendered in a loop; output={rendered}"
     );
 
     arm_idle_exit(&mut process, &mut output);
     let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
+fn tui_docks_an_agent_that_a_queued_message_starts() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n")
+        .expect("configure full-auto mode");
+    let release_marker = cwd.path().join("release-queued-subagent");
+    let mut process =
+        PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "mock_stream_delay_ms 1500")
+            .expect("spawn TUI in PTY");
+    let mut output = Vec::new();
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "Mock slow stream started.",
+        "the first turn did not start",
+    );
+    process
+        .write(
+            format!(
+                "subagent mock_stream_release_marker {}\r",
+                release_marker.display()
+            )
+            .as_bytes(),
+        )
+        .expect("queue a message that starts an agent");
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "Agents 1 active",
+        "the agent a queued message started never reached the dock",
+    );
+
+    std::fs::write(&release_marker, b"release").expect("release the agent");
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(10));
     process.close_io_and_join();
     assert_eq!(status.code(), Some(130), "TUI exited with {status}");
 }
