@@ -86,7 +86,10 @@ connection, and matching inode identity. Regular files, symlinks, live listeners
 and sockets in public directories are not deleted.
 
 Send SIGINT or SIGTERM to the foreground daemon for graceful shutdown. Runtime
-shutdown commits terminal state before client transport teardown. The daemon
+shutdown commits terminal state before client transport teardown. Shutdown has
+10 seconds: if it has not finished by then, or a second SIGINT or SIGTERM
+arrives, the daemon exits with an error saying so, and the next start recovers
+what the shutdown left unfinished, as after a crash. The daemon
 removes only its own socket inode. A crash releases the OS lock and can leave a
 stale socket for the next start to validate. The lock PID is diagnostic only:
 the implementation does not signal processes based on stale PID-file content.

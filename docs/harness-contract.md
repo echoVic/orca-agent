@@ -280,6 +280,9 @@ External tools:
 - Descriptors are advertised to the model as function tools.
 - Commands run from the workspace directory with raw JSON arguments always on
   stdin and, up to 64 KiB, mirrored in `ORCA_TOOL_ARGS` for compatibility.
+- A command runs until it exits or the turn is cancelled. When
+  `[tools] shell_timeout_secs` is set, it also stops the command after that
+  many seconds, and the call fails with `timed out after Ns`.
 
 `glob` is the preferred file discovery tool. It accepts the existing `pattern` argument for glob searches and `{"mode":"fuzzy","query":"..."}` for fuzzy path discovery. `list_files` remains accepted for compatibility but is not recommended in the system prompt.
 
