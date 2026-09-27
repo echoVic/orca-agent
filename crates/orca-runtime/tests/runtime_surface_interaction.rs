@@ -3871,6 +3871,17 @@ fn dropping_exclusive_responder_rotates_route_before_fallback_can_wake_waiter() 
     host.shutdown().unwrap();
 }
 
+/// Which way a detach went, for assertion messages: `DetachResult` has no
+/// `Debug`, and a bare `matches!` failure says nothing about the outcome.
+fn detach_outcome(result: &DetachResult) -> &'static str {
+    match result {
+        DetachResult::Detached { .. } => "Detached",
+        DetachResult::AlreadyDetached { .. } => "AlreadyDetached",
+        DetachResult::Deferred { .. } => "Deferred",
+        DetachResult::StaleAttachment { .. } => "StaleAttachment",
+    }
+}
+
 #[test]
 fn detach_route_append_failure_keeps_fallback_transition_retryable() {
     with_orca_home(|home| {
@@ -3963,16 +3974,21 @@ fn detach_route_append_failure_keeps_fallback_transition_retryable() {
             .wait_operation_terminal(request_id(), operation_id);
         host.shutdown().unwrap();
 
-        assert!(matches!(failed, DetachResult::StaleAttachment { .. }));
+        assert!(
+            matches!(failed, DetachResult::StaleAttachment { .. }),
+            "the failed detach returned {}",
+            detach_outcome(&failed)
+        );
         assert_eq!(waiter_woke_on_failure, None);
         assert!(matches!(
             intervening_response,
             Err(SurfaceClientCommandError::RuntimeUnavailable)
         ));
-        assert!(matches!(
-            fallback_detach,
-            DetachResult::StaleAttachment { .. }
-        ));
+        assert!(
+            matches!(fallback_detach, DetachResult::StaleAttachment { .. }),
+            "the fallback's detach returned {}",
+            detach_outcome(&fallback_detach)
+        );
         assert!(matches!(
             intervening_cancel,
             Err(SurfaceClientCommandError::RuntimeUnavailable)
@@ -3998,7 +4014,13 @@ fn detach_route_append_failure_keeps_fallback_transition_retryable() {
             } if epoch == ResponseRouteEpoch::try_new(1).unwrap()
                 && attachment_id == &origin.attachment_id
         ));
-        let receipt = detached_receipt.expect("retry must complete the detach");
+        let receipt = detached_receipt.unwrap_or_else(|| {
+            panic!(
+                "retry must complete the detach, got {} (interaction at revision {})",
+                detach_outcome(&retried),
+                after_retry.revision.get()
+            )
+        });
         assert_eq!(
             receipt.affected_route_epochs,
             vec![(
@@ -4020,10 +4042,14 @@ fn detach_route_append_failure_keeps_fallback_transition_retryable() {
             } if epoch == ResponseRouteEpoch::try_new(2).unwrap()
                 && attachment_id == &fallback.attachment_id
         ));
-        assert!(matches!(
-            replayed,
-            DetachResult::AlreadyDetached { receipt: replayed } if replayed == receipt
-        ));
+        assert!(
+            matches!(
+                &replayed,
+                DetachResult::AlreadyDetached { receipt: replayed } if *replayed == receipt
+            ),
+            "the replayed detach returned {}",
+            detach_outcome(&replayed)
+        );
         assert!(matches!(response, Ok(MutationReply::Committed { .. })));
         assert_eq!(answer, Some(Some("fallback".to_string())));
     });
