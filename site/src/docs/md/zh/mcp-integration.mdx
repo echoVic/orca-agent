@@ -40,7 +40,7 @@ transport 只能是 stdio 或 sse。stdio 服务器需要 command；SSE 服务�
 
 ## 工具返回的图片
 
-只有 `deepseek-flash` 和使用它的 `auto` 能在 tool 消息中直接看到 MCP 工具返回的图片。`deepseek-v4-pro` 和自定义模型（即使声明了 `supports_images = true`）收到的是一句说明，告诉模型它看不到这些图片。仅接受 PNG、JPEG、GIF 和 WebP，解码后每张不超过 5 MiB；其他类型会被丢弃并留下说明。单个 MCP 响应连同图片最多 16 MiB，超过时这次调用会失败。
+只有 `deepseek-flash` 和使用它的 `auto` 能在 tool 消息中直接看到 MCP 工具返回的图片。`deepseek-v4-pro` 和自定义模型（即使声明了 `supports_images = true`）收到的是一句说明，告诉模型它看不到这些图片。仅接受 PNG、JPEG、GIF 和 WebP，解码后每张不超过 5 MiB；不符合的图片会被丢弃，并留下说明原因的文字。单个 MCP 响应连同图片最多 16 MiB，超过时这次调用会失败。
 
 每次请求最多携带对话中最新的 3 张工具图片，更早的会替换为说明文字。这只影响发出的请求——完整历史仍保存在磁盘上。
 
