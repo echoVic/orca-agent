@@ -659,6 +659,7 @@ impl McpRegistry {
         let mut images = Vec::new();
         for content in result.content {
             match content {
+                McpContent::Text { text } if text.is_empty() => {}
                 McpContent::Text { text } => texts.push(text),
                 McpContent::Image { data, mime_type } => match tool_image(&mime_type, data) {
                     Ok(image) => images.push(image),
@@ -1453,6 +1454,82 @@ mod tests {
             "screenshot taken\n[image omitted: missing media type]"
         );
         assert!(result.images.is_empty());
+    }
+
+    #[test]
+    fn a_tool_whose_only_text_block_is_empty_reports_no_text_content() {
+        let (registry, tool_ref) = registry_with_call_tool_result(serde_json::json!({
+            "content": [{"type": "text", "text": ""}],
+            "isError": false
+        }));
+
+        let result = registry
+            .call_tool(&tool_ref, serde_json::json!({}))
+            .expect("tool result");
+
+        assert_eq!(result.output, "(MCP tool returned no text content)");
+    }
+
+    #[test]
+    fn two_accepted_mcp_images_share_one_plural_marker() {
+        let (registry, tool_ref) = registry_with_call_tool_result(serde_json::json!({
+            "content": [
+                {"type": "text", "text": "screenshots taken"},
+                {"type": "image", "data": BASE64_1X1_PNG, "mimeType": "image/png"},
+                {"type": "image", "data": BASE64_1X1_PNG, "mimeType": "image/png"}
+            ],
+            "isError": false
+        }));
+
+        let result = registry
+            .call_tool(&tool_ref, serde_json::json!({}))
+            .expect("tool result");
+
+        assert_eq!(result.output, "screenshots taken\n[2 images attached]");
+        assert_eq!(result.images.len(), 2);
+    }
+
+    #[test]
+    fn rejected_only_mcp_images_leave_only_their_notes() {
+        let (registry, tool_ref) = registry_with_call_tool_result(serde_json::json!({
+            "content": [
+                {"type": "image", "data": "PHN2Zz4=", "mimeType": "image/svg+xml"},
+                {"type": "image", "data": "not base64!", "mimeType": "image/png"}
+            ],
+            "isError": false
+        }));
+
+        let result = registry
+            .call_tool(&tool_ref, serde_json::json!({}))
+            .expect("tool result");
+
+        assert_eq!(
+            result.output,
+            "[image omitted: unsupported type image/svg+xml]\n[image omitted: invalid base64 data]"
+        );
+        assert!(result.images.is_empty());
+    }
+
+    #[test]
+    fn mixed_mcp_content_lists_text_then_notes_then_the_image_marker() {
+        let (registry, tool_ref) = registry_with_call_tool_result(serde_json::json!({
+            "content": [
+                {"type": "image", "data": BASE64_1X1_PNG, "mimeType": "image/png"},
+                {"type": "text", "text": "screenshot taken"},
+                {"type": "image", "data": "PHN2Zz4=", "mimeType": "image/svg+xml"}
+            ],
+            "isError": false
+        }));
+
+        let result = registry
+            .call_tool(&tool_ref, serde_json::json!({}))
+            .expect("tool result");
+
+        assert_eq!(
+            result.output,
+            "screenshot taken\n[image omitted: unsupported type image/svg+xml]\n[1 image attached]"
+        );
+        assert_eq!(result.images.len(), 1);
     }
 
     #[cfg(unix)]
