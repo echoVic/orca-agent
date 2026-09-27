@@ -224,6 +224,10 @@ mod unix {
         result
     }
 
+    /// How long SIGTERM or Ctrl+C waits for the runtime to finish shutting
+    /// down before the daemon exits anyway.
+    const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
     pub fn run(mut config: RunConfig, socket: PathBuf) -> io::Result<()> {
         let cwd = config
             .cwd
@@ -235,7 +239,7 @@ mod unix {
             .enable_all()
             .build()?;
         let local = tokio::task::LocalSet::new();
-        local.block_on(&runtime, async move {
+        let result = local.block_on(&runtime, async move {
             let mut term =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             let mut interrupt =
@@ -272,14 +276,28 @@ mod unix {
                 }
             }
             // Runtime commits shutdown terminals before transports disappear.
-            let result = tokio::task::spawn_blocking(move || host.shutdown())
-                .await
-                .map_err(io::Error::other)?
-                .map_err(io::Error::other);
+            // A signal is still an order to stop: a shutdown that has not
+            // finished in time, or a second signal, ends the daemon anyway,
+            // and what it left unfinished is recovered on the next start as
+            // after a crash.
+            let shutdown = tokio::task::spawn_blocking(move || host.shutdown());
+            let result = tokio::select! {
+                joined = shutdown => joined.map_err(io::Error::other)?.map_err(io::Error::other),
+                _ = tokio::time::sleep(SHUTDOWN_GRACE) => Err(io::Error::other(format!(
+                    "runtime shutdown did not finish within {}s",
+                    SHUTDOWN_GRACE.as_secs()
+                ))),
+                _ = term.recv() => Err(io::Error::other("stopped again before shutdown finished")),
+                _ = interrupt.recv() => Err(io::Error::other("stopped again before shutdown finished")),
+            };
             clients.abort_all();
             while clients.join_next().await.is_some() {}
             drop(endpoint);
             result
-        })
+        });
+        // Dropping the runtime would wait for every blocking task, including a
+        // shutdown that is stuck; the process is exiting either way.
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        result
     }
 }
