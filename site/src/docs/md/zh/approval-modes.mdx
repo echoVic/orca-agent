@@ -76,6 +76,29 @@ CLI 选项优先于环境变量、受信任项目配置、用户配置和内置�
 
 在 plan 模式下，Orca 只读地调查，可能会先问几个澄清问题，最后给出计划。随后 **Plan ready** 对话框让你选择：实现计划（切回进入 plan 之前的模式；如果会话一开始就在 plan 模式，则切到 auto-edit），或者留在 plan 模式继续完善。对话进行到一半也可以切到 plan 模式。详见[终端界面](terminal-ui.md)。
 
+## 权限规则
+
+权限规则先于审批模式决定一次工具调用。规则写在用户配置（`~/.orca/config.toml`）里，项目的 `.orca/config.toml` 不能设置。
+
+~~~toml
+[[permissions.rules]]
+tool = "bash"
+pattern = "cargo *"
+decision = "allow"
+
+[[permissions.rules]]
+tool = "bash"
+pattern = "rm -rf *"
+decision = "deny"
+
+[[permissions.rules]]
+tool = "write_file"
+pattern = "/etc/**"
+decision = "deny"
+~~~
+
+`decision` 可以是 `allow`、`prompt` 或 `deny`；多条规则同时匹配时，取最严格的一条。规则按工具名和调用目标匹配：`bash` 的目标是命令行，文件工具的目标是路径。在 `bash` 的 pattern 里，`*` 匹配任意文本（包括 `/`），所以 `rm -rf *` 也能拦住 `rm -rf /tmp/build`。在路径 pattern 里，`*` 和 `?` 不跨目录，`**` 可以跨目录。Windows 上匹配不区分 ASCII 大小写。规则不能放宽 plan 模式的限制。
+
 ## 信任是独立边界
 
 目录信任决定项目配置能否参与生效。审查工作区后，才使用公开 trust 命令查看或修改它：

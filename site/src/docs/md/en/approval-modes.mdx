@@ -98,6 +98,37 @@ the session started in plan mode), or to stay in plan mode and refine it. You
 can switch to plan mode in the middle of a conversation. See
 [Terminal UI](terminal-ui.md).
 
+## Permission rules
+
+Permission rules decide a tool call before the mode does. They live in the user
+configuration (`~/.orca/config.toml`); a project's `.orca/config.toml` cannot
+set them.
+
+~~~toml
+[[permissions.rules]]
+tool = "bash"
+pattern = "cargo *"
+decision = "allow"
+
+[[permissions.rules]]
+tool = "bash"
+pattern = "rm -rf *"
+decision = "deny"
+
+[[permissions.rules]]
+tool = "write_file"
+pattern = "/etc/**"
+decision = "deny"
+~~~
+
+`decision` is `allow`, `prompt`, or `deny`; when several rules match, the
+strictest wins. A rule matches the tool name and the call's target: the command
+line for `bash`, and the path for file tools. In a `bash` pattern, `*` matches
+any text, `/` included, so `rm -rf *` also catches `rm -rf /tmp/build`. In a
+path pattern, `*` and `?` stay within one directory and `**` crosses
+directories. On Windows, matching ignores ASCII case. Rules cannot lift plan
+mode's limits.
+
 ## Trust remains separate
 
 Folder trust decides whether a project configuration can contribute settings.

@@ -40,6 +40,17 @@ struct CompiledPermissionRule {
 #[derive(Clone, Debug)]
 struct CompiledGlob {
     pattern: Vec<u8>,
+    target: GlobTarget,
+}
+
+/// What a rule's pattern is matched against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlobTarget {
+    /// A path: `*` and `?` stop at `/`, and `**` crosses directories.
+    Path,
+    /// A command line: `*` and `?` match any character, `/` included, so a
+    /// rule still matches a command whose arguments are paths.
+    Command,
 }
 
 impl CompiledPermissionRules {
@@ -64,9 +75,16 @@ impl CompiledPermissionRules {
 
 impl CompiledPermissionRule {
     fn new(rule: PermissionRule) -> Self {
+        // `bash` is the only tool that starts a process, and its target is
+        // the command line; every other target is a path or a name.
+        let target = if rule.tool == "bash" {
+            GlobTarget::Command
+        } else {
+            GlobTarget::Path
+        };
         Self {
             tool: rule.tool,
-            pattern: CompiledGlob::new(rule.pattern),
+            pattern: CompiledGlob::new(rule.pattern, target),
             decision: rule.decision,
         }
     }
@@ -80,9 +98,10 @@ impl CompiledPermissionRule {
 }
 
 impl CompiledGlob {
-    fn new(pattern: String) -> Self {
+    fn new(pattern: String, target: GlobTarget) -> Self {
         Self {
             pattern: pattern.into_bytes(),
+            target,
         }
     }
 
@@ -102,20 +121,26 @@ impl CompiledGlob {
                 .iter()
                 .map(u8::to_ascii_lowercase)
                 .collect::<Vec<_>>();
-            return glob_matches(&pattern, &value);
+            return glob_matches(&pattern, &value, self.target);
         }
         #[cfg(not(windows))]
         {
-            glob_matches(&self.pattern, value.as_bytes())
+            glob_matches(&self.pattern, value.as_bytes(), self.target)
         }
     }
 }
 
-fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
-    glob_match(pattern, 0, value, 0)
+fn glob_matches(pattern: &[u8], value: &[u8], target: GlobTarget) -> bool {
+    glob_match(pattern, 0, value, 0, target)
 }
 
-fn glob_match(pattern: &[u8], mut p: usize, value: &[u8], mut v: usize) -> bool {
+fn glob_match(
+    pattern: &[u8],
+    mut p: usize,
+    value: &[u8],
+    mut v: usize,
+    target: GlobTarget,
+) -> bool {
     while p < pattern.len() && v < value.len() {
         match pattern[p] {
             b'*' => {
@@ -128,26 +153,26 @@ fn glob_match(pattern: &[u8], mut p: usize, value: &[u8], mut v: usize) -> bool 
                     };
                     // ** matches zero or more path segments
                     for i in v..=value.len() {
-                        if glob_match(pattern, next_p, value, i) {
+                        if glob_match(pattern, next_p, value, i, target) {
                             return true;
                         }
                     }
                     return false;
                 }
-                // Single * does not match /
+                // In a path, a single * does not match /
                 p += 1;
                 for i in v..=value.len() {
-                    if i > v && value[i - 1] == b'/' {
+                    if target == GlobTarget::Path && i > v && value[i - 1] == b'/' {
                         break;
                     }
-                    if glob_match(pattern, p, value, i) {
+                    if glob_match(pattern, p, value, i, target) {
                         return true;
                     }
                 }
                 return false;
             }
             b'?' => {
-                if value[v] == b'/' {
+                if target == GlobTarget::Path && value[v] == b'/' {
                     return false;
                 }
                 let char_len = match value[v] {
@@ -257,20 +282,69 @@ mod tests {
     }
 
     #[test]
+    fn bash_rule_wildcards_span_slashes_in_the_command() {
+        // A command line is not a path: a deny rule must still catch a
+        // command whose arguments contain `/`, and `git push *` covers a
+        // branch name with a slash in it.
+        let deny =
+            CompiledPermissionRule::new(PermissionRule::new("bash", "rm -rf *", Decision::Deny));
+        assert!(deny.matches("bash", Some("rm -rf /tmp/build")));
+        let allow =
+            CompiledPermissionRule::new(PermissionRule::new("bash", "git push *", Decision::Allow));
+        assert!(allow.matches("bash", Some("git push origin feature/login")));
+        let one_char = CompiledPermissionRule::new(PermissionRule::new(
+            "bash",
+            "cat ?etc/hosts",
+            Decision::Deny,
+        ));
+        assert!(one_char.matches("bash", Some("cat /etc/hosts")));
+        assert!(!allow.matches("bash", Some("git pull origin feature/login")));
+    }
+
+    #[test]
+    fn path_rule_star_stays_within_one_directory() {
+        let rule = CompiledPermissionRule::new(PermissionRule::new(
+            "write_file",
+            "src/*",
+            Decision::Allow,
+        ));
+        assert!(rule.matches("write_file", Some("src/main.rs")));
+        assert!(!rule.matches("write_file", Some("src/nested/main.rs")));
+    }
+
+    #[test]
     fn glob_single_star_does_not_match_path_separator() {
-        assert!(glob_matches(b"src/*", b"src/main.rs"));
-        assert!(!glob_matches(b"src/*", b"src/nested/main.rs"));
-        assert!(glob_matches(b"cargo *", b"cargo test"));
-        assert!(!glob_matches(b"cargo *", b"cargo test/nested"));
+        assert!(glob_matches(b"src/*", b"src/main.rs", GlobTarget::Path));
+        assert!(!glob_matches(
+            b"src/*",
+            b"src/nested/main.rs",
+            GlobTarget::Path
+        ));
     }
 
     #[test]
     fn glob_double_star_matches_across_directories() {
-        assert!(glob_matches(b"/etc/**", b"/etc/passwd"));
-        assert!(glob_matches(b"/etc/**", b"/etc/ssh/config"));
-        assert!(glob_matches(b"/etc/**", b"/etc/deep/nested/path"));
-        assert!(!glob_matches(b"/etc/**", b"/usr/bin/env"));
-        assert!(glob_matches(b"src/**/*.rs", b"src/foo/bar.rs"));
-        assert!(glob_matches(b"src/**/*.rs", b"src/a/b/c.rs"));
+        assert!(glob_matches(b"/etc/**", b"/etc/passwd", GlobTarget::Path));
+        assert!(glob_matches(
+            b"/etc/**",
+            b"/etc/ssh/config",
+            GlobTarget::Path
+        ));
+        assert!(glob_matches(
+            b"/etc/**",
+            b"/etc/deep/nested/path",
+            GlobTarget::Path
+        ));
+        assert!(!glob_matches(b"/etc/**", b"/usr/bin/env", GlobTarget::Path));
+        assert!(glob_matches(
+            b"src/**/*.rs",
+            b"src/foo/bar.rs",
+            GlobTarget::Path
+        ));
+        assert!(glob_matches(
+            b"src/**/*.rs",
+            b"src/a/b/c.rs",
+            GlobTarget::Path
+        ));
     }
 }
