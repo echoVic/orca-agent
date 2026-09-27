@@ -702,7 +702,11 @@ fn normalize_provider_response(
             turn_id: completed.identity.turn_id.clone(),
             name,
             action: surface_tool_action(request.action),
-            target: request.target.clone().map(surface::DisplayText::new),
+            target: request
+                .target
+                .clone()
+                .or_else(|| orca_tools::schema::tool_request_target(request))
+                .map(surface::DisplayText::new),
             raw_arguments: surface::DisplayText::new(raw_call.arguments.clone()),
             arguments_digest,
         });
@@ -1093,8 +1097,76 @@ fn is_surface_sensitive_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::next_provider_context_snapshot;
+    use super::{next_provider_context_snapshot, normalize_provider_response};
     use crate::runtime_surface as surface;
+
+    #[test]
+    fn a_tool_request_without_a_target_takes_it_from_its_arguments() {
+        // DeepSeek streams tool calls by name and arguments only.
+        let calls = [
+            (
+                "read-1",
+                orca_core::tool_types::ToolName::ReadFile,
+                "read_file",
+                serde_json::json!({"path": "billing/pages.py"}),
+            ),
+            (
+                "bash-1",
+                orca_core::tool_types::ToolName::Bash,
+                "bash",
+                serde_json::json!({"command": "python3 -m unittest"}),
+            ),
+        ];
+        let mut steps = Vec::new();
+        let mut tool_calls = Vec::new();
+        for (id, name, function_name, arguments) in calls {
+            let arguments = arguments.to_string();
+            steps.push(orca_core::provider_types::ProviderStep::ToolCall(
+                orca_core::tool_types::ToolRequest {
+                    id: id.to_string(),
+                    name,
+                    action: orca_core::approval_types::ActionKind::Read,
+                    target: None,
+                    raw_arguments: Some(arguments.clone()),
+                },
+            ));
+            tool_calls.push(orca_core::conversation::RawToolCall {
+                id: id.to_string(),
+                function_name: function_name.to_string(),
+                arguments,
+            });
+        }
+        let response = crate::model_response::RuntimeModelResponse::new(
+            orca_core::provider_types::ProviderResponse {
+                steps,
+                assistant_content: None,
+                assistant_reasoning: None,
+                tool_calls,
+                usage: None,
+            },
+            orca_core::thread_identity::TurnId::new(),
+        );
+
+        let normalized = normalize_provider_response(&response, "provider response").unwrap();
+
+        let targets = normalized
+            .tool_requests
+            .iter()
+            .map(|request| {
+                request
+                    .target
+                    .as_ref()
+                    .map(|target| target.as_str().to_string())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec![
+                Some("billing/pages.py".to_string()),
+                Some("python3 -m unittest".to_string())
+            ]
+        );
+    }
 
     #[test]
     fn provider_usage_updates_context_snapshot_with_current_prompt_tokens_bits_spec_ut() {

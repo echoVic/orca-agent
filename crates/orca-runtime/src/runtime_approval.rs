@@ -62,11 +62,17 @@ impl<'a> RuntimeToolApprovalPolicy<'a> {
             });
         }
 
-        let decision = self.policy.resolve_for_tool(
-            &approval,
-            request.name.as_str(),
-            request.target.as_deref(),
-        );
+        // Rules match what the invocation resolved: the approval carries the
+        // normalized tool and the target derived from its arguments, which a
+        // streaming provider's raw request lacks.
+        let tool = approval
+            .tool
+            .clone()
+            .unwrap_or_else(|| request.name.as_str().to_string());
+        let target = approval.target.clone().or_else(|| request.target.clone());
+        let decision = self
+            .policy
+            .resolve_for_tool(&approval, &tool, target.as_deref());
         if self.permission_overlay.strict_auto_review()
             && decision.decision == ApprovalDecision::Allow
         {
@@ -151,6 +157,45 @@ mod tests {
             other => panic!("preapproved request should be allowed, got {other:?}"),
         }
         assert!(!overlay.consume_preapproved_tool_call_id("shell-1"));
+    }
+
+    #[test]
+    fn a_rule_matches_the_target_the_invocation_derived_when_the_provider_sent_none() {
+        // A streaming provider names no target; the invocation derives one
+        // from the arguments, and a configured rule must see that one.
+        let policy = ApprovalPolicy::new(ApprovalMode::FullAuto).with_permission_rules(
+            orca_core::approval_rules::PermissionRules {
+                rules: vec![orca_core::approval_rules::PermissionRule::new(
+                    "write_file",
+                    "/etc/**",
+                    orca_core::approval_types::Decision::Deny,
+                )],
+            },
+        );
+        let mut overlay = TurnPermissionOverlay::default();
+        let approval = ApprovalRequest {
+            id: "approval-1".to_string(),
+            action: ActionKind::Write,
+            description: "write_file requested write".to_string(),
+            tool: Some("write_file".to_string()),
+            target: Some("/etc/hosts".to_string()),
+            preview: None,
+        };
+        let request = ToolRequest {
+            id: "write-1".to_string(),
+            name: ToolName::WriteFile,
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(r#"{"path":"/etc/hosts","content":"x"}"#.to_string()),
+        };
+
+        let decision =
+            RuntimeToolApprovalPolicy::new(&policy, &mut overlay).resolve(approval, &request);
+
+        assert!(
+            matches!(decision, RuntimeApprovalDecision::Denied { .. }),
+            "the deny rule must apply, got {decision:?}"
+        );
     }
 
     #[test]

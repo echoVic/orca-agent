@@ -234,6 +234,16 @@ fn canonical_allowed_names(registry: &ToolRegistry, names: &[String]) -> HashSet
         .collect()
 }
 
+/// What a tool request acts on (a path, a command, a search pattern), read
+/// from its arguments. Providers that stream tool calls send only a name and
+/// arguments, so the runtime derives the target for display, approval, and
+/// permission rules.
+pub fn tool_request_target(request: &ToolRequest) -> Option<String> {
+    let arguments: Value = serde_json::from_str(request.raw_arguments.as_deref()?).ok()?;
+    let arguments = normalize_tool_arguments(&request.name, arguments).ok()?;
+    tool_target(&request.name, &arguments)
+}
+
 fn tool_target(name: &ToolName, arguments: &Value) -> Option<String> {
     match name {
         ToolName::ReadFile | ToolName::Edit | ToolName::WriteFile => {
