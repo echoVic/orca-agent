@@ -62,6 +62,7 @@ struct WorkspaceWriteProfileContext<'a> {
     readable_roots: &'a [PathBuf],
     additional_roots: &'a [PathBuf],
     metadata_writable_roots: &'a [PathBuf],
+    metadata_read_only_paths: &'a [PathBuf],
     denied_roots: &'a [PathBuf],
     network_access: bool,
     exclude_tmpdir_env_var: bool,
@@ -87,6 +88,7 @@ pub fn bash_command(command: &str, cwd: &Path) -> Command {
         readable_roots: &[],
         additional_roots: &[],
         metadata_writable_roots: &[],
+        metadata_read_only_paths: &[],
         denied_roots: &[],
         network_access: true,
         exclude_tmpdir_env_var: false,
@@ -106,6 +108,7 @@ pub fn bash_command_with_additional_roots(
         readable_roots: &[],
         additional_roots,
         metadata_writable_roots: &[],
+        metadata_read_only_paths: &[],
         denied_roots: &[],
         network_access: true,
         exclude_tmpdir_env_var: false,
@@ -135,6 +138,11 @@ pub fn workspace_write_bash_command(context: WorkspaceWriteSandboxCommandContext
         .filter(|root| crate::sandbox::is_safe_metadata_writable_root(root))
         .map(|root| normalize_path_for_seatbelt(root))
         .collect::<Vec<_>>();
+    let canonical_metadata_read_only_paths = context
+        .metadata_read_only_paths
+        .iter()
+        .map(|path| normalize_path_for_seatbelt(path))
+        .collect::<Vec<_>>();
     let canonical_denied_roots = context
         .denied_roots
         .iter()
@@ -150,6 +158,7 @@ pub fn workspace_write_bash_command(context: WorkspaceWriteSandboxCommandContext
         readable_roots: &canonical_readable_roots,
         additional_roots: &canonical_additional_roots,
         metadata_writable_roots: &canonical_metadata_writable_roots,
+        metadata_read_only_paths: &canonical_metadata_read_only_paths,
         denied_roots: &canonical_denied_roots,
         network_access: context.network_access,
         exclude_tmpdir_env_var: context.exclude_tmpdir_env_var,
@@ -330,6 +339,7 @@ fn build_workspace_write_profile(context: WorkspaceWriteProfileContext<'_>) -> S
         readable_roots,
         additional_roots,
         metadata_writable_roots,
+        metadata_read_only_paths,
         denied_roots,
         network_access,
         exclude_tmpdir_env_var,
@@ -371,6 +381,7 @@ fn build_workspace_write_profile(context: WorkspaceWriteProfileContext<'_>) -> S
     // default protection. General `additional_roots` are emitted BEFORE the
     // deny rules and can therefore never re-open workspace metadata.
     append_metadata_write_allow_rules(&mut profile, metadata_writable_roots);
+    append_metadata_read_only_rules(&mut profile, metadata_read_only_paths);
     append_access_deny_rules(&mut profile, denied_roots);
     if let Some(home) = dirs::home_dir() {
         append_access_deny_rule(&mut profile, "SSH_DENY", &home.join(".ssh"), false);
@@ -517,6 +528,16 @@ fn append_metadata_write_allow_rules(profile: &mut SeatbeltProfileBuilder, roots
         let path = profile.path_parameter("METADATA_WRITABLE_ROOT", root);
         profile.push_rule(format!("(allow file-write* (literal {path}))"));
         profile.push_rule(format!("(allow file-write* (subpath {path}))"));
+    }
+}
+
+/// Paths inside a granted metadata root that stay read-only. Emitted after the
+/// grant, so they win over it.
+fn append_metadata_read_only_rules(profile: &mut SeatbeltProfileBuilder, paths: &[PathBuf]) {
+    for path in paths {
+        let path = profile.path_parameter("METADATA_READ_ONLY", path);
+        profile.push_rule(format!("(deny file-write* (literal {path}))"));
+        profile.push_rule(format!("(deny file-write* (subpath {path}))"));
     }
 }
 
@@ -723,6 +744,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: &[],
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: false,
             exclude_tmpdir_env_var: false,
@@ -769,6 +791,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: &[],
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: false,
             exclude_tmpdir_env_var: false,
@@ -795,6 +818,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: &[],
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: false,
             exclude_tmpdir_env_var: false,
@@ -885,6 +909,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: &[],
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: true,
             exclude_tmpdir_env_var: false,
@@ -907,6 +932,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: &[],
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: false,
             exclude_tmpdir_env_var: false,
@@ -927,6 +953,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: &[],
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: false,
             exclude_tmpdir_env_var: false,
@@ -1023,6 +1050,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: &[],
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: true,
             exclude_tmpdir_env_var: false,
@@ -1050,6 +1078,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: &[],
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: true,
             exclude_tmpdir_env_var: false,
@@ -1089,6 +1118,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: std::slice::from_ref(&git_dir),
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: true,
             exclude_tmpdir_env_var: false,
@@ -1107,6 +1137,78 @@ mod tests {
     }
 
     #[test]
+    fn workspace_write_profile_keeps_read_only_paths_inside_a_metadata_grant() {
+        let workspace = TempDir::new().unwrap();
+        let git_dir = workspace.path().join(".git");
+        let read_only = [git_dir.join("config"), git_dir.join("hooks")];
+        let profile = workspace_write_profile(WorkspaceWriteProfileContext {
+            cwd: workspace.path(),
+            readable_roots: &[],
+            additional_roots: &[],
+            metadata_writable_roots: std::slice::from_ref(&git_dir),
+            metadata_read_only_paths: &read_only,
+            denied_roots: &[],
+            network_access: true,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+            allowed_unix_socket_roots: &[],
+        });
+        let allow_git = format!(r#"(allow file-write* (subpath "{}"))"#, git_dir.display());
+        for path in &read_only {
+            let deny = format!(r#"(deny file-write* (subpath "{}"))"#, path.display());
+            let deny_at = profile
+                .find(&deny)
+                .unwrap_or_else(|| panic!("{deny} missing: {profile}"));
+            assert!(
+                deny_at > profile.find(&allow_git).unwrap(),
+                "a read-only path must come after the grant it narrows: {profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_grant_writes_git_but_not_its_read_only_paths() {
+        assert_seatbelt_available();
+        let parent = crate::sandbox::sandbox_test_parent("seatbelt-git-grant-");
+        let workspace = parent.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".git/hooks")).unwrap();
+        std::fs::write(workspace.join(".git/config"), "[core]\n").unwrap();
+        let git_dir = workspace.join(".git").canonicalize().unwrap();
+        let read_only = [git_dir.join("config"), git_dir.join("hooks")];
+
+        let output = workspace_write_bash_command(WorkspaceWriteSandboxCommandContext {
+            command: "printf ok > .git/probe; printf x >> .git/config; printf y > .git/hooks/pre-commit; true",
+            cwd: &workspace,
+            readable_roots: &[],
+            additional_roots: &[],
+            metadata_writable_roots: std::slice::from_ref(&git_dir),
+            metadata_read_only_paths: &read_only,
+            denied_roots: &[],
+            network_access: false,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+            allowed_unix_socket_roots: &[],
+        })
+        .output()
+        .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(git_dir.join("probe")).unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            std::fs::read_to_string(git_dir.join("config")).unwrap(),
+            "[core]\n"
+        );
+        assert!(!git_dir.join("hooks/pre-commit").exists());
+    }
+
+    #[test]
     fn workspace_write_profile_general_root_cannot_override_metadata_protection() {
         let workspace = TempDir::new().unwrap();
         let git_dir = workspace.path().join(".git");
@@ -1115,6 +1217,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: std::slice::from_ref(&git_dir),
             metadata_writable_roots: &[],
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: true,
             exclude_tmpdir_env_var: false,
@@ -1348,6 +1451,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: std::slice::from_ref(&metadata_link),
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: true,
             exclude_tmpdir_env_var: true,
@@ -1378,6 +1482,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: std::slice::from_ref(&git_dir),
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: true,
             exclude_tmpdir_env_var: false,
@@ -1640,6 +1745,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: &[],
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: true,
             exclude_tmpdir_env_var: false,
@@ -1692,6 +1798,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: &[],
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: false,
             exclude_tmpdir_env_var: true,
@@ -1712,6 +1819,7 @@ mod tests {
             readable_roots: &[],
             additional_roots: &[],
             metadata_writable_roots: &[],
+            metadata_read_only_paths: &[],
             denied_roots: &[],
             network_access: false,
             exclude_tmpdir_env_var: true,

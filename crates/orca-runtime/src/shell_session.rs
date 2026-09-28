@@ -521,6 +521,7 @@ impl RuntimeShellSessionManager {
                         readable_roots: &command.additional_readable_directories,
                         additional_roots: &command.additional_working_directories,
                         metadata_writable_roots: &metadata_writable_directories,
+                        metadata_read_only_paths: &[],
                         denied_roots: &command.denied_working_directories,
                         network_access,
                         exclude_tmpdir_env_var,

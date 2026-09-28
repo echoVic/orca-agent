@@ -78,6 +78,9 @@ pub struct WorkspaceWriteSandboxCommandContext<'a> {
     /// (`.git`/`.agents`/`.codex`). Unlike `additional_roots`, these are the
     /// only grants allowed to override the default metadata protection.
     pub metadata_writable_roots: &'a [PathBuf],
+    /// Paths inside a granted metadata root that stay read-only (a git grant
+    /// keeps `config` and `hooks` closed). Applied after the grant.
+    pub metadata_read_only_paths: &'a [PathBuf],
     pub denied_roots: &'a [PathBuf],
     pub network_access: bool,
     pub exclude_tmpdir_env_var: bool,
@@ -104,6 +107,7 @@ pub fn bash_command(command: &str, cwd: &Path) -> Command {
         readable_roots: &[],
         additional_roots: &[],
         metadata_writable_roots: &[],
+        metadata_read_only_paths: &[],
         denied_roots: &[],
         network_access: true,
         exclude_tmpdir_env_var: false,
@@ -129,6 +133,7 @@ pub fn bash_command_with_additional_roots(
         readable_roots: &[],
         additional_roots,
         metadata_writable_roots: &[],
+        metadata_read_only_paths: &[],
         denied_roots: &[],
         network_access: true,
         exclude_tmpdir_env_var: false,
@@ -639,6 +644,14 @@ mod platform {
                 read_only_roots.push(canonical_metadata);
             }
         }
+        // A granted `.git` keeps its config and hooks read-only. The ro-bind
+        // covers only paths that exist, which the runtime checks before it
+        // grants.
+        for path in canonicalize_all(context.metadata_read_only_paths) {
+            if !read_only_roots.contains(&path) {
+                read_only_roots.push(path);
+            }
+        }
 
         let mut denied_roots = canonicalize_all(context.denied_roots);
         // The selected cwd is an explicit user capability. Do not mask it
@@ -857,6 +870,52 @@ mod platform {
             );
             assert_eq!(command.get_current_dir(), Some(cwd.as_path()));
         }
+
+        #[test]
+        fn metadata_grant_writes_git_but_not_its_read_only_paths() {
+            let parent = crate::sandbox::sandbox_test_parent("bwrap-git-grant-");
+            let workspace = parent.path().join("workspace");
+            std::fs::create_dir_all(workspace.join(".git/hooks")).unwrap();
+            std::fs::write(workspace.join(".git/config"), "[core]\n").unwrap();
+            if !crate::sandbox::linux::enforced_available(&workspace) {
+                return;
+            }
+            let git_dir = workspace.join(".git").canonicalize().unwrap();
+            let read_only = [git_dir.join("config"), git_dir.join("hooks")];
+
+            let output = crate::sandbox::workspace_write_bash_command(
+                WorkspaceWriteSandboxCommandContext {
+                    command: "printf ok > .git/probe; printf x >> .git/config; printf y > .git/hooks/pre-commit; true",
+                    cwd: &workspace,
+                    readable_roots: &[],
+                    additional_roots: &[],
+                    metadata_writable_roots: std::slice::from_ref(&git_dir),
+                    metadata_read_only_paths: &read_only,
+                    denied_roots: &[],
+                    network_access: false,
+                    exclude_tmpdir_env_var: false,
+                    exclude_slash_tmp: false,
+                    allowed_unix_socket_roots: &[],
+                },
+            )
+            .output()
+            .unwrap();
+
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(git_dir.join("probe")).unwrap(),
+                "ok"
+            );
+            assert_eq!(
+                std::fs::read_to_string(git_dir.join("config")).unwrap(),
+                "[core]\n"
+            );
+            assert!(!git_dir.join("hooks/pre-commit").exists());
+        }
     }
 
     pub fn platform_default_read_roots() -> Vec<PathBuf> {
@@ -898,6 +957,7 @@ mod platform {
                 readable_roots: &[],
                 additional_roots: &[],
                 metadata_writable_roots: &[],
+                metadata_read_only_paths: &[],
                 denied_roots: &[],
                 network_access: false,
                 exclude_tmpdir_env_var: false,
