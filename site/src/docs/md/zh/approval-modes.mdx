@@ -99,6 +99,14 @@ decision = "deny"
 
 `decision` 可以是 `allow`、`prompt` 或 `deny`；多条规则同时匹配时，取最严格的一条。规则按工具名和调用目标匹配：`bash` 的目标是命令行，文件工具的目标是路径。在 `bash` 的 pattern 里，`*` 匹配任意文本（包括 `/`），所以 `rm -rf *` 也能拦住 `rm -rf /tmp/build`。在路径 pattern 里，`*` 和 `?` 不跨目录，`**` 可以跨目录。Windows 上匹配不区分 ASCII 大小写。规则不能放宽 plan 模式的限制。
 
+`pattern` 可以省略，默认值是 `*`，匹配任意目标，包括没有目标的调用。MCP 工具调用的名字是 `mcp__<server>__<tool>`，规则可以精确匹配某一个；写成 `mcp__<server>__*`（等价地，也可以只写 `mcp__<server>`）就能匹配该服务器上的所有工具：
+
+~~~toml
+[[permissions.rules]]
+tool = "mcp__github__*"
+decision = "allow"
+~~~
+
 ## 信任是独立边界
 
 目录信任决定项目配置能否参与生效。审查工作区后，才使用公开 trust 命令查看或修改它：

@@ -129,6 +129,17 @@ path pattern, `*` and `?` stay within one directory and `**` crosses
 directories. On Windows, matching ignores ASCII case. Rules cannot lift plan
 mode's limits.
 
+`pattern` can be omitted; it then defaults to `*`, which matches any target,
+including a call with none. MCP tool calls are named `mcp__<server>__<tool>`,
+so a rule can target one exactly. Writing `mcp__<server>__*` (or,
+equivalently, just `mcp__<server>`) matches every tool on that server:
+
+~~~toml
+[[permissions.rules]]
+tool = "mcp__github__*"
+decision = "allow"
+~~~
+
 ## Trust remains separate
 
 Folder trust decides whether a project configuration can contribute settings.

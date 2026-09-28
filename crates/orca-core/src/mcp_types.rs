@@ -151,6 +151,20 @@ impl McpToolDescriptor {
     }
 }
 
+/// Extracts the server name from an MCP tool's runtime name, which the
+/// registry builds as `mcp__<server>__<tool>` (see
+/// `orca_mcp::client::connect_server`): the segment after `mcp__` and before
+/// the next `__`. Returns `None` when `tool` does not have that shape, or
+/// when the server or tool segment is empty.
+pub fn mcp_tool_server(tool: &str) -> Option<&str> {
+    let rest = tool.strip_prefix("mcp__")?;
+    let (server, local_tool) = rest.split_once("__")?;
+    if server.is_empty() || local_tool.is_empty() {
+        return None;
+    }
+    Some(server)
+}
+
 fn default_input_schema() -> Value {
     json!({
         "type": "object",
@@ -227,5 +241,14 @@ mod tests {
             serde_json::from_str(r#"{"name":"a","annotations":{"readOnlyHint":false}}"#)
                 .expect("descriptor with readOnlyHint false");
         assert!(!hint_false.is_read_only());
+    }
+
+    #[test]
+    fn mcp_tool_server_reads_the_server_segment() {
+        assert_eq!(mcp_tool_server("mcp__github__create_issue"), Some("github"));
+        assert_eq!(mcp_tool_server("mcp__a__b__c"), Some("a"));
+        assert_eq!(mcp_tool_server("mcp__github"), None);
+        assert_eq!(mcp_tool_server("mcp____x"), None);
+        assert_eq!(mcp_tool_server("bash"), None);
     }
 }

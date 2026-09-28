@@ -375,4 +375,47 @@ mod tests {
         assert_eq!(res.decision, ApprovalDecision::Deny);
         assert!(res.reason.contains("permission deny rule"));
     }
+
+    #[test]
+    fn a_rule_can_allow_an_mcp_tool_in_suggest_mode() {
+        let policy =
+            ApprovalPolicy::new(ApprovalMode::Suggest).with_rules(vec![PermissionRule::new(
+                "mcp__github__*",
+                "*",
+                Decision::Allow,
+            )]);
+        let req = ApprovalRequest {
+            id: "mcp-suggest".to_string(),
+            action: ActionKind::Write,
+            description: "call an MCP tool".to_string(),
+            tool: Some("mcp__github__create_issue".to_string()),
+            target: None,
+            preview: None,
+        };
+
+        let res = policy.resolve_for_tool(&req, "mcp__github__create_issue", None);
+
+        assert_eq!(res.decision, ApprovalDecision::Allow);
+    }
+
+    #[test]
+    fn a_rule_cannot_lift_plan_for_an_mcp_tool() {
+        let policy = ApprovalPolicy::new(ApprovalMode::Plan).with_rules(vec![PermissionRule::new(
+            "mcp__github__*",
+            "*",
+            Decision::Allow,
+        )]);
+        let req = ApprovalRequest {
+            id: "mcp-plan".to_string(),
+            action: ActionKind::Write,
+            description: "call an MCP tool".to_string(),
+            tool: Some("mcp__github__create_issue".to_string()),
+            target: None,
+            preview: None,
+        };
+
+        let res = policy.resolve_for_tool(&req, "mcp__github__create_issue", None);
+
+        assert_eq!(res.decision, ApprovalDecision::Deny);
+    }
 }

@@ -1,12 +1,20 @@
 use serde::{Deserialize, Serialize};
 
 use crate::approval_types::Decision;
+use crate::mcp_types::mcp_tool_server;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PermissionRule {
     pub tool: String,
+    #[serde(default = "any_target")]
     pub pattern: String,
     pub decision: Decision,
+}
+
+/// Default for `PermissionRule::pattern`: matches any target, including a
+/// call that carries none (MCP tool calls have no target).
+fn any_target() -> String {
+    "*".to_string()
 }
 
 impl PermissionRule {
@@ -90,11 +98,31 @@ impl CompiledPermissionRule {
     }
 
     fn matches(&self, tool: &str, target: Option<&str>) -> bool {
-        if self.tool != tool {
-            return false;
-        }
-        target.is_some_and(|target| self.pattern.matches(target))
+        self.matches_tool(tool) && self.pattern.matches(target.unwrap_or(""))
     }
+
+    /// A rule's `tool` matches a call's tool name either literally, or, for
+    /// a server-level rule (`mcp__<server>` or `mcp__<server>__*`), when the
+    /// call is for a tool on that server.
+    fn matches_tool(&self, tool: &str) -> bool {
+        if self.tool == tool {
+            return true;
+        }
+        mcp_server_rule_name(&self.tool).is_some_and(|server| mcp_tool_server(tool) == Some(server))
+    }
+}
+
+/// Returns `Some(server)` when `rule_tool` names an entire MCP server,
+/// written as `mcp__<server>` (no further tool segment) or as
+/// `mcp__<server>__*` (every tool on that server). Any other rule tool name,
+/// including a specific `mcp__<server>__<tool>`, returns `None` so it is
+/// matched literally instead.
+fn mcp_server_rule_name(rule_tool: &str) -> Option<&str> {
+    let rest = rule_tool.strip_prefix("mcp__")?;
+    if let Some(server) = rest.strip_suffix("__*") {
+        return (!server.is_empty()).then_some(server);
+    }
+    (!rest.is_empty() && !rest.contains("__")).then_some(rest)
 }
 
 impl CompiledGlob {
@@ -346,5 +374,79 @@ mod tests {
             b"src/a/b/c.rs",
             GlobTarget::Path
         ));
+    }
+
+    #[test]
+    fn a_rule_without_a_pattern_matches_a_call_without_a_target() {
+        let rule: PermissionRule = toml::from_str(
+            r#"
+tool = "mcp__github__create_issue"
+decision = "allow"
+"#,
+        )
+        .expect("rule without a pattern");
+        let compiled = CompiledPermissionRules::from_rules(PermissionRules { rules: vec![rule] });
+
+        assert_eq!(
+            compiled.matching_decision("mcp__github__create_issue", None),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn a_rule_with_a_specific_pattern_does_not_match_a_call_without_a_target() {
+        let rule: PermissionRule = toml::from_str(
+            r#"
+tool = "mcp__github__create_issue"
+pattern = "src/**"
+decision = "allow"
+"#,
+        )
+        .expect("rule with a specific pattern");
+        let compiled = CompiledPermissionRules::from_rules(PermissionRules { rules: vec![rule] });
+
+        assert_eq!(
+            compiled.matching_decision("mcp__github__create_issue", None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_server_rule_matches_only_that_servers_tools() {
+        for rule_tool in ["mcp__github__*", "mcp__github"] {
+            let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+                rules: vec![PermissionRule::new(rule_tool, "*", Decision::Allow)],
+            });
+
+            for tool in ["mcp__github__create_issue", "mcp__github__list"] {
+                assert_eq!(
+                    compiled.matching_decision(tool, None),
+                    Some(Decision::Allow),
+                    "{rule_tool} should match {tool}"
+                );
+            }
+            for tool in ["mcp__githubx__tool", "mcp__gitlab__x", "bash"] {
+                assert_eq!(
+                    compiled.matching_decision(tool, None),
+                    None,
+                    "{rule_tool} should not match {tool}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deny_still_wins_over_a_server_allow() {
+        let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+            rules: vec![
+                PermissionRule::new("mcp__github__*", "*", Decision::Allow),
+                PermissionRule::new("mcp__github__delete_repo", "*", Decision::Deny),
+            ],
+        });
+
+        assert_eq!(
+            compiled.matching_decision("mcp__github__delete_repo", None),
+            Some(Decision::Deny)
+        );
     }
 }
