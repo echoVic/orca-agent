@@ -1617,6 +1617,23 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         });
     }
 
+    // The `tests/mcp_cli_contract.rs` end-to-end fixtures: `fx__lookup`
+    // (read-only) and `fx__write_note` (not), served by a `/bin/sh` stdio
+    // fixture, and `web__fetch` (read-only), served by a hand-rolled
+    // streamable HTTP fixture. Read-only vs. write is decided by the MCP
+    // catalog's `readOnlyHint`, not by this request's `action`.
+    for mcp_tool in ["mcp__fx__lookup", "mcp__fx__write_note", "mcp__web__fetch"] {
+        if prompt == mcp_tool {
+            return Some(ToolRequest {
+                id: "mock-tool-1".to_string(),
+                name: ToolName::Mcp(mcp_tool.to_string()),
+                action: ActionKind::Agent,
+                target: Some(mcp_tool.to_string()),
+                raw_arguments: Some(serde_json::json!({}).to_string()),
+            });
+        }
+    }
+
     if prompt == "workflow draft" {
         let script = "export const meta = { name: 'mock-workflow', description: 'Mock workflow', phases: ['main'] };\nconst result = await phase('main', async () => agent('inspect repo'));\nexport default result;";
         return Some(ToolRequest {

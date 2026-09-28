@@ -240,6 +240,13 @@
       "process-ownership-plan"
     ],
     [
+      "mcp-cli-contract-unix-fixture",
+      "tests/mcp_cli_contract.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "runtime-special-shell",
       "crates/orca-runtime/src/runtime_special.rs",
       "unix_shell_spawn",
