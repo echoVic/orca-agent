@@ -162,6 +162,15 @@ pub trait McpTransport: Send + Sync {
         }
         self.read_resource(uri)
     }
+    /// Sends `prompts/list`.
+    fn list_prompts(&self) -> Result<Value, String> {
+        Err("prompts are not supported by this transport".to_string())
+    }
+    /// Sends `prompts/get` for the prompt `name`, with `arguments` (an
+    /// object of strings).
+    fn get_prompt(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+        Err("prompts are not supported by this transport".to_string())
+    }
 }
 
 pub fn connect(config: &McpServerConfig) -> Result<Box<dyn McpTransport>, String> {
@@ -532,6 +541,23 @@ impl McpTransport for StdioTransport {
             self.tool_timeout,
             None,
             Some(should_cancel),
+        )
+    }
+
+    fn list_prompts(&self) -> Result<Value, String> {
+        self.request_with_timeout("prompts/list", json!({}), self.startup_timeout, None, None)
+    }
+
+    fn get_prompt(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        self.request_with_timeout(
+            "prompts/get",
+            json!({
+                "name": name,
+                "arguments": arguments
+            }),
+            self.tool_timeout,
+            None,
+            None,
         )
     }
 }
@@ -1119,6 +1145,21 @@ impl McpTransport for StreamableHttpTransport {
             should_cancel,
         )
     }
+
+    fn list_prompts(&self) -> Result<Value, String> {
+        self.request_with_timeout("prompts/list", json!({}), self.startup_timeout)
+    }
+
+    fn get_prompt(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        self.request_with_timeout(
+            "prompts/get",
+            json!({
+                "name": name,
+                "arguments": arguments
+            }),
+            self.tool_timeout,
+        )
+    }
 }
 
 impl StreamableHttpTransport {
@@ -1621,6 +1662,14 @@ impl McpTransport for SseFallbackTransport {
     ) -> Result<Value, String> {
         self.transport()?
             .read_resource_or_cancel(uri, should_cancel)
+    }
+
+    fn list_prompts(&self) -> Result<Value, String> {
+        self.transport()?.list_prompts()
+    }
+
+    fn get_prompt(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        self.transport()?.get_prompt(name, arguments)
     }
 }
 
@@ -4680,6 +4729,49 @@ while IFS= read -r line; do :; done
         );
     }
 
+    #[test]
+    fn remote_transports_ask_for_prompts() {
+        let streamable = StreamableHttpServer::start(StreamableHttpBehavior::default());
+        let legacy = LegacySseServer::start(LegacySseBehavior::default());
+        // The legacy server is reached through the fallback from streamable HTTP.
+        for (config, server) in [
+            (
+                streamable_http_config("streamable", &streamable),
+                &streamable,
+            ),
+            (legacy_sse_config("legacy", &legacy), &legacy),
+        ] {
+            let transport = connect(&config).expect("connect a remote MCP server");
+            transport.initialize().expect("initialize");
+
+            let listed = transport.list_prompts().expect("prompts/list");
+            let expanded = transport
+                .get_prompt("review_pr", json!({"pr": "123"}))
+                .expect("prompts/get");
+
+            assert_eq!(listed["prompts"][0]["name"], "review_pr", "{}", config.name);
+            assert_eq!(
+                expanded["messages"][0]["content"]["text"], "review 123",
+                "{}",
+                config.name
+            );
+            assert_eq!(
+                server.requests_for("prompts/list").len(),
+                1,
+                "{}",
+                config.name
+            );
+            let asked = server.requests_for("prompts/get");
+            assert_eq!(asked.len(), 1, "{}", config.name);
+            assert_eq!(
+                asked[0].body["params"],
+                json!({"name": "review_pr", "arguments": {"pr": "123"}}),
+                "{}",
+                config.name
+            );
+        }
+    }
+
     fn streamable_http_config(name: &str, server: &HttpFixture) -> McpServerConfig {
         McpServerConfig {
             name: name.to_string(),
@@ -5000,6 +5092,8 @@ while IFS= read -r line; do :; done
                 "isError": false
             }),
             Some("resources/list") => json!({"resources": []}),
+            Some("prompts/list") => fixture_prompt_list(),
+            Some("prompts/get") => fixture_prompt(&request.body),
             _ => json!({}),
         };
         write_rpc_result(stream, behavior, id, result, None);
@@ -5350,6 +5444,8 @@ while IFS= read -r line; do :; done
                 }],
                 "isError": false
             }),
+            "prompts/list" => fixture_prompt_list(),
+            "prompts/get" => fixture_prompt(&request.body),
             _ => json!({}),
         };
         let _ = events.send(Some(legacy_event(
@@ -5395,5 +5491,25 @@ while IFS= read -r line; do :; done
 
     fn legacy_event(message: &Value) -> String {
         format!("event: message\ndata: {message}\n\n")
+    }
+
+    /// The prompts the HTTP fixtures offer.
+    fn fixture_prompt_list() -> Value {
+        json!({"prompts": [{
+            "name": "review_pr",
+            "arguments": [{"name": "pr", "required": true}]
+        }]})
+    }
+
+    /// The HTTP fixtures' answer to the `prompts/get` request `body`: one
+    /// message naming the `pr` argument.
+    fn fixture_prompt(body: &Value) -> Value {
+        let pr = body["params"]["arguments"]["pr"]
+            .as_str()
+            .unwrap_or_default();
+        json!({"messages": [{
+            "role": "user",
+            "content": {"type": "text", "text": format!("review {pr}")}
+        }]})
     }
 }

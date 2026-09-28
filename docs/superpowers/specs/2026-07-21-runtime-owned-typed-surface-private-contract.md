@@ -4103,6 +4103,19 @@ SurfaceMcpTool {
   read_only: bool,          // omitted on the wire when false
 }
 
+SurfaceMcpPrompt {
+  server: NonEmptyText,
+  name: NonEmptyText,
+  description: Option<DisplayText>,
+  arguments: Vec<SurfaceMcpPromptArgument>,
+}
+
+SurfaceMcpPromptArgument {
+  name: NonEmptyText,
+  description: Option<DisplayText>,
+  required: bool,
+}
+
 SurfaceMcpResource {
   id: SurfaceCatalogEntryId,
   server: NonEmptyText,
@@ -4137,6 +4150,7 @@ SurfaceMcpCatalogSnapshot {
   revision: McpCatalogRevision,
   servers: Vec<(NonEmptyText, SurfaceMcpServerStatus)>,
   tools: Vec<SurfaceMcpTool>,
+  prompts: Vec<SurfaceMcpPrompt>,  // omitted on the wire when empty
   resources: Vec<SurfaceMcpResource>,
   resource_templates: Vec<SurfaceMcpResourceTemplate>,
   diagnostics: Vec<SurfaceMcpCatalogDiagnostic>,
@@ -4177,7 +4191,14 @@ registry's, in config order; the entry id is `mcp-tool:` plus the schema name,
 and `read_only` repeats the server's declaration (`readOnlyHint` without
 `destructiveHint`). An object schema without `additionalProperties`, or with it
 `false`, is carried closed; any other `additionalProperties` makes that level
-`Unsupported`. Resources and resource templates are not listed yet.
+`Unsupported`. Prompts are the ones the connected servers list (`prompts/list`,
+asked only of a server whose `initialize` result declares the `prompts`
+capability), in config order and then in each server's order, under the
+server's canonical name, with their arguments in the order the server declared
+them. A server lists its prompts again when it reconnects. A `prompts/list`
+that fails, and a prompt without a name or with an argument without one, leave
+the server connected and are reported with the registry's errors instead of in
+the catalog. Resources and resource templates are not listed yet.
 
 ```text
 SurfaceMcpServerAction = Reconnect
@@ -4195,6 +4216,35 @@ RuntimeSurfaceClientHandle::mcp_server_control(
 config on a worker thread, so the actor stays responsive meanwhile, then
 publishes the catalog and answers with the status the catalog gives the server.
 A name no server has is answered with `Degraded` carrying the error.
+
+```text
+SurfaceMcpPromptExpansion {
+  text: String,
+  images: Vec<ImageInput>,
+}
+
+RuntimeSurfaceClientHandle::expand_mcp_prompt(
+  request_id: SurfaceRequestId,
+  server: NonEmptyText,
+  prompt: NonEmptyText,
+  arguments: Vec<(String, String)>,
+) -> Result<Result<SurfaceMcpPromptExpansion, DisplayText>, SurfaceClientCommandError>
+```
+
+`expand_mcp_prompt` is a client-handle command outside the closed
+`SurfaceCommand` inventory. It needs `ReadSnapshot`, as `read_task_transcript`
+does. The server is named as in the catalog, and the prompt must be one it
+lists. Runtime sends `prompts/get` with `arguments` as an object of strings on
+a worker thread, so the actor stays responsive meanwhile, and the worker
+answers the caller. Nothing is committed and nothing is submitted: the client
+sends the expansion as the user's input. The expansion reads the result's
+messages in order and ignores their roles: text parts are joined with a blank
+line, an image that passes tool-image validation goes to `images` and one that
+does not leaves its omission note in the text, an embedded resource adds its
+text, and resource links and other content are skipped. A server that is
+unknown or not connected, a prompt it does not list, and an error from the
+server are answered with `Ok(Err(message))`; `SurfaceClientCommandError` is
+only `Unauthorized` or `RuntimeUnavailable`.
 
 ```text
 SurfacePinnedContextEntry {

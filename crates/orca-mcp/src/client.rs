@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -11,9 +11,10 @@ use crate::transport::{self, McpElicitationHandler, McpTransport};
 use orca_core::config::mcp_credentials::mcp_credentials_path;
 use orca_core::conversation::ImageInput;
 use orca_core::mcp_types::{
-    CallToolResult, McpContent, McpResource, McpResourceTemplate, McpServerConfig, McpTool,
-    McpToolRef, McpTransportKind, ReadResourceResult, ResourceTemplatesListResult,
-    ResourcesListResult, ToolsListResult, tool_is_enabled,
+    CallToolResult, GetPromptResult, McpContent, McpPrompt, McpPromptContent, McpResource,
+    McpResourceTemplate, McpServerConfig, McpTool, McpToolRef, McpTransportKind, PromptsListResult,
+    ReadResourceResult, ResourceTemplatesListResult, ResourcesListResult, ToolsListResult,
+    tool_is_enabled,
 };
 use orca_core::tool_images::tool_image;
 
@@ -60,8 +61,10 @@ struct McpServerEntry {
     state: McpServerState,
     /// Its registered tools.
     tools: Vec<McpTool>,
-    /// What went wrong when it was last connected: the failure, or tools
-    /// left out because their names were taken.
+    /// The prompts it offers.
+    prompts: Vec<McpPrompt>,
+    /// What went wrong when it was last connected: the failure, tools left
+    /// out because their names were taken, or prompts it could not list.
     errors: Vec<String>,
 }
 
@@ -87,22 +90,38 @@ struct McpClient {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct McpServerCapabilities {
     resources: bool,
+    prompts: bool,
 }
 
 impl McpServerCapabilities {
     fn from_initialize_result(value: &Value) -> Self {
-        Self {
-            resources: value
+        let declares = |capability: &str| {
+            value
                 .get("capabilities")
-                .and_then(|capabilities| capabilities.get("resources"))
-                .is_some(),
+                .and_then(|capabilities| capabilities.get(capability))
+                .is_some()
+        };
+        Self {
+            resources: declares("resources"),
+            prompts: declares("prompts"),
         }
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     fn resource_capable_for_test() -> Self {
-        Self { resources: true }
+        Self {
+            resources: true,
+            ..Self::default()
+        }
     }
+}
+
+/// A prompt as its server expanded it (`prompts/get`): the text and the
+/// images of its messages.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpPromptExpansion {
+    pub text: String,
+    pub images: Vec<ImageInput>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -202,15 +221,24 @@ pub(crate) fn initialize_registry_with_credentials(
             config: config.clone(),
             state: McpServerState::Disabled,
             tools: Vec::new(),
+            prompts: Vec::new(),
             errors: Vec::new(),
         };
         if !config.disabled {
             match connect_server(config, &server.name, inner.credentials_path.clone()) {
-                Ok((client, tools)) => {
+                Ok(connected) => {
                     server.state = McpServerState::Ready;
-                    server.tools =
-                        take_tool_names(&server.name, tools, &mut taken, &mut server.errors);
-                    inner.clients.insert(server.name.clone(), Arc::new(client));
+                    server.tools = take_tool_names(
+                        &server.name,
+                        connected.tools,
+                        &mut taken,
+                        &mut server.errors,
+                    );
+                    server.prompts = connected.prompts;
+                    server.errors.extend(connected.warnings);
+                    inner
+                        .clients
+                        .insert(server.name.clone(), Arc::new(connected.client));
                 }
                 Err(error) => {
                     server.state = failed_state(&error);
@@ -274,11 +302,21 @@ fn failed_state(error: &str) -> McpServerState {
     }
 }
 
+/// A server that answered, and what it offers.
+struct ConnectedServer {
+    client: McpClient,
+    tools: Vec<McpTool>,
+    prompts: Vec<McpPrompt>,
+    /// Problems that did not stop it connecting, such as prompts it could
+    /// not list.
+    warnings: Vec<String>,
+}
+
 fn connect_server(
     config: &McpServerConfig,
     server_name: &str,
     credentials_path: Option<PathBuf>,
-) -> Result<(McpClient, Vec<McpTool>), String> {
+) -> Result<ConnectedServer, String> {
     let transport = transport::connect_with_credentials(config, credentials_path)?;
     connect_server_with_transport(config, server_name, transport)
 }
@@ -287,7 +325,7 @@ fn connect_server_with_transport(
     config: &McpServerConfig,
     server_name: &str,
     transport: Box<dyn McpTransport>,
-) -> Result<(McpClient, Vec<McpTool>), String> {
+) -> Result<ConnectedServer, String> {
     let initialize_result = transport.initialize()?;
     let capabilities = McpServerCapabilities::from_initialize_result(&initialize_result);
     let result = transport.list_tools()?;
@@ -312,15 +350,101 @@ fn connect_server_with_transport(
         })
         .collect();
 
-    Ok((
-        McpClient {
+    // A server whose prompts cannot be listed still serves its tools.
+    let mut warnings = Vec::new();
+    let prompts = if capabilities.prompts {
+        let listed = transport
+            .list_prompts()
+            .map_err(|error| {
+                format!("failed to list the prompts of MCP server '{server_name}': {error}")
+            })
+            .and_then(|result| listed_prompts(server_name, result, &mut warnings));
+        listed.unwrap_or_else(|error| {
+            warnings.push(error);
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+
+    Ok(ConnectedServer {
+        client: McpClient {
             config: config.clone(),
             server_name: server_name.to_string(),
             capabilities,
             transport: Mutex::new(transport),
         },
         tools,
-    ))
+        prompts,
+        warnings,
+    })
+}
+
+/// The prompts in a `prompts/list` result, under `server_name`. A prompt
+/// without a name, or with an argument without one, cannot be asked for, so
+/// it is left out, with a note in `errors`.
+fn listed_prompts(
+    server_name: &str,
+    result: Value,
+    errors: &mut Vec<String>,
+) -> Result<Vec<McpPrompt>, String> {
+    let list: PromptsListResult = serde_json::from_value(result)
+        .map_err(|error| format!("invalid prompts/list result for '{server_name}': {error}"))?;
+    Ok(list
+        .prompts
+        .into_iter()
+        .filter(|prompt| {
+            if prompt.name.trim().is_empty() {
+                errors.push(format!(
+                    "MCP prompt without a name, skipping from '{server_name}'"
+                ));
+                false
+            } else if prompt
+                .arguments
+                .iter()
+                .any(|argument| argument.name.trim().is_empty())
+            {
+                errors.push(format!(
+                    "MCP prompt '{}' has an argument without a name, skipping from '{server_name}'",
+                    prompt.name
+                ));
+                false
+            } else {
+                true
+            }
+        })
+        .map(|prompt| McpPrompt {
+            server: server_name.to_string(),
+            name: prompt.name,
+            description: prompt.description,
+            arguments: prompt.arguments,
+        })
+        .collect())
+}
+
+/// Puts the messages of an expanded prompt together, in order: their text
+/// joined with blank lines, and their images. An image that cannot be sent
+/// leaves its note in the text instead, and an embedded resource adds its
+/// text. Roles, and content of any other kind, are not read.
+fn expand_prompt(result: GetPromptResult) -> McpPromptExpansion {
+    let mut texts = Vec::new();
+    let mut images = Vec::new();
+    for message in result.messages {
+        match message.content {
+            McpPromptContent::Text { text } => texts.push(text),
+            McpPromptContent::Image { data, mime_type } => match tool_image(&mime_type, data) {
+                Ok(image) => images.push(image),
+                Err(rejected) => texts.push(rejected.note()),
+            },
+            McpPromptContent::Resource { resource } => texts.extend(resource.text),
+            McpPromptContent::Other => {}
+        }
+    }
+    texts.retain(|text| !text.is_empty());
+    McpPromptExpansion {
+        text: texts.join("\n\n"),
+        images,
+    }
 }
 
 impl McpRegistry {
@@ -494,6 +618,54 @@ impl McpRegistry {
         self.read().tools.clone()
     }
 
+    /// The prompts of every connected server, in config order.
+    pub fn prompts(&self) -> Vec<McpPrompt> {
+        self.read()
+            .servers
+            .iter()
+            .flat_map(|server| server.prompts.iter().cloned())
+            .collect()
+    }
+
+    /// Asks `server` (its canonical or configured name) to expand its prompt
+    /// `prompt` with `arguments`, and puts the messages it answers with
+    /// together: their text in order, separated by blank lines, and their
+    /// images. An image that cannot be sent leaves its note in the text, and
+    /// an embedded resource adds its text. A server that is not connected,
+    /// or did not list the prompt, is not asked.
+    pub fn get_prompt(
+        &self,
+        server: &str,
+        prompt: &str,
+        arguments: &BTreeMap<String, String>,
+    ) -> Result<McpPromptExpansion, String> {
+        let server_name = sanitize_name(server);
+        let client = {
+            let inner = self.read();
+            let entry = inner
+                .servers
+                .iter()
+                .find(|entry| entry.name == server_name)
+                .ok_or_else(|| format!("no MCP server named '{server}'"))?;
+            let client = inner
+                .clients
+                .get(&server_name)
+                .cloned()
+                .ok_or_else(|| format!("MCP server '{server}' is not connected"))?;
+            if !entry.prompts.iter().any(|offered| offered.name == prompt) {
+                return Err(format!(
+                    "MCP server '{server}' has no prompt named '{prompt}'"
+                ));
+            }
+            client
+        };
+        // The request can take the server's whole timeout, so no lock is held.
+        let result = client.get_prompt(prompt, serde_json::json!(arguments))?;
+        let result: GetPromptResult = serde_json::from_value(result)
+            .map_err(|error| format!("invalid prompts/get result for '{server_name}': {error}"))?;
+        Ok(expand_prompt(result))
+    }
+
     /// What is wrong with the config, then what went wrong when each server
     /// was last connected.
     pub fn errors(&self) -> Vec<String> {
@@ -552,18 +724,28 @@ impl McpRegistry {
             return Err(format!("no MCP server named '{name}'"));
         };
         let (result, replaced) = match connected {
-            Ok((client, tools)) => {
+            Ok(connected) => {
                 let server = &mut inner.servers[index];
                 server.errors.clear();
-                server.tools = take_tool_names(&server_name, tools, &mut taken, &mut server.errors);
+                server.tools = take_tool_names(
+                    &server_name,
+                    connected.tools,
+                    &mut taken,
+                    &mut server.errors,
+                );
+                server.prompts = connected.prompts;
+                server.errors.extend(connected.warnings);
                 server.state = McpServerState::Ready;
-                let replaced = inner.clients.insert(server_name, Arc::new(client));
+                let replaced = inner
+                    .clients
+                    .insert(server_name, Arc::new(connected.client));
                 (Ok(()), replaced)
             }
             Err(error) => {
                 let server = &mut inner.servers[index];
                 server.state = failed_state(&error);
                 server.tools.clear();
+                server.prompts.clear();
                 server.errors = vec![error.clone()];
                 (Err(error), inner.clients.remove(&server_name))
             }
@@ -1187,18 +1369,14 @@ impl McpClient {
         &self,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, McpRequestError> {
-        self.resource_request_or_cancel(|transport| {
-            transport.list_resources_or_cancel(should_cancel)
-        })
+        self.request(|transport| transport.list_resources_or_cancel(should_cancel))
     }
 
     fn list_resource_templates_or_cancel(
         &self,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, McpRequestError> {
-        self.resource_request_or_cancel(|transport| {
-            transport.list_resource_templates_or_cancel(should_cancel)
-        })
+        self.request(|transport| transport.list_resource_templates_or_cancel(should_cancel))
     }
 
     fn read_resource_or_cancel(
@@ -1206,12 +1384,17 @@ impl McpClient {
         uri: &str,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, McpRequestError> {
-        self.resource_request_or_cancel(|transport| {
-            transport.read_resource_or_cancel(uri, should_cancel)
-        })
+        self.request(|transport| transport.read_resource_or_cancel(uri, should_cancel))
     }
 
-    fn resource_request_or_cancel(
+    fn get_prompt(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        self.request(|transport| transport.get_prompt(name, arguments))
+            .map_err(|error| error.to_string())
+    }
+
+    /// Sends `request` over the transport. An error that leaves the
+    /// transport unusable reconnects it before the error is returned.
+    fn request(
         &self,
         request: impl FnOnce(&dyn McpTransport) -> Result<Value, String>,
     ) -> Result<Value, McpRequestError> {
@@ -1431,7 +1614,7 @@ done
             ..Default::default()
         };
 
-        let (client, tools) =
+        let ConnectedServer { client, tools, .. } =
             connect_server_with_transport(&config, "filtered", Box::new(FixedToolsTransport))
                 .expect("connect with fixed tools transport");
         let lookup = tools
@@ -3323,6 +3506,358 @@ done
         assert_eq!(
             registry.reconnect_server("nope"),
             Err("no MCP server named 'nope'".to_string())
+        );
+    }
+
+    /// A stdio server that offers prompts. It declares the capabilities in
+    /// `<dir>/<name>/capabilities.json`, lists the prompts in
+    /// `<dir>/<name>/prompts.json`, and answers each `prompts/get` with the
+    /// result in `<dir>/<name>/get.json`, or with the error in
+    /// `<dir>/<name>/get-error.json` once that exists. Each message it gets
+    /// is added to `<dir>/<name>/requests`.
+    #[cfg(unix)]
+    fn prompt_server_config(
+        name: &str,
+        dir: &std::path::Path,
+        capabilities: &str,
+        prompts: &str,
+        get_result: &str,
+    ) -> McpServerConfig {
+        let state = dir.join(name);
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::write(state.join("capabilities.json"), capabilities)
+            .expect("write the capabilities");
+        std::fs::write(state.join("prompts.json"), prompts).expect("write the prompt list");
+        std::fs::write(state.join("get.json"), get_result).expect("write the prompt");
+        let script = dir.join(format!("{name}.sh"));
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+state_dir="$1"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$state_dir/requests"
+  id=${line#*'"id":'}
+  id=${id%%,*}
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":%s,"serverInfo":{"name":"prompts","version":"1"}}}\n' "$id" "$(cat "$state_dir/capabilities.json")"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$id"
+      ;;
+    *'"method":"prompts/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"prompts":%s}}\n' "$id" "$(cat "$state_dir/prompts.json")"
+      ;;
+    *'"method":"prompts/get"'*)
+      if [ -f "$state_dir/get-error.json" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":%s}\n' "$id" "$(cat "$state_dir/get-error.json")"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$(cat "$state_dir/get.json")"
+      fi
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let mut config = stdio_fixture_config(name, &script);
+        config.args.push(state.to_string_lossy().into_owned());
+        config.tool_timeout_ms = Some(STDIO_TEST_STARTUP_TIMEOUT_MS);
+        config
+    }
+
+    /// The messages with `method` that the prompt server `name` got.
+    #[cfg(unix)]
+    fn prompt_server_requests(dir: &std::path::Path, name: &str, method: &str) -> Vec<Value> {
+        std::fs::read_to_string(dir.join(name).join("requests"))
+            .expect("read the request log")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("a JSON-RPC message"))
+            .filter(|message| message["method"] == method)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn prompt_names(registry: &McpRegistry) -> Vec<String> {
+        registry
+            .prompts()
+            .into_iter()
+            .map(|prompt| prompt.name)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompts_are_listed_for_servers_that_offer_them() {
+        use orca_core::mcp_types::McpPromptArgument;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        // Its prompts are listed under "docs", the name in its tools' names.
+        let offering = prompt_server_config(
+            "Docs",
+            temp_dir.path(),
+            r#"{"prompts":{}}"#,
+            r#"[{"name":"review_pr","description":"Reviews a pull request","arguments":[{"name":"pr","description":"The pull request","required":true},{"name":"branch"}]},{"name":"summarize"}]"#,
+            r#"{"messages":[]}"#,
+        );
+        // It would list a prompt, but it does not declare the capability.
+        let silent = prompt_server_config(
+            "plain",
+            temp_dir.path(),
+            "{}",
+            r#"[{"name":"hidden"}]"#,
+            r#"{"messages":[]}"#,
+        );
+
+        let registry = initialize_registry(&[offering, silent]);
+
+        assert!(registry.errors().is_empty(), "{:?}", registry.errors());
+        assert_eq!(
+            registry.prompts(),
+            [
+                McpPrompt {
+                    server: "docs".to_string(),
+                    name: "review_pr".to_string(),
+                    description: Some("Reviews a pull request".to_string()),
+                    arguments: vec![
+                        McpPromptArgument {
+                            name: "pr".to_string(),
+                            description: Some("The pull request".to_string()),
+                            required: true,
+                        },
+                        McpPromptArgument {
+                            name: "branch".to_string(),
+                            description: None,
+                            required: false,
+                        },
+                    ],
+                },
+                McpPrompt {
+                    server: "docs".to_string(),
+                    name: "summarize".to_string(),
+                    description: None,
+                    arguments: Vec::new(),
+                },
+            ]
+        );
+        assert!(
+            prompt_server_requests(temp_dir.path(), "plain", "prompts/list").is_empty(),
+            "a server that does not offer prompts is not asked for them"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_prompt_expands_to_text_and_images() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let prompt = serde_json::json!({
+            "description": "Reviews a pull request",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {"type": "text", "text": "Review pull request 123 against main."}
+                },
+                {
+                    "role": "user",
+                    "content": {"type": "image", "data": BASE64_1X1_PNG, "mimeType": "image/png"}
+                }
+            ]
+        });
+        let config = prompt_server_config(
+            "docs",
+            temp_dir.path(),
+            r#"{"prompts":{}}"#,
+            r#"[{"name":"review_pr","arguments":[{"name":"pr","required":true},{"name":"branch"}]}]"#,
+            &prompt.to_string(),
+        );
+        let registry = initialize_registry(&[config]);
+        assert!(registry.errors().is_empty(), "{:?}", registry.errors());
+
+        let expansion = registry
+            .get_prompt(
+                "docs",
+                "review_pr",
+                &BTreeMap::from([
+                    ("pr".to_string(), "123".to_string()),
+                    ("branch".to_string(), "main".to_string()),
+                ]),
+            )
+            .expect("expand the prompt");
+
+        assert_eq!(
+            expansion,
+            McpPromptExpansion {
+                text: "Review pull request 123 against main.".to_string(),
+                images: vec![
+                    tool_image("image/png", BASE64_1X1_PNG.to_string()).expect("a valid PNG")
+                ],
+            }
+        );
+        let asked = prompt_server_requests(temp_dir.path(), "docs", "prompts/get");
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(
+            asked[0]["params"],
+            serde_json::json!({"name": "review_pr", "arguments": {"pr": "123", "branch": "main"}})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unknown_prompt_is_an_error() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let registry = initialize_registry(&[
+            prompt_server_config(
+                "docs",
+                temp_dir.path(),
+                r#"{"prompts":{}}"#,
+                r#"[{"name":"review_pr"}]"#,
+                r#"{"messages":[]}"#,
+            ),
+            missing_server_config("broken", temp_dir.path()),
+        ]);
+        let no_arguments = BTreeMap::new();
+
+        assert_eq!(
+            registry.get_prompt("docs", "deploy", &no_arguments),
+            Err("MCP server 'docs' has no prompt named 'deploy'".to_string())
+        );
+        assert_eq!(
+            registry.get_prompt("wiki", "review_pr", &no_arguments),
+            Err("no MCP server named 'wiki'".to_string())
+        );
+        assert_eq!(
+            registry.get_prompt("broken", "review_pr", &no_arguments),
+            Err("MCP server 'broken' is not connected".to_string())
+        );
+        assert!(
+            prompt_server_requests(temp_dir.path(), "docs", "prompts/get").is_empty(),
+            "a prompt the server does not list is not asked for"
+        );
+
+        // A prompt the server listed, then no longer knows.
+        std::fs::write(
+            temp_dir.path().join("docs").join("get-error.json"),
+            r#"{"code":-32602,"message":"Unknown prompt: review_pr"}"#,
+        )
+        .expect("make the server refuse the prompt");
+        let error = registry
+            .get_prompt("docs", "review_pr", &no_arguments)
+            .expect_err("the server refuses the prompt");
+        assert!(error.contains("Unknown prompt: review_pr"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnecting_a_server_refreshes_its_prompts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let registry = initialize_registry(&[prompt_server_config(
+            "docs",
+            temp_dir.path(),
+            r#"{"prompts":{}}"#,
+            r#"[{"name":"before"}]"#,
+            r#"{"messages":[]}"#,
+        )]);
+        assert_eq!(prompt_names(&registry), ["before"]);
+        std::fs::write(
+            temp_dir.path().join("docs").join("prompts.json"),
+            r#"[{"name":"after"}]"#,
+        )
+        .expect("change the prompt list");
+
+        registry
+            .reconnect_server("docs")
+            .expect("reconnect the server");
+        assert_eq!(prompt_names(&registry), ["after"]);
+
+        // A server that cannot be reached offers no prompts.
+        std::fs::remove_file(temp_dir.path().join("docs.sh")).expect("remove the server");
+        registry
+            .reconnect_server("docs")
+            .expect_err("the server is gone");
+        assert!(registry.prompts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_whose_prompt_list_fails_stays_connected() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let registry = initialize_registry(&[prompt_server_config(
+            "docs",
+            temp_dir.path(),
+            r#"{"prompts":{}}"#,
+            r#""not a list""#,
+            r#"{"messages":[]}"#,
+        )]);
+
+        assert_eq!(
+            registry.server_states(),
+            [("docs".to_string(), McpServerState::Ready)]
+        );
+        assert!(registry.prompts().is_empty());
+        let errors = registry.errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("invalid prompts/list result for 'docs'"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_expansion_keeps_its_messages_in_order() {
+        let result = serde_json::from_value::<GetPromptResult>(serde_json::json!({
+            "messages": [
+                {"role": "user", "content": {"type": "text", "text": "Intro"}},
+                {"role": "assistant", "content": {"type": "image", "data": "PHN2Zz4=", "mimeType": "image/svg+xml"}},
+                {"role": "user", "content": {"type": "resource", "resource": {"uri": "file:///notes.md", "mimeType": "text/markdown", "text": "Notes"}}},
+                {"role": "user", "content": {"type": "resource", "resource": {"uri": "file:///logo.png", "blob": BASE64_1X1_PNG}}},
+                {"role": "user", "content": {"type": "resource_link", "uri": "file:///elsewhere.md", "name": "elsewhere"}},
+                {"role": "user", "content": {"type": "audio", "data": "AAAA", "mimeType": "audio/wav"}},
+                {"role": "user", "content": {"type": "image", "data": BASE64_1X1_PNG, "mimeType": "image/png"}},
+                {"role": "user", "content": {"type": "text", "text": ""}},
+                {"role": "assistant", "content": {"type": "text", "text": "Outro"}}
+            ]
+        }))
+        .expect("a prompts/get result");
+
+        let expansion = expand_prompt(result);
+
+        assert_eq!(
+            expansion.text,
+            "Intro\n\n[image omitted: unsupported type image/svg+xml]\n\nNotes\n\nOutro"
+        );
+        assert_eq!(
+            expansion.images,
+            [tool_image("image/png", BASE64_1X1_PNG.to_string()).expect("a valid PNG")]
+        );
+    }
+
+    #[test]
+    fn prompts_without_a_name_are_left_out() {
+        let mut errors = Vec::new();
+        let prompts = listed_prompts(
+            "docs",
+            serde_json::json!({"prompts": [
+                {"name": "review_pr", "arguments": [{"name": "pr"}]},
+                {"name": " "},
+                {"name": "summarize", "arguments": [{"name": ""}]}
+            ]}),
+            &mut errors,
+        )
+        .expect("a prompts/list result");
+
+        assert_eq!(
+            prompts
+                .iter()
+                .map(|prompt| prompt.name.as_str())
+                .collect::<Vec<_>>(),
+            ["review_pr"]
+        );
+        assert_eq!(
+            errors,
+            [
+                "MCP prompt without a name, skipping from 'docs'",
+                "MCP prompt 'summarize' has an argument without a name, skipping from 'docs'",
+            ]
         );
     }
 }

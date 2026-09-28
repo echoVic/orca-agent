@@ -118,6 +118,26 @@ pub struct McpTool {
     pub read_only: bool,
 }
 
+/// A prompt an MCP server offers (`prompts/list`), listed under the
+/// canonical name of that server, the one in its tools' names.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpPrompt {
+    pub server: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+/// An argument a prompt takes, as `prompts/list` declares it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpPromptArgument {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct McpToolRef {
     pub server: String,
@@ -129,6 +149,64 @@ pub struct McpToolRef {
 pub struct ToolsListResult {
     #[serde(default)]
     pub tools: Vec<McpToolDescriptor>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PromptsListResult {
+    #[serde(default)]
+    pub prompts: Vec<McpPromptDescriptor>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct McpPromptDescriptor {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+/// The result of `prompts/get`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct GetPromptResult {
+    #[serde(default)]
+    pub messages: Vec<McpPromptMessage>,
+}
+
+/// One message of an expanded prompt. Its role is not read.
+#[derive(Clone, Debug, Deserialize)]
+pub struct McpPromptMessage {
+    pub content: McpPromptContent,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum McpPromptContent {
+    Text {
+        text: String,
+    },
+    // As in `McpContent`, a block missing a field still parses, and
+    // `tool_image` then rejects it with a note.
+    Image {
+        #[serde(default)]
+        data: String,
+        #[serde(default, rename = "mimeType")]
+        mime_type: String,
+    },
+    /// A resource embedded in the message.
+    Resource {
+        #[serde(default)]
+        resource: McpEmbeddedResource,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// What a prompt reads from an embedded resource: its text, when it has one.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct McpEmbeddedResource {
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

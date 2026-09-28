@@ -4711,6 +4711,13 @@ enum HostCommand {
 type McpServerControlReply =
     SyncSender<Result<surface::SurfaceMcpServerStatus, surface::SurfaceClientCommandError>>;
 
+type McpPromptExpansionReply = SyncSender<
+    Result<
+        Result<surface::SurfaceMcpPromptExpansion, surface::DisplayText>,
+        surface::SurfaceClientCommandError,
+    >,
+>;
+
 enum ThreadCommand {
     PromptQueue {
         action: crate::prompt_queue::PromptQueueAction,
@@ -4937,6 +4944,13 @@ enum ThreadCommand {
         server: surface::NonEmptyText,
         result: Result<(), String>,
         reply: McpServerControlReply,
+    },
+    SurfaceExpandMcpPrompt {
+        client: surface::RuntimeSurfaceClientHandle,
+        server: surface::NonEmptyText,
+        prompt: surface::NonEmptyText,
+        arguments: Vec<(String, String)>,
+        reply: McpPromptExpansionReply,
     },
     SurfaceCommitProviderResponse {
         fence: surface::SurfaceOperationFence,
@@ -6656,6 +6670,26 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
             client,
             server,
             action,
+            reply,
+        })
+    }
+
+    fn expand_mcp_prompt(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        _request_id: surface::SurfaceRequestId,
+        server: surface::NonEmptyText,
+        prompt: surface::NonEmptyText,
+        arguments: Vec<(String, String)>,
+    ) -> Result<
+        Result<surface::SurfaceMcpPromptExpansion, surface::DisplayText>,
+        surface::SurfaceClientCommandError,
+    > {
+        self.dispatch(|reply| ThreadCommand::SurfaceExpandMcpPrompt {
+            client,
+            server,
+            prompt,
+            arguments,
             reply,
         })
     }
@@ -11208,6 +11242,7 @@ fn initial_surface_snapshot(
             revision: surface::McpCatalogRevision::try_new(1).expect("one is a valid revision"),
             servers: Vec::new(),
             tools: Vec::new(),
+            prompts: Vec::new(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
             diagnostics: Vec::new(),
@@ -18155,6 +18190,9 @@ impl ThreadActor {
                 | ThreadCommand::SurfaceMcpServerReconnected { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
+                ThreadCommand::SurfaceExpandMcpPrompt { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
                 ThreadCommand::SurfaceCommitProviderResponse { reply, .. } => {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
@@ -19145,6 +19183,15 @@ impl ThreadActor {
             } => {
                 let _ = reply.send(self.finish_surface_mcp_server_reconnect(&server, result));
             }
+            ThreadCommand::SurfaceExpandMcpPrompt {
+                client,
+                server,
+                prompt,
+                arguments,
+                reply,
+            } => {
+                self.expand_surface_mcp_prompt(&client, server, prompt, arguments, reply);
+            }
             #[cfg(test)]
             ThreadCommand::SurfaceSuspendOperationForTest { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
@@ -19887,6 +19934,15 @@ impl ThreadActor {
                 reply,
             } => {
                 let _ = reply.send(self.finish_surface_mcp_server_reconnect(&server, result));
+            }
+            ThreadCommand::SurfaceExpandMcpPrompt {
+                client,
+                server,
+                prompt,
+                arguments,
+                reply,
+            } => {
+                self.expand_surface_mcp_prompt(&client, server, prompt, arguments, reply);
             }
             ThreadCommand::SurfaceCommitProviderResponse {
                 fence,
@@ -40608,6 +40664,217 @@ done
         let tools = orca_tools::registry::tool_registry_with_mcp_and_external(Some(&registry), &[]);
         assert!(tools.resolve("mcp__docs__after").is_some());
         assert!(tools.resolve("mcp__docs__before").is_none());
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A stdio MCP server that offers the prompts in `prompts` and answers
+    /// every `prompts/get` with `get_result`. Each message it gets is added
+    /// to `<dir>/<name>-mcp/requests`.
+    #[cfg(unix)]
+    fn prompt_mcp_server(
+        name: &str,
+        dir: &std::path::Path,
+        prompts: &str,
+        get_result: &str,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        let state = catalog_mcp_server_dir(name, dir);
+        fs::create_dir_all(&state).expect("MCP fixture directory");
+        fs::write(state.join("prompts.json"), prompts).expect("write the MCP prompt list");
+        fs::write(state.join("get.json"), get_result).expect("write the MCP prompt");
+        let script = state.join("server.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+state_dir="$1"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$state_dir/requests"
+  id=${line#*'"id":'}
+  id=${id%%,*}
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"prompts":{}},"serverInfo":{"name":"prompts","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$id"
+      ;;
+    *'"method":"prompts/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"prompts":%s}}\n' "$id" "$(cat "$state_dir/prompts.json")"
+      ;;
+    *'"method":"prompts/get"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$(cat "$state_dir/get.json")"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write the MCP fixture");
+        orca_core::mcp_types::McpServerConfig {
+            name: name.to_string(),
+            command: Some("/bin/sh".to_string()),
+            args: vec![
+                script.to_string_lossy().into_owned(),
+                state.to_string_lossy().into_owned(),
+            ],
+            startup_timeout_ms: Some(15_000),
+            tool_timeout_ms: Some(15_000),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_catalog_includes_prompts() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.mcp_servers = vec![
+            // Its prompts are listed under "docs", the name in its tools' names.
+            prompt_mcp_server(
+                "Docs",
+                cwd.path(),
+                r#"[{"name":"review_pr","description":"Reviews a pull request","arguments":[{"name":"pr","description":"The pull request","required":true},{"name":"branch"}]}]"#,
+                r#"{"messages":[]}"#,
+            ),
+            // A server that offers no prompts adds none.
+            catalog_mcp_server(
+                "lookup",
+                cwd.path(),
+                r#"[{"name":"find","inputSchema":{"type":"object"}}]"#,
+            ),
+        ];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp prompts")
+            .expect("start the thread");
+
+        let catalog = wait_for_mcp_catalog(&thread.surface(), |catalog| catalog.revision.get() > 1);
+
+        assert_eq!(
+            catalog.prompts,
+            [surface::SurfaceMcpPrompt {
+                server: surface_text("docs"),
+                name: surface_text("review_pr"),
+                description: Some(surface::DisplayText::new("Reviews a pull request")),
+                arguments: vec![
+                    surface::SurfaceMcpPromptArgument {
+                        name: surface_text("pr"),
+                        description: Some(surface::DisplayText::new("The pull request")),
+                        required: true,
+                    },
+                    surface::SurfaceMcpPromptArgument {
+                        name: surface_text("branch"),
+                        description: None,
+                        required: false,
+                    },
+                ],
+            }]
+        );
+        assert_eq!(
+            catalog.servers,
+            [
+                (surface_text("docs"), surface::SurfaceMcpServerStatus::Ready),
+                (
+                    surface_text("lookup"),
+                    surface::SurfaceMcpServerStatus::Ready
+                ),
+            ]
+        );
+        assert_eq!(catalog_tool_names(&catalog), ["mcp__lookup__find"]);
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expand_mcp_prompt_returns_the_expansion() {
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        let prompt = serde_json::json!({"messages": [
+            {"role": "user", "content": {"type": "text", "text": "Review pull request 123 against main."}},
+            {"role": "user", "content": {"type": "image", "data": PNG, "mimeType": "image/png"}}
+        ]});
+        config.mcp_servers = vec![prompt_mcp_server(
+            "docs",
+            cwd.path(),
+            r#"[{"name":"review_pr","arguments":[{"name":"pr","required":true},{"name":"branch"}]}]"#,
+            &prompt.to_string(),
+        )];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp prompt expansion")
+            .expect("start the thread");
+        let surface = thread.surface();
+        // Expanding a prompt takes the same right as reading a transcript.
+        let reader = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        );
+
+        let expansion = reader.client.expand_mcp_prompt(
+            surface_request_id(),
+            surface_text("docs"),
+            surface_text("review_pr"),
+            vec![
+                ("pr".to_string(), "123".to_string()),
+                ("branch".to_string(), "main".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            expansion,
+            Ok(Ok(surface::SurfaceMcpPromptExpansion {
+                text: "Review pull request 123 against main.".to_string(),
+                images: vec![
+                    orca_core::tool_images::tool_image("image/png", PNG.to_string())
+                        .expect("a valid PNG")
+                ],
+            }))
+        );
+        let asked = fs::read_to_string(catalog_mcp_server_dir("docs", cwd.path()).join("requests"))
+            .expect("read the MCP request log")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("a JSON-RPC message")
+            })
+            .filter(|message| message["method"] == "prompts/get")
+            .collect::<Vec<_>>();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(
+            asked[0]["params"],
+            serde_json::json!({"name": "review_pr", "arguments": {"pr": "123", "branch": "main"}})
+        );
+
+        // What the server cannot expand is answered with why.
+        assert_eq!(
+            reader.client.expand_mcp_prompt(
+                surface_request_id(),
+                surface_text("docs"),
+                surface_text("deploy"),
+                Vec::new(),
+            ),
+            Ok(Err(surface::DisplayText::new(
+                "MCP server 'docs' has no prompt named 'deploy'"
+            )))
+        );
+
+        // A client that has left the thread cannot expand prompts.
+        detach_surface_attachment(&surface, &reader);
+        assert_eq!(
+            reader.client.expand_mcp_prompt(
+                surface_request_id(),
+                surface_text("docs"),
+                surface_text("review_pr"),
+                Vec::new(),
+            ),
+            Err(surface::SurfaceClientCommandError::Unauthorized)
+        );
         host.shutdown().expect("shutdown runtime host");
     }
 }

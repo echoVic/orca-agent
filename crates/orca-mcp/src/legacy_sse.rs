@@ -349,6 +349,26 @@ impl McpTransport for LegacySseTransport {
             should_cancel,
         )
     }
+
+    fn list_prompts(&self) -> Result<Value, String> {
+        self.request(
+            "prompts/list",
+            json!({}),
+            self.startup_timeout,
+            None,
+            &never_cancelled,
+        )
+    }
+
+    fn get_prompt(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        self.request(
+            "prompts/get",
+            json!({"name": name, "arguments": arguments}),
+            self.tool_timeout,
+            None,
+            &never_cancelled,
+        )
+    }
 }
 
 /// What requests that cannot be cancelled pass for `should_cancel`.

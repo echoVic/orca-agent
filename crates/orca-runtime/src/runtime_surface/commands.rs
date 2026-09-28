@@ -52,6 +52,7 @@ use super::projection::{
 };
 use super::reducer::canonical_replayability_digest;
 use orca_core::budget::BudgetUsage;
+use orca_core::conversation::ImageInput;
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
@@ -613,6 +614,15 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         action: SurfaceMcpServerAction,
     ) -> Result<SurfaceMcpServerStatus, SurfaceClientCommandError>;
 
+    fn expand_mcp_prompt(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        server: NonEmptyText,
+        prompt: NonEmptyText,
+        arguments: Vec<(String, String)>,
+    ) -> Result<Result<SurfaceMcpPromptExpansion, DisplayText>, SurfaceClientCommandError>;
+
     fn respond_interaction_by_id(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -1098,6 +1108,24 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .mcp_server_control(self.clone(), request_id, server, action)
+    }
+
+    /// Has one of the thread's MCP servers expand one of its catalog prompts
+    /// with `arguments` (name, value). What the server answers comes back
+    /// as the text and images to send as the user's input; nothing is sent
+    /// or committed. A server that cannot expand the prompt is answered
+    /// with why. It takes the same right as reading a task transcript.
+    pub fn expand_mcp_prompt(
+        &self,
+        request_id: SurfaceRequestId,
+        server: NonEmptyText,
+        prompt: NonEmptyText,
+        arguments: Vec<(String, String)>,
+    ) -> Result<Result<SurfaceMcpPromptExpansion, DisplayText>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .expand_mcp_prompt(self.clone(), request_id, server, prompt, arguments)
     }
 
     pub fn respond_interaction(
@@ -2541,6 +2569,15 @@ pub enum SurfaceMcpServerAction {
     /// Connect the server again with its saved config, for instance after
     /// `orca mcp login`.
     Reconnect,
+}
+
+/// An MCP prompt as its server expanded it: the input it stands for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SurfaceMcpPromptExpansion {
+    /// The text of its messages, in order, separated by blank lines.
+    pub text: String,
+    /// The images its messages carry.
+    pub images: Vec<ImageInput>,
 }
 
 #[derive(Clone, Eq, PartialEq)]

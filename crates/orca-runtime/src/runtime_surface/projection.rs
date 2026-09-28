@@ -2080,6 +2080,24 @@ pub struct SurfaceMcpTool {
     pub read_only: bool,
 }
 
+/// A prompt an MCP server offers, which a client can have the thread expand
+/// (`expand_mcp_prompt`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceMcpPrompt {
+    pub server: NonEmptyText,
+    pub name: NonEmptyText,
+    pub description: Option<DisplayText>,
+    /// In the order the server declared them.
+    pub arguments: Vec<SurfaceMcpPromptArgument>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceMcpPromptArgument {
+    pub name: NonEmptyText,
+    pub description: Option<DisplayText>,
+    pub required: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceMcpResource {
     pub id: SurfaceCatalogEntryId,
@@ -2131,6 +2149,10 @@ pub struct SurfaceMcpCatalogSnapshot {
     pub revision: McpCatalogRevision,
     pub servers: Vec<(NonEmptyText, SurfaceMcpServerStatus)>,
     pub tools: Vec<SurfaceMcpTool>,
+    /// Omitted on the wire when empty, so a catalog without prompts is
+    /// written as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompts: Vec<SurfaceMcpPrompt>,
     pub resources: Vec<SurfaceMcpResource>,
     pub resource_templates: Vec<SurfaceMcpResourceTemplate>,
     pub diagnostics: Vec<SurfaceMcpCatalogDiagnostic>,

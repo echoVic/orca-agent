@@ -3631,6 +3631,42 @@ impl ThreadActor {
         }
     }
 
+    /// Has an MCP server expand one of its prompts for a client that may
+    /// read the thread. The server is asked on a worker thread, which
+    /// answers `reply` itself: the request can take the server's whole
+    /// timeout, and a remote server is reached with a blocking client that
+    /// must stay off the actor's runtime. Nothing is committed. What the
+    /// server cannot expand is answered with why.
+    pub(super) fn expand_surface_mcp_prompt(
+        &self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        server: surface::NonEmptyText,
+        prompt: surface::NonEmptyText,
+        arguments: Vec<(String, String)>,
+        reply: McpPromptExpansionReply,
+    ) {
+        if !self.admits_surface_client(client, surface::SurfaceCapability::ReadSnapshot) {
+            let _ = reply.send(Err(surface::SurfaceClientCommandError::Unauthorized));
+            return;
+        }
+        let registry = self.handle.mcp_registry.clone();
+        // When the worker cannot start, `reply` is dropped, which its caller
+        // reads as the runtime being unavailable.
+        let _ = thread::Builder::new()
+            .name("orca-mcp-prompt".to_string())
+            .spawn(move || {
+                let arguments = arguments.into_iter().collect();
+                let expansion = registry
+                    .get_prompt(server.as_str(), prompt.as_str(), &arguments)
+                    .map(|expansion| surface::SurfaceMcpPromptExpansion {
+                        text: expansion.text,
+                        images: expansion.images,
+                    })
+                    .map_err(surface::DisplayText::new);
+                let _ = reply.send(Ok(expansion));
+            });
+    }
+
     /// Publishes the catalog after `server` was reconnected, and answers
     /// with the status the catalog gives it. A name no server has is
     /// answered with the reconnect's error.

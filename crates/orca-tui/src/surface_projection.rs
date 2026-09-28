@@ -2400,6 +2400,7 @@ mod tests {
                 revision: McpCatalogRevision::try_new(1).unwrap(),
                 servers: Vec::new(),
                 tools: Vec::new(),
+                prompts: Vec::new(),
                 resources: Vec::new(),
                 resource_templates: Vec::new(),
                 diagnostics: Vec::new(),

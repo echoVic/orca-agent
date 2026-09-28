@@ -1,10 +1,10 @@
 //! The MCP catalog of a thread's typed surface: every configured server and
-//! how it stands, and the tools of the connected ones, built from the
-//! session's MCP registry.
+//! how it stands, and the tools and prompts of the connected ones, built
+//! from the session's MCP registry.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use orca_core::mcp_types::McpTool;
+use orca_core::mcp_types::{McpPrompt, McpTool};
 use orca_mcp::{McpRegistry, McpServerState};
 use serde_json::{Map, Value};
 
@@ -12,8 +12,9 @@ use crate::agent_continuation::canonical_json_bytes;
 use crate::runtime_surface::{
     DisplayText, FiniteF64, McpCatalogRevision, NonEmptyText, NonEmptyVec, Sha256Digest,
     SurfaceCatalogEntryId, SurfaceMcpCatalogDiagnostic, SurfaceMcpCatalogDiagnosticCode,
-    SurfaceMcpCatalogEntryKind, SurfaceMcpCatalogSnapshot, SurfaceMcpServerStatus, SurfaceMcpTool,
-    SurfaceSchema, SurfaceSchemaInteger, SurfaceSchemaProperty,
+    SurfaceMcpCatalogEntryKind, SurfaceMcpCatalogSnapshot, SurfaceMcpPrompt,
+    SurfaceMcpPromptArgument, SurfaceMcpServerStatus, SurfaceMcpTool, SurfaceSchema,
+    SurfaceSchemaInteger, SurfaceSchemaProperty,
 };
 
 /// The catalog that follows `current`, or `None` while `registry` still
@@ -33,12 +34,18 @@ pub(crate) fn next_mcp_catalog(
 /// The catalog `registry` stands for, at `revision`. Resources are not
 /// listed yet.
 fn mcp_catalog(registry: &McpRegistry, revision: McpCatalogRevision) -> SurfaceMcpCatalogSnapshot {
-    catalog_of(registry.server_states(), registry.tools(), revision)
+    catalog_of(
+        registry.server_states(),
+        registry.tools(),
+        registry.prompts(),
+        revision,
+    )
 }
 
 fn catalog_of(
     states: Vec<(String, McpServerState)>,
     registry_tools: Vec<McpTool>,
+    registry_prompts: Vec<McpPrompt>,
     revision: McpCatalogRevision,
 ) -> SurfaceMcpCatalogSnapshot {
     let mut tools = Vec::new();
@@ -106,6 +113,10 @@ fn catalog_of(
         revision,
         servers,
         tools,
+        prompts: registry_prompts
+            .into_iter()
+            .filter_map(surface_prompt)
+            .collect(),
         resources: Vec::new(),
         resource_templates: Vec::new(),
         diagnostics,
@@ -150,6 +161,27 @@ fn surface_tool(tool: &McpTool) -> Result<SurfaceMcpTool, Vec<SurfaceMcpCatalogD
             Err(codes)
         }
     }
+}
+
+/// The surface entry for `prompt`. The registry lists no prompt without a
+/// name, or with an argument without one, so every prompt makes an entry.
+fn surface_prompt(prompt: McpPrompt) -> Option<SurfaceMcpPrompt> {
+    Some(SurfaceMcpPrompt {
+        server: NonEmptyText::try_new(prompt.server).ok()?,
+        name: NonEmptyText::try_new(prompt.name).ok()?,
+        description: prompt.description.map(DisplayText::new),
+        arguments: prompt
+            .arguments
+            .into_iter()
+            .map(|argument| {
+                Some(SurfaceMcpPromptArgument {
+                    name: NonEmptyText::try_new(argument.name).ok()?,
+                    description: argument.description.map(DisplayText::new),
+                    required: argument.required,
+                })
+            })
+            .collect::<Option<_>>()?,
+    })
 }
 
 fn diagnostic_code_rank(code: SurfaceMcpCatalogDiagnosticCode) -> u8 {
@@ -444,6 +476,7 @@ fn keyword_list(keywords: BTreeSet<String>) -> NonEmptyVec<NonEmptyText> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_core::mcp_types::McpPromptArgument;
 
     fn text(value: &str) -> NonEmptyText {
         NonEmptyText::try_new(value).unwrap()
@@ -598,6 +631,7 @@ mod tests {
                 ("other".to_string(), McpServerState::Ready),
             ],
             vec![tool("lookup"), tool(" ")],
+            Vec::new(),
             McpCatalogRevision::try_new(2).unwrap(),
         );
 
@@ -632,6 +666,120 @@ mod tests {
             Sha256Digest::digest(
                 canonical_json_bytes(&serde_json::to_value(tool(" ")).unwrap()).unwrap()
             )
+        );
+    }
+
+    #[test]
+    fn prompts_are_listed_with_their_arguments() {
+        let catalog = catalog_of(
+            vec![("docs".to_string(), McpServerState::Ready)],
+            Vec::new(),
+            vec![
+                McpPrompt {
+                    server: "docs".to_string(),
+                    name: "review_pr".to_string(),
+                    description: Some("Reviews a pull request".to_string()),
+                    arguments: vec![
+                        McpPromptArgument {
+                            name: "pr".to_string(),
+                            description: Some("The pull request".to_string()),
+                            required: true,
+                        },
+                        McpPromptArgument {
+                            name: "branch".to_string(),
+                            description: None,
+                            required: false,
+                        },
+                    ],
+                },
+                McpPrompt {
+                    server: "docs".to_string(),
+                    name: "summarize".to_string(),
+                    description: None,
+                    arguments: Vec::new(),
+                },
+            ],
+            McpCatalogRevision::try_new(2).unwrap(),
+        );
+
+        assert_eq!(
+            catalog.prompts,
+            [
+                SurfaceMcpPrompt {
+                    server: text("docs"),
+                    name: text("review_pr"),
+                    description: Some(DisplayText::new("Reviews a pull request")),
+                    arguments: vec![
+                        SurfaceMcpPromptArgument {
+                            name: text("pr"),
+                            description: Some(DisplayText::new("The pull request")),
+                            required: true,
+                        },
+                        SurfaceMcpPromptArgument {
+                            name: text("branch"),
+                            description: None,
+                            required: false,
+                        },
+                    ],
+                },
+                SurfaceMcpPrompt {
+                    server: text("docs"),
+                    name: text("summarize"),
+                    description: None,
+                    arguments: Vec::new(),
+                },
+            ]
+        );
+        assert_eq!(
+            catalog.servers,
+            [(text("docs"), SurfaceMcpServerStatus::Ready)]
+        );
+    }
+
+    #[test]
+    fn an_old_catalog_without_prompts_still_deserializes() {
+        let catalog = SurfaceMcpCatalogSnapshot {
+            revision: McpCatalogRevision::try_new(3).unwrap(),
+            servers: vec![(text("docs"), SurfaceMcpServerStatus::Ready)],
+            tools: Vec::new(),
+            prompts: Vec::new(),
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        // As an Orca that knew nothing of prompts wrote it.
+        let old = serde_json::json!({
+            "revision": 3,
+            "servers": [["docs", "Ready"]],
+            "tools": [],
+            "resources": [],
+            "resource_templates": [],
+            "diagnostics": []
+        });
+
+        assert_eq!(
+            serde_json::from_value::<SurfaceMcpCatalogSnapshot>(old.clone()).unwrap(),
+            catalog
+        );
+        // A catalog without prompts is written as before.
+        assert_eq!(serde_json::to_value(&catalog).unwrap(), old);
+        let with_prompts = SurfaceMcpCatalogSnapshot {
+            prompts: vec![SurfaceMcpPrompt {
+                server: text("docs"),
+                name: text("review_pr"),
+                description: None,
+                arguments: vec![SurfaceMcpPromptArgument {
+                    name: text("pr"),
+                    description: None,
+                    required: true,
+                }],
+            }],
+            ..catalog
+        };
+        let written = serde_json::to_value(&with_prompts).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SurfaceMcpCatalogSnapshot>(written).unwrap(),
+            with_prompts
         );
     }
 }

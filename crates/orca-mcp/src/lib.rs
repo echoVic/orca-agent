@@ -8,7 +8,8 @@ pub mod transport;
 
 pub use auth::{MCP_AUTH_REQUIRED, is_auth_required};
 pub use client::{
-    McpRegistry, McpRequestError, McpServerState, canonical_server_name, initialize_registry,
+    McpPromptExpansion, McpRegistry, McpRequestError, McpServerState, canonical_server_name,
+    initialize_registry,
 };
 pub use transport::{
     McpElicitationHandler, McpElicitationMode, McpElicitationRequest, McpElicitationResponse,
