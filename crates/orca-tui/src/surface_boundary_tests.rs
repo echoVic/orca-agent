@@ -6,7 +6,7 @@ use crate::protocol::UserAction;
 const MANIFEST: &str = include_str!(
     "../../../docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json"
 );
-const CURRENT_ACTIONS: [(&str, &str); 52] = [
+const CURRENT_ACTIONS: [(&str, &str); 53] = [
     ("StartSideConversation", "host_session_lifecycle_mutation"),
     ("ToggleSideConversation", "host_session_lifecycle_mutation"),
     ("CloseSideConversation", "host_session_lifecycle_mutation"),
@@ -59,6 +59,7 @@ const CURRENT_ACTIONS: [(&str, &str); 52] = [
     ("McpReconnect", "settings_mutation"),
     ("McpLogin", "host_store_and_thread_mutation"),
     ("McpLogout", "host_store_and_thread_mutation"),
+    ("RunMcpPrompt", "authoritative_read"),
 ];
 
 const FUTURE_ACTIONS: [&str; 0] = [];
@@ -117,6 +118,7 @@ fn current_user_action_name(action: &UserAction) -> &'static str {
         UserAction::McpReconnect { .. } => "McpReconnect",
         UserAction::McpLogin { .. } => "McpLogin",
         UserAction::McpLogout { .. } => "McpLogout",
+        UserAction::RunMcpPrompt { .. } => "RunMcpPrompt",
     }
 }
 

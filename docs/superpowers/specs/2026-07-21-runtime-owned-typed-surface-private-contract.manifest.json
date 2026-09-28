@@ -276,7 +276,8 @@
       "CancelRecap",
       "McpReconnect",
       "McpLogin",
-      "McpLogout"
+      "McpLogout",
+      "RunMcpPrompt"
     ],
     "required_tui_user_action_additions": [],
     "task_source_target_variants": [
@@ -5132,6 +5133,29 @@
       "io::Result<bool> + SurfaceMcpServerStatus",
       "TuiEvent::Notice for each step (a login also sends TuiEvent::McpLoginUrl, which /mcp shows); TuiEvent::McpActionFinished, from a drop guard on the worker, or from the dispatcher when no worker starts, frees the server; the /mcp list comes from the next projection's MCP catalog",
       "none"
+    ],
+    [
+      "RunMcpPrompt",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:733",
+        "crates/orca-tui/src/slash_command_actions.rs:107",
+        "crates/orca-tui/src/action_dispatcher.rs:461",
+        "crates/orca-tui/src/mcp_prompt_actions.rs:31",
+        "crates/orca-tui/src/surface_client.rs:512",
+        "crates/orca-tui/src/mcp_prompt_actions.rs:104"
+      ],
+      "authoritative_read",
+      "UserAction::RunMcpPrompt{server, prompt, arguments}",
+      "ExpandMcpPrompt on an MCP prompt worker thread; nothing is committed, and the TUI sends the expansion as the user's input itself",
+      "RuntimeSurfaceClientHandle::expand_mcp_prompt(server, prompt, arguments)",
+      [
+        "ReadSnapshot"
+      ],
+      [],
+      "Result<SurfaceMcpPromptExpansion, DisplayText>",
+      "TuiEvent::McpPromptExpanded, from a drop guard on the worker, or from the dispatcher when no worker starts; the reducer sends the expansion as literal text (no mention bindings) with its images attached, as UserAction::SubmitWithMentions between turns or UserAction::QueuePrompt while a turn runs, or shows why nothing is sent",
+      "none"
     ]
   ],
   "tui_entrypoint_columns": [
@@ -7811,7 +7835,7 @@
   ],
   "phase_0a_manifest_invariants": [
     "source_facts has exactly 58 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 52 unique variants matching UserAction at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 53 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",

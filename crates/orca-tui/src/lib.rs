@@ -62,6 +62,7 @@ mod insert_escape;
 mod interaction_state;
 mod key_event_actions;
 mod mcp_dialog_actions;
+mod mcp_prompt_actions;
 mod mcp_server_actions;
 mod mention_menu_actions;
 mod mention_search_manager;

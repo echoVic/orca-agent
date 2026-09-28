@@ -251,6 +251,40 @@ start. While an action runs, the server's row and details show it
 manage the daemon's servers: run `orca mcp login <name>` on this machine, then
 reattach.
 
+## MCP prompts
+
+Each prompt a connected MCP server offers is a slash command,
+`/mcp__<server>__<prompt>`, where `<server>` is the name the server's tools
+use: lowercase, with other characters turned into `_` (`My-Server` becomes
+`my_server`). Type `/mcp` to list them in the command menu, each with its
+description and its arguments, `<required>` and `[optional]`:
+
+~~~text
+/mcp__github__review_pr  Review a pull request <pr> [branch]
+~~~
+
+Arguments follow the command, separated by spaces, and fill the prompt's
+arguments in order; the last one takes the rest of the text, spaces
+included. `/mcp__github__review_pr 123 main` sets `pr` to `123` and `branch`
+to `main`. An optional argument you leave out is not sent. When a required
+argument is missing, or a prompt that takes no arguments gets some, Orca
+shows the usage, such as `usage: /mcp__github__review_pr <pr> [branch]`, and
+runs nothing. Choosing a prompt that takes arguments in the menu fills in
+its command for you to add them.
+
+Orca asks the server to fill in the prompt and sends what comes back as your
+message: its text, with its images attached. Between turns it goes out at
+once; during a turn it is queued, like a message you send then. The text
+goes out as the server wrote it: an `@path` in it is not a mention, and Orca
+reads no file for it. When the server reports an error, or its answer is
+empty or more than one message can carry (over 1,048,576 characters of
+text, more than 600 images, or images over 5 MiB in all), the conversation
+says why and nothing is sent.
+
+Prompts appear once the conversation starts and their server connects;
+before your first message, `/mcp__…` says so. A TUI attached to a daemon
+session with `orca attach` has no MCP prompt commands.
+
 ## Moving around the conversation
 
 | Key | Action |

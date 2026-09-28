@@ -458,6 +458,24 @@ fn route_action(
                 let _ = event_tx.try_send(TuiEvent::Notice(not_started.notice));
             }
         }
+        UserAction::RunMcpPrompt {
+            server,
+            prompt,
+            arguments,
+        } => {
+            if let Err(not_started) = crate::mcp_prompt_actions::spawn_mcp_prompt_expansion(
+                server,
+                prompt,
+                arguments,
+                controller.runtime_thread(),
+                event_tx.clone(),
+            ) {
+                // No worker will report on the prompt, so this must arrive.
+                if !deliver_dispatcher_outcome(event_tx, &mut pending.event, *not_started) {
+                    return false;
+                }
+            }
+        }
         UserAction::Cancel => return false,
         action => {
             let arms_surface_activation = matches!(
@@ -740,6 +758,35 @@ mod tests {
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(5)),
             Ok(TuiEvent::McpActionFinished { server }) if server == "my_server"
+        ));
+        assert!(command_rx.try_recv().is_err());
+        dispatcher.shutdown().unwrap();
+    }
+
+    #[test]
+    fn mcp_prompts_expand_beside_the_dispatcher() {
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (mut dispatcher, command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).unwrap();
+
+        raw_tx
+            .send(UserAction::RunMcpPrompt {
+                server: "github".to_string(),
+                prompt: "review_pr".to_string(),
+                arguments: vec![("pr".to_string(), "12".to_string())],
+            })
+            .unwrap();
+
+        // With no runtime yet, the worker says so; the hosted controller,
+        // which a running turn keeps busy, never sees the prompt.
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(TuiEvent::McpPromptExpanded { server, prompt, result: Err(reason) })
+                if server == "github"
+                    && prompt == "review_pr"
+                    && reason == "the conversation has not started"
         ));
         assert!(command_rx.try_recv().is_err());
         dispatcher.shutdown().unwrap();

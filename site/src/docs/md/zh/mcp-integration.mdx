@@ -85,6 +85,16 @@ prompts，以及它的配置里设置的 `enabled_tools`/`disabled_tools`。`r` 
 连接时用上这次登录。`/mcp` 列出的是 Orca 启动时的配置：TUI 打开期间添加的服务器，
 要重启 TUI 后才会出现。面板和按键详见[终端界面](terminal-ui.md#mcp-服务器)。
 
+## Prompts
+
+声明了 `prompts` 能力的服务器，连接和重新连接时都会列出它的 prompts；`/mcp` 在该服务器的
+详情里显示它们。在 TUI 里，每个 prompt 都是一条斜杠命令，命名方式与该服务器的工具相同：
+`/mcp__<server>__<prompt>`，后面按顺序跟上 prompt 的参数，比如
+`/mcp__github__review_pr 123 main`。最后一个参数接收剩下的全部文本；缺少必填参数时显示用法，
+不会执行。Orca 向服务器请求这个 prompt（`prompts/get`），把返回的内容当作你的消息发出：
+各段文本用空行连接，嵌入资源取其文本，图片作为附件。服务器报错时，对话里会说明，不发送。
+参数规则和大小上限详见[终端界面](terminal-ui.md#mcp-prompt-命令)。
+
 ## 工具返回的图片
 
 只有 `deepseek-flash` 和使用它的 `auto` 能在 tool 消息中直接看到 MCP 工具返回的图片。`deepseek-v4-pro` 和自定义模型（即使声明了 `supports_images = true`）收到的是一句说明，告诉模型它看不到这些图片。仅接受 PNG、JPEG、GIF 和 WebP，解码后每张不超过 5 MiB；不符合的图片会被丢弃，并留下说明原因的文字。单个 MCP 响应连同图片最多 16 MiB，超过时这次调用会失败。

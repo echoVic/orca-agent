@@ -10,8 +10,8 @@ use orca_core::plan_types::PlanItem;
 use orca_runtime::mentions::MentionBindings;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 use orca_runtime::surface::{
-    RuntimeSurfaceThreadHandle, SurfaceOperationId, SurfaceReadError, SurfaceReadErrorCode,
-    SurfaceReadResult, SurfaceReadRevision, TaskTranscriptSnapshot,
+    RuntimeSurfaceThreadHandle, SurfaceMcpPromptExpansion, SurfaceOperationId, SurfaceReadError,
+    SurfaceReadErrorCode, SurfaceReadResult, SurfaceReadRevision, TaskTranscriptSnapshot,
 };
 
 use crate::clipboard_image::ImagePasteRequest;
@@ -477,6 +477,14 @@ pub enum TuiEvent {
         server: String,
         url: String,
     },
+    /// What the MCP server the catalog names `server` made of its prompt
+    /// `prompt`, which `/mcp__{server}__{prompt}` ran: the input to send as
+    /// the user's message, or why there is none.
+    McpPromptExpanded {
+        server: String,
+        prompt: String,
+        result: Result<SurfaceMcpPromptExpansion, String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -718,5 +726,13 @@ pub enum UserAction {
     /// config name, then reconnect it.
     McpLogout {
         server: String,
+    },
+    /// `/mcp__{server}__{prompt} args…`: have the MCP server the catalog
+    /// names `server` expand its prompt `prompt` with `arguments` (name,
+    /// value), which `McpPromptExpanded` brings back.
+    RunMcpPrompt {
+        server: String,
+        prompt: String,
+        arguments: Vec<(String, String)>,
     },
 }

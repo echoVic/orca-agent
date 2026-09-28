@@ -21,13 +21,13 @@ use orca_runtime::surface::{
     SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId,
     SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceCursor, SurfaceEvent,
     SurfaceFactFamily, SurfaceGoal, SurfaceGoalFence, SurfaceImageDetail, SurfaceImageSource,
-    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceMcpServerAction,
-    SurfaceMcpServerStatus, SurfaceOperationId, SurfacePinnedContextEntry,
-    SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot, SurfaceSnapshot,
-    SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceTaskId, SurfaceUnavailableReason,
-    SurfaceWorkflowRunId, TaskControlAction, TaskRevision, TransferBackgroundOutput,
-    UncommittedMutation, WaitOperationTerminalResult, WorkflowCatalogRevision,
-    WorkflowControlAction, WorkflowPatch,
+    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
+    SurfaceMcpPromptExpansion, SurfaceMcpServerAction, SurfaceMcpServerStatus, SurfaceOperationId,
+    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
+    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceTaskId,
+    SurfaceUnavailableReason, SurfaceWorkflowRunId, TaskControlAction, TaskRevision,
+    TransferBackgroundOutput, UncommittedMutation, WaitOperationTerminalResult,
+    WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -502,6 +502,46 @@ pub(crate) fn reconnect_mcp_server(
             "the TUI may not manage this conversation's MCP servers".to_string()
         }
     })
+}
+
+/// Has the thread's MCP server `server` (its catalog name) expand its
+/// prompt `prompt` with `arguments` (name, value), through the typed
+/// surface, and answers with the expansion, or with why there is none: the
+/// server's own reason when it could not expand the prompt. It blocks until
+/// the server answers, up to its tool timeout. Nothing is sent or recorded.
+pub(crate) fn expand_mcp_prompt(
+    thread: &RuntimeSurfaceThreadHandle,
+    server: &str,
+    prompt: &str,
+    arguments: Vec<(String, String)>,
+) -> Result<SurfaceMcpPromptExpansion, String> {
+    const UNAVAILABLE: &str = "the conversation is unavailable";
+    let server = NonEmptyText::try_new(server.to_string())
+        .map_err(|_| "the MCP server has no name".to_string())?;
+    let prompt = NonEmptyText::try_new(prompt.to_string())
+        .map_err(|_| "the MCP prompt has no name".to_string())?;
+    let surface = thread.surface();
+    let AttachResult::FreshAttached { attachment } = surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+        interaction_capabilities: BTreeSet::new(),
+    }) else {
+        return Err(UNAVAILABLE.to_string());
+    };
+    let result =
+        attachment
+            .client
+            .expand_mcp_prompt(SurfaceRequestId::new(), server, prompt, arguments);
+    detach(&surface, &attachment.client);
+    match result {
+        Ok(Ok(expansion)) => Ok(expansion),
+        Ok(Err(reason)) => Err(reason.as_str().to_string()),
+        Err(SurfaceClientCommandError::RuntimeUnavailable) => Err(UNAVAILABLE.to_string()),
+        Err(SurfaceClientCommandError::Unauthorized) => {
+            Err("the TUI may not use this conversation's MCP prompts".to_string())
+        }
+    }
 }
 
 pub(crate) fn rebind_background_presentations(

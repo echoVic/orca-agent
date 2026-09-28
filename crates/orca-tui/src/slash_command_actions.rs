@@ -70,6 +70,73 @@ fn open_mcp_panel(config: &RunConfig, state: &mut AppState) {
     }
 }
 
+/// What `/mcp__{server}__{prompt}` answers before the conversation's
+/// runtime starts.
+const MCP_PROMPTS_NOT_STARTED: &str =
+    "MCP prompts are available once the conversation starts; send a message first.";
+
+/// `/mcp__{server}__{prompt} args…`: the thread's runtime has the MCP
+/// server expand its catalog prompt with the arguments `args` gives it, off
+/// the UI thread; `McpPromptExpanded` brings the expansion back to be sent
+/// as the user's message. Arguments that do not fit the prompt show its
+/// usage instead.
+fn run_mcp_prompt(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+    server: String,
+    prompt: String,
+    args: &str,
+) {
+    let Some(view) = state
+        .mcp_catalog
+        .prompts
+        .iter()
+        .find(|view| view.server == server && view.name == prompt)
+    else {
+        return;
+    };
+    match commands::map_prompt_arguments(view, args) {
+        Ok(arguments) => {
+            state.push_message(ChatMessage::System {
+                text: format!(
+                    "running MCP prompt {}…",
+                    commands::mcp_prompt_command(&server, &prompt)
+                ),
+                expanded: false,
+            });
+            let _ = action_tx.send(UserAction::RunMcpPrompt {
+                server,
+                prompt,
+                arguments,
+            });
+        }
+        Err(usage) => state.push_message(ChatMessage::Error(usage)),
+    }
+}
+
+/// `/mcp__…` names no prompt the catalog has. Before the conversation's
+/// runtime starts, it has none yet, which is said here. Otherwise, and in
+/// an attached daemon session, whose servers this TUI does not run, it is
+/// an unknown command, for the caller to report.
+fn mcp_prompt_before_start(
+    text: &str,
+    config: &RunConfig,
+    state: &mut AppState,
+) -> Option<SlashOutcome> {
+    let before_start = !state.attached_session
+        && state.mcp_servers_before_start()
+        && config.mcp_servers.iter().any(|server| !server.disabled);
+    if !before_start || !text.trim_start().starts_with("/mcp__") {
+        return None;
+    }
+    state.push_message(ChatMessage::System {
+        text: MCP_PROMPTS_NOT_STARTED.to_string(),
+        expanded: false,
+    });
+    state.scroll_to_bottom();
+    Some(SlashOutcome::Continue)
+}
+
 pub(crate) fn handle_slash_command(
     text: &str,
     config: &mut RunConfig,
@@ -82,7 +149,9 @@ pub(crate) fn handle_slash_command(
         .as_deref()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let command = commands::parse_with_cwd(text, &cwd)?;
+    let Some(command) = commands::parse_with_cwd(text, &cwd, &state.mcp_catalog.prompts) else {
+        return mcp_prompt_before_start(text, config, state);
+    };
     dispatch_slash_command(command, None, config, state, action_tx)
 }
 
@@ -99,7 +168,7 @@ pub(crate) fn handle_composer_slash_command(
         .as_deref()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    match commands::parse_with_cwd(visible_text, &cwd) {
+    match commands::parse_with_cwd(visible_text, &cwd, &state.mcp_catalog.prompts) {
         Some(SlashCommand::Goal(GoalSlashCommand::Set(objective))) => {
             let draft = GoalDraft {
                 objective: objective.clone(),
@@ -127,7 +196,11 @@ pub(crate) fn handle_composer_slash_command(
             )
         }
         _ => {
-            let command = commands::parse_with_cwd(expanded_text, &cwd)?;
+            let Some(command) =
+                commands::parse_with_cwd(expanded_text, &cwd, &state.mcp_catalog.prompts)
+            else {
+                return mcp_prompt_before_start(expanded_text, config, state);
+            };
             dispatch_slash_command(command, None, config, state, action_tx)
         }
     }
@@ -204,6 +277,11 @@ fn dispatch_slash_command(
             }
         }
         SlashCommand::Mcp => open_mcp_panel(config, state),
+        SlashCommand::McpPrompt {
+            server,
+            prompt,
+            args,
+        } => run_mcp_prompt(state, action_tx, server, prompt, &args),
         SlashCommand::Mode(Some(mode)) => match parse_approval_mode(&mode) {
             Some(approval_mode) => {
                 request_settings_change(state, action_tx, None, None, Some(approval_mode));
@@ -1079,6 +1157,114 @@ mod tests {
             Some(ChatMessage::Error(text))
                 if text == "finish or cancel the current work before managing MCP servers"
         ));
+    }
+
+    /// A conversation whose runtime has started, with the MCP server
+    /// `github` and its prompts `review_pr <pr> [branch]` and `status`.
+    fn mcp_prompt_state() -> AppState {
+        let mut state = mcp_state(&["github"]);
+        state.mcp_catalog.prompts = vec![
+            crate::surface_projection::McpPromptView {
+                server: "github".to_string(),
+                name: "review_pr".to_string(),
+                description: Some("Review a pull request".to_string()),
+                arguments: vec![("pr".to_string(), true), ("branch".to_string(), false)],
+            },
+            crate::surface_projection::McpPromptView {
+                server: "github".to_string(),
+                name: "status".to_string(),
+                description: None,
+                arguments: Vec::new(),
+            },
+        ];
+        state
+    }
+
+    #[test]
+    fn a_missing_required_argument_shows_usage() {
+        let mut state = mcp_prompt_state();
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        for (command, usage) in [
+            (
+                "/mcp__github__review_pr",
+                "usage: /mcp__github__review_pr <pr> [branch]",
+            ),
+            (
+                "/mcp__github__review_pr   ",
+                "usage: /mcp__github__review_pr <pr> [branch]",
+            ),
+            // A prompt that takes no arguments runs only without any.
+            ("/mcp__github__status now", "usage: /mcp__github__status"),
+        ] {
+            let outcome =
+                handle_slash_command(command, &mut config, &shared, &mut state, &action_tx);
+
+            assert!(matches!(outcome, Some(SlashOutcome::Continue)), "{command}");
+            assert!(action_rx.try_recv().is_err(), "{command} ran");
+            assert!(
+                matches!(
+                    state.transcript.messages.last(),
+                    Some(ChatMessage::Error(text)) if text == usage
+                ),
+                "{command}: {:?}",
+                state.transcript.messages.last()
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_prompts_before_the_runtime_starts_say_when_they_come() {
+        const NOT_STARTED: &str =
+            "MCP prompts are available once the conversation starts; send a message first.";
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut config = test_run_config();
+        config.mcp_servers = vec![remote_mcp_server("github")];
+        let shared = Arc::new(Mutex::new(config.clone()));
+
+        // Before the runtime starts, the catalog has no prompts yet.
+        let mut state = mcp_state(&[]);
+        let outcome = handle_slash_command(
+            "/mcp__github__review_pr 12",
+            &mut config,
+            &shared,
+            &mut state,
+            &action_tx,
+        );
+        assert!(matches!(outcome, Some(SlashOutcome::Continue)));
+        assert!(matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::System { text, .. }) if text == NOT_STARTED
+        ));
+        assert!(action_rx.try_recv().is_err());
+
+        // Otherwise it is an unknown command, which the caller reports: once
+        // the runtime has started, in an attached daemon session, and when
+        // no MCP server is configured to connect.
+        let mut started = mcp_prompt_state();
+        let mut attached = mcp_state(&[]);
+        attached.attached_session = true;
+        let mut no_servers = mcp_state(&[]);
+        let mut unconfigured = test_run_config();
+        unconfigured.mcp_servers = vec![orca_core::mcp_types::McpServerConfig {
+            disabled: true,
+            ..remote_mcp_server("github")
+        }];
+        for (state, config) in [
+            (&mut started, &mut config.clone()),
+            (&mut attached, &mut config.clone()),
+            (&mut no_servers, &mut test_run_config()),
+            (&mut state, &mut unconfigured),
+        ] {
+            let before = state.transcript.messages.len();
+            let outcome =
+                handle_slash_command("/mcp__github__nope 12", config, &shared, state, &action_tx);
+            assert!(outcome.is_none());
+            assert_eq!(state.transcript.messages.len(), before);
+        }
+        assert!(action_rx.try_recv().is_err());
     }
 
     #[test]

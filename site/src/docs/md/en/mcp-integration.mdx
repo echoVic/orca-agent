@@ -102,6 +102,20 @@ logged in to before the conversation starts, and connects with that login.
 while the TUI is open appears after you restart it. See
 [Terminal UI](terminal-ui.md#mcp-servers) for the panel and its keys.
 
+## Prompts
+
+A server that declares the `prompts` capability has its prompts listed when
+it connects, and again when it reconnects; `/mcp` shows them in the server's
+details. In the TUI each prompt is a slash command named like the server's
+tools, `/mcp__<server>__<prompt>`, followed by the prompt's arguments in
+order: `/mcp__github__review_pr 123 main`. The last argument takes the rest
+of the text, and a missing required argument shows the usage instead of
+running anything. Orca asks the server for the prompt (`prompts/get`) and
+sends what it returns as your message: its text parts joined by blank lines,
+the text of any embedded resource, and its images as attachments. When the
+server reports an error, the conversation says so and nothing is sent. See
+[Terminal UI](terminal-ui.md#mcp-prompts) for the argument rules and limits.
+
 ## Images from tools
 
 `deepseek-flash` and `auto`, which uses it, are the only models that see the

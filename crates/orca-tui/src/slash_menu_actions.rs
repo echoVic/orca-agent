@@ -26,14 +26,15 @@ pub(crate) fn update_slash_menu(textarea: &TextArea, state: &mut AppState, confi
             .as_deref()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let items: Vec<SlashMenuItem> = commands::available_commands(&cwd)
-            .into_iter()
-            .filter(|(cmd, _)| cmd.starts_with(filter))
-            .map(|(cmd, desc)| SlashMenuItem {
-                command: cmd,
-                description: desc,
-            })
-            .collect();
+        let items: Vec<SlashMenuItem> =
+            commands::available_commands(&cwd, &state.mcp_catalog.prompts)
+                .into_iter()
+                .filter(|(cmd, _)| cmd.starts_with(filter))
+                .map(|(cmd, desc)| SlashMenuItem {
+                    command: cmd,
+                    description: desc,
+                })
+                .collect();
         if items.is_empty() {
             state.slash_menu = None;
         } else {
@@ -240,6 +241,16 @@ fn select_slash_menu_command(
             *textarea = make_textarea_with_text("/remember ", vim_state, theme);
             state.slash_menu = None;
         }
+        // An MCP prompt that takes arguments waits for them.
+        command
+            if command.strip_prefix('/').is_some_and(|word| {
+                commands::find_mcp_prompt(&state.mcp_catalog.prompts, word)
+                    .is_some_and(|prompt| !prompt.arguments.is_empty())
+            }) =>
+        {
+            *textarea = make_textarea_with_text(&format!("{command} "), vim_state, theme);
+            state.slash_menu = None;
+        }
         _ => {
             *textarea = make_textarea_with_text(&selected_cmd, vim_state, theme);
             state.slash_menu = None;
@@ -335,8 +346,153 @@ fn parse_reasoning_effort(choice: &str) -> Option<ReasoningEffort> {
 
 #[cfg(test)]
 mod tests {
-    use super::{approval_mode_submenu, model_submenu};
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
     use orca_core::approval_types::ApprovalMode;
+    use orca_core::config::ThemeName;
+
+    use crate::surface_projection::{McpCatalogView, McpPromptView};
+
+    fn prompt(name: &str, description: Option<&str>, arguments: &[(&str, bool)]) -> McpPromptView {
+        McpPromptView {
+            server: "github".to_string(),
+            name: name.to_string(),
+            description: description.map(str::to_string),
+            arguments: arguments
+                .iter()
+                .map(|(name, required)| ((*name).to_string(), *required))
+                .collect(),
+        }
+    }
+
+    /// A conversation whose `github` MCP server offers `prompts`.
+    fn menu_state(
+        prompts: Vec<McpPromptView>,
+    ) -> (AppState, RunConfig, mpsc::Receiver<UserAction>) {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.mcp_catalog = McpCatalogView {
+            prompts,
+            ..Default::default()
+        };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(std::env::temp_dir());
+        (state, config, action_rx)
+    }
+
+    #[test]
+    fn prompt_commands_appear_in_the_slash_menu() {
+        let (mut state, config, _action_rx) = menu_state(vec![
+            prompt(
+                "review_pr",
+                Some("Review a pull request"),
+                &[("pr", true), ("branch", false)],
+            ),
+            prompt("summarize", Some("Summarize\n  the   repository "), &[]),
+            prompt("triage", None, &[("issue", true)]),
+            // It cannot be typed as one word, so it is not offered.
+            prompt("two words", Some("Not offered"), &[]),
+        ]);
+        let theme = Theme::named(ThemeName::Dark);
+        let vim = VimState::new(false);
+
+        update_slash_menu(
+            &make_textarea_with_text("/mcp", &vim, &theme),
+            &mut state,
+            &config,
+        );
+
+        let menu = state.slash_menu.as_ref().expect("slash menu");
+        let items = menu
+            .items
+            .iter()
+            .map(|item| (item.command.as_str(), item.description.as_str()))
+            .filter(|(command, _)| *command == "/mcp" || command.starts_with("/mcp__"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items,
+            [
+                ("/mcp", "Manage MCP servers"),
+                (
+                    "/mcp__github__review_pr",
+                    "Review a pull request <pr> [branch]"
+                ),
+                ("/mcp__github__summarize", "Summarize the repository"),
+                ("/mcp__github__triage", "Run MCP prompt <issue>"),
+            ]
+        );
+    }
+
+    #[test]
+    fn choosing_a_prompt_that_takes_arguments_leaves_room_for_them() {
+        let (mut state, mut config, action_rx) = menu_state(vec![
+            prompt("review_pr", None, &[("pr", true)]),
+            prompt("status", None, &[]),
+        ]);
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let action_tx = state.event_tx.clone();
+        let theme = Theme::named(ThemeName::Dark);
+        let vim = VimState::new(false);
+
+        for (typed, key, expected) in [
+            (
+                "/mcp__github__rev",
+                KeyCode::Enter,
+                "/mcp__github__review_pr ",
+            ),
+            (
+                "/mcp__github__rev",
+                KeyCode::Tab,
+                "/mcp__github__review_pr ",
+            ),
+        ] {
+            let mut textarea = make_textarea_with_text(typed, &vim, &theme);
+            update_slash_menu(&textarea, &mut state, &config);
+            let key = KeyEvent::new(key, KeyModifiers::NONE);
+
+            assert!(handle_slash_menu_key(
+                &Event::Key(key),
+                &key,
+                &mut state,
+                &mut config,
+                &shared,
+                &action_tx,
+                &mut textarea,
+                &vim,
+                &theme,
+            ));
+
+            assert_eq!(textarea_text(&textarea), expected);
+            assert!(state.slash_menu.is_none());
+            assert!(action_rx.try_recv().is_err());
+        }
+
+        // A prompt without arguments runs at once.
+        let mut textarea = make_textarea_with_text("/mcp__github__sta", &vim, &theme);
+        update_slash_menu(&textarea, &mut state, &config);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_slash_menu_key(
+            &Event::Key(enter),
+            &enter,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &vim,
+            &theme,
+        );
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RunMcpPrompt { server, prompt, arguments })
+                if server == "github" && prompt == "status" && arguments.is_empty()
+        ));
+    }
 
     #[test]
     fn settings_submenus_preselect_the_committed_values() {

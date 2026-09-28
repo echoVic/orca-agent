@@ -695,7 +695,8 @@ pub(crate) fn hosted_tui_controller_loop(
             | Ok(UserAction::PasteImages { .. })
             | Ok(UserAction::McpReconnect { .. })
             | Ok(UserAction::McpLogin { .. })
-            | Ok(UserAction::McpLogout { .. }) => {}
+            | Ok(UserAction::McpLogout { .. })
+            | Ok(UserAction::RunMcpPrompt { .. }) => {}
             Ok(UserAction::ResumeOperation { operation_id }) => {
                 handle_hosted_operation_action(
                     HostedOperationAction::Resume { operation_id },

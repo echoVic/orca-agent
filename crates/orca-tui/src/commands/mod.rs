@@ -19,13 +19,29 @@ pub enum SlashCommand {
     Goal(GoalSlashCommand),
     Queue(QueueSlashCommand),
     WorkflowList,
-    WorkflowRun { name: String, args: Option<String> },
+    WorkflowRun {
+        name: String,
+        args: Option<String>,
+    },
     AgentDashboard,
     TaskWorkspace,
-    TaskFollowUp { task_id: String, prompt: String },
+    TaskFollowUp {
+        task_id: String,
+        prompt: String,
+    },
     Remember(String),
     SkillList,
-    SkillRun { id: String, args: Option<String> },
+    SkillRun {
+        id: String,
+        args: Option<String>,
+    },
+    /// `/mcp__{server}__{prompt} args…`, a prompt in the MCP catalog, with
+    /// the text after its name.
+    McpPrompt {
+        server: String,
+        prompt: String,
+        args: String,
+    },
     Trust(TrustSlashCommand),
 }
 
@@ -57,7 +73,11 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
     parse_static(input)
 }
 
-pub fn parse_with_cwd(input: &str, cwd: &Path) -> Option<SlashCommand> {
+pub(crate) fn parse_with_cwd(
+    input: &str,
+    cwd: &Path,
+    mcp_prompts: &[McpPromptView],
+) -> Option<SlashCommand> {
     if let Some(command) = parse_static(input) {
         return Some(command);
     }
@@ -68,6 +88,14 @@ pub fn parse_with_cwd(input: &str, cwd: &Path) -> Option<SlashCommand> {
     let command = parts.next()?;
     if builtin_command_names().contains(command) {
         return None;
+    }
+    // A prompt's last argument takes the rest of the text as typed.
+    if let Some(prompt) = find_mcp_prompt(mcp_prompts, command) {
+        return Some(SlashCommand::McpPrompt {
+            server: prompt.server.clone(),
+            prompt: prompt.name.clone(),
+            args: rest.trim_start()[command.len()..].trim().to_string(),
+        });
     }
     let args = parts.collect::<Vec<_>>().join(" ");
     let args_opt = if args.is_empty() { None } else { Some(args) };
@@ -245,7 +273,10 @@ fn no_arguments<'a>(mut parts: impl Iterator<Item = &'a str>) -> bool {
     parts.next().is_none()
 }
 
-pub fn available_commands(cwd: &Path) -> Vec<(String, String)> {
+pub(crate) fn available_commands(
+    cwd: &Path,
+    mcp_prompts: &[McpPromptView],
+) -> Vec<(String, String)> {
     let mut commands = all_commands()
         .iter()
         .map(|(command, description)| ((*command).to_string(), (*description).to_string()))
@@ -271,7 +302,101 @@ pub fn available_commands(cwd: &Path) -> Vec<(String, String)> {
             }
         }
     }
+    commands.extend(
+        mcp_prompts
+            .iter()
+            .filter(|prompt| can_type_mcp_prompt(prompt))
+            .map(|prompt| {
+                (
+                    mcp_prompt_command(&prompt.server, &prompt.name),
+                    mcp_prompt_menu_description(prompt),
+                )
+            }),
+    );
     commands
+}
+
+/// The slash command that runs the catalog prompt `prompt` of the MCP
+/// server the catalog names `server`: `/mcp__{server}__{prompt}`, named as
+/// the server's tools are.
+pub(crate) fn mcp_prompt_command(server: &str, prompt: &str) -> String {
+    format!("/mcp__{server}__{prompt}")
+}
+
+/// The catalog prompt the slash command `/{word}` runs, `word` being
+/// `mcp__{server}__{prompt}`.
+pub(crate) fn find_mcp_prompt<'a>(
+    prompts: &'a [McpPromptView],
+    word: &str,
+) -> Option<&'a McpPromptView> {
+    let rest = word.strip_prefix("mcp__")?;
+    prompts.iter().find(|prompt| {
+        can_type_mcp_prompt(prompt)
+            && rest
+                .strip_prefix(prompt.server.as_str())
+                .and_then(|name| name.strip_prefix("__"))
+                == Some(prompt.name.as_str())
+    })
+}
+
+/// A prompt whose name holds whitespace cannot be typed as one word, so no
+/// slash command runs it.
+fn can_type_mcp_prompt(prompt: &McpPromptView) -> bool {
+    !prompt.name.contains(char::is_whitespace)
+}
+
+/// `prompt`'s arguments as its usage shows them, in order: `<required>`,
+/// `[optional]`.
+fn mcp_prompt_argument_hint(prompt: &McpPromptView) -> String {
+    prompt
+        .arguments
+        .iter()
+        .map(|(name, required)| {
+            if *required {
+                format!("<{name}>")
+            } else {
+                format!("[{name}]")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// How the slash menu describes `prompt`: its description, on one line,
+/// then its arguments.
+fn mcp_prompt_menu_description(prompt: &McpPromptView) -> String {
+    let description = prompt
+        .description
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let description = if description.is_empty() {
+        "Run MCP prompt".to_string()
+    } else {
+        description
+    };
+    [description, mcp_prompt_argument_hint(prompt)]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `usage: /mcp__{server}__{prompt} <required> [optional]`.
+fn mcp_prompt_usage(prompt: &McpPromptView) -> String {
+    [
+        format!(
+            "usage: {}",
+            mcp_prompt_command(&prompt.server, &prompt.name)
+        ),
+        mcp_prompt_argument_hint(prompt),
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 fn builtin_command_names() -> std::collections::BTreeSet<&'static str> {
@@ -361,6 +486,42 @@ fn parse_goal(args: String) -> Option<GoalSlashCommand> {
             }
         }
     }
+}
+
+/// The arguments (name, value) that `args`, the text after
+/// `/mcp__{server}__{prompt}`, gives `prompt`: its words, split at
+/// whitespace, go to the declared arguments in order, and the last argument
+/// takes all the text that is left. An optional argument with no text is
+/// left out. A required argument with no text, or text for a prompt that
+/// takes no arguments, is answered with the prompt's usage.
+pub(crate) fn map_prompt_arguments(
+    prompt: &McpPromptView,
+    args: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let mut rest = args.trim();
+    let Some(last) = prompt.arguments.len().checked_sub(1) else {
+        return if rest.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(mcp_prompt_usage(prompt))
+        };
+    };
+    let mut arguments = Vec::new();
+    for (index, (name, required)) in prompt.arguments.iter().enumerate() {
+        let value = if index == last {
+            std::mem::take(&mut rest)
+        } else {
+            let (word, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            rest = tail.trim_start();
+            word
+        };
+        if !value.is_empty() {
+            arguments.push((name.clone(), value.to_string()));
+        } else if *required {
+            return Err(mcp_prompt_usage(prompt));
+        }
+    }
+    Ok(arguments)
 }
 
 pub fn available_models() -> &'static [&'static str] {
@@ -650,7 +811,7 @@ mod tests {
         )
         .unwrap();
 
-        let command_names = available_commands(temp.path())
+        let command_names = available_commands(temp.path(), &[])
             .into_iter()
             .map(|(command, _)| command)
             .collect::<Vec<_>>();
@@ -670,7 +831,7 @@ mod tests {
         .unwrap();
         std::fs::write(workflow_dir.join("model.js"), "export default 'ok';").unwrap();
 
-        let command_names = available_commands(temp.path())
+        let command_names = available_commands(temp.path(), &[])
             .into_iter()
             .map(|(command, _)| command)
             .collect::<Vec<_>>();
@@ -700,14 +861,14 @@ mod tests {
         std::fs::write(workflow_dir.join("model.js"), "export default 'ok';").unwrap();
 
         assert_eq!(
-            parse_with_cwd("/security-audit target=src", temp.path()),
+            parse_with_cwd("/security-audit target=src", temp.path(), &[]),
             Some(SlashCommand::WorkflowRun {
                 name: "security-audit".to_string(),
                 args: Some("target=src".to_string()),
             })
         );
         assert_eq!(
-            parse_with_cwd("/model", temp.path()),
+            parse_with_cwd("/model", temp.path(), &[]),
             Some(SlashCommand::Model(None))
         );
     }
@@ -750,6 +911,95 @@ mod tests {
     fn parses_mcp_command() {
         assert_eq!(parse("/mcp"), Some(SlashCommand::Mcp));
         assert!(all_commands().contains(&("/mcp", "Manage MCP servers")));
+    }
+
+    fn mcp_prompt(server: &str, name: &str, arguments: &[(&str, bool)]) -> McpPromptView {
+        McpPromptView {
+            server: server.to_string(),
+            name: name.to_string(),
+            description: None,
+            arguments: arguments
+                .iter()
+                .map(|(name, required)| ((*name).to_string(), *required))
+                .collect(),
+        }
+    }
+
+    fn pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn positional_arguments_map_with_the_last_taking_the_rest() {
+        let prompt = mcp_prompt("docs", "search", &[("a", true), ("b", true)]);
+
+        assert_eq!(
+            map_prompt_arguments(&prompt, "1 two words"),
+            Ok(pairs(&[("a", "1"), ("b", "two words")]))
+        );
+        // Any run of whitespace ends a word; the last argument keeps the
+        // rest as typed, line breaks included.
+        assert_eq!(
+            map_prompt_arguments(&prompt, "  1 \t two  words\nand more  "),
+            Ok(pairs(&[("a", "1"), ("b", "two  words\nand more")]))
+        );
+        // An optional argument left out is not sent at all, not even as "".
+        let review = mcp_prompt("github", "review_pr", &[("pr", true), ("branch", false)]);
+        assert_eq!(
+            map_prompt_arguments(&review, "123"),
+            Ok(pairs(&[("pr", "123")]))
+        );
+        assert_eq!(
+            map_prompt_arguments(&review, "123 main"),
+            Ok(pairs(&[("pr", "123"), ("branch", "main")]))
+        );
+        assert_eq!(
+            map_prompt_arguments(&mcp_prompt("docs", "status", &[]), "  "),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn an_unknown_mcp_command_is_not_parsed_as_a_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let prompts = [
+            mcp_prompt("github", "review_pr", &[("pr", true)]),
+            mcp_prompt("github", "two words", &[]),
+        ];
+        let parse = |input: &str| parse_with_cwd(input, temp.path(), &prompts);
+
+        assert_eq!(
+            parse("/mcp__github__review_pr 12  and more"),
+            Some(SlashCommand::McpPrompt {
+                server: "github".to_string(),
+                prompt: "review_pr".to_string(),
+                args: "12  and more".to_string(),
+            })
+        );
+        for input in [
+            "/mcp__github__review",
+            "/mcp__github__review_pr_all",
+            "/mcp__gitlab__review_pr 12",
+            // The server is named as the catalog names it, as in tool names.
+            "/mcp__GitHub__review_pr 12",
+            // A prompt whose name holds whitespace cannot be typed.
+            "/mcp__github__two words",
+            "/mcp__github__two",
+            "/mcp__github__",
+            "/mcp__",
+        ] {
+            assert_eq!(parse(input), None, "{input}");
+        }
+        assert_eq!(
+            invalid_slash_command_message("/mcp__github__review 12"),
+            "unknown slash command `/mcp__github__review`. Type / to view available commands."
+        );
+        // `/mcp` still opens the panel, and takes no arguments.
+        assert_eq!(parse("/mcp"), Some(SlashCommand::Mcp));
+        assert_eq!(parse("/mcp review_pr"), None);
     }
 
     #[test]
@@ -803,3 +1053,5 @@ mod tests {
     }
 }
 use std::path::Path;
+
+use crate::surface_projection::McpPromptView;

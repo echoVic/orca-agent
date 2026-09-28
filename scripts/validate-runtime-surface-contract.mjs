@@ -1185,6 +1185,8 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:user_action.route", 14],
   ["crates/orca-tui/src/slash_command_actions.rs:request_recap:user_action.route", 1],
   ["crates/orca-tui/src/mcp_dialog_actions.rs:start_action:user_action.route", 1],
+  ["crates/orca-tui/src/slash_command_actions.rs:run_mcp_prompt:user_action.route", 1],
+  ["crates/orca-tui/src/mcp_prompt_actions.rs:send_mcp_prompt_message:user_action.route", 1],
   [
     "crates/orca-tui/src/idle_submit_actions.rs:submit_pending_user_input_response:user_action.route",
     1,
@@ -1877,11 +1879,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 52 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 53 unique variants matching UserAction at baseline",
         (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 52,
-          "current_tui_user_actions must contain 52 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 53,
+          "current_tui_user_actions must contain 53 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,

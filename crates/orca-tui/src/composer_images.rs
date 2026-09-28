@@ -414,9 +414,36 @@ impl ComposerImageState {
         visible_text: &str,
         images: Vec<ImageInput>,
     ) -> (String, Vec<ComposerImageAttachment>) {
+        Self::label_inputs(visible_text, image_labels_in_text(visible_text), images)
+    }
+
+    /// `images`, which come with `text` from elsewhere (an MCP prompt), as
+    /// attachments of the text. Unlike a restored draft, the text keeps any
+    /// image label it already holds as text: each image gets a new label.
+    pub(crate) fn attach_inputs(
+        text: &str,
+        images: Vec<ImageInput>,
+    ) -> (String, Vec<ComposerImageAttachment>) {
+        Self::label_inputs(text, Vec::new(), images)
+    }
+
+    /// The decoded bytes `attachments` carry inline, which Orca caps.
+    pub(crate) fn inline_bytes(attachments: &[ComposerImageAttachment]) -> usize {
+        attachments.iter().fold(0, |total, attachment| {
+            total.saturating_add(attachment.encoded_bytes)
+        })
+    }
+
+    /// `images` as attachments of `visible_text`: the first take `labels`,
+    /// and each one after them a new label, numbered past every label in
+    /// the text and appended to it.
+    fn label_inputs(
+        visible_text: &str,
+        mut labels: Vec<String>,
+        images: Vec<ImageInput>,
+    ) -> (String, Vec<ComposerImageAttachment>) {
         let mut text = visible_text.to_string();
-        let mut labels = image_labels_in_text(visible_text);
-        let mut next_number = labels
+        let mut next_number = image_labels_in_text(visible_text)
             .iter()
             .filter_map(|label| image_number(label))
             .max()
