@@ -1,9 +1,11 @@
 # MCP Integration
 
 Add MCP servers with `orca mcp add`, inspect them with `orca mcp list` and
-`orca mcp get`, and remove them with `orca mcp remove`. These commands only
-write the user-owned Orca configuration; a project's `.orca/config.toml` is
-never touched, and a change takes effect the next time a session starts. See
+`orca mcp get`, remove them with `orca mcp remove`, and log in to or out of a
+remote server's OAuth with `orca mcp login`/`orca mcp logout`. These commands
+only write the user-owned Orca configuration (and, for `login`/`logout`, the
+credential store next to it); a project's `.orca/config.toml` is never
+touched, and a change takes effect the next time a session starts. See
 the [CLI reference](cli-reference.md#orca-mcp) for the full option list.
 
 The user configuration is $ORCA_HOME/config.toml when ORCA_HOME is set,
@@ -48,6 +50,41 @@ network = false
 shell = false
 agent = false
 ~~~
+
+## Remote servers and login
+
+`--transport` selects `http` (streamable HTTP, the default) or `sse`. `http`
+speaks the current MCP transport: every request is a POST, and the session id
+and protocol version the server negotiated at `initialize` travel with each
+later request. `sse` is the legacy transport — a GET opens an event stream,
+and requests are POSTed to the address it hands back. Existing `sse` servers
+keep working; `orca mcp add --transport sse` still exists for the rare server
+that speaks only the legacy transport.
+
+A remote server authenticates one of three ways:
+
+- **A static header** — `--header "Authorization: ..."`, sent on every
+  request.
+- **`--bearer-token-env-var VAR`** — `orca` reads `VAR` from its own
+  environment at connect time and sends it as a bearer token. The token
+  itself is never written to the config file.
+- **OAuth**, for a server configured with neither of the above. Run
+  `orca mcp login <name>` to authorize it in your browser; the authorization
+  url is also printed, for a machine with no browser to open it by hand.
+  `orca mcp logout <name>` deletes the saved login. `login` refuses a stdio
+  server, or one already using a static header or `--bearer-token-env-var`,
+  since neither uses OAuth.
+
+OAuth tokens are stored in `$ORCA_HOME/mcp-credentials.json`, next to
+`config.toml` and readable only by its owner, keyed by server name and url —
+moving a server to a new url invalidates the login saved under the old one.
+`orca mcp list` and `orca mcp get` show each server's auth status
+(`oauth: logged in`, `oauth: not logged in`, `bearer: $VAR`, `static header`,
+or `-` for a stdio server) without ever printing the token itself.
+
+`login` and `logout` only change configuration or the credential store; they
+never touch a session that is already running. A running TUI session picks
+up the change by reconnecting the server from the `/mcp` panel.
 
 ## Images from tools
 

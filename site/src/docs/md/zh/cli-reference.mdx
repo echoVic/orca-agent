@@ -29,7 +29,7 @@ orca [OPTIONS] COMMAND
 | `orca exec` | 非交互执行任务，输出文本或 JSONL 事件。 |
 | `orca workflow` | 执行和检查本地持久化工作流。 |
 | `orca trust` | 查看或更新目录信任。 |
-| `orca mcp` | 在用户配置中添加、列出、查看或删除 MCP 服务器。 |
+| `orca mcp` | 在用户配置中添加、列出、查看、删除、登录或登出 MCP 服务器。 |
 
 根选项包括 `--resume [SESSION_ID]`、`--fork ID`、`--continue`、
 `--model MODEL`、`--mode MODE`、`--api-key KEY`、`--base-url URL`
@@ -131,18 +131,22 @@ orca mcp add NAME [OPTIONS] (--url URL | -- COMMAND [ARGS]...)
 orca mcp list [--json]
 orca mcp get NAME [--json]
 orca mcp remove NAME
+orca mcp login NAME
+orca mcp logout NAME
 ```
 
-`orca mcp` 只写用户拥有的 `$ORCA_HOME/config.toml`，绝不改动项目的
-`.orca/config.toml`。改动在下一次会话启动时生效——不会影响已经在运行的会话。
-`orca mcp login` 和 `orca mcp logout` 尚未提供。
+`orca mcp` 只写用户拥有的 `$ORCA_HOME/config.toml`（`login`、`logout` 还会写旁边的
+凭据存储），绝不改动项目的 `.orca/config.toml`。改动在下一次会话启动时生效——不会
+影响已经在运行的会话。
 
 | 子命令 | 用途 |
 | --- | --- |
 | `orca mcp add` | 添加一个 stdio 或远程（HTTP/SSE）MCP 服务器。 |
 | `orca mcp list` | 列出已配置的服务器，每行一个；加 `--json` 输出 JSON。 |
 | `orca mcp get` | 查看某个服务器的配置。 |
-| `orca mcp remove` | 从用户配置中删除一个服务器。 |
+| `orca mcp remove` | 从用户配置中删除一个服务器，并删除它保存的登录（如果有）。 |
+| `orca mcp login` | 用 OAuth 登录一个远程服务器。 |
+| `orca mcp logout` | 删除一个远程服务器保存的登录。 |
 
 `add` 要么带一个 stdio 命令，要么带 `--url`，二者恰好给一个：
 
@@ -158,7 +162,14 @@ orca mcp remove NAME
 | `-- COMMAND [ARGS]...` | stdio 服务器命令及其参数。 |
 
 `list` 和 `get` 绝不输出凭据的值：`env` 和 `headers` 只显示已配置的键名，
-不显示对应的值。
+不显示对应的值；认证状态列（或 `get` 里的 `auth:` 一行）只显示状态词
+（`oauth: logged in`、`oauth: not logged in`、`bearer: $VAR`、`static header`，
+stdio 服务器则是 `-`），绝不显示 token。
+
+`login` 会在浏览器里打开服务器的授权页面，并把地址打印出来以防没有自动打开；
+对 stdio 服务器，或配置了静态 `Authorization` 请求头、`bearer_token_env_var` 的
+服务器，它会拒绝执行，因为这些服务器不使用 OAuth。`logout` 删除保存的登录；
+服务器没有保存登录时会报错。
 
 示例：
 
@@ -168,6 +179,8 @@ orca mcp add search --url https://mcp.example.test/mcp --bearer-token-env-var SE
 orca mcp list --json
 orca mcp get docs
 orca mcp remove docs
+orca mcp login docs
+orca mcp logout docs
 ```
 
 ## 配置和环境变量

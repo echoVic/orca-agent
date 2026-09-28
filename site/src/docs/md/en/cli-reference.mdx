@@ -30,7 +30,7 @@ positional text. The visible root commands are:
 | `orca exec` | Run a non-interactive task and emit text or JSONL events. |
 | `orca workflow` | Run and inspect persisted local workflows. |
 | `orca trust` | Show or update folder trust. |
-| `orca mcp` | Add, list, show, or remove MCP servers in the user config. |
+| `orca mcp` | Add, list, show, remove, log in to, or log out of MCP servers in the user config. |
 
 Root options are `--resume [SESSION_ID]`, `--fork <ID>`, `--continue`,
 `--model <MODEL>`, `--mode <MODE>`, `--api-key <KEY>`, `--base-url <URL>`, and
@@ -136,19 +136,23 @@ orca mcp add NAME [OPTIONS] (--url URL | -- COMMAND [ARGS]...)
 orca mcp list [--json]
 orca mcp get NAME [--json]
 orca mcp remove NAME
+orca mcp login NAME
+orca mcp logout NAME
 ```
 
-`orca mcp` only writes the user-owned `$ORCA_HOME/config.toml`; a project's
+`orca mcp` only writes the user-owned `$ORCA_HOME/config.toml` (and, for
+`login`/`logout`, the credential store next to it); a project's
 `.orca/config.toml` is never touched. A change takes effect the next time a
 session starts — it does not affect a session that is already running.
-`orca mcp login` and `orca mcp logout` are not available yet.
 
 | Subcommand | Purpose |
 | --- | --- |
 | `orca mcp add` | Add a stdio or remote (HTTP/SSE) MCP server. |
 | `orca mcp list` | List configured servers, one per line, or as JSON with `--json`. |
 | `orca mcp get` | Show one server's configuration. |
-| `orca mcp remove` | Remove a server from the user configuration. |
+| `orca mcp remove` | Remove a server from the user configuration, and delete its saved login if it has one. |
+| `orca mcp login` | Log in to a remote server with OAuth. |
+| `orca mcp logout` | Delete a remote server's saved login. |
 
 `add` takes either a trailing stdio command or `--url`, never both:
 
@@ -164,7 +168,15 @@ session starts — it does not affect a session that is already running.
 | `-- COMMAND [ARGS]...` | Stdio server command and its arguments. |
 
 `list` and `get` never print credential values: `env` and `headers` show only
-the configured key names, never their values.
+the configured key names, never their values, and the auth column or `auth:`
+line reports only a status word (`oauth: logged in`, `oauth: not logged in`,
+`bearer: $VAR`, `static header`, or `-` for a stdio server), never a token.
+
+`login` opens the server's authorization page in your browser and prints the
+url in case it does not open; it refuses a stdio server or one with a
+configured `Authorization` header or `bearer_token_env_var`, since those do
+not use OAuth. `logout` deletes the saved login; it fails if the server has
+none.
 
 Examples:
 
@@ -174,6 +186,8 @@ orca mcp add search --url https://mcp.example.test/mcp --bearer-token-env-var SE
 orca mcp list --json
 orca mcp get docs
 orca mcp remove docs
+orca mcp login docs
+orca mcp logout docs
 ```
 
 ## Configuration and environment

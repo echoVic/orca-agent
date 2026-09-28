@@ -298,6 +298,10 @@ enum McpCommand {
     Get(McpGetArgs),
     /// Remove an MCP server from the user config.
     Remove(McpRemoveArgs),
+    /// Log in to a remote MCP server with OAuth.
+    Login(McpLoginArgs),
+    /// Log out of a remote MCP server, deleting its saved login.
+    Logout(McpLogoutArgs),
 }
 
 // `--header`, `--bearer-token-env-var`, `--client-id`, and `--callback-port`
@@ -375,6 +379,18 @@ struct McpRemoveArgs {
     name: String,
 }
 
+#[derive(Debug, Parser)]
+struct McpLoginArgs {
+    /// MCP server name.
+    name: String,
+}
+
+#[derive(Debug, Parser)]
+struct McpLogoutArgs {
+    /// MCP server name.
+    name: String,
+}
+
 impl McpArgs {
     fn into_request(self) -> orca_runtime::command::mcp::McpCommandRequest {
         use orca_runtime::command::mcp::McpCommandRequest;
@@ -387,6 +403,8 @@ impl McpArgs {
                 json: args.json,
             },
             McpCommand::Remove(args) => McpCommandRequest::Remove { name: args.name },
+            McpCommand::Login(args) => McpCommandRequest::Login { name: args.name },
+            McpCommand::Logout(args) => McpCommandRequest::Logout { name: args.name },
         }
     }
 }
@@ -1360,6 +1378,23 @@ mod tests {
         match remove {
             McpCommandRequest::Remove { name } => assert_eq!(name, "docs"),
             other => panic!("expected a remove request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_login_and_logout_parse_into_requests() {
+        use orca_runtime::command::mcp::McpCommandRequest;
+
+        let login = parse_mcp(&["login", "docs"]).into_request();
+        match login {
+            McpCommandRequest::Login { name } => assert_eq!(name, "docs"),
+            other => panic!("expected a login request, got {other:?}"),
+        }
+
+        let logout = parse_mcp(&["logout", "docs"]).into_request();
+        match logout {
+            McpCommandRequest::Logout { name } => assert_eq!(name, "docs"),
+            other => panic!("expected a logout request, got {other:?}"),
         }
     }
 

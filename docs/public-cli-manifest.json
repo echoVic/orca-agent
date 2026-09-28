@@ -55,7 +55,7 @@
     },
     "mcp": {
       "options": [],
-      "subcommands": ["add", "list", "get", "remove"]
+      "subcommands": ["add", "list", "get", "remove", "login", "logout"]
     },
     "daemon": {
       "options": ["--socket", "--cwd"],

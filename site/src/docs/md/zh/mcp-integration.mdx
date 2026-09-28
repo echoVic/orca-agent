@@ -1,8 +1,9 @@
 # MCP 集成
 
 用 `orca mcp add` 添加 MCP 服务器，用 `orca mcp list` 和 `orca mcp get` 查看，用
-`orca mcp remove` 删除。这些命令只写用户拥有的 Orca 配置，绝不改动项目的
-`.orca/config.toml`；改动在下一次会话启动时生效。完整的选项列表见
+`orca mcp remove` 删除，用 `orca mcp login`/`orca mcp logout` 登录或登出远程服务器的
+OAuth。这些命令只写用户拥有的 Orca 配置（`login`、`logout` 还会写旁边的凭据存储），
+绝不改动项目的 `.orca/config.toml`；改动在下一次会话启动时生效。完整的选项列表见
 [CLI 参考](cli-reference.md#orca-mcp)。
 
 设置 ORCA_HOME 时，用户配置位于 $ORCA_HOME/config.toml；否则位于 ~/.orca/config.toml。
@@ -44,6 +45,34 @@ network = false
 shell = false
 agent = false
 ~~~
+
+## 远程服务器与登录
+
+`--transport` 选择 `http`（streamable HTTP，默认）或 `sse`。`http` 使用当前的 MCP
+传输方式：每个请求都是 POST，`initialize` 协商出的会话 ID 和协议版本会随之后每个
+请求带上。`sse` 是旧版传输方式——先 GET 打开一个事件流，再把请求 POST 到它给出的
+地址。已有的 `sse` 服务器照常工作；极少数只支持旧版传输的服务器仍可以用
+`orca mcp add --transport sse` 添加。
+
+远程服务器的认证方式有三种：
+
+- **静态请求头**——`--header "Authorization: ..."`，随每个请求发送。
+- **`--bearer-token-env-var VAR`**——`orca` 在连接时从自己的环境变量里读取
+  `VAR`，把它当作 bearer token 发送。token 本身绝不会写进配置文件。
+- **OAuth**，给两者都没配置的服务器用。运行 `orca mcp login <name>` 在浏览器里
+  完成授权；授权地址也会打印出来，方便在没有浏览器的机器上手动打开。
+  `orca mcp logout <name>` 删除保存的登录。对 stdio 服务器，或者已经配置了
+  静态请求头、`--bearer-token-env-var` 的服务器，`login` 会拒绝执行，因为它们都
+  不使用 OAuth。
+
+OAuth token 保存在 `$ORCA_HOME/mcp-credentials.json`，与 `config.toml` 同目录，
+只有其所有者可读，按服务器名和地址保存——把服务器迁移到新地址会让旧地址下保存的
+登录失效。`orca mcp list` 和 `orca mcp get` 会显示每个服务器的认证状态
+（`oauth: logged in`、`oauth: not logged in`、`bearer: $VAR`、`static header`，
+stdio 服务器则是 `-`），但绝不显示 token 本身。
+
+`login` 和 `logout` 只改动配置或凭据存储，不会影响已经在运行的会话。已经打开的
+TUI 会话可以在 `/mcp` 面板里重新连接该服务器，从而应用这次改动。
 
 ## 工具返回的图片
 

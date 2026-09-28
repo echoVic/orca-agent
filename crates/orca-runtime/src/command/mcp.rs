@@ -1,21 +1,24 @@
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
+use orca_mcp::oauth::OpenBrowser;
 
-/// A request to add, list, show, or remove an MCP server in the user config.
-/// `Login` and `Logout` are added in task 8.
+/// A request to add, list, show, remove, log in to, or log out of an MCP
+/// server in the user config.
 #[derive(Clone, Debug)]
 pub enum McpCommandRequest {
     Add(McpAddRequest),
     List { json: bool },
     Get { name: String, json: bool },
     Remove { name: String },
+    Login { name: String },
+    Logout { name: String },
 }
 
 /// Raw, unvalidated fields for `orca mcp add`. String and list fields carry
-/// CLI input verbatim; `run`/`run_in` validate and parse them.
+/// CLI input verbatim; `run`/`run_in_with_browser` validate and parse them.
 #[derive(Clone, Debug, Default)]
 pub struct McpAddRequest {
     pub name: String,
@@ -31,32 +34,89 @@ pub struct McpAddRequest {
 
 /// Run an `orca mcp` request against the resolved Orca configuration
 /// directory, reading and writing real process stdio.
+///
+/// For `Login`, the browser opener prints the two lines the brief specifies
+/// before opening the url: `orca_mcp::oauth::login` silently ignores an
+/// opener error and keeps waiting for the callback, so the CLI itself is the
+/// only place that ever prints the authorization url for the user to open by
+/// hand. The closure prints straight to the process's own stdout rather than
+/// through the `stdout` writer threaded through [`run_in_with_browser`]:
+/// `OpenBrowser` is `Send` with no borrowed lifetime, so it cannot capture a
+/// lock scoped to this function.
 pub fn run(request: McpCommandRequest) -> i32 {
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
-    match orca_core::config::file::config_dir() {
-        Some(config_dir) => run_in(&config_dir, request, &mut stdout, &mut stderr),
-        None => fail(
+    let Some(config_dir) = orca_core::config::file::config_dir() else {
+        return fail(
             &mut stderr,
             "could not resolve the Orca configuration directory",
-        ),
-    }
+        );
+    };
+    let credentials_path =
+        config_dir.join(orca_core::config::mcp_credentials::MCP_CREDENTIALS_FILE);
+    let open_browser = login_browser_opener(&request);
+    run_in_with_browser(
+        &config_dir,
+        &credentials_path,
+        request,
+        &mut stdout,
+        &mut stderr,
+        open_browser,
+    )
 }
 
-/// Run an `orca mcp` request against `config_dir`, writing to the given
-/// streams. Exposed separately from [`run`] so tests can point it at a
-/// temporary directory and capture output.
-pub fn run_in(
+/// The browser opener [`run`] passes to [`run_in_with_browser`]: for a
+/// `Login` request it prints the brief's two lines before handing `url` to
+/// `orca_platform::process::open_url`. Every other request never calls
+/// `login`, so `open_browser` is never invoked for them and its body does
+/// not matter.
+fn login_browser_opener(request: &McpCommandRequest) -> OpenBrowser {
+    let name = match request {
+        McpCommandRequest::Login { name } => name.clone(),
+        _ => String::new(),
+    };
+    Box::new(move |url: &str| {
+        println!("Opening your browser to log in to MCP server {name}.");
+        println!("If it does not open, visit: {url}");
+        orca_platform::process::open_url(url)
+    })
+}
+
+/// Run an `orca mcp` request against `config_dir` and `credentials_path`,
+/// writing to the given streams and, for `Login`, opening the authorization
+/// url with `open_browser`. Exposed separately from [`run`] so tests can
+/// point it at a temporary directory, capture output, and drive the browser
+/// step with a fixture instead of a real browser.
+pub fn run_in_with_browser(
     config_dir: &Path,
+    credentials_path: &Path,
     request: McpCommandRequest,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
+    open_browser: OpenBrowser,
 ) -> i32 {
     match request {
         McpCommandRequest::Add(request) => add(config_dir, request, stdout, stderr),
-        McpCommandRequest::List { json } => list(config_dir, json, stdout, stderr),
-        McpCommandRequest::Get { name, json } => get(config_dir, &name, json, stdout, stderr),
-        McpCommandRequest::Remove { name } => remove(config_dir, &name, stdout, stderr),
+        McpCommandRequest::List { json } => {
+            list(config_dir, credentials_path, json, stdout, stderr)
+        }
+        McpCommandRequest::Get { name, json } => {
+            get(config_dir, credentials_path, &name, json, stdout, stderr)
+        }
+        McpCommandRequest::Remove { name } => {
+            remove(config_dir, credentials_path, &name, stdout, stderr)
+        }
+        McpCommandRequest::Login { name } => login(
+            config_dir,
+            credentials_path,
+            &name,
+            stdout,
+            stderr,
+            open_browser,
+        ),
+        McpCommandRequest::Logout { name } => {
+            logout(config_dir, credentials_path, &name, stdout, stderr)
+        }
     }
 }
 
@@ -79,13 +139,25 @@ fn add(
     }
 }
 
-fn list(config_dir: &Path, json: bool, stdout: &mut impl Write, stderr: &mut impl Write) -> i32 {
+fn list(
+    config_dir: &Path,
+    credentials_path: &Path,
+    json: bool,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
     let (path, servers) = match orca_core::config::user_edit::list_user_mcp_servers_in(config_dir) {
         Ok(result) => result,
         Err(error) => return fail(stderr, &error.to_string()),
     };
     if json {
-        let entries: Vec<McpServerJson> = servers.iter().map(to_json).collect();
+        let mut entries = Vec::with_capacity(servers.len());
+        for server in &servers {
+            match to_json(server, credentials_path) {
+                Ok(entry) => entries.push(entry),
+                Err(error) => return fail(stderr, &error.to_string()),
+            }
+        }
         return write_json(stdout, stderr, &entries);
     }
     if servers.is_empty() {
@@ -97,10 +169,14 @@ fn list(config_dir: &Path, json: bool, stdout: &mut impl Write, stderr: &mut imp
     for server in &servers {
         let target = server_target(server);
         let transport = transport_str(&server.transport);
+        let auth = match auth_status(server, credentials_path) {
+            Ok(auth) => auth,
+            Err(error) => return fail(stderr, &error.to_string()),
+        };
         let line = if server.disabled {
-            format!("{}\t{transport}\t{target}\tdisabled", server.name)
+            format!("{}\t{transport}\t{target}\tdisabled\t{auth}", server.name)
         } else {
-            format!("{}\t{transport}\t{target}", server.name)
+            format!("{}\t{transport}\t{target}\t{auth}", server.name)
         };
         if writeln!(stdout, "{line}").is_err() {
             return 1;
@@ -111,35 +187,167 @@ fn list(config_dir: &Path, json: bool, stdout: &mut impl Write, stderr: &mut imp
 
 fn get(
     config_dir: &Path,
+    credentials_path: &Path,
     name: &str,
     json: bool,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
-    let (path, servers) = match orca_core::config::user_edit::list_user_mcp_servers_in(config_dir) {
-        Ok(result) => result,
-        Err(error) => return fail(stderr, &error.to_string()),
-    };
-    let Some(server) = servers.into_iter().find(|server| server.name == name) else {
-        return fail(
-            stderr,
-            &format!("no MCP server named '{name}' in {}", path.display()),
-        );
+    let server = match find_configured_server(config_dir, name) {
+        Ok(server) => server,
+        Err(message) => return fail(stderr, &message),
     };
     if json {
-        return write_json(stdout, stderr, &to_json(&server));
+        return match to_json(&server, credentials_path) {
+            Ok(entry) => write_json(stdout, stderr, &entry),
+            Err(error) => fail(stderr, &error.to_string()),
+        };
     }
-    print_server_text(stdout, &server)
+    let auth = match auth_status(&server, credentials_path) {
+        Ok(auth) => auth,
+        Err(error) => return fail(stderr, &error.to_string()),
+    };
+    print_server_text(stdout, &server, &auth)
 }
 
-fn remove(config_dir: &Path, name: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> i32 {
-    match orca_core::config::user_edit::remove_user_mcp_server_in(config_dir, name) {
-        Ok(path) => success(
+fn remove(
+    config_dir: &Path,
+    credentials_path: &Path,
+    name: &str,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    let path = match orca_core::config::user_edit::remove_user_mcp_server_in(config_dir, name) {
+        Ok(path) => path,
+        Err(error) => return fail(stderr, &error.to_string()),
+    };
+    // The config entry is already gone at this point: a failure below is
+    // reported, but it cannot be undone by leaving the config unchanged.
+    match orca_core::config::mcp_credentials::delete_mcp_credential(credentials_path, name) {
+        Ok(_) => success(
             stdout,
             format_args!("removed MCP server {name} from {}", path.display()),
         ),
+        Err(error) => fail(
+            stderr,
+            &format!(
+                "removed MCP server '{name}' from {}, but failed to delete its saved login: {error}",
+                path.display()
+            ),
+        ),
+    }
+}
+
+fn login(
+    config_dir: &Path,
+    credentials_path: &Path,
+    name: &str,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    open_browser: OpenBrowser,
+) -> i32 {
+    let server = match find_configured_server(config_dir, name) {
+        Ok(server) => server,
+        Err(message) => return fail(stderr, &message),
+    };
+    if !matches!(classify_auth(&server), AuthKind::OAuth) {
+        return fail(
+            stderr,
+            &format!("MCP server '{name}' does not use OAuth login"),
+        );
+    }
+    let options =
+        orca_mcp::oauth::McpLoginOptions::new(credentials_path.to_path_buf(), open_browser);
+    match orca_mcp::oauth::login(&server, options) {
+        Ok(()) => success(stdout, format_args!("logged in to MCP server {name}")),
+        Err(error) => fail(stderr, &error),
+    }
+}
+
+fn logout(
+    config_dir: &Path,
+    credentials_path: &Path,
+    name: &str,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if let Err(message) = find_configured_server(config_dir, name) {
+        return fail(stderr, &message);
+    }
+    match orca_core::config::mcp_credentials::delete_mcp_credential(credentials_path, name) {
+        Ok(true) => success(stdout, format_args!("logged out of MCP server {name}")),
+        Ok(false) => fail(stderr, &format!("MCP server '{name}' is not logged in")),
         Err(error) => fail(stderr, &error.to_string()),
     }
+}
+
+/// The configured server named `name`, or the "no MCP server named" error
+/// that `get`, `remove`, `login`, and `logout` all report the same way for
+/// one that does not exist.
+fn find_configured_server(config_dir: &Path, name: &str) -> Result<McpServerConfig, String> {
+    let (path, servers) = orca_core::config::user_edit::list_user_mcp_servers_in(config_dir)
+        .map_err(|error| error.to_string())?;
+    servers
+        .into_iter()
+        .find(|server| server.name == name)
+        .ok_or_else(|| format!("no MCP server named '{name}' in {}", path.display()))
+}
+
+/// How a server authenticates, decided from its configuration alone, in the
+/// order the brief specifies.
+enum AuthKind {
+    /// A stdio server: nothing is sent over a network to authenticate.
+    Stdio,
+    /// A configured `Authorization` header, matched case-insensitively.
+    StaticHeader,
+    /// `bearer_token_env_var`, carrying the environment variable's name.
+    BearerEnvVar(String),
+    /// Neither of the above, so OAuth is this server's only option.
+    OAuth,
+}
+
+fn classify_auth(server: &McpServerConfig) -> AuthKind {
+    if server.transport == McpTransportKind::Stdio {
+        AuthKind::Stdio
+    } else if has_authorization_header(server) {
+        AuthKind::StaticHeader
+    } else if let Some(variable) = &server.bearer_token_env_var {
+        AuthKind::BearerEnvVar(variable.clone())
+    } else {
+        AuthKind::OAuth
+    }
+}
+
+fn has_authorization_header(server: &McpServerConfig) -> bool {
+    server
+        .headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("authorization"))
+}
+
+/// The auth status shown in `list`'s trailing column, `get`'s `auth:` line,
+/// and the `--json` `auth` field. Computed from configuration and the
+/// credentials file alone — this never connects to the server.
+fn auth_status(server: &McpServerConfig, credentials_path: &Path) -> io::Result<String> {
+    Ok(match classify_auth(server) {
+        AuthKind::Stdio => "-".to_string(),
+        AuthKind::StaticHeader => "static header".to_string(),
+        AuthKind::BearerEnvVar(variable) => format!("bearer: ${variable}"),
+        AuthKind::OAuth => {
+            let url = server.url.as_deref().unwrap_or_default();
+            let logged_in = orca_core::config::mcp_credentials::load_mcp_credential(
+                credentials_path,
+                &server.name,
+                url,
+            )?
+            .is_some();
+            if logged_in {
+                "oauth: logged in".to_string()
+            } else {
+                "oauth: not logged in".to_string()
+            }
+        }
+    })
 }
 
 /// Validate and translate raw `orca mcp add` input into a server
@@ -270,7 +478,7 @@ fn server_target(server: &McpServerConfig) -> String {
     }
 }
 
-fn print_server_text(stdout: &mut impl Write, server: &McpServerConfig) -> i32 {
+fn print_server_text(stdout: &mut impl Write, server: &McpServerConfig, auth: &str) -> i32 {
     let lines = [
         format!("name: {}", server.name),
         format!("transport: {}", transport_str(&server.transport)),
@@ -305,6 +513,7 @@ fn print_server_text(stdout: &mut impl Write, server: &McpServerConfig) -> i32 {
             list_or_dash(server.disabled_tools.as_deref())
         ),
         format!("disabled: {}", server.disabled),
+        format!("auth: {auth}"),
     ];
     for line in lines {
         if writeln!(stdout, "{line}").is_err() {
@@ -358,7 +567,8 @@ fn non_empty(values: Vec<String>) -> Option<Vec<String>> {
 }
 
 /// The `--json` shape for one server: field names are snake_case, and every
-/// value that would be redacted or "-" in text mode is `null`.
+/// value that would be redacted or "-" in text mode is `null`. `auth` is
+/// never redacted — it is a status word, never a secret.
 #[derive(serde::Serialize)]
 struct McpServerJson {
     name: String,
@@ -376,10 +586,11 @@ struct McpServerJson {
     enabled_tools: Option<Vec<String>>,
     disabled_tools: Option<Vec<String>>,
     disabled: bool,
+    auth: String,
 }
 
-fn to_json(server: &McpServerConfig) -> McpServerJson {
-    McpServerJson {
+fn to_json(server: &McpServerConfig, credentials_path: &Path) -> io::Result<McpServerJson> {
+    Ok(McpServerJson {
         name: server.name.clone(),
         transport: transport_str(&server.transport),
         command: server.command.clone(),
@@ -395,7 +606,8 @@ fn to_json(server: &McpServerConfig) -> McpServerJson {
         enabled_tools: server.enabled_tools.clone(),
         disabled_tools: server.disabled_tools.clone(),
         disabled: server.disabled,
-    }
+        auth: auth_status(server, credentials_path)?,
+    })
 }
 
 fn write_json(
@@ -436,20 +648,44 @@ mod tests {
     use std::path::Path;
 
     use orca_core::config::file::FileConfig;
+    use orca_core::config::mcp_credentials::{
+        McpCredential, load_mcp_credential, save_mcp_credential,
+    };
     use orca_core::mcp_types::McpTransportKind;
+    use orca_mcp::oauth::test_server::{OAuthTestBehavior, OAuthTestServer, test_browser};
     use tempfile::tempdir;
 
     use super::*;
 
     fn run(dir: &Path, request: McpCommandRequest) -> (i32, String, String) {
+        run_with_browser(dir, request, Box::new(|_: &str| Ok(())))
+    }
+
+    fn run_with_browser(
+        dir: &Path,
+        request: McpCommandRequest,
+        open_browser: OpenBrowser,
+    ) -> (i32, String, String) {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let code = run_in(dir, request, &mut stdout, &mut stderr);
+        let code = run_in_with_browser(
+            dir,
+            &credentials_path(dir),
+            request,
+            &mut stdout,
+            &mut stderr,
+            open_browser,
+        );
         (
             code,
             String::from_utf8(stdout).expect("stdout is UTF-8"),
             String::from_utf8(stderr).expect("stderr is UTF-8"),
         )
+    }
+
+    /// Where a test's credentials live, alongside its temporary config.toml.
+    fn credentials_path(dir: &Path) -> std::path::PathBuf {
+        dir.join("mcp-credentials.json")
     }
 
     fn add_request(name: &str, command: &[&str]) -> McpCommandRequest {
@@ -467,6 +703,15 @@ mod tests {
     fn read_config(dir: &Path) -> FileConfig {
         let content = fs::read_to_string(config_path(dir)).expect("config file exists");
         toml::from_str(&content).expect("config parses")
+    }
+
+    /// Adds `server` straight to the config file under `dir`, bypassing the
+    /// CLI's own `add` translation layer — used by tests that need a server
+    /// shaped a particular way (e.g. from an OAuth test fixture) rather than
+    /// one `orca mcp add`'s raw string options can build.
+    fn seed_server(dir: &Path, server: &McpServerConfig) {
+        orca_core::config::user_edit::add_user_mcp_server_in(dir, server)
+            .unwrap_or_else(|error| panic!("seed {}: {error}", server.name));
     }
 
     #[test]
@@ -632,7 +877,13 @@ mod tests {
         assert!(
             stdout
                 .lines()
-                .any(|line| line == "docs\tstdio\tnpx -y docs-mcp"),
+                .any(|line| line == "docs\tstdio\tnpx -y docs-mcp\t-"),
+            "{stdout}"
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == "remote\thttp\thttps://example.com/mcp\tstatic header"),
             "{stdout}"
         );
         assert!(!stdout.contains("secret"), "{stdout}");
@@ -655,6 +906,7 @@ mod tests {
             stdout.lines().any(|line| line == "env: API_KEY"),
             "{stdout}"
         );
+        assert!(stdout.lines().any(|line| line == "auth: -"), "{stdout}");
         assert!(!stdout.contains("secret"), "{stdout}");
 
         let (code, stdout, _stderr) = run(
@@ -665,6 +917,7 @@ mod tests {
             },
         );
         assert_eq!(code, 0);
+        assert!(stdout.contains("\"auth\": \"-\""), "{stdout}");
         assert!(!stdout.contains("secret"), "{stdout}");
 
         let (code, stdout, _stderr) = run(
@@ -677,6 +930,10 @@ mod tests {
         assert_eq!(code, 0);
         assert!(
             stdout.lines().any(|line| line == "headers: Authorization"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.lines().any(|line| line == "auth: static header"),
             "{stdout}"
         );
         assert!(!stdout.contains("Bearer t"), "{stdout}");
@@ -879,6 +1136,441 @@ mod tests {
         assert_eq!(
             stdout.trim_end(),
             format!("no MCP servers configured in {path}")
+        );
+    }
+
+    #[test]
+    fn login_stores_a_credential_and_logout_removes_it() {
+        let temp = tempdir().unwrap();
+        let server = OAuthTestServer::start(OAuthTestBehavior::default());
+        seed_server(temp.path(), &server.config("docs"));
+
+        let (browser, _page) = test_browser();
+        let (code, stdout, stderr) = run_with_browser(
+            temp.path(),
+            McpCommandRequest::Login {
+                name: "docs".to_string(),
+            },
+            browser,
+        );
+        assert_eq!(code, 0, "stderr: {stderr}");
+        assert_eq!(stdout.trim_end(), "logged in to MCP server docs");
+
+        let credential =
+            load_mcp_credential(&credentials_path(temp.path()), "docs", &server.mcp_url())
+                .expect("read the credentials")
+                .expect("a stored login");
+        assert_eq!(credential.access_token, "at-1");
+
+        let (code, stdout, stderr) = run(
+            temp.path(),
+            McpCommandRequest::Logout {
+                name: "docs".to_string(),
+            },
+        );
+        assert_eq!(code, 0, "stderr: {stderr}");
+        assert_eq!(stdout.trim_end(), "logged out of MCP server docs");
+        assert!(
+            load_mcp_credential(&credentials_path(temp.path()), "docs", &server.mcp_url())
+                .expect("read the credentials")
+                .is_none(),
+            "logout must delete the stored credential"
+        );
+
+        // Logging out again, with no token left to remove, is its own error.
+        let (code, _stdout, stderr) = run(
+            temp.path(),
+            McpCommandRequest::Logout {
+                name: "docs".to_string(),
+            },
+        );
+        assert_eq!(code, 1);
+        assert_eq!(
+            stderr.trim_end(),
+            "orca: MCP server 'docs' is not logged in"
+        );
+    }
+
+    #[test]
+    fn login_refuses_servers_without_oauth() {
+        let temp = tempdir().unwrap();
+        let cases = [
+            McpServerConfig {
+                name: "stdio".to_string(),
+                transport: McpTransportKind::Stdio,
+                command: Some("true".to_string()),
+                ..McpServerConfig::default()
+            },
+            McpServerConfig {
+                name: "static-header".to_string(),
+                transport: McpTransportKind::Http,
+                url: Some("https://headered.example/mcp".to_string()),
+                headers: HashMap::from([("Authorization".to_string(), "Bearer t".to_string())]),
+                ..McpServerConfig::default()
+            },
+            McpServerConfig {
+                name: "lower-case-header".to_string(),
+                transport: McpTransportKind::Http,
+                url: Some("https://headered.example/mcp".to_string()),
+                headers: HashMap::from([("authorization".to_string(), "Bearer t".to_string())]),
+                ..McpServerConfig::default()
+            },
+            McpServerConfig {
+                name: "bearer-var".to_string(),
+                transport: McpTransportKind::Http,
+                url: Some("https://beared.example/mcp".to_string()),
+                bearer_token_env_var: Some("TOK".to_string()),
+                ..McpServerConfig::default()
+            },
+        ];
+        for server in &cases {
+            seed_server(temp.path(), server);
+        }
+
+        for server in &cases {
+            let (code, _stdout, stderr) = run(
+                temp.path(),
+                McpCommandRequest::Login {
+                    name: server.name.clone(),
+                },
+            );
+            assert_eq!(code, 1, "{}", server.name);
+            assert_eq!(
+                stderr.trim_end(),
+                format!(
+                    "orca: MCP server '{}' does not use OAuth login",
+                    server.name
+                ),
+                "{}",
+                server.name
+            );
+        }
+    }
+
+    #[test]
+    fn login_and_logout_of_an_unconfigured_server_match_remove() {
+        let temp = tempdir().unwrap();
+        let path = config_path(temp.path()).display().to_string();
+
+        let (code, _stdout, stderr) = run(
+            temp.path(),
+            McpCommandRequest::Login {
+                name: "ghost".to_string(),
+            },
+        );
+        assert_eq!(code, 1);
+        assert_eq!(
+            stderr.trim_end(),
+            format!("orca: no MCP server named 'ghost' in {path}")
+        );
+
+        let (code, _stdout, stderr) = run(
+            temp.path(),
+            McpCommandRequest::Logout {
+                name: "ghost".to_string(),
+            },
+        );
+        assert_eq!(code, 1);
+        assert_eq!(
+            stderr.trim_end(),
+            format!("orca: no MCP server named 'ghost' in {path}")
+        );
+    }
+
+    fn credential(server_url: &str) -> McpCredential {
+        McpCredential {
+            server_url: server_url.to_string(),
+            access_token: "super-secret-access-token".to_string(),
+            refresh_token: Some("super-secret-refresh-token".to_string()),
+            expires_at: None,
+            token_endpoint: "https://auth.example/token".to_string(),
+            client_id: "client-1".to_string(),
+            resource: server_url.to_string(),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn status_output_never_contains_tokens() {
+        let temp = tempdir().unwrap();
+        let header_secret = "header-bearer-secret";
+
+        seed_server(
+            temp.path(),
+            &McpServerConfig {
+                name: "stdio".to_string(),
+                transport: McpTransportKind::Stdio,
+                command: Some("true".to_string()),
+                ..McpServerConfig::default()
+            },
+        );
+        seed_server(
+            temp.path(),
+            &McpServerConfig {
+                name: "static-header".to_string(),
+                transport: McpTransportKind::Http,
+                url: Some("https://headered.example/mcp".to_string()),
+                headers: HashMap::from([(
+                    "authorization".to_string(),
+                    format!("Bearer {header_secret}"),
+                )]),
+                ..McpServerConfig::default()
+            },
+        );
+        seed_server(
+            temp.path(),
+            &McpServerConfig {
+                name: "bearer-var".to_string(),
+                transport: McpTransportKind::Http,
+                url: Some("https://beared.example/mcp".to_string()),
+                bearer_token_env_var: Some("BEARED_TOKEN".to_string()),
+                ..McpServerConfig::default()
+            },
+        );
+        seed_server(
+            temp.path(),
+            &McpServerConfig {
+                name: "docs".to_string(),
+                transport: McpTransportKind::Http,
+                url: Some("https://mcp.example.test/mcp".to_string()),
+                ..McpServerConfig::default()
+            },
+        );
+        let docs_credential = credential("https://mcp.example.test/mcp");
+        save_mcp_credential(&credentials_path(temp.path()), "docs", &docs_credential)
+            .expect("seed a credential");
+
+        let (list_code, list_text, list_stderr) =
+            run(temp.path(), McpCommandRequest::List { json: false });
+        let (list_json_code, list_json, list_json_stderr) =
+            run(temp.path(), McpCommandRequest::List { json: true });
+        let (docs_code, docs_text, docs_stderr) = run(
+            temp.path(),
+            McpCommandRequest::Get {
+                name: "docs".to_string(),
+                json: false,
+            },
+        );
+        let (docs_json_code, docs_json, docs_json_stderr) = run(
+            temp.path(),
+            McpCommandRequest::Get {
+                name: "docs".to_string(),
+                json: true,
+            },
+        );
+        let (headered_code, headered_text, headered_stderr) = run(
+            temp.path(),
+            McpCommandRequest::Get {
+                name: "static-header".to_string(),
+                json: false,
+            },
+        );
+
+        for (code, stderr) in [
+            (list_code, &list_stderr),
+            (list_json_code, &list_json_stderr),
+            (docs_code, &docs_stderr),
+            (docs_json_code, &docs_json_stderr),
+            (headered_code, &headered_stderr),
+        ] {
+            assert_eq!(code, 0, "stderr: {stderr}");
+        }
+        for text in [
+            &list_text,
+            &list_json,
+            &docs_text,
+            &docs_json,
+            &headered_text,
+        ] {
+            assert!(!text.contains(&docs_credential.access_token), "{text}");
+            assert!(
+                !text.contains(docs_credential.refresh_token.as_deref().unwrap()),
+                "{text}"
+            );
+            assert!(!text.contains(header_secret), "{text}");
+        }
+
+        assert!(
+            list_text
+                .lines()
+                .any(|line| line == "stdio\tstdio\ttrue\t-"),
+            "{list_text}"
+        );
+        assert!(
+            list_text
+                .lines()
+                .any(|line| line
+                    == "static-header\thttp\thttps://headered.example/mcp\tstatic header"),
+            "{list_text}"
+        );
+        assert!(
+            list_text.lines().any(|line| line
+                == "bearer-var\thttp\thttps://beared.example/mcp\tbearer: $BEARED_TOKEN"),
+            "{list_text}"
+        );
+        assert!(
+            list_text
+                .lines()
+                .any(|line| line == "docs\thttp\thttps://mcp.example.test/mcp\toauth: logged in"),
+            "{list_text}"
+        );
+
+        assert!(
+            list_json.contains("\"auth\": \"oauth: logged in\""),
+            "{list_json}"
+        );
+        assert!(
+            list_json.contains("\"auth\": \"static header\""),
+            "{list_json}"
+        );
+        assert!(
+            list_json.contains("\"auth\": \"bearer: $BEARED_TOKEN\""),
+            "{list_json}"
+        );
+        assert!(list_json.contains("\"auth\": \"-\""), "{list_json}");
+
+        assert!(
+            docs_text
+                .lines()
+                .any(|line| line == "auth: oauth: logged in"),
+            "{docs_text}"
+        );
+        assert!(
+            docs_json.contains("\"auth\": \"oauth: logged in\""),
+            "{docs_json}"
+        );
+        assert!(
+            headered_text
+                .lines()
+                .any(|line| line == "auth: static header"),
+            "{headered_text}"
+        );
+        assert!(
+            headered_text
+                .lines()
+                .any(|line| line == "headers: authorization"),
+            "{headered_text}"
+        );
+
+        // A server that has never logged in shows the other oauth status.
+        seed_server(
+            temp.path(),
+            &McpServerConfig {
+                name: "never-logged-in".to_string(),
+                transport: McpTransportKind::Http,
+                url: Some("https://never.example/mcp".to_string()),
+                ..McpServerConfig::default()
+            },
+        );
+        let (code, stdout, stderr) = run(
+            temp.path(),
+            McpCommandRequest::Get {
+                name: "never-logged-in".to_string(),
+                json: false,
+            },
+        );
+        assert_eq!(code, 0, "stderr: {stderr}");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == "auth: oauth: not logged in"),
+            "{stdout}"
+        );
+    }
+
+    #[test]
+    fn remove_also_deletes_the_saved_token() {
+        let temp = tempdir().unwrap();
+        seed_server(
+            temp.path(),
+            &McpServerConfig {
+                name: "docs".to_string(),
+                transport: McpTransportKind::Http,
+                url: Some("https://mcp.example.test/mcp".to_string()),
+                ..McpServerConfig::default()
+            },
+        );
+        save_mcp_credential(
+            &credentials_path(temp.path()),
+            "docs",
+            &credential("https://mcp.example.test/mcp"),
+        )
+        .expect("seed a credential");
+
+        let (code, stdout, stderr) = run(
+            temp.path(),
+            McpCommandRequest::Remove {
+                name: "docs".to_string(),
+            },
+        );
+        assert_eq!(code, 0, "stderr: {stderr}");
+        let path = config_path(temp.path()).display().to_string();
+        assert_eq!(
+            stdout.trim_end(),
+            format!("removed MCP server docs from {path}")
+        );
+        assert!(
+            load_mcp_credential(
+                &credentials_path(temp.path()),
+                "docs",
+                "https://mcp.example.test/mcp"
+            )
+            .expect("read the credentials")
+            .is_none(),
+            "remove must delete the saved token too"
+        );
+
+        // Removing a server with no saved token at all is not an error.
+        seed_server(
+            temp.path(),
+            &McpServerConfig {
+                name: "search".to_string(),
+                command: Some("true".to_string()),
+                ..McpServerConfig::default()
+            },
+        );
+        let (code, _stdout, stderr) = run(
+            temp.path(),
+            McpCommandRequest::Remove {
+                name: "search".to_string(),
+            },
+        );
+        assert_eq!(code, 0, "stderr: {stderr}");
+    }
+
+    #[test]
+    fn remove_reports_a_token_deletion_error_after_the_config_change() {
+        let temp = tempdir().unwrap();
+        seed_server(
+            temp.path(),
+            &McpServerConfig {
+                name: "docs".to_string(),
+                command: Some("true".to_string()),
+                ..McpServerConfig::default()
+            },
+        );
+        // A credentials file that cannot be parsed makes deletion fail, but
+        // `remove` must already have removed the config entry by the time it
+        // tries.
+        fs::write(credentials_path(temp.path()), "not json").unwrap();
+
+        let (code, _stdout, stderr) = run(
+            temp.path(),
+            McpCommandRequest::Remove {
+                name: "docs".to_string(),
+            },
+        );
+        assert_eq!(code, 1);
+        assert!(
+            stderr.contains("removed MCP server 'docs'")
+                && stderr.contains("failed to delete its saved login"),
+            "{stderr}"
+        );
+
+        let config = read_config(temp.path());
+        assert!(
+            config.mcp_servers.is_empty(),
+            "the config change must not be undone by the token-deletion failure"
         );
     }
 }
