@@ -560,6 +560,7 @@ fn new_session_started_resets_conversation_state_and_preserves_runtime_settings(
             recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: Default::default(),
         },
     )));
     state.approval_allowlist.insert("bash".to_string());
@@ -595,6 +596,7 @@ fn new_session_started_resets_conversation_state_and_preserves_runtime_settings(
             recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: Default::default(),
         },
     )));
     state.update(TuiEvent::NewSessionStarted);
@@ -641,6 +643,7 @@ fn surface_session_projection_updates_current_identity() {
             recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: Default::default(),
         },
     )));
 
@@ -785,6 +788,7 @@ fn surface_projection_announces_group_once_without_inline_child_messages() {
         recoverable_operation_id: None,
         goal_presentation: None,
         session_presentation: None,
+        mcp_catalog: Default::default(),
     };
 
     state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
@@ -1079,6 +1083,7 @@ fn child_projection_reset_preserves_parent_agent_dock() {
         recoverable_operation_id: None,
         goal_presentation: None,
         session_presentation: None,
+        mcp_catalog: Default::default(),
     };
     projection.cursor = crate::surface_projection::test_surface_cursor(2);
     state.update(TuiEvent::ChildProjectionReset {
@@ -1142,6 +1147,7 @@ fn parent_task_updates_refresh_agent_dock_while_child_is_focused() {
             recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: Default::default(),
         },
     )));
 
@@ -1879,6 +1885,7 @@ fn recovery_projection_is_not_overwritten_by_lifecycle_events() {
             recoverable_operation_id,
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: Default::default(),
         }
     };
 
@@ -1940,6 +1947,7 @@ fn surface_operation_projection_fences_conflicts_and_resets() {
             recoverable_operation_id: operation,
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: Default::default(),
         };
     let recovery_notice_count = |state: &AppState| {
         state.transcript.messages
@@ -2036,6 +2044,7 @@ fn workflow_task_projection_fences_contradictory_equal_cursor() {
         recoverable_operation_id: None,
         goal_presentation: None,
         session_presentation: None,
+        mcp_catalog: Default::default(),
     };
     let accepted = projection(vec![workflow_task_summary("task-a", "Accepted task")]);
     state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
@@ -2086,6 +2095,7 @@ fn usage_projection_allows_compaction_drop_and_rejects_stale_revision() {
         recoverable_operation_id: None,
         goal_presentation: None,
         session_presentation: None,
+        mcp_catalog: Default::default(),
     };
 
     state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
@@ -2121,6 +2131,7 @@ fn surface_session_projection_fences_stale_and_cross_thread_identity() {
         recoverable_operation_id: None,
         goal_presentation: None,
         session_presentation: None,
+        mcp_catalog: Default::default(),
     };
     let committed = projection(
         crate::surface_projection::test_surface_cursor(2),
@@ -2200,6 +2211,7 @@ fn surface_session_projection_presents_once_per_cursor() {
         recoverable_operation_id: None,
         goal_presentation: None,
         session_presentation,
+        mcp_catalog: Default::default(),
     };
     state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
         1,
@@ -2266,6 +2278,7 @@ fn rejected_reset_preserves_existing_surface_state() {
             recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: Default::default(),
         },
     )));
     state.push_message(ChatMessage::User("keep me".to_string()));
@@ -2288,6 +2301,7 @@ fn rejected_reset_preserves_existing_surface_state() {
             session_presentation: Some(
                 crate::surface_projection::SessionProjectionPresentation::Renamed,
             ),
+            mcp_catalog: Default::default(),
         },
     )));
 
@@ -2336,6 +2350,7 @@ fn surface_goal_projection_rejects_equal_usage_stale_snapshot() {
         recoverable_operation_id: None,
         goal_presentation,
         session_presentation: None,
+        mcp_catalog: Default::default(),
     };
 
     let committed_projection = projection(
@@ -2442,6 +2457,7 @@ fn surface_goal_projection_hydration_is_silent() {
             recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: Default::default(),
         },
     )));
 
@@ -2477,6 +2493,7 @@ fn surface_goal_projection_presents_clear_once_per_cursor() {
         recoverable_operation_id: None,
         goal_presentation,
         session_presentation: None,
+        mcp_catalog: Default::default(),
     };
     state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
         1,
@@ -2552,6 +2569,7 @@ fn surface_projection_consistency_current_goal_reconciles_session_scoped_state()
         recoverable_operation_id: None,
         goal_presentation: None,
         session_presentation: None,
+        mcp_catalog: Default::default(),
     };
 
     state.update(TuiEvent::SessionProjectionReset(Box::new(expected.clone())));
@@ -4220,6 +4238,7 @@ fn active_goal_projection_does_not_mark_running_app_idle() {
             recoverable_operation_id: None,
             goal_presentation: Some(crate::surface_projection::GoalProjectionPresentation::Updated),
             session_presentation: None,
+            mcp_catalog: Default::default(),
         },
     )));
     assert_eq!(state.status, AppStatus::Running);

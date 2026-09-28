@@ -436,6 +436,15 @@ fn route_action(
                 },
             }
         }
+        action @ (UserAction::McpReconnect { .. }
+        | UserAction::McpLogin { .. }
+        | UserAction::McpLogout { .. }) => {
+            crate::mcp_server_actions::spawn_mcp_server_action(
+                action,
+                controller.runtime_thread(),
+                event_tx.clone(),
+            );
+        }
         UserAction::Cancel => return false,
         action => {
             let arms_surface_activation = matches!(
@@ -693,6 +702,32 @@ mod tests {
                 && images[0].media_type == "image/png"
                 && (images[0].width, images[0].height) == (1, 1)
         ));
+        dispatcher.shutdown().unwrap();
+    }
+
+    #[test]
+    fn mcp_actions_run_beside_the_dispatcher_and_free_their_server() {
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (mut dispatcher, command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).unwrap();
+
+        raw_tx
+            .send(UserAction::McpReconnect {
+                server: "My-Server".to_string(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(TuiEvent::Notice(notice)) if notice.contains("My-Server")
+        ));
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(TuiEvent::McpActionFinished { server }) if server == "my_server"
+        ));
+        assert!(command_rx.try_recv().is_err());
         dispatcher.shutdown().unwrap();
     }
 

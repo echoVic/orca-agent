@@ -208,6 +208,42 @@ attached to a daemon session over ACP.
 the main one. `Ctrl+/` switches between the two, and `Ctrl+C` closes the side
 conversation. See [Side conversations](side-conversations.md).
 
+## MCP servers
+
+`/mcp` opens a panel of the conversation's MCP servers, one row each with its
+status:
+
+~~~text
+╭ MCP servers ─────────────────────────────────────────────────────────────────────╮
+│ › docs     connected · 2 tools                                                   │
+│   github   failed: connection refused                                            │
+│   linear   needs login                                                           │
+│   archive  disabled                                                              │
+│                                                                                  │
+│ ↑↓ select · Enter details · r reconnect · l log in · o log out · Esc close       │
+╰──────────────────────────────────────────────────────────────────────────────────╯
+~~~
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Select a server. |
+| `Enter` | Show the selected server's details: its full status, its tools (read-only ones marked `read-only`), its prompts, and the `enabled_tools`/`disabled_tools` its configuration sets. `Enter` again returns to the list. |
+| `r` | Reconnect the server. |
+| `l` | Log in to the server with OAuth in your browser, then reconnect it. The authorization url also appears in the conversation, to open by hand. |
+| `o` | Delete the server's saved login, then reconnect it; it then needs a login again. |
+| `Esc` | Close the panel. |
+
+Reconnecting, logging in, and logging out run in the background and report in
+the conversation; closing the panel does not stop them. While one runs for a
+server, that server takes no other. `l` and `o` apply only to a server that
+logs in with OAuth; see
+[MCP integration](mcp-integration.md#remote-servers-and-login).
+
+`/mcp` opens between turns. MCP servers connect when the conversation starts,
+so before your first message there is nothing to list yet. A TUI attached to a
+daemon session with `orca attach` cannot manage the daemon's servers: run
+`orca mcp login <name>` on this machine, then reattach.
+
 ## Moving around the conversation
 
 | Key | Action |

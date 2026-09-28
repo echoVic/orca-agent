@@ -269,6 +269,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         && state.image_viewer.is_none()
         && state.user_input_dialog.is_none()
         && state.config_dialog.is_none()
+        && state.mcp_dialog.is_none()
         && state.full_access_confirmation.is_none()
         && state.plan_approval_dialog.is_none()
         && !state.show_shortcuts
@@ -298,6 +299,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
 
     if state.config_dialog.is_some() {
         render_config_dialog(frame, state, theme);
+    }
+
+    if state.mcp_dialog.is_some() {
+        render_mcp_dialog(frame, state, theme);
     }
 
     if state.full_access_confirmation.is_some() {
@@ -430,6 +435,7 @@ fn main_composer_hardware_cursor_visible(state: &AppState) -> bool {
     composer_visible(state)
         && !state.show_shortcuts
         && state.config_dialog.is_none()
+        && state.mcp_dialog.is_none()
         && state.full_access_confirmation.is_none()
         && state.user_input_dialog.is_none()
         && state.image_viewer.is_none()
@@ -438,6 +444,7 @@ fn main_composer_hardware_cursor_visible(state: &AppState) -> bool {
 fn search_visible(state: &AppState) -> bool {
     state.transcript.search.open
         && state.config_dialog.is_none()
+        && state.mcp_dialog.is_none()
         && state.full_access_confirmation.is_none()
         && state.user_input_dialog.is_none()
         && state.plan_approval_dialog.is_none()
@@ -999,6 +1006,225 @@ fn config_dialog_row(
         value.to_string()
     };
     crate::chrome::option_line(theme, selected, "", label, label_width, &value_text, width)
+}
+
+/// The `/mcp` panel's keys, the same over the list and the details.
+const MCP_DIALOG_HINTS: [(&str, &str); 6] = [
+    ("↑↓", "select"),
+    ("Enter", "details"),
+    ("r", "reconnect"),
+    ("l", "log in"),
+    ("o", "log out"),
+    ("Esc", "close"),
+];
+
+/// `/mcp`: one row per server with its status, or the selected server's
+/// tools, prompts and tool filters. A window too short for all of it keeps
+/// the selected server's row and the keys.
+fn render_mcp_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    let Some(dialog) = state.mcp_dialog else {
+        return;
+    };
+    let area = frame.area();
+    let width = 84u16.min(area.width.saturating_sub(4));
+    let inner_width = usize::from(width.saturating_sub(4));
+    // In an 80-column window the keys take two rows rather than lose some.
+    let keys =
+        if crate::chrome::hint_line(theme, usize::MAX, &MCP_DIALOG_HINTS).width() <= inner_width {
+            vec![crate::chrome::hint_line(
+                theme,
+                inner_width,
+                &MCP_DIALOG_HINTS,
+            )]
+        } else {
+            MCP_DIALOG_HINTS
+                .chunks(3)
+                .map(|keys| crate::chrome::hint_line(theme, inner_width, keys))
+                .collect()
+        };
+    // Rows inside the borders of a dialog with a free row above and below,
+    // less the blank row and the keys under the body.
+    let body_rows = usize::from(area.height.saturating_sub(4))
+        .saturating_sub(1 + keys.len())
+        .max(1);
+    let mut lines = match state.selected_mcp_server() {
+        Some(server) if dialog.showing_details => {
+            mcp_server_details(state, server, theme, inner_width, body_rows)
+        }
+        _ => mcp_server_rows(state, dialog.selected, theme, inner_width, body_rows),
+    };
+    lines.push(Line::from(""));
+    lines.extend(keys);
+    let popup = crate::chrome::dialog_rect(area, width, lines.len() as u16, area.height);
+    frame.render_widget(Clear, popup);
+    let block = crate::chrome::panel_block(theme, "MCP servers", theme.border);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// The server list, scrolled so the selected server shows.
+fn mcp_server_rows(
+    state: &AppState,
+    selected: usize,
+    theme: &Theme,
+    width: usize,
+    rows: usize,
+) -> Vec<Line<'static>> {
+    let servers = &state.mcp_catalog.servers;
+    if servers.is_empty() {
+        return vec![Line::from(Span::styled(
+            "No MCP servers. Add one with 'orca mcp add'.",
+            theme.muted_style(),
+        ))];
+    }
+    let selected = selected.min(servers.len() - 1);
+    let label_width = servers
+        .iter()
+        .map(|server| UnicodeWidthStr::width(state.mcp_server_display_name(&server.name)))
+        .max()
+        .unwrap_or(0)
+        .min(width / 3);
+    servers
+        .iter()
+        .enumerate()
+        .skip((selected + 1).saturating_sub(rows))
+        .take(rows)
+        .map(|(index, server)| {
+            // One row each: a failure's reason is cut to what fits, and the
+            // details show it whole.
+            crate::chrome::option_line(
+                theme,
+                index == selected,
+                "",
+                state.mcp_server_display_name(&server.name),
+                label_width,
+                &mcp_server_status_text(state, server),
+                width,
+            )
+        })
+        .collect()
+}
+
+/// `connected · 2 tools`, `failed: {message}`, `needs login`, `disabled` or
+/// `starting`, on one line whatever the message holds.
+fn mcp_server_status_text(
+    state: &AppState,
+    server: &crate::surface_projection::McpServerView,
+) -> String {
+    if server.status != crate::surface_projection::McpServerStatusView::Connected {
+        return server
+            .status
+            .label()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    let tools = state.mcp_catalog.server_tools(&server.name).count();
+    let noun = if tools == 1 { "tool" } else { "tools" };
+    format!("{} · {tools} {noun}", server.status.label())
+}
+
+/// The server's status in full, its tools (read-only ones marked) and
+/// prompts, and the tool filters its config entry sets.
+fn mcp_server_details(
+    state: &AppState,
+    server: &crate::surface_projection::McpServerView,
+    theme: &Theme,
+    width: usize,
+    rows: usize,
+) -> Vec<Line<'static>> {
+    let catalog = &state.mcp_catalog;
+    let tools = catalog
+        .server_tools(&server.name)
+        .map(|tool| {
+            (
+                tool.name.as_str(),
+                if tool.read_only { "read-only" } else { "" },
+            )
+        })
+        .collect::<Vec<_>>();
+    let prompts = catalog
+        .server_prompts(&server.name)
+        .map(|prompt| {
+            (
+                prompt.name.as_str(),
+                prompt.description.as_deref().unwrap_or(""),
+            )
+        })
+        .collect::<Vec<_>>();
+    let config = state.mcp_server_config(&server.name);
+    let filter = |tools: &Option<Vec<String>>| {
+        tools.as_ref().map(|tools| {
+            if tools.is_empty() {
+                "none".to_string()
+            } else {
+                tools.join(", ")
+            }
+        })
+    };
+    let filters = [
+        (
+            "enabled_tools",
+            config.and_then(|config| filter(&config.enabled_tools)),
+        ),
+        (
+            "disabled_tools",
+            config.and_then(|config| filter(&config.disabled_tools)),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, tools)| Some((label, tools?)))
+    .collect::<Vec<_>>();
+    let label_width = tools
+        .iter()
+        .chain(&prompts)
+        .map(|(name, _)| UnicodeWidthStr::width(*name))
+        .chain(filters.iter().map(|(label, _)| label.len()))
+        .max()
+        .unwrap_or(0)
+        .min(width / 2);
+    let heading = |title: &str| {
+        Line::from(Span::styled(
+            title.to_string(),
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        ))
+    };
+    let row = |name: &str, detail: &str| {
+        crate::chrome::option_line(theme, false, "", name, label_width, detail, width)
+    };
+
+    let mut lines = vec![Line::from(Span::styled(
+        state.mcp_server_display_name(&server.name).to_string(),
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(
+        wrap_text(&mcp_server_status_text(state, server), width)
+            .into_iter()
+            .map(|text| Line::from(Span::styled(text, theme.muted_style()))),
+    );
+    lines.push(Line::from(""));
+    if tools.is_empty() {
+        lines.push(Line::from(Span::styled("No tools.", theme.muted_style())));
+    } else {
+        lines.push(heading("Tools"));
+        lines.extend(tools.iter().map(|(name, mark)| row(name, mark)));
+    }
+    if !prompts.is_empty() {
+        lines.push(heading("Prompts"));
+        lines.extend(
+            prompts
+                .iter()
+                .map(|(name, description)| row(name, description)),
+        );
+    }
+    if !filters.is_empty() {
+        lines.push(heading("Tool filters"));
+        lines.extend(filters.iter().map(|(label, tools)| row(label, tools)));
+    }
+    if lines.len() > rows {
+        lines.truncate(rows.saturating_sub(1));
+        lines.push(Line::from(Span::styled("…", theme.muted_style())));
+    }
+    lines
 }
 
 fn queued_preview_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line<'static>> {
@@ -4251,6 +4477,7 @@ pub(crate) fn composer_inner(area: Rect) -> Rect {
 /// other surface is modal over it.
 fn composer_focused(state: &AppState) -> bool {
     state.config_dialog.is_none()
+        && state.mcp_dialog.is_none()
         && state.full_access_confirmation.is_none()
         && state.plan_approval_dialog.is_none()
         && !state.show_shortcuts
@@ -7272,6 +7499,7 @@ mod tests {
                 recoverable_operation_id: None,
                 goal_presentation: None,
                 session_presentation: None,
+                mcp_catalog: Default::default(),
             },
         )));
     }
@@ -8973,6 +9201,211 @@ mod tests {
         let frame = frame_string(&mut state, 100, 30);
         assert!(frame.contains("Approve · bash"), "{frame}");
         assert!(!frame.contains("mention-target.rs"), "{frame}");
+    }
+
+    fn mcp_server_view(
+        name: &str,
+        status: crate::surface_projection::McpServerStatusView,
+    ) -> crate::surface_projection::McpServerView {
+        crate::surface_projection::McpServerView {
+            name: name.to_string(),
+            status,
+        }
+    }
+
+    fn mcp_tool_view(
+        server: &str,
+        name: &str,
+        read_only: bool,
+    ) -> crate::surface_projection::McpToolView {
+        crate::surface_projection::McpToolView {
+            server: server.to_string(),
+            name: name.to_string(),
+            read_only,
+        }
+    }
+
+    #[test]
+    fn slash_mcp_opens_the_panel_with_each_server_status() {
+        use crate::surface_projection::McpServerStatusView;
+        let mut state = test_state();
+        state.mcp_catalog = crate::surface_projection::McpCatalogView {
+            servers: vec![
+                mcp_server_view("docs", McpServerStatusView::Connected),
+                mcp_server_view(
+                    "github",
+                    McpServerStatusView::Failed("connection refused".to_string()),
+                ),
+                mcp_server_view("linear", McpServerStatusView::NeedsLogin),
+                mcp_server_view("archive", McpServerStatusView::Disabled),
+            ],
+            tools: vec![
+                mcp_tool_view("docs", "search", true),
+                mcp_tool_view("docs", "fetch", false),
+            ],
+            prompts: Vec::new(),
+        };
+        let mut config = crate::test_support::test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, _action_rx) = mpsc::unbounded();
+
+        crate::slash_command_actions::handle_slash_command(
+            "/mcp",
+            &mut config,
+            &shared,
+            &mut state,
+            &action_tx,
+        );
+        let frame = frame_string(&mut state, 100, 30);
+
+        for (server, status) in [
+            ("docs", "connected · 2 tools"),
+            ("github", "failed: connection refused"),
+            ("linear", "needs login"),
+            ("archive", "disabled"),
+        ] {
+            assert!(
+                frame
+                    .lines()
+                    .any(|line| line.contains(server) && line.contains(status)),
+                "no row for {server} reads {status}:\n{frame}"
+            );
+        }
+        assert!(frame.contains("› docs"), "{frame}");
+        assert!(
+            frame.contains(
+                "↑↓ select · Enter details · r reconnect · l log in · o log out · Esc close"
+            ),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn the_mcp_keys_take_two_rows_in_an_80_column_window() {
+        use crate::surface_projection::McpServerStatusView;
+        let mut state = test_state();
+        state.mcp_catalog = crate::surface_projection::McpCatalogView {
+            servers: vec![mcp_server_view("docs", McpServerStatusView::Connected)],
+            ..Default::default()
+        };
+        state.mcp_dialog = Some(crate::types::McpDialog {
+            selected: 0,
+            showing_details: false,
+        });
+
+        let frame = frame_string(&mut state, 80, 24);
+
+        assert!(
+            frame.contains("↑↓ select · Enter details · r reconnect"),
+            "{frame}"
+        );
+        assert!(
+            frame.contains("l log in · o log out · Esc close"),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn a_long_failure_stays_on_its_server_row() {
+        use crate::surface_projection::McpServerStatusView;
+        let mut state = test_state();
+        let reason = "failed to connect:\n".to_string() + &"connection refused ".repeat(12);
+        state.mcp_catalog = crate::surface_projection::McpCatalogView {
+            servers: vec![
+                mcp_server_view("github", McpServerStatusView::Failed(reason)),
+                mcp_server_view("linear", McpServerStatusView::NeedsLogin),
+            ],
+            ..Default::default()
+        };
+        state.mcp_dialog = Some(crate::types::McpDialog {
+            selected: 0,
+            showing_details: false,
+        });
+
+        let frame = frame_string(&mut state, 100, 30);
+
+        let github = frame
+            .lines()
+            .position(|line| line.contains("github"))
+            .expect("github row");
+        let lines = frame.lines().collect::<Vec<_>>();
+        assert!(
+            lines[github].contains("failed: failed to connect: connection refused"),
+            "{frame}"
+        );
+        assert!(lines[github].contains('…'), "{frame}");
+        assert!(lines[github + 1].contains("linear"), "{frame}");
+    }
+
+    #[test]
+    fn details_mark_read_only_tools_and_list_prompts() {
+        use crate::surface_projection::{McpPromptView, McpServerStatusView};
+        let mut state = test_state();
+        state.mcp_catalog = crate::surface_projection::McpCatalogView {
+            servers: vec![
+                mcp_server_view("github", McpServerStatusView::Connected),
+                mcp_server_view("docs", McpServerStatusView::Connected),
+            ],
+            tools: vec![
+                mcp_tool_view("github", "list_issues", true),
+                mcp_tool_view("github", "create_issue", false),
+                mcp_tool_view("docs", "search_docs", true),
+            ],
+            prompts: vec![McpPromptView {
+                server: "github".to_string(),
+                name: "review_pr".to_string(),
+                description: Some("Review a pull request".to_string()),
+                arguments: vec![("number".to_string(), true)],
+            }],
+        };
+        state.mcp_server_configs = vec![
+            orca_core::mcp_types::McpServerConfig {
+                name: "github".to_string(),
+                enabled_tools: Some(vec!["list_issues".to_string(), "create_issue".to_string()]),
+                disabled_tools: Some(vec!["delete_repo".to_string()]),
+                ..Default::default()
+            },
+            orca_core::mcp_types::McpServerConfig {
+                name: "docs".to_string(),
+                ..Default::default()
+            },
+        ];
+        state.mcp_dialog = Some(crate::types::McpDialog {
+            selected: 0,
+            showing_details: true,
+        });
+
+        let frame = frame_string(&mut state, 100, 30);
+        let row = |text: &str| {
+            frame
+                .lines()
+                .find(|line| line.contains(text))
+                .unwrap_or_else(|| panic!("no row shows {text}:\n{frame}"))
+                .to_string()
+        };
+
+        assert!(row("list_issues").contains("read-only"), "{frame}");
+        assert!(!row("create_issue").contains("read-only"), "{frame}");
+        assert!(
+            row("review_pr").contains("Review a pull request"),
+            "{frame}"
+        );
+        assert!(
+            row("enabled_tools").contains("list_issues, create_issue"),
+            "{frame}"
+        );
+        assert!(row("disabled_tools").contains("delete_repo"), "{frame}");
+        assert!(!frame.contains("search_docs"), "{frame}");
+
+        // A server without tool filters shows neither.
+        state.mcp_dialog = Some(crate::types::McpDialog {
+            selected: 1,
+            showing_details: true,
+        });
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(frame.contains("search_docs"), "{frame}");
+        assert!(!frame.contains("enabled_tools"), "{frame}");
+        assert!(!frame.contains("disabled_tools"), "{frame}");
     }
 
     #[test]
@@ -11897,6 +12330,7 @@ mod tests {
             recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: Default::default(),
         };
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             snapshot.clone(),

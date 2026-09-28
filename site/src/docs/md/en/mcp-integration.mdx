@@ -86,6 +86,17 @@ or `-` for a stdio server) without ever printing the token itself.
 never touch a session that is already running. A running TUI session picks
 up the change by reconnecting the server from the `/mcp` panel.
 
+## Manage servers in the TUI
+
+In the interactive TUI, `/mcp` lists the conversation's servers and how each
+stands: connected, with its tool count; failed, with the reason; needing a
+login; or disabled. `Enter` shows a server's tools, with the read-only ones
+marked, its prompts, and the `enabled_tools`/`disabled_tools` its
+configuration sets. `r` reconnects the selected server, `l` logs in to it with
+OAuth and then reconnects it, and `o` deletes its saved login and then
+reconnects it. See
+[Terminal UI](terminal-ui.md#mcp-servers) for the panel and its keys.
+
 ## Images from tools
 
 `deepseek-flash` and `auto`, which uses it, are the only models that see the
@@ -147,9 +158,11 @@ conversation explains that saving the rule failed.
 3. Review a workspace before trusting its project configuration.
 4. Use orca doctor to validate local configuration and sandbox readiness; it
    is intentionally read-only and does not start MCP servers.
-5. Inspect runtime status in the interactive TUI during a live task.
+5. Check how each server stands in the TUI's `/mcp` panel, and reconnect it
+   there.
 
 `orca mcp list` and `orca mcp get` inspect configured servers without ever
 printing credential values; `env` and `headers` show only the configured key
-names. There is still no public CLI command to restart, test, or diagnose a
-running MCP connection — that remains part of the running session.
+names. There is no CLI command to restart, test, or diagnose a running MCP
+connection: a running connection belongs to its session, and the TUI's `/mcp`
+panel shows its status and reconnects it.

@@ -754,6 +754,9 @@ impl AppState {
                     expanded: false,
                 });
             }
+            TuiEvent::McpActionFinished { server } => {
+                self.mcp_actions_in_flight.remove(&server);
+            }
             TuiEvent::BackgroundApprovalNeeded { call_id, tool } => {
                 // Already continued under the session's policy, and said so:
                 // announcing it as waiting now would contradict that.
@@ -1125,6 +1128,7 @@ impl AppState {
         self.surface_operation = surface_operation;
         self.surface_workflow_tasks = surface_workflow_tasks;
         self.surface_metrics.apply_projection(&projection);
+        self.mcp_catalog.clone_from(&projection.mcp_catalog);
         let goal_effect = self.surface_goal.apply_projection(&projection);
         self.apply_workflow_tasks_update(projection.workflow_tasks.clone());
         match operation_apply {

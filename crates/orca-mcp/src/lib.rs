@@ -6,7 +6,7 @@ mod legacy_sse;
 pub mod oauth;
 pub mod transport;
 
-pub use auth::{MCP_AUTH_REQUIRED, is_auth_required};
+pub use auth::{MCP_AUTH_REQUIRED, McpAuthKind, is_auth_required};
 pub use client::{
     McpPromptExpansion, McpRegistry, McpRequestError, McpServerState, canonical_server_name,
     initialize_registry,

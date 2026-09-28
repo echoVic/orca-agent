@@ -273,7 +273,10 @@
       "CancelOperation",
       "RequestRecap",
       "RequestAutomaticRecap",
-      "CancelRecap"
+      "CancelRecap",
+      "McpReconnect",
+      "McpLogin",
+      "McpLogout"
     ],
     "required_tui_user_action_additions": [],
     "task_source_target_variants": [
@@ -5064,6 +5067,71 @@
       "no transcript event",
       "Cancellation is fence-local and read-only",
       "none"
+    ],
+    [
+      "McpReconnect",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:702",
+        "crates/orca-tui/src/mcp_dialog_actions.rs:73",
+        "crates/orca-tui/src/action_dispatcher.rs:439",
+        "crates/orca-tui/src/mcp_server_actions.rs:56",
+        "crates/orca-tui/src/surface_client.rs:474"
+      ],
+      "settings_mutation",
+      "UserAction::McpReconnect{server}",
+      "McpServerControl(Reconnect) on an MCP action worker thread",
+      "RuntimeSurfaceClientHandle::mcp_server_control(server, Reconnect)",
+      [
+        "ManageThreadSettings"
+      ],
+      [],
+      "SurfaceMcpServerStatus",
+      "TuiEvent::Notice with the status, then TuiEvent::McpActionFinished; the /mcp list comes from the next projection's MCP catalog",
+      "none"
+    ],
+    [
+      "McpLogin",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:707",
+        "crates/orca-tui/src/mcp_dialog_actions.rs:83",
+        "crates/orca-tui/src/action_dispatcher.rs:440",
+        "crates/orca-tui/src/mcp_server_actions.rs:95",
+        "crates/orca-tui/src/mcp_server_actions.rs:110"
+      ],
+      "host_store_and_thread_mutation",
+      "UserAction::McpLogin{server: McpServerConfig}",
+      "orca_mcp::oauth::login into mcp-credentials.json, then McpServerControl(Reconnect), on an MCP action worker thread",
+      "orca_mcp::oauth::login(server, McpLoginOptions) + RuntimeSurfaceClientHandle::mcp_server_control(server, Reconnect)",
+      [
+        "ManageThreadSettings"
+      ],
+      [],
+      "Result<(), String> + SurfaceMcpServerStatus",
+      "TuiEvent::Notice for each step, then TuiEvent::McpActionFinished; the /mcp list comes from the next projection's MCP catalog",
+      "none"
+    ],
+    [
+      "McpLogout",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:712",
+        "crates/orca-tui/src/mcp_dialog_actions.rs:87",
+        "crates/orca-tui/src/action_dispatcher.rs:441",
+        "crates/orca-tui/src/mcp_server_actions.rs:129"
+      ],
+      "host_store_and_thread_mutation",
+      "UserAction::McpLogout{server}",
+      "delete_mcp_credential from mcp-credentials.json, then McpServerControl(Reconnect), on an MCP action worker thread",
+      "orca_core::config::mcp_credentials::delete_mcp_credential(path, server) + RuntimeSurfaceClientHandle::mcp_server_control(server, Reconnect)",
+      [
+        "ManageThreadSettings"
+      ],
+      [],
+      "io::Result<bool> + SurfaceMcpServerStatus",
+      "TuiEvent::Notice for each step, then TuiEvent::McpActionFinished; the /mcp list comes from the next projection's MCP catalog",
+      "none"
     ]
   ],
   "tui_entrypoint_columns": [
@@ -7743,7 +7811,7 @@
   ],
   "phase_0a_manifest_invariants": [
     "source_facts has exactly 58 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 49 unique variants matching UserAction at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 52 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",

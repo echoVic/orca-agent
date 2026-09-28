@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
+use orca_mcp::McpAuthKind;
 use orca_mcp::oauth::OpenBrowser;
 
 /// A request to add, list, show, remove, log in to, or log out of an MCP
@@ -250,7 +251,7 @@ fn login(
         Ok(server) => server,
         Err(message) => return fail(stderr, &message),
     };
-    if !matches!(classify_auth(&server), AuthKind::OAuth) {
+    if McpAuthKind::of(&server) != McpAuthKind::OAuth {
         return fail(
             stderr,
             &format!("MCP server '{name}' does not use OAuth login"),
@@ -293,47 +294,15 @@ fn find_configured_server(config_dir: &Path, name: &str) -> Result<McpServerConf
         .ok_or_else(|| format!("no MCP server named '{name}' in {}", path.display()))
 }
 
-/// How a server authenticates, decided from its configuration alone, in the
-/// order the brief specifies.
-enum AuthKind {
-    /// A stdio server: nothing is sent over a network to authenticate.
-    Stdio,
-    /// A configured `Authorization` header, matched case-insensitively.
-    StaticHeader,
-    /// `bearer_token_env_var`, carrying the environment variable's name.
-    BearerEnvVar(String),
-    /// Neither of the above, so OAuth is this server's only option.
-    OAuth,
-}
-
-fn classify_auth(server: &McpServerConfig) -> AuthKind {
-    if server.transport == McpTransportKind::Stdio {
-        AuthKind::Stdio
-    } else if has_authorization_header(server) {
-        AuthKind::StaticHeader
-    } else if let Some(variable) = &server.bearer_token_env_var {
-        AuthKind::BearerEnvVar(variable.clone())
-    } else {
-        AuthKind::OAuth
-    }
-}
-
-fn has_authorization_header(server: &McpServerConfig) -> bool {
-    server
-        .headers
-        .keys()
-        .any(|name| name.eq_ignore_ascii_case("authorization"))
-}
-
 /// The auth status shown in `list`'s trailing column, `get`'s `auth:` line,
 /// and the `--json` `auth` field. Computed from configuration and the
 /// credentials file alone — this never connects to the server.
 fn auth_status(server: &McpServerConfig, credentials_path: &Path) -> io::Result<String> {
-    Ok(match classify_auth(server) {
-        AuthKind::Stdio => "-".to_string(),
-        AuthKind::StaticHeader => "static header".to_string(),
-        AuthKind::BearerEnvVar(variable) => format!("bearer: ${variable}"),
-        AuthKind::OAuth => {
+    Ok(match McpAuthKind::of(server) {
+        McpAuthKind::Stdio => "-".to_string(),
+        McpAuthKind::StaticHeader => "static header".to_string(),
+        McpAuthKind::BearerEnvVar(variable) => format!("bearer: ${variable}"),
+        McpAuthKind::OAuth => {
             let url = server.url.as_deref().unwrap_or_default();
             let logged_in = orca_core::config::mcp_credentials::load_mcp_credential(
                 credentials_path,

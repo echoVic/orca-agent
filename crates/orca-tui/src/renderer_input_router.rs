@@ -74,7 +74,7 @@ impl<'a, 'text> RendererInputRouter<'a, 'text> {
     ) -> io::Result<Option<i32>> {
         match input {
             BatchedInputEvent::ScrollLines(lines) => {
-                if self.state.config_dialog.is_some() {
+                if self.state.config_dialog.is_some() || self.state.mcp_dialog.is_some() {
                     self.vim_state.cancel_pending_command();
                     return Ok(None);
                 }

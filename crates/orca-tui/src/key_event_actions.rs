@@ -1321,8 +1321,8 @@ mod tests {
 ///      before navigation does. Without this carve-out the branch below
 ///      would claim Esc first and the approval's deny (case 14) would never
 ///      run; see `esc_prefers_a_pending_approval_over_returning_to_a_focused_parent`.
-///   4. plan approval / config dialog / user-input dialog pending (each
-///      deferred to status)
+///   4. plan approval / config dialog / `/mcp` panel / user-input dialog
+///      pending (each deferred to status)
 ///   5. transcript search open
 ///   6. the shortcuts help overlay (`show_shortcuts`)
 ///   7. an active transcript selection
@@ -1337,7 +1337,7 @@ mod tests {
 ///       above for why a focused child does not shadow this)
 ///   14. plan approval
 ///   15. the recovery prompt
-///   16. the config dialog
+///   16. the config dialog, then the `/mcp` panel
 ///   17. the questionnaire (user-input dialog) -> backs out one step at a
 ///       time
 ///   18. the mention popup / slash menu (inside Idle handling)
@@ -1407,7 +1407,7 @@ where
         return Ok(KeyEventFlow::Unhandled);
     }
 
-    if state.config_dialog.is_some() {
+    if state.config_dialog.is_some() || state.mcp_dialog.is_some() {
         vim_state.cancel_pending_command();
         return Ok(KeyEventFlow::Unhandled);
     }

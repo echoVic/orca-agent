@@ -16,10 +16,11 @@ use orca_runtime::surface::{
     SurfaceAssistantStream, SurfaceAssistantStreamState, SurfaceCommitBatch,
     SurfaceCompletedModelResponse, SurfaceCursor, SurfaceEvent, SurfaceFileChange, SurfaceGoal,
     SurfaceGoalPauseReason, SurfaceGoalReceiptState, SurfaceGoalState, SurfaceInputPresentation,
-    SurfaceItem, SurfaceOperationFence, SurfaceOperationId, SurfaceReduceMode, SurfaceReduceResult,
-    SurfaceReducerErrorCode, SurfaceReducerState, SurfaceStreamId, SurfaceTaskStatus,
-    SurfaceToolResultKind, SurfaceUserInputState, SurfaceWorkflow, SurfaceWorkflowAgentStatus,
-    SurfaceWorkflowStatus, ThreadPersistence, ToolPatch, UnixMillis,
+    SurfaceItem, SurfaceMcpCatalogSnapshot, SurfaceMcpServerStatus, SurfaceOperationFence,
+    SurfaceOperationId, SurfaceReduceMode, SurfaceReduceResult, SurfaceReducerErrorCode,
+    SurfaceReducerState, SurfaceStreamId, SurfaceTaskStatus, SurfaceToolResultKind,
+    SurfaceUserInputState, SurfaceWorkflow, SurfaceWorkflowAgentStatus, SurfaceWorkflowStatus,
+    ThreadPersistence, ToolPatch, UnixMillis,
 };
 
 use crate::protocol::{TuiEvent, TuiTaskLifecycle};
@@ -44,6 +45,136 @@ pub struct SurfaceProjectionState {
     pub(crate) recoverable_operation_id: Option<SurfaceOperationId>,
     pub(crate) goal_presentation: Option<GoalProjectionPresentation>,
     pub(crate) session_presentation: Option<SessionProjectionPresentation>,
+    pub(crate) mcp_catalog: McpCatalogView,
+}
+
+/// The thread's MCP servers as `/mcp` shows them, with the tools and prompts
+/// of the connected ones. Servers, tools and prompts are all keyed by the
+/// catalog's server name, which is canonical (`My-Server` is `my_server`).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct McpCatalogView {
+    pub(crate) servers: Vec<McpServerView>,
+    pub(crate) tools: Vec<McpToolView>,
+    pub(crate) prompts: Vec<McpPromptView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct McpServerView {
+    pub(crate) name: String,
+    pub(crate) status: McpServerStatusView,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum McpServerStatusView {
+    Connected,
+    Failed(String),
+    NeedsLogin,
+    Disabled,
+    Starting,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct McpToolView {
+    pub(crate) server: String,
+    pub(crate) name: String,
+    pub(crate) read_only: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct McpPromptView {
+    pub(crate) server: String,
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+    /// Each argument's name and whether it is required, in the order the
+    /// server declared them.
+    pub(crate) arguments: Vec<(String, bool)>,
+}
+
+impl McpCatalogView {
+    pub(crate) fn from_surface(catalog: &SurfaceMcpCatalogSnapshot) -> Self {
+        Self {
+            servers: catalog
+                .servers
+                .iter()
+                .map(|(name, status)| McpServerView {
+                    name: name.as_str().to_string(),
+                    status: McpServerStatusView::from_surface(status),
+                })
+                .collect(),
+            tools: catalog
+                .tools
+                .iter()
+                .map(|tool| McpToolView {
+                    server: tool.server.as_str().to_string(),
+                    name: tool.name.as_str().to_string(),
+                    read_only: tool.read_only,
+                })
+                .collect(),
+            prompts: catalog
+                .prompts
+                .iter()
+                .map(|prompt| McpPromptView {
+                    server: prompt.server.as_str().to_string(),
+                    name: prompt.name.as_str().to_string(),
+                    description: prompt
+                        .description
+                        .as_ref()
+                        .map(|description| description.as_str().to_string()),
+                    arguments: prompt
+                        .arguments
+                        .iter()
+                        .map(|argument| (argument.name.as_str().to_string(), argument.required))
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The tools of the server the catalog names `server`.
+    pub(crate) fn server_tools<'a>(
+        &'a self,
+        server: &'a str,
+    ) -> impl Iterator<Item = &'a McpToolView> + 'a {
+        self.tools.iter().filter(move |tool| tool.server == server)
+    }
+
+    /// The prompts of the server the catalog names `server`.
+    pub(crate) fn server_prompts<'a>(
+        &'a self,
+        server: &'a str,
+    ) -> impl Iterator<Item = &'a McpPromptView> + 'a {
+        self.prompts
+            .iter()
+            .filter(move |prompt| prompt.server == server)
+    }
+}
+
+impl McpServerStatusView {
+    /// A stopped server serves no tools, so it reads as a failure.
+    pub(crate) fn from_surface(status: &SurfaceMcpServerStatus) -> Self {
+        match status {
+            SurfaceMcpServerStatus::Ready => Self::Connected,
+            SurfaceMcpServerStatus::Degraded { message } => {
+                Self::Failed(message.as_str().to_string())
+            }
+            SurfaceMcpServerStatus::Stopped => Self::Failed("stopped".to_string()),
+            SurfaceMcpServerStatus::AuthRequired => Self::NeedsLogin,
+            SurfaceMcpServerStatus::Disabled => Self::Disabled,
+            SurfaceMcpServerStatus::Starting => Self::Starting,
+        }
+    }
+
+    /// How `/mcp` words the status: `connected`, `failed: {message}`,
+    /// `needs login`, `disabled` or `starting`.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::Connected => "connected".to_string(),
+            Self::Failed(message) => format!("failed: {message}"),
+            Self::NeedsLogin => "needs login".to_string(),
+            Self::Disabled => "disabled".to_string(),
+            Self::Starting => "starting".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -801,6 +932,7 @@ impl SurfaceProjectionState {
                 .map(|operation| operation.operation_id().clone()),
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: McpCatalogView::from_surface(&snapshot.mcp_catalog),
         }
     }
 
@@ -2708,6 +2840,112 @@ mod tests {
             .unwrap();
 
         assert_eq!(task.last_activity_at_ms, Some(2_500));
+    }
+
+    #[test]
+    fn the_catalog_from_the_projection_reaches_app_state() {
+        use orca_runtime::surface::{
+            SurfaceCatalogEntryId, SurfaceMcpPrompt, SurfaceMcpPromptArgument, SurfaceMcpTool,
+            SurfaceSchema,
+        };
+        let text = |value: &str| NonEmptyText::try_new(value).unwrap();
+        let tool = |server: &str, name: &str, read_only| SurfaceMcpTool {
+            id: SurfaceCatalogEntryId::try_new(format!("mcp-tool:mcp__{server}__{name}")).unwrap(),
+            server: text(server),
+            name: text(name),
+            schema_name: text(&format!("mcp__{server}__{name}")),
+            description: None,
+            input_schema: SurfaceSchema::Boolean {
+                title: None,
+                description: None,
+            },
+            read_only,
+        };
+        let mut snapshot = goal_projection_snapshot();
+        snapshot.mcp_catalog.servers = vec![
+            (text("docs"), SurfaceMcpServerStatus::Ready),
+            (
+                text("github"),
+                SurfaceMcpServerStatus::Degraded {
+                    message: DisplayText::new("connection refused"),
+                },
+            ),
+            (text("jira"), SurfaceMcpServerStatus::Stopped),
+            (text("linear"), SurfaceMcpServerStatus::AuthRequired),
+            (text("archive"), SurfaceMcpServerStatus::Disabled),
+            (text("slow"), SurfaceMcpServerStatus::Starting),
+        ];
+        snapshot.mcp_catalog.tools = vec![
+            tool("docs", "search", true),
+            tool("docs", "write_page", false),
+        ];
+        snapshot.mcp_catalog.prompts = vec![SurfaceMcpPrompt {
+            server: text("docs"),
+            name: text("summarize"),
+            description: Some(DisplayText::new("Summarize a page")),
+            arguments: vec![
+                SurfaceMcpPromptArgument {
+                    name: text("page"),
+                    description: None,
+                    required: true,
+                },
+                SurfaceMcpPromptArgument {
+                    name: text("style"),
+                    description: Some(DisplayText::new("How to write it")),
+                    required: false,
+                },
+            ],
+        }];
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            event_tx,
+            "0.0.0-test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState::from_surface_snapshot(&snapshot),
+        )));
+
+        let server = |name: &str, status| McpServerView {
+            name: name.to_string(),
+            status,
+        };
+        assert_eq!(
+            state.mcp_catalog,
+            McpCatalogView {
+                servers: vec![
+                    server("docs", McpServerStatusView::Connected),
+                    server(
+                        "github",
+                        McpServerStatusView::Failed("connection refused".to_string()),
+                    ),
+                    server("jira", McpServerStatusView::Failed("stopped".to_string())),
+                    server("linear", McpServerStatusView::NeedsLogin),
+                    server("archive", McpServerStatusView::Disabled),
+                    server("slow", McpServerStatusView::Starting),
+                ],
+                tools: vec![
+                    McpToolView {
+                        server: "docs".to_string(),
+                        name: "search".to_string(),
+                        read_only: true,
+                    },
+                    McpToolView {
+                        server: "docs".to_string(),
+                        name: "write_page".to_string(),
+                        read_only: false,
+                    },
+                ],
+                prompts: vec![McpPromptView {
+                    server: "docs".to_string(),
+                    name: "summarize".to_string(),
+                    description: Some("Summarize a page".to_string()),
+                    arguments: vec![("page".to_string(), true), ("style".to_string(), false)],
+                }],
+            }
+        );
     }
 
     #[test]

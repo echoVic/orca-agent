@@ -9,7 +9,7 @@ use crate::protocol::{GoalDraft, UserAction};
 use crate::session_picker_actions::open_session_picker;
 use crate::surface_actions::TuiHostActions;
 use crate::transcript_state::ChatMessage;
-use crate::types::{AppState, AppStatus, ConfigDialog, RecapState};
+use crate::types::{AppState, AppStatus, ConfigDialog, McpDialog, RecapState};
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::RunConfig;
 
@@ -40,6 +40,39 @@ fn request_recap(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>) {
             state.recap = RecapState::Requested;
             let _ = action_tx.send(UserAction::RequestRecap);
         }
+    }
+}
+
+/// `/mcp`: the panel of the MCP servers of the thread in view. An attached
+/// daemon session's servers are the daemon's, which this TUI cannot reach;
+/// before the conversation starts, none is connected yet.
+fn open_mcp_panel(config: &RunConfig, state: &mut AppState) {
+    if state.attached_session {
+        state.push_message(ChatMessage::System {
+            text: "MCP management is not available in an attached daemon session; run 'orca mcp login <name>' on this machine, then reattach.".to_string(),
+            expanded: false,
+        });
+    } else if state.status != AppStatus::Idle {
+        state.push_message(ChatMessage::Error(
+            "finish or cancel the current work before managing MCP servers".to_string(),
+        ));
+    } else if !state.mcp_catalog.servers.is_empty() {
+        state.mcp_server_configs = config.mcp_servers.clone();
+        state.mcp_dialog = Some(McpDialog {
+            selected: 0,
+            showing_details: false,
+        });
+    } else if config.mcp_servers.is_empty() {
+        state.push_message(ChatMessage::System {
+            text: "No MCP servers. Add one with 'orca mcp add'.".to_string(),
+            expanded: false,
+        });
+    } else {
+        state.push_message(ChatMessage::System {
+            text: "MCP servers connect when the conversation starts; send a message first."
+                .to_string(),
+            expanded: false,
+        });
     }
 }
 
@@ -176,6 +209,7 @@ fn dispatch_slash_command(
                 ));
             }
         }
+        SlashCommand::Mcp => open_mcp_panel(config, state),
         SlashCommand::Mode(Some(mode)) => match parse_approval_mode(&mode) {
             Some(approval_mode) => {
                 request_settings_change(state, action_tx, None, None, Some(approval_mode));
@@ -767,6 +801,7 @@ mod tests {
                 recoverable_operation_id: Some(recoverable_operation_id),
                 goal_presentation: None,
                 session_presentation: None,
+                mcp_catalog: Default::default(),
             },
         )));
         let mut config = test_run_config();
@@ -950,6 +985,102 @@ mod tests {
         assert_eq!(dialog.approval_mode, ApprovalMode::AutoEdit);
         assert!(state.transcript.messages.is_empty());
         assert!(action_rx.try_recv().is_err());
+    }
+
+    fn mcp_state(servers: &[&str]) -> AppState {
+        let mut state = state();
+        state.mcp_catalog = crate::surface_projection::McpCatalogView {
+            servers: servers
+                .iter()
+                .map(|name| crate::surface_projection::McpServerView {
+                    name: (*name).to_string(),
+                    status: crate::surface_projection::McpServerStatusView::Connected,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        state
+    }
+
+    fn remote_mcp_server(name: &str) -> orca_core::mcp_types::McpServerConfig {
+        orca_core::mcp_types::McpServerConfig {
+            name: name.to_string(),
+            transport: orca_core::mcp_types::McpTransportKind::Http,
+            url: Some("https://docs.example/mcp".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn attached_sessions_explain_mcp_is_unavailable() {
+        let mut state = mcp_state(&["docs"]);
+        state.attached_session = true;
+        let mut config = test_run_config();
+        config.mcp_servers = vec![remote_mcp_server("docs")];
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        handle_slash_command("/mcp", &mut config, &shared, &mut state, &action_tx);
+
+        assert!(state.mcp_dialog.is_none());
+        assert!(action_rx.try_recv().is_err());
+        assert!(matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::System { text, .. }) if text == "MCP management is not available in an attached daemon session; run 'orca mcp login <name>' on this machine, then reattach."
+        ));
+    }
+
+    #[test]
+    fn mcp_without_servers_says_how_to_add_one() {
+        let mut state = mcp_state(&[]);
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, _action_rx) = mpsc::unbounded();
+
+        handle_slash_command("/mcp", &mut config, &shared, &mut state, &action_tx);
+
+        assert!(state.mcp_dialog.is_none());
+        assert!(matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::System { text, .. })
+                if text == "No MCP servers. Add one with 'orca mcp add'."
+        ));
+    }
+
+    #[test]
+    fn mcp_before_the_servers_connect_says_when_they_do() {
+        let mut state = mcp_state(&[]);
+        let mut config = test_run_config();
+        config.mcp_servers = vec![remote_mcp_server("docs")];
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, _action_rx) = mpsc::unbounded();
+
+        handle_slash_command("/mcp", &mut config, &shared, &mut state, &action_tx);
+
+        assert!(state.mcp_dialog.is_none());
+        assert!(matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::System { text, .. })
+                if text == "MCP servers connect when the conversation starts; send a message first."
+        ));
+    }
+
+    #[test]
+    fn mcp_waits_for_the_current_work_like_config() {
+        let mut state = mcp_state(&["docs"]);
+        state.enter_running();
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, _action_rx) = mpsc::unbounded();
+
+        handle_slash_command("/mcp", &mut config, &shared, &mut state, &action_tx);
+
+        assert!(state.mcp_dialog.is_none());
+        assert!(matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::Error(text))
+                if text == "finish or cancel the current work before managing MCP servers"
+        ));
     }
 
     #[test]

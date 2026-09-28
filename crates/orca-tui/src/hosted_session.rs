@@ -1045,6 +1045,7 @@ mod tests {
             recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: Default::default(),
         };
 
         project_hosted_thread_attached(

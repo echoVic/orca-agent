@@ -13,6 +13,7 @@ use orca_core::conversation::ConversationTarget;
 use orca_core::cost_types::UsageTotals;
 #[cfg(test)]
 use orca_core::goal_types::ThreadGoal;
+use orca_core::mcp_types::McpServerConfig;
 #[cfg(test)]
 use orca_core::plan_types::PlanItem;
 use orca_core::proposed_plan::ProposedPlanStreamParser;
@@ -39,8 +40,9 @@ use crate::queued_input::QueuedSubmissionState;
 #[cfg(test)]
 use crate::surface_projection::SurfaceProjectionState;
 use crate::surface_projection::{
-    SurfaceGoalProjectionState, SurfaceMetricsState, SurfaceOperationProjectionState,
-    SurfaceSessionProjectionState, SurfaceWorkflowTaskProjectionState,
+    McpCatalogView, McpServerView, SurfaceGoalProjectionState, SurfaceMetricsState,
+    SurfaceOperationProjectionState, SurfaceSessionProjectionState,
+    SurfaceWorkflowTaskProjectionState,
 };
 use crate::transcript_hit::{CollapsibleHitArea, is_collapsible};
 use crate::transcript_state::{ChatMessage, TranscriptState};
@@ -237,6 +239,14 @@ pub struct ConfigDialog {
     pub model: String,
     pub reasoning_effort: orca_core::config::ReasoningEffort,
     pub approval_mode: ApprovalMode,
+}
+
+/// The `/mcp` panel: the server selected in the list, and whether that
+/// server's details show in place of the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct McpDialog {
+    pub(crate) selected: usize,
+    pub(crate) showing_details: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,6 +487,21 @@ pub struct AppState {
     pub approval_dialog: Option<ApprovalDialog>,
     pub plan_approval_dialog: Option<PlanApprovalDialog>,
     pub config_dialog: Option<ConfigDialog>,
+    pub(crate) mcp_dialog: Option<McpDialog>,
+    /// The MCP servers of the thread in view, with their tools and prompts,
+    /// from its latest projection.
+    pub(crate) mcp_catalog: McpCatalogView,
+    /// The MCP server entries of the TUI's config when `/mcp` last opened:
+    /// the panel names servers and shows tool filters from them, and logs
+    /// in and out with them.
+    pub(crate) mcp_server_configs: Vec<McpServerConfig>,
+    /// Catalog names of the MCP servers a reconnect, login or logout from
+    /// `/mcp` still runs for. Each worker's `McpActionFinished` clears its
+    /// entry, however the action went.
+    pub(crate) mcp_actions_in_flight: std::collections::HashSet<String>,
+    /// The session belongs to a daemon this TUI attached to (`orca attach`),
+    /// whose MCP servers it cannot manage.
+    pub(crate) attached_session: bool,
     pub full_access_confirmation: Option<FullAccessConfirmation>,
     pub(crate) user_input_dialog: Option<UserInputDialog>,
     pub(crate) interaction: InteractionState,
@@ -629,6 +654,7 @@ impl AppState {
             && self.approval_dialog.is_none()
             && self.plan_approval_dialog.is_none()
             && self.config_dialog.is_none()
+            && self.mcp_dialog.is_none()
             && self.full_access_confirmation.is_none()
             && self.user_input_dialog.is_none()
             && self.task_transcript.is_none()
@@ -810,6 +836,33 @@ impl AppState {
         self.side_conversation.is_some()
     }
 
+    /// The config entry of the MCP server the catalog names `server`: the
+    /// one entry whose name is `server` once made canonical. `None` when no
+    /// entry, or more than one, is.
+    pub(crate) fn mcp_server_config(&self, server: &str) -> Option<&McpServerConfig> {
+        let mut entries = self
+            .mcp_server_configs
+            .iter()
+            .filter(|config| orca_mcp::canonical_server_name(&config.name) == server);
+        let entry = entries.next()?;
+        entries.next().is_none().then_some(entry)
+    }
+
+    /// What `/mcp` calls the MCP server the catalog names `server`: the name
+    /// its config entry gives it, as `orca mcp list` shows it, or else the
+    /// catalog's.
+    pub(crate) fn mcp_server_display_name<'a>(&'a self, server: &'a str) -> &'a str {
+        self.mcp_server_config(server)
+            .map_or(server, |config| config.name.as_str())
+    }
+
+    /// The server selected in the `/mcp` panel, while it is open.
+    pub(crate) fn selected_mcp_server(&self) -> Option<&McpServerView> {
+        let dialog = self.mcp_dialog?;
+        let servers = &self.mcp_catalog.servers;
+        servers.get(dialog.selected.min(servers.len().checked_sub(1)?))
+    }
+
     pub fn new(
         event_tx: mpsc::Sender<UserAction>,
         app_version: String,
@@ -841,6 +894,11 @@ impl AppState {
             approval_dialog: None,
             plan_approval_dialog: None,
             config_dialog: None,
+            mcp_dialog: None,
+            mcp_catalog: McpCatalogView::default(),
+            mcp_server_configs: Vec::new(),
+            mcp_actions_in_flight: std::collections::HashSet::new(),
+            attached_session: false,
             full_access_confirmation: None,
             user_input_dialog: None,
             interaction: InteractionState::default(),
@@ -1249,6 +1307,7 @@ impl AppState {
         self.atomic_skill_tokens.clear();
         self.plan_approval_dialog = None;
         self.config_dialog = None;
+        self.mcp_dialog = None;
         self.full_access_confirmation = None;
         self.user_input_dialog = None;
         self.pre_plan_approval_mode = None;
@@ -1434,6 +1493,7 @@ impl AppState {
     pub fn enter_running(&mut self) {
         self.plan_approval_dialog = None;
         self.config_dialog = None;
+        self.mcp_dialog = None;
         if self.running_started_at.is_none() {
             self.running_started_at = Some(Instant::now());
             self.turn_diagnostic_seen = false;

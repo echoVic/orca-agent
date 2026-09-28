@@ -215,6 +215,8 @@ fn run_tui_inner(
     );
     state.workspace_git = workspace_status.git;
     state.workspace_path = workspace_root.display().to_string();
+    // `cli::run_attached` is the one caller that passes a daemon to attach to.
+    state.attached_session = remote.is_some();
     state.approval_mode = config.approval_mode;
     state.reasoning_effort = config.reasoning_effort;
     state.first_run = first_run;

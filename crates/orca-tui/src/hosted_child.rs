@@ -973,6 +973,7 @@ mod tests {
             recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: Default::default(),
         };
         let (root_tx, root_rx) = crossbeam_channel::unbounded();
 

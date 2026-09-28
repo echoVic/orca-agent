@@ -13,6 +13,7 @@ use crate::approval_dialog_actions::handle_approval_dialog_key;
 use crate::config_dialog_actions::handle_config_dialog_key;
 use crate::full_access_confirmation_actions::handle_full_access_confirmation_key;
 use crate::idle_key_actions::handle_idle_key;
+use crate::mcp_dialog_actions::handle_mcp_dialog_key;
 use crate::plan_approval_actions::handle_plan_approval_key;
 use crate::protocol::UserAction;
 use crate::queued_input_actions::handle_running_key;
@@ -100,6 +101,12 @@ where
     if state.config_dialog.is_some() {
         vim_state.cancel_pending_command();
         handle_config_dialog_key(key, state, action_tx);
+        return Ok(StatusKeyFlow::Continue);
+    }
+
+    if state.mcp_dialog.is_some() {
+        vim_state.cancel_pending_command();
+        handle_mcp_dialog_key(key, state, action_tx);
         return Ok(StatusKeyFlow::Continue);
     }
 

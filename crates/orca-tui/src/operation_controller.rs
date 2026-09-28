@@ -299,6 +299,12 @@ impl TuiSurfaceTaskControl {
         ))
     }
 
+    /// The runtime thread in view, whose MCP servers `/mcp` acts on. `None`
+    /// before the conversation starts.
+    pub(crate) fn runtime_thread(&self) -> Option<orca_runtime::runtime_host::RuntimeThreadHandle> {
+        self.lock_hosted().queue_runtime.clone()
+    }
+
     pub(crate) fn pause_current_goal(&self) -> io::Result<bool> {
         let surface = self.lock_hosted().surface_active.clone();
         let Some(surface) = surface else {

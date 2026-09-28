@@ -5,6 +5,7 @@
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::OperationId;
+use orca_core::mcp_types::McpServerConfig;
 use orca_core::plan_types::PlanItem;
 use orca_runtime::mentions::MentionBindings;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
@@ -464,6 +465,11 @@ pub enum TuiEvent {
     Backtracked {
         prompt: String,
     },
+    /// The reconnect, login or logout `/mcp` started for the MCP server the
+    /// catalog names `server` is over, however it went.
+    McpActionFinished {
+        server: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -691,4 +697,19 @@ pub enum UserAction {
         focus_cycle: u64,
     },
     CancelRecap,
+    /// `r` in `/mcp`: reconnect the MCP server named `server` (its config
+    /// or catalog name).
+    McpReconnect {
+        server: String,
+    },
+    /// `l` in `/mcp`: log in to the MCP server with OAuth in the browser,
+    /// then reconnect it.
+    McpLogin {
+        server: McpServerConfig,
+    },
+    /// `o` in `/mcp`: delete the login saved for the MCP server with this
+    /// config name, then reconnect it.
+    McpLogout {
+        server: String,
+    },
 }

@@ -13,6 +13,7 @@ pub enum SlashCommand {
     CancelOperation,
     Cost,
     Config,
+    Mcp,
     Mode(Option<String>),
     Plan(Option<String>),
     Goal(GoalSlashCommand),
@@ -143,6 +144,7 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
         "cancel-operation" => no_arguments(parts).then_some(SlashCommand::CancelOperation),
         "cost" => no_arguments(parts).then_some(SlashCommand::Cost),
         "config" => no_arguments(parts).then_some(SlashCommand::Config),
+        "mcp" => no_arguments(parts).then_some(SlashCommand::Mcp),
         "mode" => {
             optional_single_argument(parts).map(|mode| SlashCommand::Mode(mode.map(str::to_string)))
         }
@@ -212,6 +214,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/cancel-operation", "Cancel a recoverable operation"),
         ("/cost", "Show session cost"),
         ("/config", "Configure runtime settings"),
+        ("/mcp", "Manage MCP servers"),
         ("/mode", "Switch approval mode"),
         ("/plan", "Plan first, then approve implementation"),
         ("/goal", "Manage a persistent goal"),
@@ -411,6 +414,7 @@ mod tests {
             "/cancel-operation now",
             "/cost now",
             "/config show",
+            "/mcp now",
             "/mode auto-edit extra",
             "/plan off extra",
             "/workflows now",
@@ -740,6 +744,12 @@ mod tests {
     fn parses_config_command() {
         assert_eq!(parse("/config"), Some(SlashCommand::Config));
         assert_eq!(parse("/config show"), None);
+    }
+
+    #[test]
+    fn parses_mcp_command() {
+        assert_eq!(parse("/mcp"), Some(SlashCommand::Mcp));
+        assert!(all_commands().contains(&("/mcp", "Manage MCP servers")));
     }
 
     #[test]

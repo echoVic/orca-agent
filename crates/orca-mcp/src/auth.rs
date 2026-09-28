@@ -17,7 +17,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 use orca_core::config::mcp_credentials::{McpCredential, load_mcp_credential};
-use orca_core::mcp_types::McpServerConfig;
+use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
 
 use crate::oauth::{self, expires_soon};
 use crate::transport::configured_headers;
@@ -29,6 +29,40 @@ pub const MCP_AUTH_REQUIRED: &str = "MCP server requires login";
 /// Whether `error` says the server needs the user to log in.
 pub fn is_auth_required(error: &str) -> bool {
     error.starts_with(MCP_AUTH_REQUIRED)
+}
+
+/// How a server authenticates, decided from its config alone, in the order
+/// its transports try. `orca mcp` and the TUI's `/mcp` panel both ask it
+/// whether a server logs in with OAuth.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpAuthKind {
+    /// A stdio server: nothing is sent over a network to authenticate.
+    Stdio,
+    /// A configured `Authorization` header, matched case-insensitively.
+    StaticHeader,
+    /// `bearer_token_env_var`, carrying the environment variable's name.
+    BearerEnvVar(String),
+    /// Neither of the above, so OAuth is this server's only option.
+    OAuth,
+}
+
+impl McpAuthKind {
+    /// How `server` authenticates.
+    pub fn of(server: &McpServerConfig) -> Self {
+        if server.transport == McpTransportKind::Stdio {
+            Self::Stdio
+        } else if server
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("authorization"))
+        {
+            Self::StaticHeader
+        } else if let Some(variable) = &server.bearer_token_env_var {
+            Self::BearerEnvVar(variable.clone())
+        } else {
+            Self::OAuth
+        }
+    }
 }
 
 /// How requests to one remote server authenticate. Every request to the

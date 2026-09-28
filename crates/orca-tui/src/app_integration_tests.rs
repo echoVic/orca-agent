@@ -849,6 +849,7 @@ fn recovery_projection_for_test(
         recoverable_operation_id: Some(operation_id),
         goal_presentation: None,
         session_presentation: None,
+        mcp_catalog: Default::default(),
     }
 }
 
@@ -1759,6 +1760,7 @@ fn stale_attachment_events_do_not_mutate_switched_session() {
             recoverable_operation_id: Some(operation_b.clone()),
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: Default::default(),
         })),
         TuiEvent::TurnStarted {
             turn: 3,
@@ -1815,6 +1817,7 @@ fn stale_attachment_events_do_not_mutate_switched_session() {
             recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation: None,
+            mcp_catalog: Default::default(),
         })),
         TuiEvent::MessageDelta("stale-delta-a".to_string()),
         TuiEvent::SessionCompleted {

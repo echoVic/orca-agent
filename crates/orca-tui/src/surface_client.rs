@@ -19,14 +19,15 @@ use orca_runtime::surface::{
     RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, SessionMetadataPatch,
     SessionMetadataPrecondition, SessionMetadataRevision, Sha256Digest, StaleMutationError,
     SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId,
-    SurfaceClientInteractionAnswer, SurfaceCursor, SurfaceEvent, SurfaceFactFamily, SurfaceGoal,
-    SurfaceGoalFence, SurfaceImageDetail, SurfaceImageSource, SurfaceInputRequest,
-    SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
-    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
-    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceTaskId,
-    SurfaceUnavailableReason, SurfaceWorkflowRunId, TaskControlAction, TaskRevision,
-    TransferBackgroundOutput, UncommittedMutation, WaitOperationTerminalResult,
-    WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
+    SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceCursor, SurfaceEvent,
+    SurfaceFactFamily, SurfaceGoal, SurfaceGoalFence, SurfaceImageDetail, SurfaceImageSource,
+    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceMcpServerAction,
+    SurfaceMcpServerStatus, SurfaceOperationId, SurfacePinnedContextEntry,
+    SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot, SurfaceSnapshot,
+    SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceTaskId, SurfaceUnavailableReason,
+    SurfaceWorkflowRunId, TaskControlAction, TaskRevision, TransferBackgroundOutput,
+    UncommittedMutation, WaitOperationTerminalResult, WorkflowCatalogRevision,
+    WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -463,6 +464,44 @@ pub(crate) fn read_task_transcript(
         Ok(result) => TaskTranscriptResult::from_surface(result),
         Err(_) => TaskTranscriptResult::unavailable("typed task transcript query failed"),
     }
+}
+
+/// Reconnects the thread's MCP server `server` (its config or catalog name)
+/// through the typed surface, and answers with the status the server has
+/// after that. It blocks for the whole reconnect, up to the server's
+/// startup timeout. The new catalog reaches the TUI with the thread's next
+/// projection, not through this answer.
+pub(crate) fn reconnect_mcp_server(
+    thread: &RuntimeSurfaceThreadHandle,
+    server: &str,
+) -> Result<SurfaceMcpServerStatus, String> {
+    const UNAVAILABLE: &str = "the conversation is unavailable";
+    let server = NonEmptyText::try_new(server.to_string())
+        .map_err(|_| "the MCP server has no name".to_string())?;
+    let surface = thread.surface();
+    let AttachResult::FreshAttached { attachment } = surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::ManageThreadSettings,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) else {
+        return Err(UNAVAILABLE.to_string());
+    };
+    let result = attachment.client.mcp_server_control(
+        SurfaceRequestId::new(),
+        server,
+        SurfaceMcpServerAction::Reconnect,
+    );
+    detach(&surface, &attachment.client);
+    result.map_err(|error| match error {
+        SurfaceClientCommandError::RuntimeUnavailable => UNAVAILABLE.to_string(),
+        SurfaceClientCommandError::Unauthorized => {
+            "the TUI may not manage this conversation's MCP servers".to_string()
+        }
+    })
 }
 
 pub(crate) fn rebind_background_presentations(
