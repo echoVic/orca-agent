@@ -431,8 +431,21 @@ impl HttpRequest {
 /// `initialize`/`list_tools`, then a fresh async client for `tools/call` —
 /// and every response here closes its connection (`Connection: close`), so
 /// the client always opens a new one instead of racing a reused, already
-/// -closed socket. The accept loop is non-blocking and polls `stop`, so
-/// dropping the fixture asks it to end promptly.
+/// -closed socket.
+///
+/// Only the *listener* is non-blocking, so the accept loop can poll `stop`
+/// without ever blocking inside `accept()`. Each *accepted* stream is put
+/// back into blocking mode by `serve_one_mcp_http_request` before it reads
+/// anything: on macOS/BSD, a socket `accept()` returns from a non-blocking
+/// listener inherits `O_NONBLOCK` (Linux does not do this — POSIX leaves it
+/// unspecified). Left non-blocking, `set_read_timeout` never gets a chance
+/// to bound anything: the first read on a connection whose request hasn't
+/// arrived yet returns `WouldBlock` at once, the handler gives up with no
+/// response, and the client sees the connection close before an answer —
+/// exactly the "error sending request" `tools/call` reported once every
+/// 10–20 runs of the full five-test file, confirmed by temporarily logging
+/// the read error kind under a stress run (`kind: WouldBlock` on the very
+/// first read, `buffered=0`, os error 35).
 struct HttpMcpFixture {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -453,15 +466,12 @@ impl HttpMcpFixture {
                     Ok((stream, _)) => {
                         thread::spawn(move || serve_one_mcp_http_request(stream));
                     }
-                    // `stop` is the only intended way to end this loop. A
-                    // transient `accept()` failure — `WouldBlock` from the
-                    // non-blocking poll, or a spurious OS-level hiccup such
-                    // as `ECONNABORTED`/`EMFILE` under the heavy concurrent
-                    // load five parallel `orca` subprocesses put on this
-                    // machine — must not tear down the listener: breaking
-                    // here would drop it, refusing every later connection
-                    // (including the fresh one `tools/call` opens) for the
-                    // rest of the test.
+                    // `stop` is the only intended way to end this loop: an
+                    // `accept()` failure — `WouldBlock` from the
+                    // non-blocking poll, or a spurious OS-level hiccup —
+                    // must not tear down the listener. Breaking here would
+                    // drop it, refusing every later connection for the rest
+                    // of the test.
                     Err(_) => {
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -488,6 +498,11 @@ impl Drop for HttpMcpFixture {
 }
 
 fn serve_one_mcp_http_request(mut stream: TcpStream) {
+    // Un-inherit the listener's non-blocking mode before reading — see
+    // `HttpMcpFixture`'s doc comment for why this is load-bearing.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
     let _ = stream.set_read_timeout(Some(HTTP_READ_TIMEOUT));
     let Some(request) = read_http_request(&mut stream) else {
         return;
