@@ -10369,7 +10369,7 @@
   },
   "artifact_bundle": {
     "private_contract_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-    "private_contract_sha256": "64e3306ebf861e3cf4f7e33dc11dd5a35e0646edfba046629471256c9519bdbe",
+    "private_contract_sha256": "9c0e962f336287c41107003c29aa83f4d5f6a91376d91f08b2fdfbab4bffcfb4",
     "parent_design_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md",
     "parent_design_commit": "89979d6062246ec4a9b98032ee62cc6d45c1e3ba",
     "parent_design_blob": "bf80af4ce1fde3607af3fd75874abddfaf79b450",
@@ -13103,6 +13103,7 @@
       "SurfaceHostShutdownStage",
       "SurfaceInputCatalogEntry",
       "SurfaceInputCatalogPage",
+      "SurfaceMcpServerAction",
       "SurfaceMcpServerDeclaration",
       "SurfaceMcpTransport",
       "SurfaceMcpValue",

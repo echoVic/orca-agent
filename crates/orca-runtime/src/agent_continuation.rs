@@ -1191,7 +1191,7 @@ pub(crate) fn compute_continuation_compatibility_hash(
     external_tools: &[ExternalToolConfig],
     frozen_agent: Option<&FrozenAgentConfig>,
 ) -> Result<Sha256Digest, AgentContinuationError> {
-    let mut mcp_tools = mcp_registry.tools().iter().collect::<Vec<_>>();
+    let mut mcp_tools = mcp_registry.tools();
     mcp_tools.sort_by(|left, right| {
         (&left.server, &left.schema_name, &left.name).cmp(&(
             &right.server,
@@ -1336,7 +1336,9 @@ pub(crate) fn compute_resumable_model_compatibility(
     Ok((canonical_model, canonical_hash))
 }
 
-fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+pub(crate) fn canonical_json_bytes(
+    value: &serde_json::Value,
+) -> Result<Vec<u8>, serde_json::Error> {
     fn write_value(
         output: &mut Vec<u8>,
         value: &serde_json::Value,

@@ -2058,9 +2058,13 @@ pub struct GoalPatchEnvelope {
 pub enum SurfaceMcpServerStatus {
     Starting,
     Ready,
-    Degraded { message: DisplayText },
+    Degraded {
+        message: DisplayText,
+    },
     Stopped,
     Disabled,
+    /// The server wants the user to log in before it can connect.
+    AuthRequired,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2071,6 +2075,9 @@ pub struct SurfaceMcpTool {
     pub schema_name: NonEmptyText,
     pub description: Option<DisplayText>,
     pub input_schema: SurfaceSchema,
+    /// The server declared the tool read-only and not destructive.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -3555,6 +3555,111 @@ impl ThreadActor {
         ))
     }
 
+    /// Publishes the MCP catalog the session's registry stands for, unless
+    /// the surface already shows it.
+    pub(super) fn publish_mcp_catalog(&mut self) -> Result<(), surface::SurfaceClientCommandError> {
+        if self.resident_surface.0.is_none() {
+            return Ok(());
+        }
+        let current = &self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .mcp_catalog;
+        let Some(snapshot) =
+            crate::mcp_catalog::next_mcp_catalog(&self.handle.mcp_registry, current)
+        else {
+            return Ok(());
+        };
+        let previous_revision = current.revision;
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![(
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::McpCatalog(surface::McpCatalogPatch::Reconciled {
+                    previous_revision,
+                    snapshot,
+                }),
+            )],
+            None,
+        );
+        self.commit_surface_actor_batch_with_retry(&batch)
+    }
+
+    /// Acts on one of the session's MCP servers for a client that may change
+    /// the thread's settings. A reconnect runs on a worker thread: it can
+    /// take the server's whole startup timeout, and a remote server is
+    /// reached with a blocking client that must stay off the actor's
+    /// runtime. The worker hands the result back to the actor, which then
+    /// answers `reply`.
+    pub(super) fn control_surface_mcp_server(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        server: surface::NonEmptyText,
+        action: surface::SurfaceMcpServerAction,
+        reply: McpServerControlReply,
+    ) {
+        if !self.admits_surface_client(client, surface::SurfaceCapability::ManageThreadSettings) {
+            let _ = reply.send(Err(surface::SurfaceClientCommandError::Unauthorized));
+            return;
+        }
+        match action {
+            surface::SurfaceMcpServerAction::Reconnect => {
+                let registry = self.handle.mcp_registry.clone();
+                // A weak sender: a pending reconnect must not keep a closed
+                // thread's mailbox open.
+                let command_tx = self.handle.command_tx.downgrade();
+                // When the worker cannot start, or the actor is gone by the
+                // time it is done, `reply` is dropped, which its caller reads
+                // as the runtime being unavailable.
+                let _ = thread::Builder::new()
+                    .name("orca-mcp-reconnect".to_string())
+                    .spawn(move || {
+                        let result = registry.reconnect_server(server.as_str());
+                        if let Some(command_tx) = command_tx.upgrade() {
+                            let _ = send_thread_command_retrying_full(
+                                &command_tx,
+                                ThreadCommand::SurfaceMcpServerReconnected {
+                                    server,
+                                    result,
+                                    reply,
+                                },
+                            );
+                        }
+                    });
+            }
+        }
+    }
+
+    /// Publishes the catalog after `server` was reconnected, and answers
+    /// with the status the catalog gives it. A name no server has is
+    /// answered with the reconnect's error.
+    pub(super) fn finish_surface_mcp_server_reconnect(
+        &mut self,
+        server: &surface::NonEmptyText,
+        result: Result<(), String>,
+    ) -> Result<surface::SurfaceMcpServerStatus, surface::SurfaceClientCommandError> {
+        self.publish_mcp_catalog()?;
+        let canonical = orca_mcp::canonical_server_name(server.as_str());
+        let status = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .mcp_catalog
+            .servers
+            .iter()
+            .find(|(name, _)| name.as_str() == canonical)
+            .map(|(_, status)| status.clone());
+        match (status, result) {
+            (Some(status), _) => Ok(status),
+            (None, Err(error)) => Ok(surface::SurfaceMcpServerStatus::Degraded {
+                message: surface::DisplayText::new(error),
+            }),
+            (None, Ok(())) => Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
+        }
+    }
+
     pub(super) fn pinned_context_mutation(
         &mut self,
         client: &surface::RuntimeSurfaceClientHandle,

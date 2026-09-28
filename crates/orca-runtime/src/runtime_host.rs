@@ -4708,6 +4708,9 @@ enum HostCommand {
     },
 }
 
+type McpServerControlReply =
+    SyncSender<Result<surface::SurfaceMcpServerStatus, surface::SurfaceClientCommandError>>;
+
 enum ThreadCommand {
     PromptQueue {
         action: crate::prompt_queue::PromptQueueAction,
@@ -4921,6 +4924,19 @@ enum ThreadCommand {
                 surface::SurfaceClientCommandError,
             >,
         >,
+    },
+    SurfaceMcpServerControl {
+        client: surface::RuntimeSurfaceClientHandle,
+        server: surface::NonEmptyText,
+        action: surface::SurfaceMcpServerAction,
+        reply: McpServerControlReply,
+    },
+    /// A worker finished reconnecting `server` for `SurfaceMcpServerControl`;
+    /// the actor publishes the catalog and answers the caller.
+    SurfaceMcpServerReconnected {
+        server: surface::NonEmptyText,
+        result: Result<(), String>,
+        reply: McpServerControlReply,
     },
     SurfaceCommitProviderResponse {
         fence: surface::SurfaceOperationFence,
@@ -5541,13 +5557,7 @@ async fn run_host_supervisor(
                 }
                 let task_registry = thread.session().task_registry().clone();
                 let mcp_registry = thread.session().mcp_registry().clone();
-                let mut startup_warnings = thread
-                    .session()
-                    .mcp_registry()
-                    .errors()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>();
+                let mut startup_warnings = thread.session().mcp_registry().errors();
                 if actors.contains_key(&thread_id) {
                     let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
                         message: format!("duplicate runtime thread id: {thread_id}"),
@@ -6631,6 +6641,21 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
             request_id,
             task_id,
             expected_revision,
+            reply,
+        })
+    }
+
+    fn mcp_server_control(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        _request_id: surface::SurfaceRequestId,
+        server: surface::NonEmptyText,
+        action: surface::SurfaceMcpServerAction,
+    ) -> Result<surface::SurfaceMcpServerStatus, surface::SurfaceClientCommandError> {
+        self.dispatch(|reply| ThreadCommand::SurfaceMcpServerControl {
+            client,
+            server,
+            action,
             reply,
         })
     }
@@ -17388,6 +17413,9 @@ impl ThreadActor {
     ) {
         let mut subscription_seal_reason = surface::SurfaceSubscriptionSealReason::ThreadClosed;
         let mut subagent_relay_poll = subagent_relay_poll_interval();
+        // The surface is live: show the MCP servers the session connected.
+        // Should the commit fail, the next reconnect publishes the catalog.
+        let _ = self.publish_mcp_catalog();
         loop {
             if self.active.is_none() {
                 self.resume_recovered_continuation_turns();
@@ -18121,6 +18149,10 @@ impl ThreadActor {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
                 ThreadCommand::SurfaceReadTaskTranscript { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
+                ThreadCommand::SurfaceMcpServerControl { reply, .. }
+                | ThreadCommand::SurfaceMcpServerReconnected { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
                 ThreadCommand::SurfaceCommitProviderResponse { reply, .. } => {
@@ -19098,6 +19130,21 @@ impl ThreadActor {
                 };
                 let _ = reply.send(result);
             }
+            ThreadCommand::SurfaceMcpServerControl {
+                client,
+                server,
+                action,
+                reply,
+            } => {
+                self.control_surface_mcp_server(&client, server, action, reply);
+            }
+            ThreadCommand::SurfaceMcpServerReconnected {
+                server,
+                result,
+                reply,
+            } => {
+                let _ = reply.send(self.finish_surface_mcp_server_reconnect(&server, result));
+            }
             #[cfg(test)]
             ThreadCommand::SurfaceSuspendOperationForTest { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
@@ -19825,6 +19872,21 @@ impl ThreadActor {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
                 let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceMcpServerControl {
+                client,
+                server,
+                action,
+                reply,
+            } => {
+                self.control_surface_mcp_server(&client, server, action, reply);
+            }
+            ThreadCommand::SurfaceMcpServerReconnected {
+                server,
+                result,
+                reply,
+            } => {
+                let _ = reply.send(self.finish_surface_mcp_server_reconnect(&server, result));
             }
             ThreadCommand::SurfaceCommitProviderResponse {
                 fence,
@@ -40192,5 +40254,360 @@ mod tests {
             .expect("second recap caller")
             .expect("second recap reply");
         host.shutdown().expect("shutdown recap host");
+    }
+
+    /// A stdio MCP server that lists the tools in `<dir>/<name>-mcp/tools.json`,
+    /// read each time it starts.
+    #[cfg(unix)]
+    fn catalog_mcp_server(
+        name: &str,
+        dir: &std::path::Path,
+        tools: &str,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        let state = catalog_mcp_server_dir(name, dir);
+        fs::create_dir_all(&state).expect("MCP fixture directory");
+        fs::write(state.join("tools.json"), tools).expect("write the MCP tool list");
+        let script = state.join("server.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+state_dir="$1"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"catalog","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":%s}}\n' "$(cat "$state_dir/tools.json")"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write the MCP fixture");
+        orca_core::mcp_types::McpServerConfig {
+            name: name.to_string(),
+            command: Some("/bin/sh".to_string()),
+            args: vec![
+                script.to_string_lossy().into_owned(),
+                state.to_string_lossy().into_owned(),
+            ],
+            startup_timeout_ms: Some(15_000),
+            tool_timeout_ms: Some(15_000),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn catalog_mcp_server_dir(name: &str, dir: &std::path::Path) -> PathBuf {
+        dir.join(format!("{name}-mcp"))
+    }
+
+    #[cfg(unix)]
+    fn surface_text(value: &str) -> surface::NonEmptyText {
+        surface::NonEmptyText::try_new(value).expect("non-empty surface text")
+    }
+
+    /// The MCP catalog of a fresh attachment, once `ready` accepts it.
+    #[cfg(unix)]
+    fn wait_for_mcp_catalog(
+        surface: &surface::RuntimeSurfaceHandle,
+        ready: impl Fn(&surface::SurfaceMcpCatalogSnapshot) -> bool,
+    ) -> surface::SurfaceMcpCatalogSnapshot {
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            let catalog = fresh_surface_attachment_with_capabilities(
+                surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+            .mcp_catalog
+            .clone();
+            if ready(&catalog) {
+                return catalog;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the MCP catalog never reached the expected state: {catalog:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn catalog_tool_names(catalog: &surface::SurfaceMcpCatalogSnapshot) -> Vec<&str> {
+        catalog
+            .tools
+            .iter()
+            .map(|tool| tool.schema_name.as_str())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_mcp_catalog_lists_servers_and_tools_after_start() {
+        use orca_mcp::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
+
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let remote = OAuthTestServer::start(OAuthTestBehavior::default());
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.mcp_servers = vec![
+            catalog_mcp_server(
+                "docs",
+                cwd.path(),
+                r#"[{"name":"lookup","description":"looks a word up","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"the word"}},"required":["word"]},"annotations":{"readOnlyHint":true}},{"name":"update","inputSchema":{"type":"object","properties":{"count":{"type":"integer","minimum":0}}}}]"#,
+            ),
+            remote.config("remote"),
+            orca_core::mcp_types::McpServerConfig {
+                name: "broken".to_string(),
+                command: Some(
+                    cwd.path()
+                        .join("missing-server")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..Default::default()
+            },
+            orca_core::mcp_types::McpServerConfig {
+                name: "off".to_string(),
+                disabled: true,
+                ..Default::default()
+            },
+        ];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp catalog")
+            .expect("start the thread");
+
+        let catalog = wait_for_mcp_catalog(&thread.surface(), |catalog| catalog.revision.get() > 1);
+
+        let broken = thread
+            .mcp_registry()
+            .errors()
+            .into_iter()
+            .find(|error| error.starts_with("failed to start MCP server 'broken'"))
+            .expect("the broken server's error");
+        assert_eq!(
+            catalog.servers,
+            [
+                (surface_text("docs"), surface::SurfaceMcpServerStatus::Ready),
+                (
+                    surface_text("remote"),
+                    surface::SurfaceMcpServerStatus::AuthRequired
+                ),
+                (
+                    surface_text("broken"),
+                    surface::SurfaceMcpServerStatus::Degraded {
+                        message: surface::DisplayText::new(broken),
+                    }
+                ),
+                (
+                    surface_text("off"),
+                    surface::SurfaceMcpServerStatus::Disabled
+                ),
+            ]
+        );
+        assert_eq!(
+            catalog.tools,
+            [
+                surface::SurfaceMcpTool {
+                    id: surface::SurfaceCatalogEntryId::try_new("mcp-tool:mcp__docs__lookup")
+                        .unwrap(),
+                    server: surface_text("docs"),
+                    name: surface_text("lookup"),
+                    schema_name: surface_text("mcp__docs__lookup"),
+                    description: Some(surface::DisplayText::new("looks a word up")),
+                    input_schema: surface::SurfaceSchema::Object {
+                        title: None,
+                        description: None,
+                        properties: vec![surface::SurfaceSchemaProperty {
+                            name: surface::DisplayText::new("word"),
+                            required: true,
+                            schema: Box::new(surface::SurfaceSchema::String {
+                                title: None,
+                                description: Some(surface::DisplayText::new("the word")),
+                                enum_values: Vec::new(),
+                                min_length: None,
+                                max_length: None,
+                            }),
+                        }],
+                        additional_properties: (),
+                    },
+                    read_only: true,
+                },
+                surface::SurfaceMcpTool {
+                    id: surface::SurfaceCatalogEntryId::try_new("mcp-tool:mcp__docs__update")
+                        .unwrap(),
+                    server: surface_text("docs"),
+                    name: surface_text("update"),
+                    schema_name: surface_text("mcp__docs__update"),
+                    description: None,
+                    input_schema: surface::SurfaceSchema::Object {
+                        title: None,
+                        description: None,
+                        properties: vec![surface::SurfaceSchemaProperty {
+                            name: surface::DisplayText::new("count"),
+                            required: false,
+                            schema: Box::new(surface::SurfaceSchema::Integer {
+                                title: None,
+                                description: None,
+                                minimum: Some(surface::SurfaceSchemaInteger::non_negative(0)),
+                                maximum: None,
+                                enum_values: Vec::new(),
+                            }),
+                        }],
+                        additional_properties: (),
+                    },
+                    read_only: false,
+                },
+            ]
+        );
+        assert!(catalog.resources.is_empty());
+        assert!(catalog.resource_templates.is_empty());
+        assert!(catalog.diagnostics.is_empty());
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnect_updates_the_catalog() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.mcp_servers = vec![catalog_mcp_server(
+            "docs",
+            cwd.path(),
+            r#"[{"name":"before","inputSchema":{"type":"object"}}]"#,
+        )];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp reconnect")
+            .expect("start the thread");
+        let surface = thread.surface();
+        let started = wait_for_mcp_catalog(&surface, |catalog| !catalog.tools.is_empty());
+        assert_eq!(catalog_tool_names(&started), ["mcp__docs__before"]);
+
+        // Reconnecting takes the right to change the thread's settings.
+        let reader = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        );
+        assert_eq!(
+            reader.client.mcp_server_control(
+                surface_request_id(),
+                surface_text("docs"),
+                surface::SurfaceMcpServerAction::Reconnect,
+            ),
+            Err(surface::SurfaceClientCommandError::Unauthorized)
+        );
+
+        fs::write(
+            catalog_mcp_server_dir("docs", cwd.path()).join("tools.json"),
+            r#"[{"name":"after","inputSchema":{"type":"object"}}]"#,
+        )
+        .expect("change the server's tools");
+        let manager = fresh_surface_attachment(&surface);
+        let status = manager
+            .client
+            .mcp_server_control(
+                surface_request_id(),
+                surface_text("docs"),
+                surface::SurfaceMcpServerAction::Reconnect,
+            )
+            .expect("reconnect the server");
+        assert_eq!(status, surface::SurfaceMcpServerStatus::Ready);
+
+        let catalog = wait_for_mcp_catalog(&surface, |catalog| catalog.revision > started.revision);
+        assert_eq!(catalog.revision.get(), started.revision.get() + 1);
+        assert_eq!(catalog_tool_names(&catalog), ["mcp__docs__after"]);
+        assert_eq!(
+            catalog.servers,
+            [(surface_text("docs"), surface::SurfaceMcpServerStatus::Ready)]
+        );
+
+        // A name no server has changes nothing.
+        let unknown = manager
+            .client
+            .mcp_server_control(
+                surface_request_id(),
+                surface_text("nope"),
+                surface::SurfaceMcpServerAction::Reconnect,
+            )
+            .expect("reconnect an unknown server");
+        assert_eq!(
+            unknown,
+            surface::SurfaceMcpServerStatus::Degraded {
+                message: surface::DisplayText::new("no MCP server named 'nope'"),
+            }
+        );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_next_request_sees_reconnected_tools() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.mcp_servers = vec![catalog_mcp_server(
+            "docs",
+            cwd.path(),
+            r#"[{"name":"before","inputSchema":{"type":"object"}}]"#,
+        )];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config.clone(), "mcp next request")
+            .expect("start the thread");
+        // What each turn builds its provider request from.
+        let registry = thread.mcp_registry();
+        let requested_mcp_tools = || {
+            crate::tool_invocation::provider_config_for_agent_loop(
+                &config,
+                0,
+                &orca_core::subagent_types::SubagentType::General,
+                crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
+                &registry,
+            )
+            .tools_override
+            .expect("the provider gets a tool list")
+            .into_iter()
+            .map(|tool| tool.name)
+            .filter(|name| name.starts_with("mcp__"))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(requested_mcp_tools(), ["mcp__docs__before"]);
+
+        fs::write(
+            catalog_mcp_server_dir("docs", cwd.path()).join("tools.json"),
+            r#"[{"name":"after","inputSchema":{"type":"object"}}]"#,
+        )
+        .expect("change the server's tools");
+        fresh_surface_attachment(&thread.surface())
+            .client
+            .mcp_server_control(
+                surface_request_id(),
+                surface_text("docs"),
+                surface::SurfaceMcpServerAction::Reconnect,
+            )
+            .expect("reconnect the server");
+
+        assert_eq!(requested_mcp_tools(), ["mcp__docs__after"]);
+        let tools = orca_tools::registry::tool_registry_with_mcp_and_external(Some(&registry), &[]);
+        assert!(tools.resolve("mcp__docs__after").is_some());
+        assert!(tools.resolve("mcp__docs__before").is_none());
+        host.shutdown().expect("shutdown runtime host");
     }
 }

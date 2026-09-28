@@ -1,12 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use serde_json::Value;
 
+use crate::auth::is_auth_required;
 use crate::legacy_sse::MCP_SSE_EVENT_STREAM_CLOSED;
 use crate::transport::{self, McpElicitationHandler, McpTransport};
+use orca_core::config::mcp_credentials::mcp_credentials_path;
 use orca_core::conversation::ImageInput;
 use orca_core::mcp_types::{
     CallToolResult, McpContent, McpResource, McpResourceTemplate, McpServerConfig, McpTool,
@@ -15,17 +17,64 @@ use orca_core::mcp_types::{
 };
 use orca_core::tool_images::tool_image;
 
+/// The MCP servers of a session and their tools. Clones share one registry,
+/// so a server reconnected through any clone serves every holder's next
+/// call.
 #[derive(Clone, Default)]
 pub struct McpRegistry {
-    inner: Arc<McpRegistryInner>,
+    inner: Arc<RwLock<McpRegistryInner>>,
 }
 
-#[derive(Default)]
+/// How a configured MCP server stands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpServerState {
+    /// Connected, with its tools registered.
+    Ready,
+    /// The last attempt to connect failed.
+    Failed { message: String },
+    /// The server wants the user to log in (`orca mcp login`).
+    NeedsLogin,
+    /// Turned off in the config, so never connected.
+    Disabled,
+}
+
+#[derive(Clone, Default)]
 struct McpRegistryInner {
+    /// Every configured server that has a name, in config order.
+    servers: Vec<McpServerEntry>,
     clients: HashMap<String, Arc<McpClient>>,
+    /// The tools of every server, in config order.
     tools: Vec<McpTool>,
     lookup: HashMap<String, McpToolRef>,
+    /// Problems with the config itself, such as a server without a name.
     errors: Vec<String>,
+    /// Where a connection looks for a stored OAuth login.
+    credentials_path: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct McpServerEntry {
+    /// The canonical name, as in its tools' names.
+    name: String,
+    config: McpServerConfig,
+    state: McpServerState,
+    /// Its registered tools.
+    tools: Vec<McpTool>,
+    /// What went wrong when it was last connected: the failure, or tools
+    /// left out because their names were taken.
+    errors: Vec<String>,
+}
+
+impl McpRegistryInner {
+    /// Rebuilds the registry-wide tool list and lookup from the servers'.
+    fn index_tools(&mut self) {
+        self.tools = self
+            .servers
+            .iter()
+            .flat_map(|server| server.tools.iter().cloned())
+            .collect();
+        self.lookup = tool_lookup(&self.tools);
+    }
 }
 
 struct McpClient {
@@ -102,59 +151,135 @@ impl From<String> for McpRequestError {
 }
 
 pub fn initialize_registry(configs: &[McpServerConfig]) -> McpRegistry {
-    let mut clients = HashMap::new();
-    let mut tools = Vec::new();
-    let mut lookup = HashMap::new();
-    let mut errors = Vec::new();
+    initialize_registry_with_credentials(configs, mcp_credentials_path())
+}
 
-    for config in configs.iter().filter(|config| !config.disabled) {
+/// Connects as [`initialize_registry`] does, reading stored OAuth logins
+/// from `credentials_path`.
+pub(crate) fn initialize_registry_with_credentials(
+    configs: &[McpServerConfig],
+    credentials_path: Option<PathBuf>,
+) -> McpRegistry {
+    let mut inner = McpRegistryInner {
+        credentials_path,
+        ..Default::default()
+    };
+    // Each name belongs to its first enabled server, or else to its first
+    // disabled one.
+    let mut owners: HashMap<String, usize> = HashMap::new();
+    for (index, config) in configs.iter().enumerate() {
         let server_name = sanitize_name(&config.name);
         if server_name.is_empty() {
-            errors.push("skipping MCP server with empty name".to_string());
             continue;
         }
-
-        match connect_server(config, &server_name) {
-            Ok((client, server_tools)) => {
-                for tool in server_tools {
-                    if lookup.contains_key(&tool.schema_name) {
-                        errors.push(format!(
-                            "MCP tool name conflict: '{}' already registered, skipping from '{}'",
-                            tool.schema_name, server_name
-                        ));
-                        continue;
-                    }
-                    lookup.insert(
-                        tool.schema_name.clone(),
-                        McpToolRef {
-                            server: tool.server.clone(),
-                            tool: tool.name.clone(),
-                            schema_name: tool.schema_name.clone(),
-                        },
-                    );
-                    tools.push(tool);
-                }
-                clients.insert(server_name, Arc::new(client));
-            }
-            Err(error) => errors.push(error),
+        let owner = owners.entry(server_name).or_insert(index);
+        if configs[*owner].disabled && !config.disabled {
+            *owner = index;
         }
     }
+    let mut taken = HashSet::new();
+    for (index, config) in configs.iter().enumerate() {
+        let server_name = sanitize_name(&config.name);
+        if server_name.is_empty() {
+            if !config.disabled {
+                inner
+                    .errors
+                    .push("skipping MCP server with empty name".to_string());
+            }
+            continue;
+        }
+        if owners.get(&server_name) != Some(&index) {
+            if !config.disabled {
+                inner.errors.push(format!(
+                    "MCP server name conflict: '{server_name}' already registered, skipping '{}'",
+                    config.name
+                ));
+            }
+            continue;
+        }
+        let mut server = McpServerEntry {
+            name: server_name,
+            config: config.clone(),
+            state: McpServerState::Disabled,
+            tools: Vec::new(),
+            errors: Vec::new(),
+        };
+        if !config.disabled {
+            match connect_server(config, &server.name, inner.credentials_path.clone()) {
+                Ok((client, tools)) => {
+                    server.state = McpServerState::Ready;
+                    server.tools =
+                        take_tool_names(&server.name, tools, &mut taken, &mut server.errors);
+                    inner.clients.insert(server.name.clone(), Arc::new(client));
+                }
+                Err(error) => {
+                    server.state = failed_state(&error);
+                    server.errors.push(error);
+                }
+            }
+        }
+        inner.servers.push(server);
+    }
+    inner.index_tools();
+    McpRegistry::from_inner(inner)
+}
 
-    McpRegistry {
-        inner: Arc::new(McpRegistryInner {
-            clients,
-            tools,
-            lookup,
-            errors,
-        }),
+/// Keeps the tools whose names are not `taken` yet, and takes them. Each
+/// one left out is reported in `errors`.
+fn take_tool_names(
+    server_name: &str,
+    tools: Vec<McpTool>,
+    taken: &mut HashSet<String>,
+    errors: &mut Vec<String>,
+) -> Vec<McpTool> {
+    tools
+        .into_iter()
+        .filter(|tool| {
+            let free = taken.insert(tool.schema_name.clone());
+            if !free {
+                errors.push(format!(
+                    "MCP tool name conflict: '{}' already registered, skipping from '{}'",
+                    tool.schema_name, server_name
+                ));
+            }
+            free
+        })
+        .collect()
+}
+
+fn tool_lookup(tools: &[McpTool]) -> HashMap<String, McpToolRef> {
+    tools
+        .iter()
+        .map(|tool| {
+            (
+                tool.schema_name.clone(),
+                McpToolRef {
+                    server: tool.server.clone(),
+                    tool: tool.name.clone(),
+                    schema_name: tool.schema_name.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The state of a server that could not be connected.
+fn failed_state(error: &str) -> McpServerState {
+    if is_auth_required(error) {
+        McpServerState::NeedsLogin
+    } else {
+        McpServerState::Failed {
+            message: error.to_string(),
+        }
     }
 }
 
 fn connect_server(
     config: &McpServerConfig,
     server_name: &str,
+    credentials_path: Option<PathBuf>,
 ) -> Result<(McpClient, Vec<McpTool>), String> {
-    let transport = transport::connect(config)?;
+    let transport = transport::connect_with_credentials(config, credentials_path)?;
     connect_server_with_transport(config, server_name, transport)
 }
 
@@ -199,29 +324,45 @@ fn connect_server_with_transport(
 }
 
 impl McpRegistry {
+    fn from_inner(inner: McpRegistryInner) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(inner)),
+        }
+    }
+
+    /// The registry as it stands. Never hold the guard across a request to a
+    /// server.
+    fn read(&self) -> RwLockReadGuard<'_, McpRegistryInner> {
+        self.inner.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, McpRegistryInner> {
+        self.inner.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The connected client of `server`.
+    fn client(&self, server: &str) -> Option<Arc<McpClient>> {
+        self.read().clients.get(server).cloned()
+    }
+
+    /// The connected clients that declared resources.
+    fn resource_clients(&self) -> Vec<(String, Arc<McpClient>)> {
+        self.read()
+            .clients
+            .iter()
+            .filter(|(_, client)| client.capabilities.resources)
+            .map(|(name, client)| (name.clone(), Arc::clone(client)))
+            .collect()
+    }
+
     #[cfg(any(test, feature = "test-utils"))]
     pub fn from_tools_for_test(tools: Vec<McpTool>) -> Self {
-        let lookup = tools
-            .iter()
-            .map(|tool| {
-                (
-                    tool.schema_name.clone(),
-                    McpToolRef {
-                        server: tool.server.clone(),
-                        tool: tool.name.clone(),
-                        schema_name: tool.schema_name.clone(),
-                    },
-                )
-            })
-            .collect();
-        Self {
-            inner: Arc::new(McpRegistryInner {
-                clients: HashMap::new(),
-                tools,
-                lookup,
-                errors: Vec::new(),
-            }),
-        }
+        let lookup = tool_lookup(&tools);
+        Self::from_inner(McpRegistryInner {
+            tools,
+            lookup,
+            ..Default::default()
+        })
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -305,14 +446,10 @@ impl McpRegistry {
             );
         }
 
-        Self {
-            inner: Arc::new(McpRegistryInner {
-                clients,
-                tools: Vec::new(),
-                lookup: HashMap::new(),
-                errors: Vec::new(),
-            }),
-        }
+        Self::from_inner(McpRegistryInner {
+            clients,
+            ..Default::default()
+        })
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -336,38 +473,111 @@ impl McpRegistry {
                 )
             })
             .collect();
-        Self {
-            inner: Arc::new(McpRegistryInner {
-                clients,
-                tools: Vec::new(),
-                lookup: HashMap::new(),
-                errors: Vec::new(),
-            }),
-        }
+        Self::from_inner(McpRegistryInner {
+            clients,
+            ..Default::default()
+        })
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     pub fn with_registry_errors_for_test(&self, errors: Vec<String>) -> Self {
-        Self {
-            inner: Arc::new(McpRegistryInner {
-                clients: self.inner.clients.clone(),
-                tools: self.inner.tools.clone(),
-                lookup: self.inner.lookup.clone(),
-                errors,
-            }),
+        let mut inner = self.read().clone();
+        for server in &mut inner.servers {
+            server.errors.clear();
         }
+        inner.errors = errors;
+        Self::from_inner(inner)
     }
 
-    pub fn tools(&self) -> &[McpTool] {
-        &self.inner.tools
+    /// The tools of every connected server, in config order.
+    pub fn tools(&self) -> Vec<McpTool> {
+        self.read().tools.clone()
     }
 
-    pub fn errors(&self) -> &[String] {
-        &self.inner.errors
+    /// What is wrong with the config, then what went wrong when each server
+    /// was last connected.
+    pub fn errors(&self) -> Vec<String> {
+        let inner = self.read();
+        inner
+            .errors
+            .iter()
+            .chain(inner.servers.iter().flat_map(|server| &server.errors))
+            .cloned()
+            .collect()
+    }
+
+    /// Every configured server and how it stands, in config order. Servers
+    /// that failed to connect and disabled servers are listed too.
+    pub fn server_states(&self) -> Vec<(String, McpServerState)> {
+        self.read()
+            .servers
+            .iter()
+            .map(|server| (server.name.clone(), server.state.clone()))
+            .collect()
+    }
+
+    /// Connects `name` again with its saved config, and replaces its client
+    /// and tools with the new ones. When that fails, the server has no
+    /// client or tools until it is reconnected, and its state says why.
+    /// Other servers are left as they are.
+    pub fn reconnect_server(&self, name: &str) -> Result<(), String> {
+        let server_name = sanitize_name(name);
+        let (config, credentials_path) = {
+            let inner = self.read();
+            let server = inner
+                .servers
+                .iter()
+                .find(|server| server.name == server_name)
+                .ok_or_else(|| format!("no MCP server named '{name}'"))?;
+            if server.config.disabled {
+                return Err(format!("MCP server '{name}' is disabled"));
+            }
+            (server.config.clone(), inner.credentials_path.clone())
+        };
+        // Connecting can take up to the startup timeout, so no lock is held.
+        let connected = connect_server(&config, &server_name, credentials_path);
+
+        let mut inner = self.write();
+        let mut taken = inner
+            .servers
+            .iter()
+            .filter(|server| server.name != server_name)
+            .flat_map(|server| server.tools.iter().map(|tool| tool.schema_name.clone()))
+            .collect::<HashSet<_>>();
+        let Some(index) = inner
+            .servers
+            .iter()
+            .position(|server| server.name == server_name)
+        else {
+            return Err(format!("no MCP server named '{name}'"));
+        };
+        let (result, replaced) = match connected {
+            Ok((client, tools)) => {
+                let server = &mut inner.servers[index];
+                server.errors.clear();
+                server.tools = take_tool_names(&server_name, tools, &mut taken, &mut server.errors);
+                server.state = McpServerState::Ready;
+                let replaced = inner.clients.insert(server_name, Arc::new(client));
+                (Ok(()), replaced)
+            }
+            Err(error) => {
+                let server = &mut inner.servers[index];
+                server.state = failed_state(&error);
+                server.tools.clear();
+                server.errors = vec![error.clone()];
+                (Err(error), inner.clients.remove(&server_name))
+            }
+        };
+        inner.index_tools();
+        drop(inner);
+        // Dropping the old client stops its server, which may wait on the
+        // process; the lock is released first.
+        drop(replaced);
+        result
     }
 
     pub fn resolve_tool(&self, schema_name: &str) -> Option<McpToolRef> {
-        self.inner.lookup.get(schema_name).cloned()
+        self.read().lookup.get(schema_name).cloned()
     }
 
     pub fn call_tool(
@@ -517,14 +727,10 @@ impl McpRegistry {
             );
         }
 
-        Self {
-            inner: Arc::new(McpRegistryInner {
-                clients,
-                tools: Vec::new(),
-                lookup: HashMap::new(),
-                errors: Vec::new(),
-            }),
-        }
+        Self::from_inner(McpRegistryInner {
+            clients,
+            ..Default::default()
+        })
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -635,14 +841,10 @@ impl McpRegistry {
             );
         }
 
-        Self {
-            inner: Arc::new(McpRegistryInner {
-                clients,
-                tools: Vec::new(),
-                lookup: HashMap::new(),
-                errors: Vec::new(),
-            }),
-        }
+        Self::from_inner(McpRegistryInner {
+            clients,
+            ..Default::default()
+        })
     }
 
     fn call_tool_inner(
@@ -653,9 +855,7 @@ impl McpRegistry {
         should_cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<McpCallOutput, String> {
         let client = self
-            .inner
-            .clients
-            .get(&tool_ref.server)
+            .client(&tool_ref.server)
             .ok_or_else(|| format!("MCP server '{}' is not connected", tool_ref.server))?;
         let result = client.call_tool(
             &tool_ref.tool,
@@ -718,17 +918,11 @@ impl McpRegistry {
         let clients = match server {
             Some(server) => vec![(
                 server.to_string(),
-                self.inner.clients.get(server).cloned().ok_or_else(|| {
+                self.client(server).ok_or_else(|| {
                     McpRequestError::Failed(format!("MCP server '{server}' is not connected"))
                 })?,
             )],
-            None => self
-                .inner
-                .clients
-                .iter()
-                .filter(|(_, client)| client.capabilities.resources)
-                .map(|(name, client)| (name.clone(), Arc::clone(client)))
-                .collect(),
+            None => self.resource_clients(),
         };
 
         let mut resources = Vec::new();
@@ -763,7 +957,7 @@ impl McpRegistry {
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<McpResourceListing, McpRequestError> {
         let clients = match server {
-            Some(server) => match self.inner.clients.get(server).cloned() {
+            Some(server) => match self.client(server) {
                 Some(client) => vec![(server.to_string(), client)],
                 None => {
                     return Ok(McpResourceListing {
@@ -772,19 +966,13 @@ impl McpRegistry {
                     });
                 }
             },
-            None => self
-                .inner
-                .clients
-                .iter()
-                .filter(|(_, client)| client.capabilities.resources)
-                .map(|(name, client)| (name.clone(), Arc::clone(client)))
-                .collect(),
+            None => self.resource_clients(),
         };
 
         let mut listing = McpResourceListing {
             resources: Vec::new(),
             errors: if server.is_none() {
-                self.inner.errors.clone()
+                self.errors()
             } else {
                 Vec::new()
             },
@@ -833,17 +1021,11 @@ impl McpRegistry {
         let clients = match server {
             Some(server) => vec![(
                 server.to_string(),
-                self.inner.clients.get(server).cloned().ok_or_else(|| {
+                self.client(server).ok_or_else(|| {
                     McpRequestError::Failed(format!("MCP server '{server}' is not connected"))
                 })?,
             )],
-            None => self
-                .inner
-                .clients
-                .iter()
-                .filter(|(_, client)| client.capabilities.resources)
-                .map(|(name, client)| (name.clone(), Arc::clone(client)))
-                .collect(),
+            None => self.resource_clients(),
         };
 
         let mut resource_templates = Vec::new();
@@ -886,7 +1068,7 @@ impl McpRegistry {
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<McpResourceTemplateListing, McpRequestError> {
         let clients = match server {
-            Some(server) => match self.inner.clients.get(server).cloned() {
+            Some(server) => match self.client(server) {
                 Some(client) => vec![(server.to_string(), client)],
                 None => {
                     return Ok(McpResourceTemplateListing {
@@ -895,19 +1077,13 @@ impl McpRegistry {
                     });
                 }
             },
-            None => self
-                .inner
-                .clients
-                .iter()
-                .filter(|(_, client)| client.capabilities.resources)
-                .map(|(name, client)| (name.clone(), Arc::clone(client)))
-                .collect(),
+            None => self.resource_clients(),
         };
 
         let mut listing = McpResourceTemplateListing {
             resource_templates: Vec::new(),
             errors: if server.is_none() {
-                self.inner.errors.clone()
+                self.errors()
             } else {
                 Vec::new()
             },
@@ -953,7 +1129,7 @@ impl McpRegistry {
         uri: &str,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<ReadResourceResult, McpRequestError> {
-        let client = self.inner.clients.get(server).ok_or_else(|| {
+        let client = self.client(server).ok_or_else(|| {
             McpRequestError::Failed(format!("MCP server '{server}' is not connected"))
         })?;
         let result = client.read_resource_or_cancel(uri, should_cancel)?;
@@ -1202,13 +1378,12 @@ done
         let registry = initialize_registry(&[config]);
 
         assert!(registry.errors().is_empty(), "{:?}", registry.errors());
-        let read_tool = registry
-            .tools()
+        let tools = registry.tools();
+        let read_tool = tools
             .iter()
             .find(|tool| tool.name == "read_file")
             .expect("read_file tool");
-        let write_tool = registry
-            .tools()
+        let write_tool = tools
             .iter()
             .find(|tool| tool.name == "write_file")
             .expect("write_file tool");
@@ -1272,20 +1447,14 @@ done
                 )
             })
             .collect();
-        let registry = McpRegistry {
-            inner: Arc::new(McpRegistryInner {
-                clients: HashMap::from([("filtered".to_string(), Arc::new(client))]),
-                tools,
-                lookup,
-                errors: Vec::new(),
-            }),
-        };
+        let registry = McpRegistry::from_inner(McpRegistryInner {
+            clients: HashMap::from([("filtered".to_string(), Arc::new(client))]),
+            tools,
+            lookup,
+            ..Default::default()
+        });
 
-        let names: Vec<&str> = registry
-            .tools()
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect();
+        let names: Vec<String> = registry.tools().into_iter().map(|tool| tool.name).collect();
         assert_eq!(names, vec!["a", "c"]);
     }
 
@@ -1318,10 +1487,10 @@ done
         let order = vec!["mcp__srv__zzz", "mcp__srv__aaa", "mcp__srv__mmm"];
         let registry =
             McpRegistry::from_tools_for_test(order.iter().map(|n| make(n)).collect::<Vec<_>>());
-        let got: Vec<&str> = registry
+        let got: Vec<String> = registry
             .tools()
-            .iter()
-            .map(|tool| tool.schema_name.as_str())
+            .into_iter()
+            .map(|tool| tool.schema_name)
             .collect();
         assert_eq!(got, order);
     }
@@ -1392,35 +1561,33 @@ done
         };
         let active = Arc::new(AtomicBool::new(false));
         let release = Arc::new(AtomicBool::new(false));
-        let registry = McpRegistry {
-            inner: Arc::new(McpRegistryInner {
-                clients: HashMap::from([(
-                    "slow".to_string(),
-                    Arc::new(McpClient {
-                        config: McpServerConfig {
-                            name: "slow".to_string(),
-                            ..Default::default()
-                        },
-                        server_name: "slow".to_string(),
-                        capabilities: McpServerCapabilities::resource_capable_for_test(),
-                        transport: Mutex::new(Box::new(CleanupAwareTransport {
-                            active: Arc::clone(&active),
-                            release: Arc::clone(&release),
-                        })),
-                    }),
-                )]),
-                tools: vec![tool.clone()],
-                lookup: HashMap::from([(
-                    tool.schema_name.clone(),
-                    McpToolRef {
-                        server: tool.server,
-                        tool: tool.name,
-                        schema_name: tool.schema_name,
+        let registry = McpRegistry::from_inner(McpRegistryInner {
+            clients: HashMap::from([(
+                "slow".to_string(),
+                Arc::new(McpClient {
+                    config: McpServerConfig {
+                        name: "slow".to_string(),
+                        ..Default::default()
                     },
-                )]),
-                errors: Vec::new(),
-            }),
-        };
+                    server_name: "slow".to_string(),
+                    capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    transport: Mutex::new(Box::new(CleanupAwareTransport {
+                        active: Arc::clone(&active),
+                        release: Arc::clone(&release),
+                    })),
+                }),
+            )]),
+            tools: vec![tool.clone()],
+            lookup: HashMap::from([(
+                tool.schema_name.clone(),
+                McpToolRef {
+                    server: tool.server,
+                    tool: tool.name,
+                    schema_name: tool.schema_name,
+                },
+            )]),
+            ..Default::default()
+        });
         let tool_ref = registry
             .resolve_tool("mcp__slow__wait")
             .expect("tool ref for slow MCP tool");
@@ -1492,32 +1659,30 @@ done
             input_schema: serde_json::json!({"type": "object"}),
             read_only: false,
         };
-        let registry = McpRegistry {
-            inner: Arc::new(McpRegistryInner {
-                clients: HashMap::from([(
-                    "screen".to_string(),
-                    Arc::new(McpClient {
-                        config: McpServerConfig {
-                            name: "screen".to_string(),
-                            ..Default::default()
-                        },
-                        server_name: "screen".to_string(),
-                        capabilities: McpServerCapabilities::default(),
-                        transport: Mutex::new(Box::new(StaticCallToolTransport { content })),
-                    }),
-                )]),
-                tools: vec![tool.clone()],
-                lookup: HashMap::from([(
-                    tool.schema_name.clone(),
-                    McpToolRef {
-                        server: tool.server,
-                        tool: tool.name,
-                        schema_name: tool.schema_name,
+        let registry = McpRegistry::from_inner(McpRegistryInner {
+            clients: HashMap::from([(
+                "screen".to_string(),
+                Arc::new(McpClient {
+                    config: McpServerConfig {
+                        name: "screen".to_string(),
+                        ..Default::default()
                     },
-                )]),
-                errors: Vec::new(),
-            }),
-        };
+                    server_name: "screen".to_string(),
+                    capabilities: McpServerCapabilities::default(),
+                    transport: Mutex::new(Box::new(StaticCallToolTransport { content })),
+                }),
+            )]),
+            tools: vec![tool.clone()],
+            lookup: HashMap::from([(
+                tool.schema_name.clone(),
+                McpToolRef {
+                    server: tool.server,
+                    tool: tool.name,
+                    schema_name: tool.schema_name,
+                },
+            )]),
+            ..Default::default()
+        });
         let tool_ref = registry
             .resolve_tool("mcp__screen__capture")
             .expect("tool ref for screen capture");
@@ -2033,32 +2198,30 @@ done
             input_schema: serde_json::json!({"type": "object"}),
             read_only: false,
         };
-        let registry = McpRegistry {
-            inner: Arc::new(McpRegistryInner {
-                clients: HashMap::from([(
-                    "prompts".to_string(),
-                    Arc::new(McpClient {
-                        config: McpServerConfig {
-                            name: "prompts".to_string(),
-                            ..Default::default()
-                        },
-                        server_name: "prompts".to_string(),
-                        capabilities: McpServerCapabilities::default(),
-                        transport: Mutex::new(Box::new(ElicitingTransport)),
-                    }),
-                )]),
-                tools: vec![tool.clone()],
-                lookup: HashMap::from([(
-                    tool.schema_name.clone(),
-                    McpToolRef {
-                        server: tool.server,
-                        tool: tool.name,
-                        schema_name: tool.schema_name,
+        let registry = McpRegistry::from_inner(McpRegistryInner {
+            clients: HashMap::from([(
+                "prompts".to_string(),
+                Arc::new(McpClient {
+                    config: McpServerConfig {
+                        name: "prompts".to_string(),
+                        ..Default::default()
                     },
-                )]),
-                errors: Vec::new(),
-            }),
-        };
+                    server_name: "prompts".to_string(),
+                    capabilities: McpServerCapabilities::default(),
+                    transport: Mutex::new(Box::new(ElicitingTransport)),
+                }),
+            )]),
+            tools: vec![tool.clone()],
+            lookup: HashMap::from([(
+                tool.schema_name.clone(),
+                McpToolRef {
+                    server: tool.server,
+                    tool: tool.name,
+                    schema_name: tool.schema_name,
+                },
+            )]),
+            ..Default::default()
+        });
         let tool_ref = registry
             .resolve_tool("mcp__prompts__authorize")
             .expect("tool ref");
@@ -2919,5 +3082,247 @@ done
         );
         let runs = std::fs::read_to_string(state_dir.join("run-count")).expect("run count");
         assert_eq!(runs, "2");
+    }
+
+    /// A stdio server that lists the tools in `<dir>/<name>/tools.json` and
+    /// adds a line to `<dir>/<name>/starts` each time it starts.
+    #[cfg(unix)]
+    fn listing_server_config(name: &str, dir: &std::path::Path, tools: &str) -> McpServerConfig {
+        let state = dir.join(name);
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::write(state.join("tools.json"), tools).expect("write the tool list");
+        let script = dir.join(format!("{name}.sh"));
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+state_dir="$1"
+printf 'start\n' >> "$state_dir/starts"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"listing","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":%s}}\n' "$(cat "$state_dir/tools.json")"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let mut config = stdio_fixture_config(name, &script);
+        config.args.push(state.to_string_lossy().into_owned());
+        config
+    }
+
+    #[cfg(unix)]
+    fn starts(dir: &std::path::Path, name: &str) -> usize {
+        std::fs::read_to_string(dir.join(name).join("starts"))
+            .expect("read the start log")
+            .lines()
+            .count()
+    }
+
+    fn schema_names(registry: &McpRegistry) -> Vec<String> {
+        registry
+            .tools()
+            .into_iter()
+            .map(|tool| tool.schema_name)
+            .collect()
+    }
+
+    /// A stdio server whose command does not exist.
+    fn missing_server_config(name: &str, dir: &std::path::Path) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            command: Some(dir.join("missing-server").to_string_lossy().into_owned()),
+            startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnecting_a_server_replaces_only_its_tools() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let first = listing_server_config(
+            "first",
+            temp_dir.path(),
+            r#"[{"name":"old_tool","inputSchema":{"type":"object"}}]"#,
+        );
+        let second = listing_server_config(
+            "second",
+            temp_dir.path(),
+            r#"[{"name":"stable","inputSchema":{"type":"object"}}]"#,
+        );
+        let registry = initialize_registry(&[first, second]);
+        assert!(registry.errors().is_empty(), "{:?}", registry.errors());
+        assert_eq!(
+            schema_names(&registry),
+            ["mcp__first__old_tool", "mcp__second__stable"]
+        );
+        // A tool registry holds a clone; it must see the new tools too.
+        let held = registry.clone();
+        std::fs::write(
+            temp_dir.path().join("first").join("tools.json"),
+            r#"[{"name":"new_tool","inputSchema":{"type":"object"}}]"#,
+        )
+        .expect("change the first server's tools");
+
+        registry
+            .reconnect_server("first")
+            .expect("reconnect the first server");
+
+        assert_eq!(
+            schema_names(&held),
+            ["mcp__first__new_tool", "mcp__second__stable"]
+        );
+        assert!(held.resolve_tool("mcp__first__old_tool").is_none());
+        assert!(held.resolve_tool("mcp__first__new_tool").is_some());
+        assert!(held.resolve_tool("mcp__second__stable").is_some());
+        assert_eq!(starts(temp_dir.path(), "first"), 2);
+        assert_eq!(
+            starts(temp_dir.path(), "second"),
+            1,
+            "the second server keeps its connection"
+        );
+        assert_eq!(
+            held.server_states(),
+            [
+                ("first".to_string(), McpServerState::Ready),
+                ("second".to_string(), McpServerState::Ready),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_server_is_listed_with_its_error() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let registry = initialize_registry(&[missing_server_config("broken", temp_dir.path())]);
+
+        let errors = registry.errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("failed to start MCP server 'broken'"),
+            "{errors:?}"
+        );
+        assert_eq!(
+            registry.server_states(),
+            [(
+                "broken".to_string(),
+                McpServerState::Failed {
+                    message: errors[0].clone()
+                }
+            )]
+        );
+
+        let error = registry
+            .reconnect_server("broken")
+            .expect_err("the server's command is still missing");
+        assert!(
+            error.starts_with("failed to start MCP server 'broken'"),
+            "{error}"
+        );
+        assert_eq!(
+            registry.server_states(),
+            [(
+                "broken".to_string(),
+                McpServerState::Failed { message: error }
+            )]
+        );
+        assert!(registry.tools().is_empty());
+    }
+
+    #[test]
+    fn a_server_that_needs_login_reports_needs_login() {
+        use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
+        use orca_core::config::mcp_credentials::{McpCredential, save_mcp_credential};
+
+        let server = OAuthTestServer::start(OAuthTestBehavior {
+            accepted_tokens: vec!["at-stored".to_string()],
+            ..Default::default()
+        });
+        let home = tempfile::tempdir().expect("temp dir");
+        let credentials = home.path().join("mcp-credentials.json");
+        let registry = initialize_registry_with_credentials(
+            &[server.config("docs")],
+            Some(credentials.clone()),
+        );
+
+        assert_eq!(
+            registry.server_states(),
+            [("docs".to_string(), McpServerState::NeedsLogin)]
+        );
+        assert_eq!(
+            registry.errors(),
+            ["MCP server requires login: run 'orca mcp login docs'"]
+        );
+        assert!(registry.tools().is_empty());
+
+        // After `orca mcp login`, a reconnect sends the stored token.
+        save_mcp_credential(
+            &credentials,
+            "docs",
+            &McpCredential {
+                server_url: server.mcp_url(),
+                access_token: "at-stored".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                token_endpoint: format!("{}/token", server.url()),
+                client_id: "configured-client".to_string(),
+                resource: server.mcp_url(),
+                scope: None,
+            },
+        )
+        .expect("store a login");
+        registry
+            .reconnect_server("docs")
+            .expect("reconnect after logging in");
+
+        assert_eq!(
+            registry.server_states(),
+            [("docs".to_string(), McpServerState::Ready)]
+        );
+        assert!(registry.errors().is_empty(), "{:?}", registry.errors());
+        assert_eq!(schema_names(&registry), ["mcp__docs__echo"]);
+    }
+
+    #[test]
+    fn disabled_servers_are_listed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut disabled = missing_server_config("off", temp_dir.path());
+        disabled.disabled = true;
+        let registry =
+            initialize_registry(&[disabled, missing_server_config("broken", temp_dir.path())]);
+
+        let states = registry.server_states();
+        assert_eq!(states.len(), 2, "{states:?}");
+        assert_eq!(states[0], ("off".to_string(), McpServerState::Disabled));
+        assert_eq!(states[1].0, "broken");
+        assert!(
+            matches!(states[1].1, McpServerState::Failed { .. }),
+            "{states:?}"
+        );
+        assert_eq!(
+            registry.errors().len(),
+            1,
+            "a disabled server is never started: {:?}",
+            registry.errors()
+        );
+
+        assert_eq!(
+            registry.reconnect_server("off"),
+            Err("MCP server 'off' is disabled".to_string())
+        );
+        assert_eq!(
+            registry.server_states()[0],
+            ("off".to_string(), McpServerState::Disabled)
+        );
+        assert_eq!(
+            registry.reconnect_server("nope"),
+            Err("no MCP server named 'nope'".to_string())
+        );
     }
 }

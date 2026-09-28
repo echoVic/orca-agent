@@ -44,11 +44,11 @@ use super::projection::{
     OperationPatch, PinnedContextPatch, SessionPatch, SettingsPatch, SubagentPatch,
     SurfaceAssistantStream, SurfaceBackgroundOperation, SurfaceContextSnapshot, SurfaceFactFamily,
     SurfaceGoal, SurfaceGoalStoreReceipt, SurfaceItem, SurfaceMcpCatalogSnapshot,
-    SurfaceMcpResource, SurfaceMcpResourceTemplate, SurfaceMcpTool, SurfacePinnedContextEntry,
-    SurfacePinnedContextSnapshot, SurfacePlanSnapshot, SurfaceSessionHealth,
-    SurfaceSettingsSnapshot, SurfaceSubagent, SurfaceTask, SurfaceThreadSnapshot, SurfaceToolView,
-    SurfaceUsageSnapshot, SurfaceWorkflow, TaskPatch, ThreadPersistence, ToolInvocationStarted,
-    ToolPatch, ToolTerminalSource, WorkflowPatch,
+    SurfaceMcpResource, SurfaceMcpResourceTemplate, SurfaceMcpServerStatus, SurfaceMcpTool,
+    SurfacePinnedContextEntry, SurfacePinnedContextSnapshot, SurfacePlanSnapshot,
+    SurfaceSessionHealth, SurfaceSettingsSnapshot, SurfaceSubagent, SurfaceTask,
+    SurfaceThreadSnapshot, SurfaceToolView, SurfaceUsageSnapshot, SurfaceWorkflow, TaskPatch,
+    ThreadPersistence, ToolInvocationStarted, ToolPatch, ToolTerminalSource, WorkflowPatch,
 };
 use super::reducer::canonical_replayability_digest;
 use orca_core::budget::BudgetUsage;
@@ -605,6 +605,14 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         expected_revision: TaskRevision,
     ) -> Result<SurfaceReadResult<TaskTranscriptSnapshot>, SurfaceClientCommandError>;
 
+    fn mcp_server_control(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        server: NonEmptyText,
+        action: SurfaceMcpServerAction,
+    ) -> Result<SurfaceMcpServerStatus, SurfaceClientCommandError>;
+
     fn respond_interaction_by_id(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -1075,6 +1083,21 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .read_task_transcript(self.clone(), request_id, task_id, expected_revision)
+    }
+
+    /// Acts on one of the thread's MCP servers and answers with the status
+    /// it has after that. Reconnecting publishes the new MCP catalog. It
+    /// takes the same right as changing the thread's settings.
+    pub fn mcp_server_control(
+        &self,
+        request_id: SurfaceRequestId,
+        server: NonEmptyText,
+        action: SurfaceMcpServerAction,
+    ) -> Result<SurfaceMcpServerStatus, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .mcp_server_control(self.clone(), request_id, server, action)
     }
 
     pub fn respond_interaction(
@@ -2510,6 +2533,14 @@ pub enum InteractionSelector {
         opaque_request_id: NonEmptyText,
         expected_kind: SurfaceInteractionKind,
     },
+}
+
+/// What to do with one of the thread's MCP servers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SurfaceMcpServerAction {
+    /// Connect the server again with its saved config, for instance after
+    /// `orca mcp login`.
+    Reconnect,
 }
 
 #[derive(Clone, Eq, PartialEq)]

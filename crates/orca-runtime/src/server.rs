@@ -8376,7 +8376,7 @@ rl.on("line", (line) => {
             let startup_warnings = state
                 .threads
                 .thread(&thread_id)
-                .map(|thread| thread.mcp_registry.errors().to_vec())
+                .map(|thread| thread.mcp_registry.errors())
                 .unwrap_or_default();
 
             handle_line(

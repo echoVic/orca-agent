@@ -457,7 +457,7 @@ pub fn tool_registry_with_mcp_and_external(
     }
     if let Some(mcp_registry) = mcp_registry {
         for tool in mcp_registry.tools() {
-            registry.register(McpProxyTool::new(tool.clone()));
+            registry.register(McpProxyTool::new(tool));
         }
     }
     registry

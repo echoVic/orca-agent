@@ -4091,7 +4091,7 @@ Any other reason/state/terminal combination is `GoalReceiptMismatch`.
 
 ```text
 SurfaceMcpServerStatus = Starting | Ready | Degraded { message: DisplayText }
-                         | Stopped | Disabled
+                         | Stopped | Disabled | AuthRequired
 
 SurfaceMcpTool {
   id: SurfaceCatalogEntryId,
@@ -4100,6 +4100,7 @@ SurfaceMcpTool {
   schema_name: NonEmptyText,
   description: Option<DisplayText>,
   input_schema: SurfaceSchema,
+  read_only: bool,          // omitted on the wire when false
 }
 
 SurfaceMcpResource {
@@ -4164,6 +4165,36 @@ Diagnostics are sorted by server/kind/source index/code and reveal only a source
 digest, so malformed source is never silently dropped or promoted to binding
 authority. A later valid descriptor removes its diagnostics through the next
 ordinary Reconciled diff.
+
+Runtime builds the catalog from the session's MCP registry and publishes it as
+`Reconciled` once the thread's surface is live, when it differs from the
+catalog the surface already holds, and again after `mcp_server_control`.
+Servers are listed in config order under their canonical names, the ones in
+their tools' names, each with the status of its registry state: connected is
+`Ready`, a failed connection is `Degraded` with the error, a server that needs a
+login is `AuthRequired`, and a disabled one is `Disabled`. Tools are the
+registry's, in config order; the entry id is `mcp-tool:` plus the schema name,
+and `read_only` repeats the server's declaration (`readOnlyHint` without
+`destructiveHint`). An object schema without `additionalProperties`, or with it
+`false`, is carried closed; any other `additionalProperties` makes that level
+`Unsupported`. Resources and resource templates are not listed yet.
+
+```text
+SurfaceMcpServerAction = Reconnect
+
+RuntimeSurfaceClientHandle::mcp_server_control(
+  request_id: SurfaceRequestId,
+  server: NonEmptyText,
+  action: SurfaceMcpServerAction,
+) -> Result<SurfaceMcpServerStatus, SurfaceClientCommandError>
+```
+
+`mcp_server_control` is a client-handle command outside the closed
+`SurfaceCommand` inventory. It needs `ManageThreadSettings`, as
+`update_settings` does. `Reconnect` connects the server again with its saved
+config on a worker thread, so the actor stays responsive meanwhile, then
+publishes the catalog and answers with the status the catalog gives the server.
+A name no server has is answered with `Degraded` carrying the error.
 
 ```text
 SurfacePinnedContextEntry {

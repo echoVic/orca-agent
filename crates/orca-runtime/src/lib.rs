@@ -47,6 +47,7 @@ mod image_routing;
 pub mod instructions;
 mod investigation_convergence;
 pub mod lifecycle;
+mod mcp_catalog;
 pub mod memory;
 pub mod mentions;
 pub mod model_response;
@@ -278,9 +279,9 @@ pub mod surface {
         SurfaceLegacyMentionKind, SurfaceLegacyMentionTarget, SurfaceLegacyPath, SurfaceLegacyUri,
         SurfaceMcpCatalogDiagnostic, SurfaceMcpCatalogDiagnosticCode, SurfaceMcpCatalogEntryKind,
         SurfaceMcpCatalogSnapshot, SurfaceMcpElicitationDecision, SurfaceMcpElicitationRequest,
-        SurfaceMcpResource, SurfaceMcpResourceTemplate, SurfaceMcpServerDeclaration,
-        SurfaceMcpServerStatus, SurfaceMcpTool, SurfaceMcpTransport, SurfaceMcpValue,
-        SurfaceMemoryReceipt, SurfaceMutationError, SurfaceMutationErrorCode,
+        SurfaceMcpResource, SurfaceMcpResourceTemplate, SurfaceMcpServerAction,
+        SurfaceMcpServerDeclaration, SurfaceMcpServerStatus, SurfaceMcpTool, SurfaceMcpTransport,
+        SurfaceMcpValue, SurfaceMemoryReceipt, SurfaceMutationError, SurfaceMutationErrorCode,
         SurfaceMutationRevision, SurfaceNetworkDomainAccess, SurfaceNetworkDomainPermission,
         SurfaceNetworkPermissions, SurfaceOperationCompletionProof, SurfaceOperationFence,
         SurfaceOperationId, SurfacePageLimit, SurfacePermissionClientDecision,
