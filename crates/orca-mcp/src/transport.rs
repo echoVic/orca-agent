@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
@@ -11,6 +10,8 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+use reqwest::StatusCode;
+use reqwest::header::{ACCEPT, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use orca_core::capability::{CapabilityReceipt, EnforcementState};
@@ -26,6 +27,19 @@ const STDIO_RESPONSE_QUEUE_CAPACITY: usize = 8;
 pub(crate) const MAX_STDIO_RESPONSE_LINE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SSE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// The MCP protocol version Orca asks for when it initializes a server.
+pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+/// The MCP protocol versions Orca speaks, newest first. A server may answer
+/// `initialize` with any of them.
+pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// A streamable HTTP POST accepts both ways a server may answer it.
+const HTTP_ACCEPT: &str = "application/json, text/event-stream";
+const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+/// How long the DELETE that ends a dropped transport's session may take.
+const HTTP_SESSION_END_TIMEOUT: Duration = Duration::from_secs(2);
+
 struct SseElicitationEnvelope {
     request: Value,
     response: tokio::sync::oneshot::Sender<Value>,
@@ -33,7 +47,8 @@ struct SseElicitationEnvelope {
 
 struct SseRequestContext {
     endpoint: String,
-    headers: HashMap<String, String>,
+    /// Every header the request carries: configured, protocol, and session.
+    headers: HeaderMap,
     id: u64,
     method: String,
     timeout: Duration,
@@ -147,10 +162,51 @@ pub trait McpTransport: Send + Sync {
 pub fn connect(config: &McpServerConfig) -> Result<Box<dyn McpTransport>, String> {
     match config.transport {
         McpTransportKind::Stdio => Ok(Box::new(StdioTransport::start(config)?)),
-        // Streamable HTTP does not have its own transport yet; it reuses the
-        // SSE transport until a dedicated one lands.
-        McpTransportKind::Sse | McpTransportKind::Http => Ok(Box::new(SseTransport::new(config)?)),
+        // Orca's `sse` transport has always POSTed each message, so servers
+        // configured that way are reached over streamable HTTP as well.
+        McpTransportKind::Sse | McpTransportKind::Http => {
+            Ok(Box::new(StreamableHttpTransport::new(config)?))
+        }
     }
+}
+
+/// The `initialize` parameters: the protocol version Orca asks for, and who
+/// it is.
+fn initialize_params() -> Value {
+    json!({
+        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "capabilities": {},
+        "clientInfo": {
+            "name": "orca",
+            "version": env!("CARGO_PKG_VERSION")
+        }
+    })
+}
+
+/// Checks the protocol version a server answered `initialize` with. Returns
+/// it when Orca speaks it, or `None` when the server did not name one.
+fn negotiated_protocol_version(
+    server_name: &str,
+    initialize_result: &Value,
+) -> Result<Option<&'static str>, String> {
+    let Some(version) = initialize_result
+        .get("protocolVersion")
+        .filter(|version| !version.is_null())
+    else {
+        return Ok(None);
+    };
+    SUPPORTED_MCP_PROTOCOL_VERSIONS
+        .into_iter()
+        .find(|supported| version.as_str() == Some(*supported))
+        .map(Some)
+        .ok_or_else(|| {
+            let version = version
+                .as_str()
+                .map_or_else(|| version.to_string(), str::to_string);
+            format!(
+                "MCP server '{server_name}' requires protocol version {version}, which Orca does not support"
+            )
+        })
 }
 
 struct StdioTransport {
@@ -326,18 +382,12 @@ impl McpTransport for StdioTransport {
     fn initialize(&self) -> Result<Value, String> {
         let result = self.request_with_timeout(
             "initialize",
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "orca",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
+            initialize_params(),
             self.startup_timeout,
             None,
             None,
         )?;
+        negotiated_protocol_version(&self.server_name, &result)?;
         self.notify("notifications/initialized", json!({}))?;
         Ok(result)
     }
@@ -803,26 +853,106 @@ fn kill_process_group(pid: u32) {
     }
 }
 
-struct SseTransport {
+/// Talks to a remote MCP server over streamable HTTP: each message is a POST
+/// to one endpoint, and the server answers with JSON or an SSE stream.
+struct StreamableHttpTransport {
     server_name: String,
     endpoint: String,
-    headers: HashMap<String, String>,
+    /// The configured headers, checked once when the transport is created.
+    headers: HeaderMap,
+    session: Mutex<HttpSession>,
     next_id: Mutex<u64>,
     client: reqwest::blocking::Client,
     startup_timeout: Duration,
     tool_timeout: Duration,
 }
 
-impl SseTransport {
+/// What `initialize` agreed with the server.
+#[derive(Clone, Default)]
+struct HttpSession {
+    /// The `Mcp-Session-Id` the server assigned, when it uses sessions.
+    id: Option<HeaderValue>,
+    /// The protocol version the server answered with.
+    protocol_version: Option<&'static str>,
+}
+
+/// Why a streamable HTTP request failed.
+#[derive(Debug)]
+enum HttpRequestError {
+    /// The server answered with an error status, which `message` names, as
+    /// in "failed with 405 Method Not Allowed".
+    Status {
+        status: StatusCode,
+        /// Whether the request carried an `Mcp-Session-Id`.
+        in_session: bool,
+        message: String,
+    },
+    /// Any other failure, already worded for the user.
+    Failed(String),
+}
+
+impl HttpRequestError {
+    fn status(context: &SseRequestContext, status: StatusCode) -> Self {
+        Self::Status {
+            status,
+            in_session: context.headers.contains_key(MCP_SESSION_ID_HEADER),
+            message: format!("MCP SSE request '{}' failed with {status}", context.method),
+        }
+    }
+
+    /// Whether the server has ended the session the request carried: it
+    /// answers 404 to a session ID it no longer knows.
+    fn ended_session(&self) -> bool {
+        matches!(
+            self,
+            Self::Status { status, in_session: true, .. } if *status == StatusCode::NOT_FOUND
+        )
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Status { message, .. } | Self::Failed(message) => message,
+        }
+    }
+}
+
+impl From<String> for HttpRequestError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl StreamableHttpTransport {
     fn new(config: &McpServerConfig) -> Result<Self, String> {
         let endpoint = config
             .url
             .clone()
             .ok_or_else(|| format!("MCP SSE server '{}' is missing url", config.name))?;
+        let mut headers = HeaderMap::new();
+        for (name, value) in &config.headers {
+            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                format!(
+                    "MCP server '{}' has an invalid header name '{name}'",
+                    config.name
+                )
+            })?;
+            let header_value = HeaderValue::from_str(value).map_err(|_| {
+                format!(
+                    "MCP server '{}' has an invalid value for header '{name}'",
+                    config.name
+                )
+            })?;
+            headers.append(header_name, header_value);
+        }
+        // The session and its protocol version are the transport's to send:
+        // a new session must start without either.
+        headers.remove(MCP_SESSION_ID_HEADER);
+        headers.remove(MCP_PROTOCOL_VERSION_HEADER);
         Ok(Self {
             server_name: config.name.clone(),
             endpoint,
-            headers: config.headers.clone(),
+            headers,
+            session: Mutex::new(HttpSession::default()),
             next_id: Mutex::new(1),
             client: reqwest::blocking::Client::new(),
             startup_timeout: timeout_from_ms(config.startup_timeout_ms),
@@ -831,22 +961,9 @@ impl SseTransport {
     }
 }
 
-impl McpTransport for SseTransport {
+impl McpTransport for StreamableHttpTransport {
     fn initialize(&self) -> Result<Value, String> {
-        let result = self.request_with_timeout(
-            "initialize",
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "orca",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-            self.startup_timeout,
-        )?;
-        self.notify("notifications/initialized", json!({}), self.startup_timeout)?;
-        Ok(result)
+        self.start_session().map_err(HttpRequestError::into_message)
     }
 
     fn list_tools(&self) -> Result<Value, String> {
@@ -961,13 +1078,81 @@ impl McpTransport for SseTransport {
     }
 }
 
-impl SseTransport {
-    fn notify(&self, method: &str, params: Value, timeout: Duration) -> Result<(), String> {
-        let mut builder = self.client.post(&self.endpoint);
-        for (key, value) in &self.headers {
-            builder = builder.header(key, value);
+impl StreamableHttpTransport {
+    /// Starts a session: sends `initialize` without session headers, keeps the
+    /// session ID and protocol version the server answers with, and sends
+    /// `notifications/initialized` in the new session.
+    ///
+    /// An earlier session stays in place until the server answers. So after a
+    /// failed attempt, the next request carries the ended session again, gets
+    /// 404, and tries once more to start a new one.
+    fn start_session(&self) -> Result<Value, HttpRequestError> {
+        let context = SseRequestContext {
+            endpoint: self.endpoint.clone(),
+            headers: self.request_headers(&HttpSession::default()),
+            id: self.next_request_id()?,
+            method: "initialize".to_string(),
+            timeout: self.startup_timeout,
+        };
+        let (result, response_headers) =
+            request_sse_with_client(&self.client, &context, initialize_params())?;
+        let session_id = response_headers
+            .get(MCP_SESSION_ID_HEADER)
+            .filter(|id| !id.is_empty())
+            .cloned();
+        let protocol_version = match negotiated_protocol_version(&self.server_name, &result) {
+            Ok(version) => version,
+            Err(error) => {
+                // Keep the session, so that dropping the transport ends it.
+                *self.session()? = HttpSession {
+                    id: session_id,
+                    protocol_version: None,
+                };
+                return Err(error.into());
+            }
+        };
+        *self.session()? = HttpSession {
+            id: session_id,
+            protocol_version,
+        };
+        self.notify("notifications/initialized", json!({}), self.startup_timeout)?;
+        Ok(result)
+    }
+
+    fn session(&self) -> Result<std::sync::MutexGuard<'_, HttpSession>, String> {
+        self.session
+            .lock()
+            .map_err(|_| "MCP SSE session lock poisoned".to_string())
+    }
+
+    /// The headers for a request in the current session.
+    fn session_headers(&self) -> Result<HeaderMap, String> {
+        let session = self.session()?.clone();
+        Ok(self.request_headers(&session))
+    }
+
+    /// The configured headers, then the ones the protocol requires, which
+    /// replace any configured value of the same name.
+    fn request_headers(&self, session: &HttpSession) -> HeaderMap {
+        let mut headers = self.headers.clone();
+        headers.insert(ACCEPT, HeaderValue::from_static(HTTP_ACCEPT));
+        if let Some(id) = &session.id {
+            headers.insert(MCP_SESSION_ID_HEADER, id.clone());
         }
-        builder
+        if let Some(version) = session.protocol_version {
+            headers.insert(
+                MCP_PROTOCOL_VERSION_HEADER,
+                HeaderValue::from_static(version),
+            );
+        }
+        headers
+    }
+
+    fn notify(&self, method: &str, params: Value, timeout: Duration) -> Result<(), String> {
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .headers(self.session_headers()?)
             .timeout(timeout)
             .json(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
             .send()
@@ -981,6 +1166,11 @@ impl SseTransport {
                     format!("MCP SSE notify '{method}' failed: {error}")
                 }
             })?;
+        // Servers acknowledge a notification with 202 and no body; some send 200.
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("MCP SSE notify '{method}' failed with {status}"));
+        }
         Ok(())
     }
 
@@ -990,16 +1180,55 @@ impl SseTransport {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
-        let id = self.next_request_id()?;
-        request_sse_with_client(
-            self.client.clone(),
-            self.endpoint.clone(),
-            self.headers.clone(),
-            id,
-            method.to_string(),
-            params,
+        let first = self.post_request(method, params.clone(), timeout);
+        self.retry_in_new_session(first, || self.post_request(method, params, timeout))
+    }
+
+    fn post_request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, HttpRequestError> {
+        let context = SseRequestContext {
+            endpoint: self.endpoint.clone(),
+            headers: self.session_headers()?,
+            id: self.next_request_id()?,
+            method: method.to_string(),
             timeout,
-        )
+        };
+        request_sse_with_client(&self.client, &context, params).map(|(result, _)| result)
+    }
+
+    /// Handles the 404 a server answers once it has ended the session a
+    /// request carried: starts a new session and sends the request once more.
+    fn retry_in_new_session(
+        &self,
+        first: Result<Value, HttpRequestError>,
+        retry: impl FnOnce() -> Result<Value, HttpRequestError>,
+    ) -> Result<Value, String> {
+        match first {
+            Err(error) if error.ended_session() => {}
+            first => return first.map_err(HttpRequestError::into_message),
+        }
+        self.start_session().map_err(|error| {
+            format!(
+                "MCP server '{}' ended its session, and starting a new one failed: {}",
+                self.server_name,
+                error.into_message()
+            )
+        })?;
+        retry().map_err(|error| {
+            if error.ended_session() {
+                format!(
+                    "MCP server '{}' ended its new session too: {}",
+                    self.server_name,
+                    error.into_message()
+                )
+            } else {
+                error.into_message()
+            }
+        })
     }
 
     fn request_with_timeout_or_cancel(
@@ -1010,14 +1239,30 @@ impl SseTransport {
         handler: Option<&dyn McpElicitationHandler>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, String> {
+        let first = self.stream_request(method, params.clone(), timeout, handler, should_cancel);
+        self.retry_in_new_session(first, || {
+            self.stream_request(method, params, timeout, handler, should_cancel)
+        })
+    }
+
+    fn stream_request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        handler: Option<&dyn McpElicitationHandler>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, HttpRequestError> {
         if should_cancel() {
-            return Err("MCP tool call cancelled".to_string());
+            return Err("MCP tool call cancelled".to_string().into());
         }
-        let id = self.next_request_id()?;
-        let endpoint = self.endpoint.clone();
-        let headers = self.headers.clone();
-        let server_name = self.server_name.clone();
-        let method = method.to_string();
+        let context = SseRequestContext {
+            endpoint: self.endpoint.clone(),
+            headers: self.session_headers()?,
+            id: self.next_request_id()?,
+            method: method.to_string(),
+            timeout,
+        };
         let stream_events = method == "tools/call";
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -1027,17 +1272,15 @@ impl SseTransport {
             let result = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|error| format!("failed to start MCP SSE request runtime: {error}"))
+                .map_err(|error| {
+                    HttpRequestError::from(format!(
+                        "failed to start MCP SSE request runtime: {error}"
+                    ))
+                })
                 .and_then(|runtime| {
                     runtime.block_on(request_sse_with_async_client(SseAsyncRequest {
                         client: reqwest::Client::new(),
-                        context: SseRequestContext {
-                            endpoint,
-                            headers,
-                            id,
-                            method,
-                            timeout,
-                        },
+                        context,
                         params,
                         cancel: worker_cancel,
                         stream_events,
@@ -1059,11 +1302,12 @@ impl SseTransport {
                     worker
                         .join()
                         .map_err(|_| "MCP SSE worker panicked before returning".to_string())?;
-                    return Err("MCP SSE worker stopped before returning".to_string());
+                    return Err("MCP SSE worker stopped before returning".to_string().into());
                 }
             }
             if let Ok(envelope) = elicitation_receiver.try_recv() {
-                let response = resolve_sse_elicitation(&server_name, &envelope.request, handler);
+                let response =
+                    resolve_sse_elicitation(&self.server_name, &envelope.request, handler);
                 let _ = envelope.response.send(response);
                 continue;
             }
@@ -1079,7 +1323,9 @@ impl SseTransport {
                 let result = receiver.recv();
                 let joined = worker.join();
                 if joined.is_err() {
-                    return Err("MCP SSE worker panicked during cancellation".to_string());
+                    return Err("MCP SSE worker panicked during cancellation"
+                        .to_string()
+                        .into());
                 }
                 return result
                     .map_err(|_| "MCP SSE worker stopped during cancellation".to_string())?;
@@ -1096,7 +1342,7 @@ impl SseTransport {
                     worker
                         .join()
                         .map_err(|_| "MCP SSE worker panicked before returning".to_string())?;
-                    return Err("MCP SSE worker stopped before returning".to_string());
+                    return Err("MCP SSE worker stopped before returning".to_string().into());
                 }
             }
         }
@@ -1110,6 +1356,31 @@ impl SseTransport {
         let id = *next_id;
         *next_id += 1;
         Ok(id)
+    }
+}
+
+impl Drop for StreamableHttpTransport {
+    /// Ends the server's session, best effort. The DELETE goes out on a
+    /// detached thread because a transport may be dropped on an async runtime
+    /// thread, where a blocking request panics.
+    fn drop(&mut self) {
+        let session = match self.session.get_mut() {
+            Ok(session) => session.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if session.id.is_none() {
+            return;
+        }
+        let request = self
+            .client
+            .delete(&self.endpoint)
+            .headers(self.request_headers(&session))
+            .timeout(HTTP_SESSION_END_TIMEOUT);
+        let _ = std::thread::Builder::new()
+            .name("mcp-http-session-end".to_string())
+            .spawn(move || {
+                let _ = request.send();
+            });
     }
 }
 
@@ -1133,12 +1404,13 @@ fn resolve_sse_elicitation(
     }
 }
 
-async fn request_sse_with_async_client(request: SseAsyncRequest) -> Result<Value, String> {
-    let mut builder = request.client.post(&request.context.endpoint);
-    for (key, value) in &request.context.headers {
-        builder = builder.header(key, value);
-    }
-    let response_future = builder
+async fn request_sse_with_async_client(
+    request: SseAsyncRequest,
+) -> Result<Value, HttpRequestError> {
+    let response_future = request
+        .client
+        .post(&request.context.endpoint)
+        .headers(request.context.headers.clone())
         .timeout(request.context.timeout)
         .json(&json!({
             "jsonrpc": "2.0",
@@ -1165,7 +1437,7 @@ async fn request_sse_with_async_client(request: SseAsyncRequest) -> Result<Value
             }
             _ = tokio::time::sleep(Duration::from_millis(25)) => {
                 if request.cancel.load(Ordering::Acquire) {
-                    return Err("MCP tool call cancelled".to_string());
+                    return Err("MCP tool call cancelled".to_string().into());
                 }
             }
         }
@@ -1173,14 +1445,15 @@ async fn request_sse_with_async_client(request: SseAsyncRequest) -> Result<Value
 
     let status = response.status();
     if !status.is_success() {
-        return Err(format!(
-            "MCP SSE request '{}' failed with {status}",
-            request.context.method
-        ));
+        return Err(HttpRequestError::status(&request.context, status));
     }
     if !request.stream_events {
         let text = read_bounded_async_sse_response(response, &request.cancel).await?;
-        return parse_terminal_sse_message(&text, &request.context.method, request.context.id);
+        return Ok(parse_terminal_sse_message(
+            &text,
+            &request.context.method,
+            request.context.id,
+        )?);
     }
     if response
         .headers()
@@ -1189,15 +1462,19 @@ async fn request_sse_with_async_client(request: SseAsyncRequest) -> Result<Value
         .is_some_and(|value| value.starts_with("application/json"))
     {
         let text = read_bounded_async_sse_response(response, &request.cancel).await?;
-        return parse_terminal_sse_message(&text, &request.context.method, request.context.id);
+        return Ok(parse_terminal_sse_message(
+            &text,
+            &request.context.method,
+            request.context.id,
+        )?);
     }
-    read_sse_stream(
+    Ok(read_sse_stream(
         response,
         &request.cancel,
         request.context,
         request.elicitation_sender,
     )
-    .await
+    .await?)
 }
 
 async fn read_sse_stream(
@@ -1315,7 +1592,7 @@ fn parse_sse_event(event: &[u8]) -> Result<Option<Value>, String> {
 }
 
 fn parse_terminal_sse_message(text: &str, method: &str, request_id: u64) -> Result<Value, String> {
-    let response = parse_sse_or_json_response(text)
+    let response = parse_sse_or_json_response(text, request_id)
         .map_err(|error| format!("invalid MCP SSE response for '{method}': {error}"))?;
     parse_terminal_message(response, method, request_id)
 }
@@ -1337,16 +1614,17 @@ fn parse_terminal_message(response: Value, method: &str, request_id: u64) -> Res
 
 async fn post_sse_message(
     endpoint: &str,
-    headers: &HashMap<String, String>,
+    headers: &HeaderMap,
     message: Value,
     timeout: Duration,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let mut builder = reqwest::Client::new().post(endpoint);
-    for (key, value) in headers {
-        builder = builder.header(key, value);
-    }
-    let response_future = builder.timeout(timeout).json(&message).send();
+    let response_future = reqwest::Client::new()
+        .post(endpoint)
+        .headers(headers.clone())
+        .timeout(timeout)
+        .json(&message)
+        .send();
     tokio::pin!(response_future);
     let response = loop {
         tokio::select! {
@@ -1399,24 +1677,21 @@ async fn read_bounded_async_sse_response(
         .map_err(|error| format!("MCP SSE response was not valid UTF-8: {error}"))
 }
 
+/// Sends one JSON-RPC request and reads its response, which comes back with
+/// the response headers.
 fn request_sse_with_client(
-    client: reqwest::blocking::Client,
-    endpoint: String,
-    headers: HashMap<String, String>,
-    id: u64,
-    method: String,
+    client: &reqwest::blocking::Client,
+    context: &SseRequestContext,
     params: Value,
-    timeout: Duration,
-) -> Result<Value, String> {
-    let mut builder = client.post(&endpoint);
-    for (key, value) in &headers {
-        builder = builder.header(key, value);
-    }
-    let response = builder
-        .timeout(timeout)
+) -> Result<(Value, HeaderMap), HttpRequestError> {
+    let method = &context.method;
+    let response = client
+        .post(&context.endpoint)
+        .headers(context.headers.clone())
+        .timeout(context.timeout)
         .json(&json!({
             "jsonrpc": "2.0",
-            "id": id,
+            "id": context.id,
             "method": method,
             "params": params
         }))
@@ -1425,7 +1700,7 @@ fn request_sse_with_client(
             if error.is_timeout() {
                 format!(
                     "MCP SSE request '{method}' timed out after {}",
-                    format_duration(timeout)
+                    format_duration(context.timeout)
                 )
             } else {
                 format!("MCP SSE request '{method}' failed: {error}")
@@ -1434,10 +1709,12 @@ fn request_sse_with_client(
 
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("MCP SSE request '{method}' failed with {status}"));
+        return Err(HttpRequestError::status(context, status));
     }
+    let headers = response.headers().clone();
     let text = read_bounded_sse_response(response)?;
-    parse_terminal_sse_message(&text, &method, id)
+    let result = parse_terminal_sse_message(&text, method, context.id)?;
+    Ok((result, headers))
 }
 
 fn read_bounded_sse_response(response: reqwest::blocking::Response) -> Result<String, String> {
@@ -1481,21 +1758,29 @@ async fn select_sse_result_or_cancel<T>(
     }
 }
 
-fn parse_sse_or_json_response(text: &str) -> Result<Value, String> {
+/// Reads a JSON body, or an SSE body, where the server's notifications and
+/// requests may come before the response. When no event answers
+/// `request_id`, the last one is returned for the caller to reject.
+fn parse_sse_or_json_response(text: &str, request_id: u64) -> Result<Value, String> {
     if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
         return Ok(value);
     }
 
-    let data = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if data.is_empty() {
-        return Err("response was neither JSON nor SSE data".to_string());
+    let mut events = text.as_bytes();
+    let mut last = None;
+    while !events.is_empty() {
+        let end = sse_event_end(events).unwrap_or(events.len());
+        if let Some(message) = parse_sse_event(&events[..end])? {
+            if message.get("id") == Some(&Value::from(request_id))
+                && message.get("method").is_none()
+            {
+                return Ok(message);
+            }
+            last = Some(message);
+        }
+        events = &events[end..];
     }
-    serde_json::from_str(&data).map_err(|error| error.to_string())
+    last.ok_or_else(|| "response was neither JSON nor SSE data".to_string())
 }
 
 fn timeout_from_ms(timeout_ms: Option<u64>) -> Duration {
@@ -1513,6 +1798,7 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -2868,7 +3154,7 @@ done
                 }
             }
         });
-        let transport = SseTransport::new(&McpServerConfig {
+        let transport = StreamableHttpTransport::new(&McpServerConfig {
             name: "cancel_peer_sse".to_string(),
             transport: McpTransportKind::Sse,
             command: None,
@@ -2912,15 +3198,18 @@ done
         });
 
         let error = request_sse_with_client(
-            reqwest::blocking::Client::new(),
-            server.url(),
-            HashMap::new(),
-            1,
-            "tools/list".to_string(),
+            &reqwest::blocking::Client::new(),
+            &SseRequestContext {
+                endpoint: server.url(),
+                headers: HeaderMap::new(),
+                id: 1,
+                method: "tools/list".to_string(),
+                timeout: Duration::from_secs(2),
+            },
             json!({}),
-            Duration::from_secs(2),
         )
-        .expect_err("oversized SSE response must be rejected");
+        .expect_err("oversized SSE response must be rejected")
+        .into_message();
 
         assert!(
             error.contains("exceeded maximum body size"),
@@ -3262,5 +3551,860 @@ done
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn http_requests_accept_json_and_event_streams() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior::default());
+        for accept in ["*/*", "application/json", "text/event-stream"] {
+            let status = reqwest::blocking::Client::new()
+                .post(server.url())
+                .header("accept", accept)
+                .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+                .send()
+                .expect("probe the streamable HTTP fixture")
+                .status();
+            assert_eq!(status, 406, "the fixture must turn away Accept: {accept}");
+        }
+        let probes = server.requests().len();
+        let transport =
+            connect(&streamable_http_config("accepting", &server)).expect("connect HTTP MCP");
+
+        transport
+            .initialize()
+            .expect("initialize with both response types accepted");
+        transport.list_tools().expect("list tools");
+        transport
+            .call_tool("echo", json!({"text": "hi"}))
+            .expect("call a tool");
+
+        let requests = server.requests().split_off(probes);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.rpc_method().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call"
+            ]
+        );
+        for request in &requests {
+            assert_eq!(
+                request.header_values("accept"),
+                ["application/json, text/event-stream"],
+                "{:?} did not accept both response types",
+                request.rpc_method()
+            );
+        }
+    }
+
+    #[test]
+    fn http_session_id_is_sent_after_initialize() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            sessions: vec!["s1"],
+            ..Default::default()
+        });
+        let transport =
+            connect(&streamable_http_config("sessions", &server)).expect("connect HTTP MCP");
+
+        transport.initialize().expect("initialize");
+        transport.list_tools().expect("list tools in the session");
+        transport
+            .call_tool("echo", json!({"text": "hi"}))
+            .expect("call a tool in the session");
+
+        assert_eq!(
+            server.session_trail(),
+            [
+                "initialize",
+                "notifications/initialized s1",
+                "tools/list s1",
+                "tools/call s1"
+            ]
+        );
+    }
+
+    #[test]
+    fn http_elicitation_replies_carry_the_session() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            protocol_version: "2025-03-26",
+            sessions: vec!["s1"],
+            elicit: true,
+            ..Default::default()
+        });
+        let transport =
+            connect(&streamable_http_config("eliciting", &server)).expect("connect HTTP MCP");
+        transport.initialize().expect("initialize");
+        let handler =
+            RecordingElicitationHandler::new(McpElicitationResponse::accept(json!({"ok": true})));
+
+        let result = transport
+            .call_tool_with_elicitation_handler("echo", json!({}), Some(&handler))
+            .expect("tool result after the elicitation");
+
+        assert_eq!(result["content"][0]["text"], "accept");
+        let reply = server
+            .requests()
+            .into_iter()
+            .find(|request| request.body["id"] == "prompt-1")
+            .expect("the elicitation reply reached the server");
+        assert_eq!(
+            reply.header("accept"),
+            Some("application/json, text/event-stream")
+        );
+        assert_eq!(reply.header("mcp-session-id"), Some("s1"));
+        assert_eq!(reply.header("mcp-protocol-version"), Some("2025-03-26"));
+    }
+
+    #[test]
+    fn http_requests_carry_the_negotiated_protocol_version() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            protocol_version: "2025-03-26",
+            ..Default::default()
+        });
+        let transport =
+            connect(&streamable_http_config("versioned", &server)).expect("connect HTTP MCP");
+
+        let initialized = transport.initialize().expect("initialize");
+        transport.list_tools().expect("list tools");
+        transport
+            .call_tool("echo", json!({"text": "hi"}))
+            .expect("call a tool");
+
+        assert_eq!(initialized["protocolVersion"], "2025-03-26");
+        let requests = server.requests();
+        assert_eq!(requests[0].rpc_method(), Some("initialize"));
+        assert_eq!(requests[0].body["params"]["protocolVersion"], "2025-06-18");
+        assert_eq!(requests[0].header("mcp-protocol-version"), None);
+        assert_eq!(
+            requests[1..]
+                .iter()
+                .map(|request| (request.rpc_method(), request.header("mcp-protocol-version")))
+                .collect::<Vec<_>>(),
+            [
+                (Some("notifications/initialized"), Some("2025-03-26")),
+                (Some("tools/list"), Some("2025-03-26")),
+                (Some("tools/call"), Some("2025-03-26")),
+            ]
+        );
+    }
+
+    #[test]
+    fn http_notifications_accept_202() {
+        for status in [202, 200] {
+            let server = StreamableHttpServer::start(StreamableHttpBehavior {
+                notification_status: status,
+                ..Default::default()
+            });
+            let transport =
+                connect(&streamable_http_config("notified", &server)).expect("connect HTTP MCP");
+
+            transport.initialize().unwrap_or_else(|error| {
+                panic!("a notification answered with {status} failed initialize: {error}")
+            });
+
+            assert_eq!(server.requests_for("notifications/initialized").len(), 1);
+        }
+
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            notification_status: 400,
+            ..Default::default()
+        });
+        let transport =
+            connect(&streamable_http_config("refusing", &server)).expect("connect HTTP MCP");
+        let error = transport
+            .initialize()
+            .expect_err("a refused notification must fail initialize");
+        assert_eq!(
+            error,
+            "MCP SSE notify 'notifications/initialized' failed with 400 Bad Request"
+        );
+    }
+
+    #[test]
+    fn an_expired_http_session_is_reinitialized_once() {
+        // The server ends session s1 as soon as it starts. Both request paths
+        // start session s2 and send the request once more.
+        let (server, transport) = expiring_http_session(vec!["s1"]);
+        let result = transport
+            .call_tool("echo", json!({"text": "again"}))
+            .expect("tool call in the new session");
+        assert_eq!(result["content"][0]["text"], "again");
+        assert_eq!(
+            server.session_trail(),
+            [
+                "initialize",
+                "notifications/initialized s1",
+                "tools/call s1",
+                "initialize",
+                "notifications/initialized s2",
+                "tools/call s2"
+            ]
+        );
+
+        assert!(
+            server
+                .requests_for("initialize")
+                .iter()
+                .all(|request| request.header("mcp-protocol-version").is_none()),
+            "a new session starts without a protocol version header"
+        );
+
+        let (server, transport) = expiring_http_session(vec!["s1"]);
+        let tools = transport
+            .list_tools()
+            .expect("tool list in the new session");
+        assert_eq!(tools["tools"][0]["name"], "echo");
+        assert_eq!(
+            server.session_trail(),
+            [
+                "initialize",
+                "notifications/initialized s1",
+                "tools/list s1",
+                "initialize",
+                "notifications/initialized s2",
+                "tools/list s2"
+            ]
+        );
+
+        // Ended again straight away: one retry, then an error naming the server.
+        let (server, transport) = expiring_http_session(vec!["s1", "s2"]);
+        let error = transport
+            .call_tool("echo", json!({"text": "again"}))
+            .expect_err("a second 404 must fail the call");
+        assert!(
+            error.contains("MCP server 'expiring'") && error.contains("404 Not Found"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(server.requests_for("initialize").len(), 2);
+        assert_eq!(server.requests_for("tools/call").len(), 2);
+    }
+
+    #[test]
+    fn json_and_event_stream_responses_both_work() {
+        for event_stream in [false, true] {
+            let server = StreamableHttpServer::start(StreamableHttpBehavior {
+                sessions: vec!["s1"],
+                event_stream,
+                ..Default::default()
+            });
+            let transport =
+                connect(&streamable_http_config("formats", &server)).expect("connect HTTP MCP");
+            let format = if event_stream { "event stream" } else { "JSON" };
+
+            let initialized = transport
+                .initialize()
+                .unwrap_or_else(|error| panic!("initialize over {format}: {error}"));
+            let tools = transport
+                .list_tools()
+                .unwrap_or_else(|error| panic!("tools/list over {format}: {error}"));
+            let called = transport
+                .call_tool("echo", json!({"text": "hi"}))
+                .unwrap_or_else(|error| panic!("tools/call over {format}: {error}"));
+            let resources = transport
+                .list_resources_or_cancel(&|| false)
+                .unwrap_or_else(|error| panic!("resources/list over {format}: {error}"));
+
+            assert_eq!(initialized["serverInfo"]["name"], "fixture", "{format}");
+            assert_eq!(tools["tools"][0]["name"], "echo", "{format}");
+            assert_eq!(called["content"][0]["text"], "hi", "{format}");
+            assert_eq!(resources, json!({"resources": []}), "{format}");
+        }
+    }
+
+    #[test]
+    fn an_unsupported_protocol_version_is_reported() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            protocol_version: "1999-01-01",
+            ..Default::default()
+        });
+        let transport =
+            connect(&streamable_http_config("future", &server)).expect("connect HTTP MCP");
+
+        let error = transport
+            .initialize()
+            .expect_err("an unsupported protocol version must fail initialize");
+
+        assert_eq!(
+            error,
+            "MCP server 'future' requires protocol version 1999-01-01, which Orca does not support"
+        );
+        assert!(
+            server.requests_for("notifications/initialized").is_empty(),
+            "Orca went on with a protocol version it does not speak"
+        );
+    }
+
+    #[test]
+    fn dropping_an_http_transport_ends_its_session() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            sessions: vec!["s1"],
+            ..Default::default()
+        });
+        let transport =
+            connect(&streamable_http_config("closing", &server)).expect("connect HTTP MCP");
+        transport.initialize().expect("initialize");
+
+        drop(transport);
+
+        let delete = server
+            .wait_for_request(|request| request.method == "DELETE")
+            .expect("dropping the transport ends the session");
+        assert_eq!(delete.header("mcp-session-id"), Some("s1"));
+        assert_eq!(delete.header("mcp-protocol-version"), Some("2025-06-18"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_declares_the_current_protocol_version() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("recording_mcp_server.sh");
+        let recorded = temp_dir.path().join("initialize.json");
+        write_executable_stdio_fixture(
+            &server,
+            r#"#!/bin/sh
+IFS= read -r line
+printf '%s\n' "$line" > "$1"
+printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"recording","version":"1"}}}\n'
+while IFS= read -r line; do :; done
+"#,
+        );
+        let transport = StdioTransport::start(&stdio_test_config(
+            "recording",
+            &server,
+            vec![recorded.to_string_lossy().into_owned()],
+            5_000,
+        ))
+        .expect("connect stdio MCP");
+
+        transport.initialize().expect("initialize MCP");
+
+        let request: Value = serde_json::from_str(
+            &fs::read_to_string(&recorded).expect("read the recorded initialize request"),
+        )
+        .expect("parse the recorded initialize request");
+        assert_eq!(request["method"], "initialize");
+        assert_eq!(request["params"]["protocolVersion"], "2025-06-18");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unsupported_protocol_version_is_reported_by_stdio_servers() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("future_mcp_server.sh");
+        write_executable_stdio_fixture(
+            &server,
+            r#"#!/bin/sh
+IFS= read -r line
+printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1999-01-01","capabilities":{},"serverInfo":{"name":"future","version":"1"}}}\n'
+while IFS= read -r line; do :; done
+"#,
+        );
+        let transport = StdioTransport::start(&stdio_test_config(
+            "future-stdio",
+            &server,
+            Vec::new(),
+            5_000,
+        ))
+        .expect("connect stdio MCP");
+
+        let error = transport
+            .initialize()
+            .expect_err("an unsupported protocol version must fail initialize");
+
+        assert_eq!(
+            error,
+            "MCP server 'future-stdio' requires protocol version 1999-01-01, which Orca does not support"
+        );
+    }
+
+    #[test]
+    fn http_requests_carry_the_configured_headers() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            sessions: vec!["s1"],
+            ..Default::default()
+        });
+        let mut config = streamable_http_config("configured", &server);
+        config.headers = HashMap::from([
+            ("X-Api-Key".to_string(), "k1".to_string()),
+            // The transport sets the protocol headers itself.
+            ("Accept".to_string(), "text/plain".to_string()),
+            ("Mcp-Session-Id".to_string(), "stale".to_string()),
+            ("MCP-Protocol-Version".to_string(), "2024-11-05".to_string()),
+        ]);
+        let transport = connect(&config).expect("connect HTTP MCP");
+
+        transport.initialize().expect("initialize");
+        transport.list_tools().expect("list tools");
+
+        assert_eq!(
+            server.session_trail(),
+            [
+                "initialize",
+                "notifications/initialized s1",
+                "tools/list s1"
+            ]
+        );
+        let requests = server.requests();
+        for request in &requests {
+            assert_eq!(request.header("x-api-key"), Some("k1"));
+            assert_eq!(
+                request.header_values("accept"),
+                ["application/json, text/event-stream"]
+            );
+        }
+        assert_eq!(requests[0].header("mcp-protocol-version"), None);
+        assert_eq!(
+            requests[2].header_values("mcp-protocol-version"),
+            ["2025-06-18"]
+        );
+    }
+
+    #[test]
+    fn invalid_http_headers_are_reported_without_their_values() {
+        let mut config = McpServerConfig {
+            name: "misconfigured".to_string(),
+            transport: McpTransportKind::Http,
+            url: Some("http://127.0.0.1:9".to_string()),
+            ..Default::default()
+        };
+        config.headers = HashMap::from([("Bad Name".to_string(), "secret-1".to_string())]);
+        let Err(error) = connect(&config) else {
+            panic!("an invalid header name must fail to connect");
+        };
+        assert_eq!(
+            error,
+            "MCP server 'misconfigured' has an invalid header name 'Bad Name'"
+        );
+
+        config.headers = HashMap::from([("Authorization".to_string(), "secret-2\n".to_string())]);
+        let Err(error) = connect(&config) else {
+            panic!("an invalid header value must fail to connect");
+        };
+        assert_eq!(
+            error,
+            "MCP server 'misconfigured' has an invalid value for header 'Authorization'"
+        );
+    }
+
+    fn streamable_http_config(name: &str, server: &StreamableHttpServer) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransportKind::Http,
+            url: Some(server.url()),
+            startup_timeout_ms: Some(5_000),
+            tool_timeout_ms: Some(5_000),
+            ..Default::default()
+        }
+    }
+
+    /// A server that ends the listed sessions right after they start, with a
+    /// transport already initialized into the first one.
+    fn expiring_http_session(
+        ended_sessions: Vec<&'static str>,
+    ) -> (StreamableHttpServer, Box<dyn McpTransport>) {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            sessions: vec!["s1", "s2"],
+            ended_sessions,
+            ..Default::default()
+        });
+        let transport =
+            connect(&streamable_http_config("expiring", &server)).expect("connect HTTP MCP");
+        transport.initialize().expect("initialize");
+        (server, transport)
+    }
+
+    /// How long the streamable HTTP fixture waits for a request to arrive.
+    /// Only a failing test waits this long.
+    const FIXTURE_WAIT: Duration = Duration::from_secs(5);
+
+    /// A streamable HTTP MCP server on a local port. Like a real one it turns
+    /// away requests that lack the headers the spec requires, and it records
+    /// every request so a test can check exactly what Orca sent.
+    struct StreamableHttpServer {
+        addr: std::net::SocketAddr,
+        requests: Arc<StdMutex<Vec<HttpExchange>>>,
+        stopped: Arc<AtomicBool>,
+    }
+
+    #[derive(Clone)]
+    struct StreamableHttpBehavior {
+        /// The version the server answers `initialize` with.
+        protocol_version: &'static str,
+        /// The session ID each successive `initialize` hands out. With none,
+        /// the server does not use sessions.
+        sessions: Vec<&'static str>,
+        /// Sessions the server ends right after they are initialized: every
+        /// later request that carries one gets 404.
+        ended_sessions: Vec<&'static str>,
+        /// The status the server acknowledges notifications with.
+        notification_status: u16,
+        /// Answer requests with an SSE stream that carries a log notification
+        /// before the response, instead of a JSON body.
+        event_stream: bool,
+        /// Ask the client a question during `tools/call`, and answer the call
+        /// with the action the client replied with.
+        elicit: bool,
+    }
+
+    impl Default for StreamableHttpBehavior {
+        fn default() -> Self {
+            Self {
+                protocol_version: "2025-06-18",
+                sessions: Vec::new(),
+                ended_sessions: Vec::new(),
+                notification_status: 202,
+                event_stream: false,
+                elicit: false,
+            }
+        }
+    }
+
+    /// One HTTP request the fixture received.
+    #[derive(Clone, Debug)]
+    struct HttpExchange {
+        method: String,
+        /// Header names are lower-cased.
+        headers: Vec<(String, String)>,
+        /// The JSON body, or null when there is none.
+        body: Value,
+    }
+
+    impl HttpExchange {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        }
+
+        fn header_values(&self, name: &str) -> Vec<&str> {
+            self.headers
+                .iter()
+                .filter(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+                .collect()
+        }
+
+        fn rpc_method(&self) -> Option<&str> {
+            self.body.get("method").and_then(Value::as_str)
+        }
+    }
+
+    impl StreamableHttpServer {
+        fn start(behavior: StreamableHttpBehavior) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind streamable HTTP fixture");
+            listener
+                .set_nonblocking(true)
+                .expect("set streamable HTTP fixture nonblocking");
+            let addr = listener
+                .local_addr()
+                .expect("streamable HTTP fixture address");
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            let stopped = Arc::new(AtomicBool::new(false));
+            let log = Arc::clone(&requests);
+            let stop = Arc::clone(&stopped);
+            std::thread::spawn(move || {
+                let initializations = Arc::new(AtomicUsize::new(0));
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let behavior = behavior.clone();
+                            let log = Arc::clone(&log);
+                            let initializations = Arc::clone(&initializations);
+                            std::thread::spawn(move || {
+                                let _ = stream.set_nonblocking(false);
+                                let Some(request) = read_http_exchange(&mut stream) else {
+                                    return;
+                                };
+                                log.lock().expect("fixture log").push(request.clone());
+                                serve_streamable_http(
+                                    &mut stream,
+                                    &request,
+                                    &behavior,
+                                    &log,
+                                    &initializations,
+                                );
+                            });
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                addr,
+                requests,
+                stopped,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn requests(&self) -> Vec<HttpExchange> {
+            self.requests.lock().expect("fixture log").clone()
+        }
+
+        fn requests_for(&self, method: &str) -> Vec<HttpExchange> {
+            self.requests()
+                .into_iter()
+                .filter(|request| request.rpc_method() == Some(method))
+                .collect()
+        }
+
+        /// Each request received, named by its JSON-RPC method and followed
+        /// by the session ID it carried.
+        fn session_trail(&self) -> Vec<String> {
+            self.requests()
+                .iter()
+                .map(|request| {
+                    let method = request.rpc_method().unwrap_or(&request.method);
+                    match request.header("mcp-session-id") {
+                        Some(session) => format!("{method} {session}"),
+                        None => method.to_string(),
+                    }
+                })
+                .collect()
+        }
+
+        fn wait_for_request(
+            &self,
+            matches: impl Fn(&HttpExchange) -> bool,
+        ) -> Option<HttpExchange> {
+            let deadline = Instant::now() + FIXTURE_WAIT;
+            loop {
+                if let Some(request) = self.requests().into_iter().find(|request| matches(request))
+                {
+                    return Some(request);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for StreamableHttpServer {
+        fn drop(&mut self) {
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn serve_streamable_http(
+        stream: &mut TcpStream,
+        request: &HttpExchange,
+        behavior: &StreamableHttpBehavior,
+        log: &StdMutex<Vec<HttpExchange>>,
+        initializations: &AtomicUsize,
+    ) {
+        if request.method == "DELETE" {
+            return write_http_status(stream, 200);
+        }
+        let accept = request.header("accept").unwrap_or_default();
+        if !(accept.contains("application/json") && accept.contains("text/event-stream")) {
+            return write_http_status(stream, 406);
+        }
+        if request
+            .header("mcp-protocol-version")
+            .is_some_and(|version| !["2025-06-18", "2025-03-26", "2024-11-05"].contains(&version))
+        {
+            return write_http_status(stream, 400);
+        }
+        let session = request.header("mcp-session-id");
+        let id = request.body.get("id").cloned();
+        if request.rpc_method() == Some("initialize") {
+            // A new session starts from an initialize request without an ID.
+            if session.is_some() {
+                return write_http_status(stream, 400);
+            }
+            let assigned = behavior
+                .sessions
+                .get(initializations.fetch_add(1, Ordering::SeqCst))
+                .copied();
+            let result = json!({
+                "protocolVersion": behavior.protocol_version,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "fixture", "version": "1"}
+            });
+            return write_rpc_result(stream, behavior, id, result, assigned);
+        }
+        let is_request = id.is_some() && request.rpc_method().is_some();
+        if !behavior.sessions.is_empty() {
+            let Some(session) = session else {
+                return write_http_status(stream, 400);
+            };
+            if !behavior.sessions.contains(&session)
+                || (is_request && behavior.ended_sessions.contains(&session))
+            {
+                return write_http_status(stream, 404);
+            }
+        }
+        if !is_request {
+            let status = if request.rpc_method().is_some() {
+                behavior.notification_status
+            } else {
+                // The client's reply to a request from the server.
+                202
+            };
+            return write_http_status(stream, status);
+        }
+        let result = match request.rpc_method() {
+            Some("tools/list") => json!({"tools": [{
+                "name": "echo",
+                "description": "echoes its text",
+                "inputSchema": {"type": "object"}
+            }]}),
+            Some("tools/call") if behavior.elicit => {
+                return elicit_before_answering(stream, id, log);
+            }
+            Some("tools/call") => json!({
+                "content": [{
+                    "type": "text",
+                    "text": request.body["params"]["arguments"]["text"].clone()
+                }],
+                "isError": false
+            }),
+            Some("resources/list") => json!({"resources": []}),
+            _ => json!({}),
+        };
+        write_rpc_result(stream, behavior, id, result, None);
+    }
+
+    fn write_rpc_result(
+        stream: &mut TcpStream,
+        behavior: &StreamableHttpBehavior,
+        id: Option<Value>,
+        result: Value,
+        session: Option<&str>,
+    ) {
+        let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
+        let session = session
+            .map(|session| format!("mcp-session-id: {session}\r\n"))
+            .unwrap_or_default();
+        let _ = if behavior.event_stream {
+            let log = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {"level": "info", "data": "working"}
+            });
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n{session}connection: close\r\n\r\nevent: message\ndata: {log}\n\nevent: message\ndata: {response}\n\n"
+            )
+        } else {
+            let body = response.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{session}connection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+    }
+
+    /// Streams an `elicitation/create` request, waits for the client's reply
+    /// to reach the server, then answers the call with the replied action.
+    fn elicit_before_answering(
+        stream: &mut TcpStream,
+        id: Option<Value>,
+        log: &StdMutex<Vec<HttpExchange>>,
+    ) {
+        let question = json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-1",
+            "method": "elicitation/create",
+            "params": {"message": "Proceed?", "requestedSchema": {"type": "object"}}
+        });
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nevent: message\ndata: {question}\n\n"
+        );
+        let _ = stream.flush();
+        let deadline = Instant::now() + FIXTURE_WAIT;
+        let action = loop {
+            let reply = log
+                .lock()
+                .expect("fixture log")
+                .iter()
+                .find(|request| request.body["id"] == "prompt-1")
+                .map(|request| request.body["result"]["action"].clone());
+            if let Some(action) = reply {
+                break action;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let answer = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"content": [{"type": "text", "text": action}], "isError": false}
+        });
+        let _ = write!(stream, "event: message\ndata: {answer}\n\n");
+    }
+
+    fn write_http_status(stream: &mut TcpStream, status: u16) {
+        let reason = match status {
+            200 => "OK",
+            202 => "Accepted",
+            400 => "Bad Request",
+            404 => "Not Found",
+            406 => "Not Acceptable",
+            _ => "Unexpected",
+        };
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status} {reason}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+    }
+
+    /// Reads one request without panicking: a fixture thread outlives the
+    /// assertions that would report it.
+    fn read_http_exchange(stream: &mut TcpStream) -> Option<HttpExchange> {
+        stream.set_read_timeout(Some(FIXTURE_WAIT)).ok()?;
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+            let mut lines = head.split("\r\n");
+            let method = lines.next()?.split_whitespace().next()?.to_string();
+            let headers = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+                .collect::<Vec<_>>();
+            let length = headers
+                .iter()
+                .find(|(name, _)| name == "content-length")
+                .and_then(|(_, value)| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let body_start = header_end + 4;
+            if buffer.len() < body_start + length {
+                continue;
+            }
+            let body = serde_json::from_slice(&buffer[body_start..body_start + length])
+                .unwrap_or_default();
+            return Some(HttpExchange {
+                method,
+                headers,
+                body,
+            });
+        }
     }
 }
