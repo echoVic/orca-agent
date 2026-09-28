@@ -58,19 +58,67 @@ pub fn save_mcp_credential(
     server: &str,
     credential: &McpCredential,
 ) -> io::Result<()> {
-    let mut credentials = read_credentials(path)?;
-    credentials.insert(server.to_string(), credential.clone());
-    write_credentials(path, &credentials)
+    LockedMcpCredentials::lock(path)?.save(server, credential)
 }
 
 /// Deletes the credential stored for `server`. Returns whether there was one.
 pub fn delete_mcp_credential(path: &Path, server: &str) -> io::Result<bool> {
-    let mut credentials = read_credentials(path)?;
-    if credentials.remove(server).is_none() {
-        return Ok(false);
+    LockedMcpCredentials::lock(path)?.delete(server)
+}
+
+/// The credentials file, locked against every other writer, in this process
+/// or another, until dropped. The file is rewritten whole, so a writer holds
+/// the lock from the read to the write, or one of two concurrent writers
+/// loses the other's change. Readers need no lock: the file is only ever
+/// replaced whole.
+///
+/// The lock is a file beside the credentials, and it does not nest: while
+/// it is held, write through it rather than through [`save_mcp_credential`]
+/// or [`delete_mcp_credential`], which would wait for it forever.
+pub struct LockedMcpCredentials {
+    path: PathBuf,
+    _lock: orca_platform::fs::ExclusiveFileLock,
+}
+
+impl LockedMcpCredentials {
+    /// Locks the credentials file at `path`, waiting while another writer
+    /// holds it.
+    pub fn lock(path: &Path) -> io::Result<Self> {
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        let lock = orca_platform::fs::ExclusiveFileLock::acquire(&lock_path).map_err(|error| {
+            io::Error::other(format!("locking {}: {error}", lock_path.display()))
+        })?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            _lock: lock,
+        })
     }
-    write_credentials(path, &credentials)?;
-    Ok(true)
+
+    /// The credential stored for `server`, when it was stored for
+    /// `server_url`.
+    pub fn load(&self, server: &str, server_url: &str) -> io::Result<Option<McpCredential>> {
+        load_mcp_credential(&self.path, server, server_url)
+    }
+
+    /// Stores `credential` for `server`, replacing any stored before.
+    pub fn save(&self, server: &str, credential: &McpCredential) -> io::Result<()> {
+        let mut credentials = read_credentials(&self.path)?;
+        credentials.insert(server.to_string(), credential.clone());
+        write_credentials(&self.path, &credentials)
+    }
+
+    /// Deletes the credential stored for `server`. Returns whether there was
+    /// one.
+    pub fn delete(&self, server: &str) -> io::Result<bool> {
+        let mut credentials = read_credentials(&self.path)?;
+        if credentials.remove(server).is_none() {
+            return Ok(false);
+        }
+        write_credentials(&self.path, &credentials)?;
+        Ok(true)
+    }
 }
 
 type Credentials = BTreeMap<String, McpCredential>;
@@ -225,6 +273,66 @@ mod tests {
         save_mcp_credential(&path, "search", &credential("https://search.example/mcp"))
             .expect("save search");
         assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn concurrent_saves_for_different_servers_all_survive() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let path = home.path().join(MCP_CREDENTIALS_FILE);
+        let servers = (0..16)
+            .map(|index| format!("server-{index}"))
+            .collect::<Vec<_>>();
+        let url = |server: &str| format!("https://{server}.example/mcp");
+        let start = std::sync::Barrier::new(servers.len());
+
+        std::thread::scope(|scope| {
+            for server in &servers {
+                let (path, start) = (&path, &start);
+                scope.spawn(move || {
+                    let credential = credential(&url(server));
+                    start.wait();
+                    save_mcp_credential(path, server, &credential).expect("save");
+                });
+            }
+        });
+
+        for server in &servers {
+            assert!(
+                load_mcp_credential(&path, server, &url(server))
+                    .expect("load")
+                    .is_some(),
+                "the credential for {server} was lost"
+            );
+        }
+    }
+
+    #[test]
+    fn a_save_waits_for_whoever_holds_the_lock() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let path = home.path().join(MCP_CREDENTIALS_FILE);
+        let held = LockedMcpCredentials::lock(&path).expect("lock the credentials");
+
+        let saving = std::thread::spawn({
+            let path = path.clone();
+            move || save_mcp_credential(&path, "docs", &credential("https://docs.example/mcp"))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !saving.is_finished(),
+            "a save must wait while another writer holds the lock"
+        );
+        assert_eq!(
+            held.load("docs", "https://docs.example/mcp").expect("load"),
+            None
+        );
+
+        drop(held);
+        saving.join().expect("the saving thread").expect("save");
+        assert!(
+            load_mcp_credential(&path, "docs", "https://docs.example/mcp")
+                .expect("load")
+                .is_some()
+        );
     }
 
     #[test]

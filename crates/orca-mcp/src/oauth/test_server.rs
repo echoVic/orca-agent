@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -44,6 +44,48 @@ pub struct OAuthTestBehavior {
     pub bare_challenge: bool,
     /// Tokens `/mcp` takes besides the ones the token endpoint issues.
     pub accepted_tokens: Vec<String>,
+    /// The token endpoint holds each request until the gate is released.
+    pub hold_token_requests: Option<TokenGate>,
+    /// The authorization server metadata names another issuer.
+    pub wrong_issuer: bool,
+    /// The protected resource metadata names another resource.
+    pub wrong_resource: bool,
+    /// The authorization server metadata names a token endpoint on another
+    /// machine, over plain http.
+    pub insecure_token_endpoint: bool,
+    /// The authorization server supports only the `plain` PKCE method.
+    pub plain_pkce_only: bool,
+    /// The token type the token endpoint issues, instead of `Bearer`.
+    pub token_type: Option<String>,
+}
+
+/// Holds requests until released, so that a test can act while one is in
+/// flight. A held request goes on after [`FIXTURE_WAIT`] regardless.
+#[derive(Clone, Debug, Default)]
+pub struct TokenGate(Arc<(Mutex<bool>, Condvar)>);
+
+impl TokenGate {
+    pub fn release(&self) {
+        let (released, changed) = &*self.0;
+        *lock(released) = true;
+        changed.notify_all();
+    }
+
+    fn wait(&self) {
+        let (released, changed) = &*self.0;
+        let deadline = Instant::now() + FIXTURE_WAIT;
+        let mut guard = lock(released);
+        while !*guard {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            guard = changed
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
 }
 
 /// One request the server received.
@@ -172,6 +214,19 @@ impl OAuthTestServer {
             .collect()
     }
 
+    /// Waits up to [`FIXTURE_WAIT`] for a request to `path`, and says
+    /// whether one arrived.
+    pub fn wait_for_request(&self, path: &str) -> bool {
+        let deadline = Instant::now() + FIXTURE_WAIT;
+        while self.requests_to(path).is_empty() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
     /// Each request received: its method and path.
     pub fn trail(&self) -> Vec<String> {
         self.requests()
@@ -242,11 +297,17 @@ fn serve(mut stream: TcpStream, state: &ServerState, base: &str) {
 }
 
 fn route(state: &ServerState, request: &RecordedRequest, base: &str) -> String {
+    let behavior = &state.behavior;
     let protected_resource = || {
+        let resource = if behavior.wrong_resource {
+            format!("{base}/elsewhere")
+        } else {
+            format!("{base}/mcp")
+        };
         json_response(
             200,
             &json!({
-                "resource": format!("{base}/mcp"),
+                "resource": resource,
                 "authorization_servers": [format!("{base}/tenant")],
                 "scopes_supported": ["mcp.read", "mcp.write"]
             }),
@@ -261,13 +322,22 @@ fn route(state: &ServerState, request: &RecordedRequest, base: &str) -> String {
         ("GET", "/.well-known/oauth-authorization-server/tenant") => json_response(
             200,
             &json!({
-                "issuer": format!("{base}/tenant"),
+                "issuer": if behavior.wrong_issuer {
+                    format!("{base}/elsewhere")
+                } else {
+                    format!("{base}/tenant")
+                },
                 "authorization_endpoint": format!("{base}/authorize"),
-                "token_endpoint": format!("{base}/token"),
+                "token_endpoint": if behavior.insecure_token_endpoint {
+                    "http://auth.example/token".to_string()
+                } else {
+                    format!("{base}/token")
+                },
                 "registration_endpoint": format!("{base}/register"),
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code", "refresh_token"],
-                "code_challenge_methods_supported": ["S256"],
+                "code_challenge_methods_supported":
+                    if behavior.plain_pkce_only { ["plain"] } else { ["S256"] },
                 "token_endpoint_auth_methods_supported": ["none"]
             }),
         ),
@@ -363,6 +433,9 @@ fn authorize(state: &ServerState, request: &RecordedRequest) -> String {
 /// The token endpoint. It issues `at-1` and `rt-1` for the code, when the
 /// verifier matches the challenge by S256, and `at-2` and `rt-2` for `rt-1`.
 fn token(state: &ServerState, request: &RecordedRequest) -> String {
+    if let Some(gate) = &state.behavior.hold_token_requests {
+        gate.wait();
+    }
     let form = request.form();
     let field = |name: &str| form.get(name).map(String::as_str);
     let issued = match field("grant_type") {
@@ -387,7 +460,7 @@ fn token(state: &ServerState, request: &RecordedRequest) -> String {
         200,
         &json!({
             "access_token": access_token,
-            "token_type": "Bearer",
+            "token_type": state.behavior.token_type.as_deref().unwrap_or("Bearer"),
             "expires_in": 3600,
             "refresh_token": refresh_token,
             "scope": "mcp.read mcp.write"

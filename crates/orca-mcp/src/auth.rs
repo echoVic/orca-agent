@@ -19,7 +19,7 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use orca_core::config::mcp_credentials::{McpCredential, load_mcp_credential};
 use orca_core::mcp_types::McpServerConfig;
 
-use crate::oauth::{self, unix_now};
+use crate::oauth::{self, expires_soon};
 use crate::transport::configured_headers;
 
 /// What an error starts with when a remote MCP server needs the user to log
@@ -30,9 +30,6 @@ pub const MCP_AUTH_REQUIRED: &str = "MCP server requires login";
 pub fn is_auth_required(error: &str) -> bool {
     error.starts_with(MCP_AUTH_REQUIRED)
 }
-
-/// A stored token this close to expiring is refreshed before it is sent.
-const REFRESH_MARGIN_SECS: u64 = 60;
 
 /// How requests to one remote server authenticate. Every request to the
 /// server shares it, so a refreshed token serves them all.
@@ -176,29 +173,22 @@ impl StoredLogin {
     }
 
     /// Replaces the token `used` carried, and returns the new one's header.
-    ///
-    /// The stored login is read first, since another request, another Orca,
-    /// or the user may have changed it since this one was loaded. After a
-    /// logout there is nothing to refresh, and nothing is stored again. A
-    /// token stored in place of `used` that is not about to expire is taken
-    /// as it is; otherwise the stored refresh token, the latest one, is
-    /// spent, and the new tokens are stored.
+    /// When another request here has already replaced it, the new one is
+    /// used as it is. Otherwise [`oauth::refresh`] replaces it, under the
+    /// credentials file's lock, seeing any change another Orca or the user
+    /// has made to the stored login.
     fn refresh(&self, used: &HeaderValue) -> Result<HeaderValue, String> {
         let _refreshing = lock(&self.refreshing);
-        let server_url = self.credential().server_url;
-        let stored = load_mcp_credential(&self.credentials_path, &self.config.name, &server_url)
-            .map_err(|error| error.to_string())?
-            .ok_or("the login is no longer stored")?;
-        let stored_header = bearer_header(&stored.access_token)
-            .ok_or("the stored access token is not a valid header value")?;
-        let credential = if stored_header == *used || expires_soon(&stored) {
-            oauth::refresh(&self.config, &self.credentials_path, &stored)?
-        } else {
-            stored
-        };
-        let header = bearer_header(&credential.access_token)
+        let current = self.credential();
+        let current_header = bearer_header(&current.access_token)
+            .ok_or("the access token is not a valid header value")?;
+        if current_header != *used {
+            return Ok(current_header);
+        }
+        let replaced = oauth::refresh(&self.config, &self.credentials_path, &current)?;
+        let header = bearer_header(&replaced.access_token)
             .ok_or("the new access token is not a valid header value")?;
-        *lock(&self.credential) = credential;
+        *lock(&self.credential) = replaced;
         Ok(header)
     }
 }
@@ -242,12 +232,6 @@ fn bearer_header(token: &str) -> Option<HeaderValue> {
     Some(header)
 }
 
-fn expires_soon(credential: &McpCredential) -> bool {
-    credential
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= unix_now().saturating_add(REFRESH_MARGIN_SECS))
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -263,7 +247,7 @@ mod tests {
     use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
 
     use super::*;
-    use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
+    use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer, TokenGate};
     use crate::oauth::unix_now;
     use crate::transport::{McpTransport, connect_with_credentials};
 
@@ -434,6 +418,55 @@ mod tests {
         assert_eq!(
             load_mcp_credential(&credentials, "docs", &server.mcp_url()).expect("read"),
             None
+        );
+    }
+
+    #[test]
+    fn a_logout_during_a_refresh_is_not_undone() {
+        let gate = TokenGate::default();
+        let server = OAuthTestServer::start(OAuthTestBehavior {
+            hold_token_requests: Some(gate.clone()),
+            ..Default::default()
+        });
+        let home = tempfile::tempdir().expect("temp dir");
+        let credentials = credentials_holding(
+            home.path(),
+            &stored_login(&server, "at-expired", Some(unix_now() - 10)),
+        );
+        let transport = connect(&server.config("docs"), Some(credentials.clone()));
+        let initializing = std::thread::spawn(move || transport.initialize());
+        assert!(
+            server.wait_for_request("/token"),
+            "the refresh never reached the token endpoint"
+        );
+
+        // The user logs out while the refresh is in flight.
+        let logging_out = std::thread::spawn({
+            let credentials = credentials.clone();
+            move || delete_mcp_credential(&credentials, "docs")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !logging_out.is_finished(),
+            "the logout must wait for the refresh in flight"
+        );
+        gate.release();
+
+        assert!(
+            logging_out
+                .join()
+                .expect("the logout thread")
+                .expect("log out"),
+            "the logout removes the refreshed login"
+        );
+        initializing
+            .join()
+            .expect("the initializing thread")
+            .expect("initialize with the refreshed token");
+        assert_eq!(
+            load_mcp_credential(&credentials, "docs", &server.mcp_url()).expect("read"),
+            None,
+            "the refresh must not undo the logout"
         );
     }
 

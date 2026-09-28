@@ -14,6 +14,12 @@
 //! 5. the code is exchanged for tokens, which are stored for the transports
 //!    to send, and to refresh with [`refresh`].
 //!
+//! Along the way the metadata must be for this server (RFC 9728 §3.3) and
+//! for the issuer asked (RFC 8414 §3.3); the authorization server must take
+//! S256 when it lists PKCE methods, and use https for its metadata and
+//! endpoints unless it is on this machine; and the tokens must be Bearer
+//! tokens.
+//!
 //! No token is ever part of an error, and a code or token is only ever sent
 //! to the endpoint named, never along a redirect.
 
@@ -32,10 +38,12 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use url::Url;
+use url::{Host, Url};
 use uuid::Uuid;
 
-use orca_core::config::mcp_credentials::{McpCredential, save_mcp_credential};
+use orca_core::config::mcp_credentials::{
+    LockedMcpCredentials, McpCredential, save_mcp_credential,
+};
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
 
 use crate::transport::{HTTP_ACCEPT, configured_headers, initialize_params, timeout_from_ms};
@@ -54,6 +62,8 @@ const MAX_CALLBACK_REQUEST_BYTES: usize = 16 * 1024;
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the callback checks for a connection.
 const CALLBACK_POLL: Duration = Duration::from_millis(20);
+/// A token this close to expiring is refreshed before it is sent.
+const REFRESH_MARGIN_SECS: u64 = 60;
 
 /// Opens a url in the user's browser.
 pub type OpenBrowser = Box<dyn FnOnce(&str) -> io::Result<()> + Send>;
@@ -62,7 +72,9 @@ pub type OpenBrowser = Box<dyn FnOnce(&str) -> io::Result<()> + Send>;
 pub struct McpLoginOptions {
     /// Where the tokens are stored: `$ORCA_HOME/mcp-credentials.json`.
     pub credentials_path: PathBuf,
-    /// Opens the authorization url in the user's browser.
+    /// Opens the authorization url in the user's browser. When it fails,
+    /// the login still waits for the callback: the caller also prints the
+    /// url, for the user to open by hand.
     pub open_browser: OpenBrowser,
     /// How long to wait for the browser to come back.
     pub callback_timeout: Duration,
@@ -97,18 +109,49 @@ pub fn login(server: &McpServerConfig, options: McpLoginOptions) -> Result<(), S
     let protected: ProtectedResource = get_json(&client, &metadata_url).map_err(|why| {
         format!("failed to read the protected resource metadata of MCP server '{name}' from {metadata_url}: {why}")
     })?;
+    // The metadata must be for this server (RFC 9728 §3.3), so that a
+    // server cannot have Orca log in to another resource for it.
+    match protected.resource.as_deref() {
+        Some(covered) if resource_covers(covered, &resource) => {}
+        Some(other) => {
+            return Err(format!(
+                "the protected resource metadata of MCP server '{name}' is for another resource: '{}'",
+                printable(other)
+            ));
+        }
+        None => {
+            return Err(format!(
+                "the protected resource metadata of MCP server '{name}' names no resource"
+            ));
+        }
+    }
     let issuer = protected
         .authorization_servers
         .as_deref()
         .and_then(<[String]>::first)
         .ok_or_else(|| format!("MCP server '{name}' names no authorization server"))?;
-    let issuer = Url::parse(issuer).map_err(|_| {
+    let issuer_url = oauth_url(issuer).ok_or_else(|| {
         format!(
-            "MCP server '{name}' names an invalid authorization server '{}'",
+            "the authorization server '{}' of MCP server '{name}' must use https",
             printable(issuer)
         )
     })?;
-    let endpoints = authorization_server(&client, server, &issuer)?;
+    let endpoints = authorization_server(&client, server, issuer, &issuer_url)?;
+    if endpoints
+        .code_challenge_methods_supported
+        .as_ref()
+        .is_some_and(|methods| !methods.iter().any(|method| method == "S256"))
+    {
+        return Err(format!(
+            "the authorization server of MCP server '{name}' does not support PKCE with S256"
+        ));
+    }
+    let insecure = |endpoint: &str| {
+        format!("the authorization server of MCP server '{name}' must use https for its {endpoint}")
+    };
+    let mut authorization_url = oauth_url(&endpoints.authorization_endpoint)
+        .ok_or_else(|| insecure("authorization endpoint"))?;
+    oauth_url(&endpoints.token_endpoint).ok_or_else(|| insecure("token endpoint"))?;
 
     let callback = Callback::listen(server)?;
     let redirect_uri = callback.redirect_uri.clone();
@@ -137,17 +180,10 @@ pub fn login(server: &McpServerConfig, options: McpLoginOptions) -> Result<(), S
     if let Some(scope) = &scope {
         params.push(("scope", scope));
     }
-    let authorization_url = web_url(&endpoints.authorization_endpoint)
-        .map(|mut url| {
-            url.query_pairs_mut().extend_pairs(&params);
-            url
-        })
-        .ok_or_else(|| {
-            format!("the authorization server of MCP server '{name}' has an invalid authorization endpoint")
-        })?;
-    (options.open_browser)(authorization_url.as_str()).map_err(|error| {
-        format!("failed to open the browser to log in to MCP server '{name}': {error}")
-    })?;
+    authorization_url.query_pairs_mut().extend_pairs(&params);
+    // The url is also printed for the user to open by hand, so a browser
+    // that does not open is no reason to stop waiting.
+    let _ = (options.open_browser)(authorization_url.as_str());
     let code = callback.wait_for_code(name, &state, options.callback_timeout)?;
 
     let tokens = request_tokens(
@@ -176,43 +212,67 @@ pub fn login(server: &McpServerConfig, options: McpLoginOptions) -> Result<(), S
         .map_err(|error| format!("failed to save the login for MCP server '{name}': {error}"))
 }
 
-/// Refreshes `credential`'s access token, stores the new tokens in
-/// `credentials_path`, and returns them.
+/// Replaces `credential`, the login in use, with a fresh one, and returns
+/// it.
+///
+/// The credentials file stays locked from the read of the stored login to
+/// the save of the new one, so a logout, a login, or another Orca's refresh
+/// waits for this one, and this one sees theirs:
+/// - a login no longer stored has been logged out of, and is neither
+///   refreshed nor stored again;
+/// - a stored token that has replaced `credential`'s, and is not about to
+///   expire, is used as it is, without a request;
+/// - otherwise the stored refresh token, the newest, is spent, and the new
+///   tokens are stored.
 pub(crate) fn refresh(
     server: &McpServerConfig,
     credentials_path: &Path,
     credential: &McpCredential,
 ) -> Result<McpCredential, String> {
     let name = &server.name;
-    let refresh_token = credential
+    let store = LockedMcpCredentials::lock(credentials_path)
+        .map_err(|error| format!("failed to lock the MCP credentials: {error}"))?;
+    let stored = store
+        .load(name, &credential.server_url)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("MCP server '{name}' is no longer logged in"))?;
+    if stored.access_token != credential.access_token && !expires_soon(&stored) {
+        return Ok(stored);
+    }
+    let refresh_token = stored
         .refresh_token
         .as_deref()
         .ok_or_else(|| format!("MCP server '{name}' has no refresh token"))?;
     let tokens = request_tokens(
         server,
-        &credential.token_endpoint,
+        &stored.token_endpoint,
         &[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
-            ("client_id", &credential.client_id),
-            ("resource", &credential.resource),
+            ("client_id", &stored.client_id),
+            ("resource", &stored.resource),
         ],
     )?;
     let refreshed = McpCredential {
         access_token: tokens.access_token,
         // A server that does not rotate refresh tokens keeps the one it
         // issued before.
-        refresh_token: tokens
-            .refresh_token
-            .or_else(|| credential.refresh_token.clone()),
+        refresh_token: tokens.refresh_token.or(stored.refresh_token),
         expires_at: tokens.expires_at,
-        scope: tokens.scope.or_else(|| credential.scope.clone()),
-        ..credential.clone()
+        scope: tokens.scope.or(stored.scope),
+        ..stored
     };
-    save_mcp_credential(credentials_path, name, &refreshed).map_err(|error| {
+    store.save(name, &refreshed).map_err(|error| {
         format!("failed to save the refreshed login for MCP server '{name}': {error}")
     })?;
     Ok(refreshed)
+}
+
+/// Whether `credential`'s access token expires within the next minute.
+pub(crate) fn expires_soon(credential: &McpCredential) -> bool {
+    credential
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= unix_now().saturating_add(REFRESH_MARGIN_SECS))
 }
 
 /// The time now, in Unix seconds.
@@ -291,6 +351,8 @@ fn discover(client: &Client, server: &McpServerConfig, url: &Url) -> Result<Url,
 #[derive(Deserialize)]
 struct ProtectedResource {
     #[serde(default)]
+    resource: Option<String>,
+    #[serde(default)]
     authorization_servers: Option<Vec<String>>,
     #[serde(default)]
     scopes_supported: Option<Vec<String>>,
@@ -309,23 +371,36 @@ impl ProtectedResource {
 /// What Orca reads of an authorization server's metadata (RFC 8414).
 #[derive(Deserialize)]
 struct AuthorizationServer {
+    issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
     #[serde(default)]
     registration_endpoint: Option<String>,
+    #[serde(default)]
+    code_challenge_methods_supported: Option<Vec<String>>,
 }
 
 /// Reads the metadata of the authorization server `issuer`, from where
-/// RFC 8414 puts it, or else from where OpenID discovery does.
+/// RFC 8414 puts it, or else from where OpenID discovery does. Metadata for
+/// another issuer is refused (RFC 8414 §3.3).
 fn authorization_server(
     client: &Client,
     server: &McpServerConfig,
-    issuer: &Url,
+    issuer: &str,
+    issuer_url: &Url,
 ) -> Result<AuthorizationServer, String> {
     let mut failures = Vec::new();
-    for url in authorization_server_metadata_urls(issuer) {
-        match get_json(client, &url) {
-            Ok(metadata) => return Ok(metadata),
+    for url in authorization_server_metadata_urls(issuer_url) {
+        match get_json::<AuthorizationServer>(client, &url) {
+            Ok(metadata) if metadata.issuer == issuer => return Ok(metadata),
+            Ok(metadata) => {
+                return Err(format!(
+                    "the authorization server metadata of MCP server '{}' is for issuer '{}', not '{}'",
+                    server.name,
+                    printable(&metadata.issuer),
+                    printable(issuer)
+                ));
+            }
             Err(why) => failures.push(format!("{url}: {why}")),
         }
     }
@@ -361,6 +436,9 @@ fn register(
     let name = &server.name;
     let endpoint = registration_endpoint.ok_or_else(|| {
         format!("the authorization server of MCP server '{name}' does not register clients; set oauth_client_id for the server")
+    })?;
+    let endpoint = oauth_url(endpoint).ok_or_else(|| {
+        format!("the authorization server of MCP server '{name}' must use https for its registration endpoint")
     })?;
     let failed = |why: String| {
         format!(
@@ -417,9 +495,14 @@ fn request_tokens(
     form: &[(&str, &str)],
 ) -> Result<Tokens, String> {
     let name = &server.name;
+    let endpoint = oauth_url(token_endpoint).ok_or_else(|| {
+        format!(
+            "the authorization server of MCP server '{name}' must use https for its token endpoint"
+        )
+    })?;
     let failed = |why: String| format!("the token request for MCP server '{name}' failed: {why}");
     let response = http_client(server, false)?
-        .post(token_endpoint)
+        .post(endpoint)
         .header(ACCEPT, "application/json")
         .form(form)
         .send()
@@ -436,19 +519,32 @@ fn request_tokens(
             .unwrap_or_default();
         return Err(failed(format!("it answered {status}{code}")));
     }
-    body.as_ref()
-        .and_then(issued_tokens)
-        .ok_or_else(|| failed("its answer holds no access token".to_string()))
+    let body = body.ok_or_else(|| failed("its answer is not JSON".to_string()))?;
+    issued_tokens(&body).map_err(failed)
 }
 
-fn issued_tokens(body: &Value) -> Option<Tokens> {
+/// The tokens in a token response, or why there are none to use. Only
+/// Bearer tokens are, since that is how the transports send them.
+fn issued_tokens(body: &Value) -> Result<Tokens, String> {
     let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_string);
-    let access_token = text("access_token").filter(|token| !token.is_empty())?;
+    let access_token = text("access_token")
+        .filter(|token| !token.is_empty())
+        .ok_or("its answer holds no access token")?;
+    match text("token_type") {
+        Some(token_type) if token_type.eq_ignore_ascii_case("Bearer") => {}
+        Some(token_type) => {
+            return Err(format!(
+                "it issued a '{}' token, not a Bearer token",
+                printable(&token_type)
+            ));
+        }
+        None => return Err("its answer names no token type".to_string()),
+    }
     // Some servers send the lifetime as a string.
     let expires_in = body
         .get("expires_in")
         .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()));
-    Some(Tokens {
+    Ok(Tokens {
         access_token,
         refresh_token: text("refresh_token"),
         expires_at: expires_in.map(|seconds| unix_now().saturating_add(seconds)),
@@ -557,12 +653,29 @@ fn on_origin(url: &Url, path: &str) -> Url {
     on_origin
 }
 
-/// `url`, when it is an http or https url: the only kind a browser is sent
-/// to.
-fn web_url(url: &str) -> Option<Url> {
-    Url::parse(url)
-        .ok()
-        .filter(|url| matches!(url.scheme(), "http" | "https"))
+/// `url`, when OAuth may use it: over https, or over plain http only to
+/// this machine, as the MCP authorization spec requires of authorization
+/// server endpoints.
+fn oauth_url(url: &str) -> Option<Url> {
+    let url = Url::parse(url).ok()?;
+    let on_this_machine = match url.host()? {
+        Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
+    };
+    (url.scheme() == "https" || (url.scheme() == "http" && on_this_machine)).then_some(url)
+}
+
+/// Whether the protected resource `resource` covers the server at
+/// `server_url`: it is on the same origin, and the server's url starts with
+/// it (RFC 9728 §3.3, which asks for the same url, loosened to a prefix).
+fn resource_covers(resource: &str, server_url: &Url) -> bool {
+    Url::parse(resource).is_ok_and(|resource| {
+        resource.origin() == server_url.origin()
+            && server_url
+                .as_str()
+                .starts_with(resource.as_str().trim_end_matches('/'))
+    })
 }
 
 /// Text a server sent, fit for a terminal: without control characters, and
@@ -947,6 +1060,167 @@ mod tests {
             format!("http://127.0.0.1:{port}/callback")
         );
         TcpListener::bind(("127.0.0.1", port)).expect("the callback port is free again");
+    }
+
+    #[test]
+    fn login_keeps_waiting_when_the_browser_does_not_open() {
+        let server = OAuthTestServer::start(OAuthTestBehavior::default());
+        let home = tempfile::tempdir().expect("temp dir");
+        let credentials = home.path().join("mcp-credentials.json");
+        // No browser opens, and the user opens the printed url by hand.
+        let (by_hand, _page) = test_browser();
+        let no_browser: OpenBrowser = Box::new(move |url: &str| {
+            by_hand(url)?;
+            Err(io::Error::other("no browser"))
+        });
+
+        login(&server.config("docs"), options(&credentials, no_browser)).expect("log in by hand");
+
+        assert!(
+            load_mcp_credential(&credentials, "docs", &server.mcp_url())
+                .expect("read the credentials")
+                .is_some()
+        );
+    }
+
+    /// Logs in to a server that behaves as told, and returns its error.
+    fn failed_login(behavior: OAuthTestBehavior) -> (OAuthTestServer, String) {
+        let server = OAuthTestServer::start(behavior);
+        let home = tempfile::tempdir().expect("temp dir");
+        let (browser, _page) = test_browser();
+        let error = login(
+            &server.config("docs"),
+            options(&home.path().join("mcp-credentials.json"), browser),
+        )
+        .expect_err("the login must fail");
+        (server, error)
+    }
+
+    #[test]
+    fn login_refuses_metadata_for_another_issuer() {
+        let (server, error) = failed_login(OAuthTestBehavior {
+            wrong_issuer: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            error,
+            format!(
+                "the authorization server metadata of MCP server 'docs' is for issuer '{0}/elsewhere', not '{0}/tenant'",
+                server.url()
+            )
+        );
+        assert_eq!(server.trail().len(), 3, "{:?}", server.trail());
+    }
+
+    #[test]
+    fn login_refuses_metadata_for_another_resource() {
+        let (server, error) = failed_login(OAuthTestBehavior {
+            wrong_resource: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            error,
+            format!(
+                "the protected resource metadata of MCP server 'docs' is for another resource: '{}/elsewhere'",
+                server.url()
+            )
+        );
+        assert_eq!(server.trail().len(), 2, "{:?}", server.trail());
+    }
+
+    #[test]
+    fn login_refuses_an_insecure_token_endpoint() {
+        let (server, error) = failed_login(OAuthTestBehavior {
+            insecure_token_endpoint: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            error,
+            "the authorization server of MCP server 'docs' must use https for its token endpoint"
+        );
+        assert_eq!(server.trail().len(), 3, "{:?}", server.trail());
+    }
+
+    #[test]
+    fn login_refuses_an_authorization_server_without_s256() {
+        let (server, error) = failed_login(OAuthTestBehavior {
+            plain_pkce_only: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            error,
+            "the authorization server of MCP server 'docs' does not support PKCE with S256"
+        );
+        assert_eq!(server.trail().len(), 3, "{:?}", server.trail());
+    }
+
+    #[test]
+    fn login_refuses_a_token_that_is_not_a_bearer_token() {
+        let (_server, error) = failed_login(OAuthTestBehavior {
+            token_type: Some("mac".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            error,
+            "the token request for MCP server 'docs' failed: it issued a 'mac' token, not a Bearer token"
+        );
+        assert!(
+            !error.contains("at-1") && !error.contains("rt-1"),
+            "{error}"
+        );
+
+        // The token type is matched in any case.
+        let server = OAuthTestServer::start(OAuthTestBehavior {
+            token_type: Some("bearer".to_string()),
+            ..Default::default()
+        });
+        let home = tempfile::tempdir().expect("temp dir");
+        let (browser, _page) = test_browser();
+        login(
+            &server.config("docs"),
+            options(&home.path().join("mcp-credentials.json"), browser),
+        )
+        .expect("a lower-case bearer token is a Bearer token");
+    }
+
+    #[test]
+    fn oauth_urls_use_https_unless_on_this_machine() {
+        for (url, allowed) in [
+            ("https://auth.example/token", true),
+            ("http://127.0.0.1:8080/token", true),
+            ("http://[::1]:8080/token", true),
+            ("http://localhost/token", true),
+            ("http://LocalHost:9/token", true),
+            ("http://auth.example/token", false),
+            ("http://127.0.0.1.example/token", false),
+            ("ftp://127.0.0.1/token", false),
+            ("not a url", false),
+        ] {
+            assert_eq!(oauth_url(url).is_some(), allowed, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_protected_resource_must_cover_the_server_url() {
+        let server_url = Url::parse("https://mcp.example/v1/mcp").expect("a server url");
+        for (resource, covers) in [
+            ("https://mcp.example/v1/mcp", true),
+            ("https://mcp.example/v1/mcp/", true),
+            ("https://mcp.example/v1", true),
+            ("https://mcp.example", true),
+            ("https://MCP.example/v1/mcp", true),
+            ("https://mcp.example/v2", false),
+            ("https://other.example/v1/mcp", false),
+            ("http://mcp.example/v1/mcp", false),
+            ("https://mcp.example:8443/v1/mcp", false),
+            ("not a url", false),
+        ] {
+            assert_eq!(resource_covers(resource, &server_url), covers, "{resource}");
+        }
     }
 
     #[test]
