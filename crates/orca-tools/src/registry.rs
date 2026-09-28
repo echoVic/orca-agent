@@ -2205,6 +2205,11 @@ struct McpProxyTool {
 
 impl McpProxyTool {
     fn new(tool: McpTool) -> Self {
+        let action_kind = if tool.read_only {
+            ActionKind::Read
+        } else {
+            ActionKind::Write
+        };
         let spec = ToolSpec {
             name: ToolName::from_str(&tool.schema_name)
                 .unwrap_or_else(|| ToolName::Mcp(tool.schema_name.clone())),
@@ -2215,12 +2220,12 @@ impl McpProxyTool {
                 .unwrap_or_else(|| format!("MCP tool {} from {}", tool.name, tool.server)),
             input_schema: tool.input_schema.clone(),
             output_schema: None,
-            capabilities: CapabilitySet::filesystem_write(),
+            capabilities: capability_set_for_action_kind(action_kind),
             exposure: ToolExposure::Direct,
             result_semantics: ResultSemantics::Standard,
             interrupt_semantics: InterruptSemantics::CooperativeCancel,
             replay_semantics: ReplaySemantics::IndeterminateAfterStart,
-            renderer: RendererHint::Write,
+            renderer: renderer_for_action_kind(action_kind),
             concurrent_safe: false,
         };
         Self { tool, spec }
@@ -2440,6 +2445,29 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_mcp_tool_is_a_read_action() {
+        let read_only = McpProxyTool::new(McpTool {
+            server: "docs".to_string(),
+            name: "search".to_string(),
+            schema_name: "mcp__docs__search".to_string(),
+            description: Some("search docs".to_string()),
+            input_schema: json!({"type": "object", "properties": {}}),
+            read_only: true,
+        });
+        assert_eq!(read_only.action_kind(), ActionKind::Read);
+
+        let write = McpProxyTool::new(McpTool {
+            server: "docs".to_string(),
+            name: "search".to_string(),
+            schema_name: "mcp__docs__search".to_string(),
+            description: Some("search docs".to_string()),
+            input_schema: json!({"type": "object", "properties": {}}),
+            read_only: false,
+        });
+        assert_eq!(write.action_kind(), ActionKind::Write);
+    }
+
+    #[test]
     fn registry_control_semantics_are_conservative_by_resolved_identity() {
         let registry = default_tool_registry();
 
@@ -2527,6 +2555,7 @@ mod tests {
             schema_name: "mcp__docs__search".to_string(),
             description: Some("search docs".to_string()),
             input_schema: json!({"type": "object", "properties": {}}),
+            read_only: false,
         });
         assert_eq!(
             mcp.spec.interrupt_semantics,

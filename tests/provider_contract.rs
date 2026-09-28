@@ -24,6 +24,7 @@ fn tool_schema_preserves_canonical_definitions_across_agent_policies() {
             "required": ["path"],
             "additionalProperties": false
         }),
+        read_only: false,
     }]);
     let external = ExternalToolConfig {
         name: "external_lookup".to_string(),

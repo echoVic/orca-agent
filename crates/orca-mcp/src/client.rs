@@ -165,12 +165,14 @@ fn connect_server(
         .into_iter()
         .map(|tool| {
             let tool_name = sanitize_name(&tool.name);
+            let read_only = tool.is_read_only();
             McpTool {
                 server: server_name.to_string(),
                 name: tool.name,
                 schema_name: format!("mcp__{server_name}__{tool_name}"),
                 description: tool.description,
                 input_schema: normalize_schema(tool.input_schema),
+                read_only,
             }
         })
         .collect();
@@ -1159,6 +1161,48 @@ mod tests {
         assert_eq!(config.args, vec!["/tmp/mcp.sh"]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_marked_read_only_by_its_server_is_read_only() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("annotated_tools_mcp_server.sh");
+        std::fs::write(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"annotated","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"read_file","description":"reads a file","inputSchema":{"type":"object","properties":{},"required":[]},"annotations":{"readOnlyHint":true}},{"name":"write_file","description":"writes a file","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let config = stdio_fixture_config("annotated", &server);
+
+        let registry = initialize_registry(&[config]);
+
+        assert!(registry.errors().is_empty(), "{:?}", registry.errors());
+        let read_tool = registry
+            .tools()
+            .iter()
+            .find(|tool| tool.name == "read_file")
+            .expect("read_file tool");
+        let write_tool = registry
+            .tools()
+            .iter()
+            .find(|tool| tool.name == "write_file")
+            .expect("write_file tool");
+        assert!(read_tool.read_only);
+        assert!(!write_tool.read_only);
+    }
+
     #[test]
     fn sanitizes_mcp_schema_names() {
         assert_eq!(sanitize_name("GitHub Files"), "github_files");
@@ -1183,6 +1227,7 @@ mod tests {
             schema_name: schema_name.to_string(),
             description: None,
             input_schema: serde_json::json!({"type": "object"}),
+            read_only: false,
         };
         let order = vec!["mcp__srv__zzz", "mcp__srv__aaa", "mcp__srv__mmm"];
         let registry =
@@ -1257,6 +1302,7 @@ mod tests {
             schema_name: "mcp__slow__wait".to_string(),
             description: None,
             input_schema: serde_json::json!({"type": "object"}),
+            read_only: false,
         };
         let active = Arc::new(AtomicBool::new(false));
         let release = Arc::new(AtomicBool::new(false));
@@ -1358,6 +1404,7 @@ mod tests {
             schema_name: "mcp__screen__capture".to_string(),
             description: None,
             input_schema: serde_json::json!({"type": "object"}),
+            read_only: false,
         };
         let registry = McpRegistry {
             inner: Arc::new(McpRegistryInner {
@@ -1898,6 +1945,7 @@ done
             schema_name: "mcp__prompts__authorize".to_string(),
             description: None,
             input_schema: serde_json::json!({"type": "object"}),
+            read_only: false,
         };
         let registry = McpRegistry {
             inner: Arc::new(McpRegistryInner {

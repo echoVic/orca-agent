@@ -62,6 +62,18 @@ only — the full history stays on disk.
 Resuming a session does not reload earlier tool images, regardless of which
 model resumes it. The resumed conversation keeps the note in their place.
 
+## Read-only tools
+
+A server can mark a tool read-only in its `tools/list` response
+(`readOnlyHint`). Orca then treats a call to that tool as a read:
+
+- Suggest mode does not ask before the call; plan mode allows it, while
+  every other MCP tool call is still denied.
+- Whether a tool is read-only is entirely up to the server's own
+  declaration.
+- A tool the server also marks `destructiveHint` is still asked about,
+  the same as any other write.
+
 ## Operate safely
 
 1. Start with a read-only capability set.

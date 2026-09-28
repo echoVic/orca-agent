@@ -910,6 +910,7 @@ mod tests {
                 "properties": {},
                 "additionalProperties": false
             }),
+            read_only: false,
         }]);
         let request = request(
             ToolName::Mcp("mcp__local__write".to_string()),

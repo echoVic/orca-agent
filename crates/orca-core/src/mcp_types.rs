@@ -71,6 +71,11 @@ pub struct McpTool {
     pub schema_name: String,
     pub description: Option<String>,
     pub input_schema: Value,
+    /// Whether the server declared this tool read-only (`readOnlyHint`) and
+    /// not destructive (`destructiveHint`). Governs whether the approval
+    /// policy treats a call to it as a read or a write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -117,12 +122,33 @@ pub struct McpResourceDescriptor {
     pub mime_type: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct McpToolAnnotations {
+    #[serde(rename = "readOnlyHint", default)]
+    pub read_only_hint: Option<bool>,
+    #[serde(rename = "destructiveHint", default)]
+    pub destructive_hint: Option<bool>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct McpToolDescriptor {
     pub name: String,
     pub description: Option<String>,
     #[serde(rename = "inputSchema", default = "default_input_schema")]
     pub input_schema: Value,
+    #[serde(default)]
+    pub annotations: Option<McpToolAnnotations>,
+}
+
+impl McpToolDescriptor {
+    /// A server declares a tool read-only with `readOnlyHint`; a
+    /// `destructiveHint` overrides that even when both are set, so the tool
+    /// is still asked about like any other write.
+    pub fn is_read_only(&self) -> bool {
+        self.annotations.as_ref().is_some_and(|annotations| {
+            annotations.read_only_hint == Some(true) && annotations.destructive_hint != Some(true)
+        })
+    }
 }
 
 fn default_input_schema() -> Value {
@@ -174,4 +200,32 @@ pub enum McpContent {
     },
     #[serde(other)]
     Other,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_needs_the_hint_and_no_destructive_hint() {
+        let read_only: McpToolDescriptor =
+            serde_json::from_str(r#"{"name":"a","annotations":{"readOnlyHint":true}}"#)
+                .expect("descriptor with readOnlyHint");
+        assert!(read_only.is_read_only());
+
+        let destructive: McpToolDescriptor = serde_json::from_str(
+            r#"{"name":"a","annotations":{"readOnlyHint":true,"destructiveHint":true}}"#,
+        )
+        .expect("descriptor with readOnlyHint and destructiveHint");
+        assert!(!destructive.is_read_only());
+
+        let no_annotations: McpToolDescriptor =
+            serde_json::from_str(r#"{"name":"a"}"#).expect("descriptor without annotations");
+        assert!(!no_annotations.is_read_only());
+
+        let hint_false: McpToolDescriptor =
+            serde_json::from_str(r#"{"name":"a","annotations":{"readOnlyHint":false}}"#)
+                .expect("descriptor with readOnlyHint false");
+        assert!(!hint_false.is_read_only());
+    }
 }
