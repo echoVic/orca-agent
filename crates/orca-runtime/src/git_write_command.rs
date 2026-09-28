@@ -97,6 +97,26 @@ pub(crate) fn git_metadata_approval_note(write: &GitMetadataWrite) -> String {
     )
 }
 
+/// Whether the user let git writes run without asking for the rest of this
+/// session. Kept in the thread's extension store, so each session thread (and
+/// each subagent thread) has its own, and a restart starts without it. It
+/// records no directory: every approved command still gets its own grant.
+#[derive(Debug, Default)]
+pub(crate) struct GitMetadataWriteSession {
+    approved: std::sync::atomic::AtomicBool,
+}
+
+impl GitMetadataWriteSession {
+    pub(crate) fn approved(&self) -> bool {
+        self.approved.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn approve(&self) {
+        self.approved
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GitCommandClass {
     /// No git invocation, or only ones that read the repository.

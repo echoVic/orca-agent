@@ -4436,6 +4436,279 @@ mod tests {
         }
     }
 
+    /// A trusted git repository under a private ORCA_HOME, for bash runs that
+    /// need the real workspace sandbox. `None` when this host has no enforced
+    /// sandbox or no git.
+    #[cfg(unix)]
+    fn git_sandbox_fixture(
+        approval_mode: orca_core::approval_types::ApprovalMode,
+    ) -> Option<(tempfile::TempDir, std::path::PathBuf, RunConfig)> {
+        if orca_tools::sandbox::enforcement_state()
+            != orca_core::capability::EnforcementState::Enforced
+            || std::process::Command::new("git")
+                .arg("--version")
+                .output()
+                .is_err()
+        {
+            eprintln!("skipping git sandbox test: no enforced sandbox or no git on this host");
+            return None;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.name", "Orca Test"],
+            &["config", "user.email", "orca@example.com"],
+            &["config", "commit.gpgsign", "false"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        // Some git installs skip the sample hooks; the grant needs the directory.
+        std::fs::create_dir_all(repo.join(".git/hooks")).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            &repo,
+            home.path(),
+            orca_core::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(repo.clone());
+        config.history_mode = HistoryMode::Record;
+        config.approval_mode = approval_mode;
+        Some((home, repo, config))
+    }
+
+    #[cfg(unix)]
+    fn spawn_git_turn(
+        thread: &RuntimeThreadHandle,
+        config: &RunConfig,
+        controller: &TuiSurfaceTaskControl,
+        event_tx: &mpsc::Sender<TuiEvent>,
+        prompt: &str,
+    ) -> mpsc::Receiver<io::Result<TuiHostedOperationOutcome>> {
+        let (result_tx, result_rx) = mpsc::bounded(1);
+        let thread = thread.clone();
+        let config = config.clone();
+        let controller = controller.clone();
+        let event_tx = event_tx.clone();
+        let prompt = prompt.to_string();
+        std::thread::spawn(move || {
+            let result = run_through_dispatch(
+                &thread,
+                HostedTurnRequest::new(prompt.as_str()),
+                config,
+                &controller,
+                &event_tx,
+            );
+            let _ = result_tx.send(result);
+        });
+        result_rx
+    }
+
+    #[cfg(unix)]
+    fn wait_for_git_permission(
+        event_rx: &mpsc::Receiver<TuiEvent>,
+    ) -> (crate::protocol::TuiInteractionKey, String) {
+        loop {
+            if let TuiEvent::PermissionApprovalNeeded { key, preview, .. } = event_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("git write permission event")
+            {
+                return (key, preview.unwrap_or_default());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_git_turn_succeeded(
+        result_rx: &mpsc::Receiver<io::Result<TuiHostedOperationOutcome>>,
+    ) {
+        let outcome = result_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("git turn finished without a second prompt")
+            .expect("git turn");
+        assert!(matches!(
+            outcome,
+            TuiHostedOperationOutcome::Turn { status } if status == "success"
+        ));
+    }
+
+    #[cfg(unix)]
+    fn commit_count(repo: &std::path::Path) -> usize {
+        let output = std::process::Command::new("git")
+            .args(["rev-list", "--count", "--all"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_edit_git_write_asks_once_and_opens_git_for_that_command_only() {
+        let _guard = crate::test_support::lock_process_env();
+        let Some((home, repo, config)) =
+            git_sandbox_fixture(orca_core::approval_types::ApprovalMode::AutoEdit)
+        else {
+            return;
+        };
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "git write approval")
+            .expect("runtime thread");
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
+        let (event_tx, event_rx) = mpsc::unbounded();
+
+        // The commit is approved; the hook write in the same command is not.
+        let turn = spawn_git_turn(
+            &thread,
+            &config,
+            &controller,
+            &event_tx,
+            "bash git commit --allow-empty -m first && printf x > .git/hooks/probe",
+        );
+        let (key, preview) = wait_for_git_permission(&event_rx);
+        assert!(preview.contains(".git"), "{preview}");
+        assert!(
+            controller
+                .respond_surface_interaction(
+                    &key,
+                    &crate::protocol::TuiInteractionResponse::Permission(
+                        crate::protocol::TuiPermissionDecision::AllowOnce
+                    )
+                )
+                .expect("permission response")
+        );
+        assert_git_turn_succeeded(&turn);
+        assert_eq!(commit_count(&repo), 1);
+        assert!(
+            !repo.join(".git/hooks/probe").exists(),
+            "hooks stay read-only"
+        );
+
+        // The next command gets no grant and no prompt.
+        let turn = spawn_git_turn(
+            &thread,
+            &config,
+            &controller,
+            &event_tx,
+            "bash printf x > .git/probe",
+        );
+        assert_git_turn_succeeded(&turn);
+        assert!(
+            !repo.join(".git/probe").exists(),
+            "the grant covered one command"
+        );
+        assert!(
+            !event_rx
+                .try_iter()
+                .any(|event| matches!(event, TuiEvent::PermissionApprovalNeeded { .. }))
+        );
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_or_session_allowed_git_writes_follow_the_answer() {
+        let _guard = crate::test_support::lock_process_env();
+        let Some((home, repo, config)) =
+            git_sandbox_fixture(orca_core::approval_types::ApprovalMode::AutoEdit)
+        else {
+            return;
+        };
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "git write answers")
+            .expect("runtime thread");
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let respond = |key: &crate::protocol::TuiInteractionKey,
+                       decision: crate::protocol::TuiPermissionDecision| {
+            assert!(
+                controller
+                    .respond_surface_interaction(
+                        key,
+                        &crate::protocol::TuiInteractionResponse::Permission(decision)
+                    )
+                    .expect("permission response")
+            );
+        };
+
+        // Denied: nothing runs.
+        let turn = spawn_git_turn(
+            &thread,
+            &config,
+            &controller,
+            &event_tx,
+            "bash git commit --allow-empty -m denied",
+        );
+        let (key, _) = wait_for_git_permission(&event_rx);
+        respond(&key, crate::protocol::TuiPermissionDecision::Deny);
+        let _ = turn
+            .recv_timeout(Duration::from_secs(20))
+            .expect("denied turn finished");
+        assert_eq!(commit_count(&repo), 0);
+
+        // Allowed for the session: the next git write does not ask.
+        let turn = spawn_git_turn(
+            &thread,
+            &config,
+            &controller,
+            &event_tx,
+            "bash git commit --allow-empty -m first",
+        );
+        let (key, _) = wait_for_git_permission(&event_rx);
+        respond(&key, crate::protocol::TuiPermissionDecision::AllowSession);
+        assert_git_turn_succeeded(&turn);
+        let turn = spawn_git_turn(
+            &thread,
+            &config,
+            &controller,
+            &event_tx,
+            "bash git commit --allow-empty -m second",
+        );
+        assert_git_turn_succeeded(&turn);
+        assert_eq!(commit_count(&repo), 2);
+
+        // The session switch is not a directory grant.
+        let turn = spawn_git_turn(
+            &thread,
+            &config,
+            &controller,
+            &event_tx,
+            "bash printf x > .git/probe",
+        );
+        assert_git_turn_succeeded(&turn);
+        assert!(!repo.join(".git/probe").exists());
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
     #[test]
     fn typed_ordinary_turn_routes_user_input_through_runtime_surface() {
         let _guard = crate::test_support::lock_process_env();

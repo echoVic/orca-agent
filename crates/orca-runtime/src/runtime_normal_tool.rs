@@ -5,9 +5,10 @@ use orca_core::tool_types::{ToolName, ToolResult};
 use serde::Deserialize;
 
 use crate::network_proxy::RuntimeNetworkBlockDecision;
-use crate::protocol::PermissionResponseDecision;
+use crate::protocol::{PermissionGrantScope, PermissionResponseDecision, RequestPermissionProfile};
 use crate::runtime_permission::{
-    RuntimePermissionEvaluation, RuntimePermissionOrigin, RuntimePermissionPolicy,
+    RuntimePermissionContext, RuntimePermissionEvaluation, RuntimePermissionOrigin,
+    RuntimePermissionPolicy, RuntimePermissionRequest,
 };
 use crate::runtime_state::PermissionRuntimeState;
 use crate::runtime_tool_call::{RuntimeNormalToolInvocation, RuntimeNormalToolWorkerContext};
@@ -173,6 +174,32 @@ fn execute_bash(
             None,
         );
     };
+    let git_metadata_grant = match git_metadata_approval(invocation, context) {
+        GitMetadataApproval::NotApplicable => None,
+        GitMetadataApproval::Granted(git_dir) => Some(git_dir),
+        GitMetadataApproval::Denied(git_dir) => {
+            return ToolResult::denied(
+                &invocation.request,
+                format!(
+                    "the user declined letting this git command write {}",
+                    git_dir.display()
+                ),
+            );
+        }
+        GitMetadataApproval::Cancelled => {
+            return ToolResult::cancelled_before_start(
+                &invocation.request,
+                "cancelled while waiting for approval to write .git",
+            );
+        }
+        GitMetadataApproval::Failed(error) => {
+            return ToolResult::failed_before_start(
+                &invocation.request,
+                format!("the approval to write .git failed: {error}"),
+                None,
+            );
+        }
+    };
     // The effective execution deadline is the earliest limit anyone set: the
     // caller's `timeout_ms` and the administrator's command cap. A caller
     // request is never silently shortened without naming the source.
@@ -233,7 +260,7 @@ fn execute_bash(
             permission_overlay: context.permission_overlay,
             terminal,
             execution_deadline,
-            git_metadata_grant: None,
+            git_metadata_grant: git_metadata_grant.as_deref(),
             #[cfg(test)]
             sandbox_override: None,
         },
@@ -348,6 +375,72 @@ fn execute_bash(
             )
         });
     terminal_output_result_with_diagnostic(invocation, Ok(aggregate), sandbox_diagnostic)
+}
+
+enum GitMetadataApproval {
+    NotApplicable,
+    Granted(PathBuf),
+    Denied(PathBuf),
+    Cancelled,
+    Failed(String),
+}
+
+/// Asks, at most once per command, whether a recognized git write may run with
+/// the workspace's `.git` writable. The grant covers this command only; see
+/// `crate::git_write_command`.
+fn git_metadata_approval(
+    invocation: &RuntimeNormalToolInvocation,
+    context: &RuntimeNormalToolWorkerContext<'_>,
+) -> GitMetadataApproval {
+    let Some(write) = crate::git_write_command::git_metadata_write_for_bash(
+        &invocation.config,
+        &invocation.cwd,
+        &invocation.request,
+    ) else {
+        return GitMetadataApproval::NotApplicable;
+    };
+    if invocation
+        .git_metadata_write_session
+        .as_ref()
+        .is_some_and(|session| session.approved())
+    {
+        return GitMetadataApproval::Granted(write.git_dir);
+    }
+    let Some(handler) = context.permission_handler else {
+        return GitMetadataApproval::NotApplicable;
+    };
+    let request = RuntimePermissionRequest {
+        // The runtime binds a foreground request to its tool call by this id.
+        id: invocation.request.id.clone(),
+        reason: Some(crate::git_write_command::git_metadata_write_reason(&write)),
+        // No directory: the grant is applied to this one command here, and a
+        // session answer must not persist a `.git` grant.
+        permissions: RequestPermissionProfile {
+            file_system: None,
+            network: None,
+        },
+        context: RuntimePermissionContext::foreground(
+            crate::surface::SurfacePermissionOrigin::Bash,
+        ),
+    };
+    match handler.request_permissions(&request) {
+        Ok(response) if response.decision == PermissionResponseDecision::Deny => {
+            GitMetadataApproval::Denied(write.git_dir)
+        }
+        Ok(response) => {
+            if response.scope == PermissionGrantScope::Session
+                && let Some(session) = invocation.git_metadata_write_session.as_ref()
+            {
+                session.approve();
+            }
+            GitMetadataApproval::Granted(write.git_dir)
+        }
+        Err(_) if context.cancel.is_cancelled() => GitMetadataApproval::Cancelled,
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+            GitMetadataApproval::Cancelled
+        }
+        Err(error) => GitMetadataApproval::Failed(error.to_string()),
+    }
 }
 
 fn deny_blocked_network_request(

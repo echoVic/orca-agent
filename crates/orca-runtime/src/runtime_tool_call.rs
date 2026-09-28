@@ -56,6 +56,9 @@ pub(crate) struct RuntimeNormalToolInvocation {
     /// terminal service does not own (child agents and other task kinds).
     pub(crate) task_registry: Option<TaskRegistry>,
     pub(crate) terminal_service: Option<Arc<TerminalService>>,
+    /// Whether this session lets git writes run without asking (bash only).
+    pub(crate) git_metadata_write_session:
+        Option<Arc<crate::git_write_command::GitMetadataWriteSession>>,
     pub(crate) owner_task_id: Option<String>,
     pub(crate) permission_overlay: TurnPermissionOverlay,
     pub(crate) control: ToolControlSemantics,
@@ -96,6 +99,7 @@ impl RuntimeNormalToolInvocation {
             shell_timeout_secs,
             task_registry: task_registry.cloned(),
             terminal_service: None,
+            git_metadata_write_session: None,
             owner_task_id: None,
             permission_overlay,
             control,
@@ -116,12 +120,21 @@ impl RuntimeNormalToolInvocation {
             shell_timeout_secs: self.shell_timeout_secs,
             task_registry: self.task_registry.clone(),
             terminal_service: self.terminal_service.clone(),
+            git_metadata_write_session: self.git_metadata_write_session.clone(),
             owner_task_id: self.owner_task_id.clone(),
             permission_overlay: self.permission_overlay.clone(),
             control: self.control,
         };
         clone.request = request.clone();
         clone
+    }
+
+    pub(crate) fn with_git_metadata_write_session(
+        mut self,
+        session: Option<Arc<crate::git_write_command::GitMetadataWriteSession>>,
+    ) -> Self {
+        self.git_metadata_write_session = session;
+        self
     }
 
     pub(crate) fn with_owner(mut self, owner: Option<&str>) -> Self {
@@ -157,8 +170,9 @@ pub(crate) struct RuntimeNormalToolCallOutput {
 ///
 /// `permission_handler`, `output_handler`, and `permission_overlay` are the
 /// worker bridge used by tools that report observed output or escalate
-/// permissions mid-call. Command approval is decided at the tool layer before
-/// dispatch, so `permission_handler` is only exercised by tests.
+/// permissions mid-call. Most command approval is decided at the tool layer
+/// before dispatch; bash's git-write approval (`git_metadata_approval`) is the
+/// mid-call exception that exercises `permission_handler` outside tests.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct RuntimeNormalToolWorkerContext<'a> {
     pub(crate) cancel: &'a CancelToken,
@@ -1192,6 +1206,7 @@ pub(crate) mod tests {
             shell_timeout_secs: 120,
             task_registry: None,
             terminal_service: None,
+            git_metadata_write_session: None,
             owner_task_id: None,
             permission_overlay: TurnPermissionOverlay::default(),
             control: ToolControlSemantics {

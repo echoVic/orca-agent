@@ -378,6 +378,15 @@ impl<'a> RuntimeToolRouter<'a> {
                         crate::terminal_service::TerminalService::new(task_registry.clone())
                     })
                 });
+                // Whether this session already lets git writes run without
+                // asking. It lives with the thread, like the terminal service.
+                let git_metadata_write_session =
+                    (execution_request.name == tool_types::ToolName::Bash).then(|| {
+                        extension_stores
+                            .map(|stores| stores.thread_store())
+                            .unwrap_or(&self.runtime.thread_extensions)
+                            .get_or_init(crate::git_write_command::GitMetadataWriteSession::default)
+                    });
                 let invocation = RuntimeNormalToolInvocation::snapshot(
                     config,
                     execution_request,
@@ -391,6 +400,7 @@ impl<'a> RuntimeToolRouter<'a> {
                     permission_overlay.clone(),
                 )
                 .with_terminal_service(terminal_service)
+                .with_git_metadata_write_session(git_metadata_write_session)
                 .with_owner(root_task_id);
                 let output = {
                     let mut output_handler = |chunk: &str| {
