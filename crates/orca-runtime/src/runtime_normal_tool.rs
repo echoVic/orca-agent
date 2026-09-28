@@ -399,10 +399,14 @@ fn git_metadata_approval(
     ) else {
         return GitMetadataApproval::NotApplicable;
     };
+    // suggest's approval already named this `.git`, or the session allows it.
     if invocation
-        .git_metadata_write_session
-        .as_ref()
-        .is_some_and(|session| session.approved())
+        .permission_overlay
+        .git_metadata_write_approved(&invocation.request.id)
+        || invocation
+            .git_metadata_write_session
+            .as_ref()
+            .is_some_and(|session| session.approved())
     {
         return GitMetadataApproval::Granted(write.git_dir);
     }

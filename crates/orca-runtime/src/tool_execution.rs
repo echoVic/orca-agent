@@ -1376,6 +1376,17 @@ impl ToolExecutionActor {
                     if approval.preview.is_none() {
                         approval.preview = file_change_preview_text(&invocation.effective, cwd);
                     }
+                    // A git write is approved together with the `.git` it
+                    // writes, so suggest asks once; bash reads the mark.
+                    let git_metadata_write = crate::git_write_command::git_metadata_write_for_bash(
+                        config,
+                        cwd,
+                        &invocation.effective,
+                    );
+                    if let Some(write) = git_metadata_write.as_ref() {
+                        approval.preview =
+                            Some(crate::git_write_command::git_metadata_approval_note(write));
+                    }
                     if event_error.is_some() {
                         return failed_approval_gate_before_start(
                             events,
@@ -1454,7 +1465,11 @@ impl ToolExecutionActor {
                                 result,
                             );
                         }
-                        ApprovalDecision::Allow if event_error.is_none() => {}
+                        ApprovalDecision::Allow if event_error.is_none() => {
+                            if git_metadata_write.is_some() {
+                                permission_overlay.approve_git_metadata_write(&tool_request.id);
+                            }
+                        }
                         ApprovalDecision::Allow => {
                             return failed_approval_gate_before_start(
                                 events,

@@ -254,6 +254,9 @@ pub struct TurnPermissionOverlay {
         std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
     strict_auto_review: bool,
     preapproved_tool_call_id: Option<String>,
+    /// Tool calls whose interactive approval named the `.git` they write, so
+    /// bash does not ask a second time.
+    git_metadata_write_approvals: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -321,6 +324,19 @@ impl TurnPermissionOverlay {
         }
         self.preapproved_tool_call_id = None;
         true
+    }
+
+    pub(crate) fn approve_git_metadata_write(&mut self, tool_call_id: &str) {
+        if !self.git_metadata_write_approved(tool_call_id) {
+            self.git_metadata_write_approvals
+                .push(tool_call_id.to_string());
+        }
+    }
+
+    pub(crate) fn git_metadata_write_approved(&self, tool_call_id: &str) -> bool {
+        self.git_metadata_write_approvals
+            .iter()
+            .any(|approved| approved == tool_call_id)
     }
 
     pub fn merge(&mut self, other: &Self) {
@@ -552,6 +568,7 @@ mod tests {
             )]),
             strict_auto_review: false,
             preapproved_tool_call_id: Some("approval-only".to_string()),
+            git_metadata_write_approvals: Vec::new(),
         };
         let current = TurnPermissionOverlay {
             additional_working_directories: vec![PathBuf::from("/existing"), PathBuf::from("/new")],
@@ -571,6 +588,7 @@ mod tests {
             ]),
             strict_auto_review: true,
             preapproved_tool_call_id: None,
+            git_metadata_write_approvals: Vec::new(),
         };
 
         let delta = current.delta_from(&baseline);

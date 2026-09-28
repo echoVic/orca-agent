@@ -4709,6 +4709,70 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn suggest_names_git_in_its_approval_and_asks_only_once() {
+        let _guard = crate::test_support::lock_process_env();
+        let Some((home, repo, config)) =
+            git_sandbox_fixture(orca_core::approval_types::ApprovalMode::Suggest)
+        else {
+            return;
+        };
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "suggest git write")
+            .expect("runtime thread");
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
+        let (event_tx, event_rx) = mpsc::unbounded();
+
+        let turn = spawn_git_turn(
+            &thread,
+            &config,
+            &controller,
+            &event_tx,
+            "bash git commit --allow-empty -m first",
+        );
+        let (key, preview) = loop {
+            match event_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("approval event")
+            {
+                TuiEvent::ApprovalNeeded { key, preview, .. } => {
+                    break (key, preview.unwrap_or_default());
+                }
+                TuiEvent::PermissionApprovalNeeded { .. } => {
+                    panic!("suggest asked for .git separately from the command approval")
+                }
+                _ => {}
+            }
+        };
+        assert!(preview.contains(".git"), "{preview}");
+        assert!(
+            controller
+                .respond_surface_interaction(
+                    &key,
+                    &crate::protocol::TuiInteractionResponse::Approval(true)
+                )
+                .expect("approval response")
+        );
+        assert_git_turn_succeeded(&turn);
+        assert_eq!(commit_count(&repo), 1);
+        assert!(
+            !event_rx
+                .try_iter()
+                .any(|event| matches!(event, TuiEvent::PermissionApprovalNeeded { .. }))
+        );
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
     #[test]
     fn typed_ordinary_turn_routes_user_input_through_runtime_surface() {
         let _guard = crate::test_support::lock_process_env();
