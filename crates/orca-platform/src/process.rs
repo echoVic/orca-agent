@@ -1,5 +1,5 @@
 use std::io::{self, Read};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::atomic::AtomicBool;
 
 /// Owns the operating-system process-tree boundary for one spawned child.
@@ -128,12 +128,13 @@ pub fn detach_current_process_stdout() -> io::Result<()> {
 }
 
 /// Opens `url` in the user's browser: with `open` on macOS, `xdg-open` on
-/// other Unix hosts, and `cmd /C start` on Windows. The opener is started
-/// and not waited for.
+/// other Unix hosts, and `ShellExecuteW` on Windows, where no shell or
+/// command line ever sees the url, so nothing in it is expanded or run. The
+/// browser is started and not waited for.
 ///
 /// Only an http or https url with no whitespace, quote, or control
-/// character is opened, so a url a remote server supplied can neither
-/// launch a local file or program nor break out of the command line.
+/// character is opened, so a url a remote server supplied cannot launch a
+/// local file or program.
 pub fn open_url(url: &str) -> io::Result<()> {
     if !is_web_url(url) {
         return Err(io::Error::new(
@@ -141,18 +142,7 @@ pub fn open_url(url: &str) -> io::Result<()> {
             "only http and https urls can be opened",
         ));
     }
-    let mut child = platform::open_url_command(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    // Reap the opener once it exits, without making the caller wait for it.
-    let _ = std::thread::Builder::new()
-        .name("open-url".to_string())
-        .spawn(move || {
-            let _ = child.wait();
-        });
-    Ok(())
+    platform::open_url(url)
 }
 
 fn is_web_url(url: &str) -> bool {
@@ -191,7 +181,7 @@ pub fn read_child_pipe_interruptibly<R: Read + std::os::windows::io::AsRawHandle
 #[cfg(not(windows))]
 mod platform {
     use std::io::{self, Read};
-    use std::process::{Child, Command};
+    use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
@@ -218,16 +208,26 @@ mod platform {
         }
     }
 
-    /// The command that opens `url` in the user's browser.
-    pub(super) fn open_url_command(url: &str) -> Command {
+    /// Starts `open` on macOS, or `xdg-open` elsewhere, with no stdio, and
+    /// reaps it once it exits, without making the caller wait for it.
+    pub(super) fn open_url(url: &str) -> io::Result<()> {
         let opener = if cfg!(target_os = "macos") {
             "open"
         } else {
             "xdg-open"
         };
-        let mut command = Command::new(opener);
-        command.arg(url);
-        command
+        let mut child = Command::new(opener)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let _ = thread::Builder::new()
+            .name("open-url".to_string())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+        Ok(())
     }
 
     pub(super) fn read_child_pipe_interruptibly<R: Read>(
@@ -399,18 +399,36 @@ mod platform {
         Ok(())
     }
 
-    /// The command that opens `url` in the user's browser:
-    /// `cmd /C start "" "<url>"`. `start` takes its first quoted argument as
-    /// the window title, hence the empty one. The quotes around the url,
-    /// which holds none itself, keep cmd from acting on its `&` and the
-    /// other characters cmd treats specially.
-    pub(super) fn open_url_command(url: &str) -> Command {
-        let mut command = Command::new("cmd");
-        command
-            .args(["/C", "start"])
-            .raw_arg("\"\"")
-            .raw_arg(format!("\"{url}\""));
-        command
+    /// Hands `url` to the shell's `open` verb, which starts the default
+    /// browser. Unlike `cmd /C start`, no command line is built, so a `%NAME%`
+    /// in the url is never expanded to an environment variable's value.
+    pub(super) fn open_url(url: &str) -> io::Result<()> {
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let verb = to_wide_name("open");
+        let file = to_wide_name(url);
+        // SAFETY: both strings are NUL-terminated UTF-16 that outlives the
+        // call, and the window, parameters, and directory may be null.
+        let instance = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // ShellExecuteW reports success with a value greater than 32.
+        let code = instance as isize;
+        if code > 32 {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "ShellExecuteW could not open the url (error {code})"
+            )))
+        }
     }
 
     pub(super) fn read_child_pipe_interruptibly<R: io::Read + AsRawHandle>(
