@@ -2273,6 +2273,7 @@ mod tests {
                     permission_overlay: &overlay,
                     terminal: crate::shell_session::ShellTerminalMode::pipe(),
                     execution_deadline: None,
+                    git_metadata_grant: None,
                     sandbox_override: Some(
                         crate::shell_session::ShellSandboxMode::DangerFullAccess,
                     ),

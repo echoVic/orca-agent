@@ -138,6 +138,9 @@ pub(crate) struct TerminalExecRequest<'a> {
     /// yield time that only bounds how long a tool call waits before handing
     /// control back. `None` adds no limit of its own.
     pub(crate) execution_deadline: Option<ExecutionDeadline>,
+    /// A `.git` the user allowed this one command to write; see
+    /// `crate::git_write_command`.
+    pub(crate) git_metadata_grant: Option<&'a Path>,
     #[cfg(test)]
     pub(crate) sandbox_override: Option<ShellSandboxMode>,
 }
@@ -1168,6 +1171,16 @@ fn prepare_shell_command(
         push_unique_path(&mut sandbox.metadata_writable_roots, root.clone());
     }
 
+    // One command's `.git` grant: it opens `.git` for this launch only and
+    // never enters the turn's overlay.
+    let metadata_read_only_paths = match request.git_metadata_grant {
+        Some(git_dir) => {
+            push_unique_path(&mut sandbox.metadata_writable_roots, git_dir.to_path_buf());
+            crate::git_write_command::read_only_git_metadata(git_dir)
+        }
+        None => Vec::new(),
+    };
+
     #[cfg(windows)]
     if !sandbox.network_policy_domains.is_empty() {
         return Err(io::Error::other(
@@ -1219,6 +1232,7 @@ fn prepare_shell_command(
             additional_working_directories,
             denied_working_directories: sandbox.denied_writable_roots,
             allowed_unix_socket_roots: sandbox.allowed_unix_socket_roots,
+            metadata_read_only_paths,
             env,
             description: request.command.to_string(),
             terminal: request.terminal,
@@ -1416,8 +1430,58 @@ mod tests {
             permission_overlay: overlay,
             terminal,
             execution_deadline: None,
+            git_metadata_grant: None,
             sandbox_override: Some(ShellSandboxMode::DangerFullAccess),
         }
+    }
+
+    #[test]
+    fn a_git_metadata_grant_opens_git_for_one_command_and_keeps_its_code_paths_read_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let git_dir = temp.path().join(".git");
+        let overlay = TurnPermissionOverlay::default();
+        let mut exec = request(
+            "git commit -m x",
+            temp.path(),
+            &overlay,
+            ShellTerminalMode::pipe(),
+        );
+        exec.git_metadata_grant = Some(&git_dir);
+
+        let (command, metadata_writable_directories, _, _) =
+            prepare_shell_command(exec).expect("prepare");
+
+        assert_eq!(metadata_writable_directories, vec![git_dir.clone()]);
+        assert_eq!(
+            command.metadata_read_only_paths,
+            vec![
+                git_dir.join("config"),
+                git_dir.join("config.worktree"),
+                git_dir.join("hooks"),
+                git_dir.join("modules"),
+            ]
+        );
+        assert!(
+            overlay.metadata_writable_directories().is_empty(),
+            "the grant never enters the turn's overlay"
+        );
+    }
+
+    #[test]
+    fn without_a_git_metadata_grant_nothing_is_opened_or_narrowed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let overlay = TurnPermissionOverlay::default();
+
+        let (command, metadata_writable_directories, _, _) = prepare_shell_command(request(
+            "git status",
+            temp.path(),
+            &overlay,
+            ShellTerminalMode::pipe(),
+        ))
+        .expect("prepare");
+
+        assert!(metadata_writable_directories.is_empty());
+        assert!(command.metadata_read_only_paths.is_empty());
     }
 
     #[test]

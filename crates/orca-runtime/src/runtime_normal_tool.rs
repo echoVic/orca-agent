@@ -233,6 +233,7 @@ fn execute_bash(
             permission_overlay: context.permission_overlay,
             terminal,
             execution_deadline,
+            git_metadata_grant: None,
             #[cfg(test)]
             sandbox_override: None,
         },
