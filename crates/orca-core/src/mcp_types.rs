@@ -9,9 +9,11 @@ use crate::capability::CapabilitySet;
 #[serde(rename_all = "snake_case")]
 pub enum McpTransportKind {
     Stdio,
+    /// Streamable HTTP, or the legacy HTTP+SSE transport of protocol
+    /// 2024-11-05 when the server turns the `initialize` POST away with 400,
+    /// 404 or 405.
     Sse,
-    /// Streamable HTTP. Until the dedicated transport lands, `connect` routes
-    /// this through the same transport as `Sse`.
+    /// Streamable HTTP.
     Http,
 }
 

@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 
+use crate::legacy_sse::MCP_SSE_EVENT_STREAM_CLOSED;
 use crate::transport::{self, McpElicitationHandler, McpTransport};
 use orca_core::conversation::ImageInput;
 use orca_core::mcp_types::{
@@ -1089,6 +1090,8 @@ fn should_reconnect_after_mcp_error(transport: &McpTransportKind, error: &str) -
         || error.contains("failed to write MCP request")
         // An oversized stdio response stops the reader and kills the server.
         || error.contains("MCP response exceeded maximum line size")
+        // The legacy SSE event stream ended; a new connection opens another.
+        || error.contains(MCP_SSE_EVENT_STREAM_CLOSED)
 }
 
 #[derive(Debug)]

@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -20,12 +20,14 @@ use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
 use orca_platform::process::ProcessJob;
 use orca_platform::shell::resolve_program;
 
+use crate::legacy_sse::LegacySseTransport;
+
 const STDIO_RESPONSE_QUEUE_CAPACITY: usize = 8;
 // The largest single MCP response either transport accepts: room for two
 // 5 MiB tool images (base64 adds a third) plus text, and far below the 64 MiB
 // session record limit a tool result is written under.
 pub(crate) const MAX_STDIO_RESPONSE_LINE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_SSE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_SSE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// The MCP protocol version Orca asks for when it initializes a server.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -162,17 +164,14 @@ pub trait McpTransport: Send + Sync {
 pub fn connect(config: &McpServerConfig) -> Result<Box<dyn McpTransport>, String> {
     match config.transport {
         McpTransportKind::Stdio => Ok(Box::new(StdioTransport::start(config)?)),
-        // Orca's `sse` transport has always POSTed each message, so servers
-        // configured that way are reached over streamable HTTP as well.
-        McpTransportKind::Sse | McpTransportKind::Http => {
-            Ok(Box::new(StreamableHttpTransport::new(config)?))
-        }
+        McpTransportKind::Http => Ok(Box::new(StreamableHttpTransport::new(config)?)),
+        McpTransportKind::Sse => Ok(Box::new(SseFallbackTransport::new(config)?)),
     }
 }
 
 /// The `initialize` parameters: the protocol version Orca asks for, and who
 /// it is.
-fn initialize_params() -> Value {
+pub(crate) fn initialize_params() -> Value {
     json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
         "capabilities": {},
@@ -185,7 +184,7 @@ fn initialize_params() -> Value {
 
 /// Checks the protocol version a server answered `initialize` with. Returns
 /// it when Orca speaks it, or `None` when the server did not name one.
-fn negotiated_protocol_version(
+pub(crate) fn negotiated_protocol_version(
     server_name: &str,
     initialize_result: &Value,
 ) -> Result<Option<&'static str>, String> {
@@ -660,7 +659,7 @@ fn try_recv_stdio_response(
     }
 }
 
-fn is_elicitation_create_request(message: &Value) -> bool {
+pub(crate) fn is_elicitation_create_request(message: &Value) -> bool {
     message.get("method").and_then(Value::as_str) == Some("elicitation/create")
 }
 
@@ -746,7 +745,7 @@ fn mcp_elicitation_request_from_json(
     })
 }
 
-fn json_rpc_id_to_string(id: &Value) -> String {
+pub(crate) fn json_rpc_id_to_string(id: &Value) -> String {
     match id {
         Value::String(value) => value.clone(),
         _ => id.to_string(),
@@ -773,7 +772,7 @@ fn mcp_elicitation_jsonrpc_response(request: &Value, response: McpElicitationRes
     })
 }
 
-fn mcp_jsonrpc_error_response(request: &Value, code: i64, message: String) -> Value {
+pub(crate) fn mcp_jsonrpc_error_response(request: &Value, code: i64, message: String) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": request.get("id").cloned().unwrap_or(Value::Null),
@@ -922,36 +921,45 @@ impl From<String> for HttpRequestError {
     }
 }
 
+/// The url a remote server is reached at.
+pub(crate) fn remote_url(config: &McpServerConfig) -> Result<String, String> {
+    config
+        .url
+        .clone()
+        .ok_or_else(|| format!("MCP SSE server '{}' is missing url", config.name))
+}
+
+/// The headers a remote server is configured with, checked. A configured
+/// session or protocol version header is left out: those are the
+/// transport's to send, and a new session must start without either.
+pub(crate) fn configured_headers(config: &McpServerConfig) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    for (name, value) in &config.headers {
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            format!(
+                "MCP server '{}' has an invalid header name '{name}'",
+                config.name
+            )
+        })?;
+        let header_value = HeaderValue::from_str(value).map_err(|_| {
+            format!(
+                "MCP server '{}' has an invalid value for header '{name}'",
+                config.name
+            )
+        })?;
+        headers.append(header_name, header_value);
+    }
+    headers.remove(MCP_SESSION_ID_HEADER);
+    headers.remove(MCP_PROTOCOL_VERSION_HEADER);
+    Ok(headers)
+}
+
 impl StreamableHttpTransport {
     fn new(config: &McpServerConfig) -> Result<Self, String> {
-        let endpoint = config
-            .url
-            .clone()
-            .ok_or_else(|| format!("MCP SSE server '{}' is missing url", config.name))?;
-        let mut headers = HeaderMap::new();
-        for (name, value) in &config.headers {
-            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-                format!(
-                    "MCP server '{}' has an invalid header name '{name}'",
-                    config.name
-                )
-            })?;
-            let header_value = HeaderValue::from_str(value).map_err(|_| {
-                format!(
-                    "MCP server '{}' has an invalid value for header '{name}'",
-                    config.name
-                )
-            })?;
-            headers.append(header_name, header_value);
-        }
-        // The session and its protocol version are the transport's to send:
-        // a new session must start without either.
-        headers.remove(MCP_SESSION_ID_HEADER);
-        headers.remove(MCP_PROTOCOL_VERSION_HEADER);
         Ok(Self {
             server_name: config.name.clone(),
-            endpoint,
-            headers,
+            endpoint: remote_url(config)?,
+            headers: configured_headers(config)?,
             session: Mutex::new(HttpSession::default()),
             next_id: Mutex::new(1),
             client: reqwest::blocking::Client::new(),
@@ -1384,7 +1392,137 @@ impl Drop for StreamableHttpTransport {
     }
 }
 
-fn resolve_sse_elicitation(
+/// `transport = "sse"`: streamable HTTP when the server speaks it, otherwise
+/// the legacy HTTP+SSE transport of protocol 2024-11-05. `initialize` picks
+/// one the way the MCP spec advises clients that must also reach older
+/// servers: it POSTs `initialize`, and only a 400, 404 or 405 answer sends it
+/// to legacy SSE. Every later call goes to the transport it picked.
+struct SseFallbackTransport {
+    config: McpServerConfig,
+    /// The transport `initialize` picked.
+    transport: OnceLock<Box<dyn McpTransport>>,
+}
+
+impl SseFallbackTransport {
+    fn new(config: &McpServerConfig) -> Result<Self, String> {
+        // Report a missing url or a bad header now, as `http` does.
+        remote_url(config)?;
+        configured_headers(config)?;
+        Ok(Self {
+            config: config.clone(),
+            transport: OnceLock::new(),
+        })
+    }
+
+    /// Starts a session over streamable HTTP, or over legacy SSE when the
+    /// server turns the `initialize` POST away.
+    fn start(&self) -> Result<(Box<dyn McpTransport>, Value), String> {
+        let http = StreamableHttpTransport::new(&self.config)?;
+        match http.start_session() {
+            Ok(result) => Ok((Box::new(http), result)),
+            Err(HttpRequestError::Status { status, .. })
+                if matches!(status.as_u16(), 400 | 404 | 405) =>
+            {
+                drop(http);
+                // Keep the first failure in view: the server may not speak
+                // legacy SSE either.
+                let legacy = LegacySseTransport::connect(&self.config).map_err(|error| {
+                    format!("{error}; the streamable HTTP initialize failed with {status}")
+                })?;
+                let result = legacy.initialize()?;
+                Ok((Box::new(legacy), result))
+            }
+            Err(error) => Err(error.into_message()),
+        }
+    }
+
+    fn transport(&self) -> Result<&dyn McpTransport, String> {
+        self.transport
+            .get()
+            .map(|transport| transport.as_ref())
+            .ok_or_else(|| format!("MCP server '{}' is not initialized", self.config.name))
+    }
+}
+
+impl McpTransport for SseFallbackTransport {
+    fn capability_receipt(&self) -> Option<CapabilityReceipt> {
+        self.transport.get()?.capability_receipt()
+    }
+
+    fn initialize(&self) -> Result<Value, String> {
+        if let Some(transport) = self.transport.get() {
+            return transport.initialize();
+        }
+        let (transport, result) = self.start()?;
+        // Should two calls race here, the first to finish is kept.
+        let _ = self.transport.set(transport);
+        Ok(result)
+    }
+
+    fn list_tools(&self) -> Result<Value, String> {
+        self.transport()?.list_tools()
+    }
+
+    fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        self.transport()?.call_tool(name, arguments)
+    }
+
+    fn call_tool_with_elicitation_handler(
+        &self,
+        name: &str,
+        arguments: Value,
+        handler: Option<&dyn McpElicitationHandler>,
+    ) -> Result<Value, String> {
+        self.transport()?
+            .call_tool_with_elicitation_handler(name, arguments, handler)
+    }
+
+    fn call_tool_with_elicitation_handler_or_cancel(
+        &self,
+        name: &str,
+        arguments: Value,
+        handler: Option<&dyn McpElicitationHandler>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        self.transport()?
+            .call_tool_with_elicitation_handler_or_cancel(name, arguments, handler, should_cancel)
+    }
+
+    fn list_resources(&self) -> Result<Value, String> {
+        self.transport()?.list_resources()
+    }
+
+    fn list_resources_or_cancel(&self, should_cancel: &dyn Fn() -> bool) -> Result<Value, String> {
+        self.transport()?.list_resources_or_cancel(should_cancel)
+    }
+
+    fn list_resource_templates(&self) -> Result<Value, String> {
+        self.transport()?.list_resource_templates()
+    }
+
+    fn list_resource_templates_or_cancel(
+        &self,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        self.transport()?
+            .list_resource_templates_or_cancel(should_cancel)
+    }
+
+    fn read_resource(&self, uri: &str) -> Result<Value, String> {
+        self.transport()?.read_resource(uri)
+    }
+
+    fn read_resource_or_cancel(
+        &self,
+        uri: &str,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        self.transport()?
+            .read_resource_or_cancel(uri, should_cancel)
+    }
+}
+
+pub(crate) fn resolve_sse_elicitation(
     server_name: &str,
     request: &Value,
     handler: Option<&dyn McpElicitationHandler>,
@@ -1562,7 +1700,7 @@ async fn await_sse_elicitation_response(
     }
 }
 
-fn sse_event_end(buffer: &[u8]) -> Option<usize> {
+pub(crate) fn sse_event_end(buffer: &[u8]) -> Option<usize> {
     buffer
         .windows(2)
         .position(|window| window == b"\n\n")
@@ -1575,14 +1713,24 @@ fn sse_event_end(buffer: &[u8]) -> Option<usize> {
         })
 }
 
-fn parse_sse_event(event: &[u8]) -> Result<Option<Value>, String> {
+/// Splits one server-sent event into its type, when it names one, and its
+/// data: every `data:` line, trimmed, joined with newlines.
+pub(crate) fn sse_event_parts(event: &[u8]) -> Result<(Option<&str>, String), String> {
     let text = std::str::from_utf8(event).map_err(|error| error.to_string())?;
-    let data = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut name = None;
+    let mut data = Vec::new();
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.trim());
+        } else if let Some(value) = line.strip_prefix("event:") {
+            name = Some(value.trim());
+        }
+    }
+    Ok((name, data.join("\n")))
+}
+
+fn parse_sse_event(event: &[u8]) -> Result<Option<Value>, String> {
+    let (_, data) = sse_event_parts(event)?;
     if data.is_empty() {
         return Ok(None);
     }
@@ -1597,7 +1745,11 @@ fn parse_terminal_sse_message(text: &str, method: &str, request_id: u64) -> Resu
     parse_terminal_message(response, method, request_id)
 }
 
-fn parse_terminal_message(response: Value, method: &str, request_id: u64) -> Result<Value, String> {
+pub(crate) fn parse_terminal_message(
+    response: Value,
+    method: &str,
+    request_id: u64,
+) -> Result<Value, String> {
     if response.get("id") != Some(&Value::from(request_id)) {
         return Err(format!(
             "MCP SSE request '{method}' returned mismatched response id"
@@ -1783,11 +1935,11 @@ fn parse_sse_or_json_response(text: &str, request_id: u64) -> Result<Value, Stri
     last.ok_or_else(|| "response was neither JSON nor SSE data".to_string())
 }
 
-fn timeout_from_ms(timeout_ms: Option<u64>) -> Duration {
+pub(crate) fn timeout_from_ms(timeout_ms: Option<u64>) -> Duration {
     Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1))
 }
 
-fn format_duration(duration: Duration) -> String {
+pub(crate) fn format_duration(duration: Duration) -> String {
     if duration.as_millis().is_multiple_of(1000) {
         format!("{}s", duration.as_secs())
     } else {
@@ -1798,6 +1950,7 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::legacy_sse::MCP_SSE_EVENT_STREAM_CLOSED;
     use std::collections::HashMap;
     use std::fs;
     use std::io::{Read, Write};
@@ -2689,7 +2842,7 @@ done
 
         let transport = connect(&McpServerConfig {
             name: "elicits-sse".to_string(),
-            transport: McpTransportKind::Sse,
+            transport: McpTransportKind::Http,
             command: None,
             args: Vec::new(),
             url: Some(format!("http://{address}")),
@@ -2733,7 +2886,7 @@ done
         let (url, server) = start_sse_elicitation_wire_fixture(SseWireElicitationMode::Decline);
         let transport = connect(&McpServerConfig {
             name: "decline-wire".to_string(),
-            transport: McpTransportKind::Sse,
+            transport: McpTransportKind::Http,
             command: None,
             args: Vec::new(),
             url: Some(url),
@@ -2772,7 +2925,7 @@ done
             start_sse_elicitation_wire_fixture(SseWireElicitationMode::MalformedParams);
         let transport = connect(&McpServerConfig {
             name: "malformed-wire".to_string(),
-            transport: McpTransportKind::Sse,
+            transport: McpTransportKind::Http,
             command: None,
             args: Vec::new(),
             url: Some(url),
@@ -2810,7 +2963,7 @@ done
         let (url, server) = start_sse_elicitation_wire_fixture(SseWireElicitationMode::StallPost);
         let transport = connect(&McpServerConfig {
             name: "cancel-post-wire".to_string(),
-            transport: McpTransportKind::Sse,
+            transport: McpTransportKind::Http,
             command: None,
             args: Vec::new(),
             url: Some(url),
@@ -3990,7 +4143,393 @@ while IFS= read -r line; do :; done
         );
     }
 
-    fn streamable_http_config(name: &str, server: &StreamableHttpServer) -> McpServerConfig {
+    #[test]
+    fn legacy_sse_reads_responses_from_the_event_stream() {
+        let server = LegacySseServer::start(LegacySseBehavior::default());
+        let mut config = legacy_sse_config("legacy", &server);
+        config.headers = HashMap::from([("X-Api-Key".to_string(), "k1".to_string())]);
+        let transport = LegacySseTransport::connect(&config).expect("open the event stream");
+
+        let initialized = transport
+            .initialize()
+            .expect("initialize over the event stream");
+        let tools = transport
+            .list_tools()
+            .expect("tools/list over the event stream");
+        let called = transport
+            .call_tool("echo", json!({"text": "hi"}))
+            .expect("tools/call over the event stream");
+
+        assert_eq!(initialized["serverInfo"]["name"], "legacy");
+        assert_eq!(tools["tools"][0]["name"], "echo");
+        assert_eq!(called["content"][0]["text"], "hi");
+        assert_eq!(
+            server.trail(),
+            [
+                "GET /sse",
+                "POST /messages?sessionId=legacy-1 initialize",
+                "POST /messages?sessionId=legacy-1 notifications/initialized",
+                "POST /messages?sessionId=legacy-1 tools/list",
+                "POST /messages?sessionId=legacy-1 tools/call",
+            ]
+        );
+        let requests = server.requests();
+        assert_eq!(requests[0].header_values("accept"), ["text/event-stream"]);
+        assert_eq!(requests[1].body["params"]["protocolVersion"], "2025-06-18");
+        for request in &requests {
+            // Legacy SSE has no session or protocol version header.
+            assert_eq!(request.header("x-api-key"), Some("k1"), "{}", request.path);
+            assert_eq!(request.header("mcp-session-id"), None, "{}", request.path);
+            assert_eq!(
+                request.header("mcp-protocol-version"),
+                None,
+                "{}",
+                request.path
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_sse_rejects_a_cross_origin_endpoint() {
+        // Another scheme, another host, and another port.
+        for endpoint in [
+            "https://127.0.0.1:{port}/messages",
+            "http://localhost:{port}/messages",
+            "http://127.0.0.1:1/messages",
+        ] {
+            let server = LegacySseServer::start(LegacySseBehavior {
+                endpoint,
+                ..Default::default()
+            });
+            let sent = endpoint.replace("{port}", &server.addr.port().to_string());
+
+            let Err(error) = LegacySseTransport::connect(&legacy_sse_config("elsewhere", &server))
+            else {
+                panic!("an endpoint on another origin was accepted: {sent}");
+            };
+
+            assert_eq!(
+                error,
+                format!("MCP server 'elsewhere' sent an endpoint on another origin: {sent}")
+            );
+            assert_eq!(
+                server.trail(),
+                ["GET /sse"],
+                "Orca sent a message to {sent}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_sse_answers_elicitation_requests_over_post() {
+        let server = LegacySseServer::start(LegacySseBehavior {
+            elicit: true,
+            elicit_unprompted: true,
+            ..Default::default()
+        });
+        let transport = LegacySseTransport::connect(&legacy_sse_config("asking", &server))
+            .expect("open the event stream");
+
+        // A question that comes while no request is waiting is turned down.
+        let unprompted = server
+            .wait_for_request(|request| request.body["id"] == "unprompted-1")
+            .expect("the unprompted question was answered");
+        assert_eq!(unprompted.path, "/messages?sessionId=legacy-1");
+        assert_eq!(unprompted.body["error"]["code"], -32601);
+
+        transport.initialize().expect("initialize");
+        let handler =
+            RecordingElicitationHandler::new(McpElicitationResponse::accept(json!({"ok": true})));
+        let accepted = transport
+            .call_tool_with_elicitation_handler("echo", json!({}), Some(&handler))
+            .expect("tool result after the question was answered");
+        // Without a handler there is no one to ask, so the question is turned down.
+        let refused = transport
+            .call_tool("echo", json!({}))
+            .expect("tool result after the question was turned down");
+
+        assert_eq!(accepted["content"][0]["text"], "accept");
+        assert_eq!(handler.requests.lock().unwrap()[0].message, "Proceed?");
+        let reply = server
+            .requests()
+            .into_iter()
+            .find(|request| request.body["id"] == "prompt-1")
+            .expect("the reply reached the server");
+        assert_eq!(reply.path, "/messages?sessionId=legacy-1");
+        assert_eq!(reply.body["result"]["content"], json!({"ok": true}));
+        assert_eq!(
+            refused["content"][0]["text"],
+            "elicitation is not supported"
+        );
+    }
+
+    #[test]
+    fn legacy_sse_times_out_each_request_on_its_own() {
+        let server = LegacySseServer::start(LegacySseBehavior {
+            unanswered: Some("tools/call"),
+            ..Default::default()
+        });
+        let mut config = legacy_sse_config("slow", &server);
+        config.tool_timeout_ms = Some(100);
+        let transport = LegacySseTransport::connect(&config).expect("open the event stream");
+        transport.initialize().expect("initialize");
+
+        let started = Instant::now();
+        let error = transport
+            .call_tool("echo", json!({"text": "hi"}))
+            .expect_err("a call that is never answered must time out");
+        let elapsed = started.elapsed();
+
+        assert_eq!(error, "MCP SSE request 'tools/call' timed out after 100ms");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the call took {elapsed:?}"
+        );
+        // The stream stays open for the next request, which has its own timeout.
+        let tools = transport
+            .list_tools()
+            .expect("tools/list after the timeout");
+        assert_eq!(tools["tools"][0]["name"], "echo");
+    }
+
+    #[test]
+    fn legacy_sse_stops_waiting_when_cancelled() {
+        let server = LegacySseServer::start(LegacySseBehavior {
+            unanswered: Some("tools/call"),
+            ..Default::default()
+        });
+        let transport = LegacySseTransport::connect(&legacy_sse_config("cancelled", &server))
+            .expect("open the event stream");
+        transport.initialize().expect("initialize");
+
+        let started = Instant::now();
+        let error = transport
+            .call_tool_with_elicitation_handler_or_cancel("echo", json!({}), None, &|| {
+                started.elapsed() >= Duration::from_millis(50)
+            })
+            .expect_err("the call must be cancelled");
+        let elapsed = started.elapsed();
+
+        assert_eq!(error, "MCP tool call cancelled");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancelling took {elapsed:?}"
+        );
+        let tools = transport
+            .list_tools()
+            .expect("tools/list after the cancellation");
+        assert_eq!(tools["tools"][0]["name"], "echo");
+    }
+
+    #[test]
+    fn dropping_a_legacy_sse_transport_stops_its_reader() {
+        let server = LegacySseServer::start(LegacySseBehavior::default());
+        let transport = LegacySseTransport::connect(&legacy_sse_config("dropped", &server))
+            .expect("open the event stream");
+        transport.initialize().expect("initialize");
+
+        // Dropping waits for the reader thread, so a reader that kept reading
+        // would hold this thread until the server closed the stream.
+        let (dropped, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(transport);
+            let _ = dropped.send(());
+        });
+
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("dropping the transport stopped its reader");
+    }
+
+    #[test]
+    fn sse_falls_back_to_legacy_when_post_is_not_allowed() {
+        // A server that only speaks legacy SSE answers the POST with 405. The
+        // spec has clients fall back on 400 and 404 as well.
+        for post_status in [405, 404, 400] {
+            let server = LegacySseServer::start(LegacySseBehavior {
+                // An absolute endpoint on the same origin works like a relative one.
+                endpoint: "http://127.0.0.1:{port}/messages?sessionId={session}",
+                post_status,
+                ..Default::default()
+            });
+            let transport =
+                connect(&legacy_sse_config("fallback", &server)).expect("connect SSE MCP");
+
+            let initialized = transport
+                .initialize()
+                .unwrap_or_else(|error| panic!("initialize after a {post_status}: {error}"));
+            let tools = transport
+                .list_tools()
+                .unwrap_or_else(|error| panic!("tools/list after a {post_status}: {error}"));
+            let called = transport
+                .call_tool("echo", json!({"text": "hi"}))
+                .unwrap_or_else(|error| panic!("tools/call after a {post_status}: {error}"));
+
+            assert_eq!(initialized["serverInfo"]["name"], "legacy");
+            assert_eq!(tools["tools"][0]["name"], "echo");
+            assert_eq!(called["content"][0]["text"], "hi");
+            assert_eq!(
+                server.trail(),
+                [
+                    "POST /sse initialize",
+                    "GET /sse",
+                    "POST /messages?sessionId=legacy-1 initialize",
+                    "POST /messages?sessionId=legacy-1 notifications/initialized",
+                    "POST /messages?sessionId=legacy-1 tools/list",
+                    "POST /messages?sessionId=legacy-1 tools/call",
+                ],
+                "after a {post_status}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_falls_back_and_reports_both_failures_when_neither_works() {
+        let server = LegacySseServer::start(LegacySseBehavior::default());
+        let mut config = legacy_sse_config("nowhere", &server);
+        config.url = Some(format!("{}/missing", server.url()));
+        let transport = connect(&config).expect("connect SSE MCP");
+
+        let error = transport
+            .initialize()
+            .expect_err("a url that answers 404 to both transports must fail");
+
+        assert_eq!(
+            error,
+            "MCP server 'nowhere' could not open its SSE event stream: 404 Not Found; \
+             the streamable HTTP initialize failed with 404 Not Found"
+        );
+        assert_eq!(server.trail(), ["POST /missing initialize", "GET /missing"]);
+    }
+
+    #[test]
+    fn sse_falls_back_only_when_post_gets_400_404_or_405() {
+        let server = LegacySseServer::start(LegacySseBehavior {
+            post_status: 500,
+            ..Default::default()
+        });
+        let transport = connect(&legacy_sse_config("failing", &server)).expect("connect SSE MCP");
+
+        let error = transport
+            .initialize()
+            .expect_err("a 500 must fail initialize");
+
+        assert_eq!(
+            error,
+            "MCP SSE request 'initialize' failed with 500 Internal Server Error"
+        );
+        assert_eq!(server.trail(), ["POST /sse initialize"]);
+    }
+
+    #[test]
+    fn sse_keeps_using_streamable_http_when_it_works() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            sessions: vec!["s1"],
+            ..Default::default()
+        });
+        let mut config = streamable_http_config("modern", &server);
+        config.transport = McpTransportKind::Sse;
+        let transport = connect(&config).expect("connect SSE MCP");
+
+        // Nothing goes out until `initialize` has picked the transport.
+        assert_eq!(
+            transport
+                .list_tools()
+                .expect_err("tools/list before initialize"),
+            "MCP server 'modern' is not initialized"
+        );
+        assert!(server.requests().is_empty());
+
+        transport.initialize().expect("initialize");
+        let tools = transport.list_tools().expect("list tools");
+        let called = transport
+            .call_tool("echo", json!({"text": "hi"}))
+            .expect("call a tool");
+
+        assert_eq!(tools["tools"][0]["name"], "echo");
+        assert_eq!(called["content"][0]["text"], "hi");
+        assert_eq!(
+            server.session_trail(),
+            [
+                "initialize",
+                "notifications/initialized s1",
+                "tools/list s1",
+                "tools/call s1"
+            ]
+        );
+        assert!(
+            server
+                .requests()
+                .iter()
+                .all(|request| request.method == "POST"),
+            "a server that speaks streamable HTTP was sent a GET"
+        );
+    }
+
+    #[test]
+    fn a_closed_event_stream_fails_pending_requests() {
+        let server = LegacySseServer::start(LegacySseBehavior {
+            close_stream_on: Some("tools/call"),
+            ..Default::default()
+        });
+        let transport = LegacySseTransport::connect(&legacy_sse_config("closing", &server))
+            .expect("open the event stream");
+        transport.initialize().expect("initialize");
+
+        let error = transport
+            .call_tool("echo", json!({"text": "hi"}))
+            .expect_err("the stream ended before the call was answered");
+        assert!(
+            error.starts_with(MCP_SSE_EVENT_STREAM_CLOSED),
+            "unexpected error: {error}"
+        );
+
+        // Later requests fail at once, without sending what no stream can answer.
+        let later = transport
+            .list_tools()
+            .expect_err("the event stream is gone");
+        assert_eq!(later, error);
+        assert!(server.requests_for("tools/list").is_empty());
+    }
+
+    #[test]
+    fn a_closed_event_stream_is_reopened_for_the_next_call() {
+        let server = LegacySseServer::start(LegacySseBehavior {
+            close_stream_on: Some("tools/call"),
+            ..Default::default()
+        });
+        let registry = crate::initialize_registry(&[legacy_sse_config("reopening", &server)]);
+        assert!(registry.errors().is_empty(), "{:?}", registry.errors());
+        let echo = registry
+            .resolve_tool("mcp__reopening__echo")
+            .expect("the echo tool is registered");
+
+        let error = registry
+            .call_tool(&echo, json!({"text": "first"}))
+            .expect_err("the stream ended under the first call");
+        let second = registry
+            .call_tool(&echo, json!({"text": "second"}))
+            .expect("the next call runs on a new event stream");
+
+        assert!(
+            error.starts_with(MCP_SSE_EVENT_STREAM_CLOSED),
+            "unexpected error: {error}"
+        );
+        assert_eq!(second.output, "second");
+        let trail = server.trail();
+        assert_eq!(
+            trail
+                .iter()
+                .filter(|request| *request == "GET /sse")
+                .count(),
+            2
+        );
+        assert_eq!(
+            trail.last().map(String::as_str),
+            Some("POST /messages?sessionId=legacy-2 tools/call")
+        );
+    }
+
+    fn streamable_http_config(name: &str, server: &HttpFixture) -> McpServerConfig {
         McpServerConfig {
             name: name.to_string(),
             transport: McpTransportKind::Http,
@@ -4005,7 +4544,7 @@ while IFS= read -r line; do :; done
     /// transport already initialized into the first one.
     fn expiring_http_session(
         ended_sessions: Vec<&'static str>,
-    ) -> (StreamableHttpServer, Box<dyn McpTransport>) {
+    ) -> (HttpFixture, Box<dyn McpTransport>) {
         let server = StreamableHttpServer::start(StreamableHttpBehavior {
             sessions: vec!["s1", "s2"],
             ended_sessions,
@@ -4017,18 +4556,22 @@ while IFS= read -r line; do :; done
         (server, transport)
     }
 
-    /// How long the streamable HTTP fixture waits for a request to arrive.
-    /// Only a failing test waits this long.
+    /// How long an HTTP fixture waits for a request to arrive, or an event
+    /// stream for its next event. Only a failing test waits this long.
     const FIXTURE_WAIT: Duration = Duration::from_secs(5);
 
-    /// A streamable HTTP MCP server on a local port. Like a real one it turns
-    /// away requests that lack the headers the spec requires, and it records
-    /// every request so a test can check exactly what Orca sent.
-    struct StreamableHttpServer {
+    /// An HTTP server on a local port. It records every request, so a test
+    /// can check exactly what Orca sent, then answers it with the handler it
+    /// was started with. Each connection is served on its own thread.
+    struct HttpFixture {
         addr: std::net::SocketAddr,
         requests: Arc<StdMutex<Vec<HttpExchange>>>,
         stopped: Arc<AtomicBool>,
     }
+
+    /// A streamable HTTP MCP server. Like a real one it turns away requests
+    /// that lack the headers the spec requires.
+    struct StreamableHttpServer;
 
     #[derive(Clone)]
     struct StreamableHttpBehavior {
@@ -4067,6 +4610,8 @@ while IFS= read -r line; do :; done
     #[derive(Clone, Debug)]
     struct HttpExchange {
         method: String,
+        /// The request target: the path and any query.
+        path: String,
         /// Header names are lower-cased.
         headers: Vec<(String, String)>,
         /// The JSON body, or null when there is none.
@@ -4095,39 +4640,46 @@ while IFS= read -r line; do :; done
     }
 
     impl StreamableHttpServer {
-        fn start(behavior: StreamableHttpBehavior) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind streamable HTTP fixture");
+        fn start(behavior: StreamableHttpBehavior) -> HttpFixture {
+            let initializations = AtomicUsize::new(0);
+            HttpFixture::serve(move |stream, request, log| {
+                serve_streamable_http(stream, request, &behavior, log, &initializations);
+            })
+        }
+    }
+
+    impl HttpFixture {
+        /// Starts serving. Each request is read and recorded, then handed to
+        /// `handle` along with every request recorded so far.
+        fn serve(
+            handle: impl Fn(&mut TcpStream, &HttpExchange, &StdMutex<Vec<HttpExchange>>)
+            + Send
+            + Sync
+            + 'static,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP fixture");
             listener
                 .set_nonblocking(true)
-                .expect("set streamable HTTP fixture nonblocking");
-            let addr = listener
-                .local_addr()
-                .expect("streamable HTTP fixture address");
+                .expect("set HTTP fixture nonblocking");
+            let addr = listener.local_addr().expect("HTTP fixture address");
             let requests = Arc::new(StdMutex::new(Vec::new()));
             let stopped = Arc::new(AtomicBool::new(false));
             let log = Arc::clone(&requests);
             let stop = Arc::clone(&stopped);
+            let handle = Arc::new(handle);
             std::thread::spawn(move || {
-                let initializations = Arc::new(AtomicUsize::new(0));
                 while !stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            let behavior = behavior.clone();
                             let log = Arc::clone(&log);
-                            let initializations = Arc::clone(&initializations);
+                            let handle = Arc::clone(&handle);
                             std::thread::spawn(move || {
                                 let _ = stream.set_nonblocking(false);
                                 let Some(request) = read_http_exchange(&mut stream) else {
                                     return;
                                 };
                                 log.lock().expect("fixture log").push(request.clone());
-                                serve_streamable_http(
-                                    &mut stream,
-                                    &request,
-                                    &behavior,
-                                    &log,
-                                    &initializations,
-                                );
+                                handle(&mut stream, &request, &log);
                             });
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -4174,25 +4726,49 @@ while IFS= read -r line; do :; done
                 .collect()
         }
 
+        /// Each request received: its HTTP method and target, then its
+        /// JSON-RPC method, if it has one.
+        fn trail(&self) -> Vec<String> {
+            self.requests()
+                .iter()
+                .map(|request| match request.rpc_method() {
+                    Some(method) => format!("{} {} {method}", request.method, request.path),
+                    None => format!("{} {}", request.method, request.path),
+                })
+                .collect()
+        }
+
         fn wait_for_request(
             &self,
             matches: impl Fn(&HttpExchange) -> bool,
         ) -> Option<HttpExchange> {
-            let deadline = Instant::now() + FIXTURE_WAIT;
-            loop {
-                if let Some(request) = self.requests().into_iter().find(|request| matches(request))
-                {
-                    return Some(request);
-                }
-                if Instant::now() >= deadline {
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            wait_in_log(&self.requests, matches)
         }
     }
 
-    impl Drop for StreamableHttpServer {
+    /// Waits up to [`FIXTURE_WAIT`] for a recorded request that `matches`.
+    fn wait_in_log(
+        log: &StdMutex<Vec<HttpExchange>>,
+        matches: impl Fn(&HttpExchange) -> bool,
+    ) -> Option<HttpExchange> {
+        let deadline = Instant::now() + FIXTURE_WAIT;
+        loop {
+            if let Some(request) = log
+                .lock()
+                .expect("fixture log")
+                .iter()
+                .find(|request| matches(request))
+            {
+                return Some(request.clone());
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    impl Drop for HttpFixture {
         fn drop(&mut self) {
             self.stopped.store(true, Ordering::SeqCst);
         }
@@ -4327,26 +4903,16 @@ while IFS= read -r line; do :; done
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nevent: message\ndata: {question}\n\n"
         );
         let _ = stream.flush();
-        let deadline = Instant::now() + FIXTURE_WAIT;
-        let action = loop {
-            let reply = log
-                .lock()
-                .expect("fixture log")
-                .iter()
-                .find(|request| request.body["id"] == "prompt-1")
-                .map(|request| request.body["result"]["action"].clone());
-            if let Some(action) = reply {
-                break action;
-            }
-            if Instant::now() >= deadline {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        let Some(reply) = wait_in_log(log, |request| request.body["id"] == "prompt-1") else {
+            return;
         };
         let answer = json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": {"content": [{"type": "text", "text": action}], "isError": false}
+            "result": {
+                "content": [{"type": "text", "text": reply.body["result"]["action"]}],
+                "isError": false
+            }
         });
         let _ = write!(stream, "event: message\ndata: {answer}\n\n");
     }
@@ -4357,7 +4923,9 @@ while IFS= read -r line; do :; done
             202 => "Accepted",
             400 => "Bad Request",
             404 => "Not Found",
+            405 => "Method Not Allowed",
             406 => "Not Acceptable",
+            500 => "Internal Server Error",
             _ => "Unexpected",
         };
         let _ = write!(
@@ -4384,7 +4952,9 @@ while IFS= read -r line; do :; done
             };
             let head = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
             let mut lines = head.split("\r\n");
-            let method = lines.next()?.split_whitespace().next()?.to_string();
+            let mut request_line = lines.next()?.split_whitespace();
+            let method = request_line.next()?.to_string();
+            let path = request_line.next()?.to_string();
             let headers = lines
                 .filter_map(|line| line.split_once(':'))
                 .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
@@ -4402,9 +4972,267 @@ while IFS= read -r line; do :; done
                 .unwrap_or_default();
             return Some(HttpExchange {
                 method,
+                path,
                 headers,
                 body,
             });
         }
+    }
+
+    fn legacy_sse_config(name: &str, server: &HttpFixture) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransportKind::Sse,
+            url: Some(format!("{}/sse", server.url())),
+            startup_timeout_ms: Some(5_000),
+            tool_timeout_ms: Some(5_000),
+            ..Default::default()
+        }
+    }
+
+    /// A legacy HTTP+SSE MCP server (protocol 2024-11-05). A GET to `/sse`
+    /// opens an event stream whose first event names the endpoint to POST
+    /// messages to. Each POST gets a bare 202, and a request's response goes
+    /// out as a `message` event on the stream, the only place a client can
+    /// read it. A POST to `/sse` itself gets `post_status`, as from a server
+    /// that predates streamable HTTP.
+    struct LegacySseServer;
+
+    #[derive(Clone)]
+    struct LegacySseBehavior {
+        /// The `endpoint` event's data. `{port}` stands for the server's
+        /// port, and `{session}` for the ID of the session the stream opens.
+        endpoint: &'static str,
+        /// The status a POST to the stream's own url gets.
+        post_status: u16,
+        /// End the event stream, without an answer, the first time a request
+        /// with this method arrives.
+        close_stream_on: Option<&'static str>,
+        /// Acknowledge requests with this method, but never answer them.
+        unanswered: Option<&'static str>,
+        /// Ask the client a question during `tools/call`, and answer the call
+        /// with the action the client replied, or the error it replied with.
+        elicit: bool,
+        /// Ask the client a question as soon as the stream opens.
+        elicit_unprompted: bool,
+    }
+
+    impl Default for LegacySseBehavior {
+        fn default() -> Self {
+            Self {
+                endpoint: "/messages?sessionId={session}",
+                post_status: 405,
+                close_stream_on: None,
+                unanswered: None,
+                elicit: false,
+                elicit_unprompted: false,
+            }
+        }
+    }
+
+    /// What the legacy fixture's connections share.
+    #[derive(Default)]
+    struct LegacySseState {
+        /// Each open event stream, by session ID. It takes the events to
+        /// write, or `None` to end the stream.
+        streams: StdMutex<HashMap<String, mpsc::Sender<Option<String>>>>,
+        /// How many streams have been opened.
+        opened: AtomicUsize,
+        /// How many questions have been asked during `tools/call`.
+        questions: AtomicUsize,
+        /// Whether a stream has been ended for `close_stream_on`.
+        closed_one: AtomicBool,
+    }
+
+    impl LegacySseServer {
+        fn start(behavior: LegacySseBehavior) -> HttpFixture {
+            let state = LegacySseState::default();
+            HttpFixture::serve(move |stream, request, log| {
+                serve_legacy_sse(stream, request, &behavior, &state, log);
+            })
+        }
+    }
+
+    fn serve_legacy_sse(
+        stream: &mut TcpStream,
+        request: &HttpExchange,
+        behavior: &LegacySseBehavior,
+        state: &LegacySseState,
+        log: &StdMutex<Vec<HttpExchange>>,
+    ) {
+        let (path, query) = request
+            .path
+            .split_once('?')
+            .unwrap_or((request.path.as_str(), ""));
+        match (request.method.as_str(), path) {
+            ("GET", "/sse") => stream_legacy_events(stream, request, behavior, state),
+            ("POST", "/sse") => write_http_status(stream, behavior.post_status),
+            ("POST", "/messages") => {
+                let events = query.strip_prefix("sessionId=").and_then(|session| {
+                    state
+                        .streams
+                        .lock()
+                        .expect("fixture streams")
+                        .get(session)
+                        .cloned()
+                });
+                match events {
+                    Some(events) => {
+                        answer_legacy_message(stream, request, behavior, state, log, &events)
+                    }
+                    // The session's stream has ended, or never existed.
+                    None => write_http_status(stream, 404),
+                }
+            }
+            _ => write_http_status(stream, 404),
+        }
+    }
+
+    /// Holds a GET open as an event stream: the endpoint first, then each
+    /// event the POST handlers send, until one of them ends the stream.
+    fn stream_legacy_events(
+        stream: &mut TcpStream,
+        request: &HttpExchange,
+        behavior: &LegacySseBehavior,
+        state: &LegacySseState,
+    ) {
+        if !request
+            .header("accept")
+            .is_some_and(|accept| accept.contains("text/event-stream"))
+        {
+            return write_http_status(stream, 406);
+        }
+        let session = format!("legacy-{}", state.opened.fetch_add(1, Ordering::SeqCst) + 1);
+        let port = stream.local_addr().expect("legacy fixture address").port();
+        let endpoint = behavior
+            .endpoint
+            .replace("{port}", &port.to_string())
+            .replace("{session}", &session);
+        let (sender, events) = mpsc::channel();
+        state
+            .streams
+            .lock()
+            .expect("fixture streams")
+            .insert(session.clone(), sender);
+        let mut opening = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\n\r\nevent: endpoint\ndata: {endpoint}\n\n"
+        );
+        if behavior.elicit_unprompted {
+            opening.push_str(&legacy_event(&json!({
+                "jsonrpc": "2.0",
+                "id": "unprompted-1",
+                "method": "elicitation/create",
+                "params": {"message": "Anyone there?"}
+            })));
+        }
+        let mut next = Some(opening);
+        while let Some(event) = next {
+            if stream
+                .write_all(event.as_bytes())
+                .and_then(|()| stream.flush())
+                .is_err()
+            {
+                break;
+            }
+            next = events.recv_timeout(FIXTURE_WAIT).ok().flatten();
+        }
+        state
+            .streams
+            .lock()
+            .expect("fixture streams")
+            .remove(&session);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Acknowledges a POSTed message with a bare 202, and answers a request
+    /// on the event stream. The answer may reach the client before the 202.
+    fn answer_legacy_message(
+        stream: &mut TcpStream,
+        request: &HttpExchange,
+        behavior: &LegacySseBehavior,
+        state: &LegacySseState,
+        log: &StdMutex<Vec<HttpExchange>>,
+        events: &mpsc::Sender<Option<String>>,
+    ) {
+        let (Some(id), Some(method)) = (request.body.get("id").cloned(), request.rpc_method())
+        else {
+            // A notification, or the client's reply to a question.
+            return write_http_status(stream, 202);
+        };
+        if behavior.close_stream_on == Some(method)
+            && !state.closed_one.swap(true, Ordering::SeqCst)
+        {
+            let _ = events.send(None);
+            return write_http_status(stream, 202);
+        }
+        if behavior.unanswered == Some(method) {
+            return write_http_status(stream, 202);
+        }
+        let result = match method {
+            "initialize" => json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "legacy", "version": "1"}
+            }),
+            "tools/list" => json!({"tools": [{
+                "name": "echo",
+                "description": "echoes its text",
+                "inputSchema": {"type": "object"}
+            }]}),
+            "tools/call" if behavior.elicit => {
+                return ask_before_answering(stream, id, state, log, events);
+            }
+            "tools/call" => json!({
+                "content": [{
+                    "type": "text",
+                    "text": request.body["params"]["arguments"]["text"].clone()
+                }],
+                "isError": false
+            }),
+            _ => json!({}),
+        };
+        let _ = events.send(Some(legacy_event(
+            &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        )));
+        write_http_status(stream, 202);
+    }
+
+    /// Asks the client a question on the event stream, waits for its reply,
+    /// then answers the call with the action the client replied, or with the
+    /// message of the error it replied with.
+    fn ask_before_answering(
+        stream: &mut TcpStream,
+        id: Value,
+        state: &LegacySseState,
+        log: &StdMutex<Vec<HttpExchange>>,
+        events: &mpsc::Sender<Option<String>>,
+    ) {
+        let question = format!(
+            "prompt-{}",
+            state.questions.fetch_add(1, Ordering::SeqCst) + 1
+        );
+        let _ = events.send(Some(legacy_event(&json!({
+            "jsonrpc": "2.0",
+            "id": question,
+            "method": "elicitation/create",
+            "params": {"message": "Proceed?", "requestedSchema": {"type": "object"}}
+        }))));
+        write_http_status(stream, 202);
+        let Some(reply) = wait_in_log(log, |request| request.body["id"] == question) else {
+            return;
+        };
+        let text = reply.body["result"]["action"]
+            .as_str()
+            .or_else(|| reply.body["error"]["message"].as_str())
+            .unwrap_or_default();
+        let _ = events.send(Some(legacy_event(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"content": [{"type": "text", "text": text}], "isError": false}
+        }))));
+    }
+
+    fn legacy_event(message: &Value) -> String {
+        format!("event: message\ndata: {message}\n\n")
     }
 }

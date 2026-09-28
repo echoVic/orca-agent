@@ -1,6 +1,7 @@
 #![deny(deprecated)]
 
 pub mod client;
+mod legacy_sse;
 pub mod transport;
 
 pub use client::{McpRegistry, McpRequestError, canonical_server_name, initialize_registry};
