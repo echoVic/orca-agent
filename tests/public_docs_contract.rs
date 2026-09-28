@@ -8,7 +8,6 @@ const FORBIDDEN_PUBLIC_CLI_CLAIMS: &[&str] = &[
     "orca goal",
     "orca context",
     "orca config ",
-    "orca mcp",
     "orca skill",
     "--max-cost ",
     "--output ",

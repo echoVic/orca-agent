@@ -13,7 +13,7 @@ fn root_binary_exposes_the_supported_command_surface() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("help is UTF-8");
 
-    for command in ["exec", "workflow", "trust"] {
+    for command in ["exec", "workflow", "trust", "mcp"] {
         assert!(
             stdout
                 .lines()

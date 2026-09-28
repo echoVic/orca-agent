@@ -15,6 +15,7 @@ use crate::tool_types::ToolOutputTruncation;
 
 pub mod file;
 pub mod folder_trust;
+pub mod user_edit;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VimInsertEscapeSequence {

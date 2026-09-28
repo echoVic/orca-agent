@@ -1,10 +1,31 @@
 # MCP 集成
 
-MCP 服务器在用户拥有的 Orca 配置中声明，不由单独的公开命令空间管理。编辑 TOML 后，审查服务器命令或端点，再启动使用该配置的交互式或无头任务。
+用 `orca mcp add` 添加 MCP 服务器，用 `orca mcp list` 和 `orca mcp get` 查看，用
+`orca mcp remove` 删除。这些命令只写用户拥有的 Orca 配置，绝不改动项目的
+`.orca/config.toml`；改动在下一次会话启动时生效。完整的选项列表见
+[CLI 参考](cli-reference.md#orca-mcp)。
 
-设置 ORCA_HOME 时，用户配置位于 $ORCA_HOME/config.toml；否则位于 ~/.orca/config.toml。项目配置仅在工作区已受信任后才会生效。
+设置 ORCA_HOME 时，用户配置位于 $ORCA_HOME/config.toml；否则位于 ~/.orca/config.toml。
 
 ## Stdio 服务器
+
+~~~bash
+orca mcp add repository -- node /absolute/path/to/server.mjs
+~~~
+
+## 远程服务器（HTTP 或 SSE）
+
+~~~bash
+orca mcp add docs --url https://mcp.example.test/mcp \
+  --header "Authorization: Bearer token-from-environment"
+~~~
+
+`--transport` 选择 `http`（默认）或 `sse`。stdio 服务器需要 command；远程服务器需要
+url。凭据尽量放在环境变量中：`--bearer-token-env-var` 指定一个在连接时读取的环境
+变量名，而不是把 token 存进配置文件。
+
+`orca mcp add` 不会设置 capabilities、超时或工具过滤。新服务器默认只有只读能力；
+在 `orca mcp add` 写好的条目上手动编辑，按需授予：
 
 ~~~toml
 [[mcp_servers]]
@@ -23,20 +44,6 @@ network = false
 shell = false
 agent = false
 ~~~
-
-## SSE 服务器
-
-~~~toml
-[[mcp_servers]]
-name = "docs"
-transport = "sse"
-url = "https://mcp.example.test/sse"
-headers = { Authorization = "Bearer token-from-environment" }
-startup_timeout_ms = 10000
-tool_timeout_ms = 30000
-~~~
-
-transport 只能是 stdio 或 sse。stdio 服务器需要 command；SSE 服务器需要 url。凭据尽量放在环境变量中，并且只授予集成实际所需的能力。
 
 ## 工具返回的图片
 
@@ -62,4 +69,6 @@ transport 只能是 stdio 或 sse。stdio 服务器需要 command；SSE 服务�
 4. 使用 orca doctor 验证本地配置和沙箱就绪状态；它是只读的，不会启动 MCP 服务器。
 5. 任务运行期间在交互式 TUI 中查看状态。
 
-公开 CLI 不提供列出、重启、测试或诊断单个 MCP 服务器的命令。这些生命周期动作属于运行中会话和配置边界。
+`orca mcp list` 和 `orca mcp get` 查看已配置的服务器时绝不输出凭据的值：`env`
+和 `headers` 只显示已配置的键名。公开 CLI 仍然不提供重启、测试或诊断运行中 MCP
+连接的命令——这些仍然属于运行中会话的一部分。

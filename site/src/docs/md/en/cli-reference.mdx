@@ -30,6 +30,7 @@ positional text. The visible root commands are:
 | `orca exec` | Run a non-interactive task and emit text or JSONL events. |
 | `orca workflow` | Run and inspect persisted local workflows. |
 | `orca trust` | Show or update folder trust. |
+| `orca mcp` | Add, list, show, or remove MCP servers in the user config. |
 
 Root options are `--resume [SESSION_ID]`, `--fork <ID>`, `--continue`,
 `--model <MODEL>`, `--mode <MODE>`, `--api-key <KEY>`, `--base-url <URL>`, and
@@ -127,6 +128,53 @@ orca trust [show|add|remove] [--cwd PATH]
 
 `show` is read-only. `add` and `remove` update the user-owned folder-trust
 store, so use them only after reviewing the directory and its sandbox policy.
+
+## `orca mcp`
+
+```text
+orca mcp add NAME [OPTIONS] (--url URL | -- COMMAND [ARGS]...)
+orca mcp list [--json]
+orca mcp get NAME [--json]
+orca mcp remove NAME
+```
+
+`orca mcp` only writes the user-owned `$ORCA_HOME/config.toml`; a project's
+`.orca/config.toml` is never touched. A change takes effect the next time a
+session starts — it does not affect a session that is already running.
+`orca mcp login` and `orca mcp logout` are not available yet.
+
+| Subcommand | Purpose |
+| --- | --- |
+| `orca mcp add` | Add a stdio or remote (HTTP/SSE) MCP server. |
+| `orca mcp list` | List configured servers, one per line, or as JSON with `--json`. |
+| `orca mcp get` | Show one server's configuration. |
+| `orca mcp remove` | Remove a server from the user configuration. |
+
+`add` takes either a trailing stdio command or `--url`, never both:
+
+| Option | Meaning |
+| --- | --- |
+| `-e, --env KEY=VALUE` | Environment variable for a stdio server (repeatable). Conflicts with `--url`. |
+| `--url URL` | Remote server endpoint. |
+| `--transport http\|sse` | Remote transport; defaults to `http`. Only meaningful with `--url`. |
+| `--header 'Name: value'` | HTTP header for a remote server (repeatable). Requires `--url`. |
+| `--bearer-token-env-var VAR` | Environment variable holding a bearer token, read at connect time. Requires `--url`. |
+| `--client-id ID` | OAuth client id. Requires `--url`. |
+| `--callback-port PORT` | Local OAuth redirect callback port. Requires `--url`. |
+| `-- COMMAND [ARGS]...` | Stdio server command and its arguments. |
+
+`list` and `get` never print credential values: `env` and `headers` show only
+the configured key names, never their values.
+
+Examples:
+
+```bash
+orca mcp add docs -- npx -y docs-mcp-server
+orca mcp add search --url https://mcp.example.test/mcp --bearer-token-env-var SEARCH_TOKEN
+orca mcp list --json
+orca mcp get docs
+orca mcp remove docs
+```
 
 ## Configuration and environment
 

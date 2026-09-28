@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{OutputFormat, ProviderKind};
 
@@ -68,6 +68,8 @@ enum Command {
     Workflow(WorkflowArgs),
     /// Inspect or update folder trust.
     Trust(TrustArgs),
+    /// Add, list, show, or remove MCP servers in the user config.
+    Mcp(McpArgs),
     /// Serve shared ACP sessions on a restricted local socket (Unix).
     Daemon(DaemonArgs),
     /// Bridge standard ACP stdio to a running local daemon (Unix).
@@ -277,6 +279,132 @@ enum TrustAction {
     Show,
     Add,
     Remove,
+}
+
+#[derive(Debug, Parser)]
+#[command(subcommand_required = true, arg_required_else_help = true)]
+struct McpArgs {
+    #[command(subcommand)]
+    command: McpCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// Add an MCP server to the user config.
+    Add(McpAddArgs),
+    /// List MCP servers in the user config.
+    List(McpListArgs),
+    /// Show one MCP server's configuration.
+    Get(McpGetArgs),
+    /// Remove an MCP server from the user config.
+    Remove(McpRemoveArgs),
+}
+
+// `--header`, `--bearer-token-env-var`, `--client-id`, and `--callback-port`
+// are documented as requiring `--url` but cannot use clap's `requires`
+// attribute for it: clap does not evaluate `requires` for an argument that
+// is itself a member of an `ArgGroup` (here, `url`), so it would silently
+// never fire. `orca_runtime::command::mcp::build_server` is the real
+// enforcement point.
+#[derive(Debug, Parser)]
+#[command(group(
+    ArgGroup::new("mcp_add_target")
+        .required(true)
+        .args(["url", "command"]),
+))]
+struct McpAddArgs {
+    /// MCP server name.
+    name: String,
+
+    /// Environment variable to set for a stdio server, as KEY=VALUE (repeatable).
+    #[arg(short = 'e', long = "env", conflicts_with = "url")]
+    env: Vec<String>,
+
+    /// Remote server URL.
+    #[arg(long)]
+    url: Option<String>,
+
+    /// Remote transport: http or sse (default http).
+    #[arg(long)]
+    transport: Option<String>,
+
+    /// HTTP header to send to a remote server, as 'Name: value' (repeatable).
+    /// Requires --url.
+    #[arg(long = "header")]
+    header: Vec<String>,
+
+    /// Environment variable holding a bearer token for a remote server.
+    /// Requires --url.
+    #[arg(long)]
+    bearer_token_env_var: Option<String>,
+
+    /// OAuth client id for a remote server. Requires --url.
+    #[arg(long)]
+    client_id: Option<String>,
+
+    /// Local OAuth redirect callback port for a remote server. Requires
+    /// --url.
+    #[arg(long)]
+    callback_port: Option<u16>,
+
+    /// Stdio server command and its arguments.
+    #[arg(last = true)]
+    command: Vec<String>,
+}
+
+#[derive(Debug, Parser)]
+struct McpListArgs {
+    /// Output a JSON array instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct McpGetArgs {
+    /// MCP server name.
+    name: String,
+
+    /// Output a JSON object instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct McpRemoveArgs {
+    /// MCP server name.
+    name: String,
+}
+
+impl McpArgs {
+    fn into_request(self) -> orca_runtime::command::mcp::McpCommandRequest {
+        use orca_runtime::command::mcp::McpCommandRequest;
+
+        match self.command {
+            McpCommand::Add(args) => McpCommandRequest::Add(args.into()),
+            McpCommand::List(args) => McpCommandRequest::List { json: args.json },
+            McpCommand::Get(args) => McpCommandRequest::Get {
+                name: args.name,
+                json: args.json,
+            },
+            McpCommand::Remove(args) => McpCommandRequest::Remove { name: args.name },
+        }
+    }
+}
+
+impl From<McpAddArgs> for orca_runtime::command::mcp::McpAddRequest {
+    fn from(args: McpAddArgs) -> Self {
+        Self {
+            name: args.name,
+            transport: args.transport,
+            env: args.env,
+            url: args.url,
+            headers: args.header,
+            bearer_token_env_var: args.bearer_token_env_var,
+            client_id: args.client_id,
+            callback_port: args.callback_port,
+            command: args.command,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -823,6 +951,7 @@ pub fn run() -> i32 {
             orca_runtime::workflow::command::run(args.into_request(cli.cwd))
         }
         Some(Command::Trust(args)) => orca_runtime::command::trust::run(args.into()),
+        Some(Command::Mcp(args)) => orca_runtime::command::mcp::run(args.into_request()),
         Some(Command::SubagentWorker(args)) => {
             orca_runtime::command::launch::run_subagent_worker(args.into())
         }
@@ -1102,5 +1231,149 @@ mod tests {
         let request = args.into_request().expect("request");
         assert_eq!(request.resume.as_deref(), Some("latest"));
         assert_eq!(request.resume_at.as_deref(), Some("item_019f1234"));
+    }
+
+    fn parse_mcp(args: &[&str]) -> McpArgs {
+        let mut argv = vec!["orca", "mcp"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv) {
+            Ok(cli) => match cli.command {
+                Some(Command::Mcp(args)) => args,
+                other => panic!("expected mcp command, got {other:?}"),
+            },
+            Err(error) => panic!("parse failed: {error}"),
+        }
+    }
+
+    #[test]
+    fn mcp_add_parses_a_stdio_command_after_double_dash() {
+        use orca_runtime::command::mcp::McpCommandRequest;
+
+        let args = parse_mcp(&[
+            "add",
+            "docs",
+            "-e",
+            "API_KEY=secret",
+            "--",
+            "npx",
+            "-y",
+            "docs-mcp",
+        ]);
+        let request = args.into_request();
+        match request {
+            McpCommandRequest::Add(add) => {
+                assert_eq!(add.name, "docs");
+                assert_eq!(add.env, ["API_KEY=secret"]);
+                assert_eq!(add.command, ["npx", "-y", "docs-mcp"]);
+                assert!(add.url.is_none());
+            }
+            other => panic!("expected an add request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_add_parses_remote_options() {
+        use orca_runtime::command::mcp::McpCommandRequest;
+
+        let args = parse_mcp(&[
+            "add",
+            "search",
+            "--url",
+            "https://example.test/mcp",
+            "--transport",
+            "sse",
+            "--header",
+            "Authorization: Bearer t",
+            "--bearer-token-env-var",
+            "TOK",
+            "--client-id",
+            "CID",
+            "--callback-port",
+            "8123",
+        ]);
+        let request = args.into_request();
+        match request {
+            McpCommandRequest::Add(add) => {
+                assert_eq!(add.name, "search");
+                assert_eq!(add.url.as_deref(), Some("https://example.test/mcp"));
+                assert_eq!(add.transport.as_deref(), Some("sse"));
+                assert_eq!(add.headers, ["Authorization: Bearer t"]);
+                assert_eq!(add.bearer_token_env_var.as_deref(), Some("TOK"));
+                assert_eq!(add.client_id.as_deref(), Some("CID"));
+                assert_eq!(add.callback_port, Some(8123));
+                assert!(add.command.is_empty());
+            }
+            other => panic!("expected an add request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_add_requires_exactly_one_of_url_or_command() {
+        let neither = Cli::try_parse_from(["orca", "mcp", "add", "docs"]);
+        assert!(neither.is_err(), "neither url nor command must be rejected");
+
+        let both = Cli::try_parse_from([
+            "orca",
+            "mcp",
+            "add",
+            "docs",
+            "--url",
+            "https://example.test",
+            "--",
+            "true",
+        ]);
+        assert!(both.is_err(), "both url and command must be rejected");
+    }
+
+    #[test]
+    fn mcp_env_conflicts_with_url() {
+        let result = Cli::try_parse_from([
+            "orca",
+            "mcp",
+            "add",
+            "docs",
+            "--url",
+            "https://example.test",
+            "-e",
+            "FOO=bar",
+        ]);
+        assert!(result.is_err(), "-e/--env must conflict with --url");
+    }
+
+    #[test]
+    fn mcp_list_and_get_and_remove_parse_into_requests() {
+        use orca_runtime::command::mcp::McpCommandRequest;
+
+        let list = parse_mcp(&["list", "--json"]).into_request();
+        assert!(matches!(list, McpCommandRequest::List { json: true }));
+
+        let get = parse_mcp(&["get", "docs"]).into_request();
+        match get {
+            McpCommandRequest::Get { name, json } => {
+                assert_eq!(name, "docs");
+                assert!(!json);
+            }
+            other => panic!("expected a get request, got {other:?}"),
+        }
+
+        let remove = parse_mcp(&["remove", "docs"]).into_request();
+        match remove {
+            McpCommandRequest::Remove { name } => assert_eq!(name, "docs"),
+            other => panic!("expected a remove request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_mcp_requires_a_subcommand() {
+        let error = Cli::try_parse_from(["orca", "mcp"]).expect_err("bare mcp must fail");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+            "unexpected error kind: {error}"
+        );
+        assert!(
+            error.to_string().contains("Usage: orca mcp <COMMAND>"),
+            "expected usage in output: {error}"
+        );
     }
 }

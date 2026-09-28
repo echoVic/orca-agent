@@ -1,15 +1,35 @@
 # MCP Integration
 
-MCP servers are declared in the user-owned Orca configuration. They are not
-managed by a separate public command namespace. Edit the TOML file, review the
-server command or endpoint, then launch an interactive or headless task that
-uses the configuration.
+Add MCP servers with `orca mcp add`, inspect them with `orca mcp list` and
+`orca mcp get`, and remove them with `orca mcp remove`. These commands only
+write the user-owned Orca configuration; a project's `.orca/config.toml` is
+never touched, and a change takes effect the next time a session starts. See
+the [CLI reference](cli-reference.md#orca-mcp) for the full option list.
 
 The user configuration is $ORCA_HOME/config.toml when ORCA_HOME is set,
-otherwise ~/.orca/config.toml. A project configuration is considered only after
-that workspace is trusted.
+otherwise ~/.orca/config.toml.
 
 ## Stdio server
+
+~~~bash
+orca mcp add repository -- node /absolute/path/to/server.mjs
+~~~
+
+## Remote server (HTTP or SSE)
+
+~~~bash
+orca mcp add docs --url https://mcp.example.test/mcp \
+  --header "Authorization: Bearer token-from-environment"
+~~~
+
+`--transport` selects `http` (the default) or `sse`. A stdio server needs a
+command; a remote server needs a url. Keep credentials in the environment
+where possible: `--bearer-token-env-var` names an environment variable read
+at connect time instead of storing a token in the config file.
+
+`orca mcp add` does not set capabilities, timeouts, or tool filters. A new
+server defaults to a read-only capability set; grant only what the
+integration needs by editing the entry `orca mcp add` created:
 
 ~~~toml
 [[mcp_servers]]
@@ -28,22 +48,6 @@ network = false
 shell = false
 agent = false
 ~~~
-
-## SSE server
-
-~~~toml
-[[mcp_servers]]
-name = "docs"
-transport = "sse"
-url = "https://mcp.example.test/sse"
-headers = { Authorization = "Bearer token-from-environment" }
-startup_timeout_ms = 10000
-tool_timeout_ms = 30000
-~~~
-
-The transport is either stdio or sse. A stdio server needs a command; an SSE
-server needs a url. Keep credentials in the environment where possible, and
-grant only the capabilities the integration needs.
 
 ## Images from tools
 
@@ -83,6 +87,7 @@ A server can mark a tool read-only in its `tools/list` response
    is intentionally read-only and does not start MCP servers.
 5. Inspect runtime status in the interactive TUI during a live task.
 
-There is no public CLI command to list, restart, test, or diagnose individual
-MCP servers. Those lifecycle actions remain part of the running session and its
-configuration boundary.
+`orca mcp list` and `orca mcp get` inspect configured servers without ever
+printing credential values; `env` and `headers` show only the configured key
+names. There is still no public CLI command to restart, test, or diagnose a
+running MCP connection — that remains part of the running session.

@@ -588,30 +588,15 @@ fn persist_user_model_settings_to_dir(
     if model.is_none() && reasoning_effort.is_none() {
         return Ok(path);
     }
-    fs::create_dir_all(dir)?;
-    let mut document = match fs::read_to_string(&path) {
-        Ok(content) => content.parse::<toml_edit::DocumentMut>().map_err(|error| {
-            io::Error::other(format!(
-                "{}: existing config cannot be parsed; fix or remove it before persisting settings ({error})",
-                path.display()
-            ))
-        })?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
-        Err(error) => return Err(error),
-    };
-    if let Some(model) = model {
-        document["model"] = toml_edit::value(model);
-    }
-    if let Some(effort) = reasoning_effort {
-        document["reasoning_effort"] = toml_edit::value(effort.as_str());
-    }
-    orca_platform::fs::atomic_write(
-        &path,
-        document.to_string().as_bytes(),
-        orca_platform::fs::AtomicWritePolicy::NoFollow,
-    )
-    .map_err(|error| io::Error::other(format!("replacing {}: {error}", path.display())))?;
-    Ok(path)
+    super::user_edit::edit_user_config_in(dir, |document| {
+        if let Some(model) = model {
+            document["model"] = toml_edit::value(model);
+        }
+        if let Some(effort) = reasoning_effort {
+            document["reasoning_effort"] = toml_edit::value(effort.as_str());
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]

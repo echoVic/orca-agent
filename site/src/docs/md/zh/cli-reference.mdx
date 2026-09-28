@@ -29,6 +29,7 @@ orca [OPTIONS] COMMAND
 | `orca exec` | 非交互执行任务，输出文本或 JSONL 事件。 |
 | `orca workflow` | 执行和检查本地持久化工作流。 |
 | `orca trust` | 查看或更新目录信任。 |
+| `orca mcp` | 在用户配置中添加、列出、查看或删除 MCP 服务器。 |
 
 根选项包括 `--resume [SESSION_ID]`、`--fork ID`、`--continue`、
 `--model MODEL`、`--mode MODE`、`--api-key KEY`、`--base-url URL`
@@ -122,6 +123,52 @@ orca trust [show|add|remove] [--cwd PATH]
 
 `show` 是只读操作。`add` 和 `remove` 会更新用户目录中的信任存储，执行前请
 确认目录内容和对应的沙箱策略。
+
+## `orca mcp`
+
+```text
+orca mcp add NAME [OPTIONS] (--url URL | -- COMMAND [ARGS]...)
+orca mcp list [--json]
+orca mcp get NAME [--json]
+orca mcp remove NAME
+```
+
+`orca mcp` 只写用户拥有的 `$ORCA_HOME/config.toml`，绝不改动项目的
+`.orca/config.toml`。改动在下一次会话启动时生效——不会影响已经在运行的会话。
+`orca mcp login` 和 `orca mcp logout` 尚未提供。
+
+| 子命令 | 用途 |
+| --- | --- |
+| `orca mcp add` | 添加一个 stdio 或远程（HTTP/SSE）MCP 服务器。 |
+| `orca mcp list` | 列出已配置的服务器，每行一个；加 `--json` 输出 JSON。 |
+| `orca mcp get` | 查看某个服务器的配置。 |
+| `orca mcp remove` | 从用户配置中删除一个服务器。 |
+
+`add` 要么带一个 stdio 命令，要么带 `--url`，二者恰好给一个：
+
+| 选项 | 含义 |
+| --- | --- |
+| `-e, --env KEY=VALUE` | stdio 服务器的环境变量（可重复）。与 `--url` 冲突。 |
+| `--url URL` | 远程服务器地址。 |
+| `--transport http\|sse` | 远程传输方式，默认 `http`。只在带 `--url` 时才有意义。 |
+| `--header 'Name: value'` | 发给远程服务器的 HTTP 请求头（可重复）。需要 `--url`。 |
+| `--bearer-token-env-var VAR` | 保存 bearer token 的环境变量名，连接时读取。需要 `--url`。 |
+| `--client-id ID` | OAuth client id。需要 `--url`。 |
+| `--callback-port PORT` | 本地 OAuth 回调端口。需要 `--url`。 |
+| `-- COMMAND [ARGS]...` | stdio 服务器命令及其参数。 |
+
+`list` 和 `get` 绝不输出凭据的值：`env` 和 `headers` 只显示已配置的键名，
+不显示对应的值。
+
+示例：
+
+```bash
+orca mcp add docs -- npx -y docs-mcp-server
+orca mcp add search --url https://mcp.example.test/mcp --bearer-token-env-var SEARCH_TOKEN
+orca mcp list --json
+orca mcp get docs
+orca mcp remove docs
+```
 
 ## 配置和环境变量
 
