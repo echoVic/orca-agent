@@ -718,12 +718,8 @@ fn normalize_provider_response(
             source_response_id: Some(response_id.clone()),
             turn_id: completed.identity.turn_id.clone(),
             name,
-            action: surface_tool_action(request.action),
-            target: request
-                .target
-                .clone()
-                .or_else(|| orca_tools::schema::tool_request_target(request))
-                .map(surface::DisplayText::new),
+            action: surface_request_action(request),
+            target: surface_request_target(request).map(surface::DisplayText::new),
             raw_arguments: surface::DisplayText::new(raw_call.arguments.clone()),
             arguments_digest,
         });
@@ -740,6 +736,38 @@ fn normalize_provider_response(
         },
         tool_requests,
     })
+}
+
+/// The action a committed request records. A provider does not classify its
+/// calls (DeepSeek reports each as a read), and the reducer ties a result's
+/// exit code and diff to this action, so it comes from the tool.
+fn surface_request_action(
+    request: &orca_core::tool_types::ToolRequest,
+) -> surface::SurfaceToolAction {
+    surface_tool_action(orca_tools::canonical_action_kind(request))
+}
+
+/// The target a committed request records: the provider's, else the one the
+/// arguments name (DeepSeek sends none).
+fn surface_request_target(request: &orca_core::tool_types::ToolRequest) -> Option<String> {
+    request
+        .target
+        .clone()
+        .or_else(|| orca_tools::schema::tool_request_target(request))
+}
+
+/// Whether `tool` records the action and target of the runtime's `request`,
+/// which carries them as the provider sent them. This build records what the
+/// tool and its arguments say; older builds copied the provider's.
+pub(crate) fn records_request_action_and_target(
+    tool: &surface::SurfaceToolRequest,
+    request: &orca_core::tool_types::ToolRequest,
+) -> bool {
+    let target = tool.target.as_ref().map(surface::DisplayText::as_str);
+    (tool.action == surface_request_action(request)
+        || tool.action == surface_tool_action(request.action))
+        && (target == surface_request_target(request).as_deref()
+            || target == request.target.as_deref())
 }
 
 /// Renames the tool calls of `response` whose ids the session already holds
@@ -935,10 +963,27 @@ fn tools_match(
         })
         .count()
         == normalized.tool_requests.len()
-        && normalized
-            .tool_requests
-            .iter()
-            .all(|expected| snapshot.tools.iter().any(|tool| tool.request == *expected))
+        && normalized.tool_requests.iter().all(|expected| {
+            snapshot
+                .tools
+                .iter()
+                .any(|tool| same_tool_call(&tool.request, expected))
+        })
+}
+
+/// Whether `recorded` is the committed form of `expected`. The action is left
+/// out: it comes from the tool, and older builds recorded the provider's
+/// placeholder, so a response replayed after an upgrade must still find the
+/// call it committed.
+fn same_tool_call(
+    recorded: &surface::SurfaceToolRequest,
+    expected: &surface::SurfaceToolRequest,
+) -> bool {
+    *recorded
+        == surface::SurfaceToolRequest {
+            action: recorded.action,
+            ..expected.clone()
+        }
 }
 
 fn surface_item_id(item: &surface::SurfaceItem) -> Option<&surface::SurfaceItemId> {
@@ -1115,7 +1160,10 @@ fn is_surface_sensitive_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_provider_context_snapshot, normalize_provider_response};
+    use super::{
+        next_provider_context_snapshot, normalize_provider_response,
+        records_request_action_and_target, same_tool_call,
+    };
     use crate::runtime_surface as surface;
 
     #[test]
@@ -1184,6 +1232,156 @@ mod tests {
                 Some("python3 -m unittest".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn a_tool_request_takes_its_action_from_the_tool_not_the_provider() {
+        // DeepSeek reports every call as a read. An edit recorded as a read
+        // then carried a diff the reducer refuses, and the turn failed.
+        let calls = [
+            (
+                "edit-1",
+                orca_core::tool_types::ToolName::Edit,
+                "edit",
+                serde_json::json!({"path": "notes.txt", "old_text": "old", "new_text": "new"}),
+            ),
+            (
+                "bash-1",
+                orca_core::tool_types::ToolName::Bash,
+                "bash",
+                serde_json::json!({"command": "git status"}),
+            ),
+            (
+                "read-1",
+                orca_core::tool_types::ToolName::ReadFile,
+                "read_file",
+                serde_json::json!({"path": "notes.txt"}),
+            ),
+        ];
+        let mut steps = Vec::new();
+        let mut tool_calls = Vec::new();
+        for (id, name, function_name, arguments) in calls {
+            let arguments = arguments.to_string();
+            steps.push(orca_core::provider_types::ProviderStep::ToolCall(
+                orca_core::tool_types::ToolRequest {
+                    id: id.to_string(),
+                    name,
+                    action: orca_core::approval_types::ActionKind::Read,
+                    target: None,
+                    raw_arguments: Some(arguments.clone()),
+                },
+            ));
+            tool_calls.push(orca_core::conversation::RawToolCall {
+                id: id.to_string(),
+                function_name: function_name.to_string(),
+                arguments,
+            });
+        }
+        let response = crate::model_response::RuntimeModelResponse::new(
+            orca_core::provider_types::ProviderResponse {
+                steps,
+                assistant_content: None,
+                assistant_reasoning: None,
+                tool_calls,
+                usage: None,
+            },
+            orca_core::thread_identity::TurnId::new(),
+        );
+
+        let normalized = normalize_provider_response(&response, "provider response").unwrap();
+
+        let actions = normalized
+            .tool_requests
+            .iter()
+            .map(|request| request.action)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec![
+                surface::SurfaceToolAction::Write,
+                surface::SurfaceToolAction::Shell,
+                surface::SurfaceToolAction::Read,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_replayed_tool_call_still_matches_the_action_an_older_build_recorded() {
+        // Older builds recorded a DeepSeek bash call as a read. A continuation
+        // replays that response after an upgrade and must find the committed
+        // call rather than add it a second time.
+        let arguments = r#"{"command":"git status"}"#;
+        let recorded = surface::SurfaceToolRequest {
+            tool_call_id: surface::SurfaceToolCallId::try_new("bash-1").unwrap(),
+            source_response_id: None,
+            turn_id: surface::SurfaceTurnId::new(),
+            name: surface::NonEmptyText::try_new("bash").unwrap(),
+            action: surface::SurfaceToolAction::Read,
+            target: Some(surface::DisplayText::new("git status")),
+            raw_arguments: surface::DisplayText::new(arguments),
+            arguments_digest: surface::Sha256Digest::digest(arguments),
+        };
+        let replayed = surface::SurfaceToolRequest {
+            action: surface::SurfaceToolAction::Shell,
+            ..recorded.clone()
+        };
+        let other_arguments = r#"{"command":"git push"}"#;
+        let another_call = surface::SurfaceToolRequest {
+            raw_arguments: surface::DisplayText::new(other_arguments),
+            arguments_digest: surface::Sha256Digest::digest(other_arguments),
+            ..replayed.clone()
+        };
+
+        assert!(same_tool_call(&recorded, &replayed));
+        assert!(!same_tool_call(&recorded, &another_call));
+    }
+
+    #[test]
+    fn an_approval_binds_to_the_committed_request_whichever_build_recorded_it() {
+        use surface::SurfaceToolAction::{Read, Shell, Write};
+        // The approval path hands over the call as DeepSeek sent it: a read
+        // with no target. This build records what the tool and its arguments
+        // say; earlier builds kept the read, and older ones the missing target.
+        let arguments = r#"{"path":"notes.txt","old_text":"old","new_text":"new"}"#;
+        let request = orca_core::tool_types::ToolRequest {
+            id: "edit-1".to_string(),
+            name: orca_core::tool_types::ToolName::Edit,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: Some(arguments.to_string()),
+        };
+        let committed = |action, target: Option<&str>| surface::SurfaceToolRequest {
+            tool_call_id: surface::SurfaceToolCallId::try_new("edit-1").unwrap(),
+            source_response_id: None,
+            turn_id: surface::SurfaceTurnId::new(),
+            name: surface::NonEmptyText::try_new("edit").unwrap(),
+            action,
+            target: target.map(surface::DisplayText::new),
+            raw_arguments: surface::DisplayText::new(arguments),
+            arguments_digest: surface::Sha256Digest::digest(arguments),
+        };
+
+        assert!(records_request_action_and_target(
+            &committed(Write, Some("notes.txt")),
+            &request
+        ));
+        assert!(records_request_action_and_target(
+            &committed(Read, Some("notes.txt")),
+            &request
+        ));
+        assert!(records_request_action_and_target(
+            &committed(Read, None),
+            &request
+        ));
+        // Neither the tool nor the provider gave these, so it is another call.
+        assert!(!records_request_action_and_target(
+            &committed(Write, Some("other.txt")),
+            &request
+        ));
+        assert!(!records_request_action_and_target(
+            &committed(Shell, Some("notes.txt")),
+            &request
+        ));
     }
 
     #[test]

@@ -76,7 +76,7 @@ use crate::runtime_actor::commit::{
 };
 use crate::runtime_actor::generation_context::{
     GenerationContextController, build_background_provider_response_events,
-    rename_tool_calls_held_by_earlier_responses,
+    records_request_action_and_target, rename_tool_calls_held_by_earlier_responses,
 };
 use crate::runtime_actor::goal::{
     ActiveGoalControl, GoalBlockingCompletion, GoalOperationController, GoalSurfaceWorkerResult,

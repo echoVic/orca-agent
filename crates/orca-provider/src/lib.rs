@@ -1906,8 +1906,11 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
             name: ToolName::Edit,
-            action: ActionKind::Write,
-            target: Some(file.to_string()),
+            // Shaped as the DeepSeek parser shapes every call: a read with no
+            // target, leaving the runtime to classify the tool and find its
+            // target in the arguments.
+            action: ActionKind::Read,
+            target: None,
             raw_arguments: Some(
                 serde_json::json!({
                     "path": file,

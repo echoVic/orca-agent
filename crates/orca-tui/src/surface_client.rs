@@ -4349,7 +4349,15 @@ mod tests {
             std::fs::read_to_string(home.path().join("approval.txt")).unwrap(),
             "new"
         );
-        assert!(event_rx.try_iter().any(
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        // The mock sends the edit as DeepSeek does, a read with no target;
+        // its row still shows what it changed.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TuiEvent::ToolCompleted { name, diff: Some(diff), .. }
+                if name == "edit" && diff.contains("-old") && diff.contains("+new")
+        )));
+        assert!(events.iter().any(
             |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
         ));
 

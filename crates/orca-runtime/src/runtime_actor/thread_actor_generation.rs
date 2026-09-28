@@ -2186,13 +2186,20 @@ impl ThreadActor {
                     None
                 },
                 truncated: result.truncated,
-                file_change: result.file_change_preview.as_deref().and_then(|preview| {
-                    surface_file_change(
-                        preview,
-                        tool.request.target.as_ref().map(|target| target.as_str()),
-                        cwd,
-                    )
-                }),
+                // The reducer takes a diff only from a write. Sessions from
+                // older builds recorded DeepSeek edits as reads; theirs is lost
+                // rather than failing the turn after the edit has landed.
+                file_change: if matches!(tool.request.action, surface::SurfaceToolAction::Write) {
+                    result.file_change_preview.as_deref().and_then(|preview| {
+                        surface_file_change(
+                            preview,
+                            tool.request.target.as_ref().map(|target| target.as_str()),
+                            cwd,
+                        )
+                    })
+                } else {
+                    None
+                },
             },
             content,
         ))
@@ -3316,8 +3323,7 @@ impl ThreadActor {
         if tool.source_response_id.is_none()
             || tool.turn_id != generation.logical_turn_id
             || tool.name.as_str() != request.name.as_str()
-            || tool.action != surface_tool_action(request.action)
-            || tool.target.as_ref().map(surface::DisplayText::as_str) != request.target.as_deref()
+            || !records_request_action_and_target(&tool, request)
             || tool.raw_arguments.as_str() != raw_arguments
             || tool.arguments_digest != surface_sha256(raw_arguments.as_bytes())
         {
@@ -5654,13 +5660,79 @@ fn surface_file_change(
 
 #[cfg(test)]
 mod file_change_tests {
-    use super::surface_file_change;
+    use super::{ThreadActor, surface_file_change};
     use crate::runtime_surface as surface;
     use orca_core::tool_types::FileChangePreview;
 
     fn workspace() -> surface::CanonicalPath {
         surface::CanonicalPath::try_new(std::env::temp_dir().join("orca-file-change-ws"))
             .expect("canonical workspace")
+    }
+
+    const EDIT_ARGUMENTS: &str = r#"{"path":"notes.txt","old_text":"old","new_text":"new"}"#;
+
+    fn committed_edit(action: surface::SurfaceToolAction) -> surface::SurfaceToolView {
+        surface::SurfaceToolView {
+            request: surface::SurfaceToolRequest {
+                tool_call_id: surface::SurfaceToolCallId::try_new("edit-1").unwrap(),
+                source_response_id: None,
+                turn_id: surface::SurfaceTurnId::new(),
+                name: surface::NonEmptyText::try_new("edit").unwrap(),
+                action,
+                target: Some(surface::DisplayText::new("notes.txt")),
+                raw_arguments: surface::DisplayText::new(EDIT_ARGUMENTS),
+                arguments_digest: surface::Sha256Digest::digest(EDIT_ARGUMENTS),
+            },
+            state: surface::SurfaceToolViewState::Running,
+            invocation_started: None,
+            arguments_bytes: surface::ByteCount::new(EDIT_ARGUMENTS.len() as u64),
+            output_bytes: surface::ByteCount::new(0),
+            streamed_output: surface::DisplayText::new(""),
+            streamed_output_truncated: false,
+            result: None,
+            capability_calls: Vec::new(),
+            terminal_leases: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_diff_rides_only_on_a_tool_recorded_as_a_write() {
+        // The reducer refuses a file change on any other action, and a
+        // refused batch failed the turn after the edit had landed. Sessions
+        // from older builds recorded every DeepSeek call as a read.
+        let request = orca_core::tool_types::ToolRequest {
+            id: "edit-1".to_string(),
+            name: orca_core::tool_types::ToolName::Edit,
+            action: orca_core::approval_types::ActionKind::Write,
+            target: Some("notes.txt".to_string()),
+            raw_arguments: Some(EDIT_ARGUMENTS.to_string()),
+        };
+        let result = orca_core::tool_types::ToolResult::completed(
+            &request,
+            "edited notes.txt".to_string(),
+            false,
+        )
+        .with_file_change_preview(FileChangePreview::UnifiedDiff {
+            text: "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+            truncated: false,
+        });
+        let cwd = workspace();
+
+        let (recorded_as_read, _) = ThreadActor::surface_completed_tool_result(
+            &committed_edit(surface::SurfaceToolAction::Read),
+            &result,
+            &cwd,
+        )
+        .expect("a legacy edit still completes");
+        let (recorded_as_write, _) = ThreadActor::surface_completed_tool_result(
+            &committed_edit(surface::SurfaceToolAction::Write),
+            &result,
+            &cwd,
+        )
+        .expect("an edit completes");
+
+        assert_eq!(recorded_as_read.file_change, None);
+        assert!(recorded_as_write.file_change.is_some());
     }
 
     #[test]
