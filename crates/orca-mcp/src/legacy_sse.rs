@@ -18,6 +18,7 @@ use url::Url;
 
 use orca_core::mcp_types::McpServerConfig;
 
+use crate::auth::{AuthAttempt, RemoteAuth};
 use crate::transport::{
     MAX_SSE_RESPONSE_BYTES, McpElicitationHandler, McpTransport, configured_headers,
     format_duration, initialize_params, is_elicitation_create_request, json_rpc_id_to_string,
@@ -43,8 +44,9 @@ pub(crate) struct LegacySseTransport {
     server_name: String,
     /// Where messages are POSTed: the endpoint the event stream named.
     endpoint: Url,
-    /// The configured headers, sent with every request.
+    /// The configured headers, sent with every request along with the auth.
     headers: HeaderMap,
+    auth: Arc<RemoteAuth>,
     client: reqwest::blocking::Client,
     stream: Arc<EventStream>,
     next_id: AtomicU64,
@@ -56,43 +58,58 @@ pub(crate) struct LegacySseTransport {
 
 impl LegacySseTransport {
     /// Opens the server's event stream, then waits up to the startup timeout
-    /// for the endpoint it names.
-    pub(crate) fn connect(config: &McpServerConfig) -> Result<Self, String> {
+    /// for the endpoint it names. When the server refuses the stream with
+    /// 401, the token is refreshed, once, and the stream opened again.
+    pub(crate) fn connect(config: &McpServerConfig, auth: Arc<RemoteAuth>) -> Result<Self, String> {
         let base = Url::parse(&remote_url(config)?)
             .map_err(|error| format!("MCP server '{}' has an invalid url: {error}", config.name))?;
         let headers = configured_headers(config)?;
         let startup_timeout = timeout_from_ms(config.startup_timeout_ms);
-        let stream = Arc::new(EventStream::default());
-        let (announce, announced) = mpsc::channel();
-        let reader = ReaderThread::spawn(EventStreamReader {
-            server_name: config.name.clone(),
-            base,
-            headers: headers.clone(),
-            stream: Arc::clone(&stream),
-            announce: Some(announce),
-            endpoint: None,
-            reply_timeout: startup_timeout,
-        })?;
-        let endpoint = match announced.recv_timeout(startup_timeout) {
-            Ok(endpoint) => endpoint?,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                return Err(format!(
-                    "MCP server '{}' sent no SSE endpoint within {}",
-                    config.name,
-                    format_duration(startup_timeout)
-                ));
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(format!(
-                    "MCP server '{}' closed its SSE event stream before sending an endpoint",
-                    config.name
-                ));
+        let mut attempt = auth.begin()?;
+        let (stream, reader, endpoint) = loop {
+            let mut stream_headers = headers.clone();
+            attempt.apply(&mut stream_headers);
+            let stream = Arc::new(EventStream::default());
+            let (announce, announced) = mpsc::channel();
+            let reader = ReaderThread::spawn(EventStreamReader {
+                server_name: config.name.clone(),
+                base: base.clone(),
+                headers: stream_headers,
+                stream: Arc::clone(&stream),
+                announce: Some(announce),
+                endpoint: None,
+                unauthorized: false,
+                reply_timeout: startup_timeout,
+            })?;
+            match announced.recv_timeout(startup_timeout) {
+                Ok(Ok(endpoint)) => break (stream, reader, endpoint),
+                Ok(Err(refusal)) if refusal.unauthorized => {
+                    match auth.after_unauthorized(&attempt)? {
+                        Some(retry) => attempt = retry,
+                        None => return Err(refusal.reason),
+                    }
+                }
+                Ok(Err(refusal)) => return Err(refusal.reason),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(format!(
+                        "MCP server '{}' sent no SSE endpoint within {}",
+                        config.name,
+                        format_duration(startup_timeout)
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(format!(
+                        "MCP server '{}' closed its SSE event stream before sending an endpoint",
+                        config.name
+                    ));
+                }
             }
         };
         Ok(Self {
             server_name: config.name.clone(),
             endpoint,
             headers,
+            auth,
             client: reqwest::blocking::Client::new(),
             stream,
             next_id: AtomicU64::new(1),
@@ -171,16 +188,43 @@ impl LegacySseTransport {
     }
 
     /// POSTs one message to the endpoint. Any 2xx will do: an answer, if one
-    /// is due, comes on the event stream.
+    /// is due, comes on the event stream. When the server answers 401, the
+    /// token is refreshed, once, and the message POSTed again.
     fn post(&self, message: &Value, deadline: Instant) -> Result<(), Failure> {
+        let mut attempt = self.auth.begin().map_err(Failure::Auth)?;
+        loop {
+            match self.post_with(&attempt, message, deadline) {
+                Err(Failure::Status(status)) if status == StatusCode::UNAUTHORIZED => {
+                    match self
+                        .auth
+                        .after_unauthorized(&attempt)
+                        .map_err(Failure::Auth)?
+                    {
+                        Some(retry) => attempt = retry,
+                        None => return Err(Failure::Status(status)),
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn post_with(
+        &self,
+        auth: &AuthAttempt,
+        message: &Value,
+        deadline: Instant,
+    ) -> Result<(), Failure> {
         let timeout = deadline.saturating_duration_since(Instant::now());
         if timeout.is_zero() {
             return Err(Failure::TimedOut);
         }
+        let mut headers = self.headers.clone();
+        auth.apply(&mut headers);
         let response = self
             .client
             .post(self.endpoint.clone())
-            .headers(self.headers.clone())
+            .headers(headers)
             .timeout(timeout)
             .json(message)
             .send()
@@ -317,6 +361,9 @@ enum Failure {
     TimedOut,
     Status(StatusCode),
     Failed(String),
+    /// The server needs a login Orca cannot make. The message says so, and
+    /// is reported as it is.
+    Auth(String),
 }
 
 impl Failure {
@@ -330,6 +377,7 @@ impl Failure {
             ),
             Self::Status(status) => format!("MCP SSE {what} failed with {status}"),
             Self::Failed(error) => format!("MCP SSE {what} failed: {error}"),
+            Self::Auth(error) => error,
         }
     }
 }
@@ -467,6 +515,13 @@ impl Drop for ReaderThread {
     }
 }
 
+/// Why the event stream ended before it named an endpoint.
+struct NoEndpoint {
+    reason: String,
+    /// The server refused to open the stream with 401.
+    unauthorized: bool,
+}
+
 /// Reads the event stream on its own thread. It announces the endpoint,
 /// hands each response to the request waiting for it, and fails every
 /// waiting request once the stream ends.
@@ -478,9 +533,11 @@ struct EventStreamReader {
     stream: Arc<EventStream>,
     /// Where to announce the endpoint, or why there is none, until it has
     /// been announced.
-    announce: Option<mpsc::Sender<Result<Url, String>>>,
+    announce: Option<mpsc::Sender<Result<Url, NoEndpoint>>>,
     /// The endpoint, once announced.
     endpoint: Option<Url>,
+    /// Whether the server refused to open the stream with 401.
+    unauthorized: bool,
     /// How long a reply the reader POSTs itself may take.
     reply_timeout: Duration,
 }
@@ -498,7 +555,10 @@ impl EventStreamReader {
             ),
         };
         if let Some(announce) = self.announce.take() {
-            let _ = announce.send(Err(reason.clone()));
+            let _ = announce.send(Err(NoEndpoint {
+                reason: reason.clone(),
+                unauthorized: self.unauthorized,
+            }));
         }
         self.stream.close(reason);
     }
@@ -545,7 +605,7 @@ impl EventStreamReader {
     }
 
     /// Opens the event stream: a GET that must answer with one.
-    async fn open(&self, client: &reqwest::Client) -> Result<reqwest::Response, String> {
+    async fn open(&mut self, client: &reqwest::Client) -> Result<reqwest::Response, String> {
         let refused = |why: String| {
             format!(
                 "MCP server '{}' could not open its SSE event stream: {why}",
@@ -562,6 +622,7 @@ impl EventStreamReader {
             .map_err(|error| refused(error.to_string()))?;
         let status = response.status();
         if !status.is_success() {
+            self.unauthorized = status == StatusCode::UNAUTHORIZED;
             return Err(refused(status.to_string()));
         }
         let content_type = response

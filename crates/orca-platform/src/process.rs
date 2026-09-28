@@ -1,5 +1,5 @@
 use std::io::{self, Read};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicBool;
 
 /// Owns the operating-system process-tree boundary for one spawned child.
@@ -127,6 +127,45 @@ pub fn detach_current_process_stdout() -> io::Result<()> {
     platform::detach_current_process_stdout()
 }
 
+/// Opens `url` in the user's browser: with `open` on macOS, `xdg-open` on
+/// other Unix hosts, and `cmd /C start` on Windows. The opener is started
+/// and not waited for.
+///
+/// Only an http or https url with no whitespace, quote, or control
+/// character is opened, so a url a remote server supplied can neither
+/// launch a local file or program nor break out of the command line.
+pub fn open_url(url: &str) -> io::Result<()> {
+    if !is_web_url(url) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only http and https urls can be opened",
+        ));
+    }
+    let mut child = platform::open_url_command(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    // Reap the opener once it exits, without making the caller wait for it.
+    let _ = std::thread::Builder::new()
+        .name("open-url".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    Ok(())
+}
+
+fn is_web_url(url: &str) -> bool {
+    let web_scheme = url.split_once("://").is_some_and(|(scheme, rest)| {
+        (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+            && !rest.is_empty()
+    });
+    web_scheme
+        && !url.chars().any(|character| {
+            character.is_whitespace() || character.is_control() || character == '"'
+        })
+}
+
 /// Reads a captured child pipe without making cancellation depend on a
 /// blocking operating-system read returning first.
 #[cfg(not(windows))]
@@ -177,6 +216,18 @@ mod platform {
         } else {
             Ok(())
         }
+    }
+
+    /// The command that opens `url` in the user's browser.
+    pub(super) fn open_url_command(url: &str) -> Command {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let mut command = Command::new(opener);
+        command.arg(url);
+        command
     }
 
     pub(super) fn read_child_pipe_interruptibly<R: Read>(
@@ -346,6 +397,20 @@ mod platform {
         // The new standard handle remains open until process exit and is
         // intentionally not wrapped in a Rust-owned file object.
         Ok(())
+    }
+
+    /// The command that opens `url` in the user's browser:
+    /// `cmd /C start "" "<url>"`. `start` takes its first quoted argument as
+    /// the window title, hence the empty one. The quotes around the url,
+    /// which holds none itself, keep cmd from acting on its `&` and the
+    /// other characters cmd treats specially.
+    pub(super) fn open_url_command(url: &str) -> Command {
+        let mut command = Command::new("cmd");
+        command
+            .args(["/C", "start"])
+            .raw_arg("\"\"")
+            .raw_arg(format!("\"{url}\""));
+        command
     }
 
     pub(super) fn read_child_pipe_interruptibly<R: io::Read + AsRawHandle>(
@@ -650,6 +715,29 @@ mod platform {
     impl Drop for ProcessJob {
         fn drop(&mut self) {
             unsafe { CloseHandle(self.handle) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_url_opens_only_web_urls() {
+        // Each is turned away before anything is started.
+        for url in [
+            "",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "calc.exe",
+            "https://",
+            "https://example.com/\"&calc",
+            "https://example.com/a b",
+            "https://example.com/\n",
+        ] {
+            let error = open_url(url).expect_err(url);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{url:?}");
         }
     }
 }

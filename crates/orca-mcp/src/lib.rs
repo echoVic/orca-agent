@@ -1,9 +1,12 @@
 #![deny(deprecated)]
 
+mod auth;
 pub mod client;
 mod legacy_sse;
+pub mod oauth;
 pub mod transport;
 
+pub use auth::{MCP_AUTH_REQUIRED, is_auth_required};
 pub use client::{McpRegistry, McpRequestError, canonical_server_name, initialize_registry};
 pub use transport::{
     McpElicitationHandler, McpElicitationMode, McpElicitationRequest, McpElicitationResponse,

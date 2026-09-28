@@ -9,11 +9,14 @@ test-utils = []
 [dependencies]
 orca-core = { path = "../orca-core" }
 orca-platform = { path = "../orca-platform" }
+base64 = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
-base64 = { workspace = true }
 tempfile = { workspace = true }

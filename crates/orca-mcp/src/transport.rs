@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{
@@ -15,11 +16,13 @@ use reqwest::header::{ACCEPT, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use orca_core::capability::{CapabilityReceipt, EnforcementState};
+use orca_core::config::mcp_credentials::mcp_credentials_path;
 use orca_core::execution_broker::ExecutionBroker;
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
 use orca_platform::process::ProcessJob;
 use orca_platform::shell::resolve_program;
 
+use crate::auth::{AuthAttempt, RemoteAuth, is_auth_required};
 use crate::legacy_sse::LegacySseTransport;
 
 const STDIO_RESPONSE_QUEUE_CAPACITY: usize = 8;
@@ -36,7 +39,7 @@ pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// A streamable HTTP POST accepts both ways a server may answer it.
-const HTTP_ACCEPT: &str = "application/json, text/event-stream";
+pub(crate) const HTTP_ACCEPT: &str = "application/json, text/event-stream";
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 /// How long the DELETE that ends a dropped transport's session may take.
@@ -162,11 +165,36 @@ pub trait McpTransport: Send + Sync {
 }
 
 pub fn connect(config: &McpServerConfig) -> Result<Box<dyn McpTransport>, String> {
+    connect_with_credentials(config, mcp_credentials_path())
+}
+
+/// Connects as [`connect`] does, reading a stored OAuth login from
+/// `credentials_path`.
+pub(crate) fn connect_with_credentials(
+    config: &McpServerConfig,
+    credentials_path: Option<PathBuf>,
+) -> Result<Box<dyn McpTransport>, String> {
     match config.transport {
         McpTransportKind::Stdio => Ok(Box::new(StdioTransport::start(config)?)),
-        McpTransportKind::Http => Ok(Box::new(StreamableHttpTransport::new(config)?)),
-        McpTransportKind::Sse => Ok(Box::new(SseFallbackTransport::new(config)?)),
+        McpTransportKind::Http => Ok(Box::new(StreamableHttpTransport::new(
+            config,
+            remote_auth(config, credentials_path)?,
+        )?)),
+        McpTransportKind::Sse => Ok(Box::new(SseFallbackTransport::new(
+            config,
+            remote_auth(config, credentials_path)?,
+        )?)),
     }
+}
+
+/// How requests to a remote server authenticate. A missing url is reported
+/// first.
+fn remote_auth(
+    config: &McpServerConfig,
+    credentials_path: Option<PathBuf>,
+) -> Result<Arc<RemoteAuth>, String> {
+    remote_url(config)?;
+    RemoteAuth::resolve(config, credentials_path).map(Arc::new)
 }
 
 /// The `initialize` parameters: the protocol version Orca asks for, and who
@@ -859,6 +887,7 @@ struct StreamableHttpTransport {
     endpoint: String,
     /// The configured headers, checked once when the transport is created.
     headers: HeaderMap,
+    auth: Arc<RemoteAuth>,
     session: Mutex<HttpSession>,
     next_id: Mutex<u64>,
     client: reqwest::blocking::Client,
@@ -897,6 +926,11 @@ impl HttpRequestError {
             in_session: context.headers.contains_key(MCP_SESSION_ID_HEADER),
             message: format!("MCP SSE request '{}' failed with {status}", context.method),
         }
+    }
+
+    /// Whether the server turned the request's credentials away.
+    fn unauthorized(&self) -> bool {
+        matches!(self, Self::Status { status, .. } if *status == StatusCode::UNAUTHORIZED)
     }
 
     /// Whether the server has ended the session the request carried: it
@@ -955,11 +989,12 @@ pub(crate) fn configured_headers(config: &McpServerConfig) -> Result<HeaderMap, 
 }
 
 impl StreamableHttpTransport {
-    fn new(config: &McpServerConfig) -> Result<Self, String> {
+    fn new(config: &McpServerConfig, auth: Arc<RemoteAuth>) -> Result<Self, String> {
         Ok(Self {
             server_name: config.name.clone(),
             endpoint: remote_url(config)?,
             headers: configured_headers(config)?,
+            auth,
             session: Mutex::new(HttpSession::default()),
             next_id: Mutex::new(1),
             client: reqwest::blocking::Client::new(),
@@ -1095,15 +1130,16 @@ impl StreamableHttpTransport {
     /// failed attempt, the next request carries the ended session again, gets
     /// 404, and tries once more to start a new one.
     fn start_session(&self) -> Result<Value, HttpRequestError> {
-        let context = SseRequestContext {
-            endpoint: self.endpoint.clone(),
-            headers: self.request_headers(&HttpSession::default()),
-            id: self.next_request_id()?,
-            method: "initialize".to_string(),
-            timeout: self.startup_timeout,
-        };
-        let (result, response_headers) =
-            request_sse_with_client(&self.client, &context, initialize_params())?;
+        let (result, response_headers) = self.authorized(|auth| {
+            let context = SseRequestContext {
+                endpoint: self.endpoint.clone(),
+                headers: self.request_headers(&HttpSession::default(), auth),
+                id: self.next_request_id()?,
+                method: "initialize".to_string(),
+                timeout: self.startup_timeout,
+            };
+            request_sse_with_client(&self.client, &context, initialize_params())
+        })?;
         let session_id = response_headers
             .get(MCP_SESSION_ID_HEADER)
             .filter(|id| !id.is_empty())
@@ -1134,15 +1170,16 @@ impl StreamableHttpTransport {
     }
 
     /// The headers for a request in the current session.
-    fn session_headers(&self) -> Result<HeaderMap, String> {
+    fn session_headers(&self, auth: &AuthAttempt) -> Result<HeaderMap, String> {
         let session = self.session()?.clone();
-        Ok(self.request_headers(&session))
+        Ok(self.request_headers(&session, auth))
     }
 
-    /// The configured headers, then the ones the protocol requires, which
-    /// replace any configured value of the same name.
-    fn request_headers(&self, session: &HttpSession) -> HeaderMap {
+    /// The configured headers and the auth, then the headers the protocol
+    /// requires, which replace any configured value of the same name.
+    fn request_headers(&self, session: &HttpSession, auth: &AuthAttempt) -> HeaderMap {
         let mut headers = self.headers.clone();
+        auth.apply(&mut headers);
         headers.insert(ACCEPT, HeaderValue::from_static(HTTP_ACCEPT));
         if let Some(id) = &session.id {
             headers.insert(MCP_SESSION_ID_HEADER, id.clone());
@@ -1157,29 +1194,59 @@ impl StreamableHttpTransport {
     }
 
     fn notify(&self, method: &str, params: Value, timeout: Duration) -> Result<(), String> {
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .headers(self.session_headers()?)
-            .timeout(timeout)
-            .json(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
-            .send()
-            .map_err(|error| {
-                if error.is_timeout() {
-                    format!(
-                        "MCP SSE notify '{method}' timed out after {}",
-                        format_duration(timeout)
-                    )
-                } else {
-                    format!("MCP SSE notify '{method}' failed: {error}")
+        let message = json!({ "jsonrpc": "2.0", "method": method, "params": params });
+        self.authorized(|auth| {
+            let headers = self.session_headers(auth)?;
+            let in_session = headers.contains_key(MCP_SESSION_ID_HEADER);
+            let response = self
+                .client
+                .post(&self.endpoint)
+                .headers(headers)
+                .timeout(timeout)
+                .json(&message)
+                .send()
+                .map_err(|error| {
+                    if error.is_timeout() {
+                        format!(
+                            "MCP SSE notify '{method}' timed out after {}",
+                            format_duration(timeout)
+                        )
+                    } else {
+                        format!("MCP SSE notify '{method}' failed: {error}")
+                    }
+                })?;
+            // Servers acknowledge a notification with 202 and no body; some send 200.
+            let status = response.status();
+            if !status.is_success() {
+                return Err(HttpRequestError::Status {
+                    status,
+                    in_session,
+                    message: format!("MCP SSE notify '{method}' failed with {status}"),
+                });
+            }
+            Ok(())
+        })
+        .map_err(HttpRequestError::into_message)
+    }
+
+    /// Sends a request with the auth it goes out with. When the server
+    /// answers 401, the token is refreshed, once, and the request sent again.
+    fn authorized<T>(
+        &self,
+        mut send: impl FnMut(&AuthAttempt) -> Result<T, HttpRequestError>,
+    ) -> Result<T, HttpRequestError> {
+        let mut attempt = self.auth.begin()?;
+        loop {
+            match send(&attempt) {
+                Err(error) if error.unauthorized() => {
+                    match self.auth.after_unauthorized(&attempt)? {
+                        Some(retry) => attempt = retry,
+                        None => return Err(error),
+                    }
                 }
-            })?;
-        // Servers acknowledge a notification with 202 and no body; some send 200.
-        let status = response.status();
-        if !status.is_success() {
-            return Err(format!("MCP SSE notify '{method}' failed with {status}"));
+                result => return result,
+            }
         }
-        Ok(())
     }
 
     fn request_with_timeout(
@@ -1198,14 +1265,17 @@ impl StreamableHttpTransport {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, HttpRequestError> {
-        let context = SseRequestContext {
-            endpoint: self.endpoint.clone(),
-            headers: self.session_headers()?,
-            id: self.next_request_id()?,
-            method: method.to_string(),
-            timeout,
-        };
-        request_sse_with_client(&self.client, &context, params).map(|(result, _)| result)
+        self.authorized(|auth| {
+            let context = SseRequestContext {
+                endpoint: self.endpoint.clone(),
+                headers: self.session_headers(auth)?,
+                id: self.next_request_id()?,
+                method: method.to_string(),
+                timeout,
+            };
+            request_sse_with_client(&self.client, &context, params.clone())
+                .map(|(result, _)| result)
+        })
     }
 
     /// Handles the 404 a server answers once it has ended the session a
@@ -1261,12 +1331,34 @@ impl StreamableHttpTransport {
         handler: Option<&dyn McpElicitationHandler>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, HttpRequestError> {
+        self.authorized(|auth| {
+            self.stream_request_with(
+                auth,
+                method,
+                params.clone(),
+                timeout,
+                handler,
+                should_cancel,
+            )
+        })
+    }
+
+    /// Sends one request whose answer may stream, with `auth`.
+    fn stream_request_with(
+        &self,
+        auth: &AuthAttempt,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        handler: Option<&dyn McpElicitationHandler>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, HttpRequestError> {
         if should_cancel() {
             return Err("MCP tool call cancelled".to_string().into());
         }
         let context = SseRequestContext {
             endpoint: self.endpoint.clone(),
-            headers: self.session_headers()?,
+            headers: self.session_headers(auth)?,
             id: self.next_request_id()?,
             method: method.to_string(),
             timeout,
@@ -1382,7 +1474,7 @@ impl Drop for StreamableHttpTransport {
         let request = self
             .client
             .delete(&self.endpoint)
-            .headers(self.request_headers(&session))
+            .headers(self.request_headers(&session, &self.auth.current()))
             .timeout(HTTP_SESSION_END_TIMEOUT);
         let _ = std::thread::Builder::new()
             .name("mcp-http-session-end".to_string())
@@ -1399,17 +1491,21 @@ impl Drop for StreamableHttpTransport {
 /// to legacy SSE. Every later call goes to the transport it picked.
 struct SseFallbackTransport {
     config: McpServerConfig,
+    /// The auth both transports share, so a token either refreshes serves
+    /// the other.
+    auth: Arc<RemoteAuth>,
     /// The transport `initialize` picked.
     transport: OnceLock<Box<dyn McpTransport>>,
 }
 
 impl SseFallbackTransport {
-    fn new(config: &McpServerConfig) -> Result<Self, String> {
+    fn new(config: &McpServerConfig, auth: Arc<RemoteAuth>) -> Result<Self, String> {
         // Report a missing url or a bad header now, as `http` does.
         remote_url(config)?;
         configured_headers(config)?;
         Ok(Self {
             config: config.clone(),
+            auth,
             transport: OnceLock::new(),
         })
     }
@@ -1417,7 +1513,7 @@ impl SseFallbackTransport {
     /// Starts a session over streamable HTTP, or over legacy SSE when the
     /// server turns the `initialize` POST away.
     fn start(&self) -> Result<(Box<dyn McpTransport>, Value), String> {
-        let http = StreamableHttpTransport::new(&self.config)?;
+        let http = StreamableHttpTransport::new(&self.config, Arc::clone(&self.auth))?;
         match http.start_session() {
             Ok(result) => Ok((Box::new(http), result)),
             Err(HttpRequestError::Status { status, .. })
@@ -1425,10 +1521,16 @@ impl SseFallbackTransport {
             {
                 drop(http);
                 // Keep the first failure in view: the server may not speak
-                // legacy SSE either.
-                let legacy = LegacySseTransport::connect(&self.config).map_err(|error| {
-                    format!("{error}; the streamable HTTP initialize failed with {status}")
-                })?;
+                // legacy SSE either. A login the user must make is reported
+                // as it is.
+                let legacy = LegacySseTransport::connect(&self.config, Arc::clone(&self.auth))
+                    .map_err(|error| {
+                        if is_auth_required(&error) {
+                            error
+                        } else {
+                            format!("{error}; the streamable HTTP initialize failed with {status}")
+                        }
+                    })?;
                 let result = legacy.initialize()?;
                 Ok((Box::new(legacy), result))
             }
@@ -3307,7 +3409,7 @@ done
                 }
             }
         });
-        let transport = StreamableHttpTransport::new(&McpServerConfig {
+        let config = McpServerConfig {
             name: "cancel_peer_sse".to_string(),
             transport: McpTransportKind::Sse,
             command: None,
@@ -3320,8 +3422,9 @@ done
             startup_timeout_ms: Some(5000),
             tool_timeout_ms: Some(5000),
             ..Default::default()
-        })
-        .expect("connect cancellable SSE MCP");
+        };
+        let transport = StreamableHttpTransport::new(&config, no_auth(&config))
+            .expect("connect cancellable SSE MCP");
         let started = Instant::now();
 
         let error = transport
@@ -4148,7 +4251,7 @@ while IFS= read -r line; do :; done
         let server = LegacySseServer::start(LegacySseBehavior::default());
         let mut config = legacy_sse_config("legacy", &server);
         config.headers = HashMap::from([("X-Api-Key".to_string(), "k1".to_string())]);
-        let transport = LegacySseTransport::connect(&config).expect("open the event stream");
+        let transport = legacy_sse(&config).expect("open the event stream");
 
         let initialized = transport
             .initialize()
@@ -4203,8 +4306,7 @@ while IFS= read -r line; do :; done
             });
             let sent = endpoint.replace("{port}", &server.addr.port().to_string());
 
-            let Err(error) = LegacySseTransport::connect(&legacy_sse_config("elsewhere", &server))
-            else {
+            let Err(error) = legacy_sse(&legacy_sse_config("elsewhere", &server)) else {
                 panic!("an endpoint on another origin was accepted: {sent}");
             };
 
@@ -4227,8 +4329,8 @@ while IFS= read -r line; do :; done
             elicit_unprompted: true,
             ..Default::default()
         });
-        let transport = LegacySseTransport::connect(&legacy_sse_config("asking", &server))
-            .expect("open the event stream");
+        let transport =
+            legacy_sse(&legacy_sse_config("asking", &server)).expect("open the event stream");
 
         // A question that comes while no request is waiting is turned down.
         let unprompted = server
@@ -4271,7 +4373,7 @@ while IFS= read -r line; do :; done
         });
         let mut config = legacy_sse_config("slow", &server);
         config.tool_timeout_ms = Some(100);
-        let transport = LegacySseTransport::connect(&config).expect("open the event stream");
+        let transport = legacy_sse(&config).expect("open the event stream");
         transport.initialize().expect("initialize");
 
         let started = Instant::now();
@@ -4298,8 +4400,8 @@ while IFS= read -r line; do :; done
             unanswered: Some("tools/call"),
             ..Default::default()
         });
-        let transport = LegacySseTransport::connect(&legacy_sse_config("cancelled", &server))
-            .expect("open the event stream");
+        let transport =
+            legacy_sse(&legacy_sse_config("cancelled", &server)).expect("open the event stream");
         transport.initialize().expect("initialize");
 
         let started = Instant::now();
@@ -4324,8 +4426,8 @@ while IFS= read -r line; do :; done
     #[test]
     fn dropping_a_legacy_sse_transport_stops_its_reader() {
         let server = LegacySseServer::start(LegacySseBehavior::default());
-        let transport = LegacySseTransport::connect(&legacy_sse_config("dropped", &server))
-            .expect("open the event stream");
+        let transport =
+            legacy_sse(&legacy_sse_config("dropped", &server)).expect("open the event stream");
         transport.initialize().expect("initialize");
 
         // Dropping waits for the reader thread, so a reader that kept reading
@@ -4378,6 +4480,55 @@ while IFS= read -r line; do :; done
                     "POST /messages?sessionId=legacy-1 tools/call",
                 ],
                 "after a {post_status}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_sse_sends_the_stored_token_on_its_stream_and_posts() {
+        let server = LegacySseServer::start(LegacySseBehavior::default());
+        let config = legacy_sse_config("legacy", &server);
+        let url = config.url.clone().expect("a url");
+        let home = tempfile::tempdir().expect("temp dir");
+        let credentials = home.path().join("mcp-credentials.json");
+        orca_core::config::mcp_credentials::save_mcp_credential(
+            &credentials,
+            "legacy",
+            &orca_core::config::mcp_credentials::McpCredential {
+                server_url: url.clone(),
+                access_token: "at-1".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                token_endpoint: format!("{}/token", server.url()),
+                client_id: "configured-client".to_string(),
+                resource: url,
+                scope: None,
+            },
+        )
+        .expect("store a login");
+        let transport =
+            connect_with_credentials(&config, Some(credentials)).expect("connect SSE MCP");
+
+        transport.initialize().expect("initialize over legacy SSE");
+        transport.list_tools().expect("tools/list over legacy SSE");
+
+        assert_eq!(
+            server.trail(),
+            [
+                "POST /sse initialize",
+                "GET /sse",
+                "POST /messages?sessionId=legacy-1 initialize",
+                "POST /messages?sessionId=legacy-1 notifications/initialized",
+                "POST /messages?sessionId=legacy-1 tools/list",
+            ]
+        );
+        for request in server.requests() {
+            assert_eq!(
+                request.header_values("authorization"),
+                ["Bearer at-1"],
+                "{} {}",
+                request.method,
+                request.path
             );
         }
     }
@@ -4471,8 +4622,8 @@ while IFS= read -r line; do :; done
             close_stream_on: Some("tools/call"),
             ..Default::default()
         });
-        let transport = LegacySseTransport::connect(&legacy_sse_config("closing", &server))
-            .expect("open the event stream");
+        let transport =
+            legacy_sse(&legacy_sse_config("closing", &server)).expect("open the event stream");
         transport.initialize().expect("initialize");
 
         let error = transport
@@ -4977,6 +5128,16 @@ while IFS= read -r line; do :; done
                 body,
             });
         }
+    }
+
+    /// The auth of a server with no credentials: none is sent.
+    fn no_auth(config: &McpServerConfig) -> Arc<RemoteAuth> {
+        Arc::new(RemoteAuth::resolve(config, None).expect("resolve the auth"))
+    }
+
+    /// Connects over legacy SSE alone, with no credentials.
+    fn legacy_sse(config: &McpServerConfig) -> Result<LegacySseTransport, String> {
+        LegacySseTransport::connect(config, no_auth(config))
     }
 
     fn legacy_sse_config(name: &str, server: &HttpFixture) -> McpServerConfig {

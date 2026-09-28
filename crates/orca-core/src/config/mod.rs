@@ -15,6 +15,7 @@ use crate::tool_types::ToolOutputTruncation;
 
 pub mod file;
 pub mod folder_trust;
+pub mod mcp_credentials;
 pub mod user_edit;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -121,6 +121,13 @@
       "windows-test-portability"
     ],
     [
+      "mcp-credentials-owner-only-mode-fixture",
+      "crates/orca-core/src/config/mcp_credentials.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "task-output-store-symlink-fixture",
       "crates/orca-runtime/tests/task_output_store.rs",
       "unix_std_api",
