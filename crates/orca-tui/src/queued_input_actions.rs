@@ -103,9 +103,44 @@ pub(crate) fn submit_composer_follow_up_now(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum FollowUp {
+pub(crate) enum FollowUp {
     Queue,
     Now,
+}
+
+/// Hands `message` to the dispatcher as a follow-up to the running turn:
+/// queued, or sent now. `false` when the action queue cannot take it, and
+/// then nothing is sent.
+pub(crate) fn dispatch_follow_up(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+    message: QueuedUserMessage,
+    follow_up: FollowUp,
+) -> bool {
+    let prompt = message.submission_text().to_string();
+    let bindings = message.submission_bindings().clone();
+    let images = message.images().to_vec();
+    let action = match follow_up {
+        FollowUp::Queue => UserAction::QueuePrompt {
+            prompt,
+            bindings,
+            images,
+        },
+        FollowUp::Now => UserAction::SubmitNow {
+            prompt,
+            bindings,
+            images,
+        },
+    };
+    if action_tx.try_send(action).is_err() {
+        return false;
+    }
+    // Only a queued follow-up is sure to become a queue item whose composer
+    // Alt+Up can restore; one sent now usually joins the running turn instead.
+    if follow_up == FollowUp::Queue {
+        state.remember_runtime_queued_message(message);
+    }
+    true
 }
 
 fn send_composer_follow_up(
@@ -133,29 +168,9 @@ fn send_composer_follow_up(
         ));
         return false;
     }
-    let prompt = message.submission_text().to_string();
-    let bindings = message.submission_bindings().clone();
-    let images = message.images().to_vec();
-    let action = match follow_up {
-        FollowUp::Queue => UserAction::QueuePrompt {
-            prompt,
-            bindings,
-            images,
-        },
-        FollowUp::Now => UserAction::SubmitNow {
-            prompt,
-            bindings,
-            images,
-        },
-    };
-    if action_tx.try_send(action).is_err() {
+    if !dispatch_follow_up(state, action_tx, message, follow_up) {
         state.report_queued_input_error("follow-up action queue is unavailable".to_string());
         return false;
-    }
-    // Only a queued follow-up is sure to become a queue item whose composer
-    // Alt+Up can restore; one sent now usually joins the running turn instead.
-    if follow_up == FollowUp::Queue {
-        state.remember_runtime_queued_message(message);
     }
     state.slash_menu = None;
     state.mention.clear_projection();

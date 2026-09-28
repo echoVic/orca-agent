@@ -270,11 +270,15 @@ to `main`. An optional argument you leave out is not sent. When a required
 argument is missing, or a prompt that takes no arguments gets some, Orca
 shows the usage, such as `usage: /mcp__github__review_pr <pr> [branch]`, and
 runs nothing. Choosing a prompt that takes arguments in the menu fills in
-its command for you to add them.
+its command for you to add them. `↑` brings back a prompt command you ran,
+as it does a message.
 
 Orca asks the server to fill in the prompt and sends what comes back as your
 message: its text, with its images attached. Between turns it goes out at
-once; during a turn it is queued, like a message you send then. The text
+once; during a turn it is queued, like a message you send then. It goes only
+to the conversation you ran it in: if you start, resume, or switch to
+another conversation before the server answers, it is not sent, and the
+conversation says so. The text
 goes out as the server wrote it: an `@path` in it is not a mention, and Orca
 reads no file for it. When the server reports an error, or its answer is
 empty or more than one message can carry (over 1,048,576 characters of

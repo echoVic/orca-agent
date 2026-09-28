@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 use tui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
+use orca_runtime::mentions::MentionBindings;
 
 use crate::commands;
-use crate::composer_images::{ComposerImageState, DeferredImageSubmit};
+use crate::composer_images::{ComposerImageAttachment, ComposerImageState, DeferredImageSubmit};
 use crate::composer_input_actions::sync_vim_mode_label;
 use crate::composer_textarea::{
     MAX_USER_INPUT_TEXT_CHARS, expand_pending_pastes, make_textarea, make_textarea_with_text,
@@ -174,17 +175,9 @@ pub(crate) fn handle_idle_submit(
         if !history_text.is_empty() {
             state.record_prompt(history_text);
         }
-        state.push_user_message_with_images(visible_text.trim().to_string(), &images);
-        state.enter_running();
-        state.scroll_to_bottom();
+        let visible_text = visible_text.trim().to_string();
         let bindings = state.mention_bindings.clone();
-        let _ = action_tx.send(UserAction::SubmitWithMentions {
-            prompt: text,
-            bindings,
-            images,
-        });
-        state.request_runtime_queue_start();
-        state.resume_queued_follow_up_autosend();
+        submit_user_message(state, action_tx, visible_text, text, bindings, images);
     }
     state.pending_pastes.clear();
     state.composer_images.clear_attachments();
@@ -229,6 +222,30 @@ pub(crate) fn submit_pending_user_input_response(
         response: TuiInteractionResponse::UserQuestionnaire(response),
     });
     true
+}
+
+/// Sends `prompt`, with its mention `bindings` and attached `images`, as the
+/// user's next message between turns; the conversation shows it as
+/// `visible_text` with the images. A paused queue starts again, since the
+/// user took over.
+pub(crate) fn submit_user_message(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+    visible_text: String,
+    prompt: String,
+    bindings: MentionBindings,
+    images: Vec<ComposerImageAttachment>,
+) {
+    state.push_user_message_with_images(visible_text, &images);
+    state.enter_running();
+    state.scroll_to_bottom();
+    let _ = action_tx.send(UserAction::SubmitWithMentions {
+        prompt,
+        bindings,
+        images,
+    });
+    state.request_runtime_queue_start();
+    state.resume_queued_follow_up_autosend();
 }
 
 fn reset_composer_after_submit(

@@ -427,13 +427,6 @@ impl ComposerImageState {
         Self::label_inputs(text, Vec::new(), images)
     }
 
-    /// The decoded bytes `attachments` carry inline, which Orca caps.
-    pub(crate) fn inline_bytes(attachments: &[ComposerImageAttachment]) -> usize {
-        attachments.iter().fold(0, |total, attachment| {
-            total.saturating_add(attachment.encoded_bytes)
-        })
-    }
-
     /// `images` as attachments of `visible_text`: the first take `labels`,
     /// and each one after them a new label, numbered past every label in
     /// the text and appended to it.

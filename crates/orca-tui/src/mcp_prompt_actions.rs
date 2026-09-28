@@ -1,12 +1,14 @@
 //! What `/mcp__{server}__{prompt}` does once its arguments fit the prompt.
 //! The runtime of the thread in view has the MCP server expand the prompt,
 //! which can take up to the server's tool timeout, so it runs on a worker of
-//! its own, off the UI thread and the action dispatcher. The worker always
-//! reports back with `McpPromptExpanded`, and the UI thread sends the
-//! expansion as the user's message, as the composer sends one: at once
-//! between turns, or queued while a turn runs.
+//! its own, off the UI thread and the action dispatcher. The worker checks
+//! the expansion against what one message can carry, attaches its images,
+//! and always reports back with `McpPromptExpanded`. The UI thread sends the
+//! message only into the conversation the prompt was run in, the way the
+//! composer sends one: at once between turns, or queued while a turn runs.
 
 use crossbeam_channel::Sender;
+use orca_core::conversation::{ImageInput, ImageSource};
 use orca_runtime::mentions::MentionBindings;
 use orca_runtime::runtime_host::RuntimeThreadHandle;
 use orca_runtime::surface::SurfaceMcpPromptExpansion;
@@ -15,23 +17,30 @@ use crate::clipboard_image::{MAX_COMPOSER_IMAGE_BYTES, MAX_COMPOSER_IMAGE_COUNT}
 use crate::commands::mcp_prompt_command;
 use crate::composer_images::{ComposerImageAttachment, ComposerImageState};
 use crate::composer_textarea::MAX_USER_INPUT_TEXT_CHARS;
-use crate::protocol::{TuiEvent, UserAction};
+use crate::idle_submit_actions::submit_user_message;
+use crate::protocol::{SessionAttachmentId, TuiEvent};
 use crate::queued_input::QueuedUserMessage;
+use crate::queued_input_actions::{FollowUp, dispatch_follow_up};
 use crate::transcript_state::ChatMessage;
 use crate::types::{AppState, AppStatus};
+
+/// A prompt's expansion as the composer holds a message (its text, then a
+/// label for each attached image), or what the conversation says instead.
+type McpPromptMessage = Result<(String, Vec<ComposerImageAttachment>), ChatMessage>;
 
 /// Why there is no expansion when a worker ends without one.
 const WORKER_STOPPED: &str = "its worker stopped unexpectedly";
 
 /// Starts expanding the prompt `prompt` of the MCP server the catalog names
-/// `server`, with `arguments` (name, value), on the MCP servers of
-/// `runtime`, the thread in view, on a worker of its own. When no worker
-/// starts, the report it would have sent comes back, for the caller to
-/// deliver.
+/// `server`, with `arguments` (name, value), for the conversation
+/// `attachment`, on the MCP servers of `runtime`, the thread in view, on a
+/// worker of its own. When no worker starts, the report it would have sent
+/// comes back, for the caller to deliver.
 pub(crate) fn spawn_mcp_prompt_expansion(
     server: String,
     prompt: String,
     arguments: Vec<(String, String)>,
+    attachment: Option<SessionAttachmentId>,
     runtime: Option<RuntimeThreadHandle>,
     event_tx: Sender<TuiEvent>,
 ) -> Result<(), Box<TuiEvent>> {
@@ -39,50 +48,62 @@ pub(crate) fn spawn_mcp_prompt_expansion(
     std::thread::Builder::new()
         .name("orca-tui-mcp-prompt".to_string())
         .spawn(move || {
-            run_mcp_prompt_worker(server, prompt, &event_tx, |server, prompt| match runtime {
-                Some(runtime) => crate::surface_client::expand_mcp_prompt(
-                    &runtime.typed_surface(),
-                    server,
-                    prompt,
-                    arguments,
-                ),
-                None => Err("the conversation has not started".to_string()),
+            run_mcp_prompt_worker(server, prompt, attachment, &event_tx, |server, prompt| {
+                match runtime {
+                    Some(runtime) => crate::surface_client::expand_mcp_prompt(
+                        &runtime.typed_surface(),
+                        server,
+                        prompt,
+                        arguments,
+                    ),
+                    None => Err("the conversation has not started".to_string()),
+                }
             });
         })
         .map(|_| ())
         .map_err(|error| {
+            let command = mcp_prompt_command(&failed_server, &failed_prompt);
             Box::new(TuiEvent::McpPromptExpanded {
                 server: failed_server,
                 prompt: failed_prompt,
-                result: Err(format!("could not start a worker: {error}")),
+                attachment,
+                message: Err(failed(
+                    &command,
+                    &format!("could not start a worker: {error}"),
+                )),
             })
         })
 }
 
-/// A worker's whole run: `expand` the prompt, then report the expansion, or
-/// why there is none, however `expand` ends, a panic included.
+/// A worker's whole run: `expand` the prompt, then report the message it
+/// makes, or why there is none, however `expand` ends, a panic included.
 fn run_mcp_prompt_worker(
     server: String,
     prompt: String,
+    attachment: Option<SessionAttachmentId>,
     event_tx: &Sender<TuiEvent>,
     expand: impl FnOnce(&str, &str) -> Result<SurfaceMcpPromptExpansion, String>,
 ) {
+    let command = mcp_prompt_command(&server, &prompt);
     let mut report = ReportOnDrop {
         event_tx: event_tx.clone(),
         server,
         prompt,
-        result: Err(WORKER_STOPPED.to_string()),
+        attachment,
+        message: Err(failed(&command, WORKER_STOPPED)),
     };
-    report.result = expand(&report.server, &report.prompt);
+    report.message =
+        prompt_message(&command, expand(&report.server, &report.prompt)).map_err(|say| *say);
 }
 
-/// Sends `McpPromptExpanded` with `result` when dropped, which reports on
+/// Sends `McpPromptExpanded` with `message` when dropped, which reports on
 /// every way out of a worker, unwinding included.
 struct ReportOnDrop {
     event_tx: Sender<TuiEvent>,
     server: String,
     prompt: String,
-    result: Result<SurfaceMcpPromptExpansion, String>,
+    attachment: Option<SessionAttachmentId>,
+    message: McpPromptMessage,
 }
 
 impl Drop for ReportOnDrop {
@@ -91,107 +112,153 @@ impl Drop for ReportOnDrop {
         let _ = self.event_tx.send(TuiEvent::McpPromptExpanded {
             server: std::mem::take(&mut self.server),
             prompt: std::mem::take(&mut self.prompt),
-            result: std::mem::replace(&mut self.result, Err(String::new())),
+            attachment: self.attachment,
+            message: std::mem::replace(&mut self.message, Ok(Default::default())),
         });
     }
 }
 
-impl AppState {
-    /// What the worker for `/mcp__{server}__{prompt}` brought back. An
-    /// expansion is sent as the user's message; nothing is sent when the
-    /// server could not expand the prompt, or when the expansion is empty
-    /// or too large for Orca to send, and the conversation says why.
-    pub(crate) fn submit_mcp_prompt_expansion(
-        &mut self,
-        server: &str,
-        prompt: &str,
-        result: Result<SurfaceMcpPromptExpansion, String>,
-    ) {
-        let command = mcp_prompt_command(server, prompt);
-        let not_sent = match result {
-            Err(reason) => ChatMessage::Error(format!("MCP prompt {command} failed: {reason}")),
-            Ok(expansion) if expansion.text.trim().is_empty() && expansion.images.is_empty() => {
-                ChatMessage::System {
-                    text: format!("MCP prompt {command} returned nothing to send"),
-                    expanded: false,
-                }
-            }
-            Ok(expansion) => match composer_message(expansion) {
-                Ok((text, images)) => return self.send_mcp_prompt_message(text, images),
-                Err(reason) => ChatMessage::Error(format!(
-                    "MCP prompt {command} is too large to send: {reason}"
-                )),
-            },
-        };
-        self.finish_assistant_stream();
-        self.push_message(not_sent);
-    }
-
-    /// Sends `text`, with `images` attached, as the user's message, and as
-    /// literal text: an `@` path in it is not a mention for Orca to read.
-    /// Between turns it is sent at once; while a turn runs it is queued, as
-    /// the composer queues a message then.
-    fn send_mcp_prompt_message(&mut self, text: String, images: Vec<ComposerImageAttachment>) {
-        let bindings = MentionBindings::new(&text);
-        if self.status == AppStatus::Idle {
-            self.push_user_message_with_images(text.clone(), &images);
-            self.enter_running();
-            self.scroll_to_bottom();
-            let _ = self.event_tx.send(UserAction::SubmitWithMentions {
-                prompt: text,
-                bindings,
-                images,
-            });
-            self.request_runtime_queue_start();
-            self.resume_queued_follow_up_autosend();
-            return;
-        }
-        let Some(message) =
-            QueuedUserMessage::from_composer_with_images(text, Vec::new(), bindings, images)
-        else {
-            return;
-        };
-        let queued = UserAction::QueuePrompt {
-            prompt: message.submission_text().to_string(),
-            bindings: message.submission_bindings().clone(),
-            images: message.images().to_vec(),
-        };
-        if self.event_tx.try_send(queued).is_err() {
-            self.report_queued_input_error("follow-up action queue is unavailable".to_string());
-            return;
-        }
-        self.remember_runtime_queued_message(message);
-    }
+/// What the conversation says when the prompt `command` ran could not be
+/// expanded, `reason` being why.
+fn failed(command: &str, reason: &str) -> ChatMessage {
+    ChatMessage::Error(format!("MCP prompt {command} failed: {reason}"))
 }
 
-/// `expansion` as the composer would hold it: its text, then a label for
-/// each image, which is attached. `Err` says why Orca does not send it:
-/// more than one message can carry.
-fn composer_message(
-    expansion: SurfaceMcpPromptExpansion,
-) -> Result<(String, Vec<ComposerImageAttachment>), String> {
+/// The message `command` expanded to, as `result` has it. Nothing is sent
+/// when the server could not expand the prompt, or when the expansion is
+/// empty or more than one message can carry; `Err` is what the
+/// conversation says instead.
+fn prompt_message(
+    command: &str,
+    result: Result<SurfaceMcpPromptExpansion, String>,
+) -> Result<(String, Vec<ComposerImageAttachment>), Box<ChatMessage>> {
+    let expansion = result.map_err(|reason| Box::new(failed(command, &reason)))?;
     let text = expansion.text.trim();
+    if text.is_empty() && expansion.images.is_empty() {
+        return Err(Box::new(ChatMessage::System {
+            text: format!("MCP prompt {command} returned nothing to send"),
+            expanded: false,
+        }));
+    }
+    if let Err(reason) = check_message_limits(text, &expansion.images) {
+        return Err(Box::new(ChatMessage::Error(format!(
+            "MCP prompt {command} is too large to send: {reason}"
+        ))));
+    }
+    let (text, images) = ComposerImageState::attach_inputs(text, expansion.images);
+    Ok((text.trim().to_string(), images))
+}
+
+/// Why `text` and `images` are more than one message can carry. Images are
+/// measured by their base64 text, before any is decoded; their total bounds
+/// each image too.
+fn check_message_limits(text: &str, images: &[ImageInput]) -> Result<(), String> {
     let chars = text.chars().count();
     if chars > MAX_USER_INPUT_TEXT_CHARS {
         return Err(format!(
             "its text exceeds the maximum length of {MAX_USER_INPUT_TEXT_CHARS} characters ({chars} provided)"
         ));
     }
-    if expansion.images.len() > MAX_COMPOSER_IMAGE_COUNT {
+    if images.len() > MAX_COMPOSER_IMAGE_COUNT {
         return Err(format!(
             "its {} images exceed Orca's {MAX_COMPOSER_IMAGE_COUNT}-image limit",
-            expansion.images.len()
+            images.len()
         ));
     }
-    let (text, images) = ComposerImageState::attach_inputs(text, expansion.images);
-    // The total bounds each image too.
-    if ComposerImageState::inline_bytes(&images) > MAX_COMPOSER_IMAGE_BYTES {
+    let inline_bytes = images.iter().fold(0usize, |total, image| {
+        total.saturating_add(inline_bytes(image))
+    });
+    if inline_bytes > MAX_COMPOSER_IMAGE_BYTES {
         return Err(format!(
             "its images exceed Orca's {} MiB inline limit",
             MAX_COMPOSER_IMAGE_BYTES / (1024 * 1024)
         ));
     }
-    Ok((text.trim().to_string(), images))
+    Ok(())
+}
+
+/// The bytes `image` carries inline once decoded, counted from its base64
+/// text without decoding it. An image by url or file id carries none.
+fn inline_bytes(image: &ImageInput) -> usize {
+    match &image.source {
+        ImageSource::Base64 { data, .. } => {
+            let digits = data.trim_end_matches('=').len();
+            digits / 4 * 3 + digits % 4 * 3 / 4
+        }
+        ImageSource::Url { .. } | ImageSource::File { .. } => 0,
+    }
+}
+
+impl AppState {
+    /// What the worker for `/mcp__{server}__{prompt}`, run in the
+    /// conversation `attachment`, reported: `message` is sent as the
+    /// user's, or the conversation says why it is not. Only the
+    /// conversation the prompt was run in gets it; after `/new`, a fork, a
+    /// resume, or a switch to a side or child conversation, and while the
+    /// session picker or setup is open, nothing is sent.
+    pub(crate) fn submit_mcp_prompt_expansion(
+        &mut self,
+        server: &str,
+        prompt: &str,
+        attachment: Option<SessionAttachmentId>,
+        message: McpPromptMessage,
+    ) {
+        let command = mcp_prompt_command(server, prompt);
+        if attachment != self.active_session_attachment
+            || matches!(self.status, AppStatus::SessionPicker | AppStatus::Setup)
+        {
+            return self.say_mcp_prompt_not_sent(ChatMessage::System {
+                text: format!("MCP prompt {command} was not sent: the conversation changed"),
+                expanded: false,
+            });
+        }
+        match message {
+            Ok((text, images)) => self.send_mcp_prompt_message(&command, text, images),
+            Err(not_sent) => self.say_mcp_prompt_not_sent(not_sent),
+        }
+    }
+
+    /// Sends `text`, with `images` attached, as the user's message, and as
+    /// literal text: an `@` path in it is not a mention for Orca to read.
+    /// It goes the composer's way: at once between turns, and queued while
+    /// a turn runs.
+    fn send_mcp_prompt_message(
+        &mut self,
+        command: &str,
+        text: String,
+        images: Vec<ComposerImageAttachment>,
+    ) {
+        let action_tx = self.event_tx.clone();
+        let bindings = MentionBindings::new(&text);
+        if self.status == AppStatus::Idle {
+            return submit_user_message(self, &action_tx, text.clone(), text, bindings, images);
+        }
+        let message =
+            QueuedUserMessage::from_composer_with_images(text, Vec::new(), bindings, images);
+        debug_assert!(
+            message.is_some(),
+            "an MCP prompt message has text or an image label"
+        );
+        let not_sent = match message {
+            Some(message) => {
+                if dispatch_follow_up(self, &action_tx, message, FollowUp::Queue) {
+                    return;
+                }
+                "follow-up action queue is unavailable"
+            }
+            None => "it has nothing to send",
+        };
+        self.say_mcp_prompt_not_sent(ChatMessage::Error(format!(
+            "MCP prompt {command} was not sent: {not_sent}"
+        )));
+    }
+
+    /// Says `message`, about a prompt whose message is not sent, after any
+    /// assistant text still streaming in.
+    fn say_mcp_prompt_not_sent(&mut self, message: ChatMessage) {
+        self.finish_assistant_stream();
+        self.push_message(message);
+    }
 }
 
 #[cfg(test)]
@@ -200,21 +267,19 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use base64::Engine as _;
-    use orca_core::conversation::{ImageDetail, ImageInput, ImageSource};
+    use orca_core::conversation::ImageDetail;
 
-    use crate::clipboard_image::MAX_COMPOSER_IMAGE_COUNT;
-    use crate::composer_images::ComposerImageState;
-    use crate::composer_textarea::MAX_USER_INPUT_TEXT_CHARS;
-    use crate::protocol::UserAction;
+    use crate::protocol::{AttachedTuiEvent, UserAction};
     use crate::slash_command_actions::handle_slash_command;
     use crate::surface_projection::{
         McpCatalogView, McpPromptView, McpServerStatusView, McpServerView,
     };
-    use crate::transcript_state::ChatMessage;
-    use crate::types::AppStatus;
 
     /// A 1x1 PNG.
     const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    /// The conversation in view in `prompt_state`.
+    const ATTACHMENT: SessionAttachmentId = SessionAttachmentId::new(1);
 
     fn png() -> ImageInput {
         orca_core::tool_images::tool_image("image/png", PNG.to_string()).expect("a valid PNG")
@@ -235,12 +300,18 @@ mod tests {
     /// `github` and its prompt `review_pr <pr> [branch]`.
     fn prompt_state() -> (AppState, crossbeam_channel::Receiver<UserAction>) {
         let (action_tx, action_rx) = crossbeam_channel::unbounded();
+        (prompt_state_with(action_tx), action_rx)
+    }
+
+    /// `prompt_state`, sending its actions to `action_tx`.
+    fn prompt_state_with(action_tx: crossbeam_channel::Sender<UserAction>) -> AppState {
         let mut state = AppState::new(
             action_tx,
             "test".to_string(),
             "mock".to_string(),
             "/tmp".to_string(),
         );
+        state.active_session_attachment = Some(ATTACHMENT);
         state.mcp_catalog = McpCatalogView {
             servers: vec![McpServerView {
                 name: "github".to_string(),
@@ -254,19 +325,33 @@ mod tests {
                 arguments: vec![("pr".to_string(), true), ("branch".to_string(), false)],
             }],
         };
-        (state, action_rx)
+        state
     }
 
-    /// What the worker brings back for `/mcp__github__review_pr`.
+    /// What a worker for `/mcp__github__review_pr`, run in the conversation
+    /// `prompt_state` shows, reports when the server answers with `result`.
+    fn report(result: Result<SurfaceMcpPromptExpansion, String>) -> TuiEvent {
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        run_mcp_prompt_worker(
+            "github".to_string(),
+            "review_pr".to_string(),
+            Some(ATTACHMENT),
+            &event_tx,
+            |_, _| result,
+        );
+        event_rx.try_recv().expect("the worker's report")
+    }
+
+    /// The report for an expansion to `text` and `images`.
     fn expanded(text: &str, images: Vec<ImageInput>) -> TuiEvent {
-        TuiEvent::McpPromptExpanded {
-            server: "github".to_string(),
-            prompt: "review_pr".to_string(),
-            result: Ok(SurfaceMcpPromptExpansion {
-                text: text.to_string(),
-                images,
-            }),
-        }
+        report(Ok(SurfaceMcpPromptExpansion {
+            text: text.to_string(),
+            images,
+        }))
+    }
+
+    fn last_message(state: &AppState) -> Option<&ChatMessage> {
+        state.transcript.messages.last()
     }
 
     #[test]
@@ -288,6 +373,7 @@ mod tests {
             server,
             prompt,
             arguments,
+            attachment,
         }) = action_rx.try_recv()
         else {
             panic!("the prompt did not run");
@@ -300,21 +386,28 @@ mod tests {
                 ("branch".to_string(), "against main".to_string()),
             ]
         );
+        assert_eq!(attachment, Some(ATTACHMENT));
         assert!(matches!(
-            state.transcript.messages.last(),
+            last_message(&state),
             Some(ChatMessage::System { text, .. })
                 if text == "running MCP prompt /mcp__github__review_pr…"
         ));
+        // ↑ brings the command back, as it does a skill's.
+        assert_eq!(
+            state.input_history.last().map(String::as_str),
+            Some("/mcp__github__review_pr 123 against main")
+        );
         assert_eq!(state.status, AppStatus::Idle);
 
-        state.update(TuiEvent::McpPromptExpanded {
-            server,
-            prompt,
-            result: Ok(SurfaceMcpPromptExpansion {
+        // The worker's report, from the action's own run.
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        run_mcp_prompt_worker(server, prompt, attachment, &event_tx, |_, _| {
+            Ok(SurfaceMcpPromptExpansion {
                 text: "Review pull request 123 against main.".to_string(),
                 images: vec![png()],
-            }),
+            })
         });
+        state.update(event_rx.try_recv().expect("the worker's report"));
 
         let Ok(UserAction::SubmitWithMentions {
             prompt,
@@ -345,33 +438,155 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_that_expands_while_a_turn_runs_is_queued() {
-        let (mut state, action_rx) = prompt_state();
-        state.enter_running();
-        let shown = state.transcript.messages.len();
+    fn a_prompt_typed_with_a_paste_gets_the_pasted_text() {
+        use orca_core::config::ThemeName;
 
-        // The server's `@` path is text, not a file for Orca to read, and
-        // its image label is text too.
-        state.update(expanded(
-            "Compare @src/main.rs with [Image #1]",
-            vec![png()],
+        use crate::composer_textarea::{make_textarea_with_text, textarea_text};
+        use crate::theme::Theme;
+        use crate::vim::VimState;
+
+        let (mut state, action_rx) = prompt_state();
+        let action_tx = state.event_tx.clone();
+        let mut config = crate::test_support::test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let placeholder = "[Pasted Content 1001 chars]";
+        let pasted = format!("rebase onto main\n{}", "x".repeat(984));
+        state.pending_pastes = vec![(placeholder.to_string(), pasted.clone())];
+        let mut textarea = make_textarea_with_text(
+            &format!("/mcp__github__review_pr 123 {placeholder}"),
+            &vim,
+            &theme,
+        );
+
+        assert!(crate::idle_submit_actions::handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
         ));
 
-        let Ok(UserAction::QueuePrompt {
-            prompt,
-            bindings,
-            images,
-        }) = action_rx.try_recv()
-        else {
-            panic!("the expansion was not queued");
-        };
-        assert_eq!(prompt, "Compare @src/main.rs with [Image #1]");
-        assert!(bindings.is_empty());
-        assert_eq!(ComposerImageState::image_inputs(&images), [png()]);
-        // Like any input queued during a turn, it joins the conversation
-        // when its own turn starts.
-        assert_eq!(state.transcript.messages.len(), shown);
-        assert_eq!(state.status, AppStatus::Running);
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RunMcpPrompt { arguments, .. })
+                if arguments == [
+                    ("pr".to_string(), "123".to_string()),
+                    ("branch".to_string(), pasted.clone()),
+                ]
+        ));
+        assert_eq!(textarea_text(&textarea), "");
+        assert!(state.pending_pastes.is_empty());
+        assert_eq!(
+            state.input_history.last(),
+            Some(&format!("/mcp__github__review_pr 123 {pasted}"))
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_expands_while_a_turn_runs_is_queued() {
+        for status in [
+            AppStatus::Running,
+            AppStatus::WaitingApproval,
+            AppStatus::WaitingUserInput,
+            AppStatus::Compacting,
+        ] {
+            let (mut state, action_rx) = prompt_state();
+            state.set_status(status);
+            let shown = state.transcript.messages.len();
+
+            // The server's `@` path is text, not a file for Orca to read,
+            // and its image label is text too.
+            state.update(expanded(
+                "Compare @src/main.rs with [Image #1]",
+                vec![png()],
+            ));
+
+            let Ok(UserAction::QueuePrompt {
+                prompt,
+                bindings,
+                images,
+            }) = action_rx.try_recv()
+            else {
+                panic!("{status:?}: the expansion was not queued");
+            };
+            assert_eq!(prompt, "Compare @src/main.rs with [Image #1]");
+            assert!(bindings.is_empty());
+            assert_eq!(ComposerImageState::image_inputs(&images), [png()]);
+            // Like any input queued during a turn, it joins the
+            // conversation when its own turn starts.
+            assert_eq!(state.transcript.messages.len(), shown, "{status:?}");
+            assert_eq!(state.status, status);
+        }
+    }
+
+    #[test]
+    fn a_queued_expansion_the_action_queue_cannot_take_is_not_sent() {
+        let (action_tx, action_rx) = crossbeam_channel::bounded(1);
+        let mut state = prompt_state_with(action_tx.clone());
+        state.enter_running();
+        action_tx
+            .try_send(UserAction::Interrupt)
+            .expect("fill the action queue");
+
+        state.update(expanded("Review pull request 123.", Vec::new()));
+
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+        assert!(action_rx.try_recv().is_err());
+        assert!(matches!(
+            last_message(&state),
+            Some(ChatMessage::Error(text)) if text
+                == "MCP prompt /mcp__github__review_pr was not sent: follow-up action queue is unavailable"
+        ));
+    }
+
+    #[test]
+    fn an_expansion_for_a_conversation_no_longer_in_view_is_not_sent() {
+        let (mut state, action_rx) = prompt_state();
+        // `/new`, a fork, a resume or a side conversation gives the view a
+        // new attachment.
+        crate::attachment_routing::accept_attached_tui_event(
+            &mut state,
+            TuiEvent::Attached(Box::new(AttachedTuiEvent {
+                attachment: Some(SessionAttachmentId::new(2)),
+                event: TuiEvent::SessionAttachmentActivated,
+            })),
+        )
+        .expect("activate the new attachment");
+
+        state.update(expanded("Review pull request 123.", vec![png()]));
+
+        assert!(action_rx.try_recv().is_err());
+        assert_eq!(state.status, AppStatus::Idle);
+        assert!(matches!(
+            last_message(&state),
+            Some(ChatMessage::System { text, .. })
+                if text == "MCP prompt /mcp__github__review_pr was not sent: the conversation changed"
+        ));
+    }
+
+    #[test]
+    fn an_expansion_is_not_sent_while_the_session_picker_or_setup_is_open() {
+        for status in [AppStatus::SessionPicker, AppStatus::Setup] {
+            let (mut state, action_rx) = prompt_state();
+            state.set_status(status);
+
+            state.update(expanded("Review pull request 123.", Vec::new()));
+
+            assert!(action_rx.try_recv().is_err(), "{status:?}");
+            assert_eq!(state.status, status);
+            assert!(
+                matches!(
+                    last_message(&state),
+                    Some(ChatMessage::System { text, .. })
+                        if text == "MCP prompt /mcp__github__review_pr was not sent: the conversation changed"
+                ),
+                "{status:?}"
+            );
+        }
     }
 
     #[test]
@@ -412,13 +627,13 @@ mod tests {
             assert_eq!(state.status, AppStatus::Idle);
             assert!(
                 matches!(
-                    state.transcript.messages.last(),
+                    last_message(&state),
                     Some(ChatMessage::Error(message)) if *message == format!(
                         "MCP prompt /mcp__github__review_pr is too large to send: {reason}"
                     )
                 ),
                 "{reason}: {:?}",
-                state.transcript.messages.last()
+                last_message(&state)
             );
         }
 
@@ -435,6 +650,22 @@ mod tests {
     }
 
     #[test]
+    fn image_bytes_are_counted_from_base64_without_decoding() {
+        for bytes in [0, 1, 2, 3, 4, 5, 6, 1023, 5 * 1024 * 1024 + 1] {
+            assert_eq!(inline_bytes(&image_of(bytes)), bytes, "{bytes} bytes");
+        }
+        // Unpadded base64 counts the same.
+        let unpadded = ImageInput {
+            source: ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: base64::engine::general_purpose::STANDARD_NO_PAD.encode([0u8; 5]),
+            },
+            detail: ImageDetail::High,
+        };
+        assert_eq!(inline_bytes(&unpadded), 5);
+    }
+
+    #[test]
     fn an_expansion_with_nothing_in_it_sends_nothing() {
         for text in ["", " \n\t "] {
             let (mut state, action_rx) = prompt_state();
@@ -444,7 +675,7 @@ mod tests {
             assert!(action_rx.try_recv().is_err());
             assert_eq!(state.status, AppStatus::Idle);
             assert!(matches!(
-                state.transcript.messages.last(),
+                last_message(&state),
                 Some(ChatMessage::System { text, .. })
                     if text == "MCP prompt /mcp__github__review_pr returned nothing to send"
             ));
@@ -455,16 +686,14 @@ mod tests {
     fn a_prompt_its_server_cannot_expand_says_why_and_sends_nothing() {
         let (mut state, action_rx) = prompt_state();
 
-        state.update(TuiEvent::McpPromptExpanded {
-            server: "github".to_string(),
-            prompt: "review_pr".to_string(),
-            result: Err("MCP server 'github' has no prompt named 'review_pr'".to_string()),
-        });
+        state.update(report(Err(
+            "MCP server 'github' has no prompt named 'review_pr'".to_string(),
+        )));
 
         assert!(action_rx.try_recv().is_err());
         assert_eq!(state.status, AppStatus::Idle);
         assert!(matches!(
-            state.transcript.messages.last(),
+            last_message(&state),
             Some(ChatMessage::Error(text)) if text
                 == "MCP prompt /mcp__github__review_pr failed: MCP server 'github' has no prompt named 'review_pr'"
         ));
@@ -478,6 +707,7 @@ mod tests {
             run_mcp_prompt_worker(
                 "github".to_string(),
                 "review_pr".to_string(),
+                Some(ATTACHMENT),
                 &event_tx,
                 |_, _| -> Result<SurfaceMcpPromptExpansion, String> {
                     panic!("the MCP prompt worker panicked")
@@ -494,7 +724,7 @@ mod tests {
         }
         assert!(action_rx.try_recv().is_err());
         assert!(matches!(
-            state.transcript.messages.last(),
+            last_message(&state),
             Some(ChatMessage::Error(text))
                 if text == "MCP prompt /mcp__github__review_pr failed: its worker stopped unexpectedly"
         ));
@@ -609,13 +839,21 @@ done
             server,
             prompt,
             arguments,
+            attachment,
         }) = action_rx.try_recv()
         else {
             panic!("the prompt did not run");
         };
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        spawn_mcp_prompt_expansion(server, prompt, arguments, Some(thread.clone()), event_tx)
-            .expect("start the MCP prompt worker");
+        spawn_mcp_prompt_expansion(
+            server,
+            prompt,
+            arguments,
+            attachment,
+            Some(thread.clone()),
+            event_tx,
+        )
+        .expect("start the MCP prompt worker");
         state.update(
             event_rx
                 .recv_timeout(Duration::from_secs(20))

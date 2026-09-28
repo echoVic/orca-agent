@@ -10,8 +10,8 @@ use orca_core::plan_types::PlanItem;
 use orca_runtime::mentions::MentionBindings;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 use orca_runtime::surface::{
-    RuntimeSurfaceThreadHandle, SurfaceMcpPromptExpansion, SurfaceOperationId, SurfaceReadError,
-    SurfaceReadErrorCode, SurfaceReadResult, SurfaceReadRevision, TaskTranscriptSnapshot,
+    RuntimeSurfaceThreadHandle, SurfaceOperationId, SurfaceReadError, SurfaceReadErrorCode,
+    SurfaceReadResult, SurfaceReadRevision, TaskTranscriptSnapshot,
 };
 
 use crate::clipboard_image::ImagePasteRequest;
@@ -478,12 +478,15 @@ pub enum TuiEvent {
         url: String,
     },
     /// What the MCP server the catalog names `server` made of its prompt
-    /// `prompt`, which `/mcp__{server}__{prompt}` ran: the input to send as
-    /// the user's message, or why there is none.
+    /// `prompt`, which `/mcp__{server}__{prompt}` ran in the conversation
+    /// `attachment`: the message to send as the user's there, as the
+    /// composer holds one (its text, then a label for each attached image),
+    /// or what the conversation says instead.
     McpPromptExpanded {
         server: String,
         prompt: String,
-        result: Result<SurfaceMcpPromptExpansion, String>,
+        attachment: Option<SessionAttachmentId>,
+        message: Result<(String, Vec<ComposerImageAttachment>), ChatMessage>,
     },
 }
 
@@ -727,12 +730,14 @@ pub enum UserAction {
     McpLogout {
         server: String,
     },
-    /// `/mcp__{server}__{prompt} args…`: have the MCP server the catalog
-    /// names `server` expand its prompt `prompt` with `arguments` (name,
-    /// value), which `McpPromptExpanded` brings back.
+    /// `/mcp__{server}__{prompt} args…` in the conversation `attachment`:
+    /// have the MCP server the catalog names `server` expand its prompt
+    /// `prompt` with `arguments` (name, value), which `McpPromptExpanded`
+    /// brings back.
     RunMcpPrompt {
         server: String,
         prompt: String,
         arguments: Vec<(String, String)>,
+        attachment: Option<SessionAttachmentId>,
     },
 }

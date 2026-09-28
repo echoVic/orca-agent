@@ -78,8 +78,9 @@ const MCP_PROMPTS_NOT_STARTED: &str =
 /// `/mcp__{server}__{prompt} args…`: the thread's runtime has the MCP
 /// server expand its catalog prompt with the arguments `args` gives it, off
 /// the UI thread; `McpPromptExpanded` brings the expansion back to be sent
-/// as the user's message. Arguments that do not fit the prompt show its
-/// usage instead.
+/// as the user's message in this conversation. Arguments that do not fit
+/// the prompt show its usage instead. A run is kept in the input history,
+/// as a skill's is.
 fn run_mcp_prompt(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
@@ -87,27 +88,36 @@ fn run_mcp_prompt(
     prompt: String,
     args: &str,
 ) {
-    let Some(view) = state
+    let command = commands::mcp_prompt_command(&server, &prompt);
+    let view = state
         .mcp_catalog
         .prompts
         .iter()
-        .find(|view| view.server == server && view.name == prompt)
-    else {
+        .find(|view| view.server == server && view.name == prompt);
+    // The command was just parsed from this same catalog.
+    debug_assert!(view.is_some(), "{command} names no catalog prompt");
+    let Some(view) = view else {
+        state.push_message(ChatMessage::Error(format!(
+            "MCP prompt {command} was not run: the MCP catalog no longer lists it"
+        )));
         return;
     };
     match commands::map_prompt_arguments(view, args) {
         Ok(arguments) => {
+            state.record_prompt(if args.is_empty() {
+                command.clone()
+            } else {
+                format!("{command} {args}")
+            });
             state.push_message(ChatMessage::System {
-                text: format!(
-                    "running MCP prompt {}…",
-                    commands::mcp_prompt_command(&server, &prompt)
-                ),
+                text: format!("running MCP prompt {command}…"),
                 expanded: false,
             });
             let _ = action_tx.send(UserAction::RunMcpPrompt {
                 server,
                 prompt,
                 arguments,
+                attachment: state.active_session_attachment,
             });
         }
         Err(usage) => state.push_message(ChatMessage::Error(usage)),

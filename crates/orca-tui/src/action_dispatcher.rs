@@ -462,11 +462,13 @@ fn route_action(
             server,
             prompt,
             arguments,
+            attachment,
         } => {
             if let Err(not_started) = crate::mcp_prompt_actions::spawn_mcp_prompt_expansion(
                 server,
                 prompt,
                 arguments,
+                attachment,
                 controller.runtime_thread(),
                 event_tx.clone(),
             ) {
@@ -771,22 +773,30 @@ mod tests {
         let (mut dispatcher, command_rx) =
             TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).unwrap();
 
+        let attachment = Some(crate::protocol::SessionAttachmentId::new(3));
         raw_tx
             .send(UserAction::RunMcpPrompt {
                 server: "github".to_string(),
                 prompt: "review_pr".to_string(),
                 arguments: vec![("pr".to_string(), "12".to_string())],
+                attachment,
             })
             .unwrap();
 
-        // With no runtime yet, the worker says so; the hosted controller,
-        // which a running turn keeps busy, never sees the prompt.
+        // With no runtime yet, the worker says so, for the conversation the
+        // prompt ran in; the hosted controller, which a running turn keeps
+        // busy, never sees the prompt.
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(5)),
-            Ok(TuiEvent::McpPromptExpanded { server, prompt, result: Err(reason) })
-                if server == "github"
-                    && prompt == "review_pr"
-                    && reason == "the conversation has not started"
+            Ok(TuiEvent::McpPromptExpanded {
+                server,
+                prompt,
+                attachment: reported,
+                message: Err(crate::transcript_state::ChatMessage::Error(reason)),
+            }) if server == "github"
+                && prompt == "review_pr"
+                && reported == attachment
+                && reason == "MCP prompt /mcp__github__review_pr failed: the conversation has not started"
         ));
         assert!(command_rx.try_recv().is_err());
         dispatcher.shutdown().unwrap();

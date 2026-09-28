@@ -760,8 +760,9 @@ impl AppState {
             TuiEvent::McpPromptExpanded {
                 server,
                 prompt,
-                result,
-            } => self.submit_mcp_prompt_expansion(&server, &prompt, result),
+                attachment,
+                message,
+            } => self.submit_mcp_prompt_expansion(&server, &prompt, attachment, message),
             TuiEvent::McpLoginUrl { server, url } => {
                 if let Some(crate::types::McpActionInFlight::LoggingIn { authorization_url }) =
                     self.mcp_actions_in_flight.get_mut(&server)

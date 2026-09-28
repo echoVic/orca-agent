@@ -489,7 +489,7 @@ mod tests {
         );
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::RunMcpPrompt { server, prompt, arguments })
+            Ok(UserAction::RunMcpPrompt { server, prompt, arguments, .. })
                 if server == "github" && prompt == "status" && arguments.is_empty()
         ));
     }
