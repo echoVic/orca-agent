@@ -128,6 +128,13 @@ fn build_message(cwd: &Path, denied_path: Option<&Path>, suggested_root: Option<
     }
     if let Some(root) = suggested_root {
         parts.push(format!("suggested write root: {}", root.display()));
+        // Metadata stays read-only in the sandbox; this names the way to ask.
+        if orca_tools::sandbox::is_protected_metadata_root(root) {
+            parts.push(format!(
+                "to allow it, call request_permissions with fileSystem.write [\"{}\"]",
+                root.display()
+            ));
+        }
     }
     if let Some(path) = denied_path
         && path
@@ -186,6 +193,13 @@ mod tests {
         assert!(diagnostic.message.contains("not a stale git lock"));
         assert!(diagnostic.message.contains("/repo"));
         assert!(diagnostic.message.contains("/repo/web"));
+        assert!(
+            diagnostic
+                .message
+                .contains(r#"call request_permissions with fileSystem.write ["/repo/.git"]"#),
+            "{}",
+            diagnostic.message
+        );
     }
 
     #[test]
@@ -205,5 +219,7 @@ mod tests {
         // No authority-bearing receipt is produced by this parser. Callers
         // must obtain a SandboxDenialReceipt directly from the backend.
         assert!(diagnostic.message.contains("sandbox denied"));
+        // Only protected metadata gets the hint; `/etc` is not workspace metadata.
+        assert!(!diagnostic.message.contains("request_permissions"));
     }
 }
