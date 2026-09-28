@@ -15,11 +15,9 @@ use crate::network_proxy::{
     RuntimeNetworkBlockDecision, RuntimeNetworkBlockReport, RuntimeNetworkBlockRequest,
     RuntimeNetworkPolicy, RuntimeNetworkProxy, runtime_network_permission_gate_channel,
 };
-#[cfg(test)]
-use crate::shell_session::ShellSandboxMode;
 use crate::shell_session::{
-    RuntimeShellSessionManager, ShellSessionCommand, ShellSessionHandle, ShellSessionOutput,
-    ShellSessionTermination, ShellTerminalMode,
+    RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellSessionHandle,
+    ShellSessionOutput, ShellSessionTermination, ShellTerminalMode,
 };
 use crate::tasks::TaskRegistry;
 
@@ -1172,13 +1170,17 @@ fn prepare_shell_command(
     }
 
     // One command's `.git` grant: it opens `.git` for this launch only and
-    // never enters the turn's overlay.
+    // never enters the turn's overlay. A grant is only ever narrowed in the
+    // workspace-write sandbox (shell_session.rs applies
+    // `metadata_read_only_paths` there); any other mode must not open `.git`
+    // at all, so a grant that outlives a folder-trust revocation into
+    // read-only or danger-full-access never widens that launch.
     let metadata_read_only_paths = match request.git_metadata_grant {
-        Some(git_dir) => {
+        Some(git_dir) if matches!(sandbox.mode, ShellSandboxMode::WorkspaceWrite { .. }) => {
             push_unique_path(&mut sandbox.metadata_writable_roots, git_dir.to_path_buf());
             crate::git_write_command::read_only_git_metadata(git_dir)
         }
-        None => Vec::new(),
+        _ => Vec::new(),
     };
 
     #[cfg(windows)]
@@ -1446,6 +1448,11 @@ mod tests {
             &overlay,
             ShellTerminalMode::pipe(),
         );
+        exec.sandbox_override = Some(ShellSandboxMode::WorkspaceWrite {
+            network_access: false,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        });
         exec.git_metadata_grant = Some(&git_dir);
 
         let (command, metadata_writable_directories, _, _) =
@@ -1465,6 +1472,33 @@ mod tests {
             overlay.metadata_writable_directories().is_empty(),
             "the grant never enters the turn's overlay"
         );
+    }
+
+    #[test]
+    fn a_git_metadata_grant_is_ignored_outside_the_workspace_sandbox() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let git_dir = temp.path().join(".git");
+        let overlay = TurnPermissionOverlay::default();
+        let mut exec = request(
+            "git commit -m x",
+            temp.path(),
+            &overlay,
+            ShellTerminalMode::pipe(),
+        );
+        exec.sandbox_override = Some(ShellSandboxMode::ReadOnly {
+            network_access: false,
+            allow_global_read: true,
+        });
+        exec.git_metadata_grant = Some(&git_dir);
+
+        let (command, metadata_writable_directories, _, _) =
+            prepare_shell_command(exec).expect("prepare");
+
+        assert!(
+            metadata_writable_directories.is_empty(),
+            "a grant must not open .git outside the workspace-write sandbox"
+        );
+        assert!(command.metadata_read_only_paths.is_empty());
     }
 
     #[test]
