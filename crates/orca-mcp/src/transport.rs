@@ -171,6 +171,12 @@ pub trait McpTransport: Send + Sync {
     fn get_prompt(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
         Err("prompts are not supported by this transport".to_string())
     }
+    /// Whether the transport shut itself down after a failed request, so no
+    /// request can go through it any more. The stdio transport does this
+    /// when its server stops answering, or answers something it cannot use.
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 pub fn connect(config: &McpServerConfig) -> Result<Box<dyn McpTransport>, String> {
@@ -559,6 +565,13 @@ impl McpTransport for StdioTransport {
             None,
             None,
         )
+    }
+
+    fn is_closed(&self) -> bool {
+        // A terminated server's responses are gone for good.
+        self.state
+            .lock()
+            .map_or(true, |state| state.responses.is_none())
     }
 }
 
@@ -1670,6 +1683,12 @@ impl McpTransport for SseFallbackTransport {
 
     fn get_prompt(&self, name: &str, arguments: Value) -> Result<Value, String> {
         self.transport()?.get_prompt(name, arguments)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.transport
+            .get()
+            .is_some_and(|transport| transport.is_closed())
     }
 }
 

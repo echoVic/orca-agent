@@ -350,10 +350,17 @@ fn connect_server_with_transport(
         })
         .collect();
 
-    // A server whose prompts cannot be listed still serves its tools.
+    let client = McpClient {
+        config: config.clone(),
+        server_name: server_name.to_string(),
+        capabilities,
+        transport: Mutex::new(transport),
+    };
+    // A server whose prompts cannot be listed still serves its tools: a
+    // failure that stopped its transport has connected it again.
     let mut warnings = Vec::new();
-    let prompts = if capabilities.prompts {
-        let listed = transport
+    let prompts = if client.capabilities.prompts {
+        let listed = client
             .list_prompts()
             .map_err(|error| {
                 format!("failed to list the prompts of MCP server '{server_name}': {error}")
@@ -368,12 +375,7 @@ fn connect_server_with_transport(
     };
 
     Ok(ConnectedServer {
-        client: McpClient {
-            config: config.clone(),
-            server_name: server_name.to_string(),
-            capabilities,
-            transport: Mutex::new(transport),
-        },
+        client,
         tools,
         prompts,
         warnings,
@@ -1387,28 +1389,38 @@ impl McpClient {
         self.request(|transport| transport.read_resource_or_cancel(uri, should_cancel))
     }
 
+    fn list_prompts(&self) -> Result<Value, String> {
+        self.request(|transport| transport.list_prompts())
+            .map_err(|error| error.to_string())
+    }
+
     fn get_prompt(&self, name: &str, arguments: Value) -> Result<Value, String> {
         self.request(|transport| transport.get_prompt(name, arguments))
             .map_err(|error| error.to_string())
     }
 
     /// Sends `request` over the transport. An error that leaves the
-    /// transport unusable reconnects it before the error is returned.
+    /// transport unusable, or after which it closed itself, reconnects it
+    /// before the error is returned.
     fn request(
         &self,
         request: impl FnOnce(&dyn McpTransport) -> Result<Value, String>,
     ) -> Result<Value, McpRequestError> {
-        let result = {
+        let (result, closed) = {
             let transport = self.transport.lock().map_err(|_| {
                 McpRequestError::Failed(format!(
                     "MCP server '{}' transport lock poisoned",
                     self.server_name
                 ))
             })?;
-            request(transport.as_ref())
+            let result = request(transport.as_ref());
+            let closed = result.is_err() && transport.is_closed();
+            (result, closed)
         };
         match result {
-            Err(error) if should_reconnect_after_mcp_error(&self.config.transport, &error) => {
+            Err(error)
+                if closed || should_reconnect_after_mcp_error(&self.config.transport, &error) =>
+            {
                 let startup_timeout_cap_ms = (self.config.transport == McpTransportKind::Stdio
                     && error == MCP_TOOL_CALL_CANCELLED)
                     .then_some(CANCELLED_STDIO_RECONNECT_TIMEOUT_MS);
@@ -3859,5 +3871,176 @@ done
                 "MCP prompt 'summarize' has an argument without a name, skipping from 'docs'",
             ]
         );
+    }
+
+    /// A stdio server that declares prompts and serves the tool `echo`, but
+    /// answers `prompts/list` with `prompt_list_reply`, a JSON-RPC message
+    /// in which `%s` stands for the request id, or never when there is none.
+    /// Each message it gets is added to `<dir>/requests`.
+    #[cfg(unix)]
+    fn broken_prompt_list_server(
+        dir: &std::path::Path,
+        prompt_list_reply: Option<&str>,
+    ) -> McpServerConfig {
+        if let Some(reply) = prompt_list_reply {
+            std::fs::write(dir.join("prompt-list-reply"), reply)
+                .expect("write the prompts/list reply");
+        }
+        let script = dir.join("broken_prompt_list.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+state_dir="$1"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$state_dir/requests"
+  id=${line#*'"id":'}
+  id=${id%%,*}
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"prompts":{}},"serverInfo":{"name":"broken","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+    *'"method":"prompts/list"'*)
+      if [ -f "$state_dir/prompt-list-reply" ]; then
+        printf "$(cat "$state_dir/prompt-list-reply")\n" "$id"
+      fi
+      ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echoed"}],"isError":false}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let mut config = stdio_fixture_config("broken", &script);
+        config.args.push(dir.to_string_lossy().into_owned());
+        config.tool_timeout_ms = Some(STDIO_TEST_STARTUP_TIMEOUT_MS);
+        config
+    }
+
+    /// The method of each message the server logged to `<dir>/requests`, in
+    /// the order they arrived.
+    #[cfg(unix)]
+    fn logged_methods(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("requests"))
+            .expect("read the request log")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).expect("a JSON-RPC message")["method"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_never_lists_its_prompts_still_serves_its_tools() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = broken_prompt_list_server(temp_dir.path(), None);
+        // `prompts/list` waits this long; the server answers everything else
+        // at once.
+        config.startup_timeout_ms = Some(1_000);
+
+        let registry = initialize_registry(&[config]);
+
+        assert_eq!(
+            registry.server_states(),
+            [("broken".to_string(), McpServerState::Ready)]
+        );
+        assert_eq!(
+            registry.errors(),
+            [
+                "failed to list the prompts of MCP server 'broken': MCP request 'prompts/list' timed out after 1s"
+            ]
+        );
+        assert!(registry.prompts().is_empty());
+        let echo = registry
+            .resolve_tool("mcp__broken__echo")
+            .expect("the echo tool is registered");
+        let first = registry
+            .call_tool(&echo, serde_json::json!({}))
+            .expect("the first call reaches a live server");
+        assert_eq!(first.output, "echoed");
+        // The server was started again once and not asked for its prompts
+        // again, so the unanswered request cost one start-up timeout.
+        assert_eq!(
+            logged_methods(temp_dir.path()),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "prompts/list",
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_prompt_list_failure_restarts_the_server_only_when_it_stopped_the_server() {
+        for (reply, error, restarted) in [
+            // An answer without a result stops the stdio transport.
+            (
+                r#"{"jsonrpc":"2.0","id":%s}"#,
+                "MCP request 'prompts/list' missing result",
+                true,
+            ),
+            // An error answer leaves it running.
+            (
+                r#"{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}"#,
+                r#"MCP request 'prompts/list' failed: {"code":-32601,"message":"Method not found"}"#,
+                false,
+            ),
+        ] {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let config = broken_prompt_list_server(temp_dir.path(), Some(reply));
+
+            let registry = initialize_registry(&[config]);
+
+            assert_eq!(
+                registry.server_states(),
+                [("broken".to_string(), McpServerState::Ready)],
+                "{reply}"
+            );
+            assert_eq!(
+                registry.errors(),
+                [format!(
+                    "failed to list the prompts of MCP server 'broken': {error}"
+                )],
+                "{reply}"
+            );
+            let echo = registry
+                .resolve_tool("mcp__broken__echo")
+                .expect("the echo tool is registered");
+            let first = registry
+                .call_tool(&echo, serde_json::json!({}))
+                .unwrap_or_else(|error| panic!("the first call failed after {reply}: {error}"));
+            assert_eq!(first.output, "echoed", "{reply}");
+            let restart: &[&str] = if restarted {
+                &["initialize", "notifications/initialized", "tools/list"]
+            } else {
+                &[]
+            };
+            let expected = [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "prompts/list",
+            ]
+            .iter()
+            .chain(restart)
+            .chain(&["tools/call"])
+            .map(|method| method.to_string())
+            .collect::<Vec<_>>();
+            assert_eq!(logged_methods(temp_dir.path()), expected, "{reply}");
+        }
     }
 }
