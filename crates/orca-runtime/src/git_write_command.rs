@@ -8,6 +8,95 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use orca_core::config::RunConfig;
+use orca_core::tool_types::{ToolName, ToolRequest};
+
+/// The `.git` a bash request would write, when one approval can let it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitMetadataWrite {
+    pub(crate) command: String,
+    pub(crate) git_dir: PathBuf,
+}
+
+/// The `.git` a bash request would write, when one approval can let it: the
+/// command is a recognized git write, bash runs it in the workspace-write
+/// sandbox, and its working directory is a repository root whose `config` and
+/// `hooks` exist (Linux can keep only existing paths read-only).
+pub(crate) fn git_metadata_write_for_bash(
+    config: &RunConfig,
+    workspace: &Path,
+    request: &ToolRequest,
+) -> Option<GitMetadataWrite> {
+    // The Windows sandbox denies `.git` as a whole and cannot open part of it.
+    if cfg!(windows) || request.name != ToolName::Bash {
+        return None;
+    }
+    let arguments: serde_json::Value =
+        serde_json::from_str(request.raw_arguments.as_deref()?).ok()?;
+    let command = arguments.get("command")?.as_str()?.trim();
+    let workdir = arguments
+        .get("workdir")
+        .and_then(serde_json::Value::as_str)
+        .map(Path::new);
+    let cwd = crate::runtime_normal_tool::resolve_workdir(workspace, workdir).ok()?;
+    if classify_git_command(command, &cwd) != GitCommandClass::WritesMetadata {
+        return None;
+    }
+    let sandbox = crate::server::bash_sandbox_for_cwd(config, &cwd).ok()?;
+    if !matches!(
+        sandbox.mode,
+        crate::shell_session::ShellSandboxMode::WorkspaceWrite { .. }
+    ) {
+        return None;
+    }
+    let git_dir = cwd.join(".git");
+    let is = |path: PathBuf, directory: bool| {
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+            if directory {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            }
+        })
+    };
+    (is(git_dir.clone(), true)
+        && is(git_dir.join("config"), false)
+        && is(git_dir.join("hooks"), true))
+    .then(|| GitMetadataWrite {
+        command: command.to_string(),
+        git_dir,
+    })
+}
+
+/// The parts of a granted `.git` that stay read-only. Everything that can make
+/// code run outside the sandbox later lives here (hooks, and config's
+/// fsmonitor, hooksPath, pager, aliases, and filters; `modules` holds each
+/// submodule's own), and a commit or merge never writes them.
+pub(crate) fn read_only_git_metadata(git_dir: &Path) -> Vec<PathBuf> {
+    ["config", "config.worktree", "hooks", "modules"]
+        .iter()
+        .map(|name| git_dir.join(name))
+        .collect()
+}
+
+/// What the auto-edit permission prompt says.
+pub(crate) fn git_metadata_write_reason(write: &GitMetadataWrite) -> String {
+    format!(
+        "`{}` writes {}. Allow it for this command only? Its config, hooks, and modules stay read-only. Allowing it for the session lets later git writes run without asking, each for its own command.",
+        write.command,
+        write.git_dir.display()
+    )
+}
+
+/// What suggest's approval shows, so approving the command also approves the
+/// `.git` it writes.
+pub(crate) fn git_metadata_approval_note(write: &GitMetadataWrite) -> String {
+    format!(
+        "This command writes {} for this run only; its config, hooks, and modules stay read-only.",
+        write.git_dir.display()
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GitCommandClass {
     /// No git invocation, or only ones that read the repository.
@@ -653,6 +742,127 @@ mod tests {
         assert_eq!(
             class("git -C ./sub/../sub status"),
             GitCommandClass::ReadOnly
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod approvable_tests {
+    use std::path::{Path, PathBuf};
+
+    use orca_core::approval_types::{ActionKind, ApprovalMode};
+    use orca_core::config::RunConfig;
+    use orca_core::config::folder_trust::{TrustLevel, set_trust_with_config_dir};
+    use orca_core::tool_types::{ToolName, ToolRequest};
+
+    use super::{GitMetadataWrite, git_metadata_write_for_bash};
+
+    /// A repository root with the `.git` layout `git init` leaves.
+    fn repository(parent: &Path, name: &str) -> PathBuf {
+        let root = parent.join(name);
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    fn config(root: &Path, mode: ApprovalMode) -> RunConfig {
+        let mut config = crate::runtime_tool_call::tests::test_config();
+        config.cwd = Some(root.to_path_buf());
+        config.approval_mode = mode;
+        config
+    }
+
+    fn bash(arguments: serde_json::Value) -> ToolRequest {
+        ToolRequest {
+            id: "bash-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: None,
+            raw_arguments: Some(arguments.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_git_write_at_the_root_of_a_trusted_repository_can_be_approved() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let root = repository(home.path(), "repo");
+        set_trust_with_config_dir(&root, home.path(), TrustLevel::Trusted).unwrap();
+        let request = bash(serde_json::json!({"command": "git commit -m x"}));
+
+        for mode in [ApprovalMode::AutoEdit, ApprovalMode::Suggest] {
+            assert_eq!(
+                git_metadata_write_for_bash(&config(&root, mode), &root, &request),
+                Some(GitMetadataWrite {
+                    command: "git commit -m x".to_string(),
+                    git_dir: root.join(".git"),
+                }),
+                "{mode:?}"
+            );
+        }
+        // plan runs bash read-only, and full-auto runs it without a sandbox.
+        for mode in [ApprovalMode::Plan, ApprovalMode::FullAuto] {
+            assert_eq!(
+                git_metadata_write_for_bash(&config(&root, mode), &root, &request),
+                None,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn untrusted_folders_subdirectories_partial_layouts_and_reads_cannot_be_approved() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let commit = bash(serde_json::json!({"command": "git commit -m x"}));
+
+        // Untrusted: bash runs read-only.
+        let untrusted = repository(home.path(), "untrusted");
+        assert_eq!(
+            git_metadata_write_for_bash(
+                &config(&untrusted, ApprovalMode::AutoEdit),
+                &untrusted,
+                &commit
+            ),
+            None
+        );
+
+        let root = repository(home.path(), "repo");
+        set_trust_with_config_dir(&root, home.path(), TrustLevel::Trusted).unwrap();
+        let auto_edit = config(&root, ApprovalMode::AutoEdit);
+
+        // A subdirectory workdir: only it is writable, not the root's `.git`.
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let in_sub = bash(serde_json::json!({"command": "git commit -m x", "workdir": "sub"}));
+        assert_eq!(
+            git_metadata_write_for_bash(&auto_edit, &root, &in_sub),
+            None
+        );
+
+        // A read, a refused write, and another tool.
+        let status = bash(serde_json::json!({"command": "git status"}));
+        assert_eq!(
+            git_metadata_write_for_bash(&auto_edit, &root, &status),
+            None
+        );
+        let config_write = bash(serde_json::json!({"command": "git config core.hooksPath x"}));
+        assert_eq!(
+            git_metadata_write_for_bash(&auto_edit, &root, &config_write),
+            None
+        );
+        let mut read_file = bash(serde_json::json!({"command": "git commit -m x"}));
+        read_file.name = ToolName::ReadFile;
+        assert_eq!(
+            git_metadata_write_for_bash(&auto_edit, &root, &read_file),
+            None
+        );
+
+        // Without `hooks`, the grant could not keep a new hooks directory
+        // read-only on Linux.
+        std::fs::remove_dir(root.join(".git/hooks")).unwrap();
+        assert_eq!(
+            git_metadata_write_for_bash(&auto_edit, &root, &commit),
+            None
         );
     }
 }

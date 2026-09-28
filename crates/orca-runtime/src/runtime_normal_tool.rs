@@ -765,7 +765,7 @@ fn parse_arguments<T: for<'de> Deserialize<'de>>(
     serde_json::from_str(raw).map_err(|error| format!("invalid {tool_name} arguments: {error}"))
 }
 
-fn resolve_workdir(base: &Path, workdir: Option<&Path>) -> Result<PathBuf, String> {
+pub(crate) fn resolve_workdir(base: &Path, workdir: Option<&Path>) -> Result<PathBuf, String> {
     let cwd = match workdir {
         Some(workdir) if workdir.is_absolute() => workdir.to_path_buf(),
         Some(workdir) => base.join(workdir),
