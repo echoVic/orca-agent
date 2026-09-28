@@ -1,12 +1,15 @@
 //! Keys of the `/mcp` panel. `r`, `l` and `o` hand a reconnect, a login or
 //! a logout of the selected server to a worker (see `mcp_server_actions`);
 //! the panel's list only ever changes with the catalog the next projection
-//! brings.
+//! brings. Before the conversation's runtime starts, the panel lists the
+//! config's servers, which can be logged in to and out of but not yet
+//! reconnected.
 
 use crossbeam_channel as mpsc;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use orca_mcp::McpAuthKind;
 
+use crate::mcp_server_actions::MCP_SERVERS_NOT_STARTED;
 use crate::protocol::UserAction;
 use crate::transcript_state::ChatMessage;
 use crate::types::AppState;
@@ -26,7 +29,7 @@ pub(crate) fn handle_mcp_dialog_key(
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return;
     }
-    let server_count = state.mcp_catalog.servers.len();
+    let server_count = state.mcp_panel_servers().len();
     let Some(dialog) = state.mcp_dialog.as_mut() else {
         return;
     };
@@ -70,6 +73,9 @@ fn start_action(
     };
     let name = state.mcp_server_display_name(&server).to_string();
     let request = match action {
+        McpServerAction::Reconnect if state.mcp_servers_before_start() => {
+            Err(MCP_SERVERS_NOT_STARTED.to_string())
+        }
         McpServerAction::Reconnect => Ok(UserAction::McpReconnect {
             server: name.clone(),
         }),
@@ -332,6 +338,21 @@ mod tests {
             action_rx.try_recv(),
             Ok(UserAction::McpLogout { server }) if server == "My-Server"
         ));
+    }
+
+    #[test]
+    fn r_before_the_runtime_starts_says_when_servers_connect_and_sends_nothing() {
+        // No catalog yet: the panel lists the config's servers.
+        let (mut state, action_tx, action_rx) = open_panel(Vec::new(), vec![remote("linear")]);
+
+        press(&mut state, &action_tx, KeyCode::Char('r'));
+
+        assert!(action_rx.try_recv().is_err());
+        assert_eq!(
+            last_notice(&state),
+            Some("MCP servers connect when the conversation starts; send a message first.")
+        );
+        assert!(state.mcp_actions_in_flight.is_empty());
     }
 
     #[test]

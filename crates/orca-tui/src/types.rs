@@ -40,8 +40,8 @@ use crate::queued_input::QueuedSubmissionState;
 #[cfg(test)]
 use crate::surface_projection::SurfaceProjectionState;
 use crate::surface_projection::{
-    McpCatalogView, McpServerView, SurfaceGoalProjectionState, SurfaceMetricsState,
-    SurfaceOperationProjectionState, SurfaceSessionProjectionState,
+    McpCatalogView, McpServerStatusView, McpServerView, SurfaceGoalProjectionState,
+    SurfaceMetricsState, SurfaceOperationProjectionState, SurfaceSessionProjectionState,
     SurfaceWorkflowTaskProjectionState,
 };
 use crate::transcript_hit::{CollapsibleHitArea, is_collapsible};
@@ -856,11 +856,39 @@ impl AppState {
             .map_or(server, |config| config.name.as_str())
     }
 
+    /// Whether `/mcp` lists the config's servers because the conversation's
+    /// runtime has not started, so none has connected yet.
+    pub(crate) fn mcp_servers_before_start(&self) -> bool {
+        self.mcp_catalog.servers.is_empty()
+    }
+
+    /// The servers `/mcp` lists, keyed by their catalog names: the
+    /// catalog's, or, before the conversation's runtime starts, one for each
+    /// server in the config, as not connected yet or disabled.
+    pub(crate) fn mcp_panel_servers(&self) -> Vec<McpServerView> {
+        if !self.mcp_servers_before_start() {
+            return self.mcp_catalog.servers.clone();
+        }
+        self.mcp_server_configs
+            .iter()
+            .filter_map(|config| {
+                let name = orca_mcp::canonical_server_name(&config.name);
+                let status = if config.disabled {
+                    McpServerStatusView::Disabled
+                } else {
+                    McpServerStatusView::NotConnectedYet
+                };
+                (!name.is_empty()).then_some(McpServerView { name, status })
+            })
+            .collect()
+    }
+
     /// The server selected in the `/mcp` panel, while it is open.
-    pub(crate) fn selected_mcp_server(&self) -> Option<&McpServerView> {
+    pub(crate) fn selected_mcp_server(&self) -> Option<McpServerView> {
         let dialog = self.mcp_dialog?;
-        let servers = &self.mcp_catalog.servers;
-        servers.get(dialog.selected.min(servers.len().checked_sub(1)?))
+        let servers = self.mcp_panel_servers();
+        let selected = dialog.selected.min(servers.len().checked_sub(1)?);
+        servers.into_iter().nth(selected)
     }
 
     pub fn new(

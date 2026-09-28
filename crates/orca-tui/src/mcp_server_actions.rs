@@ -2,7 +2,9 @@
 //! its own, off the UI thread and the action dispatcher: a reconnect takes
 //! up to the server's startup timeout, and a login waits for the browser
 //! for up to five minutes. Each says how it went in notices, and ends with
-//! `McpActionFinished`, which lets `/mcp` act on the server again.
+//! `McpActionFinished`, which lets `/mcp` act on the server again. Before
+//! the conversation's runtime starts, there is nothing to reconnect: its
+//! servers connect when it does, with whatever login is saved by then.
 
 use std::io;
 use std::path::Path;
@@ -18,6 +20,10 @@ use crate::protocol::{TuiEvent, UserAction};
 use crate::surface_projection::McpServerStatusView;
 
 const NO_CONFIG_DIR: &str = "could not resolve the Orca configuration directory";
+
+/// What `r` answers before the conversation's runtime starts.
+pub(crate) const MCP_SERVERS_NOT_STARTED: &str =
+    "MCP servers connect when the conversation starts; send a message first.";
 
 /// Starts `action`, a `McpReconnect`, `McpLogin` or `McpLogout`, on the
 /// MCP servers of `runtime`, the thread in view. Closing `/mcp` does not
@@ -40,7 +46,9 @@ pub(crate) fn spawn_mcp_server_action(
     let spawned = std::thread::Builder::new()
         .name("orca-tui-mcp-action".to_string())
         .spawn(move || {
-            run_mcp_server_action(action, runtime.as_ref(), &worker_tx);
+            run_mcp_server_action(action, runtime.as_ref(), &worker_tx, |server| {
+                log_in_with_browser(server, &worker_tx)
+            });
             let _ = worker_tx.send(TuiEvent::McpActionFinished {
                 server: worker_server,
             });
@@ -53,35 +61,42 @@ pub(crate) fn spawn_mcp_server_action(
     }
 }
 
+/// Runs `action` on the MCP servers of `runtime`, logging in with
+/// `log_in`. Without a runtime, which starts with the conversation, a
+/// login or logout reconnects nothing.
 fn run_mcp_server_action(
     action: UserAction,
     runtime: Option<&RuntimeThreadHandle>,
     event_tx: &Sender<TuiEvent>,
+    log_in: impl FnOnce(&McpServerConfig) -> Result<(), String>,
 ) {
     let notice = |text: String| {
         let _ = event_tx.send(TuiEvent::Notice(text));
     };
-    let reconnect = |server: &str| {
-        let result = match runtime {
-            Some(runtime) => {
-                crate::surface_client::reconnect_mcp_server(&runtime.typed_surface(), server)
+    let reconnect = |server: String| {
+        runtime.map(|runtime| {
+            move || {
+                let result =
+                    crate::surface_client::reconnect_mcp_server(&runtime.typed_surface(), &server);
+                reconnect_notice(&server, result)
             }
-            None => Err("the conversation has not started".to_string()),
-        };
-        reconnect_notice(server, result)
+        })
     };
     match action {
-        UserAction::McpReconnect { server } => notice(reconnect(&server)),
+        UserAction::McpReconnect { server } => match reconnect(server) {
+            Some(reconnect) => notice(reconnect()),
+            None => notice(MCP_SERVERS_NOT_STARTED.to_string()),
+        },
         UserAction::McpLogin { server } => log_in_then_reconnect(
             &server.name,
-            || log_in(&server, event_tx),
-            || reconnect(&server.name),
+            || log_in(&server),
+            reconnect(server.name.clone()),
             &notice,
         ),
         UserAction::McpLogout { server } => log_out_then_reconnect(
             &server,
             mcp_credentials_path().as_deref(),
-            || reconnect(&server),
+            reconnect(server.clone()),
             &notice,
         ),
         _ => {}
@@ -92,7 +107,10 @@ fn run_mcp_server_action(
 /// name as `orca mcp login` does. The authorization url is shown before the
 /// browser opens: a browser that does not open leaves the login waiting,
 /// for the user to open the url by hand.
-fn log_in(server: &McpServerConfig, event_tx: &Sender<TuiEvent>) -> Result<(), String> {
+fn log_in_with_browser(
+    server: &McpServerConfig,
+    event_tx: &Sender<TuiEvent>,
+) -> Result<(), String> {
     let credentials_path = mcp_credentials_path().ok_or(NO_CONFIG_DIR)?;
     let url_tx = event_tx.clone();
     let open_browser: OpenBrowser = Box::new(move |url: &str| {
@@ -105,31 +123,36 @@ fn log_in(server: &McpServerConfig, event_tx: &Sender<TuiEvent>) -> Result<(), S
 }
 
 /// `l`: logs in to `server` with `login`, and once that succeeds reconnects
-/// it with `reconnect`, whose notice it shows. A login that fails is shown,
-/// and nothing is reconnected.
+/// it with `reconnect`, whose notice it shows. With no `reconnect`, before
+/// the conversation's runtime starts, the server takes up the login when it
+/// connects. A login that fails is shown, and nothing is reconnected.
 fn log_in_then_reconnect(
     server: &str,
     login: impl FnOnce() -> Result<(), String>,
-    reconnect: impl FnOnce() -> String,
+    reconnect: Option<impl FnOnce() -> String>,
     notice: &dyn Fn(String),
 ) {
     notice(format!("waiting for browser login for {server}…"));
-    match login() {
-        Ok(()) => {
+    match (login(), reconnect) {
+        (Ok(()), Some(reconnect)) => {
             notice(format!("logged in to MCP server {server}"));
             notice(reconnect());
         }
-        Err(error) => notice(error),
+        (Ok(()), None) => notice(format!(
+            "logged in to MCP server {server}; it connects when the conversation starts"
+        )),
+        (Err(error), _) => notice(error),
     }
 }
 
 /// `o`: deletes the login saved in `credentials_path` under `server`, the
-/// server's config name, and then reconnects it with `reconnect`, whose
-/// notice it shows. With no login saved, it says so and reconnects nothing.
+/// server's config name, and then reconnects it with `reconnect`, if there
+/// is one, whose notice it shows. With no login saved, it says so and
+/// reconnects nothing.
 fn log_out_then_reconnect(
     server: &str,
     credentials_path: Option<&Path>,
-    reconnect: impl FnOnce() -> String,
+    reconnect: Option<impl FnOnce() -> String>,
     notice: &dyn Fn(String),
 ) {
     let deleted = credentials_path
@@ -138,7 +161,9 @@ fn log_out_then_reconnect(
     match deleted {
         Ok(true) => {
             notice(format!("logged out of MCP server {server}"));
-            notice(reconnect());
+            if let Some(reconnect) = reconnect {
+                notice(reconnect());
+            }
         }
         Ok(false) => notice(format!("MCP server '{server}' is not logged in")),
         Err(error) => notice(format!("failed to log out of MCP server {server}: {error}")),
@@ -195,10 +220,10 @@ mod tests {
             log_in_then_reconnect(
                 "linear",
                 || Ok(()),
-                || {
+                Some(|| {
                     reconnects.set(reconnects.get() + 1);
                     "MCP server linear: connected".to_string()
-                },
+                }),
                 notice,
             )
         });
@@ -220,7 +245,7 @@ mod tests {
             log_in_then_reconnect(
                 "linear",
                 || Err("timed out waiting for the browser login for MCP server 'linear'".into()),
-                || panic!("a failed login reconnected the server"),
+                Some(|| -> String { panic!("a failed login reconnected the server") }),
                 notice,
             )
         });
@@ -243,7 +268,9 @@ mod tests {
             log_out_then_reconnect(
                 "linear",
                 Some(&credentials),
-                || panic!("a logout with no login to drop reconnected the server"),
+                Some(|| -> String {
+                    panic!("a logout with no login to drop reconnected the server")
+                }),
                 notice,
             )
         });
@@ -264,10 +291,10 @@ mod tests {
             log_out_then_reconnect(
                 "My-Server",
                 Some(&credentials),
-                || {
+                Some(|| {
                     reconnects.set(reconnects.get() + 1);
                     "MCP server My-Server: needs login".to_string()
-                },
+                }),
                 notice,
             )
         });
@@ -291,6 +318,83 @@ mod tests {
             load_mcp_credential(&credentials, "my_server", url)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn l_before_the_runtime_starts_logs_in_and_reconnects_nothing() {
+        use std::sync::{Arc, Mutex};
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // `orca mcp add`, `orca`, `/mcp`, `l`: no message yet, so no runtime.
+        let (action_tx, action_rx) = crossbeam_channel::unbounded();
+        let mut state = crate::types::AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = crate::test_support::test_run_config();
+        config.mcp_servers = vec![orca_core::mcp_types::McpServerConfig {
+            name: "linear".to_string(),
+            transport: orca_core::mcp_types::McpTransportKind::Http,
+            url: Some("https://linear.example/mcp".to_string()),
+            ..Default::default()
+        }];
+        let shared = Arc::new(Mutex::new(config.clone()));
+        crate::slash_command_actions::handle_slash_command(
+            "/mcp",
+            &mut config,
+            &shared,
+            &mut state,
+            &action_tx,
+        );
+        crate::mcp_dialog_actions::handle_mcp_dialog_key(
+            &KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &mut state,
+            &action_tx,
+        );
+        let action = action_rx.try_recv().expect("`l` sent a login");
+        assert!(matches!(&action, UserAction::McpLogin { server } if server.name == "linear"));
+        assert!(state.mcp_actions_in_flight.contains("linear"));
+
+        // The worker, with the browser login standing in for itself.
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        run_mcp_server_action(action, None, &event_tx, |_| Ok(()));
+
+        let notices = event_rx
+            .try_iter()
+            .map(|event| match event {
+                TuiEvent::Notice(notice) => notice,
+                other => panic!("the login sent {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notices,
+            [
+                "waiting for browser login for linear…",
+                "logged in to MCP server linear; it connects when the conversation starts",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_logout_before_the_runtime_starts_reconnects_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let credentials = home.path().join(MCP_CREDENTIALS_FILE);
+        let url = "https://linear.example/mcp";
+        save_mcp_credential(&credentials, "linear", &credential(url)).unwrap();
+
+        let notices = notices_of(|notice| {
+            log_out_then_reconnect("linear", Some(&credentials), None::<fn() -> String>, notice)
+        });
+
+        assert_eq!(notices, ["logged out of MCP server linear"]);
+        assert!(
+            load_mcp_credential(&credentials, "linear", url)
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -343,8 +447,7 @@ mod tests {
 
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(5)),
-            Ok(TuiEvent::Notice(notice))
-                if notice == "failed to reconnect MCP server My-Server: the conversation has not started"
+            Ok(TuiEvent::Notice(notice)) if notice == MCP_SERVERS_NOT_STARTED
         ));
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(5)),

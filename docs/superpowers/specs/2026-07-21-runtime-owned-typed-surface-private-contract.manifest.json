@@ -5073,14 +5073,14 @@
       "current",
       [
         "crates/orca-tui/src/protocol.rs:702",
-        "crates/orca-tui/src/mcp_dialog_actions.rs:73",
+        "crates/orca-tui/src/mcp_dialog_actions.rs:79",
         "crates/orca-tui/src/action_dispatcher.rs:439",
-        "crates/orca-tui/src/mcp_server_actions.rs:56",
+        "crates/orca-tui/src/mcp_server_actions.rs:67",
         "crates/orca-tui/src/surface_client.rs:474"
       ],
       "settings_mutation",
       "UserAction::McpReconnect{server}",
-      "McpServerControl(Reconnect) on an MCP action worker thread",
+      "McpServerControl(Reconnect) on an MCP action worker thread; before the conversation's runtime starts, /mcp answers r itself and sends nothing",
       "RuntimeSurfaceClientHandle::mcp_server_control(server, Reconnect)",
       [
         "ManageThreadSettings"
@@ -5095,14 +5095,14 @@
       "current",
       [
         "crates/orca-tui/src/protocol.rs:707",
-        "crates/orca-tui/src/mcp_dialog_actions.rs:83",
+        "crates/orca-tui/src/mcp_dialog_actions.rs:89",
         "crates/orca-tui/src/action_dispatcher.rs:440",
-        "crates/orca-tui/src/mcp_server_actions.rs:95",
-        "crates/orca-tui/src/mcp_server_actions.rs:110"
+        "crates/orca-tui/src/mcp_server_actions.rs:110",
+        "crates/orca-tui/src/mcp_server_actions.rs:129"
       ],
       "host_store_and_thread_mutation",
       "UserAction::McpLogin{server: McpServerConfig}",
-      "orca_mcp::oauth::login into mcp-credentials.json, then McpServerControl(Reconnect), on an MCP action worker thread",
+      "orca_mcp::oauth::login into mcp-credentials.json, then McpServerControl(Reconnect) once the conversation's runtime has started, on an MCP action worker thread",
       "orca_mcp::oauth::login(server, McpLoginOptions) + RuntimeSurfaceClientHandle::mcp_server_control(server, Reconnect)",
       [
         "ManageThreadSettings"
@@ -5117,13 +5117,13 @@
       "current",
       [
         "crates/orca-tui/src/protocol.rs:712",
-        "crates/orca-tui/src/mcp_dialog_actions.rs:87",
+        "crates/orca-tui/src/mcp_dialog_actions.rs:93",
         "crates/orca-tui/src/action_dispatcher.rs:441",
-        "crates/orca-tui/src/mcp_server_actions.rs:129"
+        "crates/orca-tui/src/mcp_server_actions.rs:152"
       ],
       "host_store_and_thread_mutation",
       "UserAction::McpLogout{server}",
-      "delete_mcp_credential from mcp-credentials.json, then McpServerControl(Reconnect), on an MCP action worker thread",
+      "delete_mcp_credential from mcp-credentials.json, then McpServerControl(Reconnect) once the conversation's runtime has started, on an MCP action worker thread",
       "orca_core::config::mcp_credentials::delete_mcp_credential(path, server) + RuntimeSurfaceClientHandle::mcp_server_control(server, Reconnect)",
       [
         "ManageThreadSettings"

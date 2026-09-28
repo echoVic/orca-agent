@@ -71,6 +71,9 @@ pub(crate) enum McpServerStatusView {
     NeedsLogin,
     Disabled,
     Starting,
+    /// A configured server before the conversation's runtime has started:
+    /// servers connect when it does. The catalog never reports it.
+    NotConnectedYet,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,7 +168,7 @@ impl McpServerStatusView {
     }
 
     /// How `/mcp` words the status: `connected`, `failed: {message}`,
-    /// `needs login`, `disabled` or `starting`.
+    /// `needs login`, `disabled`, `starting` or `not connected yet`.
     pub(crate) fn label(&self) -> String {
         match self {
             Self::Connected => "connected".to_string(),
@@ -173,6 +176,7 @@ impl McpServerStatusView {
             Self::NeedsLogin => "needs login".to_string(),
             Self::Disabled => "disabled".to_string(),
             Self::Starting => "starting".to_string(),
+            Self::NotConnectedYet => "not connected yet".to_string(),
         }
     }
 }

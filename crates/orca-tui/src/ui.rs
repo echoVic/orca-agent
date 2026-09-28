@@ -1049,7 +1049,7 @@ fn render_mcp_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
         .max(1);
     let mut lines = match state.selected_mcp_server() {
         Some(server) if dialog.showing_details => {
-            mcp_server_details(state, server, theme, inner_width, body_rows)
+            mcp_server_details(state, &server, theme, inner_width, body_rows)
         }
         _ => mcp_server_rows(state, dialog.selected, theme, inner_width, body_rows),
     };
@@ -1069,7 +1069,7 @@ fn mcp_server_rows(
     width: usize,
     rows: usize,
 ) -> Vec<Line<'static>> {
-    let servers = &state.mcp_catalog.servers;
+    let servers = state.mcp_panel_servers();
     if servers.is_empty() {
         return vec![Line::from(Span::styled(
             "No MCP servers. Add one with 'orca mcp add'.",
@@ -1104,8 +1104,9 @@ fn mcp_server_rows(
         .collect()
 }
 
-/// `connected · 2 tools`, `failed: {message}`, `needs login`, `disabled` or
-/// `starting`, on one line whatever the message holds.
+/// `connected · 2 tools`, `failed: {message}`, `needs login`, `disabled`,
+/// `starting` or `not connected yet`, on one line whatever the message
+/// holds.
 fn mcp_server_status_text(
     state: &AppState,
     server: &crate::surface_projection::McpServerView,
@@ -1124,7 +1125,8 @@ fn mcp_server_status_text(
 }
 
 /// The server's status in full, its tools (read-only ones marked) and
-/// prompts, and the tool filters its config entry sets.
+/// prompts, and the tool filters its config entry sets. Before the server
+/// connects, its tools and prompts are not known yet.
 fn mcp_server_details(
     state: &AppState,
     server: &crate::surface_projection::McpServerView,
@@ -1202,7 +1204,12 @@ fn mcp_server_details(
             .map(|text| Line::from(Span::styled(text, theme.muted_style()))),
     );
     lines.push(Line::from(""));
-    if tools.is_empty() {
+    if server.status == crate::surface_projection::McpServerStatusView::NotConnectedYet {
+        lines.push(Line::from(Span::styled(
+            "Tools and prompts appear once the server connects.",
+            theme.muted_style(),
+        )));
+    } else if tools.is_empty() {
         lines.push(Line::from(Span::styled("No tools.", theme.muted_style())));
     } else {
         lines.push(heading("Tools"));
@@ -9301,6 +9308,73 @@ mod tests {
         );
         assert!(
             frame.contains("l log in · o log out · Esc close"),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn the_panel_before_the_runtime_starts_lists_the_configured_servers() {
+        let mut state = test_state();
+        let remote = |name: &str| orca_core::mcp_types::McpServerConfig {
+            name: name.to_string(),
+            transport: orca_core::mcp_types::McpTransportKind::Http,
+            url: Some("https://mcp.example/mcp".to_string()),
+            ..Default::default()
+        };
+        let mut config = crate::test_support::test_run_config();
+        config.mcp_servers = vec![
+            orca_core::mcp_types::McpServerConfig {
+                enabled_tools: Some(vec!["list_issues".to_string()]),
+                ..remote("My-Server")
+            },
+            orca_core::mcp_types::McpServerConfig {
+                disabled: true,
+                ..remote("archive")
+            },
+        ];
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, _action_rx) = mpsc::unbounded();
+
+        // No message sent yet: the runtime, and with it the catalog, is not
+        // there.
+        crate::slash_command_actions::handle_slash_command(
+            "/mcp",
+            &mut config,
+            &shared,
+            &mut state,
+            &action_tx,
+        );
+        let frame = frame_string(&mut state, 100, 30);
+
+        assert!(
+            frame
+                .lines()
+                .any(|line| line.contains("› My-Server") && line.contains("not connected yet")),
+            "{frame}"
+        );
+        assert!(
+            frame
+                .lines()
+                .any(|line| line.contains("archive") && line.contains("disabled")),
+            "{frame}"
+        );
+
+        state.mcp_dialog = Some(crate::types::McpDialog {
+            selected: 0,
+            showing_details: true,
+        });
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(frame.contains("My-Server"), "{frame}");
+        assert!(frame.contains("not connected yet"), "{frame}");
+        assert!(
+            frame.contains("Tools and prompts appear once the server connects."),
+            "{frame}"
+        );
+        assert!(!frame.contains("No tools."), "{frame}");
+        assert!(
+            frame
+                .lines()
+                .any(|line| line.contains("enabled_tools") && line.contains("list_issues")),
             "{frame}"
         );
     }

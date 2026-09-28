@@ -721,7 +721,8 @@ mod tests {
 
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(5)),
-            Ok(TuiEvent::Notice(notice)) if notice.contains("My-Server")
+            Ok(TuiEvent::Notice(notice))
+                if notice == crate::mcp_server_actions::MCP_SERVERS_NOT_STARTED
         ));
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(5)),

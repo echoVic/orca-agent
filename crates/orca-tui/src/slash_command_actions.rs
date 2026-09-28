@@ -43,9 +43,9 @@ fn request_recap(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>) {
     }
 }
 
-/// `/mcp`: the panel of the MCP servers of the thread in view. An attached
-/// daemon session's servers are the daemon's, which this TUI cannot reach;
-/// before the conversation starts, none is connected yet.
+/// `/mcp`: the panel of the MCP servers of the thread in view, or, before
+/// the conversation's runtime starts, of the config. An attached daemon
+/// session's servers are the daemon's, which this TUI cannot reach.
 fn open_mcp_panel(config: &RunConfig, state: &mut AppState) {
     if state.attached_session {
         state.push_message(ChatMessage::System {
@@ -56,22 +56,16 @@ fn open_mcp_panel(config: &RunConfig, state: &mut AppState) {
         state.push_message(ChatMessage::Error(
             "finish or cancel the current work before managing MCP servers".to_string(),
         ));
-    } else if !state.mcp_catalog.servers.is_empty() {
-        state.mcp_server_configs = config.mcp_servers.clone();
-        state.mcp_dialog = Some(McpDialog {
-            selected: 0,
-            showing_details: false,
-        });
-    } else if config.mcp_servers.is_empty() {
+    } else if state.mcp_catalog.servers.is_empty() && config.mcp_servers.is_empty() {
         state.push_message(ChatMessage::System {
             text: "No MCP servers. Add one with 'orca mcp add'.".to_string(),
             expanded: false,
         });
     } else {
-        state.push_message(ChatMessage::System {
-            text: "MCP servers connect when the conversation starts; send a message first."
-                .to_string(),
-            expanded: false,
+        state.mcp_server_configs = config.mcp_servers.clone();
+        state.mcp_dialog = Some(McpDialog {
+            selected: 0,
+            showing_details: false,
         });
     }
 }
@@ -1048,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_before_the_servers_connect_says_when_they_do() {
+    fn mcp_before_the_runtime_starts_opens_on_the_configured_servers() {
         let mut state = mcp_state(&[]);
         let mut config = test_run_config();
         config.mcp_servers = vec![remote_mcp_server("docs")];
@@ -1057,12 +1051,15 @@ mod tests {
 
         handle_slash_command("/mcp", &mut config, &shared, &mut state, &action_tx);
 
-        assert!(state.mcp_dialog.is_none());
-        assert!(matches!(
-            state.transcript.messages.last(),
-            Some(ChatMessage::System { text, .. })
-                if text == "MCP servers connect when the conversation starts; send a message first."
-        ));
+        assert!(state.mcp_dialog.is_some());
+        assert!(state.transcript.messages.is_empty());
+        assert_eq!(
+            state.mcp_panel_servers(),
+            [crate::surface_projection::McpServerView {
+                name: "docs".to_string(),
+                status: crate::surface_projection::McpServerStatusView::NotConnectedYet,
+            }]
+        );
     }
 
     #[test]
