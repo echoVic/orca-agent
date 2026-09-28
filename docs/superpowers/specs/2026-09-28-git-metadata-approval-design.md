@@ -54,7 +54,7 @@ auto-edit 的设计是"拿沙箱换免审批"：bash 不逐条询问，直接在
 触发条件（同时满足）：
 
 1. 这次 bash 会在 workspace-write 沙箱中运行（`bash_sandbox_for_cwd` 的结果是 `WorkspaceWrite`：auto-edit 或 suggest，且目录已 trust）。
-2. 命令的工作目录就是仓库根：`<工作目录>/.git` 是真实目录（不是文件、不是符号链接；复用 `is_safe_metadata_writable_root`）。沙箱保护的正是这个路径；bash 通过 `workdir` 指定子目录时，可写根只有该子目录，仓库根的 `.git` 不在可写范围内，属于第 7 节不覆盖的情况。
+2. 命令的工作目录就是仓库根：`<工作目录>/.git` 是真实目录（不是文件、不是符号链接；复用 `is_safe_metadata_writable_root`），并且 `.git/config` 是文件、`.git/hooks` 是目录。沙箱保护的正是这个路径；bash 通过 `workdir` 指定子目录时，可写根只有该子目录，仓库根的 `.git` 不在可写范围内，属于第 7 节不覆盖的情况。要求 config 和 hooks 存在，是因为 Linux 的只读 bind 只能挂到已存在的路径上：缺了 `hooks` 目录时，放开 `.git` 就能新建一个 hooks 目录并放进脚本。
 3. 第 2 节判定为"需要写 `.git`"。
 
 auto-edit：在 `execute_bash`（`crates/orca-runtime/src/runtime_normal_tool.rs`）调用 `service.exec` 之前，按以下顺序处理：
@@ -63,13 +63,14 @@ auto-edit：在 `execute_bash`（`crates/orca-runtime/src/runtime_normal_tool.rs
 - 没有权限处理器：不询问、不授权，照常运行。
 - 否则构造一个 `RuntimePermissionRequest`（原因写明命令、目录、"只对这一条命令生效，config 和 hooks 仍只读"），直接调用处理器。**不经过** `PermissionRuntimeState::request_permission`，因为后者会把结果合并进本轮的权限叠加层，变成整轮授权。
 
-suggest：审批闸门（`crates/orca-runtime/src/tool_execution.rs` 中的 `handle_approval`）为识别出的 git 写命令在审批描述中加上 `.git` 说明；审批通过后，这次调用携带"已获得提到 `.git` 的审批"的标记，`execute_bash` 据此直接授予单条授权，不再询问。
+suggest：审批闸门（`crates/orca-runtime/src/tool_execution.rs` 中的 `handle_approval`）在交互式审批（`RuntimeApprovalDecision::Ask`）时，为识别出的 git 写命令在审批预览中加上 `.git` 说明；用户批准后，闸门在本轮权限叠加层上记下这个工具调用 id（"已获得提到 `.git` 的审批"），`execute_bash` 看到该标记就直接授予单条授权，不再询问。被规则自动放行的命令不经过 `Ask` 分支，不会得到标记，按 auto-edit 的方式询问。
 
 "本会话"的语义：
 
-- 现有权限窗的 Session 范围会被持久化为会话级的文件写授权。这一步发生在 actor 处理交互回复时（`thread_actor_interaction.rs` 中 `scope == Session` 的分支），不在调用方，所以只绕开 `PermissionRuntimeState` 不够：请求要带一个独立的种类（如 `RuntimePermissionRequestKind::GitMetadataWrite`），actor 见到这个种类时跳过持久化，调用方把 Session 回复解释为"打开开关"。否则 `.git` 会变回对所有命令开放。这里的"本会话"只记录一个"git 写命令免询问"的开关，不记录任何目录授权。
-- v1 中开关只保存在运行时内存里：进程重启或恢复会话后，第一次 git 写命令会重新询问。
-- 子 agent 的 bash 走现有的子 agent 权限转发，开关不在 agent 之间共享。
+- 权限请求**不带任何目录**，只带说明文字；授权由调用方在批准后自行施加到这一次执行上。现有的会话级持久化（`thread_actor_interaction.rs` 中的 `surface_session_permission_settings`）本来就拒绝在会话范围内持久化受保护的元数据目录（"protected metadata paths are limited to the current turn"），如果请求里带着 `.git`，用户选"本会话"会被拒绝；而空的权限请求在会话范围下什么也不会持久化。调用方把 Session 回复解释为"打开开关"。这里的"本会话"只记录一个"git 写命令免询问"的开关，不记录任何目录授权。
+- 开关放在线程的扩展存储里（`thread_extensions.get_or_init`，与 bash 共用的终端服务同一处）。v1 中只在内存里：进程重启或恢复会话后，第一次 git 写命令会重新询问。
+- 子 agent 是独立的线程，有各自的扩展存储，开关不在 agent 之间共享；子 agent 的 bash 走现有的子 agent 权限转发。
+- 权限请求的 id 必须是这次工具调用的 id：actor 会用它找到已提交的工具调用来绑定前台请求（与网络拦截的请求相同）。
 
 ## 4. 沙箱侧
 
@@ -94,7 +95,7 @@ suggest：审批闸门（`crates/orca-runtime/src/tool_execution.rs` 中的 `han
 
 - **识别器**：表驱动单测覆盖四种判定、复合命令、引号、环境变量、`-C`/`-c`、包装命令，以及各子命令的读写形式。
 - **沙箱 profile**：单条授权时 `.git` 可写且 `config`/`hooks`/`modules`/`config.worktree` 的限制存在；macOS 上 Seatbelt 可用时做真实执行测试：临时仓库中 `git commit` 成功，`printf x > .git/hooks/pre-commit` 与 `git config core.fsmonitor x` 失败。
-- **端到端**（与 v0.5.3 修复相同的 TUI surface 测试方式，mock 的 bash 调用使用 DeepSeek 形状：action 为 read、无 target）：
+- **端到端**（与 v0.5.3 修复相同的 TUI surface 测试方式，使用 mock 现有的 `bash <命令>` 场景；识别只看命令文本，v0.5.3 起 action 也由工具决定，所以不需要 DeepSeek 形状）：
   - auto-edit：git commit → 弹权限窗 → 允许一次 → 提交成功；随后一条写 `.git` 的普通命令仍然失败（证明是单条授权）。
   - 拒绝 → 工具返回 denied，没有提交。
   - 本会话允许 → 第二条 git 写命令不弹窗并成功。
