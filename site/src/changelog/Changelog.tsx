@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.3":
+        "A successful edit or write no longer fails the turn when the model is DeepSeek: the file changed, but the turn stopped with an IllegalTransition error. Approval prompts for DeepSeek tool calls appear again. Orca now records each DeepSeek call as the kind of tool it is, so edit rows show their diff, a shell result keeps its exit code, and ACP clients see the right tool kind; sessions from v0.5.1 and v0.5.2 still resume.",
       "v0.5.2":
         "A * in a bash permission rule now matches /, so a deny rule such as rm -rf * also catches rm -rf /tmp/build; rules for file paths are unchanged. A plan inside a reply keeps its place when a session is resumed or a background turn returns to the foreground. Stopping a background agent while its worker starts now stops it and shows \"stopped by user\"; a late turn/steer gets an idle reply instead of running later as a turn; and the post-publish release checks wait up to 15 minutes for npm.",
       "v0.5.1":
@@ -680,6 +682,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.3":
+        "使用 DeepSeek 时，成功的 edit 或 write 不再让当前轮次失败：此前文件已经改好，轮次却以 IllegalTransition 错误中止。DeepSeek 工具调用的审批弹窗重新出现。Orca 现在按工具本身的类型记录每个 DeepSeek 调用，因此编辑行会显示 diff，shell 结果保留退出码，ACP 客户端看到正确的工具类型；v0.5.1 和 v0.5.2 留下的会话仍可恢复。",
       "v0.5.2":
         "bash 权限规则中的 * 现在也匹配 /，所以 rm -rf * 这样的拒绝规则也能拦住 rm -rf /tmp/build；文件路径类规则不变。恢复会话或把后台轮次切回前台时，回复中间的计划会留在原来的位置。后台 agent 的 worker 还在启动时按停止，现在能正常停下并显示“stopped by user”；来得太晚的 turn/steer 会得到 idle 回复，而不是之后作为新的一轮执行；发布后的校验最多等待 15 分钟，以应对 npm 的传播延迟。",
       "v0.5.1":

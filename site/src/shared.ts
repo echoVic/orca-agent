@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.2";
+export const releaseVersion = "v0.5.3";
 
 export const releases = [
+  {
+    version: "v0.5.3",
+    date: "2026-09-28",
+    title: "DeepSeek edit and approval fixes",
+    body: "A successful edit or write no longer fails the turn when the model is DeepSeek, and approval prompts for DeepSeek tool calls appear again. Orca records each DeepSeek call as the kind of tool it is, so edit rows show their diff and sessions from v0.5.1 and v0.5.2 still resume.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.3",
+  },
   {
     version: "v0.5.2",
     date: "2026-09-27",
