@@ -147,7 +147,9 @@ pub trait McpTransport: Send + Sync {
 pub fn connect(config: &McpServerConfig) -> Result<Box<dyn McpTransport>, String> {
     match config.transport {
         McpTransportKind::Stdio => Ok(Box::new(StdioTransport::start(config)?)),
-        McpTransportKind::Sse => Ok(Box::new(SseTransport::new(config)?)),
+        // Streamable HTTP does not have its own transport yet; it reuses the
+        // SSE transport until a dedicated one lands.
+        McpTransportKind::Sse | McpTransportKind::Http => Ok(Box::new(SseTransport::new(config)?)),
     }
 }
 
@@ -1923,6 +1925,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(timeout_ms),
             tool_timeout_ms: Some(timeout_ms),
+            ..Default::default()
         }
     }
 
@@ -2023,6 +2026,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(tool_timeout_ms),
+            ..Default::default()
         })
         .expect("connect stdio MCP");
         transport.initialize().expect("initialize MCP");
@@ -2082,6 +2086,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(1000),
+            ..Default::default()
         })
         .expect("connect stdio MCP");
         transport.initialize().expect("initialize MCP");
@@ -2150,6 +2155,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(1000),
+            ..Default::default()
         })
         .expect("connect stdio MCP");
         transport.initialize().expect("initialize MCP");
@@ -2227,6 +2233,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(1000),
+            ..Default::default()
         })
         .expect("connect stdio MCP");
         transport.initialize().expect("initialize MCP");
@@ -2296,6 +2303,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(5000),
             tool_timeout_ms: Some(100),
+            ..Default::default()
         })
         .expect("connect SSE MCP");
         transport.initialize().expect("initialize SSE MCP");
@@ -2405,6 +2413,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(1_000),
             tool_timeout_ms: Some(1_000),
+            ..Default::default()
         })
         .expect("connect SSE MCP");
         let handler = RecordingElicitationHandler::new(McpElicitationResponse::accept(
@@ -2448,6 +2457,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(1_000),
             tool_timeout_ms: Some(1_000),
+            ..Default::default()
         })
         .expect("connect decline SSE MCP");
 
@@ -2486,6 +2496,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(1_000),
             tool_timeout_ms: Some(1_000),
+            ..Default::default()
         })
         .expect("connect malformed SSE MCP");
 
@@ -2523,6 +2534,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(1_000),
             tool_timeout_ms: Some(2_000),
+            ..Default::default()
         })
         .expect("connect cancellation SSE MCP");
         let handler = RecordingElicitationHandler::new(McpElicitationResponse::accept(
@@ -2674,6 +2686,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(5000),
             tool_timeout_ms: Some(5000),
+            ..Default::default()
         })
         .expect("connect SSE MCP");
         transport.initialize().expect("initialize SSE MCP");
@@ -2724,6 +2737,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(5000),
             tool_timeout_ms: Some(5000),
+            ..Default::default()
         })
         .expect("connect SSE MCP");
         transport.initialize().expect("initialize SSE MCP");
@@ -2866,6 +2880,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(5000),
             tool_timeout_ms: Some(5000),
+            ..Default::default()
         })
         .expect("connect cancellable SSE MCP");
         let started = Instant::now();
@@ -2928,6 +2943,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(100),
             tool_timeout_ms: Some(100),
+            ..Default::default()
         })
         .expect("connect SSE MCP");
 

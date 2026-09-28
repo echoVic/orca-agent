@@ -1256,6 +1256,11 @@ fn map_acp_mcp_server(server: McpServer) -> Result<McpServerConfig, String> {
                 capabilities: Default::default(),
                 startup_timeout_ms: None,
                 tool_timeout_ms: None,
+                bearer_token_env_var: None,
+                oauth_client_id: None,
+                oauth_callback_port: None,
+                enabled_tools: None,
+                disabled_tools: None,
             })
         }
         McpServer::Sse(server) => {
@@ -1305,6 +1310,11 @@ fn map_acp_mcp_server(server: McpServer) -> Result<McpServerConfig, String> {
                 capabilities: Default::default(),
                 startup_timeout_ms: None,
                 tool_timeout_ms: None,
+                bearer_token_env_var: None,
+                oauth_client_id: None,
+                oauth_callback_port: None,
+                enabled_tools: None,
+                disabled_tools: None,
             })
         }
         McpServer::Http(server) => Err(format!(

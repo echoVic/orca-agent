@@ -10,7 +10,7 @@ use orca_core::conversation::ImageInput;
 use orca_core::mcp_types::{
     CallToolResult, McpContent, McpResource, McpResourceTemplate, McpServerConfig, McpTool,
     McpToolRef, McpTransportKind, ReadResourceResult, ResourceTemplatesListResult,
-    ResourcesListResult, ToolsListResult,
+    ResourcesListResult, ToolsListResult, tool_is_enabled,
 };
 use orca_core::tool_images::tool_image;
 
@@ -154,6 +154,14 @@ fn connect_server(
     server_name: &str,
 ) -> Result<(McpClient, Vec<McpTool>), String> {
     let transport = transport::connect(config)?;
+    connect_server_with_transport(config, server_name, transport)
+}
+
+fn connect_server_with_transport(
+    config: &McpServerConfig,
+    server_name: &str,
+    transport: Box<dyn McpTransport>,
+) -> Result<(McpClient, Vec<McpTool>), String> {
     let initialize_result = transport.initialize()?;
     let capabilities = McpServerCapabilities::from_initialize_result(&initialize_result);
     let result = transport.list_tools()?;
@@ -163,6 +171,7 @@ fn connect_server(
     let tools = list
         .tools
         .into_iter()
+        .filter(|tool| tool_is_enabled(config, &tool.name))
         .map(|tool| {
             let tool_name = sanitize_name(&tool.name);
             let read_only = tool.is_read_only();
@@ -1149,6 +1158,7 @@ mod tests {
             capabilities: Default::default(),
             startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(1000),
+            ..Default::default()
         }
     }
 
@@ -1201,6 +1211,79 @@ done
             .expect("write_file tool");
         assert!(read_tool.read_only);
         assert!(!write_tool.read_only);
+    }
+
+    #[test]
+    fn filtered_tools_are_not_registered() {
+        struct FixedToolsTransport;
+
+        impl McpTransport for FixedToolsTransport {
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"capabilities": {}}))
+            }
+
+            fn list_tools(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": [
+                    {"name": "a", "inputSchema": {"type": "object"}},
+                    {"name": "b", "inputSchema": {"type": "object"}},
+                    {"name": "c", "inputSchema": {"type": "object"}}
+                ]}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                Err("fixed tools transport does not support tool calls".to_string())
+            }
+
+            fn list_resources(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"resources": []}))
+            }
+
+            fn list_resource_templates(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"resourceTemplates": []}))
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Err("fixed tools transport does not support resource reads".to_string())
+            }
+        }
+
+        let config = McpServerConfig {
+            name: "filtered".to_string(),
+            disabled_tools: Some(vec!["b".to_string()]),
+            ..Default::default()
+        };
+
+        let (client, tools) =
+            connect_server_with_transport(&config, "filtered", Box::new(FixedToolsTransport))
+                .expect("connect with fixed tools transport");
+        let lookup = tools
+            .iter()
+            .map(|tool| {
+                (
+                    tool.schema_name.clone(),
+                    McpToolRef {
+                        server: tool.server.clone(),
+                        tool: tool.name.clone(),
+                        schema_name: tool.schema_name.clone(),
+                    },
+                )
+            })
+            .collect();
+        let registry = McpRegistry {
+            inner: Arc::new(McpRegistryInner {
+                clients: HashMap::from([("filtered".to_string(), Arc::new(client))]),
+                tools,
+                lookup,
+                errors: Vec::new(),
+            }),
+        };
+
+        let names: Vec<&str> = registry
+            .tools()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "c"]);
     }
 
     #[test]
@@ -2589,6 +2672,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(100),
+            ..Default::default()
         }]);
         assert!(
             registry.errors().is_empty(),

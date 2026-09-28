@@ -584,6 +584,7 @@ done
             capabilities: Default::default(),
             startup_timeout_ms: None,
             tool_timeout_ms: None,
+            ..Default::default()
         }]);
         assert!(
             registry.errors().is_empty(),

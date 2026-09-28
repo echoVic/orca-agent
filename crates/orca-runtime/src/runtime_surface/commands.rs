@@ -3675,6 +3675,10 @@ pub enum SurfaceMcpTransport {
         url: CanonicalUri,
         headers: Vec<(NonEmptyText, SurfaceMcpValue)>,
     },
+    Http {
+        url: CanonicalUri,
+        headers: Vec<(NonEmptyText, SurfaceMcpValue)>,
+    },
 }
 
 pub struct SurfaceMcpServerDeclaration {

@@ -10,6 +10,9 @@ use crate::capability::CapabilitySet;
 pub enum McpTransportKind {
     Stdio,
     Sse,
+    /// Streamable HTTP. Until the dedicated transport lands, `connect` routes
+    /// this through the same transport as `Sse`.
+    Http,
 }
 
 impl Default for McpTransportKind {
@@ -41,6 +44,41 @@ pub struct McpServerConfig {
     pub startup_timeout_ms: Option<u64>,
     #[serde(default)]
     pub tool_timeout_ms: Option<u64>,
+    /// Name of the environment variable holding a bearer token for HTTP/SSE
+    /// auth. Read at connect time; never stored in the config file itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env_var: Option<String>,
+    /// OAuth client id for the server's authorization flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+    /// Local loopback port the OAuth redirect callback listens on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_callback_port: Option<u16>,
+    /// When set, only these server-declared tool names are registered; every
+    /// other tool from this server is filtered out. `disabled_tools` is still
+    /// applied on top of this allow-list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tools: Option<Vec<String>>,
+    /// Server-declared tool names to exclude from registration, applied
+    /// after `enabled_tools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_tools: Option<Vec<String>>,
+}
+
+/// Whether `tool_name` (the server's own, unsanitized tool name) should be
+/// registered for `config`'s server: `enabled_tools`, when set, is an
+/// allow-list (an empty list enables nothing); `disabled_tools` is then
+/// subtracted from whatever the allow-list (or the absence of one) admits.
+pub fn tool_is_enabled(config: &McpServerConfig, tool_name: &str) -> bool {
+    let allowed = config
+        .enabled_tools
+        .as_ref()
+        .is_none_or(|enabled| enabled.iter().any(|name| name == tool_name));
+    let denied = config
+        .disabled_tools
+        .as_ref()
+        .is_some_and(|disabled| disabled.iter().any(|name| name == tool_name));
+    allowed && !denied
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -250,5 +288,84 @@ mod tests {
         assert_eq!(mcp_tool_server("mcp__github"), None);
         assert_eq!(mcp_tool_server("mcp____x"), None);
         assert_eq!(mcp_tool_server("bash"), None);
+    }
+
+    #[test]
+    fn tool_filters_apply_the_allow_list_then_the_deny_list() {
+        let unfiltered = McpServerConfig::default();
+        assert!(tool_is_enabled(&unfiltered, "a"));
+        assert!(tool_is_enabled(&unfiltered, "b"));
+        assert!(tool_is_enabled(&unfiltered, "c"));
+
+        let allow_only = McpServerConfig {
+            enabled_tools: Some(vec!["a".to_string(), "b".to_string()]),
+            ..Default::default()
+        };
+        assert!(tool_is_enabled(&allow_only, "a"));
+        assert!(tool_is_enabled(&allow_only, "b"));
+        assert!(!tool_is_enabled(&allow_only, "c"));
+
+        let allow_then_deny = McpServerConfig {
+            enabled_tools: Some(vec!["a".to_string(), "b".to_string()]),
+            disabled_tools: Some(vec!["b".to_string()]),
+            ..Default::default()
+        };
+        assert!(tool_is_enabled(&allow_then_deny, "a"));
+        assert!(!tool_is_enabled(&allow_then_deny, "b"));
+        assert!(!tool_is_enabled(&allow_then_deny, "c"));
+
+        let deny_only = McpServerConfig {
+            disabled_tools: Some(vec!["c".to_string()]),
+            ..Default::default()
+        };
+        assert!(tool_is_enabled(&deny_only, "a"));
+        assert!(tool_is_enabled(&deny_only, "b"));
+        assert!(!tool_is_enabled(&deny_only, "c"));
+    }
+
+    #[test]
+    fn new_server_fields_round_trip_and_stay_absent_when_unset() {
+        let toml_source = r#"
+name = "custom"
+transport = "http"
+url = "https://example.test/mcp"
+bearer_token_env_var = "EXAMPLE_TOKEN"
+oauth_client_id = "client-123"
+oauth_callback_port = 51000
+enabled_tools = ["a", "b"]
+disabled_tools = ["b"]
+"#;
+        let config: McpServerConfig =
+            toml::from_str(toml_source).expect("parse http transport config with new fields");
+        assert_eq!(config.transport, McpTransportKind::Http);
+        assert_eq!(
+            config.bearer_token_env_var.as_deref(),
+            Some("EXAMPLE_TOKEN")
+        );
+        assert_eq!(config.oauth_client_id.as_deref(), Some("client-123"));
+        assert_eq!(config.oauth_callback_port, Some(51000));
+        assert_eq!(
+            config.enabled_tools,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(config.disabled_tools, Some(vec!["b".to_string()]));
+
+        let minimal = McpServerConfig {
+            name: "demo".to_string(),
+            ..Default::default()
+        };
+        let serialized = toml::to_string(&minimal).expect("serialize minimal config");
+        for key in [
+            "bearer_token_env_var",
+            "oauth_client_id",
+            "oauth_callback_port",
+            "enabled_tools",
+            "disabled_tools",
+        ] {
+            assert!(
+                !serialized.contains(key),
+                "serialized config unexpectedly contains {key}: {serialized}"
+            );
+        }
     }
 }
