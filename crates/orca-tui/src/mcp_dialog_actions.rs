@@ -12,7 +12,7 @@ use orca_mcp::McpAuthKind;
 use crate::mcp_server_actions::MCP_SERVERS_NOT_STARTED;
 use crate::protocol::UserAction;
 use crate::transcript_state::ChatMessage;
-use crate::types::AppState;
+use crate::types::{AppState, McpActionInFlight};
 
 #[derive(Clone, Copy)]
 enum McpServerAction {
@@ -57,54 +57,66 @@ pub(crate) fn handle_mcp_dialog_key(
 }
 
 /// Sends `action` for the selected server, unless one is still running for
-/// it: an older reconnect could otherwise overwrite a newer one. Logging in
-/// and out uses the server's config entry, under whose name its login is
-/// saved, and only for a server that logs in with OAuth.
+/// it, which answers first: an older reconnect could otherwise overwrite a
+/// newer one. Logging in and out uses the server's config entry, under
+/// whose name its login is saved, and only for a server that logs in with
+/// OAuth. Before the conversation's runtime starts, there is nothing to
+/// reconnect.
 fn start_action(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
     action: McpServerAction,
 ) {
-    let Some(server) = state
-        .selected_mcp_server()
-        .map(|server| server.name.clone())
-    else {
+    let Some(server) = state.selected_mcp_server() else {
         return;
     };
-    let name = state.mcp_server_display_name(&server).to_string();
-    let request = match action {
-        McpServerAction::Reconnect if state.mcp_servers_before_start() => {
-            Err(MCP_SERVERS_NOT_STARTED.to_string())
-        }
-        McpServerAction::Reconnect => Ok(UserAction::McpReconnect {
-            server: name.clone(),
-        }),
-        McpServerAction::LogIn | McpServerAction::LogOut => {
-            match state.mcp_server_config(&server) {
-                None => Err(format!("no single configured MCP server matches {name}")),
-                Some(config) if McpAuthKind::of(config) != McpAuthKind::OAuth => {
-                    Err(format!("MCP server '{name}' does not use OAuth login"))
+    let request = if state.mcp_actions_in_flight.contains_key(&server.key) {
+        Err(format!(
+            "an MCP action for {} is already running",
+            server.name
+        ))
+    } else {
+        match action {
+            McpServerAction::Reconnect if state.mcp_servers_before_start() => {
+                Err(MCP_SERVERS_NOT_STARTED.to_string())
+            }
+            McpServerAction::Reconnect => Ok((
+                UserAction::McpReconnect {
+                    server: server.name.clone(),
+                },
+                McpActionInFlight::Reconnecting,
+            )),
+            McpServerAction::LogIn | McpServerAction::LogOut => {
+                match state.mcp_server_config(&server.key) {
+                    None => Err(format!(
+                        "no single configured MCP server matches {}",
+                        server.name
+                    )),
+                    Some(config) if McpAuthKind::of(config) != McpAuthKind::OAuth => Err(format!(
+                        "MCP server '{}' does not use OAuth login",
+                        server.name
+                    )),
+                    Some(config) if matches!(action, McpServerAction::LogIn) => Ok((
+                        UserAction::McpLogin {
+                            server: config.clone(),
+                        },
+                        McpActionInFlight::LoggingIn {
+                            authorization_url: None,
+                        },
+                    )),
+                    Some(config) => Ok((
+                        UserAction::McpLogout {
+                            server: config.name.clone(),
+                        },
+                        McpActionInFlight::LoggingOut,
+                    )),
                 }
-                Some(config) if matches!(action, McpServerAction::LogIn) => {
-                    Ok(UserAction::McpLogin {
-                        server: config.clone(),
-                    })
-                }
-                Some(config) => Ok(UserAction::McpLogout {
-                    server: config.name.clone(),
-                }),
             }
         }
     };
-    let request = request.and_then(|request| {
-        if state.mcp_actions_in_flight.insert(server) {
-            Ok(request)
-        } else {
-            Err(format!("an MCP action for {name} is already running"))
-        }
-    });
     match request {
-        Ok(request) => {
+        Ok((request, running)) => {
+            state.mcp_actions_in_flight.insert(server.key, running);
             let _ = action_tx.send(request);
         }
         Err(notice) => state.push_message(ChatMessage::System {
@@ -228,7 +240,10 @@ mod tests {
             Ok(UserAction::McpReconnect { server }) if server == "github"
         ));
         assert!(action_rx.try_recv().is_err());
-        assert!(state.mcp_actions_in_flight.contains("github"));
+        assert_eq!(
+            state.mcp_actions_in_flight.get("github"),
+            Some(&McpActionInFlight::Reconnecting)
+        );
     }
 
     #[test]
@@ -280,6 +295,34 @@ mod tests {
             server: "linear".to_string(),
         });
         assert!(state.mcp_actions_in_flight.is_empty());
+
+        // A running action answers first, before the checks `l` and `o`
+        // make of a server that does not log in with OAuth…
+        let (mut state, action_tx, action_rx) = open_panel(
+            vec![server("local", McpServerStatusView::Connected)],
+            vec![stdio("local")],
+        );
+        press(&mut state, &action_tx, KeyCode::Char('r'));
+        assert!(action_rx.try_recv().is_ok());
+        for key in ['l', 'o'] {
+            press(&mut state, &action_tx, KeyCode::Char(key));
+            assert!(action_rx.try_recv().is_err(), "'{key}' sent an action");
+            assert_eq!(
+                last_notice(&state),
+                Some("an MCP action for local is already running")
+            );
+        }
+
+        // …and before `r`'s answer before the conversation starts.
+        let (mut state, action_tx, action_rx) = open_panel(Vec::new(), vec![remote("linear")]);
+        press(&mut state, &action_tx, KeyCode::Char('l'));
+        assert!(action_rx.try_recv().is_ok());
+        press(&mut state, &action_tx, KeyCode::Char('r'));
+        assert!(action_rx.try_recv().is_err());
+        assert_eq!(
+            last_notice(&state),
+            Some("an MCP action for linear is already running")
+        );
     }
 
     #[test]
@@ -328,7 +371,7 @@ mod tests {
             action_rx.try_recv(),
             Ok(UserAction::McpLogin { server }) if server.name == "My-Server"
         ));
-        assert!(state.mcp_actions_in_flight.contains("my_server"));
+        assert!(state.mcp_actions_in_flight.contains_key("my_server"));
 
         state.update(TuiEvent::McpActionFinished {
             server: "my_server".to_string(),

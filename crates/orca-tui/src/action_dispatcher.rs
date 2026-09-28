@@ -439,11 +439,24 @@ fn route_action(
         action @ (UserAction::McpReconnect { .. }
         | UserAction::McpLogin { .. }
         | UserAction::McpLogout { .. }) => {
-            crate::mcp_server_actions::spawn_mcp_server_action(
+            if let Err(not_started) = crate::mcp_server_actions::spawn_mcp_server_action(
                 action,
                 controller.runtime_thread(),
                 event_tx.clone(),
-            );
+            ) {
+                // No worker will free the server: its finish must arrive,
+                // ahead of the notice, which may be dropped.
+                if !deliver_dispatcher_outcome(
+                    event_tx,
+                    &mut pending.event,
+                    TuiEvent::McpActionFinished {
+                        server: not_started.server,
+                    },
+                ) {
+                    return false;
+                }
+                let _ = event_tx.try_send(TuiEvent::Notice(not_started.notice));
+            }
         }
         UserAction::Cancel => return false,
         action => {

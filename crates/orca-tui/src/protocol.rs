@@ -470,6 +470,13 @@ pub enum TuiEvent {
     McpActionFinished {
         server: String,
     },
+    /// The login `/mcp` runs for the MCP server the catalog names `server`
+    /// asked the browser to open `url`, which the panel shows for a user who
+    /// has no browser to open.
+    McpLoginUrl {
+        server: String,
+        url: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

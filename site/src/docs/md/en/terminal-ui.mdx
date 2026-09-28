@@ -240,12 +240,16 @@ logs in with OAuth; see
 [MCP integration](mcp-integration.md#remote-servers-and-login).
 
 `/mcp` opens between turns. MCP servers connect when the conversation starts,
-so before your first message the panel lists the servers in your
-configuration as `not connected yet` (or `disabled`), and their details show
-only the tool filters. `l` and `o` already work then: the server uses the
-login when it connects. `r` waits for the conversation to start. A TUI
-attached to a daemon session with `orca attach` cannot manage the daemon's
-servers: run `orca mcp login <name>` on this machine, then reattach.
+so before your first message the panel lists the servers in the configuration
+Orca started with as `not connected yet` (or `disabled`), and their details
+show only the tool filters; a server added with `orca mcp add` while the TUI
+is open appears after you restart it. `l` and `o` already work then: the
+server uses the login when it connects. `r` waits for the conversation to
+start. While an action runs, the server's row and details show it
+(`reconnecting…`, `waiting for browser login…` with the authorization url, or
+`logging out…`). A TUI attached to a daemon session with `orca attach` cannot
+manage the daemon's servers: run `orca mcp login <name>` on this machine, then
+reattach.
 
 ## Moving around the conversation
 

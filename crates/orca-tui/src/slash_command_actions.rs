@@ -1055,7 +1055,8 @@ mod tests {
         assert!(state.transcript.messages.is_empty());
         assert_eq!(
             state.mcp_panel_servers(),
-            [crate::surface_projection::McpServerView {
+            [crate::types::McpPanelServer {
+                key: "docs".to_string(),
                 name: "docs".to_string(),
                 status: crate::surface_projection::McpServerStatusView::NotConnectedYet,
             }]

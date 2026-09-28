@@ -25,39 +25,81 @@ const NO_CONFIG_DIR: &str = "could not resolve the Orca configuration directory"
 pub(crate) const MCP_SERVERS_NOT_STARTED: &str =
     "MCP servers connect when the conversation starts; send a message first.";
 
+/// A `/mcp` action whose worker could not start. Nothing else frees its
+/// server, so the caller must deliver `McpActionFinished` for it.
+#[derive(Debug)]
+pub(crate) struct McpActionNotStarted {
+    /// The catalog's name for the server.
+    pub(crate) server: String,
+    /// Why, for the user.
+    pub(crate) notice: String,
+}
+
 /// Starts `action`, a `McpReconnect`, `McpLogin` or `McpLogout`, on the
-/// MCP servers of `runtime`, the thread in view. Closing `/mcp` does not
-/// stop it.
+/// MCP servers of `runtime`, the thread in view, on a worker of its own.
+/// Closing `/mcp` does not stop it.
 pub(crate) fn spawn_mcp_server_action(
     action: UserAction,
     runtime: Option<RuntimeThreadHandle>,
     event_tx: Sender<TuiEvent>,
-) {
-    let name = match &action {
-        UserAction::McpReconnect { server } | UserAction::McpLogout { server } => server.clone(),
-        UserAction::McpLogin { server } => server.name.clone(),
-        _ => return,
+) -> Result<(), McpActionNotStarted> {
+    let Some(name) = action_server_name(&action).map(str::to_string) else {
+        return Ok(());
     };
-    // The catalog's name for the server, which `/mcp` holds while the
-    // action runs.
-    let server = orca_mcp::canonical_server_name(&name);
-    let worker_tx = event_tx.clone();
-    let worker_server = server.clone();
-    let spawned = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("orca-tui-mcp-action".to_string())
         .spawn(move || {
-            run_mcp_server_action(action, runtime.as_ref(), &worker_tx, |server| {
-                log_in_with_browser(server, &worker_tx)
+            run_mcp_server_worker(action, runtime.as_ref(), &event_tx, |server| {
+                log_in_with_browser(server, &event_tx)
             });
-            let _ = worker_tx.send(TuiEvent::McpActionFinished {
-                server: worker_server,
-            });
+        })
+        .map(|_| ())
+        .map_err(|error| McpActionNotStarted {
+            server: orca_mcp::canonical_server_name(&name),
+            notice: format!("failed to start the MCP action for {name}: {error}"),
+        })
+}
+
+/// The name `action` gives its server: the config name, or the catalog's.
+fn action_server_name(action: &UserAction) -> Option<&str> {
+    match action {
+        UserAction::McpReconnect { server } | UserAction::McpLogout { server } => Some(server),
+        UserAction::McpLogin { server } => Some(&server.name),
+        _ => None,
+    }
+}
+
+/// A worker's whole run: `action`, then `McpActionFinished` for its server,
+/// however the action ends, a panic included.
+fn run_mcp_server_worker(
+    action: UserAction,
+    runtime: Option<&RuntimeThreadHandle>,
+    event_tx: &Sender<TuiEvent>,
+    log_in: impl FnOnce(&McpServerConfig) -> Result<(), String>,
+) {
+    let Some(name) = action_server_name(&action) else {
+        return;
+    };
+    let _finished = FinishOnDrop {
+        event_tx: event_tx.clone(),
+        server: orca_mcp::canonical_server_name(name),
+    };
+    run_mcp_server_action(action, runtime, event_tx, log_in);
+}
+
+/// Sends `McpActionFinished` for `server` when dropped, which frees the
+/// server in `/mcp` on every way out of a worker, unwinding included.
+struct FinishOnDrop {
+    event_tx: Sender<TuiEvent>,
+    server: String,
+}
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        // A worker's own thread may wait for room in the event channel.
+        let _ = self.event_tx.send(TuiEvent::McpActionFinished {
+            server: std::mem::take(&mut self.server),
         });
-    if let Err(error) = spawned {
-        let _ = event_tx.try_send(TuiEvent::Notice(format!(
-            "failed to start the MCP action for {name}: {error}"
-        )));
-        let _ = event_tx.try_send(TuiEvent::McpActionFinished { server });
     }
 }
 
@@ -104,22 +146,39 @@ fn run_mcp_server_action(
 }
 
 /// Logs in to `server` in the browser, saving the tokens under its config
-/// name as `orca mcp login` does. The authorization url is shown before the
-/// browser opens: a browser that does not open leaves the login waiting,
-/// for the user to open the url by hand.
+/// name as `orca mcp login` does.
 fn log_in_with_browser(
     server: &McpServerConfig,
     event_tx: &Sender<TuiEvent>,
 ) -> Result<(), String> {
     let credentials_path = mcp_credentials_path().ok_or(NO_CONFIG_DIR)?;
-    let url_tx = event_tx.clone();
-    let open_browser: OpenBrowser = Box::new(move |url: &str| {
-        let _ = url_tx.send(TuiEvent::Notice(format!(
+    let open_browser = browser_opener(
+        orca_mcp::canonical_server_name(&server.name),
+        event_tx.clone(),
+        orca_platform::process::open_url,
+    );
+    orca_mcp::oauth::login(server, McpLoginOptions::new(credentials_path, open_browser))
+}
+
+/// Opens the authorization url with `open_url`, after handing it to `/mcp`
+/// for the server the catalog names `server`, and to the conversation: a
+/// browser that does not open leaves the login waiting, for the user to
+/// open the url by hand.
+fn browser_opener(
+    server: String,
+    event_tx: Sender<TuiEvent>,
+    open_url: fn(&str) -> io::Result<()>,
+) -> OpenBrowser {
+    Box::new(move |url: &str| {
+        let _ = event_tx.send(TuiEvent::McpLoginUrl {
+            server,
+            url: url.to_string(),
+        });
+        let _ = event_tx.send(TuiEvent::Notice(format!(
             "If your browser does not open, visit: {url}"
         )));
-        orca_platform::process::open_url(url)
-    });
-    orca_mcp::oauth::login(server, McpLoginOptions::new(credentials_path, open_browser))
+        open_url(url)
+    })
 }
 
 /// `l`: logs in to `server` with `login`, and once that succeeds reconnects
@@ -321,13 +380,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn l_before_the_runtime_starts_logs_in_and_reconnects_nothing() {
+    /// `orca mcp add linear --url …`, `orca`, `/mcp`, `l`: no message yet,
+    /// so no runtime. Returns the TUI and the login `l` sent.
+    fn login_pressed_before_start() -> (crate::types::AppState, UserAction) {
         use std::sync::{Arc, Mutex};
 
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        // `orca mcp add`, `orca`, `/mcp`, `l`: no message yet, so no runtime.
         let (action_tx, action_rx) = crossbeam_channel::unbounded();
         let mut state = crate::types::AppState::new(
             action_tx.clone(),
@@ -357,7 +416,13 @@ mod tests {
         );
         let action = action_rx.try_recv().expect("`l` sent a login");
         assert!(matches!(&action, UserAction::McpLogin { server } if server.name == "linear"));
-        assert!(state.mcp_actions_in_flight.contains("linear"));
+        assert!(state.mcp_actions_in_flight.contains_key("linear"));
+        (state, action)
+    }
+
+    #[test]
+    fn l_before_the_runtime_starts_logs_in_and_reconnects_nothing() {
+        let (_state, action) = login_pressed_before_start();
 
         // The worker, with the browser login standing in for itself.
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -376,6 +441,47 @@ mod tests {
                 "waiting for browser login for linear…",
                 "logged in to MCP server linear; it connects when the conversation starts",
             ]
+        );
+    }
+
+    #[test]
+    fn a_login_that_panics_still_frees_its_server() {
+        let (mut state, action) = login_pressed_before_start();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        let worker = std::thread::spawn(move || {
+            run_mcp_server_worker(action, None, &event_tx, |_| -> Result<(), String> {
+                panic!("the browser login panicked")
+            })
+        });
+
+        assert!(worker.join().is_err(), "the login did not panic");
+        for event in event_rx.try_iter() {
+            state.update(event);
+        }
+        assert!(state.mcp_actions_in_flight.is_empty());
+    }
+
+    #[test]
+    fn the_login_hands_its_url_to_the_panel_before_the_browser_opens() {
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let url = "https://auth.example/authorize?client_id=orca&state=1";
+
+        let open = browser_opener("linear".to_string(), event_tx, |_| Ok(()));
+        open(url).expect("open the url");
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    TuiEvent::McpLoginUrl { server, url: shown },
+                    TuiEvent::Notice(notice),
+                ] if server == "linear"
+                    && shown == url
+                    && *notice == format!("If your browser does not open, visit: {url}")
+            ),
+            "{events:?}"
         );
     }
 
@@ -443,7 +549,8 @@ mod tests {
             },
             None,
             event_tx,
-        );
+        )
+        .expect("start the MCP action worker");
 
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(5)),
@@ -468,6 +575,7 @@ mod tests {
         std::fs::write(
             &script,
             r#"state_dir="$1"
+printf '%s\n' "$$" >> "$state_dir/pids"
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
@@ -491,6 +599,38 @@ done
             startup_timeout_ms: Some(15_000),
             tool_timeout_ms: Some(15_000),
             ..Default::default()
+        }
+    }
+
+    /// The process ids the listing fixture in `dir` started with, in order.
+    #[cfg(unix)]
+    fn fixture_pids(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("pids"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Waits up to five seconds for process `pid` to be gone.
+    #[cfg(unix)]
+    fn wait_until_reaped(pid: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "MCP fixture process {pid} is still running"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -553,7 +693,8 @@ done
             },
             Some(thread.clone()),
             event_tx,
-        );
+        )
+        .expect("start the MCP action worker");
 
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(20)),
@@ -564,8 +705,15 @@ done
             Ok(TuiEvent::McpActionFinished { server }) if server == "docs"
         ));
         assert_eq!(project(&mut state), ["after"]);
+        // The reconnect replaced the first server, which is gone; shutting
+        // the thread down takes the second.
+        let pids = fixture_pids(fixture.path());
+        assert_eq!(pids.len(), 2, "{pids:?}");
+        wait_until_reaped(&pids[0]);
         thread.shutdown().expect("thread shutdown");
         host.shutdown().expect("host shutdown");
+        drop(thread);
+        wait_until_reaped(&pids[1]);
     }
 
     #[test]
@@ -588,7 +736,8 @@ done
             },
             Some(thread.clone()),
             event_tx,
-        );
+        )
+        .expect("start the MCP action worker");
 
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(10)),

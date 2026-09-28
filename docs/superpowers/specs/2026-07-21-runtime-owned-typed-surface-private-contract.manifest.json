@@ -5072,10 +5072,10 @@
       "McpReconnect",
       "current",
       [
-        "crates/orca-tui/src/protocol.rs:702",
-        "crates/orca-tui/src/mcp_dialog_actions.rs:79",
+        "crates/orca-tui/src/protocol.rs:709",
+        "crates/orca-tui/src/mcp_dialog_actions.rs:84",
         "crates/orca-tui/src/action_dispatcher.rs:439",
-        "crates/orca-tui/src/mcp_server_actions.rs:67",
+        "crates/orca-tui/src/mcp_server_actions.rs:109",
         "crates/orca-tui/src/surface_client.rs:474"
       ],
       "settings_mutation",
@@ -5087,18 +5087,18 @@
       ],
       [],
       "SurfaceMcpServerStatus",
-      "TuiEvent::Notice with the status, then TuiEvent::McpActionFinished; the /mcp list comes from the next projection's MCP catalog",
+      "TuiEvent::Notice for each step (a login also sends TuiEvent::McpLoginUrl, which /mcp shows); TuiEvent::McpActionFinished, from a drop guard on the worker, or from the dispatcher when no worker starts, frees the server; the /mcp list comes from the next projection's MCP catalog",
       "none"
     ],
     [
       "McpLogin",
       "current",
       [
-        "crates/orca-tui/src/protocol.rs:707",
-        "crates/orca-tui/src/mcp_dialog_actions.rs:89",
+        "crates/orca-tui/src/protocol.rs:714",
+        "crates/orca-tui/src/mcp_dialog_actions.rs:100",
         "crates/orca-tui/src/action_dispatcher.rs:440",
-        "crates/orca-tui/src/mcp_server_actions.rs:110",
-        "crates/orca-tui/src/mcp_server_actions.rs:129"
+        "crates/orca-tui/src/mcp_server_actions.rs:150",
+        "crates/orca-tui/src/mcp_server_actions.rs:188"
       ],
       "host_store_and_thread_mutation",
       "UserAction::McpLogin{server: McpServerConfig}",
@@ -5109,17 +5109,17 @@
       ],
       [],
       "Result<(), String> + SurfaceMcpServerStatus",
-      "TuiEvent::Notice for each step, then TuiEvent::McpActionFinished; the /mcp list comes from the next projection's MCP catalog",
+      "TuiEvent::Notice for each step (a login also sends TuiEvent::McpLoginUrl, which /mcp shows); TuiEvent::McpActionFinished, from a drop guard on the worker, or from the dispatcher when no worker starts, frees the server; the /mcp list comes from the next projection's MCP catalog",
       "none"
     ],
     [
       "McpLogout",
       "current",
       [
-        "crates/orca-tui/src/protocol.rs:712",
-        "crates/orca-tui/src/mcp_dialog_actions.rs:93",
+        "crates/orca-tui/src/protocol.rs:719",
+        "crates/orca-tui/src/mcp_dialog_actions.rs:108",
         "crates/orca-tui/src/action_dispatcher.rs:441",
-        "crates/orca-tui/src/mcp_server_actions.rs:152"
+        "crates/orca-tui/src/mcp_server_actions.rs:211"
       ],
       "host_store_and_thread_mutation",
       "UserAction::McpLogout{server}",
@@ -5130,7 +5130,7 @@
       ],
       [],
       "io::Result<bool> + SurfaceMcpServerStatus",
-      "TuiEvent::Notice for each step, then TuiEvent::McpActionFinished; the /mcp list comes from the next projection's MCP catalog",
+      "TuiEvent::Notice for each step (a login also sends TuiEvent::McpLoginUrl, which /mcp shows); TuiEvent::McpActionFinished, from a drop guard on the worker, or from the dispatcher when no worker starts, frees the server; the /mcp list comes from the next projection's MCP catalog",
       "none"
     ]
   ],

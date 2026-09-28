@@ -1079,7 +1079,7 @@ fn mcp_server_rows(
     let selected = selected.min(servers.len() - 1);
     let label_width = servers
         .iter()
-        .map(|server| UnicodeWidthStr::width(state.mcp_server_display_name(&server.name)))
+        .map(|server| UnicodeWidthStr::width(server.name.as_str()))
         .max()
         .unwrap_or(0)
         .min(width / 3);
@@ -1095,7 +1095,7 @@ fn mcp_server_rows(
                 theme,
                 index == selected,
                 "",
-                state.mcp_server_display_name(&server.name),
+                &server.name,
                 label_width,
                 &mcp_server_status_text(state, server),
                 width,
@@ -1104,13 +1104,15 @@ fn mcp_server_rows(
         .collect()
 }
 
+/// While an action runs for the server, what it does: `reconnecting…`,
+/// `waiting for browser login…` or `logging out…`. Otherwise
 /// `connected · 2 tools`, `failed: {message}`, `needs login`, `disabled`,
 /// `starting` or `not connected yet`, on one line whatever the message
 /// holds.
-fn mcp_server_status_text(
-    state: &AppState,
-    server: &crate::surface_projection::McpServerView,
-) -> String {
+fn mcp_server_status_text(state: &AppState, server: &crate::types::McpPanelServer) -> String {
+    if let Some(action) = state.mcp_actions_in_flight.get(&server.key) {
+        return action.label().to_string();
+    }
     if server.status != crate::surface_projection::McpServerStatusView::Connected {
         return server
             .status
@@ -1119,24 +1121,25 @@ fn mcp_server_status_text(
             .collect::<Vec<_>>()
             .join(" ");
     }
-    let tools = state.mcp_catalog.server_tools(&server.name).count();
+    let tools = state.mcp_catalog.server_tools(&server.key).count();
     let noun = if tools == 1 { "tool" } else { "tools" };
     format!("{} · {tools} {noun}", server.status.label())
 }
 
-/// The server's status in full, its tools (read-only ones marked) and
-/// prompts, and the tool filters its config entry sets. Before the server
-/// connects, its tools and prompts are not known yet.
+/// The server's status in full, with the authorization url a login waits
+/// on, its tools (read-only ones marked) and prompts, and the tool filters
+/// its config entry sets. Before the server connects, its tools and prompts
+/// are not known yet.
 fn mcp_server_details(
     state: &AppState,
-    server: &crate::surface_projection::McpServerView,
+    server: &crate::types::McpPanelServer,
     theme: &Theme,
     width: usize,
     rows: usize,
 ) -> Vec<Line<'static>> {
     let catalog = &state.mcp_catalog;
     let tools = catalog
-        .server_tools(&server.name)
+        .server_tools(&server.key)
         .map(|tool| {
             (
                 tool.name.as_str(),
@@ -1145,7 +1148,7 @@ fn mcp_server_details(
         })
         .collect::<Vec<_>>();
     let prompts = catalog
-        .server_prompts(&server.name)
+        .server_prompts(&server.key)
         .map(|prompt| {
             (
                 prompt.name.as_str(),
@@ -1153,7 +1156,7 @@ fn mcp_server_details(
             )
         })
         .collect::<Vec<_>>();
-    let config = state.mcp_server_config(&server.name);
+    let config = state.mcp_server_config(&server.key);
     let filter = |tools: &Option<Vec<String>>| {
         tools.as_ref().map(|tools| {
             if tools.is_empty() {
@@ -1195,14 +1198,29 @@ fn mcp_server_details(
     };
 
     let mut lines = vec![Line::from(Span::styled(
-        state.mcp_server_display_name(&server.name).to_string(),
+        server.name.clone(),
         Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     ))];
     lines.extend(
-        wrap_text(&mcp_server_status_text(state, server), width)
+        crate::display_text::wrap_to_display_width(&mcp_server_status_text(state, server), width)
             .into_iter()
             .map(|text| Line::from(Span::styled(text, theme.muted_style()))),
     );
+    // In full, broken wherever it must: the user may have to open it by hand.
+    if let Some(crate::types::McpActionInFlight::LoggingIn {
+        authorization_url: Some(url),
+    }) = state.mcp_actions_in_flight.get(&server.key)
+    {
+        lines.push(Line::from(Span::styled(
+            "If your browser does not open, visit:",
+            theme.muted_style(),
+        )));
+        lines.extend(
+            crate::display_text::wrap_to_display_width(url, width)
+                .into_iter()
+                .map(|text| Line::from(Span::styled(text, Style::default().fg(theme.text)))),
+        );
+    }
     lines.push(Line::from(""));
     if server.status == crate::surface_projection::McpServerStatusView::NotConnectedYet {
         lines.push(Line::from(Span::styled(
@@ -9377,6 +9395,176 @@ mod tests {
                 .any(|line| line.contains("enabled_tools") && line.contains("list_issues")),
             "{frame}"
         );
+    }
+
+    fn servers_with_running_actions() -> AppState {
+        use crate::surface_projection::McpServerStatusView;
+        use crate::types::McpActionInFlight;
+        let mut state = test_state();
+        state.mcp_catalog = crate::surface_projection::McpCatalogView {
+            servers: vec![
+                mcp_server_view("linear", McpServerStatusView::NeedsLogin),
+                mcp_server_view("docs", McpServerStatusView::Connected),
+                mcp_server_view("github", McpServerStatusView::Connected),
+            ],
+            ..Default::default()
+        };
+        state.mcp_actions_in_flight.extend([
+            (
+                "linear".to_string(),
+                McpActionInFlight::LoggingIn {
+                    authorization_url: None,
+                },
+            ),
+            ("docs".to_string(), McpActionInFlight::Reconnecting),
+            ("github".to_string(), McpActionInFlight::LoggingOut),
+        ]);
+        state.mcp_dialog = Some(crate::types::McpDialog {
+            selected: 0,
+            showing_details: false,
+        });
+        state
+    }
+
+    #[test]
+    fn a_running_action_shows_in_its_row_and_details() {
+        let mut state = servers_with_running_actions();
+
+        let frame = frame_string(&mut state, 100, 30);
+        for (server, running) in [
+            ("linear", "waiting for browser login…"),
+            ("docs", "reconnecting…"),
+            ("github", "logging out…"),
+        ] {
+            assert!(
+                frame
+                    .lines()
+                    .any(|line| line.contains(server) && line.contains(running)),
+                "no row for {server} reads {running}:\n{frame}"
+            );
+        }
+        assert!(!frame.contains("needs login"), "{frame}");
+
+        for (selected, running) in [
+            "waiting for browser login…",
+            "reconnecting…",
+            "logging out…",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state.mcp_dialog = Some(crate::types::McpDialog {
+                selected,
+                showing_details: true,
+            });
+            let frame = frame_string(&mut state, 100, 30);
+            assert!(frame.contains(running), "{frame}");
+        }
+    }
+
+    #[test]
+    fn a_waiting_login_shows_its_url_in_the_details() {
+        let mut state = servers_with_running_actions();
+        let url = format!(
+            "https://auth.example/authorize?response_type=code&client_id=orca&state={}",
+            "0123456789abcdef".repeat(8)
+        );
+        state.update(TuiEvent::McpLoginUrl {
+            server: "linear".to_string(),
+            url: url.clone(),
+        });
+        state.mcp_dialog = Some(crate::types::McpDialog {
+            selected: 0,
+            showing_details: true,
+        });
+
+        let frame = frame_string(&mut state, 100, 30);
+
+        // The url is wider than the panel: it is broken over rows, in full.
+        let rows = frame
+            .lines()
+            .filter_map(|line| line.split('│').nth(1).map(str::trim))
+            .collect::<Vec<_>>();
+        let visit = rows
+            .iter()
+            .position(|row| *row == "If your browser does not open, visit:")
+            .unwrap_or_else(|| panic!("no url shown:\n{frame}"));
+        let shown = rows[visit + 1..]
+            .iter()
+            .take_while(|row| !row.is_empty())
+            .copied()
+            .collect::<String>();
+        assert_eq!(shown, url, "{frame}");
+    }
+
+    #[test]
+    fn a_finished_action_gives_its_row_the_catalog_status_back() {
+        let mut state = servers_with_running_actions();
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(frame.contains("waiting for browser login…"), "{frame}");
+
+        state.update(TuiEvent::McpActionFinished {
+            server: "linear".to_string(),
+        });
+
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(!frame.contains("waiting for browser login…"), "{frame}");
+        assert!(
+            frame
+                .lines()
+                .any(|line| line.contains("linear") && line.contains("needs login")),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn before_start_entries_sharing_a_name_each_show_their_own() {
+        let mut state = test_state();
+        let remote = |name: &str| orca_core::mcp_types::McpServerConfig {
+            name: name.to_string(),
+            transport: orca_core::mcp_types::McpTransportKind::Http,
+            url: Some("https://mcp.example/mcp".to_string()),
+            ..Default::default()
+        };
+        let mut config = crate::test_support::test_run_config();
+        config.mcp_servers = vec![remote("My-Server"), remote("my_server")];
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+        crate::slash_command_actions::handle_slash_command(
+            "/mcp",
+            &mut config,
+            &shared,
+            &mut state,
+            &action_tx,
+        );
+
+        let frame = frame_string(&mut state, 100, 30);
+        let row = |name: &str| {
+            frame
+                .lines()
+                .position(|line| {
+                    line.split_whitespace().any(|word| word == name)
+                        && line.contains("not connected yet")
+                })
+                .unwrap_or_else(|| panic!("no row for {name}:\n{frame}"))
+        };
+        assert_ne!(row("My-Server"), row("my_server"), "{frame}");
+
+        // Either entry could be the one the name means.
+        crate::mcp_dialog_actions::handle_mcp_dialog_key(
+            &crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('l'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut state,
+            &action_tx,
+        );
+        assert!(action_rx.try_recv().is_err());
+        assert!(matches!(
+            state.transcript.messages.last(),
+            Some(crate::transcript_state::ChatMessage::System { text, .. })
+                if text == "no single configured MCP server matches My-Server"
+        ));
     }
 
     #[test]

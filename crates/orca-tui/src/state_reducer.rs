@@ -757,6 +757,13 @@ impl AppState {
             TuiEvent::McpActionFinished { server } => {
                 self.mcp_actions_in_flight.remove(&server);
             }
+            TuiEvent::McpLoginUrl { server, url } => {
+                if let Some(crate::types::McpActionInFlight::LoggingIn { authorization_url }) =
+                    self.mcp_actions_in_flight.get_mut(&server)
+                {
+                    *authorization_url = Some(url);
+                }
+            }
             TuiEvent::BackgroundApprovalNeeded { call_id, tool } => {
                 // Already continued under the session's policy, and said so:
                 // announcing it as waiting now would contradict that.

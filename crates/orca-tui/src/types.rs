@@ -40,8 +40,8 @@ use crate::queued_input::QueuedSubmissionState;
 #[cfg(test)]
 use crate::surface_projection::SurfaceProjectionState;
 use crate::surface_projection::{
-    McpCatalogView, McpServerStatusView, McpServerView, SurfaceGoalProjectionState,
-    SurfaceMetricsState, SurfaceOperationProjectionState, SurfaceSessionProjectionState,
+    McpCatalogView, McpServerStatusView, SurfaceGoalProjectionState, SurfaceMetricsState,
+    SurfaceOperationProjectionState, SurfaceSessionProjectionState,
     SurfaceWorkflowTaskProjectionState,
 };
 use crate::transcript_hit::{CollapsibleHitArea, is_collapsible};
@@ -247,6 +247,40 @@ pub struct ConfigDialog {
 pub(crate) struct McpDialog {
     pub(crate) selected: usize,
     pub(crate) showing_details: bool,
+}
+
+/// A server as `/mcp` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpPanelServer {
+    /// The catalog's name for the server, which keys its tools, prompts,
+    /// config entry and running action.
+    pub(crate) key: String,
+    /// What the panel calls it: the name its config entry gives it.
+    pub(crate) name: String,
+    pub(crate) status: McpServerStatusView,
+}
+
+/// A reconnect, login or logout `/mcp` runs for a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum McpActionInFlight {
+    Reconnecting,
+    /// Waiting for the browser, with the authorization url once the login
+    /// has asked the browser to open it.
+    LoggingIn {
+        authorization_url: Option<String>,
+    },
+    LoggingOut,
+}
+
+impl McpActionInFlight {
+    /// What `/mcp` shows as the server's status while the action runs.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Reconnecting => "reconnecting…",
+            Self::LoggingIn { .. } => "waiting for browser login…",
+            Self::LoggingOut => "logging out…",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -495,10 +529,10 @@ pub struct AppState {
     /// the panel names servers and shows tool filters from them, and logs
     /// in and out with them.
     pub(crate) mcp_server_configs: Vec<McpServerConfig>,
-    /// Catalog names of the MCP servers a reconnect, login or logout from
-    /// `/mcp` still runs for. Each worker's `McpActionFinished` clears its
+    /// The reconnect, login or logout `/mcp` still runs for a server, by the
+    /// server's catalog name. Each worker's `McpActionFinished` clears its
     /// entry, however the action went.
-    pub(crate) mcp_actions_in_flight: std::collections::HashSet<String>,
+    pub(crate) mcp_actions_in_flight: std::collections::HashMap<String, McpActionInFlight>,
     /// The session belongs to a daemon this TUI attached to (`orca attach`),
     /// whose MCP servers it cannot manage.
     pub(crate) attached_session: bool,
@@ -862,29 +896,42 @@ impl AppState {
         self.mcp_catalog.servers.is_empty()
     }
 
-    /// The servers `/mcp` lists, keyed by their catalog names: the
-    /// catalog's, or, before the conversation's runtime starts, one for each
-    /// server in the config, as not connected yet or disabled.
-    pub(crate) fn mcp_panel_servers(&self) -> Vec<McpServerView> {
+    /// The servers `/mcp` lists: the catalog's, or, before the
+    /// conversation's runtime starts, one for each entry in the config, as
+    /// not connected yet or disabled, under the entry's own name.
+    pub(crate) fn mcp_panel_servers(&self) -> Vec<McpPanelServer> {
         if !self.mcp_servers_before_start() {
-            return self.mcp_catalog.servers.clone();
+            return self
+                .mcp_catalog
+                .servers
+                .iter()
+                .map(|server| McpPanelServer {
+                    key: server.name.clone(),
+                    name: self.mcp_server_display_name(&server.name).to_string(),
+                    status: server.status.clone(),
+                })
+                .collect();
         }
         self.mcp_server_configs
             .iter()
             .filter_map(|config| {
-                let name = orca_mcp::canonical_server_name(&config.name);
+                let key = orca_mcp::canonical_server_name(&config.name);
                 let status = if config.disabled {
                     McpServerStatusView::Disabled
                 } else {
                     McpServerStatusView::NotConnectedYet
                 };
-                (!name.is_empty()).then_some(McpServerView { name, status })
+                (!key.is_empty()).then(|| McpPanelServer {
+                    key,
+                    name: config.name.clone(),
+                    status,
+                })
             })
             .collect()
     }
 
     /// The server selected in the `/mcp` panel, while it is open.
-    pub(crate) fn selected_mcp_server(&self) -> Option<McpServerView> {
+    pub(crate) fn selected_mcp_server(&self) -> Option<McpPanelServer> {
         let dialog = self.mcp_dialog?;
         let servers = self.mcp_panel_servers();
         let selected = dialog.selected.min(servers.len().checked_sub(1)?);
@@ -925,7 +972,7 @@ impl AppState {
             mcp_dialog: None,
             mcp_catalog: McpCatalogView::default(),
             mcp_server_configs: Vec::new(),
-            mcp_actions_in_flight: std::collections::HashSet::new(),
+            mcp_actions_in_flight: std::collections::HashMap::new(),
             attached_session: false,
             full_access_confirmation: None,
             user_input_dialog: None,
