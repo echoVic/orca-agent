@@ -90,6 +90,22 @@ TUI 会话可以在 `/mcp` 面板里重新连接该服务器，从而应用这�
 - 一个工具是否只读，完全以服务器自己的声明为准。
 - 服务器同时标了 `destructiveHint` 的工具，仍会像其他写操作一样询问。
 
+## 总是允许
+
+MCP 工具的审批面板会比其他工具多两个选项：`5` always allow this tool (saved) 和 `6` always allow this server (saved)。两者都会执行这次调用，并像 `3` 本会话允许一样，在本会话剩余时间内不再询问；此外还会往用户配置里追加一条允许规则，让之后的会话也不再询问：
+
+~~~toml
+[[permissions.rules]]
+tool = "mcp__github__create_issue"
+decision = "allow"
+
+[[permissions.rules]]
+tool = "mcp__github__*"
+decision = "allow"
+~~~
+
+第一条规则（`5`）只针对这一个工具；第二条（`6`）覆盖该服务器上的所有工具。两条规则都不写 pattern，因为 MCP 工具调用本来就没有目标——参见[权限规则](approval-modes.md#权限规则)。规则保存失败时（比如现有配置解析不了），这次调用仍会执行，本会话也仍然不再询问；对话里会说明规则未能保存的原因。
+
 ## 安全操作
 
 1. 从只读能力集开始。

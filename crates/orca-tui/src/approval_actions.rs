@@ -1,38 +1,89 @@
 use crossbeam_channel as mpsc;
 
+use orca_core::mcp_types::mcp_tool_server;
+
 use crate::protocol::{
     TuiInteractionKind, TuiInteractionResponse, TuiPermissionDecision, UserAction,
 };
+use crate::transcript_state::ChatMessage;
 use crate::types::{AppState, AppStatus, ApprovalOption};
 
 /// Resolve the approval dialog by the chosen option. The "always allow"
 /// options record a session allowlist entry so later matching approvals are
-/// auto-granted by the app event loop. Tool approvals stay a simple allow/deny
-/// bool; permission requests carry the typed scope so "always" reaches the
-/// runtime as a session grant instead of a single turn.
+/// auto-granted by the app event loop; the two "(saved)" options (MCP tools
+/// only) additionally persist an allow rule to the user config so future
+/// sessions skip the prompt too — a write failure is reported through the
+/// transcript, but does not undo the session's grant. Tool approvals stay a
+/// simple allow/deny bool; permission requests carry the typed scope so
+/// "always" reaches the runtime as a session grant instead of a single turn.
 pub(crate) fn resolve_approval_option(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
     option: ApprovalOption,
 ) {
-    if let Some(dialog) = &state.approval_dialog {
-        match option {
-            ApprovalOption::AlwaysTool => {
+    // Pulled out as owned values up front: the saved-allow branches need
+    // `&mut state` as a whole (to report a save failure), which cannot
+    // coexist with a borrow of `state.approval_dialog`.
+    let dialog_tool = state
+        .approval_dialog
+        .as_ref()
+        .map(|dialog| dialog.tool.clone());
+    let dialog_target = state
+        .approval_dialog
+        .as_ref()
+        .and_then(|dialog| dialog.target.clone());
+
+    match option {
+        ApprovalOption::AlwaysTool => {
+            if let Some(tool) = &dialog_tool {
                 state
                     .approval_allowlist
-                    .insert(AppState::approval_key_tool(&dialog.tool));
+                    .insert(AppState::approval_key_tool(tool));
             }
-            ApprovalOption::AlwaysTarget => {
-                if let Some(target) = &dialog.target {
-                    state
-                        .approval_allowlist
-                        .insert(AppState::approval_key_target(&dialog.tool, target));
-                }
-            }
-            ApprovalOption::Once | ApprovalOption::Deny => {}
         }
+        ApprovalOption::AlwaysTarget => {
+            if let (Some(tool), Some(target)) = (&dialog_tool, &dialog_target) {
+                state
+                    .approval_allowlist
+                    .insert(AppState::approval_key_target(tool, target));
+            }
+        }
+        ApprovalOption::AlwaysToolSaved => {
+            if let Some(tool) = &dialog_tool {
+                state
+                    .approval_allowlist
+                    .insert(AppState::approval_key_tool(tool));
+                save_allow_rule(state, tool);
+            }
+        }
+        ApprovalOption::AlwaysServerSaved => {
+            let rule_tool = dialog_tool
+                .as_deref()
+                .and_then(mcp_tool_server)
+                .map(AppState::approval_key_mcp_server);
+            if let Some(rule_tool) = rule_tool {
+                state.approval_allowlist.insert(rule_tool.clone());
+                save_allow_rule(state, &rule_tool);
+            }
+        }
+        ApprovalOption::Once | ApprovalOption::Deny => {}
     }
     resolve_approval(state, action_tx, option);
+}
+
+/// Persist a saved-allow rule for `tool` (a bare tool name for
+/// `AlwaysToolSaved`, or `mcp__<server>__*` for `AlwaysServerSaved`) to the
+/// user config. The session grant above already stands either way, so a
+/// write failure is reported to the transcript instead of undoing it.
+fn save_allow_rule(state: &mut AppState, tool: &str) {
+    if let Err(error) = orca_core::config::user_edit::add_user_allow_rule(tool) {
+        state.push_message(ChatMessage::System {
+            text: format!(
+                "Allowed for this session, but saving the rule to the user config failed: {error}"
+            ),
+            expanded: false,
+        });
+    }
 }
 
 fn resolve_approval(
@@ -85,15 +136,17 @@ fn resolve_approval(
     state.approval_dialog = None;
 }
 
-/// Map a chosen approval option to the typed permission decision. The two
-/// "always" options are the user's request to persist the grant for the rest
-/// of the session; "allow this once" stays turn-scoped.
+/// Map a chosen approval option to the typed permission decision. Every
+/// persistent "always" option — session-only or saved to the user config —
+/// is the user's request to persist the grant for the rest of the session;
+/// "allow this once" stays turn-scoped.
 fn permission_decision_for(option: ApprovalOption) -> TuiPermissionDecision {
     match option {
         ApprovalOption::Once => TuiPermissionDecision::AllowOnce,
-        ApprovalOption::AlwaysTool | ApprovalOption::AlwaysTarget => {
-            TuiPermissionDecision::AllowSession
-        }
+        ApprovalOption::AlwaysTool
+        | ApprovalOption::AlwaysTarget
+        | ApprovalOption::AlwaysToolSaved
+        | ApprovalOption::AlwaysServerSaved => TuiPermissionDecision::AllowSession,
         ApprovalOption::Deny => TuiPermissionDecision::Deny,
     }
 }
@@ -105,15 +158,19 @@ mod tests {
     #[test]
     fn always_options_map_to_a_session_scoped_grant() {
         // The previous bool wire form collapsed "always" to a single turn.
-        // Both persistent options must now reach the runtime as a session grant.
-        assert_eq!(
-            permission_decision_for(ApprovalOption::AlwaysTool),
-            TuiPermissionDecision::AllowSession
-        );
-        assert_eq!(
-            permission_decision_for(ApprovalOption::AlwaysTarget),
-            TuiPermissionDecision::AllowSession
-        );
+        // Every persistent option must now reach the runtime as a session grant.
+        for option in [
+            ApprovalOption::AlwaysTool,
+            ApprovalOption::AlwaysTarget,
+            ApprovalOption::AlwaysToolSaved,
+            ApprovalOption::AlwaysServerSaved,
+        ] {
+            assert_eq!(
+                permission_decision_for(option),
+                TuiPermissionDecision::AllowSession,
+                "{option:?}"
+            );
+        }
     }
 
     #[test]
@@ -150,6 +207,37 @@ mod tests {
             background_task_id: None,
             selected: 0,
             options: crate::types::ApprovalDialog::options_for("edit", Some("billing/pages.py")),
+            diff: None,
+            diff_scroll: 0,
+        });
+        state
+    }
+
+    /// Like `state_awaiting_a_tool_approval`, but for an MCP tool call: no
+    /// target (MCP tool calls have none), and `options_for` therefore offers
+    /// the two saved-allow options instead of `AlwaysTarget`.
+    fn state_awaiting_an_mcp_tool_approval(tool: &str) -> AppState {
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            event_tx,
+            "test".to_string(),
+            "model".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = AppStatus::WaitingApproval;
+        state.approval_dialog = Some(crate::types::ApprovalDialog {
+            id: "approval-1".to_string(),
+            interaction: Some(crate::protocol::TuiInteractionKey::new(
+                orca_core::cancel::OperationIdAllocator::new().allocate(),
+                "approval-1",
+                TuiInteractionKind::Approval,
+            )),
+            tool: tool.to_string(),
+            target: None,
+            permission_kind: None,
+            background_task_id: None,
+            selected: 0,
+            options: crate::types::ApprovalDialog::options_for(tool, None),
             diff: None,
             diff_scroll: 0,
         });
@@ -202,6 +290,50 @@ mod tests {
         assert!(permission_decision_for(ApprovalOption::Once).is_allow());
         assert!(permission_decision_for(ApprovalOption::AlwaysTool).is_allow());
         assert!(permission_decision_for(ApprovalOption::AlwaysTarget).is_allow());
+        assert!(permission_decision_for(ApprovalOption::AlwaysToolSaved).is_allow());
+        assert!(permission_decision_for(ApprovalOption::AlwaysServerSaved).is_allow());
         assert!(!permission_decision_for(ApprovalOption::Deny).is_allow());
+    }
+
+    #[test]
+    fn saving_a_server_allow_covers_the_servers_other_tools_this_session() {
+        let home = crate::test_support::isolate_orca_home();
+        let mut state = state_awaiting_an_mcp_tool_approval("mcp__github__create_issue");
+        let (action_tx, _action_rx) = mpsc::unbounded();
+
+        resolve_approval_option(&mut state, &action_tx, ApprovalOption::AlwaysServerSaved);
+
+        // Another tool on the same server is covered this session...
+        assert!(state.approval_is_allowlisted("mcp__github__list_issues", None));
+        // ...but a different server is not.
+        assert!(!state.approval_is_allowlisted("mcp__gitlab__list_issues", None));
+
+        let config =
+            std::fs::read_to_string(home.path().join("config.toml")).expect("config written");
+        assert!(
+            config.contains(r#"tool = "mcp__github__*""#),
+            "server rule missing: {config}"
+        );
+    }
+
+    #[test]
+    fn a_failed_save_still_allows_and_says_why() {
+        let home = crate::test_support::isolate_orca_home();
+        std::fs::write(home.path().join("config.toml"), "model = [\n").expect("seed broken config");
+        let mut state = state_awaiting_an_mcp_tool_approval("mcp__github__create_issue");
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        resolve_approval_option(&mut state, &action_tx, ApprovalOption::AlwaysToolSaved);
+
+        // The call is still allowed this session even though the save failed.
+        assert_eq!(state.status, AppStatus::Running);
+        assert!(state.approval_is_allowlisted("mcp__github__create_issue", None));
+        assert!(action_rx.try_recv().is_ok(), "an approval response is sent");
+        let last = state.transcript.messages.last().expect("a system message");
+        assert!(
+            matches!(last, crate::transcript_state::ChatMessage::System { text, .. }
+                if text.contains("saving the rule to the user config failed")),
+            "got {last:?}"
+        );
     }
 }

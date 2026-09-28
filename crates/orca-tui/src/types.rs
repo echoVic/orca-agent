@@ -254,6 +254,14 @@ pub enum ApprovalOption {
     AlwaysTool,
     /// Approve and remember this tool + target for the rest of the session.
     AlwaysTarget,
+    /// MCP tools only: approve, remember this tool for the rest of the
+    /// session, and save an allow rule to the user config so future
+    /// sessions skip the prompt too.
+    AlwaysToolSaved,
+    /// MCP tools only: approve, remember every tool on this server for the
+    /// rest of the session, and save a server-wide allow rule to the user
+    /// config.
+    AlwaysServerSaved,
     /// Reject this call.
     Deny,
 }
@@ -265,6 +273,8 @@ impl ApprovalOption {
             ApprovalOption::AlwaysTarget => '2',
             ApprovalOption::AlwaysTool => '3',
             ApprovalOption::Deny => '4',
+            ApprovalOption::AlwaysToolSaved => '5',
+            ApprovalOption::AlwaysServerSaved => '6',
         }
     }
 
@@ -274,6 +284,8 @@ impl ApprovalOption {
             ApprovalOption::AlwaysTool => 'a',
             ApprovalOption::AlwaysTarget => 'A',
             ApprovalOption::Deny => 'n',
+            ApprovalOption::AlwaysToolSaved => '5',
+            ApprovalOption::AlwaysServerSaved => '6',
         }
     }
 
@@ -284,8 +296,10 @@ impl ApprovalOption {
     pub fn label(self) -> &'static str {
         match self {
             ApprovalOption::Once => "allow this once",
-            ApprovalOption::AlwaysTool => "always allow",
+            ApprovalOption::AlwaysTool => "allow for this session",
             ApprovalOption::AlwaysTarget => "always allow this exact call",
+            ApprovalOption::AlwaysToolSaved => "always allow this tool (saved)",
+            ApprovalOption::AlwaysServerSaved => "always allow this server (saved)",
             ApprovalOption::Deny => "deny",
         }
     }
@@ -318,10 +332,24 @@ impl ApprovalDialog {
     /// so we hide it to reduce noise.
     const DYNAMIC_TARGET_TOOLS: &[&str] = &["web_search", "search", "grep"];
 
-    /// Returns the set of options to display. The `AlwaysTarget` option is
-    /// only shown when a target is present AND the tool is likely to be
-    /// called again with the same target (e.g. reading a fixed file path).
+    /// Returns the set of options to display. An MCP tool call (`mcp__<server>__<tool>`)
+    /// always gets the same five options, in place of `AlwaysTarget`: MCP
+    /// tool calls carry no target to remember exactly, so the two saved
+    /// options — which persist to the user config instead — take its place.
+    /// For every other tool, `AlwaysTarget` is only shown when a target is
+    /// present AND the tool is likely to be called again with the same
+    /// target (e.g. reading a fixed file path).
     pub fn options_for(tool: &str, target: Option<&str>) -> Vec<ApprovalOption> {
+        if orca_core::mcp_types::mcp_tool_server(tool).is_some() {
+            return vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::AlwaysToolSaved,
+                ApprovalOption::AlwaysServerSaved,
+                ApprovalOption::Deny,
+            ];
+        }
+
         let show_always_target =
             target.is_some() && !Self::DYNAMIC_TARGET_TOOLS.iter().any(|t| tool.contains(t));
 
@@ -1648,12 +1676,26 @@ impl AppState {
         format!("{tool}\u{0}{target}")
     }
 
+    /// Allowlist key for every tool on an MCP server (a saved or
+    /// session-only "always allow this server" grant).
+    pub fn approval_key_mcp_server(server: &str) -> String {
+        format!("mcp__{server}__*")
+    }
+
     /// True if a pending approval for this tool/target was already granted an
-    /// "always allow" this session.
+    /// "always allow" this session, whether by tool, by target, or (for an
+    /// MCP tool) by its whole server.
     pub fn approval_is_allowlisted(&self, tool: &str, target: Option<&str>) -> bool {
         if self
             .approval_allowlist
             .contains(&Self::approval_key_tool(tool))
+        {
+            return true;
+        }
+        if let Some(server) = orca_core::mcp_types::mcp_tool_server(tool)
+            && self
+                .approval_allowlist
+                .contains(&Self::approval_key_mcp_server(server))
         {
             return true;
         }

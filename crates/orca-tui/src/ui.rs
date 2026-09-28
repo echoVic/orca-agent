@@ -6396,6 +6396,11 @@ fn approval_option_label(option: ApprovalOption, tool: &str) -> String {
         ApprovalOption::Once => "Allow once".to_string(),
         ApprovalOption::AlwaysTool => format!("Allow {tool} this session"),
         ApprovalOption::AlwaysTarget => "Allow this exact call".to_string(),
+        ApprovalOption::AlwaysToolSaved => format!("Always allow {tool} (saved)"),
+        ApprovalOption::AlwaysServerSaved => match orca_core::mcp_types::mcp_tool_server(tool) {
+            Some(server) => format!("Always allow the {server} server (saved)"),
+            None => "Always allow this server (saved)".to_string(),
+        },
         ApprovalOption::Deny => "Deny".to_string(),
     }
 }
@@ -6405,6 +6410,10 @@ fn approval_option_detail(option: ApprovalOption) -> &'static str {
         ApprovalOption::Once => "run it now",
         ApprovalOption::AlwaysTool => "skip approval for this tool until you quit",
         ApprovalOption::AlwaysTarget => "remember only this exact call",
+        ApprovalOption::AlwaysToolSaved => "save an allow rule so future sessions skip it too",
+        ApprovalOption::AlwaysServerSaved => {
+            "save an allow rule covering every tool on this server"
+        }
         ApprovalOption::Deny => "ask Orca for another way",
     }
 }

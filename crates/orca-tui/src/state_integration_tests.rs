@@ -950,6 +950,28 @@ fn approval_dialog_has_four_options_with_target_and_three_without() {
 }
 
 #[test]
+fn mcp_tools_offer_saved_allow_options() {
+    // An MCP tool call gets the two extra "(saved)" options instead of
+    // `AlwaysTarget` (MCP tool calls have no target to remember exactly).
+    let mcp = ApprovalDialog::options_for("mcp__github__create_issue", None);
+    assert_eq!(
+        mcp,
+        vec![
+            ApprovalOption::Once,
+            ApprovalOption::AlwaysTool,
+            ApprovalOption::AlwaysToolSaved,
+            ApprovalOption::AlwaysServerSaved,
+            ApprovalOption::Deny,
+        ]
+    );
+
+    // A non-MCP tool never offers the saved options, target or not.
+    let bash = ApprovalDialog::options_for("bash", Some("ls"));
+    assert!(!bash.contains(&ApprovalOption::AlwaysToolSaved));
+    assert!(!bash.contains(&ApprovalOption::AlwaysServerSaved));
+}
+
+#[test]
 fn approval_allowlist_grants_matching_tool_and_target() {
     let mut tool_scope = state();
 

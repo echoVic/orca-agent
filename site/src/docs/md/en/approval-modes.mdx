@@ -76,8 +76,17 @@ the input:
 | --- | --- |
 | `1` Allow once | Run this call. |
 | `2` Allow this exact call | Run it, and allow the same tool with the same target again without asking. Not offered when the call has no specific target. |
-| `3` Allow the tool this session | Run it, and stop asking for this tool until you quit. |
+| `3` Allow for this session | Run it, and stop asking for this tool until you quit. |
 | `4` Deny | Do not run it. The turn stops so you can tell Orca what to do instead. `Esc` also denies. |
+| `5` Always allow this tool (saved) | MCP tools only. Run it, stop asking for this tool for the rest of the session, and save an allow rule to the user config so future sessions skip the prompt too. |
+| `6` Always allow this server (saved) | MCP tools only. Run it, and do the same for every tool on that server, saving a server-wide allow rule instead. |
+
+Choices `5` and `6` only appear for an MCP tool call, in place of `2`, which
+needs a specific target to remember and an MCP tool call has none. If the
+rule cannot be saved — an existing config that fails to parse, for example —
+the call still runs and the rest of this session still skips the prompt; a
+message explains that the rule was not saved. See
+[Permission rules](#permission-rules) for the rule shape.
 
 `PgUp`/`PgDn` page through a preview that is longer than the panel.
 

@@ -141,7 +141,7 @@ pub fn list_user_mcp_servers_in(dir: &Path) -> io::Result<(PathBuf, Vec<McpServe
         Some(item) => {
             let array = item
                 .as_array_of_tables()
-                .ok_or_else(|| not_an_array_error(&path))?;
+                .ok_or_else(|| not_an_array_error(&path, "mcp_servers"))?;
             array
                 .iter()
                 .map(|table| {
@@ -156,6 +156,53 @@ pub fn list_user_mcp_servers_in(dir: &Path) -> io::Result<(PathBuf, Vec<McpServe
         }
     };
     Ok((path, servers))
+}
+
+/// Add an allow rule for `tool` to the user-owned config's
+/// `[[permissions.rules]]` array. Once loaded (the next session, or now, for
+/// a caller that also grants it locally), it lets the matching tool call run
+/// without asking.
+pub fn add_user_allow_rule(tool: &str) -> io::Result<bool> {
+    let dir = resolve_config_dir()?;
+    add_user_allow_rule_in(&dir, tool)
+}
+
+/// Add an allow rule for `tool` to the `[[permissions.rules]]` array of the
+/// config file under `dir`. The rule is written with no `pattern`, so it
+/// matches any target (`PermissionRule`'s default). Returns `false` without
+/// writing when an equivalent allow rule already exists: same `tool`,
+/// `decision = "allow"`, and `pattern` either absent or `"*"`.
+pub fn add_user_allow_rule_in(dir: &Path, tool: &str) -> io::Result<bool> {
+    let path = user_config_path_in(dir);
+    let mut appended = false;
+    edit_user_config_in(dir, |document| {
+        let rules = permission_rules_array_mut(document, &path)?;
+        if rules
+            .iter()
+            .any(|table| is_equivalent_allow_rule(table, tool))
+        {
+            return Ok(());
+        }
+        let mut rule = Table::new();
+        rule.insert("tool", toml_edit::value(tool));
+        rule.insert("decision", toml_edit::value("allow"));
+        rules.push(rule);
+        appended = true;
+        Ok(())
+    })?;
+    Ok(appended)
+}
+
+/// Whether `table` is already an allow rule for `tool` with no specific
+/// pattern: the shape `add_user_allow_rule_in` writes, or a hand-written
+/// equivalent (`pattern = "*"`).
+fn is_equivalent_allow_rule(table: &Table, tool: &str) -> bool {
+    table.get("tool").and_then(Item::as_str) == Some(tool)
+        && table.get("decision").and_then(Item::as_str) == Some("allow")
+        && matches!(
+            table.get("pattern").and_then(Item::as_str),
+            None | Some("*")
+        )
 }
 
 fn resolve_config_dir() -> io::Result<PathBuf> {
@@ -174,12 +221,34 @@ fn mcp_servers_array_mut<'a>(
         .entry("mcp_servers")
         .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
     item.as_array_of_tables_mut()
-        .ok_or_else(|| not_an_array_error(path))
+        .ok_or_else(|| not_an_array_error(path, "mcp_servers"))
 }
 
-fn not_an_array_error(path: &Path) -> io::Error {
+/// Borrow the document's `permissions.rules` array of tables, creating the
+/// `permissions` table and/or the `rules` array when either is absent.
+/// Errors when an existing value along that path is some other TOML type
+/// instead of silently discarding it.
+fn permission_rules_array_mut<'a>(
+    document: &'a mut DocumentMut,
+    path: &Path,
+) -> io::Result<&'a mut ArrayOfTables> {
+    let permissions = document
+        .entry("permissions")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let permissions = permissions
+        .as_table_mut()
+        .ok_or_else(|| not_an_array_error(path, "permissions"))?;
+    let rules = permissions
+        .entry("rules")
+        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+    rules
+        .as_array_of_tables_mut()
+        .ok_or_else(|| not_an_array_error(path, "permissions.rules"))
+}
+
+fn not_an_array_error(path: &Path, field: &str) -> io::Error {
     io::Error::other(format!(
-        "mcp_servers in {} is not an array of tables; edit it by hand",
+        "{field} in {} is not an array of tables; edit it by hand",
         path.display()
     ))
 }
@@ -275,5 +344,70 @@ mod tests {
             )
         );
         assert!(validate_mcp_server_name("").is_err());
+    }
+
+    #[test]
+    fn saving_an_allow_rule_appends_once() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(add_user_allow_rule_in(dir.path(), "mcp__github__create_issue").unwrap());
+        assert!(!add_user_allow_rule_in(dir.path(), "mcp__github__create_issue").unwrap());
+
+        let path = dir.path().join(USER_CONFIG_FILE);
+        let document: DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        let rules = document["permissions"]["rules"]
+            .as_array_of_tables()
+            .unwrap();
+        assert_eq!(rules.len(), 1, "{document}");
+
+        // A hand-written equivalent rule (`pattern = "*"` instead of an
+        // omitted pattern) also counts as already existing.
+        std::fs::write(
+            &path,
+            concat!(
+                "[[permissions.rules]]\n",
+                "tool = \"mcp__docs__search\"\n",
+                "pattern = \"*\"\n",
+                "decision = \"allow\"\n",
+            ),
+        )
+        .unwrap();
+        assert!(!add_user_allow_rule_in(dir.path(), "mcp__docs__search").unwrap());
+    }
+
+    #[test]
+    fn saving_an_allow_rule_keeps_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(USER_CONFIG_FILE);
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                "# keep this comment\n",
+                "model = \"deepseek-flash\"\n\n",
+                "[[permissions.rules]]\n",
+                "tool = \"bash\"\n",
+                "pattern = \"cargo *\"\n",
+                "decision = \"allow\"\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(add_user_allow_rule_in(dir.path(), "mcp__github__create_issue").unwrap());
+
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            updated.contains("# keep this comment"),
+            "comment lost: {updated:?}"
+        );
+        assert!(
+            updated.contains("model = \"deepseek-flash\""),
+            "unrelated key lost: {updated:?}"
+        );
+        let document: DocumentMut = updated.parse().unwrap();
+        let rules = document["permissions"]["rules"]
+            .as_array_of_tables()
+            .unwrap();
+        assert_eq!(rules.len(), 2, "{updated}");
     }
 }

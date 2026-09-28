@@ -115,6 +115,31 @@ A server can mark a tool read-only in its `tools/list` response
 - A tool the server also marks `destructiveHint` is still asked about,
   the same as any other write.
 
+## Always allow
+
+An MCP tool's approval panel offers two extra choices beyond the ones every
+tool call gets: `5` always allow this tool (saved) and `6` always allow this
+server (saved). Both run the call and, like `3` allow for this session, stop
+asking for the rest of the session; they additionally append an allow rule to
+the user configuration so a future session skips the prompt too:
+
+~~~toml
+[[permissions.rules]]
+tool = "mcp__github__create_issue"
+decision = "allow"
+
+[[permissions.rules]]
+tool = "mcp__github__*"
+decision = "allow"
+~~~
+
+The first rule (`5`) names one tool; the second (`6`) covers every tool on
+that server. Neither writes a `pattern`, since an MCP tool call has none —
+see [Permission rules](approval-modes.md#permission-rules). If the rule
+cannot be saved (an existing config that fails to parse, for example), the
+call still runs and the rest of this session still skips the prompt; the
+conversation explains that saving the rule failed.
+
 ## Operate safely
 
 1. Start with a read-only capability set.

@@ -1155,7 +1155,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
     "crates/orca-tui/src/background_approval_actions.rs:continue_allowed_background_approvals:user_action.route",
     1,
   ],
-  ["crates/orca-tui/src/approval_actions.rs:resolve_approval_option:approval_allowlist.insert", 2],
+  ["crates/orca-tui/src/approval_actions.rs:resolve_approval_option:approval_allowlist.insert", 4],
   [
     "crates/orca-tui/src/full_access_confirmation_actions.rs:request_settings_change:user_action.route",
     1,
