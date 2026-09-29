@@ -56,6 +56,7 @@ auto-edit 的设计是"拿沙箱换免审批"：bash 不逐条询问，直接在
 1. 这次 bash 会在 workspace-write 沙箱中运行（`bash_sandbox_for_cwd` 的结果是 `WorkspaceWrite`：auto-edit 或 suggest，且目录已 trust）。
 2. 命令的工作目录就是仓库根：`<工作目录>/.git` 是真实目录（不是文件、不是符号链接；复用 `is_safe_metadata_writable_root`），并且 `.git/config` 是文件、`.git/hooks` 是目录。沙箱保护的正是这个路径；bash 通过 `workdir` 指定子目录时，可写根只有该子目录，仓库根的 `.git` 不在可写范围内，属于第 7 节不覆盖的情况。要求 config 和 hooks 存在，是因为 Linux 的只读 bind 只能挂到已存在的路径上：缺了 `hooks` 目录时，放开 `.git` 就能新建一个 hooks 目录并放进脚本。
 3. 第 2 节判定为"需要写 `.git`"。
+4. `.git` 尚未被现有授权（权限 profile 或本轮 `request_permissions`）放开——已放开时按原样整块放开，不询问、不收窄。
 
 auto-edit：在 `execute_bash`（`crates/orca-runtime/src/runtime_normal_tool.rs`）调用 `service.exec` 之前，按以下顺序处理：
 

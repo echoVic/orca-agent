@@ -1377,12 +1377,21 @@ impl ToolExecutionActor {
                         approval.preview = file_change_preview_text(&invocation.effective, cwd);
                     }
                     // A git write is approved together with the `.git` it
-                    // writes, so suggest asks once; bash reads the mark.
+                    // writes, so suggest asks once; bash reads the mark. An
+                    // existing grant (a permission profile, or an earlier
+                    // `request_permissions` this turn) already opened this
+                    // `.git` as a whole, so it gets no note and no mark here.
                     let git_metadata_write = crate::git_write_command::git_metadata_write_for_bash(
                         config,
                         cwd,
                         &invocation.effective,
-                    );
+                    )
+                    .filter(|write| {
+                        !crate::git_write_command::git_dir_writable_in_overlay(
+                            permission_overlay,
+                            &write.git_dir,
+                        )
+                    });
                     if let Some(write) = git_metadata_write.as_ref() {
                         approval.preview =
                             Some(crate::git_write_command::git_metadata_approval_note(write));

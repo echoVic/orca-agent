@@ -50,6 +50,14 @@ pub(crate) fn git_metadata_write_for_bash(
         return None;
     }
     let git_dir = cwd.join(".git");
+    // A permission profile can already grant `.git` write as a whole (its
+    // resolved sandbox lists it in `metadata_writable_roots`). That grant
+    // opens `.git` for every command, not just this one, and keeps its
+    // meaning: this path must leave it alone rather than narrowing it down
+    // to a single approved command.
+    if metadata_roots_contain(&sandbox.metadata_writable_roots, &git_dir) {
+        return None;
+    }
     let is = |path: PathBuf, directory: bool| {
         std::fs::symlink_metadata(path).is_ok_and(|metadata| {
             if directory {
@@ -66,6 +74,40 @@ pub(crate) fn git_metadata_write_for_bash(
         command: command.to_string(),
         git_dir,
     })
+}
+
+/// `path`, canonicalized, or `path` itself when it cannot be (it does not
+/// exist, for instance). Used to compare two roots that may each be spelled
+/// with or without symlinks resolved.
+fn canonical_or_self(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Whether `git_dir` is already one of `roots`, comparing each root both as
+/// written and canonicalized. Two sources can already grant `.git` as a
+/// whole before this module ever sees a command: a permission profile's
+/// `CommandExecSandbox::metadata_writable_roots`, and a turn's
+/// `request_permissions`-granted `TurnPermissionOverlay::metadata_writable_directories`.
+/// Either may spell the same directory differently than the `git_dir` this
+/// module computes from `cwd`, so a literal-only comparison could miss an
+/// existing grant.
+fn metadata_roots_contain(roots: &[PathBuf], git_dir: &Path) -> bool {
+    let canonical_git_dir = canonical_or_self(git_dir);
+    roots
+        .iter()
+        .any(|root| root == git_dir || canonical_or_self(root) == canonical_git_dir)
+}
+
+/// Whether `overlay` already makes `git_dir` writable: a `request_permissions`
+/// grant earlier this turn put it in `metadata_writable_directories()`. Like a
+/// permission profile's grant, that opens `.git` as a whole for the rest of
+/// the turn and keeps that meaning — this module's one-command path must
+/// leave it alone: no prompt, no suggest note or mark, no narrowing.
+pub(crate) fn git_dir_writable_in_overlay(
+    overlay: &crate::runtime_permission::TurnPermissionOverlay,
+    git_dir: &Path,
+) -> bool {
+    metadata_roots_contain(overlay.metadata_writable_directories(), git_dir)
 }
 
 /// The parts of a granted `.git` that stay read-only. Everything that can make
@@ -766,13 +808,54 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod overlay_tests {
+    use std::path::{Path, PathBuf};
+
+    use crate::protocol::{RequestFileSystemPermissions, RequestPermissionProfile};
+    use crate::runtime_permission::TurnPermissionOverlay;
+
+    use super::git_dir_writable_in_overlay;
+
+    #[test]
+    fn a_default_overlay_has_not_granted_git_dir() {
+        let overlay = TurnPermissionOverlay::default();
+        assert!(!git_dir_writable_in_overlay(
+            &overlay,
+            Path::new("/repo/.git")
+        ));
+    }
+
+    #[test]
+    fn an_overlay_that_merged_a_git_dir_write_has_granted_it() {
+        let git_dir = PathBuf::from("/repo/.git");
+        let mut overlay = TurnPermissionOverlay::default();
+        overlay.merge_permissions(&RequestPermissionProfile {
+            file_system: Some(RequestFileSystemPermissions {
+                write: Some(vec![git_dir.clone()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert!(git_dir_writable_in_overlay(&overlay, &git_dir));
+        // A different repository's `.git` was not granted by this overlay.
+        assert!(!git_dir_writable_in_overlay(
+            &overlay,
+            Path::new("/other/.git")
+        ));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod approvable_tests {
     use std::path::{Path, PathBuf};
 
     use orca_core::approval_types::{ActionKind, ApprovalMode};
-    use orca_core::config::RunConfig;
     use orca_core::config::folder_trust::{TrustLevel, set_trust_with_config_dir};
+    use orca_core::config::{
+        ActivePermissionProfile, PermissionProfileConfig, PermissionProfileFileAccess, RunConfig,
+    };
     use orca_core::tool_types::{ToolName, ToolRequest};
 
     use super::{GitMetadataWrite, git_metadata_write_for_bash};
@@ -828,6 +911,48 @@ mod approvable_tests {
                 "{mode:?}"
             );
         }
+    }
+
+    /// A permission profile's `.git` grant is already an "open the whole
+    /// thing" grant (spec 2026-09-28-git-metadata-approval-design.md §4): the
+    /// one-command path must find nothing to do, not narrow it.
+    #[test]
+    fn a_git_write_already_granted_by_a_permission_profile_is_left_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let root = repository(home.path(), "repo");
+        set_trust_with_config_dir(&root, home.path(), TrustLevel::Trusted).unwrap();
+        let request = bash(serde_json::json!({"command": "git commit -m x"}));
+
+        let mut granted = config(&root, ApprovalMode::AutoEdit);
+        granted.permission_profiles.insert(
+            "metadata".to_string(),
+            PermissionProfileConfig {
+                extends: Some(":workspace".to_string()),
+                filesystem: std::collections::HashMap::from([(
+                    root.join(".git"),
+                    PermissionProfileFileAccess::Write,
+                )])
+                .into(),
+                ..Default::default()
+            },
+        );
+        granted.active_permission_profile = Some(ActivePermissionProfile {
+            id: "metadata".to_string(),
+            extends: None,
+        });
+
+        assert_eq!(
+            git_metadata_write_for_bash(&granted, &root, &request),
+            None,
+            "an existing profile grant must be left exactly as it was"
+        );
+        // Sanity: the same repository and command are still approvable
+        // without the profile.
+        assert!(
+            git_metadata_write_for_bash(&config(&root, ApprovalMode::AutoEdit), &root, &request)
+                .is_some()
+        );
     }
 
     #[test]

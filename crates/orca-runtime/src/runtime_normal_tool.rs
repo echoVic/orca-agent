@@ -399,6 +399,15 @@ fn git_metadata_approval(
     ) else {
         return GitMetadataApproval::NotApplicable;
     };
+    // A `request_permissions` grant earlier this turn already opened this
+    // `.git` as a whole; leave it exactly as granted — no prompt, no suggest
+    // mark, no session check, no narrowing.
+    if crate::git_write_command::git_dir_writable_in_overlay(
+        &invocation.permission_overlay,
+        &write.git_dir,
+    ) {
+        return GitMetadataApproval::NotApplicable;
+    }
     // suggest's approval already named this `.git`, or the session allows it.
     if invocation
         .permission_overlay
@@ -1323,5 +1332,94 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reason, "wait_elapsed");
+    }
+}
+
+/// `git_metadata_approval` alone: proves the overlay short-circuit returns
+/// before the function ever looks at a permission handler, not just that the
+/// end-to-end TUI flow happens to skip a prompt.
+#[cfg(all(test, unix))]
+mod git_metadata_approval_tests {
+    use orca_core::approval_types::{ActionKind, ApprovalMode};
+    use orca_core::cancel::CancelToken;
+    use orca_core::config::folder_trust::{TrustLevel, set_trust_with_config_dir};
+    use orca_core::tool_types::{InterruptSemantics, ToolName, ToolRequest};
+
+    use crate::protocol::{RequestFileSystemPermissions, RequestPermissionProfile};
+    use crate::runtime_permission::{
+        RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
+        TurnPermissionOverlay,
+    };
+    use crate::runtime_tool_call::RuntimeNormalToolWorkerContext;
+
+    use super::{GitMetadataApproval, git_metadata_approval};
+
+    /// Fails the test if the runtime ever asks it for a permission. Reaching
+    /// this handler would prove the overlay short-circuit did not run before
+    /// the (removed, in the fixed code) prompt check.
+    struct PanicsIfAsked;
+
+    impl RuntimePermissionRequestHandler for PanicsIfAsked {
+        fn request_permissions(
+            &self,
+            _request: &RuntimePermissionRequest,
+        ) -> std::io::Result<RuntimePermissionResponse> {
+            panic!("an already-granted .git must not be re-prompted");
+        }
+    }
+
+    #[test]
+    fn an_overlay_granted_git_dir_is_not_applicable_and_never_prompts() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let root = home.path().join("repo");
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+        let root = root.canonicalize().unwrap();
+        set_trust_with_config_dir(&root, home.path(), TrustLevel::Trusted).unwrap();
+
+        let mut config = crate::runtime_tool_call::tests::test_config();
+        config.cwd = Some(root.clone());
+        config.approval_mode = ApprovalMode::AutoEdit;
+
+        let mut overlay = TurnPermissionOverlay::default();
+        overlay.merge_permissions(&RequestPermissionProfile {
+            file_system: Some(RequestFileSystemPermissions {
+                write: Some(vec![root.join(".git")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let mut invocation = crate::runtime_tool_call::tests::normal_invocation(
+            "bash-1",
+            InterruptSemantics::WaitForTerminal,
+        );
+        invocation.config = config;
+        invocation.cwd = root.clone();
+        invocation.request = ToolRequest {
+            id: "bash-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: None,
+            raw_arguments: Some(serde_json::json!({"command": "git commit -m x"}).to_string()),
+        };
+        invocation.permission_overlay = overlay;
+
+        let cancel = CancelToken::new();
+        let handler = PanicsIfAsked;
+        let mut context_overlay = invocation.permission_overlay.clone();
+        let context = RuntimeNormalToolWorkerContext {
+            cancel: &cancel,
+            permission_handler: Some(&handler),
+            mcp_elicitation_handler: None,
+            output_handler: None,
+            permission_overlay: &mut context_overlay,
+        };
+
+        assert!(matches!(
+            git_metadata_approval(&invocation, &context),
+            GitMetadataApproval::NotApplicable
+        ));
     }
 }
