@@ -661,6 +661,95 @@ fn handle_child_agent_provider_error_retries_prompt_too_long_once() {
 }
 
 #[test]
+fn child_that_cannot_fit_a_reply_fails_without_sending_the_user_to_new() {
+    let request = ChildAgentRequest::new(
+        "inspect repo".to_string(),
+        SubagentType::General,
+        None,
+        2,
+        false,
+    );
+    let instructions = ProjectInstructions::default();
+    let memory = MemoryBlock::default();
+    let mut runtime_config = config(None);
+    // No window this small leaves room for a minimal reply, and a child's
+    // opening request holds nothing compaction could remove.
+    runtime_config.model_runtime.context_window = Some(1_000);
+    let mut tracker = CostTracker::new(None);
+
+    let result = run_child_agent_loop_with_tool_executor(
+        &runtime_config,
+        ChildAgentLoopContext {
+            request: &request,
+            cwd: std::env::temp_dir().as_path(),
+            instructions: &instructions,
+            memory: &memory,
+            hooks: &HookRunner::default(),
+            child_cost_tracker: &mut tracker,
+            lease: None,
+        },
+        |_setup, _cancel, _tool_request| unreachable!("the child sends no request"),
+    )
+    .expect("child loop runner should return a result");
+
+    assert_eq!(result.status, RunStatus::Failed);
+    let error = result.error.expect("the child reports why it stopped");
+    assert!(error.contains("sub-agent"), "{error}");
+    assert!(!error.contains("/new"), "{error}");
+}
+
+#[test]
+fn child_prompt_too_long_that_cannot_shrink_fails_without_sending_the_user_to_new() {
+    let request = ChildAgentRequest::new(
+        "inspect repo".to_string(),
+        SubagentType::General,
+        None,
+        2,
+        false,
+    );
+    let instructions = ProjectInstructions::default();
+    let memory = MemoryBlock::default();
+    let runtime_config = config(None);
+    // Only the system prompt and the task: nothing compaction could remove.
+    let mut setup = prepare_child_agent_loop(
+        &runtime_config,
+        &request,
+        std::env::temp_dir().as_path(),
+        &instructions,
+        &memory,
+    );
+    let response = ProviderResponse {
+        steps: vec![ProviderStep::Error(ProviderError::new(
+            ProviderErrorKind::ContextExceeded,
+            "prompt_too_long",
+        ))],
+        assistant_content: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        usage: None,
+    };
+
+    let decision = handle_child_agent_provider_error(
+        &runtime_config,
+        &mut setup,
+        std::env::temp_dir().as_path(),
+        &HookRunner::default(),
+        &response,
+    )
+    .expect("provider-error handling should not fail")
+    .expect("prompt-too-long should produce a decision");
+
+    let ChildAgentProviderErrorDecision::Fail(result) = decision else {
+        panic!("an unshrinkable child must not retry");
+    };
+    assert_eq!(result.status, RunStatus::Failed);
+    let error = result.error.expect("the child reports why it stopped");
+    assert!(error.starts_with("prompt_too_long"), "{error}");
+    assert!(error.contains("sub-agent"), "{error}");
+    assert!(!error.contains("/new"), "{error}");
+}
+
+#[test]
 fn child_agent_provider_error_records_usage_before_failure() {
     let request = ChildAgentRequest::new(
         "inspect repo".to_string(),

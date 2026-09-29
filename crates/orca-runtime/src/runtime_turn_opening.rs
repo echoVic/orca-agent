@@ -96,7 +96,8 @@ impl RuntimeTurnOpeningStep {
             input.history_writer.as_deref_mut(),
         )
         .prepare_request(input.conversation)?;
-        if let Err(message) = prepared {
+        if let Err(overflow) = prepared {
+            let message = crate::compaction::context_overflow_message(overflow.prompt_tokens);
             if turn_context.emit_deltas {
                 input.sink.emit(input.events.error(&message))?;
             }

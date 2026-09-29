@@ -250,6 +250,15 @@ pub(crate) struct RuntimeCompactionAdoption {
     pub(crate) prompt_tokens: usize,
 }
 
+/// A request with no room for a minimal reply even after emergency
+/// compaction. The caller words it for its audience.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeContextOverflow {
+    /// What the prompt measures: after the compaction when it was adopted,
+    /// before it otherwise.
+    pub(crate) prompt_tokens: usize,
+}
+
 pub(crate) fn context_overflow_message(prompt_tokens: usize) -> String {
     format!(
         "The conversation no longer fits the model's context window (about {prompt_tokens} \
@@ -261,6 +270,23 @@ pub(crate) fn unrecoverable_overflow_message(provider_message: &str) -> String {
     format!(
         "{provider_message} Compaction cannot shrink the conversation further; start a new \
          conversation with /new."
+    )
+}
+
+// A sub-agent that runs out of room fails alone. Its parent session is fine,
+// so the advice is a narrower task rather than a new conversation.
+pub(crate) fn child_context_overflow_message(prompt_tokens: usize) -> String {
+    format!(
+        "The sub-agent's context no longer fits the model's context window (about \
+         {prompt_tokens} tokens) and compaction cannot shrink it further. Retry with a \
+         narrower task."
+    )
+}
+
+pub(crate) fn child_unrecoverable_overflow_message(provider_message: &str) -> String {
+    format!(
+        "{provider_message} Compaction cannot shrink the sub-agent's context further; retry \
+         with a narrower task."
     )
 }
 
@@ -526,11 +552,11 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
 
     /// Before a request: compact when pressure calls for it, and as an
     /// emergency when the prompt leaves no room for a minimal reply. `Err`
-    /// carries the user-facing message when not even that makes room.
+    /// when not even that makes room.
     pub(crate) fn prepare_request(
         &mut self,
         conversation: &mut Conversation,
-    ) -> io::Result<Result<(), String>> {
+    ) -> io::Result<Result<(), RuntimeContextOverflow>> {
         let measured = context::measure_prompt(conversation, self.provider_config).tokens;
         let trigger = if self.context_config.request_reply_budget(measured).is_none() {
             Some(RuntimeCompactionTrigger::Overflow)
@@ -553,7 +579,9 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             {
                 Ok(())
             } else {
-                Err(context_overflow_message(adoption.prompt_tokens))
+                Err(RuntimeContextOverflow {
+                    prompt_tokens: adoption.prompt_tokens,
+                })
             },
         )
     }
@@ -1727,7 +1755,13 @@ mod tests {
         .prepare_request(&mut conversation)
         .expect("prepare");
 
-        let message = prepared.expect_err("no room for a reply");
+        let overflow = prepared.expect_err("no room for a reply");
+        // Nothing was adopted, so the failure reports the prompt as it was.
+        assert_eq!(
+            overflow.prompt_tokens,
+            context::wire_equivalent_tokens(&conversation, &provider_config)
+        );
+        let message = context_overflow_message(overflow.prompt_tokens);
         assert!(message.contains("/new"), "{message}");
         assert_eq!(conversation.messages.len(), before.len());
     }

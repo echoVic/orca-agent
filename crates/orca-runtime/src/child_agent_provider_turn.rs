@@ -237,6 +237,7 @@ pub fn compact_child_agent_conversation_if_needed(
 
 /// Before a child request: compact when needed, and fail the child with a
 /// clear message when not even emergency compaction leaves room to reply.
+/// Only the child fails; its parent session can go on.
 pub fn prepare_child_agent_request(
     config: &RunConfig,
     setup: &mut ChildAgentLoopSetup,
@@ -256,7 +257,11 @@ pub fn prepare_child_agent_request(
         &mut sink,
         None,
     );
-    compaction.prepare_request(&mut setup.conversation)
+    Ok(compaction
+        .prepare_request(&mut setup.conversation)?
+        .map_err(|overflow| {
+            crate::compaction::child_context_overflow_message(overflow.prompt_tokens)
+        }))
 }
 
 pub fn handle_child_agent_provider_error(
@@ -300,7 +305,7 @@ pub fn handle_child_agent_provider_error(
                     ChildAgentResult {
                         status: RunStatus::Failed,
                         final_message: None,
-                        error: Some(crate::compaction::unrecoverable_overflow_message(
+                        error: Some(crate::compaction::child_unrecoverable_overflow_message(
                             &error.message,
                         )),
                         budget_usage: None,
