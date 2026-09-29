@@ -4617,6 +4617,31 @@ mod tests {
                 .any(|event| matches!(event, TuiEvent::PermissionApprovalNeeded { .. }))
         );
 
+        // Security regression guard: "allow once" must act as exactly that,
+        // not as "allow for the rest of the session". A second recognized
+        // git write still asks, independently of the first command's grant.
+        let turn = spawn_git_turn(
+            &thread,
+            &config,
+            &controller,
+            &event_tx,
+            "bash git commit --allow-empty -m second",
+        );
+        let (key, preview) = wait_for_git_permission(&event_rx);
+        assert!(preview.contains(".git"), "{preview}");
+        assert!(
+            controller
+                .respond_surface_interaction(
+                    &key,
+                    &crate::protocol::TuiInteractionResponse::Permission(
+                        crate::protocol::TuiPermissionDecision::AllowOnce
+                    )
+                )
+                .expect("permission response")
+        );
+        assert_git_turn_succeeded(&turn);
+        assert_eq!(commit_count(&repo), 2);
+
         thread.shutdown().expect("thread shutdown");
         host.shutdown().expect("host shutdown");
         match previous {
