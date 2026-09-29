@@ -688,11 +688,14 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         let mut emergency_config;
         let context_config = if trigger.is_emergency() {
             emergency_config = self.context_config.clone();
-            // Micro-compaction trims by raw estimate, which an anchored count can exceed.
+            // The line is on the measured scale, and so is compaction's
+            // trimming: it scales its estimate up to the provider's count. A
+            // line taken from the smaller raw estimate would cut the
+            // provider's excess twice.
             emergency_config.soft_compact_token_limit = Some(
                 self.context_config
                     .soft_limit()
-                    .min(before.tokens.min(before.estimated).saturating_mul(3) / 4)
+                    .min(before.tokens.saturating_mul(3) / 4)
                     .max(1),
             );
             &emergency_config
@@ -1842,6 +1845,65 @@ mod tests {
         assert!(
             after <= estimated * 3 / 4,
             "estimate {estimated} only shrank to {after}"
+        );
+    }
+
+    #[test]
+    fn emergency_compaction_cuts_on_the_measured_scale_only_once() {
+        use orca_core::conversation::Message;
+        // A window whose compaction line never caps the emergency line.
+        let config = step_config(1_000_000);
+        let provider_config = bare_provider_config();
+        let hooks = HookRunner::default();
+        let mut events = EventFactory::new("emergency-scale".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let subagent_type = SubagentType::General;
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut conversation = history_with_turns(8, 4_000);
+        let before_messages = conversation.messages.len();
+        let estimated = context::wire_equivalent_tokens(&conversation, &provider_config);
+        // The provider counted half again the estimate, a ratio the anchor accepts.
+        conversation.record_usage_anchor((estimated * 3 / 2) as u64, estimated, before_messages);
+        let measured = context::measure_prompt(&conversation, &provider_config).tokens;
+        let ratio = measured as f64 / estimated as f64;
+
+        let shrunk = RuntimeCompactionStep::new(
+            orca_core::config::ProviderKind::Mock,
+            &config,
+            &provider_config,
+            RuntimeTurnContext::new(cwd.path(), "", 0, false, &subagent_type),
+            &hooks,
+            &mut events,
+            &mut sink,
+            None,
+        )
+        .compact_after_provider_error_retry(
+            &mut conversation,
+            RuntimeCompactionTrigger::PromptTooLong,
+        )
+        .expect("compact");
+
+        assert!(shrunk);
+        assert_eq!(conversation.messages.len(), before_messages, "a micro cut");
+        let shortened = conversation
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(message,
+                Message::Tool { content, .. } if content.starts_with("[tool output micro-compact]"))
+            })
+            .count();
+        let after = context::wire_equivalent_tokens(&conversation, &provider_config);
+        // Every tool output is the same size, so each shortening saves the same.
+        let saving = (estimated - after) / shortened;
+        // Micro-compaction aims for 9/10 of the line at 3/4 of the measured
+        // prompt, and trims on the measured scale.
+        let target = measured * 3 / 4 * 9 / 10;
+        let scaled = |tokens: usize| (tokens as f64 * ratio) as usize;
+        assert!(scaled(after) <= target, "{after} tokens miss {target}");
+        assert!(
+            scaled(after + saving) > target,
+            "{shortened} shortenings: one fewer would have reached {target}"
         );
     }
 }
