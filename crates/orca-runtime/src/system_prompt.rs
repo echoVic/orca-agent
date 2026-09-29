@@ -85,7 +85,8 @@ Rules:
 - After creating a plan, immediately mark the first step `in_progress` and begin executing it. Never stop after just creating the plan.
 - Keep exactly one step `in_progress` at all times until done.
 - Mark a step `completed` only after verifying it (tests pass, output correct).
-- You can mark multiple items complete in a single `update_plan` call.
+- As soon as a step is verified, call `update_plan` before starting the next one: mark it `completed` and the next step `in_progress`. The user follows progress through the plan, so it must not lag behind the work.
+- Mark several steps complete in one call only when they finished together; never save plan updates for the end.
 - When changing plans mid-task, provide an `explanation` of the rationale.
 - Do not repeat the plan contents after calling `update_plan` — the harness already displays it.
 - Example tool arguments: `{{"plan":[{{"step":"Inspect code","status":"in_progress"}}]}}`.
@@ -246,6 +247,16 @@ mod tests {
         assert!(!prompt.contains("Parameters: `"));
         assert!(!prompt.contains(r#""additionalProperties":false"#));
         assert!(prompt.contains(r#"{"plan":[{"step":"Inspect code","status":"in_progress"}]}"#));
+    }
+
+    #[test]
+    fn prompt_asks_for_a_plan_update_as_each_step_finishes() {
+        let prompt = build_system_prompt(std::path::Path::new("/repo"));
+
+        assert!(prompt.contains(
+            "As soon as a step is verified, call `update_plan` before starting the next one"
+        ));
+        assert!(!prompt.contains("You can mark multiple items complete in a single"));
     }
 
     #[test]
