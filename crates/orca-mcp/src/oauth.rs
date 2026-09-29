@@ -715,7 +715,9 @@ impl Callback {
     }
 
     /// Waits up to `timeout` for the browser to come back to `/callback`
-    /// with a code, answering any other request with 404.
+    /// with the `state` sent and a code. Any other request is answered with
+    /// 404, and a callback with another state with an error page; the wait
+    /// goes on after both.
     fn wait_for_code(self, name: &str, state: &str, timeout: Duration) -> Result<String, String> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -740,8 +742,8 @@ impl Callback {
 }
 
 /// Answers one connection to the callback listener, and returns what the
-/// browser came back with: `None` for a request that is not the callback,
-/// or that never arrives.
+/// browser came back with: `None` for a request that is not the callback
+/// for this login, or that never arrives.
 fn answer_callback(
     mut stream: TcpStream,
     name: &str,
@@ -765,7 +767,17 @@ fn answer_callback(
     let params = url::form_urlencoded::parse(query.as_bytes())
         .into_owned()
         .collect::<HashMap<_, _>>();
-    let outcome = callback_code(name, state, &params);
+    // Another state means another login, such as an old browser tab's, or a
+    // page that forged it: it is turned away, and this login waits on.
+    if params.get("state").map(String::as_str) != Some(state) {
+        respond(
+            &mut stream,
+            "400 Bad Request",
+            "This is not the login Orca is waiting for. Finish the login Orca opened most recently.",
+        );
+        return None;
+    }
+    let outcome = callback_code(name, &params);
     match &outcome {
         Ok(_) => respond(
             &mut stream,
@@ -781,17 +793,9 @@ fn answer_callback(
     Some(outcome)
 }
 
-/// The code the browser came back with, once its `state` is the one sent.
-fn callback_code(
-    name: &str,
-    state: &str,
-    params: &HashMap<String, String>,
-) -> Result<String, String> {
-    if params.get("state").map(String::as_str) != Some(state) {
-        return Err(format!(
-            "the browser login for MCP server '{name}' came back with a mismatched state"
-        ));
-    }
+/// The code a callback with the `state` sent came back with, or why the
+/// login failed.
+fn callback_code(name: &str, params: &HashMap<String, String>) -> Result<String, String> {
     if let Some(error) = params.get("error") {
         let description = params
             .get("error_description")
@@ -1005,29 +1009,88 @@ mod tests {
         );
     }
 
+    /// A browser the authorization server sends back to the callback with a
+    /// state of its own (`OAuthTestBehavior::wrong_state`), which then comes
+    /// back again with the state Orca sent. It hands back both pages.
+    fn browser_with_a_stray_callback() -> (OpenBrowser, std::sync::mpsc::Receiver<String>) {
+        let (page_sender, pages) = std::sync::mpsc::channel();
+        let browser = move |url: &str| {
+            let authorization = url::Url::parse(url).map_err(io::Error::other)?;
+            let sent_state = authorization
+                .query_pairs()
+                .find(|(name, _)| name == "state")
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default();
+            std::thread::spawn(move || {
+                let Ok(client) = Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(FIXTURE_WAIT)
+                    .build()
+                else {
+                    return;
+                };
+                let Some(stray) =
+                    client
+                        .get(authorization.as_str())
+                        .send()
+                        .ok()
+                        .and_then(|response| {
+                            let location = response.headers().get(reqwest::header::LOCATION)?;
+                            url::Url::parse(location.to_str().ok()?).ok()
+                        })
+                else {
+                    return;
+                };
+                let code = stray
+                    .query_pairs()
+                    .find(|(name, _)| name == "code")
+                    .map(|(_, value)| value.into_owned())
+                    .unwrap_or_default();
+                let mut right = stray.clone();
+                right
+                    .query_pairs_mut()
+                    .clear()
+                    .append_pair("code", &code)
+                    .append_pair("state", &sent_state);
+                for callback in [stray, right] {
+                    let page = client
+                        .get(callback.as_str())
+                        .send()
+                        .and_then(Response::text)
+                        .unwrap_or_default();
+                    let _ = page_sender.send(page);
+                }
+            });
+            Ok(())
+        };
+        (Box::new(browser), pages)
+    }
+
     #[test]
-    fn callback_rejects_a_mismatched_state() {
+    fn a_callback_with_another_state_is_turned_away_and_the_login_waits_on() {
         let server = OAuthTestServer::start(OAuthTestBehavior {
             wrong_state: true,
             ..Default::default()
         });
         let home = tempfile::tempdir().expect("temp dir");
         let credentials = home.path().join("mcp-credentials.json");
-        let (browser, page) = test_browser();
+        let (browser, pages) = browser_with_a_stray_callback();
 
-        let error = login(&server.config("docs"), options(&credentials, browser))
-            .expect_err("a callback with another state must fail");
+        login(&server.config("docs"), options(&credentials, browser))
+            .expect("the callback with the state Orca sent logs in");
 
-        assert_eq!(
-            error,
-            "the browser login for MCP server 'docs' came back with a mismatched state"
-        );
-        assert!(server.requests_to("/token").is_empty());
-        assert!(!credentials.exists());
+        let stray = pages.recv_timeout(FIXTURE_WAIT).expect("the stray page");
         assert!(
-            page.recv_timeout(FIXTURE_WAIT)
-                .expect("the callback page")
-                .contains("Login failed.")
+            stray.contains("This is not the login Orca is waiting for"),
+            "{stray}"
+        );
+        let right = pages.recv_timeout(FIXTURE_WAIT).expect("the login page");
+        assert!(right.contains("Login complete."), "{right}");
+        assert_eq!(server.requests_to("/token").len(), 1);
+        assert!(
+            load_mcp_credential(&credentials, "docs", &server.mcp_url())
+                .expect("read the credentials")
+                .is_some()
         );
     }
 
