@@ -1501,6 +1501,13 @@ fn format_compaction_notice(
     collapsed_messages: usize,
     status_text: &str,
 ) -> String {
+    // The runtime reports a compaction whose result did not shrink the
+    // history with strategy "none": the history is unchanged.
+    if strategy == "none" {
+        return format!(
+            "Context compaction could not shrink the conversation ({before_messages} messages unchanged)."
+        );
+    }
     let label = compaction_notice_label(reason, status_text);
     let detail = if collapsed_messages > 0 && !strategy.trim().is_empty() {
         format!(" (collapsed {collapsed_messages}, {strategy})")

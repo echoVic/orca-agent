@@ -47,6 +47,9 @@ impl RuntimeCompactionTrigger {
 pub(crate) enum RuntimeCompactionStrategy {
     LocalTruncation,
     RemoteSummary,
+    /// The compacted history did not shrink and was discarded: the history
+    /// stays as it was.
+    None,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +89,7 @@ impl RuntimeCompactionStrategy {
         match self {
             Self::LocalTruncation => "local_truncation",
             Self::RemoteSummary => "remote_summary",
+            Self::None => "none",
         }
     }
 }
@@ -208,7 +212,13 @@ impl RuntimeCompactionOutcome {
             before_messages: self.before_messages(),
             after_messages: self.after_messages(),
             collapsed_messages: self.before_messages().saturating_sub(self.after_messages()),
-            status_text: reason.status_text(),
+            status_text: match self.strategy() {
+                RuntimeCompactionStrategy::None => {
+                    "context compaction could not shrink the conversation"
+                }
+                RuntimeCompactionStrategy::LocalTruncation
+                | RuntimeCompactionStrategy::RemoteSummary => reason.status_text(),
+            },
         }
     }
 
@@ -222,6 +232,13 @@ impl RuntimeCompactionOutcome {
                 RuntimeCompactionStrategy::LocalTruncation
                 | RuntimeCompactionStrategy::RemoteSummary,
             ) => true,
+            (
+                RuntimeCompactionTrigger::SoftLimit
+                | RuntimeCompactionTrigger::HardLimit
+                | RuntimeCompactionTrigger::Overflow
+                | RuntimeCompactionTrigger::PromptTooLong,
+                RuntimeCompactionStrategy::None,
+            ) => false,
         }
     }
 }
@@ -432,6 +449,17 @@ impl RuntimeCompactionTask {
         }
     }
 
+    /// A compaction whose result did not shrink the history: nothing was
+    /// compacted, and the outcome says so.
+    pub(crate) fn unchanged(&self) -> RuntimeCompactionOutcome {
+        RuntimeCompactionOutcome {
+            trigger: self.trigger(),
+            before_messages: self.before_messages(),
+            after_messages: self.before_messages(),
+            strategy: RuntimeCompactionStrategy::None,
+        }
+    }
+
     pub(crate) fn trigger(&self) -> RuntimeCompactionTrigger {
         self.trigger
     }
@@ -603,7 +631,10 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
 
         let (outcome, adoption) = self.compact_and_persist(conversation, trigger)?;
 
-        if self.turn_context.emit_deltas {
+        // PostCompact reports a compaction; a result that did not shrink
+        // left the history as it was. The completion event still closes the
+        // compacting state the started event opened, saying nothing shrank.
+        if adoption.adopted && self.turn_context.emit_deltas {
             self.run_compaction_hook(
                 HookEvent::PostCompact,
                 before_messages,
@@ -660,7 +691,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         if after.estimated >= before.estimated {
             // Nothing shrank: keep the history as it was, and persist nothing.
             return Ok((
-                task.finish(before_messages, &compaction.kind),
+                task.unchanged(),
                 RuntimeCompactionAdoption {
                     adopted: false,
                     prompt_tokens: before.tokens,
@@ -1391,6 +1422,137 @@ mod tests {
                 "soft {soft}, hard {hard}"
             );
         }
+    }
+
+    #[test]
+    fn compaction_that_cannot_shrink_skips_post_compact_and_reports_nothing_compacted() {
+        let temp = tempfile::tempdir().unwrap();
+        let pre_marker = temp.path().join("pre-compact.marker");
+        let post_marker = temp.path().join("post-compact.marker");
+        let hooks = HookRunner::new(vec![
+            HookConfig {
+                event: HookEvent::PreCompact,
+                command: format!("touch '{}'", pre_marker.display()),
+                tool: None,
+            },
+            HookConfig {
+                event: HookEvent::PostCompact,
+                command: format!("touch '{}'", post_marker.display()),
+                tool: None,
+            },
+        ]);
+        // Only the current request, too large on its own: nothing to collapse or trim.
+        let mut conversation = Conversation::new();
+        conversation.add_system("immutable instructions".to_string());
+        conversation.add_user("evidence ".repeat(2_000));
+        let config = context::ContextConfig {
+            max_tokens: 100_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(100_000),
+            soft_compact_token_limit: Some(300),
+        };
+        let provider_config = bare_provider_config();
+        let mut events = EventFactory::new("unshrinkable-completion".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let subagent_type = SubagentType::General;
+        let mut step = RuntimeCompactionStep::new(
+            orca_core::config::ProviderKind::Mock,
+            &config,
+            &provider_config,
+            RuntimeTurnContext::new(temp.path(), "", 0, true, &subagent_type),
+            &hooks,
+            &mut events,
+            &mut sink,
+            None,
+        );
+
+        assert!(!step.compact_if_needed(&mut conversation).expect("compact"));
+        assert!(
+            !step
+                .compact_after_provider_error_retry(
+                    &mut conversation,
+                    RuntimeCompactionTrigger::PromptTooLong,
+                )
+                .expect("compact")
+        );
+
+        assert!(pre_marker.exists(), "compaction hooks must run");
+        assert!(!post_marker.exists(), "nothing was compacted");
+        let completions = String::from_utf8(output)
+            .expect("jsonl is utf8")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event json"))
+            .filter(|event| event["type"] == "context.compacted")
+            .collect::<Vec<_>>();
+        // Both entry points still close the compacting state they opened.
+        assert_eq!(completions.len(), 2);
+        for completion in completions {
+            let payload = &completion["payload"];
+            assert_eq!(payload["strategy"], "none");
+            assert_eq!(
+                payload["status_text"],
+                "context compaction could not shrink the conversation"
+            );
+            assert_eq!(payload["before_messages"], 2);
+            assert_eq!(payload["after_messages"], 2);
+            assert_eq!(payload["collapsed_messages"], 0);
+        }
+    }
+
+    #[test]
+    fn prepare_request_makes_room_for_a_reply_while_pressure_is_quiet() {
+        // Both compaction lines sit at the window, so pressure never fires:
+        // only the missing room for a minimal reply can start a compaction.
+        let config = context::ContextConfig {
+            max_tokens: 40_000,
+            compaction_threshold: 0.9,
+            reserved_for_response: 4_096,
+            auto_compact_token_limit: Some(40_000),
+            soft_compact_token_limit: Some(40_000),
+        };
+        let provider_config = bare_provider_config();
+        let mut conversation = history_with_turns(8, 4_000);
+        let before = context::wire_equivalent_tokens(&conversation, &provider_config);
+        assert!(before < config.soft_limit(), "pressure must stay quiet");
+        assert!(
+            config.request_reply_budget(before).is_none(),
+            "fixture must leave no room for a reply"
+        );
+        let hooks = HookRunner::default();
+        let mut events = EventFactory::new("no-reply-room".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let subagent_type = SubagentType::General;
+        let cwd = tempfile::tempdir().expect("cwd");
+
+        let prepared = RuntimeCompactionStep::new(
+            orca_core::config::ProviderKind::Mock,
+            &config,
+            &provider_config,
+            RuntimeTurnContext::new(cwd.path(), "", 0, true, &subagent_type),
+            &hooks,
+            &mut events,
+            &mut sink,
+            None,
+        )
+        .prepare_request(&mut conversation)
+        .expect("prepare");
+
+        assert_eq!(prepared, Ok(()));
+        let after = context::wire_equivalent_tokens(&conversation, &provider_config);
+        assert!(
+            config.request_reply_budget(after).is_some(),
+            "compacted {before} down to {after}"
+        );
+        let started = String::from_utf8(output)
+            .expect("jsonl is utf8")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event json"))
+            .find(|event| event["type"] == "context.compaction.started")
+            .expect("compaction started");
+        assert_eq!(started["payload"]["reason"], "exceeded_context_limit");
     }
 
     fn bare_provider_config() -> ProviderConfig {

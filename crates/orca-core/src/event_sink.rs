@@ -104,10 +104,19 @@ impl<W: Write> EventSink<W> {
             EventType::ContextCompacted => {
                 let before = event.payload["before_messages"].as_u64().unwrap_or(0);
                 let after = event.payload["after_messages"].as_u64().unwrap_or(0);
-                writeln!(
-                    self.writer,
-                    "context compacted: {before} -> {after} messages"
-                )
+                // Strategy "none": the result did not shrink and was discarded.
+                if event.payload["strategy"] == "none" {
+                    writeln!(
+                        self.writer,
+                        "context compaction could not shrink the conversation \
+                         ({before} messages unchanged)"
+                    )
+                } else {
+                    writeln!(
+                        self.writer,
+                        "context compacted: {before} -> {after} messages"
+                    )
+                }
             }
             EventType::ApprovalRequested => writeln!(self.writer, "approval requested"),
             EventType::ApprovalResolved => writeln!(self.writer, "approval resolved"),
@@ -332,6 +341,41 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("error: something broke"));
         assert!(output.contains("assistant: hi"));
+    }
+
+    #[test]
+    fn text_format_does_not_claim_a_compaction_that_changed_nothing() {
+        let mut buf = Vec::new();
+        let mut sink = EventSink::new(&mut buf, OutputFormat::Text);
+        let mut f = EventFactory::new("run-1".to_string());
+
+        sink.emit(f.context_compacted(
+            "exceeded_context_limit",
+            "local_truncation",
+            12,
+            5,
+            7,
+            "compacted context at token limit",
+        ))
+        .unwrap();
+        sink.emit(f.context_compacted(
+            "exceeded_context_limit",
+            "none",
+            12,
+            12,
+            0,
+            "context compaction could not shrink the conversation",
+        ))
+        .unwrap();
+
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            vec![
+                "context compacted: 12 -> 5 messages",
+                "context compaction could not shrink the conversation (12 messages unchanged)",
+            ]
+        );
     }
 
     #[test]

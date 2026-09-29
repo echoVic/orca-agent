@@ -4340,6 +4340,28 @@ fn compacted_event_explains_runtime_recovery_reason() {
 }
 
 #[test]
+fn compaction_that_could_not_shrink_does_not_claim_a_compaction() {
+    let mut state = state();
+    state.update(TuiEvent::CompactionStarted);
+
+    state.update(TuiEvent::Compacted {
+        before_messages: 902,
+        after_messages: 902,
+        reason: "exceeded_context_limit".to_string(),
+        strategy: "none".to_string(),
+        collapsed_messages: 0,
+        status_text: "context compaction could not shrink the conversation".to_string(),
+    });
+
+    assert!(matches!(
+        state.transcript.messages.last(),
+        Some(ChatMessage::System { text: message, .. })
+            if message == "Context compaction could not shrink the conversation (902 messages unchanged)."
+    ));
+    assert_eq!(state.status, AppStatus::Idle);
+}
+
+#[test]
 fn compaction_lifecycle_sets_compacting_until_completion() {
     let mut state = state();
 
