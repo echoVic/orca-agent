@@ -625,10 +625,11 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         let mut emergency_config;
         let context_config = if trigger.is_emergency() {
             emergency_config = self.context_config.clone();
+            // Micro-compaction trims by raw estimate, which an anchored count can exceed.
             emergency_config.soft_compact_token_limit = Some(
                 self.context_config
                     .soft_limit()
-                    .min(before.tokens.saturating_mul(3) / 4)
+                    .min(before.tokens.min(before.estimated).saturating_mul(3) / 4)
                     .max(1),
             );
             &emergency_config
@@ -1388,5 +1389,52 @@ mod tests {
         .expect("compact");
 
         assert!(!shrunk);
+    }
+
+    #[test]
+    fn emergency_compaction_cuts_deep_even_when_the_provider_counts_more() {
+        let config = step_config(40_000);
+        let provider_config = bare_provider_config();
+        let hooks = HookRunner::default();
+        let mut events = EventFactory::new("emergency-anchor".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let subagent_type = SubagentType::General;
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut conversation = history_with_turns(8, 4_000);
+        let estimated = context::wire_equivalent_tokens(&conversation, &provider_config);
+        // The provider counted half again the estimate, a ratio the anchor accepts.
+        conversation.record_usage_anchor(
+            (estimated * 3 / 2) as u64,
+            estimated,
+            conversation.messages.len(),
+        );
+        assert_eq!(
+            context::measure_prompt(&conversation, &provider_config).tokens,
+            estimated * 3 / 2,
+            "fixture must measure from the anchor"
+        );
+
+        let shrunk = RuntimeCompactionStep::new(
+            orca_core::config::ProviderKind::Mock,
+            &config,
+            &provider_config,
+            RuntimeTurnContext::new(cwd.path(), "", 0, false, &subagent_type),
+            &hooks,
+            &mut events,
+            &mut sink,
+            None,
+        )
+        .compact_after_provider_error_retry(
+            &mut conversation,
+            RuntimeCompactionTrigger::PromptTooLong,
+        )
+        .expect("compact");
+
+        assert!(shrunk);
+        let after = context::wire_equivalent_tokens(&conversation, &provider_config);
+        assert!(
+            after <= estimated * 3 / 4,
+            "estimate {estimated} only shrank to {after}"
+        );
     }
 }
