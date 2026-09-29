@@ -169,9 +169,9 @@ pub(crate) struct RuntimeProviderTurnInput<'a, 'runtime, W: io::Write> {
     pub(crate) turn_context: RuntimeTurnContext<'a>,
     pub(crate) hooks: &'a HookRunner,
     pub(crate) cancel: &'a CancelToken,
-    /// Full model context window, used as the denominator for the local
-    /// `context.updated` observability event emitted after real usage arrives.
-    pub(crate) context_window: usize,
+    /// This request's budget: the reply reservation to trim per request, and
+    /// the compaction line the local `context.updated` event reports against.
+    pub(crate) context_config: &'a context::ContextConfig,
     pub(crate) io: RuntimeProviderTurnIo<'a, W>,
 }
 
@@ -507,11 +507,21 @@ impl RuntimeProviderTurnStep {
             }
             conversation.messages.push(analysis);
         }
+        // The persisted messages this request is built from; the usage
+        // anchor measures against them.
+        let request_message_count = conversation.messages.len();
+
         let model_conversation =
             conversation_with_hook_context(&prepared_images.conversation, &pre_model_outcome);
         let model_conversation = conversation_with_runtime_system_messages(
             &model_conversation,
             input.runtime_system_messages,
+        );
+        let measurement = context::measure_prompt(&model_conversation, input.provider_config);
+        let request_config = context::with_request_reply_budget(
+            input.provider_config,
+            input.context_config,
+            measurement.tokens,
         );
         if input.provider == ProviderKind::DeepSeek
             && let Some(writer) = history_writer.as_deref_mut()
@@ -540,7 +550,7 @@ impl RuntimeProviderTurnStep {
                     orca_provider::start_streaming_bounded(
                         input.provider,
                         &model_conversation,
-                        input.provider_config,
+                        &request_config,
                         input.cancel.clone(),
                         crate::investigation_convergence::FINAL_REPORT_MAX_TOKENS,
                         crate::investigation_convergence::FINAL_REPORT_TIMEOUT,
@@ -549,7 +559,7 @@ impl RuntimeProviderTurnStep {
                     orca_provider::start_streaming(
                         input.provider,
                         &model_conversation,
-                        input.provider_config,
+                        &request_config,
                         input.cancel.clone(),
                     )
                 };
@@ -616,7 +626,16 @@ impl RuntimeProviderTurnStep {
                 return cancelled_provider_turn(emit_deltas, events, sink);
             }
         };
+        let attempt_usage = response.usage;
         merge_provider_usage(&mut response.usage, failed_attempt_usage);
+        if response.error().is_none() {
+            record_request_usage_anchor(
+                conversation,
+                attempt_usage,
+                measurement.estimated,
+                request_message_count,
+            );
+        }
 
         let mut usage_error = None;
         let mut budget_stop = None;
@@ -659,10 +678,11 @@ impl RuntimeProviderTurnStep {
                 }
                 // Real occupancy: the provider-reported prompt tokens for THIS
                 // request (not the cumulative CostTracker totals) against the
-                // full model window. Non-persisted observability only.
-                sink.emit(
-                    events.context_updated(usage.input_tokens as usize, input.context_window),
-                )?;
+                // compaction line. Non-persisted observability only.
+                sink.emit(events.context_updated(
+                    usage.input_tokens as usize,
+                    input.context_config.soft_limit(),
+                ))?;
             }
         }
 
@@ -917,7 +937,7 @@ impl RuntimeTurnProviderCycleStep {
                     turn_context: turn_context.clone(),
                     hooks: capabilities.hooks,
                     cancel: capabilities.cancel,
-                    context_window: input.context_config.max_tokens,
+                    context_config: input.context_config,
                     io: RuntimeProviderTurnIo {
                         conversation,
                         cost_tracker: input.cost_tracker,
@@ -1103,6 +1123,24 @@ fn merge_provider_usage(total: &mut Option<Usage>, usage: Option<Usage>) {
     total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
     total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
     total.cache_tokens = total.cache_tokens.saturating_add(usage.cache_tokens);
+}
+
+/// Anchors the next request's measurement on this one: the provider's prompt
+/// count for the attempt that answered, against Orca's estimate of the same
+/// request. Usage merged across failed attempts would overstate the prompt,
+/// so callers pass the answering attempt's usage.
+pub(crate) fn record_request_usage_anchor(
+    conversation: &mut Conversation,
+    usage: Option<orca_core::provider_types::Usage>,
+    estimated: usize,
+    message_count: usize,
+) {
+    match usage.filter(|usage| usage.input_tokens > 0) {
+        Some(usage) => {
+            conversation.record_usage_anchor(usage.input_tokens, estimated, message_count)
+        }
+        None => conversation.clear_usage_anchor(),
+    }
 }
 
 fn emit_provider_delta<W: io::Write>(
@@ -1469,6 +1507,11 @@ mod tests {
         let mut actor = RuntimeTaskActor::new(&mut lifecycle);
         let mut conversation = Conversation::new();
         conversation.add_user("mock_usage_then_cancel".to_string());
+        let context_config = context::ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::FLASH_MODEL),
+            &ModelRuntimeConfig::default(),
+            orca_core::config::ReasoningEffort::default(),
+        );
         let provider_config = ProviderConfig {
             api_key: None,
             base_url: None,
@@ -1506,7 +1549,7 @@ mod tests {
                 ),
                 hooks: &hooks,
                 cancel: &cancel,
-                context_window: 1_000_000,
+                context_config: &context_config,
                 io: RuntimeProviderTurnIo {
                     conversation: &mut conversation,
                     cost_tracker: &mut cost_tracker,
@@ -1528,10 +1571,10 @@ mod tests {
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert_eq!(output.matches("\"type\":\"usage.updated\"").count(), 1);
         // Real-usage-driven context observability accompanies usage: the prompt
-        // tokens for this request (120) against the full model window.
+        // tokens for this request (120) against the compaction line.
         assert_eq!(output.matches("\"type\":\"context.updated\"").count(), 1);
         assert!(output.contains("\"used_tokens\":120"));
-        assert!(output.contains("\"limit_tokens\":1000000"));
+        assert!(output.contains(&format!("\"limit_tokens\":{}", context_config.soft_limit())));
         assert!(!output.contains("\"type\":\"error\""));
     }
 
@@ -1542,6 +1585,11 @@ mod tests {
         let mut actor = RuntimeTaskActor::new(&mut lifecycle);
         let mut conversation = Conversation::new();
         conversation.add_user("mock_usage_then_cancel".to_string());
+        let context_config = context::ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::FLASH_MODEL),
+            &ModelRuntimeConfig::default(),
+            orca_core::config::ReasoningEffort::default(),
+        );
         let provider_config = ProviderConfig {
             api_key: None,
             base_url: None,
@@ -1588,7 +1636,7 @@ mod tests {
                 ),
                 hooks: &hooks,
                 cancel: &cancel,
-                context_window: 1_000_000,
+                context_config: &context_config,
                 io: RuntimeProviderTurnIo {
                     conversation: &mut conversation,
                     cost_tracker: &mut cost_tracker,
@@ -1616,6 +1664,11 @@ mod tests {
         conversation.add_system("base system".to_string());
         conversation.add_user("mock_system_echo".to_string());
         let runtime_system_messages = vec!["runtime directive context".to_string()];
+        let context_config = context::ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::FLASH_MODEL),
+            &ModelRuntimeConfig::default(),
+            orca_core::config::ReasoningEffort::default(),
+        );
         let provider_config = ProviderConfig {
             api_key: None,
             base_url: None,
@@ -1653,7 +1706,7 @@ mod tests {
                 ),
                 hooks: &hooks,
                 cancel: &cancel,
-                context_window: 1_000_000,
+                context_config: &context_config,
                 io: RuntimeProviderTurnIo {
                     conversation: &mut conversation,
                     cost_tracker: &mut cost_tracker,
@@ -1699,6 +1752,11 @@ mod tests {
                 detail: orca_core::conversation::ImageDetail::High,
             }],
         );
+        let context_config = context::ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::FLASH_MODEL),
+            &ModelRuntimeConfig::default(),
+            orca_core::config::ReasoningEffort::default(),
+        );
         let provider_config = ProviderConfig {
             api_key: None,
             base_url: None,
@@ -1735,7 +1793,7 @@ mod tests {
                 ),
                 hooks: &hooks,
                 cancel: &cancel,
-                context_window: 1_000_000,
+                context_config: &context_config,
                 io: RuntimeProviderTurnIo {
                     conversation: &mut conversation,
                     cost_tracker: &mut cost_tracker,
@@ -2321,5 +2379,33 @@ mod tests {
             continuing,
             RuntimeProviderResponseResult::Continue
         ));
+    }
+
+    #[test]
+    fn a_successful_request_anchors_the_next_measurement() {
+        let mut conversation = Conversation::new();
+        conversation.add_system("sys".to_string());
+        conversation.add_user("hello".to_string());
+
+        record_request_usage_anchor(
+            &mut conversation,
+            Some(orca_core::provider_types::Usage {
+                input_tokens: 1_200,
+                output_tokens: 30,
+                cache_tokens: 0,
+            }),
+            1_000,
+            2,
+        );
+
+        let anchor = conversation.valid_usage_anchor().expect("anchor");
+        assert_eq!(
+            (anchor.prompt_tokens, anchor.estimated_tokens),
+            (1_200, 1_000)
+        );
+
+        // A response without usage leaves nothing to anchor on.
+        record_request_usage_anchor(&mut conversation, None, 1_000, 2);
+        assert!(conversation.valid_usage_anchor().is_none());
     }
 }

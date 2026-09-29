@@ -6,6 +6,7 @@ use orca_core::config::RunConfig;
 use orca_core::event_schema::RunStatus;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::tool_types::{ToolRequest, ToolResult};
+use orca_provider::context;
 
 use crate::agent_continuation::{conversation_has_open_tool_calls, try_last_settled_tool_boundary};
 use crate::child_agent_entrypoints::run_child_agent_with_executor;
@@ -260,12 +261,20 @@ where
             );
         }
 
+        let measurement = context::measure_prompt(&setup.conversation, &turn_provider_config);
+        let request_config = context::with_request_reply_budget(
+            &turn_provider_config,
+            &setup.context_config,
+            measurement.tokens,
+        );
+        let request_message_count = setup.conversation.messages.len();
+
         let response = match run_child_agent_provider_turn(
             config,
             &setup,
             context.cwd,
             context.hooks,
-            &turn_provider_config,
+            &request_config,
             &child_cancel,
         ) {
             ChildAgentProviderTurn::Response(response) => response,
@@ -296,6 +305,14 @@ where
                 return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
         };
+        if response.error().is_none() {
+            crate::provider_turn::record_request_usage_anchor(
+                &mut setup.conversation,
+                response.usage,
+                measurement.estimated,
+                request_message_count,
+            );
+        }
 
         let provider_error_decision = handle_child_agent_provider_error_with_usage(
             config,
@@ -515,12 +532,20 @@ where
             );
         }
 
+        let measurement = context::measure_prompt(&setup.conversation, &turn_provider_config);
+        let request_config = context::with_request_reply_budget(
+            &turn_provider_config,
+            &setup.context_config,
+            measurement.tokens,
+        );
+        let request_message_count = setup.conversation.messages.len();
+
         let response = match run_child_agent_provider_turn_observed(
             config,
             &setup,
             context.cwd,
             context.hooks,
-            &turn_provider_config,
+            &request_config,
             &child_cancel,
             observer,
         ) {
@@ -552,6 +577,14 @@ where
                 return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
         };
+        if response.error().is_none() {
+            crate::provider_turn::record_request_usage_anchor(
+                &mut setup.conversation,
+                response.usage,
+                measurement.estimated,
+                request_message_count,
+            );
+        }
 
         let provider_error_decision = handle_child_agent_provider_error_with_usage(
             config,
