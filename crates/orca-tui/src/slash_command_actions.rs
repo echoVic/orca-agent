@@ -49,7 +49,7 @@ fn request_recap(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>) {
 fn open_mcp_panel(config: &RunConfig, state: &mut AppState) {
     if state.attached_session {
         state.push_message(ChatMessage::System {
-            text: "MCP management is not available in an attached daemon session; run 'orca mcp login <name>' on this machine, then reattach.".to_string(),
+            text: "MCP management is not available in an attached daemon session: run 'orca mcp login <name>' on this machine, then 'orca attach new' for a daemon session that uses the login; this session uses it once the daemon restarts and you reattach.".to_string(),
             expanded: false,
         });
     } else if state.status != AppStatus::Idle {
@@ -1093,6 +1093,11 @@ mod tests {
         }
     }
 
+    /// The daemon connects a session's MCP servers when it opens the
+    /// session, reading the saved logins then (`SharedSessions::open` starts
+    /// a thread, whose registry connects the servers). A new daemon session
+    /// so uses a new login, while reattaching reuses the live session's
+    /// servers until the daemon restarts and reopens it.
     #[test]
     fn attached_sessions_explain_mcp_is_unavailable() {
         let mut state = mcp_state(&["docs"]);
@@ -1108,7 +1113,7 @@ mod tests {
         assert!(action_rx.try_recv().is_err());
         assert!(matches!(
             state.transcript.messages.last(),
-            Some(ChatMessage::System { text, .. }) if text == "MCP management is not available in an attached daemon session; run 'orca mcp login <name>' on this machine, then reattach."
+            Some(ChatMessage::System { text, .. }) if text == "MCP management is not available in an attached daemon session: run 'orca mcp login <name>' on this machine, then 'orca attach new' for a daemon session that uses the login; this session uses it once the daemon restarts and you reattach."
         ));
     }
 

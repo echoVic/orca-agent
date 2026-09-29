@@ -248,8 +248,10 @@ server uses the login when it connects. `r` waits for the conversation to
 start. While an action runs, the server's row and details show it
 (`reconnecting…`, `waiting for browser login…` with the authorization url, or
 `logging out…`). A TUI attached to a daemon session with `orca attach` cannot
-manage the daemon's servers: run `orca mcp login <name>` on this machine, then
-reattach.
+manage the daemon's servers. The daemon connects a session's servers when it
+opens the session, so after `orca mcp login <name>` on this machine,
+`orca attach new` starts a daemon session that uses the login; a session the
+daemon already has open uses it once the daemon restarts and you reattach.
 
 ## MCP prompts
 

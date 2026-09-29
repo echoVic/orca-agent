@@ -188,7 +188,7 @@ Orca 提问时，用数字键或 `↑`/`↓` 加 `Enter` 回答；`←`/`→` �
 
 重新连接、登录和退出登录都在后台进行，结果显示在对话里；关闭面板不会中止它们。一个服务器上的操作结束之前，不能再对它发起别的操作。`l` 和 `o` 只适用于用 OAuth 登录的服务器，见 [MCP 集成](mcp-integration.md#远程服务器与登录)。
 
-`/mcp` 在轮次之间打开。MCP 服务器在对话开始时才连接，所以发出第一条消息之前，面板列出的是 Orca 启动时配置里的服务器，状态为 `not connected yet`（或 `disabled`），详情里只有工具筛选；TUI 打开期间用 `orca mcp add` 添加的服务器，要重启 TUI 后才会出现。这时已经可以用 `l` 和 `o` 登录或退出登录：服务器连接时会用上这次登录。`r` 要等对话开始后才能用。操作进行期间，服务器所在行和详情会显示它（`reconnecting…`、带授权地址的 `waiting for browser login…`，或 `logging out…`）。通过 `orca attach` 挂接到 daemon 会话的 TUI 不能管理 daemon 的服务器：在本机运行 `orca mcp login <name>`，然后重新挂接。
+`/mcp` 在轮次之间打开。MCP 服务器在对话开始时才连接，所以发出第一条消息之前，面板列出的是 Orca 启动时配置里的服务器，状态为 `not connected yet`（或 `disabled`），详情里只有工具筛选；TUI 打开期间用 `orca mcp add` 添加的服务器，要重启 TUI 后才会出现。这时已经可以用 `l` 和 `o` 登录或退出登录：服务器连接时会用上这次登录。`r` 要等对话开始后才能用。操作进行期间，服务器所在行和详情会显示它（`reconnecting…`、带授权地址的 `waiting for browser login…`，或 `logging out…`）。通过 `orca attach` 挂接到 daemon 会话的 TUI 不能管理 daemon 的服务器。daemon 在打开会话时连接它的服务器，所以在本机运行 `orca mcp login <name>` 之后，用 `orca attach new` 开的 daemon 会话会用上这次登录；daemon 已经打开的会话，要等 daemon 重启、重新挂接后才会用上。
 
 ## MCP prompt 命令
 
