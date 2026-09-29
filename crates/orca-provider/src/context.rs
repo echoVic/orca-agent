@@ -815,7 +815,8 @@ fn compact_with_summary_inner(
     cancel: Option<&CancelToken>,
 ) -> CompactionResult {
     let normalized = normalized_for_compaction(conversation);
-    let pressure = context_pressure(&normalized, context_config, provider_config);
+    let measured = measure_prompt(&normalized, provider_config);
+    let pressure = context_pressure_for_tokens(measured.tokens, context_config);
     if !pressure.should_soft_compact && !pressure.should_hard_compact {
         return CompactionResult {
             conversation: normalized,
@@ -823,13 +824,19 @@ fn compact_with_summary_inner(
         };
     }
     let micro_target = context_config.soft_limit().saturating_mul(9) / 10;
+    // Pressure is the provider's count; trim on that scale too, or a count
+    // above the estimate leaves the estimate under the target and nothing cut.
+    let ratio = (measured.tokens as f64 / measured.estimated.max(1) as f64).max(1.0);
+    let count = |candidate: &Conversation| {
+        (wire_equivalent_tokens(candidate, provider_config) as f64 * ratio) as usize
+    };
     let micro_compacted = cache_aware_micro_compaction(
         &normalized,
         micro_target,
         context_config.target_compaction_limit(),
-        |candidate| wire_equivalent_tokens(candidate, provider_config),
+        count,
     );
-    if wire_equivalent_tokens(&micro_compacted, provider_config) <= micro_target {
+    if count(&micro_compacted) <= micro_target {
         let mut conversation = micro_compacted;
         conversation.clear_usage_anchor();
         return CompactionResult {
@@ -2886,6 +2893,45 @@ mod tests {
         let result = compact_with_summary(ProviderKind::DeepSeek, &conv, &config, &provider_config);
 
         assert!(result.conversation.usage_anchor.is_none());
+    }
+
+    #[test]
+    fn compaction_trims_to_the_anchored_count_when_the_estimate_reads_low() {
+        let provider_config = bare_provider_config();
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        for index in 0..6 {
+            conv.add_user(format!("inspect file {index}"));
+            conv.add_assistant(
+                None,
+                None,
+                vec![RawToolCall {
+                    id: format!("call-{index}"),
+                    function_name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            );
+            conv.add_tool_result(format!("call-{index}"), "evidence ".repeat(1_000));
+        }
+        conv.add_user("current request".to_string());
+        let estimated = wire_equivalent_tokens(&conv, &provider_config);
+        // The provider counted a fifth more than Orca's estimate.
+        conv.record_usage_anchor((estimated * 6 / 5) as u64, estimated, conv.messages.len());
+        let config = ContextConfig {
+            max_tokens: 100_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(100_000),
+            soft_compact_token_limit: Some(estimated * 10 / 9 + 50),
+        };
+        // Over the line by the anchored count, under the micro target by the estimate.
+        assert!(measure_prompt(&conv, &provider_config).tokens > config.soft_limit());
+        assert!(estimated < config.soft_limit() * 9 / 10);
+
+        let result = compact_with_summary(ProviderKind::Mock, &conv, &config, &provider_config);
+
+        let after = wire_equivalent_tokens(&result.conversation, &provider_config);
+        assert!(after < estimated, "estimate {estimated} stayed at {after}");
     }
 
     #[test]

@@ -5592,22 +5592,7 @@ async fn run_host_supervisor(
                         continue;
                     }
                     // A recovered context keeps the ceiling its ledger recorded.
-                    if let Some(event) = surface_context_limit_event(
-                        resident.coordinator.state().snapshot(),
-                        &actor_config,
-                    ) {
-                        let batch = runtime_surface_event_batch(
-                            resident.coordinator.state().snapshot(),
-                            vec![event],
-                            None,
-                        );
-                        if let Err(error) = resident.coordinator.commit_actor_batch(&batch) {
-                            let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
-                                message: format!("failed to refresh the context limit: {error:?}"),
-                            }));
-                            continue;
-                        }
-                    }
+                    refresh_recovered_context_limit(&mut resident.coordinator, &actor_config);
                 }
                 startup_warnings.extend(
                     crate::shell_readiness::ShellReadiness::run_startup_warnings(&actor_config),
@@ -10898,16 +10883,17 @@ fn surface_context_limit_tokens(config: &RunConfig) -> u64 {
     .max(1) as u64
 }
 
-/// Moves the meter's ceiling to the compaction line of `config`, or `None`
-/// when it is already there. Every Context event carries the ceiling forward,
-/// so a resumed ledger replays the one it recorded and a settings change would
-/// otherwise keep the old line.
+/// Moves the meter's ceiling to the compaction line of `config` and keeps
+/// usage under it, or `None` when both already hold. Every Context event
+/// carries the ceiling forward, so a resumed ledger replays the one it
+/// recorded and a settings change would otherwise keep the old line.
 fn surface_context_limit_event(
     snapshot: &surface::SurfaceSnapshot,
     config: &RunConfig,
 ) -> Option<(surface::SurfaceScope, surface::SurfaceEvent)> {
     let limit_tokens = surface_context_limit_tokens(config);
-    if snapshot.context.limit_tokens == limit_tokens {
+    if snapshot.context.limit_tokens == limit_tokens && snapshot.context.used_tokens <= limit_tokens
+    {
         return None;
     }
     let mut context = snapshot.context.clone();
@@ -10921,6 +10907,37 @@ fn surface_context_limit_event(
         surface::SurfaceScope::Thread,
         surface::SurfaceEvent::Context(context),
     ))
+}
+
+/// Commits a recovered thread's ceiling refresh. Ledger failures are retried
+/// like other actor commits, since a partial append or failed checkpoint
+/// leaves the batch incomplete and blocks later commits. A final failure is
+/// only logged: a stale meter must not stop the thread starting.
+fn refresh_recovered_context_limit(
+    coordinator: &mut surface::RuntimeCommitCoordinator<
+        'static,
+        surface::RuntimeSurfaceCommitLedger,
+    >,
+    config: &RunConfig,
+) {
+    let Some(event) = surface_context_limit_event(coordinator.state().snapshot(), config) else {
+        return;
+    };
+    let batch = runtime_surface_event_batch(coordinator.state().snapshot(), vec![event], None);
+    for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+        match coordinator.commit_actor_batch(&batch) {
+            Ok(_) => return,
+            Err(surface::SurfaceCommitError::Ledger(
+                surface::SurfaceLedgerError::AppendFailed
+                | surface::SurfaceLedgerError::PartialAppend
+                | surface::SurfaceLedgerError::CheckpointFailed,
+            )) if attempt + 1 < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS => {}
+            Err(error) => {
+                eprintln!("orca: failed to refresh the context limit: {error:?}");
+                return;
+            }
+        }
+    }
 }
 
 fn initial_surface_snapshot(
@@ -11129,7 +11146,11 @@ fn initial_surface_snapshot(
         context: surface::SurfaceContextSnapshot {
             revision: surface::ContextRevision::try_new(1).expect("one is a valid revision"),
             window_id: context_window_id,
-            used_tokens: restored_context_tokens.unwrap_or(0),
+            // A legacy session's last request can sit past the compaction
+            // line; the reducer rejects any later context update above it.
+            used_tokens: restored_context_tokens
+                .unwrap_or(0)
+                .min(context_limit_tokens),
             limit_tokens: context_limit_tokens,
             compaction: surface::CompactionState::Idle,
             fragments: Vec::new(),
@@ -23498,6 +23519,35 @@ mod tests {
         assert_eq!(surface_context_limit_tokens(&run_config), 768_928);
         run_config.reasoning_effort = orca_core::config::ReasoningEffort::High;
         assert_eq!(surface_context_limit_tokens(&run_config), 800_000);
+    }
+
+    #[test]
+    fn context_limit_event_clamps_usage_above_a_current_ceiling() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled);
+        let mut snapshot = initial_surface_snapshot(
+            surface::SurfaceThreadId::try_from_bytes(*uuid::Uuid::new_v4().as_bytes()).unwrap(),
+            surface::SurfaceIncarnation::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+            surface::ThreadOwnerEpoch::new(1),
+            surface::ThreadPersistence::EphemeralAttached,
+            &config,
+            "meter ceiling",
+            None,
+        )
+        .unwrap();
+        assert_eq!(snapshot.context.limit_tokens, 768_928);
+        assert!(surface_context_limit_event(&snapshot, &config).is_none());
+
+        // The ceiling is current, but the usage past it still needs the clamp.
+        snapshot.context.used_tokens = 800_000;
+        let Some((surface::SurfaceScope::Thread, surface::SurfaceEvent::Context(context))) =
+            surface_context_limit_event(&snapshot, &config)
+        else {
+            panic!("usage above the ceiling must be clamped");
+        };
+        assert_eq!(context.limit_tokens, 768_928);
+        assert_eq!(context.used_tokens, 768_928);
+        assert_eq!(context.revision.get(), snapshot.context.revision.get() + 1);
     }
 
     fn test_absolute_path(name: &str) -> PathBuf {
@@ -39138,6 +39188,87 @@ mod tests {
         assert_eq!(snapshot.context.used_tokens, 41_483);
         // The compaction line at the default Max effort.
         assert_eq!(snapshot.context.limit_tokens, 768_928);
+
+        resumed
+            .shutdown()
+            .expect("shutdown resumed legacy context thread");
+        resumed_host
+            .shutdown()
+            .expect("shutdown resumed legacy context host");
+    }
+
+    #[test]
+    fn legacy_resume_past_the_compaction_line_starts_within_the_ceiling() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+
+        let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+            .expect("start legacy context fixture host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "legacy context past the line",
+            )
+            .expect("start legacy context fixture thread");
+        let thread_id = thread.thread_id().to_string();
+        let transcript_path = SessionStore::new()
+            .load_session(&thread_id)
+            .expect("load legacy context fixture")
+            .path;
+        thread
+            .shutdown()
+            .expect("shutdown legacy context fixture thread");
+        host.shutdown()
+            .expect("shutdown legacy context fixture host");
+
+        // The last legacy request sent 800,000 prompt tokens, past the
+        // 768,928 compaction line, and no Context event recorded a ceiling.
+        let mut writer = crate::thread_store::SessionWriter::append_to_existing(transcript_path)
+            .expect("open legacy context fixture transcript");
+        writer
+            .append_usage(UsageTotals {
+                input_tokens: 800_000,
+                output_tokens: 10_000,
+                cache_tokens: 790_000,
+                estimated_cost_usd: 0.05,
+            })
+            .expect("append legacy usage snapshot");
+        drop(writer);
+
+        let resumed_host = RuntimeHost::start().expect("start resumed legacy context host");
+        let resumed = resumed_host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id)),
+                "resume legacy context past the line",
+            )
+            .expect("resume legacy context fixture");
+        let surface = resumed.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        assert_eq!(attachment.baseline.snapshot.context.limit_tokens, 768_928);
+        assert_eq!(attachment.baseline.snapshot.context.used_tokens, 768_928);
+
+        // Manual compaction copies the context into its running state, which
+        // the reducer rejects when usage is above the ceiling.
+        let output = committed_surface_value(
+            attachment
+                .client
+                .manual_compact(
+                    surface_request_id(),
+                    attachment.baseline.snapshot.context.revision,
+                )
+                .expect("start manual compaction"),
+        );
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), output.operation_id)
+            .expect("wait manual compaction terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
 
         resumed
             .shutdown()

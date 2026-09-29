@@ -35,10 +35,9 @@ impl RuntimeCompactionTrigger {
     }
 
     /// A request with no room for a minimal reply, and one the provider
-    /// rejected as too long, must make room: they force a real reduction and
-    /// keep the result only when it shrank the prompt. Pressure past the hard
-    /// line is ordinary compaction; at the default Max effort that line is
-    /// the soft line.
+    /// rejected as too long, must make room: they force a real reduction.
+    /// Pressure past the hard line is ordinary compaction; at the default Max
+    /// effort that line is the soft line.
     fn is_emergency(self) -> bool {
         matches!(self, Self::Overflow | Self::PromptTooLong)
     }
@@ -658,8 +657,8 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             )
         };
         let after = context::measure_prompt(&compaction.conversation, self.provider_config);
-        if trigger.is_emergency() && after.estimated >= before.estimated {
-            // Nothing shrank: keep the history as it was.
+        if after.estimated >= before.estimated {
+            // Nothing shrank: keep the history as it was, and persist nothing.
             return Ok((
                 task.finish(before_messages, &compaction.kind),
                 RuntimeCompactionAdoption {
@@ -1248,6 +1247,60 @@ mod tests {
                 .unwrap()
                 .contains("\"type\":\"context.compacted\"")
         );
+    }
+
+    #[test]
+    fn ordinary_compaction_that_cannot_shrink_is_not_adopted() {
+        // Soft line only (SoftLimit), then soft == hard (HardLimit).
+        for (soft, hard) in [(300, 100_000), (300, 300)] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("context.jsonl");
+            let meta =
+                crate::history::create_meta(temp.path(), "mock", None, "unshrinkable compaction");
+            let mut record = serde_json::to_value(meta).unwrap();
+            record["type"] = serde_json::json!("session.meta");
+            fs::write(&path, format!("{record}\n")).unwrap();
+            let mut writer = SessionWriter::append_to_existing(path.clone()).unwrap();
+            // Only the current request, too large on its own: nothing to collapse or trim.
+            let mut conversation = Conversation::new();
+            conversation.add_system("immutable instructions".to_string());
+            conversation.add_user("evidence ".repeat(2_000));
+            let before = format!("{:?}", conversation.messages);
+            let config = context::ContextConfig {
+                max_tokens: 100_000,
+                compaction_threshold: 1.0,
+                reserved_for_response: 0,
+                auto_compact_token_limit: Some(hard),
+                soft_compact_token_limit: Some(soft),
+            };
+            let hooks = HookRunner::default();
+            let mut events = EventFactory::new("unshrinkable-compaction".to_string());
+            let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+            let subagent_type = SubagentType::General;
+
+            let adopted = RuntimeCompactionStep::new(
+                orca_core::config::ProviderKind::Mock,
+                &config,
+                &bare_provider_config(),
+                RuntimeTurnContext::new(temp.path(), "", 0, false, &subagent_type),
+                &hooks,
+                &mut events,
+                &mut sink,
+                Some(&mut writer),
+            )
+            .compact_if_needed(&mut conversation)
+            .expect("compaction");
+
+            assert!(!adopted, "soft {soft}, hard {hard}");
+            assert_eq!(format!("{:?}", conversation.messages), before);
+            drop(writer);
+            assert!(
+                !fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("\"type\":\"context.manual_compaction_snapshot\""),
+                "soft {soft}, hard {hard}"
+            );
+        }
     }
 
     fn bare_provider_config() -> ProviderConfig {
