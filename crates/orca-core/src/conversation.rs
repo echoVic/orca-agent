@@ -39,6 +39,11 @@ impl ConversationTarget {
 pub const MISSING_TOOL_TERMINAL_ERROR: &str = "Tool invocation outcome is indeterminate because its terminal result was missing from recovered history. Inspect external state before retrying.";
 pub const IMAGE_ANALYSIS_MESSAGE_PREFIX: &str = "[Image analysis:";
 
+// Deliveries that earlier versions pinned: background task and subagent
+// notices, and parent guidance to a subagent. Every turn holding one was
+// kept whole by compaction, so a long session could no longer shrink.
+const DELIVERED_NOTICE_PREFIXES: [&str; 2] = ["<task-notification>", "[Parent guidance id="];
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RawToolCall {
     pub id: String,
@@ -500,6 +505,21 @@ impl Conversation {
                 || content.starts_with("[Earlier conversation history was truncated")
             )
         });
+    }
+
+    /// Unpins delivered notices in sessions written before they became
+    /// ordinary messages.
+    pub fn unpin_delivered_notices(&mut self) {
+        for message in &mut self.messages {
+            if let Message::System { content, pinned } = message
+                && *pinned
+                && DELIVERED_NOTICE_PREFIXES
+                    .iter()
+                    .any(|prefix| content.starts_with(prefix))
+            {
+                *pinned = false;
+            }
+        }
     }
 
     pub fn add_user(&mut self, content: String) {
@@ -1208,6 +1228,35 @@ mod tests {
 
         conv.replace_plan_state("[Pinned plan state]\n[pending] a".to_string());
         assert!(!conv.internal_context.render().contains("[Plan reminder]"));
+    }
+
+    #[test]
+    fn resumed_notices_lose_their_pin_but_user_pins_stay() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user_pinned("keep this constraint".to_string());
+        conv.messages.push(Message::pinned_system(
+            "<task-notification>Terminal session done</task-notification>".to_string(),
+        ));
+        conv.messages.push(Message::pinned_system(
+            "[Parent guidance id=7] look at the tests".to_string(),
+        ));
+        conv.messages.push(Message::pinned_system(
+            "[Plan mode on]\nPlan mode applies".to_string(),
+        ));
+
+        conv.unpin_delivered_notices();
+
+        let pinned = conv
+            .messages
+            .iter()
+            .filter(|message| message.is_pinned())
+            .filter_map(Message::content_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pinned,
+            vec!["keep this constraint", "[Plan mode on]\nPlan mode applies"]
+        );
     }
 
     #[test]

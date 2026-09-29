@@ -2110,7 +2110,7 @@ mod tests {
         assert!(conversation.messages.iter().any(|message| {
             matches!(
                 message,
-                Message::System { content, pinned: true }
+                Message::System { content, pinned: false }
                     if content.contains("Cost budget is low")
             )
         }));

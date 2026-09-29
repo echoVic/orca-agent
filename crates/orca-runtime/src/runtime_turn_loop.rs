@@ -313,7 +313,7 @@ impl RuntimeTurnLoopStep {
                             None => !present,
                         };
                         if !present {
-                            conversation.add_system_pinned(content);
+                            conversation.add_system(content);
                         }
                         emit_safe_child_checkpoint(
                             input.prepared_conversation,
@@ -483,7 +483,7 @@ fn deliver_child_results<W: io::Write>(
             }
         }
         if !present {
-            conversation.add_system_pinned(content);
+            conversation.add_system(content);
         }
         if let Err(error) = emit_safe_child_checkpoint(
             input.prepared_conversation,
@@ -701,7 +701,7 @@ fn park_pending_task_wait<W: io::Write>(
         None => !present,
     };
     if !present {
-        conversation.add_system_pinned(content);
+        conversation.add_system(content);
     }
     emit_safe_child_checkpoint(
         input.prepared_conversation,

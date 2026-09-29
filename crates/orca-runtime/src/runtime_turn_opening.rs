@@ -126,14 +126,14 @@ impl RuntimeTurnOpeningStep {
             RuntimeTurnStartResult::Continue => {}
         }
 
-        // Soft-land before a hard budget wall: inject a pinned system reminder
-        // when remaining budget crosses configured thresholds. Reminders come
-        // from the controller and never mutate usage or success state.
+        // Soft-land before a hard budget wall: inject a system reminder when
+        // remaining budget crosses configured thresholds. Reminders come from
+        // the controller and never mutate usage or success state.
         if let Some(message) = input.operation.controller.take_pending_soft_landing() {
-            input.conversation.add_system_pinned(message);
+            input.conversation.add_system(message);
         }
         if let Some(message) = input.actor.take_pending_cost_budget_soft_landing() {
-            input.conversation.add_system_pinned(message);
+            input.conversation.add_system(message);
         }
 
         let routed_model = RuntimeModelRouteStep::new().route(RuntimeModelRouteInput {

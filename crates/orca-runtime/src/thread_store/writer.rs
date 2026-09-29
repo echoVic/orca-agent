@@ -1358,7 +1358,7 @@ impl SessionWriter {
         let record = StoredConversationRecord::identified(
             ConversationItemId::new(),
             TurnId::new(),
-            StoredMessage::from(&Message::pinned_system(content.to_owned())),
+            StoredMessage::from(&Message::system(content.to_owned())),
         );
         let line = encode_record_line(&self.path, &record.as_session_record())?;
 

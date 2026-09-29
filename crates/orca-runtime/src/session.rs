@@ -135,6 +135,7 @@ pub(crate) fn bootstrap_agent_conversation(
         let mut conv = crate::thread_store::resume_conversation(resumed, system_prompt);
         conv.strip_legacy_pinned_volatile();
         conv.strip_legacy_summary_messages();
+        conv.unpin_delivered_notices();
         conv
     } else {
         let mut conversation = Conversation::new();
@@ -264,6 +265,7 @@ impl InteractiveSession {
                 let mut conv = store.resume_conversation(&transcript, system_prompt);
                 conv.strip_legacy_pinned_volatile();
                 conv.strip_legacy_summary_messages();
+                conv.unpin_delivered_notices();
                 (conv, Some(transcript))
             }
             HistoryMode::ResumeAt {
@@ -282,6 +284,7 @@ impl InteractiveSession {
                 let mut conv = store.resume_conversation(&transcript, system_prompt);
                 conv.strip_legacy_pinned_volatile();
                 conv.strip_legacy_summary_messages();
+                conv.unpin_delivered_notices();
                 (conv, Some(transcript))
             }
             HistoryMode::Record | HistoryMode::Disabled => {

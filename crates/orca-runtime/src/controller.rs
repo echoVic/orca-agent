@@ -2002,7 +2002,7 @@ fn drain_terminal_notifications(
         return;
     };
     for completion in service.drain_completions() {
-        let message = Message::pinned_system(completion.model_notification());
+        let message = Message::system(completion.model_notification());
         session.append_message(&message);
         session.conversation_mut().messages.push(message);
     }
@@ -2038,7 +2038,7 @@ fn drain_subagent_notifications(session: &mut InteractiveSession) {
             Ok(true) if !already_present => session
                 .conversation_mut()
                 .messages
-                .push(Message::pinned_system(content)),
+                .push(Message::system(content)),
             Ok(_) => {}
             Err(_) => {
                 session.task_registry().release_subagent_result_claim(&ack);
@@ -2303,7 +2303,7 @@ mod tests {
         let message_count = thread.session().conversation().messages.len();
         assert!(matches!(
             thread.session().conversation().messages.last(),
-            Some(Message::System { content, pinned: true })
+            Some(Message::System { content, pinned: false })
                 if content.contains("<task-notification>")
                     && content.contains("notified")
                     && content.contains(&started.task_id)
