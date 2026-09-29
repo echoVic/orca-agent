@@ -102,6 +102,7 @@ pub(crate) fn read_manual_compaction_snapshot(
             internal_context: Default::default(),
             rolling_summary: record.rolling_summary,
             summary: record.summary_state,
+            usage_anchor: None,
         },
     }))
 }

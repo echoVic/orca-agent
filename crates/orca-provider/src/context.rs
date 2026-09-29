@@ -663,6 +663,42 @@ pub fn wire_equivalent_tokens(
     wire_equivalent_tokens_with_counter(conversation, provider_config, &DefaultTokenCounter)
 }
 
+/// What the next request's prompt measures. `estimated` is Orca's estimate of
+/// the whole request; `tokens` anchors on the provider's count for the last
+/// request when the conversation still holds what it measured.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PromptMeasurement {
+    pub estimated: usize,
+    pub tokens: usize,
+}
+
+// A reported count this far from Orca's estimate of the same request does not
+// describe that request (usage merged across retries); measure from the
+// estimate instead.
+const ANCHOR_MIN_RATIO: f64 = 0.5;
+const ANCHOR_MAX_RATIO: f64 = 1.6;
+
+pub fn measure_prompt(
+    conversation: &Conversation,
+    provider_config: &ProviderConfig,
+) -> PromptMeasurement {
+    let estimated = wire_equivalent_tokens(conversation, provider_config);
+    let tokens = conversation
+        .valid_usage_anchor()
+        .filter(|anchor| {
+            let ratio = anchor.prompt_tokens as f64 / anchor.estimated_tokens.max(1) as f64;
+            (ANCHOR_MIN_RATIO..=ANCHOR_MAX_RATIO).contains(&ratio)
+        })
+        .map(|anchor| {
+            usize::try_from(anchor.prompt_tokens)
+                .unwrap_or(usize::MAX)
+                .saturating_add(estimated)
+                .saturating_sub(anchor.estimated_tokens)
+        })
+        .unwrap_or(estimated);
+    PromptMeasurement { estimated, tokens }
+}
+
 pub fn needs_compaction_wire(
     conversation: &Conversation,
     config: &ContextConfig,
@@ -676,7 +712,7 @@ pub fn context_pressure(
     config: &ContextConfig,
     provider_config: &ProviderConfig,
 ) -> ContextPressure {
-    let wire_tokens = wire_equivalent_tokens(conversation, provider_config);
+    let wire_tokens = measure_prompt(conversation, provider_config).tokens;
     context_pressure_for_tokens(wire_tokens, config)
 }
 
@@ -794,8 +830,10 @@ fn compact_with_summary_inner(
         |candidate| wire_equivalent_tokens(candidate, provider_config),
     );
     if wire_equivalent_tokens(&micro_compacted, provider_config) <= micro_target {
+        let mut conversation = micro_compacted;
+        conversation.clear_usage_anchor();
         return CompactionResult {
-            conversation: micro_compacted,
+            conversation,
             kind: CompactionKind::LocalTruncation,
         };
     }
@@ -808,19 +846,26 @@ fn compact_with_summary_inner(
         provider_config,
         cancel,
     ) {
-        Some((conversation, summary)) => CompactionResult {
-            conversation,
-            kind: CompactionKind::RemoteSummary(summary),
-        },
-        None => CompactionResult {
-            conversation: local_compaction(
+        Some((mut conversation, summary)) => {
+            conversation.clear_usage_anchor();
+            CompactionResult {
+                conversation,
+                kind: CompactionKind::RemoteSummary(summary),
+            }
+        }
+        None => {
+            let mut conversation = local_compaction(
                 &normalized,
                 context_config,
                 &DefaultTokenCounter,
                 tools_schema_tokens_with_counter(provider_config, &DefaultTokenCounter),
-            ),
-            kind: CompactionKind::LocalTruncation,
-        },
+            );
+            conversation.clear_usage_anchor();
+            CompactionResult {
+                conversation,
+                kind: CompactionKind::LocalTruncation,
+            }
+        }
     }
 }
 
@@ -1771,9 +1816,13 @@ pub fn compact_with_counter(
         |candidate| conversation_tokens_with_counter(candidate, counter),
     );
     if conversation_tokens_with_counter(&micro, counter) <= target {
+        let mut micro = micro;
+        micro.clear_usage_anchor();
         return micro;
     }
-    local_compaction(&normalized, config, counter, 0)
+    let mut result = local_compaction(&normalized, config, counter, 0);
+    result.clear_usage_anchor();
+    result
 }
 
 fn local_compaction(
@@ -2279,6 +2328,52 @@ mod tests {
         assert!(!pressure.should_hard_compact);
     }
 
+    fn bare_provider_config() -> ProviderConfig {
+        ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::default(),
+            tools_override: Some(vec![]),
+            mcp_registry: None,
+            external_tools: vec![],
+            max_output_tokens: None,
+        }
+    }
+
+    #[test]
+    fn measured_prompt_anchors_on_the_reported_count() {
+        let provider_config = bare_provider_config();
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("read the file".to_string());
+        let first = wire_equivalent_tokens(&conv, &provider_config);
+        conv.record_usage_anchor(first as u64 + 5, first, conv.messages.len());
+        conv.add_assistant(Some("reading it now".to_string()), None, vec![]);
+
+        let measurement = measure_prompt(&conv, &provider_config);
+
+        let estimated = wire_equivalent_tokens(&conv, &provider_config);
+        assert_eq!(measurement.estimated, estimated);
+        // The provider counted 5 more than Orca did; only the change since is estimated.
+        assert_eq!(measurement.tokens, estimated + 5);
+    }
+
+    #[test]
+    fn measured_prompt_ignores_an_implausible_anchor() {
+        let provider_config = bare_provider_config();
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("read the file".to_string());
+        let first = wire_equivalent_tokens(&conv, &provider_config);
+        // Three times Orca's own estimate: usage merged across retries.
+        conv.record_usage_anchor(first as u64 * 3, first, conv.messages.len());
+
+        let measurement = measure_prompt(&conv, &provider_config);
+
+        assert_eq!(measurement.tokens, measurement.estimated);
+    }
+
     #[test]
     fn conversation_tokens_can_use_custom_counter() {
         let mut conv = Conversation::new();
@@ -2718,6 +2813,40 @@ mod tests {
         assert!(result.conversation.messages.iter().any(|message| {
             matches!(message, Message::System { content, .. } if content.contains("truncated to fit context window"))
         }));
+    }
+
+    #[test]
+    fn compaction_drops_the_usage_anchor() {
+        let provider_config = bare_provider_config();
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        for index in 0..6 {
+            conv.add_user(format!("inspect file {index}"));
+            conv.add_assistant(
+                None,
+                None,
+                vec![RawToolCall {
+                    id: format!("call-{index}"),
+                    function_name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            );
+            conv.add_tool_result(format!("call-{index}"), "evidence ".repeat(1_000));
+        }
+        conv.add_user("current request".to_string());
+        let estimated = wire_equivalent_tokens(&conv, &provider_config);
+        conv.record_usage_anchor(estimated as u64, estimated, conv.messages.len());
+        let config = ContextConfig {
+            max_tokens: 20_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(20_000),
+            soft_compact_token_limit: Some(1_500),
+        };
+
+        let result = compact_with_summary(ProviderKind::DeepSeek, &conv, &config, &provider_config);
+
+        assert!(result.conversation.usage_anchor.is_none());
     }
 
     #[test]

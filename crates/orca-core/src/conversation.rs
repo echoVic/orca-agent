@@ -341,12 +341,27 @@ pub trait TokenCountable {
     fn count(&self, text: &str) -> usize;
 }
 
+/// The provider's prompt-token count for the last request, with Orca's own
+/// estimate of that same request. The next request is measured as the
+/// reported count plus the estimated change, so only the change carries
+/// estimate error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UsageAnchor {
+    pub prompt_tokens: u64,
+    pub estimated_tokens: usize,
+    message_count: usize,
+    boundary: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub internal_context: InternalContext,
     pub rolling_summary: Option<String>,
     pub summary: SummaryState,
+    /// Not persisted: a resumed conversation measures from a full estimate
+    /// until its first response.
+    pub usage_anchor: Option<UsageAnchor>,
 }
 
 impl Conversation {
@@ -356,6 +371,7 @@ impl Conversation {
             internal_context: InternalContext::default(),
             rolling_summary: None,
             summary: SummaryState::default(),
+            usage_anchor: None,
         }
     }
 
@@ -551,6 +567,65 @@ impl Conversation {
         self.messages.truncate(index);
         Some(prompt)
     }
+
+    /// Anchors measurement on a request built from the first `message_count`
+    /// messages.
+    pub fn record_usage_anchor(
+        &mut self,
+        prompt_tokens: u64,
+        estimated_tokens: usize,
+        message_count: usize,
+    ) {
+        self.usage_anchor = message_count
+            .checked_sub(1)
+            .and_then(|index| self.messages.get(index))
+            .map(|boundary| UsageAnchor {
+                prompt_tokens,
+                estimated_tokens,
+                message_count,
+                boundary: message_fingerprint(boundary),
+            });
+    }
+
+    /// The anchor while the messages it measured are still in place.
+    pub fn valid_usage_anchor(&self) -> Option<UsageAnchor> {
+        let anchor = self.usage_anchor?;
+        let boundary = self.messages.get(anchor.message_count.checked_sub(1)?)?;
+        (message_fingerprint(boundary) == anchor.boundary).then_some(anchor)
+    }
+
+    pub fn clear_usage_anchor(&mut self) {
+        self.usage_anchor = None;
+    }
+}
+
+// Identifies the last message an anchor measured, so an edit or rewind of
+// the history shows up as a different fingerprint.
+fn message_fingerprint(message: &Message) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match message {
+        Message::System { content, .. } => (0_u8, content).hash(&mut hasher),
+        Message::User {
+            content, images, ..
+        } => (1_u8, content, images.len()).hash(&mut hasher),
+        Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } => {
+            (2_u8, content).hash(&mut hasher);
+            for call in tool_calls {
+                call.id.hash(&mut hasher);
+            }
+        }
+        Message::Tool {
+            tool_call_id,
+            content,
+            ..
+        } => (3_u8, tool_call_id, content).hash(&mut hasher),
+    }
+    hasher.finish()
 }
 
 pub fn assistant_message_has_payload(content: Option<&str>, tool_calls: &[RawToolCall]) -> bool {
@@ -1387,5 +1462,32 @@ mod tests {
             Message::Tool { tool_call_id, content, .. }
                 if tool_call_id == "call_1" && content == "first result"
         ));
+    }
+
+    #[test]
+    fn usage_anchor_holds_until_the_measured_messages_change() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("first".to_string());
+        conv.record_usage_anchor(1_000, 900, 2);
+        conv.add_assistant(Some("reply".to_string()), None, vec![]);
+        assert_eq!(
+            conv.valid_usage_anchor()
+                .map(|anchor| (anchor.prompt_tokens, anchor.estimated_tokens)),
+            Some((1_000, 900))
+        );
+
+        // Editing a measured message invalidates the anchor.
+        conv.messages[1] = Message::user("edited".to_string());
+        assert!(conv.valid_usage_anchor().is_none());
+
+        // So does rewinding past it.
+        conv.record_usage_anchor(1_000, 900, 2);
+        conv.messages.truncate(1);
+        assert!(conv.valid_usage_anchor().is_none());
+
+        // An anchor over no messages measures nothing.
+        conv.record_usage_anchor(1_000, 900, 0);
+        assert!(conv.valid_usage_anchor().is_none());
     }
 }
