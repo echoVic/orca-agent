@@ -142,7 +142,7 @@ fn below_pressure_keeps_exact_prefix_and_dynamic_overlay_trails_history() {
 }
 
 #[test]
-fn hard_pressure_keeps_pinned_and_current_tool_turn_atomically() {
+fn hard_pressure_keeps_pinned_units_and_the_current_turn_tail() {
     let mut conversation = tool_fixture();
     if let Message::Tool { pinned, .. } = &mut conversation.messages[4] {
         *pinned = true;
@@ -165,36 +165,114 @@ fn hard_pressure_keeps_pinned_and_current_tool_turn_atomically() {
         ],
     );
     conversation.add_tool_result("pending-b".to_string(), "completed b".to_string());
-    let normalized = normalized_for_compaction(&conversation);
-    let active = turn_ranges(&normalized.messages).last().unwrap().clone();
-    let expected = format_messages(&normalized.messages[active]);
     let config = config(500, 700);
     let result = compact_with_summary(ProviderKind::DeepSeek, &conversation, &config, &provider());
-    let active = turn_ranges(&result.conversation.messages)
-        .last()
-        .unwrap()
-        .clone();
-    assert_eq!(
-        format_messages(&result.conversation.messages[active]),
-        expected
-    );
-    assert!(result.conversation.messages.iter().any(|message| matches!(message,
+    let messages = &result.conversation.messages;
+    // The message that opened the current turn stays, and so does its newest unit.
+    assert!(messages.iter().any(|message| message.content_str() == Some("inspect file 99")));
+    assert!(messages.iter().any(|message| matches!(message,
+        Message::Tool { tool_call_id, terminal: Some(_), .. } if tool_call_id == "pending-a")));
+    // The pinned tool result keeps the call that produced it.
+    assert!(messages.iter().any(|message| matches!(message,
         Message::Assistant { tool_calls, .. } if tool_calls.iter().any(|call| call.id == "call-0"))));
-    assert!(
-        result
-            .conversation
-            .messages
-            .iter()
-            .any(|message| matches!(message,
-        Message::Tool { tool_call_id, terminal: Some(_), .. } if tool_call_id == "pending-a"))
+    assert!(!messages.iter().any(|message| message.content_str() == Some("inspect file 2")));
+}
+
+#[test]
+fn pinned_notices_in_every_turn_do_not_block_compaction() {
+    let mut conversation = Conversation::new();
+    conversation.add_system("immutable instructions".to_string());
+    for index in 0..6 {
+        tool_turn(&mut conversation, index, 1_000);
+        conversation.add_system_pinned(format!(
+            "<task-notification>task {index} finished</task-notification>"
+        ));
+    }
+    conversation.add_user("current request".to_string());
+    let before = conversation.messages.len();
+
+    let result = compact_with_summary(
+        ProviderKind::DeepSeek,
+        &conversation,
+        &config(500, 700),
+        &provider(),
     );
-    assert!(
-        !result
-            .conversation
-            .messages
-            .iter()
-            .any(|message| message.content_str() == Some("inspect file 2"))
+    let messages = &result.conversation.messages;
+
+    assert!(messages.len() < before, "nothing was compacted");
+    for index in 0..6 {
+        let notice = format!("<task-notification>task {index} finished</task-notification>");
+        assert!(messages.iter().any(|message| message.is_pinned()
+            && message.content_str() == Some(notice.as_str())));
+    }
+    assert!(!messages.iter().any(|message| matches!(message,
+        Message::Tool { tool_call_id, .. } if tool_call_id == "call-0")));
+    assert!(messages.iter().any(|message| message.content_str() == Some("current request")));
+}
+
+#[test]
+fn compaction_cuts_into_a_long_current_turn() {
+    let mut conversation = Conversation::new();
+    conversation.add_system("immutable instructions".to_string());
+    conversation.add_user("refactor the whole module".to_string());
+    for index in 0..30 {
+        conversation.add_assistant(
+            None,
+            Some("next step".to_string()),
+            vec![RawToolCall {
+                id: format!("call-{index}"),
+                function_name: "read_file".to_string(),
+                arguments: format!(r#"{{"path":"file-{index}.rs"}}"#),
+            }],
+        );
+        conversation.add_tool_result(format!("call-{index}"), "evidence ".repeat(200));
+    }
+
+    let result = compact_with_summary(
+        ProviderKind::DeepSeek,
+        &conversation,
+        &config(2_000, 3_000),
+        &provider(),
     );
+    let messages = &result.conversation.messages;
+
+    assert!(messages.len() < conversation.messages.len(), "nothing was compacted");
+    assert!(messages.iter().any(|message| message.content_str() == Some("refactor the whole module")));
+    assert!(messages.iter().any(|message| matches!(message,
+        Message::Tool { tool_call_id, .. } if tool_call_id == "call-29")));
+    assert!(!messages.iter().any(|message| matches!(message,
+        Message::Tool { tool_call_id, .. } if tool_call_id == "call-0")));
+    // Every kept tool result still follows the call that asked for it.
+    for (index, message) in messages.iter().enumerate() {
+        if let Message::Tool { tool_call_id, .. } = message {
+            assert!(messages[..index].iter().any(|earlier| matches!(earlier,
+                Message::Assistant { tool_calls, .. }
+                    if tool_calls.iter().any(|call| &call.id == tool_call_id))));
+        }
+    }
+}
+
+#[test]
+fn micro_compaction_shortens_output_beside_a_pinned_notice() {
+    let mut conversation = tool_fixture();
+    // Right after the first turn's tool result.
+    conversation.messages.insert(
+        5,
+        Message::pinned_system("<task-notification>done</task-notification>".to_string()),
+    );
+
+    let result = compact_with_summary(
+        ProviderKind::DeepSeek,
+        &conversation,
+        &config(1_500, 20_000),
+        &provider(),
+    );
+    let messages = &result.conversation.messages;
+
+    assert!(matches!(&messages[4],
+        Message::Tool { content, .. } if content.starts_with("[tool output micro-compact]")));
+    assert!(matches!(&messages[5],
+        Message::System { content, pinned: true } if content.contains("done")));
 }
 
 #[test]

@@ -1018,24 +1018,42 @@ fn leading_system_count(messages: &[Message]) -> usize {
         .count()
 }
 
-// Image-analysis user messages are an internal continuation of the request,
-// not a new turn. Tool invocations and their repaired terminals remain atomic.
-fn turn_ranges(messages: &[Message]) -> Vec<std::ops::Range<usize>> {
-    let prefix = leading_system_count(messages);
-    let mut starts = vec![];
-    for (index, message) in messages.iter().enumerate().skip(prefix) {
-        if index == prefix
-            || matches!(message, Message::User { content, .. }
-            if !content.starts_with(orca_core::conversation::IMAGE_ANALYSIS_MESSAGE_PREFIX))
-        {
-            starts.push(index);
-        }
-    }
-    starts
+/// Compaction works on units: a user message that opens a turn, or an
+/// assistant message together with the tool results that answer it. System
+/// notices and image-analysis messages ride with the unit before them, so a
+/// cut never separates a tool call from its result.
+struct CompactionUnit {
+    range: std::ops::Range<usize>,
+    opens_turn: bool,
+}
+
+fn compaction_units(messages: &[Message]) -> Vec<CompactionUnit> {
+    let mut units: Vec<CompactionUnit> = Vec::new();
+    for (index, message) in messages
         .iter()
         .enumerate()
-        .map(|(index, start)| *start..starts.get(index + 1).copied().unwrap_or(messages.len()))
-        .collect()
+        .skip(leading_system_count(messages))
+    {
+        let opens_turn = matches!(message, Message::User { content, .. }
+            if !content.starts_with(orca_core::conversation::IMAGE_ANALYSIS_MESSAGE_PREFIX));
+        if units.is_empty() || opens_turn || matches!(message, Message::Assistant { .. }) {
+            units.push(CompactionUnit {
+                range: index..index + 1,
+                opens_turn,
+            });
+        } else if let Some(unit) = units.last_mut() {
+            unit.range.end = index + 1;
+        }
+    }
+    units
+}
+
+// A pinned assistant or tool message keeps its whole unit: kept alone, a tool
+// result would lose the call it answers.
+fn unit_pinned_whole(messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        message.is_pinned() && matches!(message, Message::Assistant { .. } | Message::Tool { .. })
+    })
 }
 
 fn partition_for_compaction(
@@ -1047,73 +1065,80 @@ fn partition_for_compaction(
     let messages = &conversation.messages;
     let target_tokens = config.target_compaction_limit();
     let prefix = messages[..leading_system_count(messages)].to_vec();
-    let turns = turn_ranges(messages);
-    let mut retain = turns
+    let units = compaction_units(messages);
+    let newest = units.len().checked_sub(1)?;
+    let current_opener = units.iter().rposition(|unit| unit.opens_turn);
+    let tokens = |message: &Message| message_tokens_with_counter(message, counter);
+    let cost = |unit: &CompactionUnit| messages[unit.range.clone()].iter().map(tokens).sum::<usize>();
+    let pinned_cost = |unit: &CompactionUnit| {
+        messages[unit.range.clone()]
+            .iter()
+            .filter(|message| message.is_pinned())
+            .map(tokens)
+            .sum::<usize>()
+    };
+    let image_cost = |unit: &CompactionUnit| {
+        messages[unit.range.clone()]
+            .iter()
+            .map(|message| match message {
+                Message::User { images, .. } => images.iter().map(image_tokens).sum::<usize>(),
+                _ => 0,
+            })
+            .sum::<usize>()
+    };
+
+    // Always kept: the newest unit, the message that opened the current turn,
+    // units whose pinned assistant or tool message cannot stand alone, and
+    // every other pinned message on its own.
+    let mut retain = units
         .iter()
         .enumerate()
-        .map(|(index, range)| {
-            index + 1 == turns.len() || messages[range.clone()].iter().any(Message::is_pinned)
+        .map(|(index, unit)| {
+            index == newest
+                || Some(index) == current_opener
+                || unit_pinned_whole(&messages[unit.range.clone()])
         })
         .collect::<Vec<_>>();
-    let costs = turns
-        .iter()
-        .map(|range| {
-            messages[range.clone()]
-                .iter()
-                .map(|message| message_tokens_with_counter(message, counter))
-                .sum::<usize>()
-        })
-        .collect::<Vec<_>>();
-    let mut budget = prefix
-        .iter()
-        .map(|message| message_tokens_with_counter(message, counter))
-        .sum::<usize>()
+    let mut budget = prefix.iter().map(tokens).sum::<usize>()
         + internal_context_tokens_with_counter(conversation, counter)
         + tool_tokens
         + summary_budget(config)
         + 32
-        + costs
+        + units
             .iter()
             .zip(&retain)
-            .filter_map(|(cost, keep)| keep.then_some(cost))
+            .map(|(unit, keep)| if *keep { cost(unit) } else { pinned_cost(unit) })
             .sum::<usize>();
-    let image_costs = turns
-        .iter()
-        .map(|range| {
-            messages[range.clone()]
-                .iter()
-                .map(|message| {
-                    if let Message::User { images, .. } = message {
-                        images.iter().map(image_tokens).sum::<usize>()
-                    } else {
-                        0
-                    }
-                })
-                .sum::<usize>()
-        })
-        .collect::<Vec<_>>();
+
+    let image_allowance = MAX_HISTORY_IMAGE_TOKENS.min(target_tokens / 4);
     let mut retained_history_images = 0;
-    let mut tail_fits = true;
-    for index in (0..turns.len()).rev() {
+    for index in (0..units.len()).rev() {
         if retain[index] {
             continue;
         }
-        if tail_fits
-            && budget.saturating_add(costs[index]) <= target_tokens
-            && retained_history_images + image_costs[index]
-                <= MAX_HISTORY_IMAGE_TOKENS.min(target_tokens / 4)
+        let unit = &units[index];
+        let unit_cost = cost(unit).saturating_sub(pinned_cost(unit));
+        if budget.saturating_add(unit_cost) > target_tokens
+            || retained_history_images + image_cost(unit) > image_allowance
         {
-            retain[index] = true;
-            budget += costs[index];
-            retained_history_images += image_costs[index];
-        } else {
-            tail_fits = false;
+            // Keep only a contiguous recent tail.
+            break;
         }
+        retain[index] = true;
+        budget += unit_cost;
+        retained_history_images += image_cost(unit);
     }
+
     let mut kept = vec![];
     let mut collapsed = vec![];
-    for (range, retain) in turns.into_iter().zip(retain) {
-        if retain { &mut kept } else { &mut collapsed }.extend_from_slice(&messages[range]);
+    for (unit, keep) in units.iter().zip(retain) {
+        for message in &messages[unit.range.clone()] {
+            if keep || message.is_pinned() {
+                kept.push(message.clone());
+            } else {
+                collapsed.push(message.clone());
+            }
+        }
     }
     (!collapsed.is_empty()).then_some(CompactionPartition {
         prefix,
@@ -1902,19 +1927,17 @@ fn cache_aware_micro_compaction(
     count: impl Fn(&Conversation) -> usize,
 ) -> Conversation {
     let mut result = conversation.clone();
-    let turns = turn_ranges(&result.messages);
+    let units = compaction_units(&result.messages);
     let image_budget = MAX_HISTORY_IMAGE_TOKENS.min(retention_budget / 4);
     let mut remaining_images = image_budget;
-    // Evidence recency takes priority over prefix reuse for images. Protected
-    // turns are exempt; otherwise keep whole image groups within the allowance.
-    for range in turns.iter().rev().skip(1) {
-        if result.messages[range.clone()]
-            .iter()
-            .any(Message::is_pinned)
-        {
-            continue;
-        }
-        for message in result.messages[range.clone()].iter_mut().rev() {
+    // Evidence recency takes priority over prefix reuse for images. The
+    // newest unit and pinned messages are exempt; otherwise keep whole image
+    // groups within the allowance.
+    for unit in units.iter().rev().skip(1) {
+        for message in result.messages[unit.range.clone()].iter_mut().rev() {
+            if message.is_pinned() {
+                continue;
+            }
             if let Message::User {
                 content, images, ..
             } = message
@@ -1933,31 +1956,30 @@ fn cache_aware_micro_compaction(
         }
     }
     // Work backwards only until enough capacity is recovered. Everything
-    // before the first changed turn remains an exact, useful cache prefix.
-    for range in turns.iter().rev().skip(1) {
-        if count(&result) <= target {
+    // before the first changed unit remains an exact, useful cache prefix.
+    // Track the estimate by the tokens each rewrite saves instead of
+    // re-counting the whole conversation per unit.
+    let mut estimate = count(&result);
+    for unit in units.iter().rev().skip(1) {
+        if estimate <= target {
             break;
         }
-        if result.messages[range.clone()]
-            .iter()
-            .any(Message::is_pinned)
-        {
-            continue;
-        }
-        for message in &mut result.messages[range.clone()] {
-            match message {
-                Message::Tool { content, .. }
-                    if content.len() > STALE_TOOL_OUTPUT_BYTES
-                        && !content.starts_with("[tool output micro-compact]") =>
-                {
-                    let reduced = micro_compact_tool_output(content);
-                    if DefaultTokenCounter.count_text(&reduced)
-                        < DefaultTokenCounter.count_text(content)
-                    {
-                        *content = reduced;
-                    }
+        for message in &mut result.messages[unit.range.clone()] {
+            if let Message::Tool {
+                content,
+                pinned: false,
+                ..
+            } = message
+                && content.len() > STALE_TOOL_OUTPUT_BYTES
+                && !content.starts_with("[tool output micro-compact]")
+            {
+                let reduced = micro_compact_tool_output(content);
+                let before = DefaultTokenCounter.count_text(content);
+                let after = DefaultTokenCounter.count_text(&reduced);
+                if after < before {
+                    *content = reduced;
+                    estimate = estimate.saturating_sub(before - after);
                 }
-                _ => {}
             }
         }
     }
