@@ -5617,10 +5617,11 @@ fn format_elapsed_compact(elapsed_secs: u64) -> String {
     format!("{hours}h {minutes:02}m {seconds:02}s")
 }
 
-/// Remaining context as a percentage of the full model window (100% = empty).
-/// Fed by the provider-reported prompt tokens once a turn completes; a fresh
-/// session reads high. Pure local observability — never sent upstream, so it
-/// cannot affect DeepSeek's prefix cache. Hidden until a real budget is known.
+/// Room left before automatic compaction, as a percentage of the compaction
+/// line (100% = empty, 0% = compaction is due). Fed by the provider-reported
+/// prompt tokens once a turn completes. Pure local observability — never sent
+/// upstream, so it cannot affect DeepSeek's prefix cache. Hidden until a real
+/// budget is known.
 fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
     let used_tokens = state.context_used_tokens();
     let limit_tokens = state.context_limit_tokens();

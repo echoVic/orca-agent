@@ -424,7 +424,7 @@ fn format_status(state: &AppState, config: &RunConfig) -> String {
     } else {
         let used = context_used_tokens.min(context_limit_tokens);
         let remaining = context_limit_tokens.saturating_sub(used);
-        format!("{remaining} remaining / {context_limit_tokens} total")
+        format!("{remaining} left before compaction (compacts at {context_limit_tokens})")
     };
     let usage = state.usage();
     let active_tasks = state
@@ -790,7 +790,7 @@ mod tests {
             "execution profile: read-only",
             "shell sandbox: read-only",
             "/tmp/project",
-            "750 remaining / 1000 total",
+            "750 left before compaction (compacts at 1000)",
             "100 input, 50 output, 25 cache",
             "$0.125000",
             "recoverable: yes",

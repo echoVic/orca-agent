@@ -10867,6 +10867,19 @@ fn hydrate_session_pinned_context_from_surface(
     }
 }
 
+/// The context meter's ceiling: the line where automatic compaction starts,
+/// so "ctx 0%" means compaction is due rather than that requests will fail.
+fn surface_context_limit_tokens(config: &RunConfig) -> u64 {
+    let model = config.model.as_option();
+    orca_provider::context::ContextConfig::for_model_with_runtime(
+        model.as_deref(),
+        &config.model_runtime,
+        config.reasoning_effort,
+    )
+    .soft_limit()
+    .max(1) as u64
+}
+
 fn initial_surface_snapshot(
     thread_id: surface::SurfaceThreadId,
     incarnation: surface::SurfaceIncarnation,
@@ -10986,11 +10999,7 @@ fn initial_surface_snapshot(
     let permission_rules_digest = surface_sha256(
         &serde_json::to_vec(&permission_rules).expect("surface permission rules are serializable"),
     );
-    let context_limit_tokens = config
-        .model_runtime
-        .context_window
-        .unwrap_or_else(|| orca_core::model::max_context_tokens(config.model.as_deref()))
-        .max(1) as u64;
+    let context_limit_tokens = surface_context_limit_tokens(config);
     let settings = surface::SurfaceRuntimeSettings {
         model: surface::NonEmptyText::try_new(
             config
@@ -23437,6 +23446,17 @@ mod tests {
         assert_eq!(next.compaction, surface::CompactionState::Idle);
     }
 
+    #[test]
+    fn context_meter_counts_down_to_the_compaction_line() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut run_config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled);
+        run_config.reasoning_effort = orca_core::config::ReasoningEffort::Max;
+        // 0.9 x 1_000_000 - 131_072: where automatic compaction starts.
+        assert_eq!(surface_context_limit_tokens(&run_config), 768_928);
+        run_config.reasoning_effort = orca_core::config::ReasoningEffort::High;
+        assert_eq!(surface_context_limit_tokens(&run_config), 800_000);
+    }
+
     fn test_absolute_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(name)
     }
@@ -31862,7 +31882,8 @@ mod tests {
         ));
         let snapshot = fresh_surface_attachment(&surface).baseline.snapshot;
         assert_eq!(snapshot.context.used_tokens, 151_063);
-        assert_eq!(snapshot.context.limit_tokens, 1_000_000);
+        // The compaction line at the default Max effort.
+        assert_eq!(snapshot.context.limit_tokens, 768_928);
         host.shutdown()
             .expect("shutdown semantic retry runtime host");
     }
@@ -38912,7 +38933,8 @@ mod tests {
             .snapshot;
 
         assert_eq!(snapshot.context.used_tokens, 41_483);
-        assert_eq!(snapshot.context.limit_tokens, 1_000_000);
+        // The compaction line at the default Max effort.
+        assert_eq!(snapshot.context.limit_tokens, 768_928);
 
         resumed
             .shutdown()

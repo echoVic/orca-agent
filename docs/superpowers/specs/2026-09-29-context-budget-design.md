@@ -1,6 +1,6 @@
 # 上下文预算、压缩兜底与进度展示
 
-> 状态：待评审。基线 `5838259b`（v0.5.4）。
+> 状态：第一阶段已实现（分支 context-budget，2026-09-29）。基线 5838259b（v0.5.4）。
 > 目标：会话不会再因为"回复预留 + 历史"超过模型上限而卡死；压缩在任何形状的历史上都能真正缩小；上下文仪表显示的是还能用多少，而不是整个窗口的剩余比例。
 
 ## 0. 背景
@@ -136,20 +136,18 @@ Codewhale 的 CHANGELOG（#4293/#4368/#4378）记录了与本次相同的事故�
 紧急压缩与普通压缩使用同一套分区（第 4、5 节），区别如下：
 
 - 不因为"低于触发线"而跳过；
-- 强制把压缩线压到当前测量值的四分之三以下，保证至少做一次真正的缩减；
+- 强制把压缩线压到"测量值 P"与"整个请求的本地估算"两者中较小者的四分之三（不高于 T），保证至少做一次真正的缩减。取较小者，是因为压缩内部按本地估算裁剪，而以 API 用量为锚的 P 可能比估算大，按 P 算出的压缩线可能落在估算之上，结果什么也压不掉；
 - pinned 消息仍逐条保留。改为按消息生效后，剩下的 pinned 只有用户显式 pin 的内容、plan 模式说明和轮次提示，都很短。如果"系统提示 + pinned 消息 + 最新单元"本身就放不下，紧急压缩按下面的方式失败。
 
-压缩后重新测量（锚点已失效，走整份估算），只在同时满足以下两条时采用结果并重试一次：
+压缩后重新测量（锚点已失效，走整份估算，再按压缩前 API 计数与估算之比放大，只放大不缩小）。估算严格小于压缩前，就采用结果，替换并持久化历史；估算没有变小，就不替换历史。之后：
 
-- 新的测量值严格小于压缩前；
-- 新请求能装下最小回复。
+- 发送前：无论是否采用，只要请求仍装不下最小回复，本轮就不发请求，直接停止并给出下面的失败说明；
+- API 超限：只有历史确实变小才重试一次，重试的请求同样先经过发送前的检查；历史没有变小就不重试，在服务端的错误原文之后附上 `Compaction cannot shrink the conversation further; start a new conversation with /new.`（`unrecoverable_overflow_message`）。
 
-否则不替换历史、不重试，并给出明确的失败说明（由测试锁定）：
+失败说明（`compaction.rs` 的 `context_overflow_message`；`{prompt_tokens}` 是压缩后的测量值，没有采用时是压缩前的测量值；测试检查其中的 `/new`）：
 
 ```
-Context is still over the model limit after compaction (~{P} tokens; the
-request needs {W} or less including {R_min} for the reply). Start a new
-conversation with /new, or lower model_runtime.max_output_tokens.
+The conversation no longer fits the model's context window (about {prompt_tokens} tokens) and compaction cannot shrink it further. Start a new conversation with /new.
 ```
 
 API 超限的重试仍是每轮一次（`RuntimeCompactionRetryState` 的 `prompt_too_long_retried`）。

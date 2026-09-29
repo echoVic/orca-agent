@@ -4878,14 +4878,15 @@ fn resumed_legacy_usage_projects_context_before_next_turn() {
             unreachable!("predicate accepted only a surface projection")
         };
         assert_eq!(projection.context_used_tokens, 41_483);
-        assert_eq!(projection.context_limit_tokens, 1_000_000);
+        // The compaction line at the default Max effort.
+        assert_eq!(projection.context_limit_tokens, 768_928);
         let expected_usage = projection.usage.clone();
 
         let (mut resumed_state, _action_rx) = test_state();
         resumed_state.update(TuiEvent::SurfaceProjectionSynced(projection));
         assert_eq!(resumed_state.usage(), &expected_usage);
         assert_eq!(resumed_state.context_used_tokens(), 41_483);
-        assert_eq!(resumed_state.context_limit_tokens(), 1_000_000);
+        assert_eq!(resumed_state.context_limit_tokens(), 768_928);
 
         harness.shutdown();
     });
