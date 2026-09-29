@@ -21,12 +21,12 @@ orca mcp add docs --url https://mcp.example.test/mcp \
   --header "Authorization: Bearer token-from-environment"
 ~~~
 
-`--transport` 选择 `http`（默认）或 `sse`。stdio 服务器需要 command；远程服务器需要
-url。凭据尽量放在环境变量中：`--bearer-token-env-var` 指定一个在连接时读取的环境
-变量名，而不是把 token 存进配置文件。
+stdio 服务器需要 command；远程服务器需要 url。凭据尽量放在环境变量中：
+`--bearer-token-env-var` 指定一个在连接时读取的环境变量名，而不是把 token 存进
+配置文件。
 
-`orca mcp add` 不会设置 capabilities、超时或工具过滤。新服务器默认只有只读能力；
-在 `orca mcp add` 写好的条目上手动编辑，按需授予：
+`orca mcp add` 不会设置 capabilities、超时或[工具筛选](#工具筛选)。新服务器默认只有
+只读能力；在 `orca mcp add` 写好的条目上手动编辑，按需授予：
 
 ~~~toml
 [[mcp_servers]]
@@ -50,9 +50,10 @@ agent = false
 
 `--transport` 选择 `http`（streamable HTTP，默认）或 `sse`。`http` 使用当前的 MCP
 传输方式：每个请求都是 POST，`initialize` 协商出的会话 ID 和协议版本会随之后每个
-请求带上。`sse` 是旧版传输方式——先 GET 打开一个事件流，再把请求 POST 到它给出的
-地址。已有的 `sse` 服务器照常工作；极少数只支持旧版传输的服务器仍可以用
-`orca mcp add --transport sse` 添加。
+请求带上。`sse` 开始时也这样做，只有服务器对第一个 `initialize` POST 回 400、404 或
+405 时，才改用旧版 HTTP+SSE 传输：先 GET 打开一个事件流，再把请求 POST 到它给出的
+地址。已有的 `sse` 服务器照常工作；可能只支持旧版传输的服务器适合用
+`--transport sse` 添加。
 
 远程服务器的认证方式有三种：
 
@@ -65,11 +66,40 @@ agent = false
   静态请求头、`--bearer-token-env-var` 的服务器，`login` 会拒绝执行，因为它们都
   不使用 OAuth。
 
+这些选项保存为服务器条目里的键，也可以手动写：
+
+~~~toml
+[[mcp_servers]]
+name = "search"
+transport = "http"
+url = "https://search.example.test/mcp"
+bearer_token_env_var = "SEARCH_TOKEN"   # --bearer-token-env-var
+
+[[mcp_servers]]
+name = "tracker"
+transport = "http"
+url = "https://tracker.example.test/mcp"
+oauth_client_id = "orca-cli"            # --client-id
+oauth_callback_port = 51000             # --callback-port
+~~~
+
+`oauth_client_id` 是授权服务器事先发给你的 client id；不配置时，Orca 会向服务器
+动态注册。`oauth_callback_port` 固定浏览器回来时访问的地址
+`http://127.0.0.1:<port>/callback` 的端口，给只接受事先登记过回调地址的服务器用；
+不配置时使用任意空闲端口。
+
 OAuth token 保存在 `$ORCA_HOME/mcp-credentials.json`，与 `config.toml` 同目录，
 只有其所有者可读，按服务器名和地址保存——把服务器迁移到新地址会让旧地址下保存的
 登录失效。`orca mcp list` 和 `orca mcp get` 会显示每个服务器的认证状态
 （`oauth: logged in`、`oauth: not logged in`、`bearer: $VAR`、`static header`，
 stdio 服务器则是 `-`），但绝不显示 token 本身。
+
+会话进行中，保存的登录失效且刷新不了时，工具调用会报下面的错，这一轮结束后
+`/mcp` 会把该服务器显示为 `needs login`：
+
+~~~text
+MCP server requires login: run 'orca mcp login <name>', or log in from /mcp
+~~~
 
 `login` 和 `logout` 只改动配置或凭据存储，不会影响已经在运行的会话。已经打开的
 TUI 会话可以在 `/mcp` 面板里重新连接该服务器，从而应用这次改动。
@@ -77,9 +107,10 @@ TUI 会话可以在 `/mcp` 面板里重新连接该服务器，从而应用这�
 ## 在 TUI 里管理服务器
 
 在交互式 TUI 里，`/mcp` 列出当前对话的服务器及其状态：已连接（附工具数）、连接失败
-（附原因）、需要登录，或已停用。按 `Enter` 查看某个服务器的工具（只读工具带标记）、
-prompts，以及它的配置里设置的 `enabled_tools`/`disabled_tools`。`r` 重新连接所选
-服务器，`l` 用 OAuth 登录后重新连接，`o` 删除保存的登录后重新连接。发出第一条消息之前，
+（附原因）、需要登录，或已停用。按 `Enter` 查看某个服务器的工具（每个工具附上权限
+规则里用的名字，只读工具带标记）、prompts，以及它的配置里设置的
+`enabled_tools`/`disabled_tools`。`r` 重新连接所选服务器，`l` 用 OAuth 登录后重新
+连接，`o` 删除保存的登录后重新连接。发出第一条消息之前，
 还没有服务器连接：面板列出配置里的服务器，状态为 `not connected yet`，这时 `l` 已经
 可以登录，所以启动 `orca` 之前用 `orca mcp add` 添加的服务器，可以在对话开始前登录，
 连接时用上这次登录。`/mcp` 列出的是 Orca 启动时的配置：TUI 打开期间添加的服务器，
@@ -111,9 +142,33 @@ prompts，以及它的配置里设置的 `enabled_tools`/`disabled_tools`。`r` 
 - 一个工具是否只读，完全以服务器自己的声明为准。
 - 服务器同时标了 `destructiveHint` 的工具，仍会像其他写操作一样询问。
 
+## 工具筛选
+
+服务器条目可以限定 Orca 注册它的哪些工具。`orca mcp add` 不设置这两个键，需要手动
+写。两者写的都是服务器在 `tools/list` 里给工具起的名字，比如 `createIssue`，而不是
+Orca 的 `mcp__github__createissue`：
+
+~~~toml
+[[mcp_servers]]
+name = "github"
+transport = "http"
+url = "https://github-mcp.example.test/mcp"
+enabled_tools = ["list_issues", "create_issue", "delete_repo"]
+disabled_tools = ["delete_repo"]
+~~~
+
+- `enabled_tools` 是白名单：只注册其中列出的工具。空列表 `enabled_tools = []`
+  一个工具也不注册。
+- `disabled_tools` 是黑名单，在白名单之后生效，所以两个名单里都有的工具不会注册。
+  上面的例子只注册 `list_issues` 和 `create_issue`。
+- 不写某个键，就不做那一项筛选。被筛掉的工具不会注册，模型看不到它。
+
+`orca mcp get` 会显示这两个键：没设置的显示 `-`，空列表显示 `none`；`/mcp` 里服务器的
+详情也会显示。
+
 ## 总是允许
 
-MCP 工具的审批面板会比其他工具多两个选项：`5` always allow this tool (saved) 和 `6` always allow this server (saved)。两者都会执行这次调用，并像 `3` 本会话允许一样，在本会话剩余时间内不再询问；此外还会往用户配置里追加一条允许规则，让之后的会话也不再询问：
+MCP 工具的审批面板会比其他工具多两个选项：`5` Always allow `<tool>` (saved) 和 `6` Always allow the `<server>` server (saved)。两者都会执行这次调用，并像 `3` Allow `<tool>` this session 一样，在本会话剩余时间内不再询问；此外还会往用户配置里追加一条允许规则，让之后的会话也不再询问：
 
 ~~~toml
 [[permissions.rules]]
@@ -125,7 +180,7 @@ tool = "mcp__github__*"
 decision = "allow"
 ~~~
 
-第一条规则（`5`）只针对这一个工具；第二条（`6`）覆盖该服务器上的所有工具。两条规则都不写 pattern，因为 MCP 工具调用本来就没有目标——参见[权限规则](approval-modes.md#权限规则)。规则保存失败时（比如现有配置解析不了），这次调用仍会执行，本会话也仍然不再询问；对话里会说明规则未能保存的原因。
+第一条规则（`5`）只针对这一个工具；第二条（`6`）覆盖该服务器上的所有工具。两条规则都不写 pattern：不写 pattern 的规则覆盖这个工具的所有调用，而且 MCP 调用的目标本来就是工具自己的名字。手动写这类规则时，按 Orca 的方式写工具名，也就是 `/mcp` 详情里显示的写法：转成小写，连续的其他字符换成一个 `_`。Orca 读规则里的 `mcp__` 名字时也这样规范化，所以写 `mcp__GitHub__createIssue` 同样指 `mcp__github__createissue`。参见[权限规则](approval-modes.md#权限规则)。规则保存失败时（比如现有配置解析不了），这次调用仍会执行，本会话也仍然不再询问；对话里会说明规则未能保存的原因。
 
 ## 安全操作
 
@@ -135,6 +190,8 @@ decision = "allow"
 4. 使用 orca doctor 验证本地配置和沙箱就绪状态；它是只读的，不会启动 MCP 服务器。
 5. 在 TUI 的 `/mcp` 面板里查看每个服务器的状态，并在那里重新连接。
 
-`orca mcp list` 和 `orca mcp get` 查看已配置的服务器时绝不输出凭据的值：`env`
-和 `headers` 只显示已配置的键名。CLI 不提供重启、测试或诊断运行中 MCP 连接的命令：
-运行中的连接属于它所在的会话，由 TUI 的 `/mcp` 面板显示其状态并重新连接。
+`orca mcp list` 和 `orca mcp get` 查看已配置的服务器时不会连接它们。它们会按配置原样
+显示 stdio 服务器的命令和参数、远程服务器的地址，所以不要把密钥写在这些地方；`env`
+和 `headers` 只显示键名，绝不显示值，也绝不显示 token。CLI 不提供重启、测试或诊断
+运行中 MCP 连接的命令：运行中的连接属于它所在的会话，由 TUI 的 `/mcp` 面板显示其状态
+并重新连接。

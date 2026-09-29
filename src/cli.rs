@@ -68,7 +68,7 @@ enum Command {
     Workflow(WorkflowArgs),
     /// Inspect or update folder trust.
     Trust(TrustArgs),
-    /// Add, list, show, or remove MCP servers in the user config.
+    /// Add, list, show, remove, log in to, or log out of MCP servers in the user config.
     Mcp(McpArgs),
     /// Serve shared ACP sessions on a restricted local socket (Unix).
     Daemon(DaemonArgs),

@@ -4181,24 +4181,27 @@ authority. A later valid descriptor removes its diagnostics through the next
 ordinary Reconciled diff.
 
 Runtime builds the catalog from the session's MCP registry and publishes it as
-`Reconciled` once the thread's surface is live, when it differs from the
-catalog the surface already holds, and again after `mcp_server_control`.
-Servers are listed in config order under their canonical names, the ones in
-their tools' names, each with the status of its registry state: connected is
-`Ready`, a failed connection is `Degraded` with the error, a server that needs a
-login is `AuthRequired`, and a disabled one is `Disabled`. Tools are the
-registry's, in config order; the entry id is `mcp-tool:` plus the schema name,
-and `read_only` repeats the server's declaration (`readOnlyHint` without
-`destructiveHint`). An object schema without `additionalProperties`, or with it
-`false`, is carried closed; any other `additionalProperties` makes that level
-`Unsupported`. Prompts are the ones the connected servers list (`prompts/list`,
-asked only of a server whose `initialize` result declares the `prompts`
-capability), in config order and then in each server's order, under the
-server's canonical name, with their arguments in the order the server declared
-them. A server lists its prompts again when it reconnects. A `prompts/list`
-that fails, and a prompt without a name or with an argument without one, leave
-the server connected and are reported with the registry's errors instead of in
-the catalog. Resources and resource templates are not listed yet.
+`Reconciled` only when it differs from the catalog the surface already holds.
+It checks once the thread's surface is live, after each `mcp_server_control`,
+and after each operation finishes, since a tool call can find that a server
+needs a login again. Servers are listed in config order under their canonical
+names, the ones in their tools' names, each with the status of its registry
+state: connected is `Ready`, a failed connection is `Degraded` with the error,
+a server that needs a login, found on connecting or by a tool call whose login
+could not be refreshed, is `AuthRequired`, and a disabled one is `Disabled`.
+Tools are the registry's, in config order; the entry id is `mcp-tool:` plus the
+schema name, and `read_only` repeats the server's declaration (`readOnlyHint`
+without `destructiveHint`). An object schema without `additionalProperties`, or
+with it `false`, is carried closed; any other `additionalProperties` makes that
+level `Unsupported`. Prompts are the ones the connected servers list
+(`prompts/list`, asked only of a server whose `initialize` result declares the
+`prompts` capability), in config order and then in each server's order, under
+the server's canonical name, with their arguments in the order the server
+declared them. A server lists its prompts again when it reconnects. A
+`prompts/list` that fails, and a prompt without a name or with an argument
+without one, leave the server connected and are reported with the registry's
+errors instead of in the catalog. Resources and resource templates are not
+listed yet.
 
 ```text
 SurfaceMcpServerAction = Reconnect
@@ -4214,7 +4217,8 @@ RuntimeSurfaceClientHandle::mcp_server_control(
 `SurfaceCommand` inventory. It needs `ManageThreadSettings`, as
 `update_settings` does. `Reconnect` connects the server again with its saved
 config on a worker thread, so the actor stays responsive meanwhile, then
-publishes the catalog and answers with the status the catalog gives the server.
+publishes the catalog if the reconnect changed it, and answers with the status
+the catalog gives the server.
 A name no server has is answered with `Degraded` carrying the error.
 
 ```text
@@ -6283,6 +6287,10 @@ SurfaceMcpTransport =
     env: Vec<(NonEmptyText, SurfaceMcpValue)>,
   }
   | Sse {
+      url: CanonicalUri,
+      headers: Vec<(NonEmptyText, SurfaceMcpValue)>,
+    }
+  | Http {
       url: CanonicalUri,
       headers: Vec<(NonEmptyText, SurfaceMcpValue)>,
     }

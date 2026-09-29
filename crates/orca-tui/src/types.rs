@@ -377,9 +377,9 @@ impl ApprovalDialog {
     const DYNAMIC_TARGET_TOOLS: &[&str] = &["web_search", "search", "grep"];
 
     /// Returns the set of options to display. An MCP tool call (`mcp__<server>__<tool>`)
-    /// always gets the same five options, in place of `AlwaysTarget`: MCP
-    /// tool calls carry no target to remember exactly, so the two saved
-    /// options — which persist to the user config instead — take its place.
+    /// always gets the same five options, in place of `AlwaysTarget`: an MCP
+    /// call's target is its own tool name, so remembering it adds nothing to
+    /// `AlwaysTool`, and the two saved options, persisted to the user config, take its place.
     /// For every other tool, `AlwaysTarget` is only shown when a target is
     /// present AND the tool is likely to be called again with the same
     /// target (e.g. reading a fixed file path).

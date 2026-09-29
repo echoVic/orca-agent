@@ -63,12 +63,12 @@ CLI 选项优先于环境变量、受信任项目配置、用户配置和内置�
 | --- | --- |
 | `1` Allow once | 执行这一次。 |
 | `2` Allow this exact call | 执行，并且之后同一工具、同一目标的调用不再询问。调用没有具体目标时不提供这一项。 |
-| `3` 本会话允许 | 执行，并且在退出前不再询问这个工具。 |
+| `3` Allow `<tool>` this session | 执行，并且在退出前不再询问这个工具。 |
 | `4` Deny | 不执行。本轮停下，由你告诉 Orca 换什么做法。按 `Esc` 也是拒绝。 |
-| `5` Always allow this tool (saved) | 仅 MCP 工具提供。执行，本会话内不再询问这个工具，并把一条允许规则保存到用户配置，之后的会话也不再询问。 |
-| `6` Always allow this server (saved) | 仅 MCP 工具提供。执行，本会话内该服务器上的所有工具都不再询问，改为保存一条覆盖整个服务器的允许规则。 |
+| `5` Always allow `<tool>` (saved) | 仅 MCP 工具提供。执行，本会话内不再询问这个工具，并把一条允许规则保存到用户配置，之后的会话也不再询问。 |
+| `6` Always allow the `<server>` server (saved) | 仅 MCP 工具提供。执行，本会话内该服务器上的所有工具都不再询问，改为保存一条覆盖整个服务器的允许规则。 |
 
-选项 `5`、`6` 只在 MCP 工具的调用里出现，取代 `2` 的位置——`2` 需要一个具体目标才能记住，而 MCP 工具调用没有目标。规则保存失败时（比如现有配置解析不了），这次调用仍会执行，本会话也仍然不再询问；界面会说明规则未能保存的原因。规则的形状见[权限规则](#权限规则)。
+选项 `5`、`6` 只在 MCP 工具的调用里出现，取代 `2` 的位置：MCP 工具调用的目标就是工具自己的名字，再次允许这一次调用，允许的范围与 `3` 相同。规则保存失败时（比如现有配置解析不了），这次调用仍会执行，本会话也仍然不再询问；界面会说明规则未能保存的原因。规则的形状见[权限规则](#权限规则)。
 
 预览内容比面板长时，用 `PgUp`/`PgDn` 翻页查看。
 
@@ -103,13 +103,21 @@ decision = "deny"
 
 `decision` 可以是 `allow`、`prompt` 或 `deny`；多条规则同时匹配时，取最严格的一条。规则按工具名和调用目标匹配：`bash` 的目标是命令行，文件工具的目标是路径。在 `bash` 的 pattern 里，`*` 匹配任意文本（包括 `/`），所以 `rm -rf *` 也能拦住 `rm -rf /tmp/build`。在路径 pattern 里，`*` 和 `?` 不跨目录，`**` 可以跨目录。Windows 上匹配不区分 ASCII 大小写。规则不能放宽 plan 模式的限制。
 
-`pattern` 可以省略，默认值是 `*`，匹配任意目标，包括没有目标的调用。MCP 工具调用的名字是 `mcp__<server>__<tool>`，规则可以精确匹配某一个；写成 `mcp__<server>__*`（等价地，也可以只写 `mcp__<server>`）就能匹配该服务器上的所有工具：
+不写 `pattern` 的规则覆盖这个工具的所有调用，不论目标是什么：任何路径（包括嵌套路径和绝对路径）、任何命令。这与 `pattern = "*"` 不同，后者在路径里不跨目录。写 allow 规则时要当心：`tool = "bash"`、`decision = "allow"` 而不写 `pattern`，会让 Orca 不经询问执行任何命令。
+
+MCP 工具的名字是 `mcp__<server>__<tool>`，规则可以精确匹配某一个；写成 `mcp__<server>__*`（或者只写 `mcp__<server>`）就覆盖该服务器上的所有工具。MCP 规则不要写 `pattern`：MCP 调用的目标就是工具自己的名字，比如 `mcp__github__create_issue`，pattern 只能重复 `tool` 已经写明的内容。规则里 `mcp__` 名字的服务器段和工具段，会按 Orca 给 MCP 工具命名的方式规范化：转成小写，连续的其他字符换成一个 `_`，所以 `mcp__My-Server__deleteRepo` 指的是工具 `mcp__my_server__deleterepo`。`/mcp` 面板里服务器的详情列出了每个工具在规则里的写法。
 
 ~~~toml
 [[permissions.rules]]
 tool = "mcp__github__*"
 decision = "allow"
+
+[[permissions.rules]]
+tool = "mcp__github__delete_repo"
+decision = "deny"
 ~~~
+
+同时有这两条规则时，`github` 服务器上的工具都不再询问，只有 `delete_repo` 被更严格的 deny 规则拒绝。
 
 ## 信任是独立边界
 

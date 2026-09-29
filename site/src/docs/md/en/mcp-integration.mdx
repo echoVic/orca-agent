@@ -24,14 +24,15 @@ orca mcp add docs --url https://mcp.example.test/mcp \
   --header "Authorization: Bearer token-from-environment"
 ~~~
 
-`--transport` selects `http` (the default) or `sse`. A stdio server needs a
-command; a remote server needs a url. Keep credentials in the environment
-where possible: `--bearer-token-env-var` names an environment variable read
-at connect time instead of storing a token in the config file.
+A stdio server needs a command; a remote server needs a url. Keep
+credentials in the environment where possible: `--bearer-token-env-var` names
+an environment variable read at connect time instead of storing a token in
+the config file.
 
-`orca mcp add` does not set capabilities, timeouts, or tool filters. A new
-server defaults to a read-only capability set; grant only what the
-integration needs by editing the entry `orca mcp add` created:
+`orca mcp add` does not set capabilities, timeouts, or
+[tool filters](#tool-filters). A new server defaults to a read-only capability
+set; grant only what the integration needs by editing the entry
+`orca mcp add` created:
 
 ~~~toml
 [[mcp_servers]]
@@ -56,10 +57,11 @@ agent = false
 `--transport` selects `http` (streamable HTTP, the default) or `sse`. `http`
 speaks the current MCP transport: every request is a POST, and the session id
 and protocol version the server negotiated at `initialize` travel with each
-later request. `sse` is the legacy transport — a GET opens an event stream,
-and requests are POSTed to the address it hands back. Existing `sse` servers
-keep working; `orca mcp add --transport sse` still exists for the rare server
-that speaks only the legacy transport.
+later request. `sse` starts the same way, and falls back to the legacy
+HTTP+SSE transport only when the server answers that first `initialize` POST
+with 400, 404, or 405: a GET then opens an event stream, and requests are
+POSTed to the address it hands back. Existing `sse` servers keep working, and
+`--transport sse` suits a server that may speak only the legacy transport.
 
 A remote server authenticates one of three ways:
 
@@ -75,12 +77,44 @@ A remote server authenticates one of three ways:
   server, or one already using a static header or `--bearer-token-env-var`,
   since neither uses OAuth.
 
+The options are saved as keys of the server's entry, which you can also
+write by hand:
+
+~~~toml
+[[mcp_servers]]
+name = "search"
+transport = "http"
+url = "https://search.example.test/mcp"
+bearer_token_env_var = "SEARCH_TOKEN"   # --bearer-token-env-var
+
+[[mcp_servers]]
+name = "tracker"
+transport = "http"
+url = "https://tracker.example.test/mcp"
+oauth_client_id = "orca-cli"            # --client-id
+oauth_callback_port = 51000             # --callback-port
+~~~
+
+`oauth_client_id` is a client id the authorization server issued ahead of
+time; without one, Orca registers itself with the server. `oauth_callback_port`
+fixes the port of the address the browser comes back to,
+`http://127.0.0.1:<port>/callback`, for a server that only accepts a
+redirect address registered in advance; otherwise any free port is used.
+
 OAuth tokens are stored in `$ORCA_HOME/mcp-credentials.json`, next to
 `config.toml` and readable only by its owner, keyed by server name and url —
 moving a server to a new url invalidates the login saved under the old one.
 `orca mcp list` and `orca mcp get` show each server's auth status
 (`oauth: logged in`, `oauth: not logged in`, `bearer: $VAR`, `static header`,
 or `-` for a stdio server) without ever printing the token itself.
+
+When a saved login stops working during a session and cannot be refreshed,
+the tool call fails with this error, and `/mcp` shows the server as
+`needs login` once that turn ends:
+
+~~~text
+MCP server requires login: run 'orca mcp login <name>', or log in from /mcp
+~~~
 
 `login` and `logout` only change configuration or the credential store; they
 never touch a session that is already running. A running TUI session picks
@@ -90,11 +124,11 @@ up the change by reconnecting the server from the `/mcp` panel.
 
 In the interactive TUI, `/mcp` lists the conversation's servers and how each
 stands: connected, with its tool count; failed, with the reason; needing a
-login; or disabled. `Enter` shows a server's tools, with the read-only ones
-marked, its prompts, and the `enabled_tools`/`disabled_tools` its
-configuration sets. `r` reconnects the selected server, `l` logs in to it with
-OAuth and then reconnects it, and `o` deletes its saved login and then
-reconnects it. Before your first message no server has connected yet: the
+login; or disabled. `Enter` shows a server's tools, each with the name a
+permission rule uses for it and the read-only ones marked, its prompts, and
+the `enabled_tools`/`disabled_tools` its configuration sets. `r` reconnects
+the selected server, `l` logs in to it with OAuth and then reconnects it, and
+`o` deletes its saved login and then reconnects it. Before your first message no server has connected yet: the
 panel lists the configured ones as `not connected yet`, and `l` already logs
 in, so a server added with `orca mcp add` before you start `orca` can be
 logged in to before the conversation starts, and connects with that login.
@@ -145,13 +179,41 @@ A server can mark a tool read-only in its `tools/list` response
 - A tool the server also marks `destructiveHint` is still asked about,
   the same as any other write.
 
+## Tool filters
+
+A server's entry can limit which of its tools Orca registers. `orca mcp add`
+does not set the two keys, so write them by hand. Both take the names the
+server gives its tools in `tools/list`, such as `createIssue`, not Orca's
+`mcp__github__createissue`:
+
+~~~toml
+[[mcp_servers]]
+name = "github"
+transport = "http"
+url = "https://github-mcp.example.test/mcp"
+enabled_tools = ["list_issues", "create_issue", "delete_repo"]
+disabled_tools = ["delete_repo"]
+~~~
+
+- `enabled_tools` is an allow-list: only the tools it names are registered.
+  An empty list, `enabled_tools = []`, registers no tool at all.
+- `disabled_tools` is a deny-list applied after the allow-list, so a tool on
+  both lists is left out. Here only `list_issues` and `create_issue` are
+  registered.
+- Leave a key out to skip that filter. A tool filtered out is not registered,
+  and the model never sees it.
+
+`orca mcp get` shows both keys, `-` for one that is not set and `none` for an
+empty list, and so do the server's details in `/mcp`.
+
 ## Always allow
 
 An MCP tool's approval panel offers two extra choices beyond the ones every
-tool call gets: `5` always allow this tool (saved) and `6` always allow this
-server (saved). Both run the call and, like `3` allow for this session, stop
-asking for the rest of the session; they additionally append an allow rule to
-the user configuration so a future session skips the prompt too:
+tool call gets: `5` Always allow `<tool>` (saved) and `6` Always allow the
+`<server>` server (saved). Both run the call and, like `3` Allow `<tool>` this
+session, stop asking for the rest of the session; they additionally append an
+allow rule to the user configuration so a future session skips the prompt
+too:
 
 ~~~toml
 [[permissions.rules]]
@@ -164,11 +226,16 @@ decision = "allow"
 ~~~
 
 The first rule (`5`) names one tool; the second (`6`) covers every tool on
-that server. Neither writes a `pattern`, since an MCP tool call has none —
-see [Permission rules](approval-modes.md#permission-rules). If the rule
-cannot be saved (an existing config that fails to parse, for example), the
-call still runs and the rest of this session still skips the prompt; the
-conversation explains that saving the rule failed.
+that server. Neither writes a `pattern`: a rule without one covers every call
+of its tool, and an MCP call's target is the tool's own name anyway. To write
+such a rule by hand, name the tool as Orca does, as the `/mcp` details show
+it: lowercase, with every run of other characters turned into `_`. Orca reads
+a rule's `mcp__` name the same way, so `mcp__GitHub__createIssue` also names
+`mcp__github__createissue`. See
+[Permission rules](approval-modes.md#permission-rules). If the rule cannot be
+saved (an existing config that fails to parse, for example), the call still
+runs and the rest of this session still skips the prompt; the conversation
+explains that saving the rule failed.
 
 ## Operate safely
 
@@ -180,8 +247,10 @@ conversation explains that saving the rule failed.
 5. Check how each server stands in the TUI's `/mcp` panel, and reconnect it
    there.
 
-`orca mcp list` and `orca mcp get` inspect configured servers without ever
-printing credential values; `env` and `headers` show only the configured key
-names. There is no CLI command to restart, test, or diagnose a running MCP
-connection: a running connection belongs to its session, and the TUI's `/mcp`
-panel shows its status and reconnects it.
+`orca mcp list` and `orca mcp get` inspect configured servers without
+connecting to them. They print a stdio server's command and arguments and a
+remote server's url as configured, so keep secrets out of those; they never
+print the values of `env` or `headers`, only their names, or a token. There
+is no CLI command to restart, test, or diagnose a running MCP connection: a
+running connection belongs to its session, and the TUI's `/mcp` panel shows
+its status and reconnects it.

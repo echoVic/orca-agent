@@ -167,10 +167,20 @@ session starts — it does not affect a session that is already running.
 | `--callback-port PORT` | Local OAuth redirect callback port. Requires `--url`. |
 | `-- COMMAND [ARGS]...` | Stdio server command and its arguments. |
 
-`list` and `get` never print credential values: `env` and `headers` show only
-the configured key names, never their values, and the auth column or `auth:`
+`NAME` takes letters, digits, `-` and `_`, with at least one letter or digit
+and no `__`. Orca names a server's tools from its name in lowercase, with every
+run of `-` and `_` turned into one `_` and none left at either end, so `add`
+refuses a name that reads the same as a configured one that way (`GitHub`
+beside `github`, `my-server` beside `my_server`) and names the server it
+clashes with.
+
+`list` and `get` print a stdio server's command and arguments and a remote
+server's url as configured, so keep secrets out of those. They never print the
+values of `env` or `headers`, only their names, and the auth column or `auth:`
 line reports only a status word (`oauth: logged in`, `oauth: not logged in`,
 `bearer: $VAR`, `static header`, or `-` for a stdio server), never a token.
+`get` also shows `enabled_tools` and `disabled_tools`: `-` for one that is not
+set, and `none` for an empty list.
 
 `login` opens the server's authorization page in your browser and prints the
 url in case it does not open; it refuses a stdio server or one with a
@@ -183,11 +193,12 @@ Examples:
 ```bash
 orca mcp add docs -- npx -y docs-mcp-server
 orca mcp add search --url https://mcp.example.test/mcp --bearer-token-env-var SEARCH_TOKEN
+orca mcp add tracker --url https://tracker.example.test/mcp
 orca mcp list --json
 orca mcp get docs
+orca mcp login tracker
+orca mcp logout tracker
 orca mcp remove docs
-orca mcp login docs
-orca mcp logout docs
 ```
 
 ## Configuration and environment

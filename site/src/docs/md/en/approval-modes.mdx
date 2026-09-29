@@ -76,17 +76,17 @@ the input:
 | --- | --- |
 | `1` Allow once | Run this call. |
 | `2` Allow this exact call | Run it, and allow the same tool with the same target again without asking. Not offered when the call has no specific target. |
-| `3` Allow for this session | Run it, and stop asking for this tool until you quit. |
+| `3` Allow `<tool>` this session | Run it, and stop asking for this tool until you quit. |
 | `4` Deny | Do not run it. The turn stops so you can tell Orca what to do instead. `Esc` also denies. |
-| `5` Always allow this tool (saved) | MCP tools only. Run it, stop asking for this tool for the rest of the session, and save an allow rule to the user config so future sessions skip the prompt too. |
-| `6` Always allow this server (saved) | MCP tools only. Run it, and do the same for every tool on that server, saving a server-wide allow rule instead. |
+| `5` Always allow `<tool>` (saved) | MCP tools only. Run it, stop asking for this tool for the rest of the session, and save an allow rule to the user config so future sessions skip the prompt too. |
+| `6` Always allow the `<server>` server (saved) | MCP tools only. Run it, and do the same for every tool on that server, saving a server-wide allow rule instead. |
 
-Choices `5` and `6` only appear for an MCP tool call, in place of `2`, which
-needs a specific target to remember and an MCP tool call has none. If the
-rule cannot be saved — an existing config that fails to parse, for example —
-the call still runs and the rest of this session still skips the prompt; a
-message explains that the rule was not saved. See
-[Permission rules](#permission-rules) for the rule shape.
+Choices `5` and `6` only appear for an MCP tool call, in place of `2`: an MCP
+tool call's target is the tool's own name, so allowing that exact call again
+would allow no less than `3` does. If the rule cannot be saved — an existing
+config that fails to parse, for example — the call still runs and the rest of
+this session still skips the prompt; a message explains that the rule was not
+saved. See [Permission rules](#permission-rules) for the rule shape.
 
 `PgUp`/`PgDn` page through a preview that is longer than the panel.
 
@@ -138,16 +138,34 @@ path pattern, `*` and `?` stay within one directory and `**` crosses
 directories. On Windows, matching ignores ASCII case. Rules cannot lift plan
 mode's limits.
 
-`pattern` can be omitted; it then defaults to `*`, which matches any target,
-including a call with none. MCP tool calls are named `mcp__<server>__<tool>`,
-so a rule can target one exactly. Writing `mcp__<server>__*` (or,
-equivalently, just `mcp__<server>`) matches every tool on that server:
+Without a `pattern`, a rule covers every call of its tool, whatever the
+target: every path, nested or absolute, and every command. That is not the
+same as `pattern = "*"`, which in a path stays within one directory. Take care
+with allow rules: `tool = "bash"` with `decision = "allow"` and no `pattern`
+lets Orca run any command without asking.
+
+An MCP tool is named `mcp__<server>__<tool>`, so a rule can name one exactly,
+and `mcp__<server>__*` (or just `mcp__<server>`) covers every tool on that
+server. Write MCP rules without a `pattern`: an MCP call's target is the
+tool's own name, such as `mcp__github__create_issue`, so a pattern can only
+repeat what `tool` says. Orca normalizes the server and tool parts of a
+rule's `mcp__` name the way it names MCP tools, lowercase with every run of
+other characters turned into `_`, so `mcp__My-Server__deleteRepo` names the
+tool `mcp__my_server__deleterepo`. The details of a server in the `/mcp`
+panel show each tool's name as a rule writes it.
 
 ~~~toml
 [[permissions.rules]]
 tool = "mcp__github__*"
 decision = "allow"
+
+[[permissions.rules]]
+tool = "mcp__github__delete_repo"
+decision = "deny"
 ~~~
+
+With both rules, every tool on the `github` server runs without asking except
+`delete_repo`, which the stricter deny rule refuses.
 
 ## Trust remains separate
 
