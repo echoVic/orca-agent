@@ -1011,10 +1011,14 @@ struct CompactionPartition {
     kept: Vec<Message>,
 }
 
+// Only unpinned leading system messages are immutable instructions. A pinned
+// system message (e.g. a background-task notice) is kept conversation
+// content, not an instruction, so it must not be swept into the prefix or it
+// would anchor ahead of the summary forever instead of sorting after it.
 fn leading_system_count(messages: &[Message]) -> usize {
     messages
         .iter()
-        .take_while(|message| matches!(message, Message::System { .. }))
+        .take_while(|message| matches!(message, Message::System { pinned: false, .. }))
         .count()
 }
 
@@ -1069,7 +1073,12 @@ fn partition_for_compaction(
     let newest = units.len().checked_sub(1)?;
     let current_opener = units.iter().rposition(|unit| unit.opens_turn);
     let tokens = |message: &Message| message_tokens_with_counter(message, counter);
-    let cost = |unit: &CompactionUnit| messages[unit.range.clone()].iter().map(tokens).sum::<usize>();
+    let cost = |unit: &CompactionUnit| {
+        messages[unit.range.clone()]
+            .iter()
+            .map(tokens)
+            .sum::<usize>()
+    };
     let pinned_cost = |unit: &CompactionUnit| {
         messages[unit.range.clone()]
             .iter()
@@ -1928,12 +1937,20 @@ fn cache_aware_micro_compaction(
 ) -> Conversation {
     let mut result = conversation.clone();
     let units = compaction_units(&result.messages);
+    // The unit that opened the current turn is exempt from the image pass
+    // just like the newest unit: it may sit several units behind the newest
+    // one (e.g. a tool call/result pair answering it), but it is still the
+    // live request the reply is about, so its images must survive verbatim.
+    let current_opener = units.iter().rposition(|unit| unit.opens_turn);
     let image_budget = MAX_HISTORY_IMAGE_TOKENS.min(retention_budget / 4);
     let mut remaining_images = image_budget;
     // Evidence recency takes priority over prefix reuse for images. The
-    // newest unit and pinned messages are exempt; otherwise keep whole image
-    // groups within the allowance.
-    for unit in units.iter().rev().skip(1) {
+    // newest unit, the current turn's opener, and pinned messages are
+    // exempt; otherwise keep whole image groups within the allowance.
+    for (index, unit) in units.iter().enumerate().rev().skip(1) {
+        if Some(index) == current_opener {
+            continue;
+        }
         for message in result.messages[unit.range.clone()].iter_mut().rev() {
             if message.is_pinned() {
                 continue;

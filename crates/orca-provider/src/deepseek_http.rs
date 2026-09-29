@@ -1003,9 +1003,13 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
         &conversation.messages
     };
 
+    // Only unpinned leading system messages are immutable instructions; a
+    // pinned system message is kept conversation content (e.g. a
+    // background-task notice) and must sort after the summary, not anchor
+    // ahead of it as part of the prefix.
     let prefix_len = source_messages
         .iter()
-        .take_while(|message| matches!(message, Message::System { .. }))
+        .take_while(|message| matches!(message, Message::System { pinned: false, .. }))
         .count();
     for msg in source_messages {
         let api_msg = match msg {

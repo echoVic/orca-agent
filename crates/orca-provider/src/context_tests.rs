@@ -169,13 +169,21 @@ fn hard_pressure_keeps_pinned_units_and_the_current_turn_tail() {
     let result = compact_with_summary(ProviderKind::DeepSeek, &conversation, &config, &provider());
     let messages = &result.conversation.messages;
     // The message that opened the current turn stays, and so does its newest unit.
-    assert!(messages.iter().any(|message| message.content_str() == Some("inspect file 99")));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content_str() == Some("inspect file 99"))
+    );
     assert!(messages.iter().any(|message| matches!(message,
         Message::Tool { tool_call_id, terminal: Some(_), .. } if tool_call_id == "pending-a")));
     // The pinned tool result keeps the call that produced it.
     assert!(messages.iter().any(|message| matches!(message,
         Message::Assistant { tool_calls, .. } if tool_calls.iter().any(|call| call.id == "call-0"))));
-    assert!(!messages.iter().any(|message| message.content_str() == Some("inspect file 2")));
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.content_str() == Some("inspect file 2"))
+    );
 }
 
 #[test]
@@ -202,12 +210,45 @@ fn pinned_notices_in_every_turn_do_not_block_compaction() {
     assert!(messages.len() < before, "nothing was compacted");
     for index in 0..6 {
         let notice = format!("<task-notification>task {index} finished</task-notification>");
-        assert!(messages.iter().any(|message| message.is_pinned()
-            && message.content_str() == Some(notice.as_str())));
+        assert!(
+            messages.iter().any(
+                |message| message.is_pinned() && message.content_str() == Some(notice.as_str())
+            )
+        );
     }
     assert!(!messages.iter().any(|message| matches!(message,
         Message::Tool { tool_call_id, .. } if tool_call_id == "call-0")));
-    assert!(messages.iter().any(|message| message.content_str() == Some("current request")));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content_str() == Some("current request"))
+    );
+
+    // Pinned messages are kept conversation content, not instructions: they
+    // must sort after the summary the compaction injects, not before it.
+    let api_messages = crate::deepseek_http::conversation_to_api_messages(&result.conversation);
+    let summary_index = api_messages
+        .iter()
+        .position(|message| {
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.starts_with("[Summary baseline]"))
+        })
+        .expect("compaction must produce a summary baseline");
+    let first_notice_index = api_messages
+        .iter()
+        .position(|message| {
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("<task-notification>"))
+        })
+        .expect("pinned notices must survive compaction");
+    assert!(
+        summary_index < first_notice_index,
+        "pinned messages must sort after the summary, not before it"
+    );
 }
 
 #[test]
@@ -236,8 +277,15 @@ fn compaction_cuts_into_a_long_current_turn() {
     );
     let messages = &result.conversation.messages;
 
-    assert!(messages.len() < conversation.messages.len(), "nothing was compacted");
-    assert!(messages.iter().any(|message| message.content_str() == Some("refactor the whole module")));
+    assert!(
+        messages.len() < conversation.messages.len(),
+        "nothing was compacted"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content_str() == Some("refactor the whole module"))
+    );
     assert!(messages.iter().any(|message| matches!(message,
         Message::Tool { tool_call_id, .. } if tool_call_id == "call-29")));
     assert!(!messages.iter().any(|message| matches!(message,
@@ -273,6 +321,54 @@ fn micro_compaction_shortens_output_beside_a_pinned_notice() {
         Message::Tool { content, .. } if content.starts_with("[tool output micro-compact]")));
     assert!(matches!(&messages[5],
         Message::System { content, pinned: true } if content.contains("done")));
+}
+
+#[test]
+fn micro_compaction_exempts_the_current_turn_openers_images() {
+    let mut conversation = Conversation::new();
+    conversation.add_system("instructions".to_string());
+    // Earlier history with a large, shrinkable tool output: pressure to
+    // relieve without ever touching the current turn's images.
+    tool_turn(&mut conversation, 0, 5_000);
+    let image = ImageInput {
+        source: ImageSource::File {
+            file_id: "evidence".to_string(),
+        },
+        detail: ImageDetail::Auto,
+    };
+    conversation.add_user_with_images("describe these".to_string(), vec![image; 5]);
+    conversation.add_assistant(
+        None,
+        Some("looking".to_string()),
+        vec![RawToolCall {
+            id: "call-1".to_string(),
+            function_name: "read_file".to_string(),
+            arguments: r#"{"path":"a.rs"}"#.to_string(),
+        }],
+    );
+    conversation.add_tool_result("call-1".to_string(), "small result".to_string());
+
+    let result = compact_with_summary(
+        ProviderKind::DeepSeek,
+        &conversation,
+        &config(13_000, 30_000),
+        &provider(),
+    );
+    let messages = &result.conversation.messages;
+
+    // The micro path (not the deep/local-truncation fallback) must have run
+    // and been accepted: the early tool turn is still a live message, only
+    // shortened in place, not collapsed away by a partition.
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content_str() == Some("inspect file 0"))
+    );
+    // The current turn's opener keeps its images and its text untouched.
+    assert!(
+        messages.iter().any(|message| matches!(message,
+        Message::User { content, images, .. } if content == "describe these" && images.len() == 5))
+    );
 }
 
 #[test]
