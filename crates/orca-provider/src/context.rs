@@ -133,6 +133,7 @@ pub fn display_summary_provider_config(config: &ProviderConfig) -> ProviderConfi
         tools_override: Some(Vec::new()),
         mcp_registry: None,
         external_tools: Vec::new(),
+        max_output_tokens: None,
     }
 }
 
@@ -474,6 +475,25 @@ impl ContextConfig {
         let small_window_cap = ((soft as f64) * COMPACTION_TARGET_SOFT_CAP_FRACTION) as usize;
         COMPACTION_TARGET_TOKENS.min(small_window_cap).max(1)
     }
+}
+
+/// The provider config for one request: its reply reservation trimmed to the
+/// room `prompt_tokens` leaves in the window. A request that cannot fit a
+/// minimal reply still goes out with the minimum; the provider's rejection
+/// then drives emergency compaction.
+pub fn with_request_reply_budget(
+    provider_config: &ProviderConfig,
+    context_config: &ContextConfig,
+    prompt_tokens: usize,
+) -> ProviderConfig {
+    let budget = context_config
+        .request_reply_budget(prompt_tokens)
+        .unwrap_or_else(|| {
+            ModelRuntimeConfig::MIN_OUTPUT_TOKENS.min(context_config.reserved_for_response)
+        });
+    let mut config = provider_config.clone();
+    config.max_output_tokens = Some(u32::try_from(budget).unwrap_or(u32::MAX));
+    config
 }
 
 impl Default for ContextConfig {
@@ -1221,6 +1241,7 @@ fn request_summary(
         tools_override: Some(Vec::new()),
         mcp_registry: None,
         external_tools: Vec::new(),
+        max_output_tokens: None,
     };
 
     let user_prompt = format!(
@@ -1999,6 +2020,7 @@ mod tests {
             }]),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         assert!(!needs_compaction(&conv, &config));
@@ -2110,6 +2132,35 @@ mod tests {
         assert_eq!(config.request_reply_budget(900_000), Some(91_808));
         // 11,808 left is below the 16,384 minimum reply.
         assert_eq!(config.request_reply_budget(980_000), None);
+    }
+
+    #[test]
+    fn request_config_carries_the_trimmed_reply_budget() {
+        let context_config = ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::FLASH_MODEL),
+            &ModelRuntimeConfig::default(),
+            ReasoningEffort::Max,
+        );
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: Some(vec![]),
+            mcp_registry: None,
+            external_tools: vec![],
+            max_output_tokens: None,
+        };
+
+        let roomy = with_request_reply_budget(&provider_config, &context_config, 664_935);
+        let tight = with_request_reply_budget(&provider_config, &context_config, 900_000);
+        let full = with_request_reply_budget(&provider_config, &context_config, 995_000);
+
+        assert_eq!(roomy.max_output_tokens, Some(131_072));
+        assert_eq!(tight.max_output_tokens, Some(91_808));
+        // No room left: the request still goes out with the minimum, and the
+        // provider's rejection drives emergency compaction.
+        assert_eq!(full.max_output_tokens, Some(16_384));
     }
 
     #[test]
@@ -2272,6 +2323,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         assert_eq!(
@@ -2657,6 +2709,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let result = compact_with_summary(ProviderKind::DeepSeek, &conv, &config, &provider_config);
@@ -2727,6 +2780,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         cancel.cancel();
@@ -2811,6 +2865,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let cancel_after_accept = cancel.clone();
@@ -2890,6 +2945,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let result = compact_with_summary(ProviderKind::DeepSeek, &conv, &config, &provider_config);
@@ -2927,6 +2983,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let result = compact_with_summary(ProviderKind::Mock, &conv, &config, &provider_config);
@@ -2972,6 +3029,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let result = compact_with_summary(ProviderKind::DeepSeek, &conv, &config, &provider_config);
@@ -3016,6 +3074,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let (_summary_conversation, delta) = summarize_collapsed_messages(
@@ -3802,6 +3861,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         provider_config.tools_override = Some(vec![crate::tool_schema::ProviderToolDefinition {
             name: "should_not_run".to_string(),
@@ -3856,6 +3916,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let result = request_display_summary(
@@ -3886,6 +3947,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         cancel.cancel();
@@ -4003,6 +4065,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let key = display_summary_cache_key(ProviderKind::DeepSeek, &config, &evidence);
         crate::summary_cache::store(&key, "cached recap");
@@ -4103,6 +4166,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let evidence = DisplaySummaryEvidence {
             digest: "wire-cap".to_string(),

@@ -824,6 +824,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let hooks = HookRunner::default();
         let mut events = EventFactory::new("compaction-event-test".to_string());
@@ -923,6 +924,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let mut conversation = Conversation::new();
         conversation.add_system("system".to_string());
@@ -1016,6 +1018,7 @@ mod tests {
                 tools_override: Some(vec![]),
                 mcp_registry: None,
                 external_tools: vec![],
+                max_output_tokens: None,
             };
             let tokens = context::wire_equivalent_tokens(&conversation, &provider);
             let config = context::ContextConfig {
@@ -1107,6 +1110,7 @@ mod tests {
             tools_override: Some(vec![]),
             mcp_registry: None,
             external_tools: vec![],
+            max_output_tokens: None,
         };
         let before =
             orca_provider::prompt_cache::checkpoint_for_deepseek_request(&conversation, &provider)

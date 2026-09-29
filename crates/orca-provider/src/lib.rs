@@ -39,6 +39,10 @@ pub struct ProviderConfig {
     pub tools_override: Option<Vec<tool_schema::ProviderToolDefinition>>,
     pub mcp_registry: Option<McpRegistry>,
     pub external_tools: Vec<ExternalToolConfig>,
+    /// Reply tokens this request reserves (`max_tokens`). The runtime sets it
+    /// per request from the context budget; `None` falls back to the
+    /// reasoning-effort default.
+    pub max_output_tokens: Option<u32>,
 }
 
 pub enum ProviderStreamEvent {
@@ -2267,6 +2271,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let started = std::time::Instant::now();
@@ -2318,6 +2323,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let mut stream = start_streaming(ProviderKind::Mock, &conversation, &config, cancel);
@@ -2370,6 +2376,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let mut stream = start_streaming(ProviderKind::Mock, &conversation, &config, cancel);
@@ -2414,6 +2421,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let mut stream = start_streaming(ProviderKind::Mock, &conversation, &config, cancel);
@@ -2467,6 +2475,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let cancel_probe = cancel.clone();
@@ -2499,6 +2508,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let cancel_probe = cancel.clone();
@@ -2522,6 +2532,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let caller = std::thread::current().id();
@@ -2554,6 +2565,7 @@ mod tests {
                 tools_override: None,
                 mcp_registry: None,
                 external_tools: Vec::new(),
+                max_output_tokens: None,
             };
             let cancel = CancelToken::new();
 
@@ -2588,6 +2600,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let cancel_from_callback = cancel.clone();
@@ -2623,6 +2636,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let mut deltas = Vec::new();
@@ -2670,6 +2684,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let mut deltas = Vec::new();
@@ -2718,6 +2733,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let response = call_streaming(

@@ -116,6 +116,7 @@ fn main() {
         tools_override: Some(vec![read_file_tool()]),
         mcp_registry: None,
         external_tools: Vec::new(),
+        max_output_tokens: None,
     };
     // Give the provider time to store a prefix before the request that reuses it.
     let settle = || std::thread::sleep(Duration::from_secs(3));

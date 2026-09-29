@@ -162,6 +162,7 @@ pub(crate) fn provider_config_for_agent_loop(
         tools_override,
         mcp_registry: Some(mcp_registry.clone()),
         external_tools: config.external_tools.clone(),
+        max_output_tokens: None,
     };
     if let Some(tool) = provider_config
         .tools_override

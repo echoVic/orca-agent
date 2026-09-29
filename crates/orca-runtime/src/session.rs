@@ -792,6 +792,7 @@ impl InteractiveSession {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let compaction = orca_provider::context::compact_with_summary_cancellable(
             config.provider,

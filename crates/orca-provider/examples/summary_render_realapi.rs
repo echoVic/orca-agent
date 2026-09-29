@@ -92,6 +92,7 @@ fn main() {
         tools_override: Some(Vec::new()),
         mcp_registry: None,
         external_tools: Vec::new(),
+        max_output_tokens: None,
     };
 
     // ---- Fixtures -------------------------------------------------------
@@ -147,6 +148,7 @@ fn main() {
         tools_override: Some(Vec::new()),
         mcp_registry: None,
         external_tools: Vec::new(),
+        max_output_tokens: None,
     };
     let mut normal = Conversation::new();
     normal.add_system(format!(

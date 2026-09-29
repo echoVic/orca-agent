@@ -1987,6 +1987,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let runtime = ModelRuntimeConfig::default();
         let context_config = context::ContextConfig::for_model_with_runtime(
@@ -2069,6 +2070,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let runtime = ModelRuntimeConfig::default();
         let context_config = context::ContextConfig::for_model_with_runtime(
@@ -2133,6 +2135,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let mut cost_tracker = CostTracker::new(None);
         let model = ModelSelection::parse(None).expect("model");
@@ -2180,6 +2183,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let mut cost_tracker = CostTracker::new(None);
         let model = ModelSelection::parse(None).expect("model");

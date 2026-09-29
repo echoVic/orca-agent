@@ -338,6 +338,7 @@ impl RuntimeThread {
                             tools_override: Some(Vec::new()),
                             mcp_registry: None,
                             external_tools: Vec::new(),
+                            max_output_tokens: None,
                         },
                         cancel,
                     ))

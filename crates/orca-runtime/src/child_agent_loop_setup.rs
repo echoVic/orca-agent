@@ -158,6 +158,7 @@ fn build_child_agent_loop_setup(
         ),
         mcp_registry: Some(mcp_registry.clone()),
         external_tools: config.external_tools.clone(),
+        max_output_tokens: None,
     };
 
     let budget_model = config.model.as_option();

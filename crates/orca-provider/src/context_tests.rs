@@ -17,6 +17,7 @@ fn provider() -> ProviderConfig {
         tools_override: Some(vec![]),
         mcp_registry: None,
         external_tools: vec![],
+        max_output_tokens: None,
     }
 }
 

@@ -313,6 +313,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         }
     }
 

@@ -15010,6 +15010,7 @@ fn prepare_goal_surface_finalization_worker(
                                 tools_override: Some(Vec::new()),
                                 mcp_registry: None,
                                 external_tools: Vec::new(),
+                                max_output_tokens: None,
                             },
                             cancel,
                         ))
@@ -15325,6 +15326,7 @@ fn prepare_goal_surface_continuation_worker(
                             tools_override: Some(Vec::new()),
                             mcp_registry: None,
                             external_tools: Vec::new(),
+                            max_output_tokens: None,
                         },
                         cancel,
                     ))
@@ -18309,6 +18311,7 @@ impl ThreadActor {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let request_id = request.request_id;
         let worker = thread::spawn(move || {

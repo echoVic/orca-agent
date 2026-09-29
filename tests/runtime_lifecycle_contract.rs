@@ -381,6 +381,7 @@ fn task_actor_routes_model_turn_and_updates_cost_model() {
         tools_override: None,
         mcp_registry: None,
         external_tools: Vec::new(),
+        max_output_tokens: None,
     };
 
     let routed = actor.route_model_turn(
@@ -485,6 +486,7 @@ fn task_actor_calls_streaming_provider_and_forwards_model_deltas() {
         tools_override: None,
         mcp_registry: None,
         external_tools: Vec::new(),
+        max_output_tokens: None,
     };
     let mut conversation = Conversation::new();
     conversation.add_user("mock_usage".to_string());

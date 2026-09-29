@@ -86,6 +86,7 @@ fn mock_provider_can_request_workflow_tool() {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         },
     );
 
@@ -130,6 +131,7 @@ fn mock_provider_can_request_workflow_draft_tool() {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         },
     );
 

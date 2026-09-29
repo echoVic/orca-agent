@@ -14,6 +14,7 @@ fn config(tools: Vec<ProviderToolDefinition>) -> ProviderConfig {
         tools_override: Some(tools),
         mcp_registry: None,
         external_tools: Vec::new(),
+        max_output_tokens: None,
     }
 }
 

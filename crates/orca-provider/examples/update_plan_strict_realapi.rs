@@ -88,6 +88,7 @@ fn provider_config(api_key: &str, base_url: Option<&str>) -> ProviderConfig {
         tools_override: Some(update_plan_tool_definitions()),
         mcp_registry: None,
         external_tools: Vec::new(),
+        max_output_tokens: None,
     }
 }
 

@@ -104,6 +104,7 @@ fn run() -> Result<(), String> {
         tools_override: Some(Vec::new()),
         mcp_registry: None,
         external_tools: Vec::new(),
+        max_output_tokens: None,
     };
     let context_config = ContextConfig {
         max_tokens: 6_000,

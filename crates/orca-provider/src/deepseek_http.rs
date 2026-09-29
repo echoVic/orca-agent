@@ -20,7 +20,6 @@ use crate::tool_schema::{deepseek_strict_tools_schema_for_endpoint, deepseek_too
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 pub(crate) const DEFAULT_MODEL: &str = FLASH_MODEL;
-const DEFAULT_CHAT_MAX_TOKENS: u32 = 384_000;
 const DEEPSEEK_MAX_TOOLS: usize = 128;
 const EMPTY_RESPONSE_RETRIES: usize = 1;
 const STREAM_INTEGRITY_RETRIES: usize = 1;
@@ -464,6 +463,19 @@ async fn request_chat_streaming(
     request_chat_streaming_with_budget(conversation, config, cancel, on_step, None, false).await
 }
 
+/// The `max_tokens` a chat request reserves for its reply: the runtime's
+/// per-request budget, or the reasoning-effort default.
+fn chat_max_tokens(config: &ProviderConfig) -> u32 {
+    config.max_output_tokens.unwrap_or_else(|| {
+        let window = orca_core::model::max_context_tokens(config.model.as_deref());
+        u32::try_from(crate::context::default_reply_budget(
+            config.reasoning_effort,
+            window,
+        ))
+        .unwrap_or(u32::MAX)
+    })
+}
+
 /// Runs a bounded auxiliary completion through the production serializer, SSE
 /// parser and cancellation path, with one HTTP attempt and thinking disabled.
 /// Callers must supply a tool-free config. No tool/empty-response recovery loop.
@@ -547,7 +559,7 @@ async fn request_chat_streaming_with_budget(
             include_usage: true,
         }),
         tools: Some(primary_tools),
-        max_tokens: Some(summary_budget.unwrap_or(DEFAULT_CHAT_MAX_TOKENS)),
+        max_tokens: Some(summary_budget.unwrap_or_else(|| chat_max_tokens(config))),
         reasoning_effort: summary_budget.is_none().then_some(config.reasoning_effort),
     };
 
@@ -770,7 +782,7 @@ fn request_chat(
         stream: false,
         stream_options: None,
         tools: Some(primary_tools),
-        max_tokens: Some(DEFAULT_CHAT_MAX_TOKENS),
+        max_tokens: Some(chat_max_tokens(config)),
         reasoning_effort: Some(config.reasoning_effort),
     };
 
@@ -1962,7 +1974,7 @@ mod tests {
             stream: true,
             stream_options: None,
             tools: None,
-            max_tokens: Some(DEFAULT_CHAT_MAX_TOKENS),
+            max_tokens: Some(131_072),
             reasoning_effort: Some(orca_core::config::ReasoningEffort::Low),
         };
 
@@ -1970,7 +1982,7 @@ mod tests {
 
         assert_eq!(json["reasoning_effort"], "low");
         assert_eq!(json["thinking"]["type"], "enabled");
-        assert_eq!(json["max_tokens"], 384_000);
+        assert_eq!(json["max_tokens"], 131_072);
     }
 
     #[test]
@@ -1989,6 +2001,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let response = request_chat(&conversation, &config).expect("retry succeeds");
@@ -2008,8 +2021,8 @@ mod tests {
         let retry: Value = serde_json::from_str(&bodies[1]).expect("retry request json");
         assert_eq!(first["model"], FLASH_MODEL);
         assert_eq!(retry["model"], FLASH_MODEL);
-        assert_eq!(first["max_tokens"], DEFAULT_CHAT_MAX_TOKENS);
-        assert_eq!(retry["max_tokens"], DEFAULT_CHAT_MAX_TOKENS);
+        assert_eq!(first["max_tokens"], chat_max_tokens(&config));
+        assert_eq!(retry["max_tokens"], chat_max_tokens(&config));
         assert_eq!(
             first["messages"].as_array().expect("first messages").len(),
             1
@@ -2023,6 +2036,65 @@ mod tests {
             format!("hello\n\n{EMPTY_RESPONSE_RECOVERY_PROMPT}")
         );
         assert_eq!(conversation.messages.len(), 1);
+    }
+
+    #[test]
+    fn chat_request_reserves_the_configured_reply_budget() {
+        let ok = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"prompt_cache_hit_tokens":0}}"#;
+        let (base_url, bodies) = spawn_response_sequence_server(vec![ok, ok]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        let mut config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some(FLASH_MODEL.to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::High,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+            max_output_tokens: Some(50_000),
+        };
+
+        request_chat(&conversation, &config).expect("budgeted request");
+        config.max_output_tokens = None;
+        request_chat(&conversation, &config).expect("default request");
+
+        let bodies = bodies.lock().expect("lock captured bodies");
+        let budgeted: Value = serde_json::from_str(&bodies[0]).expect("budgeted body");
+        let default: Value = serde_json::from_str(&bodies[1]).expect("default body");
+        assert_eq!(budgeted["max_tokens"], 50_000);
+        // High effort reserves 65,536 when the runtime names no budget.
+        assert_eq!(default["max_tokens"], 65_536);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_request_reserves_the_configured_reply_budget() {
+        let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
+                      data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                      data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"prompt_cache_hit_tokens\":0}}\n\n\
+                      data: [DONE]\n\n";
+        let (base_url, bodies) = spawn_streaming_response_sequence_server(vec![answer]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some(FLASH_MODEL.to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+            max_output_tokens: Some(40_000),
+        };
+        let cancel = CancelToken::new();
+
+        request_chat_streaming(&conversation, &config, &cancel, &mut |_| {})
+            .await
+            .expect("streaming request");
+
+        let bodies = bodies.lock().expect("lock captured bodies");
+        let body: Value = serde_json::from_str(&bodies[0]).expect("streaming body");
+        assert_eq!(body["max_tokens"], 40_000);
     }
 
     #[test]
@@ -2042,6 +2114,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         request_chat(&conversation, &config).expect("retry succeeds");
@@ -2073,6 +2146,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let error = request_chat(&conversation, &config).expect_err("reasoning-only is invalid");
@@ -2108,6 +2182,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let error = request_chat(&conversation, &config).expect_err("length must be an error");
@@ -2140,6 +2215,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let error =
@@ -2163,6 +2239,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let response = request_chat(&conversation, &config)
@@ -2196,6 +2273,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let response = crate::call(
@@ -2235,6 +2313,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
 
         let response = request_chat(&conversation, &config)
@@ -2279,6 +2358,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
 
@@ -2320,6 +2400,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
 
@@ -2357,6 +2438,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
 
@@ -2406,6 +2488,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let mut emitted = Vec::new();
@@ -2454,6 +2537,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
 
@@ -2482,6 +2566,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let mut emitted = Vec::new();
@@ -2542,6 +2627,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let mut emitted = Vec::new();
@@ -2617,6 +2703,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
 
@@ -2651,6 +2738,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
 
@@ -2690,6 +2778,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
 
@@ -2733,6 +2822,7 @@ mod tests {
             tools_override: None,
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
 
@@ -2768,6 +2858,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let mut deltas = Vec::new();
@@ -2848,6 +2939,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let cancel_from_callback = cancel.clone();
@@ -2937,6 +3029,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let cancel_from_callback = cancel.clone();
@@ -3028,6 +3121,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cancel = CancelToken::new();
         let cancel_after_headers = cancel.clone();
@@ -3108,6 +3202,7 @@ mod tests {
             tools_override: Some(definitions.clone()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let permuted_plain = ProviderConfig {
             tools_override: Some(permuted.clone()),

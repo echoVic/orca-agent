@@ -554,6 +554,7 @@ fn auto_memory_provider_config(config: &RunConfig) -> ProviderConfig {
         tools_override: Some(Vec::new()),
         mcp_registry: None,
         external_tools: Vec::new(),
+        max_output_tokens: None,
     }
 }
 

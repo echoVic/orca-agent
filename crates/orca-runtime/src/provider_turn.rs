@@ -1350,6 +1350,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let hooks = HookRunner::default();
         let mut events = EventFactory::new("provider-error-test".to_string());
@@ -1476,6 +1477,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let hooks = HookRunner::default();
         let cancel = CancelToken::new();
@@ -1548,6 +1550,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let hooks = HookRunner::default();
         let cancel = CancelToken::new();
@@ -1621,6 +1624,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let hooks = HookRunner::default();
         let cancel = CancelToken::new();
@@ -1703,6 +1707,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let hooks = HookRunner::default();
         let cancel = CancelToken::new();
@@ -1789,6 +1794,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let hooks = HookRunner::default();
         let mut events = EventFactory::new("provider-error-step".to_string());
@@ -2062,6 +2068,7 @@ mod tests {
             tools_override: Some(Vec::new()),
             mcp_registry: None,
             external_tools: Vec::new(),
+            max_output_tokens: None,
         };
         let cwd = tempfile::tempdir().expect("cwd");
         let mut events = EventFactory::new("provider-cycle-continuation".to_string());
