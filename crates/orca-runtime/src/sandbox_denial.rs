@@ -129,10 +129,11 @@ fn build_message(cwd: &Path, denied_path: Option<&Path>, suggested_root: Option<
     if let Some(root) = suggested_root {
         parts.push(format!("suggested write root: {}", root.display()));
         // Metadata stays read-only in the sandbox; this names the way to ask.
+        // The root is a JSON string, so a Windows path keeps its backslashes.
         if orca_tools::sandbox::is_protected_metadata_root(root) {
+            let root = serde_json::Value::String(root.display().to_string());
             parts.push(format!(
-                "to allow it, call request_permissions with fileSystem.write [\"{}\"]",
-                root.display()
+                "to allow it, call request_permissions with fileSystem.write [{root}]"
             ));
         }
     }
@@ -193,13 +194,34 @@ mod tests {
         assert!(diagnostic.message.contains("not a stale git lock"));
         assert!(diagnostic.message.contains("/repo"));
         assert!(diagnostic.message.contains("/repo/web"));
-        assert!(
-            diagnostic
-                .message
-                .contains(r#"call request_permissions with fileSystem.write ["/repo/.git"]"#),
-            "{}",
-            diagnostic.message
-        );
+        // The root is rebuilt from components, so Windows shows `\repo\.git`.
+        let hint = if cfg!(windows) {
+            r#"call request_permissions with fileSystem.write ["\\repo\\.git"]"#
+        } else {
+            r#"call request_permissions with fileSystem.write ["/repo/.git"]"#
+        };
+        assert!(diagnostic.message.contains(hint), "{}", diagnostic.message);
+    }
+
+    #[test]
+    fn permission_hint_writes_the_directory_as_a_json_string() {
+        let cwd = Path::new("/work");
+        let stderr =
+            r#"fatal: Unable to create '/work/my "app"/.git/index.lock': Operation not permitted"#;
+
+        let diagnostic = diagnose_sandbox_denial(cwd, "", stderr).expect("diagnostic");
+
+        let root = diagnostic
+            .suggested_write_root
+            .expect("suggested write root");
+        let hint = diagnostic
+            .message
+            .split("fileSystem.write ")
+            .nth(1)
+            .and_then(|rest| rest.split("; ").next())
+            .expect("request_permissions hint");
+        let roots: Vec<String> = serde_json::from_str(hint).expect("the hint is a JSON array");
+        assert_eq!(roots, vec![root.display().to_string()]);
     }
 
     #[test]
