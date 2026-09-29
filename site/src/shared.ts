@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.3";
+export const releaseVersion = "v0.5.4";
 
 export const releases = [
+  {
+    version: "v0.5.4",
+    date: "2026-09-29",
+    title: "Git write approvals and plan progress",
+    body: "In auto-edit and suggest, a git write such as git commit costs one approval instead of failing against the read-only .git; the grant covers that one command and keeps .git config and hooks read-only. The model updates the plan as each step finishes, a stale plan gets its reminder again, and plan, goal, or memory changes no longer make DeepSeek read the whole history as a cache miss.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.4",
+  },
   {
     version: "v0.5.3",
     date: "2026-09-28",

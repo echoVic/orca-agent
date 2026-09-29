@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.4":
+        "In auto-edit and suggest, a git write such as git commit asks once and runs, instead of failing against the read-only .git. The grant covers that one command and keeps .git/config, hooks, and modules read-only; in suggest, approving the command also grants it. The model updates the plan as each step finishes, and the reminder for a stale plan fires again. Plan, goal, memory, and mode context now go at the end of each DeepSeek request, so changing them no longer makes the whole history a cache miss.",
       "v0.5.3":
         "A successful edit or write no longer fails the turn when the model is DeepSeek: the file changed, but the turn stopped with an IllegalTransition error. Approval prompts for DeepSeek tool calls appear again. Orca now records each DeepSeek call as the kind of tool it is, so edit rows show their diff, a shell result keeps its exit code, and ACP clients see the right tool kind; sessions from v0.5.1 and v0.5.2 still resume.",
       "v0.5.2":
@@ -682,6 +684,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.4":
+        "在 auto-edit 和 suggest 模式下，git commit 这类写 git 的命令不再撞上只读的 .git 而失败，而是先询问一次再运行。授权只对这一条命令生效，.git/config、hooks 和 modules 仍然只读；suggest 模式下，批准命令本身即完成授权。模型每完成一步就更新计划，计划久未更新时的提醒重新生效。计划、goal、记忆和模式上下文改放在每次 DeepSeek 请求的末尾，修改它们不再让整段历史缓存失效。",
       "v0.5.3":
         "使用 DeepSeek 时，成功的 edit 或 write 不再让当前轮次失败：此前文件已经改好，轮次却以 IllegalTransition 错误中止。DeepSeek 工具调用的审批弹窗重新出现。Orca 现在按工具本身的类型记录每个 DeepSeek 调用，因此编辑行会显示 diff，shell 结果保留退出码，ACP 客户端看到正确的工具类型；v0.5.1 和 v0.5.2 留下的会话仍可恢复。",
       "v0.5.2":
