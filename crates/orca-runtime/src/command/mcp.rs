@@ -500,8 +500,11 @@ fn join_or_dash(values: &[String]) -> String {
     }
 }
 
+/// A tool filter as `get` prints it: `-` when it is not set, and `none` when
+/// it is set to an empty list, which for `enabled_tools` enables no tool.
 fn list_or_dash(values: Option<&[String]>) -> String {
     match values {
+        Some([]) => "none".to_string(),
         Some(values) => values.join(","),
         None => "-".to_string(),
     }
@@ -961,6 +964,71 @@ mod tests {
         );
         assert_eq!(code, 0);
         assert!(!stdout.contains("Bearer t"), "{stdout}");
+    }
+
+    #[test]
+    fn get_shows_an_empty_tool_filter_as_none() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            config_path(temp.path()),
+            concat!(
+                "[[mcp_servers]]\n",
+                "name = \"docs\"\n",
+                "command = \"docs-mcp\"\n",
+                "enabled_tools = []\n",
+                "disabled_tools = []\n",
+                "\n",
+                "[[mcp_servers]]\n",
+                "name = \"search\"\n",
+                "command = \"search-mcp\"\n",
+                "enabled_tools = [\"lookup\", \"list\"]\n",
+            ),
+        )
+        .unwrap();
+        let get = |name: &str, json: bool| {
+            let (code, stdout, stderr) = run(
+                temp.path(),
+                McpCommandRequest::Get {
+                    name: name.to_string(),
+                    json,
+                },
+            );
+            assert_eq!(code, 0, "stderr: {stderr}");
+            stdout
+        };
+
+        // An empty allow-list enables no tool at all, which a blank would
+        // hide.
+        let docs = get("docs", false);
+        assert!(
+            docs.lines().any(|line| line == "enabled_tools: none"),
+            "{docs}"
+        );
+        assert!(
+            docs.lines().any(|line| line == "disabled_tools: none"),
+            "{docs}"
+        );
+        let docs: serde_json::Value = serde_json::from_str(&get("docs", true)).unwrap();
+        assert_eq!(docs["enabled_tools"], serde_json::json!([]));
+        assert_eq!(docs["disabled_tools"], serde_json::json!([]));
+
+        let search = get("search", false);
+        assert!(
+            search
+                .lines()
+                .any(|line| line == "enabled_tools: lookup,list"),
+            "{search}"
+        );
+        assert!(
+            search.lines().any(|line| line == "disabled_tools: -"),
+            "{search}"
+        );
+        let search: serde_json::Value = serde_json::from_str(&get("search", true)).unwrap();
+        assert_eq!(
+            search["enabled_tools"],
+            serde_json::json!(["lookup", "list"])
+        );
+        assert_eq!(search["disabled_tools"], serde_json::Value::Null);
     }
 
     #[test]
