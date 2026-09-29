@@ -1020,7 +1020,7 @@ struct CompactionPartition {
 }
 
 // Only unpinned leading system messages are immutable instructions. A pinned
-// system message (e.g. a background-task notice) is kept conversation
+// system message (user-pinned context, a plan-mode note) is kept conversation
 // content, not an instruction, so it must not be swept into the prefix or it
 // would anchor ahead of the summary forever instead of sorting after it.
 fn leading_system_count(messages: &[Message]) -> usize {
