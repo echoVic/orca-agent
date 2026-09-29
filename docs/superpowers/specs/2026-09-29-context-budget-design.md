@@ -80,17 +80,15 @@ Codewhale 的 CHANGELOG（#4293/#4368/#4378）记录了与本次相同的事故�
 测量值 P 用于三处：压缩触发判断、每次请求的 `max_tokens`、仪表。
 
 ```
-锚点有效：P = 锚点.prompt_tokens + 锚点.output_tokens
-            + 估算(锚点之后追加的消息)
-            + (估算(当前内部上下文) − 锚点.内部上下文估算)
-锚点无效：P = 估算(整个请求)          （即现在的 wire_equivalent_tokens）
+锚点有效：P = 锚点.prompt_tokens + (估算(当前整个请求) − 锚点.发送时整个请求的估算)
+锚点无效：P = 估算(整个请求)          （即 wire_equivalent_tokens）
 ```
 
-- **锚点**（`UsageAnchor`）存在 `Conversation` 上，不持久化，包含：上次请求的 `prompt_tokens`（`Usage.input_tokens`，含缓存命中）与 `output_tokens`、写入助手回复后的消息条数、最后一条已计入消息的指纹、当时内部上下文的估算值。
-- **何时设置**：主 agent 与子 agent 每次成功拿到带用量的回复并写入助手消息之后（`provider_turn.rs` 与 `child_agent_provider_turn.rs`）。
-- **何时失效**：任何压缩提交后；消息条数少于锚点记录的条数，或那条消息的指纹对不上（回退、编辑历史）；会话恢复后（新建的 `Conversation` 本来就没有锚点）。
-- **为什么加上 `output_tokens`**：助手回复会成为下一次提示的一部分（带工具调用时还要回放 reasoning）。没有工具调用时 reasoning 不回放，这样估计略偏大，方向是安全的。
-- **估算器**：仍用现有的 `DefaultTokenCounter`，但只估增量，不再每次估整个 60 万 token 的历史。
+- **锚点**（`UsageAnchor`）存在 `Conversation` 上，不持久化，包含：那次请求 API 报告的 `prompt_tokens`（`Usage.input_tokens`，含缓存命中）、发送时 Orca 对整个请求的估算、请求里的消息条数，以及其中最后一条消息的指纹。
+- **何时设置**：主 agent 与子 agent 的请求成功返回且带有 `input_tokens` 时（`provider_turn.rs` 与 `child_agent_loop_runner.rs`）；成功返回却没有用量时清除锚点。
+- **何时失效**：任何压缩提交后；消息条数少于锚点记录的条数，或那条消息的指纹对不上（回退、编辑历史）；会话恢复后（新建的 `Conversation` 本来就没有锚点）。报告值与发送时估算之比不在 0.5 到 1.6 之间时也不用锚点：这样的计数多半合并了几次重试的用量，说明不了那次请求。
+- **差值怎么算**：每次都用发送时的同一套算法重新估算整个请求（消息、摘要、内部上下文与工具定义），减去发送时的估算。锚点之后的变化都在这个差值里：助手回复（及请求会回放的 reasoning）、工具结果、新消息、内部上下文的增减。所以不再另加 `output_tokens`：回复已经作为消息出现在当前请求里，再加一次就重复了。
+- **估算器**：仍用现有的 `DefaultTokenCounter`。逐条文本的计数有缓存（按内容先进先出，上限 4,096 条、8 MiB），没有变化的历史消息通常直接命中，重新估算整个请求的开销主要在新增内容上。
 
 ## 4. pinned 按消息生效
 
@@ -112,7 +110,9 @@ Codewhale 的 CHANGELOG（#4293/#4368/#4378）记录了与本次相同的事故�
 
 ### 4.3 旧会话
 
-恢复会话时，`<task-notification>` 开头的 pinned system 消息按普通消息载入，与已有的 `strip_legacy_pinned_volatile` 同处处理。事故会话恢复后即可被压缩。
+恢复会话时，以 `<task-notification>`、`[Parent guidance id=`、`[Task wait result id=`、`[Budget soft landing]` 开头的 pinned system 消息按普通消息载入，与已有的 `strip_legacy_pinned_volatile` 同处处理。事故会话恢复后即可被压缩。
+
+恢复时旧的系统提示与其他临时的 system 上下文重新生成，不从记录载入。以上四种通知（`is_delivered_notice`）不在此列，未 pin 的也照常载入：它们是对话内容，压缩把它们摘要之前，模型都要能看到原文。
 
 ## 5. 压缩可以切分当前轮
 
@@ -125,6 +125,7 @@ Codewhale 的 CHANGELOG（#4293/#4368/#4378）记录了与本次相同的事故�
 - **最新单元总是保留**，即使它单独超过目标。
 - **开启本轮的用户消息始终保留原文**：它是这一轮的任务说明。
 - 摘要证据按原顺序包含当前轮被折叠的部分。
+- **微压缩同样保护当前轮最近的部分**：缩短旧工具输出（`cache_aware_micro_compaction`）时，当前轮最新的若干单元（从最新往前累加，不超过同一个保留目标，至少包括最新单元）和开启本轮的用户消息保持原文，这些单元里的图片也不删。其余单元从新到旧缩短，先是当前轮较早的单元，再是更早的轮次；一旦低于目标就停下，更早的部分原样保留，作为可复用的缓存前缀。判断是否低于目标时，估算按 API 计数与估算之比放大（只放大不缩小），与触发判断用同一尺度，每次缩短省下的 token 也按同一比例计入。
 
 ## 6. 紧急压缩与超限恢复
 
@@ -133,15 +134,19 @@ Codewhale 的 CHANGELOG（#4293/#4368/#4378）记录了与本次相同的事故�
 - 发送前测得本次请求装不下最小回复（第 2 节）；
 - API 返回上下文超限（沿用 `is_prompt_too_long_error` 识别）。
 
-按压力触发的自动压缩（包括越过硬线的）都是普通压缩，不走下面的规则：默认 Max 强度下软线与硬线重合（768,928），每次自动压缩都会越过硬线。
+按压力触发的自动压缩（包括越过硬线的）都是普通压缩，下面的前两条区别不适用于它：默认 Max 强度下软线与硬线重合（768,928），每次自动压缩都会越过硬线。
 
 紧急压缩与普通压缩使用同一套分区（第 4、5 节），区别如下：
 
 - 不因为"低于触发线"而跳过；
-- 强制把压缩线压到"测量值 P"与"整个请求的本地估算"两者中较小者的四分之三（不高于 T），保证至少做一次真正的缩减。取较小者，是因为压缩内部按本地估算裁剪，而以 API 用量为锚的 P 可能比估算大，按 P 算出的压缩线可能落在估算之上，结果什么也压不掉；
+- 强制把压缩线压到测量值 P 的四分之三（不高于 T），保证至少做一次真正的缩减。压缩内部判断是否达标时，本地估算也按 API 计数与估算之比放大（只放大不缩小，第 5 节），所以这条线在两种尺度上都是同样比例的缩减；若再取 P 与估算中较小者，API 计数比估算大时，多出的部分会被扣两次；
 - pinned 消息仍逐条保留。改为按消息生效后，剩下的 pinned 只有用户显式 pin 的内容、plan 模式说明和轮次提示，都很短。如果"系统提示 + pinned 消息 + 最新单元"本身就放不下，紧急压缩按下面的方式失败。
 
-压缩后重新测量（锚点已失效，走整份估算，再按压缩前 API 计数与估算之比放大，只放大不缩小）。估算严格小于压缩前，就采用结果，替换并持久化历史；估算没有变小，就不替换历史。之后：
+压缩后重新测量（锚点已失效，走整份估算，再按压缩前 API 计数与估算之比放大，只放大不缩小）。估算严格小于压缩前，就采用结果，替换并持久化历史；估算没有变小，就不替换也不持久化历史。这条"变小才采用"的规则对所有触发方式都适用，普通压缩也一样，所以压不动的历史不会在每次请求时被原样换回、写入快照、再报告一次压缩。
+
+没有采用时，压缩事件仍然结束（`context.compacted`，界面靠它结束"正在压缩"的状态），但事件说明什么也没压缩：`strategy` 为 `none`，前后消息数相同，`status_text` 为 `context compaction could not shrink the conversation`；也不运行 PostCompact hook。TUI 显示 `Context compaction could not shrink the conversation (N messages unchanged).`，文本输出显示同样的内容，而不是"已压缩 N -> N"。事件类型和字段不变，ACP 与 JSONL 的使用方照常解析。
+
+压缩之后：
 
 - 发送前：无论是否采用，只要请求仍装不下最小回复，本轮就不发请求，直接停止并给出下面的失败说明；
 - API 超限：只有历史确实变小才重试一次，重试的请求同样先经过发送前的检查；历史没有变小就不重试，在服务端的错误原文之后附上 `Compaction cannot shrink the conversation further; start a new conversation with /new.`（`unrecoverable_overflow_message`）。
@@ -153,6 +158,8 @@ The conversation no longer fits the model's context window (about {prompt_tokens
 ```
 
 API 超限的重试仍是每轮一次（`RuntimeCompactionRetryState` 的 `prompt_too_long_retried`）。
+
+子 agent 用自己的说明：父会话不受影响，所以不建议 `/new`，而是建议缩小任务。发送前装不下时是 `The sub-agent's context no longer fits the model's context window (about {prompt_tokens} tokens) and compaction cannot shrink it further. Retry with a narrower task.`；API 超限且无法缩小时，在错误原文之后附上 `Compaction cannot shrink the sub-agent's context further; retry with a narrower task.`。
 
 ## 7. 仪表
 
@@ -189,9 +196,9 @@ API 超限的重试仍是每轮一次（`RuntimeCompactionRetryState` 的 `promp
 - **请求体**：流式与非流式请求的 `max_tokens` 取自 `ProviderConfig.max_output_tokens`；缺省时为按思考强度的默认值。
 - **测量**：有锚点时 P = 锚点 + 增量；压缩、回退、指纹不符时锚点失效，走整份估算；内部上下文变化计入差值。
 - **pinned**：复现事故形状，每个历史轮次都含一条 pinned 通知，压缩必须显著缩小，pinned 消息逐条保留在摘要之后。
-- **切分当前轮**：一轮 400 条消息的历史可以被压缩；工具调用与结果不被拆开；开启本轮的用户消息与最新单元保留原文。
-- **紧急压缩**：模拟服务端返回超限错误，压缩后重试成功；压缩无法缩小时不重试、不替换历史，并给出失败说明。
-- **旧会话**：`<task-notification>` pinned 消息恢复后按普通消息处理。
+- **切分当前轮**：一轮 400 条消息的历史可以被压缩；工具调用与结果不被拆开；开启本轮的用户消息与最新单元保留原文；微压缩保留当前轮在保留目标之内的最近单元，API 计数高于估算时缩短到刚好低于目标就停。
+- **紧急压缩**：模拟服务端返回超限错误，压缩后重试成功；压缩无法缩小时不重试、不替换历史，并给出失败说明；没有采用的压缩不运行 PostCompact，完成事件报告 `none`；子 agent 的失败说明不含 `/new`。
+- **旧会话**：四种 pinned 通知恢复后按普通消息处理；未 pin 的通知经过压缩快照和恢复之后仍在。
 - **仪表**：上限为 T；TUI 与 ACP 两条路径一致。
 
 ## 11. 兼容性与风险
