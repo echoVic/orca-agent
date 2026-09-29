@@ -149,7 +149,12 @@ impl Default for ThinkingConfig {
 }
 
 fn add_empty_response_recovery_instruction(request: &mut ChatRequest) {
-    if let Some(last) = request.messages.last_mut()
+    // Look past the trailing internal-context overlay to the prompt itself.
+    if let Some(last) = request
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role != "system")
         && last.role == "user"
         && let Some(content) = &mut last.content
     {
@@ -1066,9 +1071,14 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
 
     let mut injected = vec![];
     inject_summary_messages(&conversation.summary, &mut injected);
+    // Keep every leading instruction message immutable; the summary changes
+    // only on compaction, so it can sit ahead of the history.
+    messages.splice(prefix_len..prefix_len, injected);
 
+    // Plan, goal, memory, and mode state change mid-session. Sent last, a
+    // change costs only this message instead of the cached history prefix.
     if let Some(overlay) = render_internal_context(conversation) {
-        injected.push(ApiMessage {
+        messages.push(ApiMessage {
             role: "system".to_string(),
             content: Some(overlay),
             images: Vec::new(),
@@ -1077,9 +1087,6 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
             tool_call_id: None,
         });
     }
-    // Keep every leading instruction message immutable; changing overlay state
-    // must not invalidate an otherwise unchanged summary prefix.
-    messages.splice(prefix_len..prefix_len, injected);
 
     messages
 }
@@ -1681,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_context_is_a_separate_system_message_after_instructions() {
+    fn internal_context_is_a_separate_system_message_after_the_history() {
         let mut conv = Conversation::new();
         conv.add_system("system prompt".to_string());
         conv.add_user("do something".to_string());
@@ -1690,12 +1697,46 @@ mod tests {
 
         let messages = conversation_to_api_messages(&conv);
         assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[1].role, "system");
-        let overlay = messages[1].content.as_deref().unwrap();
+        assert_eq!(messages[0].content.as_deref(), Some("system prompt"));
+        assert_eq!(messages[1].content.as_deref(), Some("do something"));
+        assert_eq!(messages[2].role, "system");
+        let overlay = messages[2].content.as_deref().unwrap();
         assert!(overlay.contains("[Goal state]"));
         assert!(overlay.contains("[Plan]"));
-        assert_eq!(messages[2].content.as_deref(), Some("do something"));
+    }
+
+    #[test]
+    fn changing_internal_context_leaves_the_history_prefix_unchanged() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.summary.baseline = Some("earlier work".to_string());
+        conv.add_user("read a file".to_string());
+        conv.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: r#"{"path":"x"}"#.to_string(),
+            }],
+        );
+        conv.add_tool_result("tc1".to_string(), "file contents".to_string());
+        conv.replace_plan_state("[in_progress] read the file".to_string());
+        let before = serde_json::to_value(conversation_to_api_messages(&conv)).unwrap();
+
+        conv.replace_plan_state("[completed] read the file\n[in_progress] patch it".to_string());
+        conv.replace_memory_context(Some("- a recalled fact".to_string()));
+        let after = serde_json::to_value(conversation_to_api_messages(&conv)).unwrap();
+
+        let (before, after) = (before.as_array().unwrap(), after.as_array().unwrap());
+        assert_eq!(before.len(), after.len());
+        let overlay = after.len() - 1;
+        assert_eq!(before[..overlay], after[..overlay]);
+        assert_eq!(after[1]["content"], "[Summary baseline]\nearlier work");
+        assert_eq!(after[overlay]["role"], "system");
+        let overlay = after[overlay]["content"].as_str().unwrap();
+        assert!(overlay.contains("[in_progress] patch it"));
+        assert!(overlay.contains("a recalled fact"));
     }
 
     #[test]
@@ -1712,7 +1753,7 @@ mod tests {
         );
 
         let messages = conversation_to_api_messages(&conv);
-        let overlay = messages[1].content.as_deref().unwrap();
+        let overlay = messages.last().unwrap().content.as_deref().unwrap();
 
         assert!(crate::context::DefaultTokenCounter.count_text(overlay) <= 2);
         assert_ne!(overlay, "one two three four five six");
@@ -1737,12 +1778,12 @@ mod tests {
 
         let messages = conversation_to_api_messages(&conv);
         assert_eq!(messages.len(), 5);
-        let overlay = &messages[1];
+        let tool = &messages[3];
+        assert_eq!(tool.role, "tool");
+        assert_eq!(tool.content.as_deref(), Some("file contents"));
+        let overlay = messages.last().unwrap();
         assert_eq!(overlay.role, "system");
         assert!(overlay.content.as_deref().unwrap().contains("updated plan"));
-        let last = messages.last().unwrap();
-        assert_eq!(last.role, "tool");
-        assert_eq!(last.content.as_deref(), Some("file contents"));
     }
 
     #[test]
@@ -1982,6 +2023,39 @@ mod tests {
             format!("hello\n\n{EMPTY_RESPONSE_RECOVERY_PROMPT}")
         );
         assert_eq!(conversation.messages.len(), 1);
+    }
+
+    #[test]
+    fn empty_response_recovery_joins_the_user_prompt_ahead_of_internal_context() {
+        let (base_url, bodies) = spawn_two_response_server(
+            r#"{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"prompt_cache_hit_tokens":7}}"#,
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":13,"completion_tokens":5,"prompt_cache_hit_tokens":9}}"#,
+        );
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        conversation.replace_plan_state("[in_progress] answer".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some(FLASH_MODEL.to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        request_chat(&conversation, &config).expect("retry succeeds");
+
+        let bodies = bodies.lock().expect("lock captured bodies");
+        let retry: Value = serde_json::from_str(&bodies[1]).expect("retry request json");
+        let messages = retry["messages"].as_array().expect("retry messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0]["content"],
+            format!("hello\n\n{EMPTY_RESPONSE_RECOVERY_PROMPT}")
+        );
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(messages[1]["content"], "[in_progress] answer");
     }
 
     #[test]

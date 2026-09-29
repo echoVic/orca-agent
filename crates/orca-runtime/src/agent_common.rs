@@ -287,11 +287,11 @@ const PLAN_MODE_ON: &str = "[Plan mode on]";
 const PLAN_MODE_OFF: &str = "[Plan mode off]";
 
 /// The note that records a switch into or out of plan mode where it happens
-/// in the conversation. The Plan Mode instructions live in the mode context,
-/// which sits ahead of the whole history: after a switch mid-session a model
-/// reads them before the turns that ran in another mode, and takes plan mode
-/// for over. `None` while the mode the conversation last noted still holds;
-/// a conversation with no note has never been told plan mode is on.
+/// in the conversation. The mode context only carries the Plan Mode
+/// instructions that hold now; the note marks where the turns that ran in the
+/// other mode end, so a model does not carry their mode forward. `None` while
+/// the mode the conversation last noted still holds; a conversation with no
+/// note has never been told plan mode is on.
 pub(crate) fn plan_mode_switch_note(
     conversation: &orca_core::conversation::Conversation,
     approval_mode: ApprovalMode,

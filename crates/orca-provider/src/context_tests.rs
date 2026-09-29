@@ -105,7 +105,7 @@ fn cache_aware_reduction_preserves_more_prefix_than_eager_micro_ab() {
 }
 
 #[test]
-fn below_pressure_keeps_exact_prefix_and_dynamic_overlay_follows_summary() {
+fn below_pressure_keeps_exact_prefix_and_dynamic_overlay_trails_history() {
     let mut conversation = tool_fixture();
     conversation.summary.baseline = Some("stable summary".to_string());
     conversation.replace_plan_state("first plan".to_string());
@@ -124,7 +124,10 @@ fn below_pressure_keeps_exact_prefix_and_dynamic_overlay_follows_summary() {
     changed.replace_plan_state("second plan".to_string());
     let metrics =
         measure_deepseek_prefix_reuse(&conversation, &provider, &changed, &provider).unwrap();
-    assert_eq!(metrics.unchanged_prefix_messages, 3);
+    assert_eq!(
+        metrics.unchanged_prefix_messages,
+        crate::deepseek_http::conversation_to_api_messages(&changed).len() - 1
+    );
     let changed_provider = ProviderConfig {
         model: Some("another-model".to_string()),
         ..provider.clone()
