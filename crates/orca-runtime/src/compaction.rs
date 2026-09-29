@@ -21,6 +21,7 @@ use orca_core::conversation::Conversation;
 pub(crate) enum RuntimeCompactionTrigger {
     SoftLimit,
     HardLimit,
+    Overflow,
     PromptTooLong,
 }
 
@@ -28,15 +29,18 @@ impl RuntimeCompactionTrigger {
     pub(crate) fn reason(self) -> RuntimeCompactionReason {
         match self {
             Self::SoftLimit => RuntimeCompactionReason::ApproachingContextLimit,
-            Self::HardLimit => RuntimeCompactionReason::ExceededContextLimit,
+            Self::HardLimit | Self::Overflow => RuntimeCompactionReason::ExceededContextLimit,
             Self::PromptTooLong => RuntimeCompactionReason::PromptTooLongRecovery,
         }
     }
 
-    /// Hard-limit and prompt-too-long compactions must make room: they force
-    /// a real reduction and keep the result only when it shrank the prompt.
+    /// A request with no room for a minimal reply, and one the provider
+    /// rejected as too long, must make room: they force a real reduction and
+    /// keep the result only when it shrank the prompt. Pressure past the hard
+    /// line is ordinary compaction; at the default Max effort that line is
+    /// the soft line.
     fn is_emergency(self) -> bool {
-        matches!(self, Self::HardLimit | Self::PromptTooLong)
+        matches!(self, Self::Overflow | Self::PromptTooLong)
     }
 }
 
@@ -214,6 +218,7 @@ impl RuntimeCompactionOutcome {
             (
                 RuntimeCompactionTrigger::SoftLimit
                 | RuntimeCompactionTrigger::HardLimit
+                | RuntimeCompactionTrigger::Overflow
                 | RuntimeCompactionTrigger::PromptTooLong,
                 RuntimeCompactionStrategy::LocalTruncation
                 | RuntimeCompactionStrategy::RemoteSummary,
@@ -501,7 +506,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
     ) -> io::Result<Result<(), String>> {
         let measured = context::measure_prompt(conversation, self.provider_config).tokens;
         let trigger = if self.context_config.request_reply_budget(measured).is_none() {
-            Some(RuntimeCompactionTrigger::HardLimit)
+            Some(RuntimeCompactionTrigger::Overflow)
         } else {
             RuntimeCompactionPolicy::decide_for_pressure(context::context_pressure_for_tokens(
                 measured,
@@ -1323,7 +1328,70 @@ mod tests {
         // output instead, so compare the measured size, not the count.
         let after = context::wire_equivalent_tokens(&conversation, &provider_config);
         assert!(after < before);
+        // The room comes from the Overflow emergency line: ordinary compaction
+        // only aims for 9/10 of the 31,904 soft line (28,713), above 27,712.
         assert!(config.request_reply_budget(after).is_some());
+    }
+
+    #[test]
+    fn only_the_two_spec_entry_points_are_emergencies() {
+        // Pressure past the hard line is ordinary compaction: at the default
+        // Max effort the soft and hard lines coincide.
+        assert!(!RuntimeCompactionTrigger::SoftLimit.is_emergency());
+        assert!(!RuntimeCompactionTrigger::HardLimit.is_emergency());
+        assert!(RuntimeCompactionTrigger::Overflow.is_emergency());
+        assert!(RuntimeCompactionTrigger::PromptTooLong.is_emergency());
+        // Overflow reports like the hard line, so emitted events do not change.
+        assert_eq!(
+            RuntimeCompactionTrigger::Overflow.reason(),
+            RuntimeCompactionTrigger::HardLimit.reason()
+        );
+    }
+
+    #[test]
+    fn prepare_request_compacts_normally_while_a_reply_still_fits() {
+        // Soft line == hard line == 30,000, like the default Max effort's
+        // 768,928. A prompt just past it still leaves room for a reply.
+        let config = context::ContextConfig {
+            max_tokens: 60_000,
+            compaction_threshold: 0.9,
+            reserved_for_response: 24_000,
+            auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
+        };
+        assert_eq!(config.soft_limit(), config.effective_limit());
+        let provider_config = bare_provider_config();
+        let hooks = HookRunner::default();
+        let mut events = EventFactory::new("prepare-request".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let subagent_type = SubagentType::General;
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut conversation = history_with_turns(16, 2_000);
+        let before = context::wire_equivalent_tokens(&conversation, &provider_config);
+        assert!(before > config.soft_limit(), "fixture must pass the line");
+        assert!(
+            config.request_reply_budget(before).is_some(),
+            "fixture must leave room for a reply"
+        );
+
+        let prepared = RuntimeCompactionStep::new(
+            orca_core::config::ProviderKind::Mock,
+            &config,
+            &provider_config,
+            RuntimeTurnContext::new(cwd.path(), "", 0, false, &subagent_type),
+            &hooks,
+            &mut events,
+            &mut sink,
+            None,
+        )
+        .prepare_request(&mut conversation)
+        .expect("prepare");
+
+        assert_eq!(prepared, Ok(()));
+        let after = context::wire_equivalent_tokens(&conversation, &provider_config);
+        assert!(after <= config.soft_limit() * 9 / 10, "normal micro target");
+        // An emergency would have forced the line under 3/4 of the prompt.
+        assert!(after > before * 3 / 4, "compacted {before} down to {after}");
     }
 
     #[test]

@@ -1276,14 +1276,20 @@ impl ThreadActor {
                     let host_commit_id =
                         surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                             .expect("generated UUID is v7");
+                    let mut settings_events = vec![(
+                        surface::SurfaceScope::Thread,
+                        surface::SurfaceEvent::Settings(surface::SettingsPatch::Committed {
+                            previous_revision: previous_settings_revision,
+                            snapshot: next_settings.clone(),
+                        }),
+                    )];
+                    // An effort change moves the compaction line the meter counts down to.
+                    settings_events.extend(surface_context_limit_event(
+                        self.resident_surface.coordinator.state().snapshot(),
+                        &next_config,
+                    ));
                     let settings_batch = self.surface_event_batch_with_commit_id(
-                        vec![(
-                            surface::SurfaceScope::Thread,
-                            surface::SurfaceEvent::Settings(surface::SettingsPatch::Committed {
-                                previous_revision: previous_settings_revision,
-                                snapshot: next_settings.clone(),
-                            }),
-                        )],
+                        settings_events,
                         Some(host_commit_id.clone()),
                     );
                     self.commit_surface_actor_batch_with_retry(&settings_batch)
@@ -3504,16 +3510,19 @@ impl ThreadActor {
             .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         }
         next_settings.pending = None;
-        let batch = self.surface_event_batch_with_commit_id(
-            vec![(
-                surface::SurfaceScope::Thread,
-                surface::SurfaceEvent::Settings(surface::SettingsPatch::Committed {
-                    previous_revision: current.thread_revision,
-                    snapshot: next_settings.clone(),
-                }),
-            )],
-            None,
-        );
+        let mut events = vec![(
+            surface::SurfaceScope::Thread,
+            surface::SurfaceEvent::Settings(surface::SettingsPatch::Committed {
+                previous_revision: current.thread_revision,
+                snapshot: next_settings.clone(),
+            }),
+        )];
+        // An effort change moves the compaction line the meter counts down to.
+        events.extend(surface_context_limit_event(
+            self.resident_surface.coordinator.state().snapshot(),
+            &next_config,
+        ));
+        let batch = self.surface_event_batch_with_commit_id(events, None);
         self.commit_surface_actor_batch_with_retry(&batch)?;
         if let Some(state) = self.state.as_mut() {
             if patches

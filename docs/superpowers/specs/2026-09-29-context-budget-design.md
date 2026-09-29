@@ -133,6 +133,8 @@ Codewhale 的 CHANGELOG（#4293/#4368/#4378）记录了与本次相同的事故�
 - 发送前测得本次请求装不下最小回复（第 2 节）；
 - API 返回上下文超限（沿用 `is_prompt_too_long_error` 识别）。
 
+按压力触发的自动压缩（包括越过硬线的）都是普通压缩，不走下面的规则：默认 Max 强度下软线与硬线重合（768,928），每次自动压缩都会越过硬线。
+
 紧急压缩与普通压缩使用同一套分区（第 4、5 节），区别如下：
 
 - 不因为"低于触发线"而跳过；
@@ -154,7 +156,7 @@ API 超限的重试仍是每轮一次（`RuntimeCompactionRetryState` 的 `promp
 
 ## 7. 仪表
 
-- **上限**：`SurfaceContextSnapshot.limit_tokens` 由窗口改为触发线 T（`runtime_host.rs` 初始化处；模型或配置变化时同步更新）。
+- **上限**：`SurfaceContextSnapshot.limit_tokens` 由窗口改为触发线 T（`runtime_host.rs` 初始化处；模型或配置变化时同步更新）。每个 Context 事件都把上限原样带下去，所以恢复会话时，账本回放出的上限若与当前配置的 T 不同，线程启动时立即提交一个只改上限的 Context 事件；改变思考强度或模型的设置提交，也在同一批次里带上新的上限。
 - **已用**：仍为上一次请求 API 报告的 `prompt_tokens`（`next_provider_context_snapshot`）。
 - 状态栏的 `ctx N%` 因此表示"距离自动压缩还剩多少"，到 0% 就会压缩，而不是请求失败。
 - ACP 的 `UsageUpdate(used, limit)` 一并改为以 T 为上限。

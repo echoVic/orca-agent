@@ -5580,7 +5580,8 @@ async fn run_host_supervisor(
                 } else {
                     (unavailable_surface_handle(host_incarnation.clone()), None)
                 };
-                if let Some(resident) = resident_surface.as_ref() {
+                let mut resident_surface = resident_surface;
+                if let Some(resident) = resident_surface.as_mut() {
                     if let Err(error) = hydrate_run_config_from_surface_settings(
                         &mut actor_config,
                         &resident.coordinator.state().snapshot().settings.effective,
@@ -5589,6 +5590,23 @@ async fn run_host_supervisor(
                             message: format!("failed to restore runtime settings: {error:?}"),
                         }));
                         continue;
+                    }
+                    // A recovered context keeps the ceiling its ledger recorded.
+                    if let Some(event) = surface_context_limit_event(
+                        resident.coordinator.state().snapshot(),
+                        &actor_config,
+                    ) {
+                        let batch = runtime_surface_event_batch(
+                            resident.coordinator.state().snapshot(),
+                            vec![event],
+                            None,
+                        );
+                        if let Err(error) = resident.coordinator.commit_actor_batch(&batch) {
+                            let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
+                                message: format!("failed to refresh the context limit: {error:?}"),
+                            }));
+                            continue;
+                        }
                     }
                 }
                 startup_warnings.extend(
@@ -10878,6 +10896,31 @@ fn surface_context_limit_tokens(config: &RunConfig) -> u64 {
     )
     .soft_limit()
     .max(1) as u64
+}
+
+/// Moves the meter's ceiling to the compaction line of `config`, or `None`
+/// when it is already there. Every Context event carries the ceiling forward,
+/// so a resumed ledger replays the one it recorded and a settings change would
+/// otherwise keep the old line.
+fn surface_context_limit_event(
+    snapshot: &surface::SurfaceSnapshot,
+    config: &RunConfig,
+) -> Option<(surface::SurfaceScope, surface::SurfaceEvent)> {
+    let limit_tokens = surface_context_limit_tokens(config);
+    if snapshot.context.limit_tokens == limit_tokens {
+        return None;
+    }
+    let mut context = snapshot.context.clone();
+    context.revision =
+        surface::ContextRevision::try_new(context.revision.get().checked_add(1)?).ok()?;
+    context.limit_tokens = limit_tokens;
+    // The reducer rejects usage above the ceiling; provider usage is clamped
+    // to it the same way.
+    context.used_tokens = context.used_tokens.min(limit_tokens);
+    Some((
+        surface::SurfaceScope::Thread,
+        surface::SurfaceEvent::Context(context),
+    ))
 }
 
 fn initial_surface_snapshot(
@@ -31886,6 +31929,166 @@ mod tests {
         assert_eq!(snapshot.context.limit_tokens, 768_928);
         host.shutdown()
             .expect("shutdown semantic retry runtime host");
+    }
+
+    fn run_usage_turn(surface: &surface::RuntimeSurfaceHandle, intent_text: &str) {
+        let attachment = fresh_surface_attachment(surface);
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(&attachment.baseline.snapshot, intent_text),
+                )
+                .expect("reserve usage turn"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit usage turn"),
+        );
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait usage turn");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+    }
+
+    #[test]
+    fn resume_moves_a_recorded_meter_ceiling_to_the_compaction_line() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host =
+            RuntimeHost::start_with_executor(Arc::new(ProviderResponseCheckpointRetryExecutor))
+                .expect("start runtime host");
+        // Metering against the full window, as builds before the compaction
+        // line did, leaves a 1,000,000 ceiling in the ledger's Context events.
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.model_runtime.auto_compact_token_limit = Some(1_000_000);
+        config.model_runtime.soft_compact_token_limit = Some(1_000_000);
+        let thread = host
+            .start_thread(config, "full-window meter")
+            .expect("start recorded runtime thread");
+        run_usage_turn(&thread.surface(), "record a context update");
+        let recorded = fresh_surface_attachment(&thread.surface())
+            .baseline
+            .snapshot;
+        assert_eq!(recorded.context.used_tokens, 151_063);
+        assert_eq!(recorded.context.limit_tokens, 1_000_000);
+        let thread_id = thread.thread_id().to_string();
+        thread.shutdown().expect("shutdown recorded thread");
+        host.shutdown().expect("shutdown recorded host");
+
+        let resumed_host =
+            RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).expect("start resumed host");
+        let resumed = resumed_host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id)),
+                "resume full-window meter",
+            )
+            .expect("resume recorded thread");
+        let snapshot = fresh_surface_attachment(&resumed.surface())
+            .baseline
+            .snapshot;
+        // The compaction line at the default Max effort, before any new turn.
+        assert_eq!(snapshot.context.limit_tokens, 768_928);
+        assert_eq!(snapshot.context.used_tokens, 151_063);
+        resumed.shutdown().expect("shutdown resumed thread");
+        resumed_host.shutdown().expect("shutdown resumed host");
+    }
+
+    #[test]
+    fn effort_switch_moves_the_meter_ceiling_to_the_new_compaction_line() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host =
+            RuntimeHost::start_with_executor(Arc::new(ProviderResponseCheckpointRetryExecutor))
+                .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "effort meter",
+            )
+            .expect("start recorded runtime thread");
+        let surface = thread.surface();
+        let capabilities = BTreeSet::from([
+            surface::SurfaceCapability::ReadSnapshot,
+            surface::SurfaceCapability::SubmitOperation,
+            surface::SurfaceCapability::ManageThreadSettings,
+        ]);
+        let attachment = fresh_surface_attachment_with_capabilities(&surface, capabilities.clone());
+        assert_eq!(attachment.baseline.snapshot.context.limit_tokens, 768_928);
+
+        // A direct settings update, as /effort sends, moves the ceiling.
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .update_settings(
+                    surface_request_id(),
+                    attachment.baseline.snapshot.settings.thread_revision,
+                    surface::NonEmptyVec::try_new(vec![
+                        surface::RuntimeSettingsPatch::SetReasoning {
+                            effort: surface::SurfaceReasoningEffort::High,
+                        },
+                    ])
+                    .unwrap(),
+                )
+                .expect("switch to high effort"),
+        );
+        let snapshot = fresh_surface_attachment(&surface).baseline.snapshot;
+        assert_eq!(snapshot.context.limit_tokens, 800_000);
+
+        // So do settings a turn applies before it is requested.
+        let current = fresh_surface_attachment_with_capabilities(&surface, capabilities);
+        let mut intent = surface_user_turn_intent(&current.baseline.snapshot, "back to max");
+        intent.settings_preparation =
+            surface::OperationSettingsPreparation::ApplyThreadOverridesBeforeRequested {
+                expected_settings_revision: current.baseline.snapshot.settings.thread_revision,
+                expected_policy_epoch: current.baseline.snapshot.settings.effective.policy_epoch,
+                patches: surface::NonEmptyVec::try_new(vec![
+                    surface::RuntimeSettingsPatch::SetReasoning {
+                        effort: surface::SurfaceReasoningEffort::Max,
+                    },
+                ])
+                .unwrap(),
+            };
+        let reserved = committed_surface_value(
+            current
+                .client
+                .reserve_operation(surface_request_id(), intent)
+                .expect("reserve max-effort turn"),
+        );
+        let snapshot = fresh_surface_attachment(&surface).baseline.snapshot;
+        assert_eq!(snapshot.context.limit_tokens, 768_928);
+
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            current
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit max-effort turn"),
+        );
+        let _ = current
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait max-effort turn");
+        let snapshot = fresh_surface_attachment(&surface).baseline.snapshot;
+        assert_eq!(snapshot.context.used_tokens, 151_063);
+        assert_eq!(snapshot.context.limit_tokens, 768_928);
+        thread.shutdown().expect("shutdown effort meter thread");
+        host.shutdown().expect("shutdown effort meter host");
     }
 
     #[test]
