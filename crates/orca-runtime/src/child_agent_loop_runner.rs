@@ -15,9 +15,9 @@ use crate::child_agent_loop_setup::{
     try_prepare_child_agent_loop,
 };
 use crate::child_agent_provider_turn::{
-    ChildAgentProviderErrorDecision, ChildAgentProviderTurn,
-    compact_child_agent_conversation_if_needed, handle_child_agent_provider_error,
-    route_child_agent_model, run_child_agent_provider_turn, run_child_agent_provider_turn_observed,
+    ChildAgentProviderErrorDecision, ChildAgentProviderTurn, handle_child_agent_provider_error,
+    prepare_child_agent_request, route_child_agent_model, run_child_agent_provider_turn,
+    run_child_agent_provider_turn_observed,
 };
 use crate::child_agent_response_folding::{
     ChildAgentProviderResponseFold, ChildAgentToolContext, ChildAgentToolExecution,
@@ -248,7 +248,17 @@ where
             }
         }
 
-        compact_child_agent_conversation_if_needed(config, &mut setup, context.cwd, context.hooks)?;
+        if let Err(message) =
+            prepare_child_agent_request(config, &mut setup, context.cwd, context.hooks)?
+        {
+            let result = ChildAgentResult {
+                status: RunStatus::Failed,
+                final_message: None,
+                error: Some(message),
+                budget_usage: None,
+            };
+            return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
+        }
 
         let child_cancel = CancelToken::new();
         let mut turn_provider_config =
@@ -519,7 +529,17 @@ where
             }
         }
 
-        compact_child_agent_conversation_if_needed(config, &mut setup, context.cwd, context.hooks)?;
+        if let Err(message) =
+            prepare_child_agent_request(config, &mut setup, context.cwd, context.hooks)?
+        {
+            let result = ChildAgentResult {
+                status: RunStatus::Failed,
+                final_message: None,
+                error: Some(message),
+                budget_usage: None,
+            };
+            return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
+        }
 
         let child_cancel = CancelToken::new();
         let mut turn_provider_config =

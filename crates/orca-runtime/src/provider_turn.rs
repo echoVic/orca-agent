@@ -766,8 +766,13 @@ impl RuntimeProviderTurnStep {
 
         match RuntimeCompactionPolicy::decide_for_provider_error(&error.message, compaction_retry) {
             RuntimeCompactionRetryDecision::CompactAndRetry { trigger, reason: _ } => {
-                compaction.compact_after_provider_error_retry(conversation, trigger)?;
-                Ok(RuntimeProviderErrorOutcome::ContinueAfterCompaction)
+                if compaction.compact_after_provider_error_retry(conversation, trigger)? {
+                    Ok(RuntimeProviderErrorOutcome::ContinueAfterCompaction)
+                } else {
+                    let message = crate::compaction::unrecoverable_overflow_message(&error.message);
+                    compaction.emit_error(&message)?;
+                    Ok(RuntimeProviderErrorOutcome::Failed(message))
+                }
             }
             RuntimeCompactionRetryDecision::SurfaceError => {
                 compaction.emit_error(&error.message)?;

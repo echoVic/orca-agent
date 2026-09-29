@@ -235,6 +235,30 @@ pub fn compact_child_agent_conversation_if_needed(
     compaction.compact_if_needed(&mut setup.conversation)
 }
 
+/// Before a child request: compact when needed, and fail the child with a
+/// clear message when not even emergency compaction leaves room to reply.
+pub fn prepare_child_agent_request(
+    config: &RunConfig,
+    setup: &mut ChildAgentLoopSetup,
+    cwd: &Path,
+    hooks: &HookRunner,
+) -> io::Result<Result<(), String>> {
+    let mut events = EventFactory::new("child-agent-compaction".to_string());
+    let mut sink = EventSink::new(child_event_output(), config.output_format);
+    let subagent_type = SubagentType::General;
+    let mut compaction = RuntimeCompactionStep::new(
+        config.provider,
+        &setup.context_config,
+        &setup.provider_config,
+        RuntimeTurnContext::new(cwd, "", 0, false, &subagent_type),
+        hooks,
+        &mut events,
+        &mut sink,
+        None,
+    );
+    compaction.prepare_request(&mut setup.conversation)
+}
+
 pub fn handle_child_agent_provider_error(
     config: &RunConfig,
     setup: &mut ChildAgentLoopSetup,
@@ -268,9 +292,21 @@ pub fn handle_child_agent_provider_error(
                 &mut sink,
                 None,
             );
-            compaction.compact_after_provider_error_retry(&mut setup.conversation, trigger)?;
-            setup.compaction_retry.record_prompt_too_long_retry();
-            Ok(Some(ChildAgentProviderErrorDecision::RetryAfterCompaction))
+            if compaction.compact_after_provider_error_retry(&mut setup.conversation, trigger)? {
+                setup.compaction_retry.record_prompt_too_long_retry();
+                Ok(Some(ChildAgentProviderErrorDecision::RetryAfterCompaction))
+            } else {
+                Ok(Some(ChildAgentProviderErrorDecision::Fail(
+                    ChildAgentResult {
+                        status: RunStatus::Failed,
+                        final_message: None,
+                        error: Some(crate::compaction::unrecoverable_overflow_message(
+                            &error.message,
+                        )),
+                        budget_usage: None,
+                    },
+                )))
+            }
         }
         RuntimeCompactionRetryDecision::SurfaceError => Ok(Some(
             ChildAgentProviderErrorDecision::Fail(ChildAgentResult {

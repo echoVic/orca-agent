@@ -14,7 +14,8 @@ pub use crate::child_agent_loop_setup::{
 pub use crate::child_agent_provider_turn::{
     ChildAgentProviderErrorDecision, ChildAgentProviderTurn,
     compact_child_agent_conversation_if_needed, handle_child_agent_provider_error,
-    route_child_agent_model, run_child_agent_provider_turn, run_child_agent_provider_turn_observed,
+    prepare_child_agent_request, route_child_agent_model, run_child_agent_provider_turn,
+    run_child_agent_provider_turn_observed,
 };
 pub use crate::child_agent_response_folding::{
     ChildAgentProviderResponseFold, ChildAgentToolContext, ChildAgentToolExecution,

@@ -125,7 +125,6 @@ impl AgentLoopResult {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn failure(status: RunStatus, error: impl Into<String>) -> Self {
         Self::terminal(status, TurnEndReason::Unclassified, Some(error.into()))
     }

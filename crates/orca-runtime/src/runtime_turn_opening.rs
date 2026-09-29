@@ -2,7 +2,7 @@ use std::io;
 
 use orca_core::config::ProviderKind;
 use orca_core::conversation::Conversation;
-use orca_core::event_schema::EventFactory;
+use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::model::{ImageRouteDecision, ModelSelection};
 use orca_provider::{ProviderConfig, context};
@@ -85,7 +85,7 @@ impl RuntimeTurnOpeningStep {
             return Ok(RuntimeTurnOpeningResult::Return(result));
         }
 
-        RuntimeCompactionStep::new(
+        let prepared = RuntimeCompactionStep::new(
             input.provider,
             input.context_config,
             input.provider_config,
@@ -95,7 +95,16 @@ impl RuntimeTurnOpeningStep {
             input.sink,
             input.history_writer.as_deref_mut(),
         )
-        .compact_if_needed(input.conversation)?;
+        .prepare_request(input.conversation)?;
+        if let Err(message) = prepared {
+            if turn_context.emit_deltas {
+                input.sink.emit(input.events.error(&message))?;
+            }
+            return Ok(RuntimeTurnOpeningResult::Return(AgentLoopResult::failure(
+                RunStatus::Failed,
+                message,
+            )));
+        }
 
         if turn_context.emit_deltas {
             let pressure = context::context_pressure(

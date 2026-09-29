@@ -32,6 +32,12 @@ impl RuntimeCompactionTrigger {
             Self::PromptTooLong => RuntimeCompactionReason::PromptTooLongRecovery,
         }
     }
+
+    /// Hard-limit and prompt-too-long compactions must make room: they force
+    /// a real reduction and keep the result only when it shrank the prompt.
+    fn is_emergency(self) -> bool {
+        matches!(self, Self::HardLimit | Self::PromptTooLong)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,6 +222,37 @@ impl RuntimeCompactionOutcome {
     }
 }
 
+/// Whether a compaction replaced history, and what the next request measures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeCompactionAdoption {
+    pub(crate) adopted: bool,
+    pub(crate) prompt_tokens: usize,
+}
+
+pub(crate) fn context_overflow_message(prompt_tokens: usize) -> String {
+    format!(
+        "The conversation no longer fits the model's context window (about {prompt_tokens} \
+         tokens) and compaction cannot shrink it further. Start a new conversation with /new."
+    )
+}
+
+pub(crate) fn unrecoverable_overflow_message(provider_message: &str) -> String {
+    format!(
+        "{provider_message} Compaction cannot shrink the conversation further; start a new \
+         conversation with /new."
+    )
+}
+
+// The compacted history carries no usage anchor. Scale its estimate by the
+// ratio the provider's count showed for the history it replaces, never down.
+fn calibrated_prompt_tokens(estimated: usize, reference: context::PromptMeasurement) -> usize {
+    if reference.tokens <= reference.estimated {
+        return estimated;
+    }
+    let scaled = estimated as u128 * reference.tokens as u128 / reference.estimated.max(1) as u128;
+    usize::try_from(scaled).unwrap_or(usize::MAX)
+}
+
 pub(crate) struct RuntimeCompactionPolicy<'a> {
     context_config: &'a context::ContextConfig,
     provider_config: &'a ProviderConfig,
@@ -346,9 +383,17 @@ pub fn handle_tui_agent_provider_error<W: io::Write>(
                 runtime_parts.writer,
             )
             .with_cancel(input.cancel);
-            compaction.compact_after_provider_error_retry(runtime_parts.conversation, trigger)?;
-            state.retry.record_prompt_too_long_retry();
-            Ok(TuiAgentProviderErrorAction::RetryAfterCompaction)
+            let shrunk = compaction
+                .compact_after_provider_error_retry(runtime_parts.conversation, trigger)?;
+            if shrunk {
+                state.retry.record_prompt_too_long_retry();
+                Ok(TuiAgentProviderErrorAction::RetryAfterCompaction)
+            } else {
+                state.retry.reset();
+                Ok(TuiAgentProviderErrorAction::SurfaceError(
+                    unrecoverable_overflow_message(&error.message),
+                ))
+            }
         }
         RuntimeCompactionRetryDecision::SurfaceError => {
             state.retry.reset();
@@ -442,19 +487,54 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             return Ok(false);
         };
         self.emit_compaction_started(trigger, conversation.messages.len())?;
-        self.compact_with_budget_hooks(conversation, trigger)?;
-        Ok(true)
+        Ok(self
+            .compact_with_budget_hooks(conversation, trigger)?
+            .adopted)
+    }
+
+    /// Before a request: compact when pressure calls for it, and as an
+    /// emergency when the prompt leaves no room for a minimal reply. `Err`
+    /// carries the user-facing message when not even that makes room.
+    pub(crate) fn prepare_request(
+        &mut self,
+        conversation: &mut Conversation,
+    ) -> io::Result<Result<(), String>> {
+        let measured = context::measure_prompt(conversation, self.provider_config).tokens;
+        let trigger = if self.context_config.request_reply_budget(measured).is_none() {
+            Some(RuntimeCompactionTrigger::HardLimit)
+        } else {
+            RuntimeCompactionPolicy::decide_for_pressure(context::context_pressure_for_tokens(
+                measured,
+                self.context_config,
+            ))
+        };
+        let Some(trigger) = trigger else {
+            return Ok(Ok(()));
+        };
+        self.emit_compaction_started(trigger, conversation.messages.len())?;
+        let adoption = self.compact_with_budget_hooks(conversation, trigger)?;
+        Ok(
+            if self
+                .context_config
+                .request_reply_budget(adoption.prompt_tokens)
+                .is_some()
+            {
+                Ok(())
+            } else {
+                Err(context_overflow_message(adoption.prompt_tokens))
+            },
+        )
     }
 
     pub(crate) fn compact_after_provider_error_retry(
         &mut self,
         conversation: &mut Conversation,
         trigger: RuntimeCompactionTrigger,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         self.emit_compaction_started(trigger, conversation.messages.len())?;
-        let outcome = self.compact_and_persist(conversation, trigger)?;
+        let (outcome, adoption) = self.compact_and_persist(conversation, trigger)?;
         self.emit_compaction_completed(&outcome)?;
-        Ok(())
+        Ok(adoption.adopted)
     }
 
     fn emit_compaction_started(
@@ -482,7 +562,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         &mut self,
         conversation: &mut Conversation,
         trigger: RuntimeCompactionTrigger,
-    ) -> io::Result<()> {
+    ) -> io::Result<RuntimeCompactionAdoption> {
         let before_messages = conversation.messages.len();
         let budget_hook_context = HookContext {
             cwd: &self.turn_context.cwd.display().to_string(),
@@ -517,7 +597,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             self.run_compaction_hook(HookEvent::PreCompact, before_messages, None)?;
         }
 
-        let outcome = self.compact_and_persist(conversation, trigger)?;
+        let (outcome, adoption) = self.compact_and_persist(conversation, trigger)?;
 
         if self.turn_context.emit_deltas {
             self.run_compaction_hook(
@@ -528,29 +608,30 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         }
         self.emit_compaction_completed(&outcome)?;
 
-        Ok(())
+        Ok(adoption)
     }
 
     fn compact_and_persist(
         &mut self,
         conversation: &mut Conversation,
         trigger: RuntimeCompactionTrigger,
-    ) -> io::Result<RuntimeCompactionOutcome> {
+    ) -> io::Result<(RuntimeCompactionOutcome, RuntimeCompactionAdoption)> {
         let before_messages = conversation.messages.len();
         let task = RuntimeCompactionTask::start(trigger, before_messages);
-        // An API rejection is authoritative even when the approximate local
-        // tokenizer thinks the prompt fits. Force one real reduction attempt.
-        let mut recovery_config;
-        let context_config = if trigger == RuntimeCompactionTrigger::PromptTooLong {
-            recovery_config = self.context_config.clone();
-            let measured = context::wire_equivalent_tokens(conversation, self.provider_config);
-            recovery_config.soft_compact_token_limit = Some(
+        let before = context::measure_prompt(conversation, self.provider_config);
+        // An emergency must make room even when the local estimate says the
+        // prompt fits: force the compaction line under three quarters of the
+        // measured prompt so at least one real reduction happens.
+        let mut emergency_config;
+        let context_config = if trigger.is_emergency() {
+            emergency_config = self.context_config.clone();
+            emergency_config.soft_compact_token_limit = Some(
                 self.context_config
                     .soft_limit()
-                    .min(measured.saturating_sub(1))
+                    .min(before.tokens.saturating_mul(3) / 4)
                     .max(1),
             );
-            &recovery_config
+            &emergency_config
         } else {
             self.context_config
         };
@@ -570,6 +651,17 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
                 self.provider_config,
             )
         };
+        let after = context::measure_prompt(&compaction.conversation, self.provider_config);
+        if trigger.is_emergency() && after.estimated >= before.estimated {
+            // Nothing shrank: keep the history as it was.
+            return Ok((
+                task.finish(before_messages, &compaction.kind),
+                RuntimeCompactionAdoption {
+                    adopted: false,
+                    prompt_tokens: before.tokens,
+                },
+            ));
+        }
         let after_messages = compaction.conversation.messages.len();
         let outcome = task.finish(after_messages, &compaction.kind);
         let details = outcome.details();
@@ -593,7 +685,14 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             )?;
         }
         *conversation = compaction.conversation;
-        Ok(outcome)
+        conversation.clear_usage_anchor();
+        Ok((
+            outcome,
+            RuntimeCompactionAdoption {
+                adopted: true,
+                prompt_tokens: calibrated_prompt_tokens(after.estimated, before),
+            },
+        ))
     }
 
     fn emit_compaction_completed(&mut self, outcome: &RuntimeCompactionOutcome) -> io::Result<()> {
@@ -644,6 +743,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_core::config::ReasoningEffort;
     use orca_core::hook_types::HookConfig;
     use std::fs;
 
@@ -1142,5 +1242,151 @@ mod tests {
                 .unwrap()
                 .contains("\"type\":\"context.compacted\"")
         );
+    }
+
+    fn bare_provider_config() -> ProviderConfig {
+        ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::default(),
+            tools_override: Some(vec![]),
+            mcp_registry: None,
+            external_tools: vec![],
+            max_output_tokens: None,
+        }
+    }
+
+    fn step_config(window: usize) -> context::ContextConfig {
+        context::ContextConfig {
+            max_tokens: window,
+            compaction_threshold: 0.9,
+            reserved_for_response: 4_096,
+            auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
+        }
+    }
+
+    fn history_with_turns(turns: usize, words: usize) -> Conversation {
+        let mut conversation = Conversation::new();
+        conversation.add_system("immutable instructions".to_string());
+        for index in 0..turns {
+            conversation.add_user(format!("inspect file {index}"));
+            conversation.add_assistant(
+                None,
+                None,
+                vec![orca_core::conversation::RawToolCall {
+                    id: format!("call-{index}"),
+                    function_name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            );
+            conversation.add_tool_result(format!("call-{index}"), "evidence ".repeat(words));
+        }
+        conversation.add_user("current request".to_string());
+        conversation
+    }
+
+    #[test]
+    fn prepare_request_compacts_when_no_reply_fits() {
+        // 40K window, 4,096 reply: a request needs the prompt at or under 27,712.
+        let config = step_config(40_000);
+        let provider_config = bare_provider_config();
+        let hooks = HookRunner::default();
+        let mut events = EventFactory::new("prepare-request".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let subagent_type = SubagentType::General;
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut conversation = history_with_turns(8, 4_000);
+        let before = context::wire_equivalent_tokens(&conversation, &provider_config);
+        assert!(
+            config.request_reply_budget(before).is_none(),
+            "fixture must overflow"
+        );
+
+        let prepared = RuntimeCompactionStep::new(
+            orca_core::config::ProviderKind::Mock,
+            &config,
+            &provider_config,
+            RuntimeTurnContext::new(cwd.path(), "", 0, false, &subagent_type),
+            &hooks,
+            &mut events,
+            &mut sink,
+            None,
+        )
+        .prepare_request(&mut conversation)
+        .expect("prepare");
+
+        assert_eq!(prepared, Ok(()));
+        // Micro-compaction may keep every message and shorten old tool
+        // output instead, so compare the measured size, not the count.
+        let after = context::wire_equivalent_tokens(&conversation, &provider_config);
+        assert!(after < before);
+        assert!(config.request_reply_budget(after).is_some());
+    }
+
+    #[test]
+    fn prepare_request_stops_when_compaction_cannot_make_room() {
+        let config = step_config(40_000);
+        let provider_config = bare_provider_config();
+        let hooks = HookRunner::default();
+        let mut events = EventFactory::new("prepare-request".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let subagent_type = SubagentType::General;
+        let cwd = tempfile::tempdir().expect("cwd");
+        // Only the current request, too large on its own: nothing to collapse.
+        let mut conversation = Conversation::new();
+        conversation.add_system("immutable instructions".to_string());
+        conversation.add_user("evidence ".repeat(40_000));
+        let before = conversation.messages.clone();
+
+        let prepared = RuntimeCompactionStep::new(
+            orca_core::config::ProviderKind::Mock,
+            &config,
+            &provider_config,
+            RuntimeTurnContext::new(cwd.path(), "", 0, false, &subagent_type),
+            &hooks,
+            &mut events,
+            &mut sink,
+            None,
+        )
+        .prepare_request(&mut conversation)
+        .expect("prepare");
+
+        let message = prepared.expect_err("no room for a reply");
+        assert!(message.contains("/new"), "{message}");
+        assert_eq!(conversation.messages.len(), before.len());
+    }
+
+    #[test]
+    fn overflow_retry_is_refused_when_compaction_cannot_shrink() {
+        let config = step_config(40_000);
+        let provider_config = bare_provider_config();
+        let hooks = HookRunner::default();
+        let mut events = EventFactory::new("overflow-retry".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let subagent_type = SubagentType::General;
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut conversation = Conversation::new();
+        conversation.add_system("immutable instructions".to_string());
+        conversation.add_user("small request".to_string());
+
+        let shrunk = RuntimeCompactionStep::new(
+            orca_core::config::ProviderKind::Mock,
+            &config,
+            &provider_config,
+            RuntimeTurnContext::new(cwd.path(), "", 0, false, &subagent_type),
+            &hooks,
+            &mut events,
+            &mut sink,
+            None,
+        )
+        .compact_after_provider_error_retry(
+            &mut conversation,
+            RuntimeCompactionTrigger::PromptTooLong,
+        )
+        .expect("compact");
+
+        assert!(!shrunk);
     }
 }
