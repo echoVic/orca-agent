@@ -120,6 +120,7 @@ pub(crate) fn record_assistant_response_for_agent<W: io::Write>(
     if emit_deltas {
         sink.emit(events.model_response_completed(response))?;
     }
+    conversation.internal_context.note_assistant_turn();
     conversation.messages.push(response.assistant_message());
     Ok(())
 }
@@ -1106,6 +1107,45 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(conversation.messages.len(), 1);
+    }
+
+    #[test]
+    fn recorded_assistant_responses_age_an_open_plan_into_a_reminder() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        conversation.replace_plan_state("[in_progress] inspect\n[pending] patch".to_string());
+        let response = CompletedModelResponse::new(
+            orca_core::thread_item_projection::ModelResponseIdentity::new(TurnId::new()),
+            Some("working".to_string()),
+            None,
+            vec![],
+        );
+        let mut events = EventFactory::new("plan-reminder".to_string());
+        let mut sink = EventSink::new(Vec::new(), orca_core::config::OutputFormat::Jsonl);
+
+        for _ in 0..orca_core::conversation::PLAN_REMINDER_AFTER_TURNS {
+            assert!(
+                !conversation
+                    .internal_context
+                    .render()
+                    .contains("[Plan reminder]")
+            );
+            record_assistant_response_for_agent(
+                &mut conversation,
+                &response,
+                false,
+                &mut events,
+                &mut sink,
+            )
+            .expect("record assistant response");
+        }
+
+        assert!(
+            conversation
+                .internal_context
+                .render()
+                .contains("[Plan reminder]")
+        );
     }
 
     #[test]
