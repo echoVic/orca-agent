@@ -227,6 +227,12 @@ impl OAuthTestServer {
         true
     }
 
+    /// Stops taking every token `/mcp` has taken so far, as a server does
+    /// once a login is revoked.
+    pub fn revoke_tokens(&self) {
+        lock(&self.state.accepted).clear();
+    }
+
     /// Each request received: its method and path.
     pub fn trail(&self) -> Vec<String> {
         self.requests()

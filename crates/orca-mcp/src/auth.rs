@@ -195,7 +195,7 @@ impl RemoteAuth {
 
     fn login_required(&self) -> String {
         format!(
-            "{MCP_AUTH_REQUIRED}: run 'orca mcp login {}'",
+            "{MCP_AUTH_REQUIRED}: run 'orca mcp login {}', or log in from /mcp",
             self.server_name
         )
     }
@@ -285,7 +285,8 @@ mod tests {
     use crate::oauth::unix_now;
     use crate::transport::{McpTransport, connect_with_credentials};
 
-    const LOGIN_REQUIRED: &str = "MCP server requires login: run 'orca mcp login docs'";
+    const LOGIN_REQUIRED: &str =
+        "MCP server requires login: run 'orca mcp login docs', or log in from /mcp";
 
     /// A login stored for the server, with `access_token` and the refresh
     /// token `rt-1`.

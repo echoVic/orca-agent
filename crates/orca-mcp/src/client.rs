@@ -760,6 +760,21 @@ impl McpRegistry {
         result
     }
 
+    /// Marks `server` (its canonical name) as needing a login, once a
+    /// request to it finds that its login no longer works. Its client and
+    /// tools stay until it is reconnected, which a login does; the next
+    /// catalog shows the server as needing a login.
+    fn mark_needs_login(&self, server: &str) {
+        if let Some(entry) = self
+            .write()
+            .servers
+            .iter_mut()
+            .find(|entry| entry.name == server)
+        {
+            entry.state = McpServerState::NeedsLogin;
+        }
+    }
+
     pub fn resolve_tool(&self, schema_name: &str) -> Option<McpToolRef> {
         self.read().lookup.get(schema_name).cloned()
     }
@@ -1041,12 +1056,18 @@ impl McpRegistry {
         let client = self
             .client(&tool_ref.server)
             .ok_or_else(|| format!("MCP server '{}' is not connected", tool_ref.server))?;
-        let result = client.call_tool(
-            &tool_ref.tool,
-            arguments,
-            elicitation_handler,
-            should_cancel,
-        )?;
+        let result = client
+            .call_tool(
+                &tool_ref.tool,
+                arguments,
+                elicitation_handler,
+                should_cancel,
+            )
+            .inspect_err(|error| {
+                if is_auth_required(error) {
+                    self.mark_needs_login(&tool_ref.server);
+                }
+            })?;
         let result: CallToolResult = serde_json::from_value(result)
             .map_err(|error| format!("invalid MCP tool result: {error}"))?;
 
@@ -3430,7 +3451,7 @@ done
         );
         assert_eq!(
             registry.errors(),
-            ["MCP server requires login: run 'orca mcp login docs'"]
+            ["MCP server requires login: run 'orca mcp login docs', or log in from /mcp"]
         );
         assert!(registry.tools().is_empty());
 
@@ -3460,6 +3481,59 @@ done
         );
         assert!(registry.errors().is_empty(), "{:?}", registry.errors());
         assert_eq!(schema_names(&registry), ["mcp__docs__echo"]);
+    }
+
+    #[test]
+    fn a_call_that_finds_the_login_gone_marks_the_server_as_needing_login() {
+        use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
+        use orca_core::config::mcp_credentials::{McpCredential, save_mcp_credential};
+
+        let server = OAuthTestServer::start(OAuthTestBehavior {
+            accepted_tokens: vec!["at-stored".to_string()],
+            refuse_refresh: true,
+            ..Default::default()
+        });
+        let home = tempfile::tempdir().expect("temp dir");
+        let credentials = home.path().join("mcp-credentials.json");
+        save_mcp_credential(
+            &credentials,
+            "docs",
+            &McpCredential {
+                server_url: server.mcp_url(),
+                access_token: "at-stored".to_string(),
+                refresh_token: Some("rt-1".to_string()),
+                expires_at: None,
+                token_endpoint: format!("{}/token", server.url()),
+                client_id: "configured-client".to_string(),
+                resource: server.mcp_url(),
+                scope: None,
+            },
+        )
+        .expect("store a login");
+        let registry =
+            initialize_registry_with_credentials(&[server.config("docs")], Some(credentials));
+        assert_eq!(
+            registry.server_states(),
+            [("docs".to_string(), McpServerState::Ready)]
+        );
+
+        // The login is revoked, and the refresh token is turned away too.
+        server.revoke_tokens();
+        let echo = registry
+            .resolve_tool("mcp__docs__echo")
+            .expect("the echo tool");
+        let error = registry
+            .call_tool(&echo, serde_json::json!({}))
+            .expect_err("the server turns the token away");
+
+        assert_eq!(
+            error,
+            "MCP server requires login: run 'orca mcp login docs', or log in from /mcp"
+        );
+        assert_eq!(
+            registry.server_states(),
+            [("docs".to_string(), McpServerState::NeedsLogin)]
+        );
     }
 
     #[test]

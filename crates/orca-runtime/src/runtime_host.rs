@@ -21334,6 +21334,10 @@ impl ThreadActor {
         let result = self.finish_generation_inner(active, result, allow_resume, true);
         if result.is_err() {
             self.goal_controller.clear_active(operation_id);
+        } else {
+            // A tool call may have found that an MCP server needs a login
+            // again. Nothing is committed while the catalog still matches.
+            let _ = self.publish_mcp_catalog();
         }
         result
     }
@@ -40533,6 +40537,77 @@ done
         assert!(catalog.resources.is_empty());
         assert!(catalog.resource_templates.is_empty());
         assert!(catalog.diagnostics.is_empty());
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_call_that_finds_the_login_gone_shows_in_the_catalog() {
+        use orca_core::config::mcp_credentials::{
+            McpCredential, mcp_credentials_path, save_mcp_credential,
+        };
+        use orca_mcp::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
+
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let remote = OAuthTestServer::start(OAuthTestBehavior {
+            accepted_tokens: vec!["at-stored".to_string()],
+            refuse_refresh: true,
+            ..Default::default()
+        });
+        // The session's servers read logins through the `ORCA_HOME`
+        // variable, never the thread's override: point it at the isolated
+        // test home before resolving the path, so no real login is touched.
+        let isolated_home = crate::history::isolated_test_orca_home();
+        let credentials = mcp_credentials_path().expect("the credentials path");
+        assert!(
+            credentials.starts_with(isolated_home),
+            "{}",
+            credentials.display()
+        );
+        save_mcp_credential(
+            &credentials,
+            "docs",
+            &McpCredential {
+                server_url: remote.mcp_url(),
+                access_token: "at-stored".to_string(),
+                refresh_token: Some("rt-1".to_string()),
+                expires_at: None,
+                token_endpoint: format!("{}/token", remote.url()),
+                client_id: "configured-client".to_string(),
+                resource: remote.mcp_url(),
+                scope: None,
+            },
+        )
+        .expect("store a login");
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.mcp_servers = vec![remote.config("docs")];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp login gone")
+            .expect("start the thread");
+        let surface = thread.surface();
+        wait_for_mcp_catalog(&surface, |catalog| {
+            catalog.servers == [(surface_text("docs"), surface::SurfaceMcpServerStatus::Ready)]
+        });
+
+        // The login is revoked, so the model's call to the tool fails.
+        remote.revoke_tokens();
+        let attachment = fresh_surface_attachment(&surface);
+        run_surface_turn_to_success(&surface, &attachment, "mcp__docs__echo");
+
+        let catalog = wait_for_mcp_catalog(&surface, |catalog| {
+            catalog.servers
+                == [(
+                    surface_text("docs"),
+                    surface::SurfaceMcpServerStatus::AuthRequired,
+                )]
+        });
+        assert_eq!(catalog_tool_names(&catalog), ["mcp__docs__echo"]);
         host.shutdown().expect("shutdown runtime host");
     }
 
