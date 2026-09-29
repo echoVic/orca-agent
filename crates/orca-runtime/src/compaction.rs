@@ -1187,6 +1187,96 @@ mod tests {
     }
 
     #[test]
+    fn delivered_notices_survive_compaction_and_resume_unpinned() {
+        use orca_core::conversation::{Message, RawToolCall};
+        crate::history::with_redirected_orca_home("delivered-notice-resume", |home| {
+            let temp = tempfile::tempdir().unwrap();
+            let sessions = home.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let path = sessions.join("session-notice-resume.jsonl");
+            let meta = crate::history::create_meta(temp.path(), "mock", None, "notice resume");
+            let mut record = serde_json::to_value(meta).unwrap();
+            record["type"] = serde_json::json!("session.meta");
+            fs::write(&path, format!("{record}\n")).unwrap();
+            let mut writer = SessionWriter::append_to_existing(path.clone()).unwrap();
+            let mut conversation = Conversation::new();
+            conversation.add_system("immutable instructions".to_string());
+            for index in 0..6 {
+                conversation.add_user(format!("inspect {index}"));
+                conversation.add_assistant(
+                    None,
+                    None,
+                    vec![RawToolCall {
+                        id: format!("call-{index}"),
+                        function_name: "read_file".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                );
+                conversation.add_tool_result(format!("call-{index}"), "output ".repeat(1_000));
+            }
+            for message in &conversation.messages {
+                writer.append_legacy_message(message).unwrap();
+            }
+            // Delivered the way a turn boundary delivers a finished task.
+            let notice = "<task-notification>Terminal session s-1 (task t-1) finished with \
+                          status completed and exit code 0.\nbuild ok</task-notification>"
+                .to_string();
+            assert!(writer.append_system_delivery_once(&notice).unwrap());
+            conversation.add_system(notice.clone());
+            // Ephemeral runtime context is rebuilt on resume, not restored.
+            let ephemeral = Message::system("ephemeral runtime note".to_string());
+            writer.append_legacy_message(&ephemeral).unwrap();
+            conversation.messages.push(ephemeral);
+            let request = Message::user("current request".to_string());
+            writer.append_legacy_message(&request).unwrap();
+            conversation.messages.push(request);
+            let provider = bare_provider_config();
+            let tokens = context::wire_equivalent_tokens(&conversation, &provider);
+            let config = context::ContextConfig {
+                max_tokens: tokens + 100,
+                compaction_threshold: 1.0,
+                reserved_for_response: 0,
+                auto_compact_token_limit: Some(tokens + 100),
+                soft_compact_token_limit: Some(tokens - 50),
+            };
+            let hooks = HookRunner::default();
+            let mut events = EventFactory::new("notice-resume".to_string());
+            let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+            let subagent = SubagentType::General;
+
+            let adopted = RuntimeCompactionStep::new(
+                orca_core::config::ProviderKind::Mock,
+                &config,
+                &provider,
+                RuntimeTurnContext::new(temp.path(), "", 0, false, &subagent),
+                &hooks,
+                &mut events,
+                &mut sink,
+                Some(&mut writer),
+            )
+            .compact_if_needed(&mut conversation)
+            .unwrap();
+            assert!(adopted, "the compaction must write a snapshot");
+            assert!(conversation.messages.iter().any(|message| matches!(message,
+                Message::System { content, pinned: false } if content == &notice)));
+
+            let transcript = crate::thread_store::JsonlThreadStore::new()
+                .load_session("notice-resume")
+                .unwrap();
+            let resumed = crate::history::resume_conversation(&transcript, "fresh".to_string());
+            let system = resumed
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::System { content, pinned } => Some((content.as_str(), *pinned)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(system, vec![("fresh", false), (notice.as_str(), false)]);
+        });
+    }
+
+    #[test]
     fn automatic_compaction_snapshot_failure_keeps_live_conversation_unchanged() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("context.jsonl");

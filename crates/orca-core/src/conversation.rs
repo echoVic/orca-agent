@@ -50,6 +50,15 @@ const DELIVERED_NOTICE_PREFIXES: [&str; 4] = [
     "[Budget soft landing]",
 ];
 
+/// Whether a system message is a delivered notice. Notices are ordinary
+/// conversation content: the model keeps seeing each one until compaction
+/// summarizes it, including across a resume.
+pub fn is_delivered_notice(content: &str) -> bool {
+    DELIVERED_NOTICE_PREFIXES
+        .iter()
+        .any(|prefix| content.starts_with(prefix))
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RawToolCall {
     pub id: String,
@@ -519,9 +528,7 @@ impl Conversation {
         for message in &mut self.messages {
             if let Message::System { content, pinned } = message
                 && *pinned
-                && DELIVERED_NOTICE_PREFIXES
-                    .iter()
-                    .any(|prefix| content.starts_with(prefix))
+                && is_delivered_notice(content)
             {
                 *pinned = false;
             }
@@ -1268,6 +1275,27 @@ mod tests {
         assert_eq!(
             pinned,
             vec!["keep this constraint", "[Plan mode on]\nPlan mode applies"]
+        );
+        // Unpinned, not dropped: the model still has to see each notice.
+        let notices = conv
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::System {
+                    content,
+                    pinned: false,
+                } if is_delivered_notice(content) => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notices,
+            vec![
+                "<task-notification>Terminal session done</task-notification>",
+                "[Parent guidance id=7] look at the tests",
+                "[Task wait result id=3] build finished",
+                "[Budget soft landing]\nwrap up soon",
+            ]
         );
     }
 

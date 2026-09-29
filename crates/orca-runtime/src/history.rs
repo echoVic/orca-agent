@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use crate::thread_store::sessions_dir;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
-use orca_core::conversation::{Conversation, Message, SummaryState, normalize_tool_boundaries};
+use orca_core::conversation::{
+    Conversation, Message, SummaryState, is_delivered_notice, normalize_tool_boundaries,
+};
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
 pub use crate::thread_store::{
@@ -298,6 +300,9 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
         &transcript.summaries,
     )
     .into_iter()
+    // The old system prompt and ephemeral system context are rebuilt rather
+    // than restored. The truncation marker and delivered notices are
+    // conversation content; a notice stays until compaction summarizes it.
     .filter(|message| {
         !matches!(
             message,
@@ -306,7 +311,7 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
                 pinned: false,
             } if !content.starts_with(
                 "[Earlier conversation history was truncated to fit context window]"
-            )
+            ) && !is_delivered_notice(content)
         )
     })
     .collect::<Vec<_>>();
