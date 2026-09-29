@@ -136,11 +136,11 @@ impl ScriptedEndpoint {
                         "resumed child must restore its own checkpoint"
                     );
                 } else {
-                    // A finished child's own report reaches the parent as a
-                    // pinned `<task-notification>`; the report is the child's
-                    // output and the parent is meant to read it. What must not
-                    // happen is the definition body arriving as *instructions*,
-                    // so every other system message is checked.
+                    // A finished child's own report reaches the parent as an
+                    // ordinary `<task-notification>` system message; the report
+                    // is the child's output and the parent is meant to read it.
+                    // What must not happen is the definition body arriving as
+                    // *instructions*, so every other system message is checked.
                     let leaked = messages
                         .iter()
                         .filter(|message| {

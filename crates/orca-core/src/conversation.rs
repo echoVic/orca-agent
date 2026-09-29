@@ -40,9 +40,15 @@ pub const MISSING_TOOL_TERMINAL_ERROR: &str = "Tool invocation outcome is indete
 pub const IMAGE_ANALYSIS_MESSAGE_PREFIX: &str = "[Image analysis:";
 
 // Deliveries that earlier versions pinned: background task and subagent
-// notices, and parent guidance to a subagent. Every turn holding one was
-// kept whole by compaction, so a long session could no longer shrink.
-const DELIVERED_NOTICE_PREFIXES: [&str; 2] = ["<task-notification>", "[Parent guidance id="];
+// notices, parent guidance to a subagent, task wait results, and budget
+// soft-landing reminders. Every turn holding one was kept whole by
+// compaction, so a long session could no longer shrink.
+const DELIVERED_NOTICE_PREFIXES: [&str; 4] = [
+    "<task-notification>",
+    "[Parent guidance id=",
+    "[Task wait result id=",
+    "[Budget soft landing]",
+];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RawToolCall {
@@ -1240,6 +1246,12 @@ mod tests {
         ));
         conv.messages.push(Message::pinned_system(
             "[Parent guidance id=7] look at the tests".to_string(),
+        ));
+        conv.messages.push(Message::pinned_system(
+            "[Task wait result id=3] build finished".to_string(),
+        ));
+        conv.messages.push(Message::pinned_system(
+            "[Budget soft landing]\nwrap up soon".to_string(),
         ));
         conv.messages.push(Message::pinned_system(
             "[Plan mode on]\nPlan mode applies".to_string(),
