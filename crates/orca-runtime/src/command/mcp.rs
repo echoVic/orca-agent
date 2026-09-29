@@ -818,6 +818,51 @@ mod tests {
     }
 
     #[test]
+    fn add_rejects_a_name_that_clashes_once_normalized() {
+        let temp = tempdir().unwrap();
+        let path = config_path(temp.path()).display().to_string();
+        for (first, second, canonical) in [
+            ("GitHub", "github", "github"),
+            ("my-server", "my_server", "my_server"),
+        ] {
+            let (code, _stdout, stderr) = run(temp.path(), add_request(first, &["true"]));
+            assert_eq!(code, 0, "stderr: {stderr}");
+            let before = fs::read_to_string(config_path(temp.path())).unwrap();
+
+            let (code, _stdout, stderr) = run(temp.path(), add_request(second, &["true"]));
+
+            assert_eq!(code, 1);
+            assert_eq!(
+                stderr.trim_end(),
+                format!(
+                    "orca: MCP server name '{second}' clashes with '{first}' in {path}: Orca names both servers' tools mcp__{canonical}__*; choose another name, or remove '{first}' first with 'orca mcp remove {first}'"
+                )
+            );
+            assert_eq!(
+                fs::read_to_string(config_path(temp.path())).unwrap(),
+                before
+            );
+        }
+
+        for name in ["_", "-", "-_-"] {
+            let (code, _stdout, stderr) = run(temp.path(), add_request(name, &["true"]));
+            assert_eq!(code, 1, "{name}");
+            assert_eq!(
+                stderr.trim_end(),
+                format!("orca: invalid MCP server name '{name}': it needs a letter or a digit")
+            );
+        }
+        let servers = read_config(temp.path()).mcp_servers;
+        assert_eq!(
+            servers
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            ["GitHub", "my-server"]
+        );
+    }
+
+    #[test]
     fn list_and_get_hide_secret_values() {
         let temp = tempdir().unwrap();
         let (code, _stdout, stderr) = run(

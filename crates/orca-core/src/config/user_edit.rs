@@ -6,7 +6,7 @@ use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table};
 
 use crate::approval_rules::canonical_rule_tool;
 use crate::config::file::USER_CONFIG_FILE;
-use crate::mcp_types::{McpServerConfig, McpTransportKind};
+use crate::mcp_types::{McpServerConfig, McpTransportKind, canonical_mcp_name};
 
 /// Parse the user-owned config file under `dir`, hand the document to `edit`
 /// for in-place mutation, and atomically write the result back, preserving
@@ -54,20 +54,26 @@ fn read_document(path: &Path) -> io::Result<DocumentMut> {
 
 /// Validate an MCP server name: letters, digits, `-`, and `_`, without a
 /// double underscore (`__`), which is reserved to separate the server and
-/// tool segments of a tool's runtime name (`mcp__<server>__<tool>`).
+/// tool segments of a tool's runtime name (`mcp__<server>__<tool>`), and
+/// with a letter or a digit, so the canonical name its tools are named with
+/// is not empty.
 pub fn validate_mcp_server_name(name: &str) -> Result<(), String> {
     let is_valid = !name.is_empty()
         && name.chars().all(|character| {
             character.is_ascii_alphanumeric() || character == '-' || character == '_'
         })
         && !name.contains("__");
-    if is_valid {
-        Ok(())
-    } else {
-        Err(format!(
+    if !is_valid {
+        return Err(format!(
             "invalid MCP server name '{name}': use letters, digits, '-' and '_', without '__'"
-        ))
+        ));
     }
+    if canonical_mcp_name(name).is_empty() {
+        return Err(format!(
+            "invalid MCP server name '{name}': it needs a letter or a digit"
+        ));
+    }
+    Ok(())
 }
 
 /// Add `server` to the user-owned config's `[[mcp_servers]]` array.
@@ -78,10 +84,14 @@ pub fn add_user_mcp_server(server: &McpServerConfig) -> io::Result<PathBuf> {
 
 /// Add `server` to the `[[mcp_servers]]` array of the config file under
 /// `dir`. Only non-empty/non-default fields are written; `env` and
-/// `headers` are written as inline tables.
+/// `headers` are written as inline tables. A server whose name is taken,
+/// or has the canonical form of a name that is (`GitHub` and `github`,
+/// `my-server` and `my_server`), is refused: Orca would give both servers'
+/// tools the same names and connect only one of them.
 pub fn add_user_mcp_server_in(dir: &Path, server: &McpServerConfig) -> io::Result<PathBuf> {
     validate_mcp_server_name(&server.name).map_err(io::Error::other)?;
     let path = user_config_path_in(dir);
+    let canonical = canonical_mcp_name(&server.name);
     edit_user_config_in(dir, |document| {
         let servers = mcp_servers_array_mut(document, &path)?;
         if servers
@@ -93,6 +103,17 @@ pub fn add_user_mcp_server_in(dir: &Path, server: &McpServerConfig) -> io::Resul
                 server.name,
                 path.display(),
                 server.name
+            )));
+        }
+        if let Some(existing) = servers
+            .iter()
+            .filter_map(table_name)
+            .find(|existing| canonical_mcp_name(existing) == canonical)
+        {
+            return Err(io::Error::other(format!(
+                "MCP server name '{}' clashes with '{existing}' in {}: Orca names both servers' tools mcp__{canonical}__*; choose another name, or remove '{existing}' first with 'orca mcp remove {existing}'",
+                server.name,
+                path.display(),
             )));
         }
         servers.push(server_to_table(server));
@@ -351,6 +372,18 @@ mod tests {
             )
         );
         assert!(validate_mcp_server_name("").is_err());
+    }
+
+    #[test]
+    fn validate_mcp_server_name_rejects_a_name_without_a_letter_or_digit() {
+        for name in ["_", "-", "-_-"] {
+            assert_eq!(
+                validate_mcp_server_name(name),
+                Err(format!(
+                    "invalid MCP server name '{name}': it needs a letter or a digit"
+                ))
+            );
+        }
     }
 
     #[test]
