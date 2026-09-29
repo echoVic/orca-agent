@@ -486,6 +486,49 @@ fn calibrated_micro_compaction_stops_once_the_scaled_estimate_is_under_target() 
 }
 
 #[test]
+fn pressure_keeps_the_anchor_when_normalization_repairs_earlier_history() {
+    let mut conversation = tool_fixture();
+    // An early call whose result never arrived: normalization repairs it with
+    // an inserted result, which moves every later message up by one.
+    conversation.messages.insert(
+        3,
+        Message::Assistant {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![RawToolCall {
+                id: "lost".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            pinned: false,
+        },
+    );
+    let provider = provider();
+    let estimated = wire_equivalent_tokens(&conversation, &provider);
+    // The provider counted half again the estimate, a ratio the anchor accepts.
+    conversation.record_usage_anchor(
+        (estimated * 3 / 2) as u64,
+        estimated,
+        conversation.messages.len(),
+    );
+    assert_eq!(
+        measure_prompt(&conversation, &provider).tokens,
+        estimated * 3 / 2
+    );
+
+    // Past the line only on the provider's count.
+    let soft = estimated * 5 / 4;
+    let result = compact_with_summary(
+        ProviderKind::DeepSeek,
+        &conversation,
+        &config(soft, soft * 2),
+        &provider,
+    );
+
+    assert!(shortened_outputs(&result.conversation) > 0);
+}
+
+#[test]
 fn image_detail_budgets_apply_without_tokenizing_payload_and_keep_current_images() {
     let mut image = ImageInput {
         source: ImageSource::Base64 {

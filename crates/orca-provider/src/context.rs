@@ -815,7 +815,11 @@ fn compact_with_summary_inner(
     cancel: Option<&CancelToken>,
 ) -> CompactionResult {
     let normalized = normalized_for_compaction(conversation);
-    let measured = measure_prompt(&normalized, provider_config);
+    // Measure the history the usage anchor was recorded on: a repair that
+    // moves messages before its boundary would drop the anchor from the
+    // normalized copy. The estimate is the same either way, since the
+    // request is built from normalized messages.
+    let measured = measure_prompt(conversation, provider_config);
     let pressure = context_pressure_for_tokens(measured.tokens, context_config);
     if !pressure.should_soft_compact && !pressure.should_hard_compact {
         return CompactionResult {
