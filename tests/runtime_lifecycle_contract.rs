@@ -192,14 +192,20 @@ fn reported_session_triggers_soft_compaction() {
         context_window: Some(1_000_000),
         auto_compact_token_limit: None,
         soft_compact_token_limit: Some(96_000),
+        max_output_tokens: None,
     };
-    let context_config =
-        orca_provider::context::ContextConfig::for_model_with_runtime(Some(PRO_MODEL), &runtime);
+    let context_config = orca_provider::context::ContextConfig::for_model_with_runtime(
+        Some(PRO_MODEL),
+        &runtime,
+        orca_core::config::ReasoningEffort::default(),
+    );
     let pressure = orca_provider::context::context_pressure_for_tokens(120_000, &context_config);
     assert_eq!(pressure.soft_limit, 96_000);
-    // Hard ceiling = 1_000_000 * 0.90 - 4096 = 895_904 (safety net); the soft
-    // line above is an explicit absolute override.
-    assert_eq!(pressure.effective_limit, 895_904);
+    // Hard ceiling = 1_000_000 * 0.90 - 131_072 = 768_928: the default (max)
+    // reasoning effort now reserves 131,072 reply tokens off the input
+    // budget, instead of the old fixed 4,096; the soft line above is an
+    // explicit absolute override.
+    assert_eq!(pressure.effective_limit, 768_928);
     assert!(pressure.should_soft_compact);
     assert!(!pressure.should_hard_compact);
 }

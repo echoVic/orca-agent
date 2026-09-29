@@ -153,14 +153,27 @@ pub struct ModelRuntimeConfig {
     pub auto_compact_token_limit: Option<usize>,
     #[serde(default)]
     pub soft_compact_token_limit: Option<usize>,
+    /// Reply tokens each request reserves, replacing the reasoning-effort
+    /// default.
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
 }
 
 impl ModelRuntimeConfig {
+    /// The smallest reply a request may reserve; below this a request has to
+    /// shed context first.
+    pub const MIN_OUTPUT_TOKENS: usize = 16_384;
+    /// DeepSeek V4's documented output ceiling.
+    pub const MAX_OUTPUT_TOKENS: usize = 384_000;
+
     pub fn normalized(self) -> Self {
         Self {
             context_window: self.context_window.map(|value| value.max(1)),
             auto_compact_token_limit: self.auto_compact_token_limit.map(|value| value.max(1)),
             soft_compact_token_limit: self.soft_compact_token_limit.map(|value| value.max(1)),
+            max_output_tokens: self
+                .max_output_tokens
+                .map(|value| value.clamp(Self::MIN_OUTPUT_TOKENS, Self::MAX_OUTPUT_TOKENS)),
         }
     }
 }
@@ -1030,6 +1043,7 @@ mod tests {
                 context_window: Some(128_000),
                 auto_compact_token_limit: Some(96_000),
                 soft_compact_token_limit: Some(64_000),
+                max_output_tokens: None,
             },
             reasoning_effort: ReasoningEffort::Max,
             api_key: Some("sk-secret".to_string()),
@@ -1265,5 +1279,20 @@ mod tests {
         );
         assert_eq!(parent.approval_mode, ApprovalMode::Plan);
         assert_eq!(parent.model.as_deref(), Some(FLASH_MODEL));
+    }
+
+    #[test]
+    fn model_runtime_clamps_the_reply_budget() {
+        let clamp = |tokens| {
+            ModelRuntimeConfig {
+                max_output_tokens: Some(tokens),
+                ..ModelRuntimeConfig::default()
+            }
+            .normalized()
+            .max_output_tokens
+        };
+        assert_eq!(clamp(1_000), Some(16_384));
+        assert_eq!(clamp(500_000), Some(384_000));
+        assert_eq!(clamp(100_000), Some(100_000));
     }
 }

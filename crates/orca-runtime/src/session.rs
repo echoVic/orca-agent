@@ -799,6 +799,7 @@ impl InteractiveSession {
             &orca_provider::context::ContextConfig::for_model_with_runtime(
                 config.model.as_option().as_deref(),
                 &config.model_runtime,
+                config.reasoning_effort,
             ),
             &provider_config,
             cancel,

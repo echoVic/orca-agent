@@ -835,6 +835,7 @@ mod tests {
         let context_config = context::ContextConfig::for_model_with_runtime(
             Some(orca_core::model::FLASH_MODEL),
             &config.model_runtime,
+            orca_core::config::ReasoningEffort::default(),
         );
         let provider_config = ProviderConfig {
             api_key: None,
@@ -1046,6 +1047,7 @@ mod tests {
         let context_config = context::ContextConfig::for_model_with_runtime(
             Some(orca_core::model::FLASH_MODEL),
             &config.model_runtime,
+            orca_core::config::ReasoningEffort::default(),
         );
         let provider_config = ProviderConfig {
             api_key: None,

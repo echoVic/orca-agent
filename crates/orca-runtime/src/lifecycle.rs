@@ -1992,6 +1992,7 @@ mod tests {
         let context_config = context::ContextConfig::for_model_with_runtime(
             Some(orca_core::model::FLASH_MODEL),
             &runtime,
+            orca_core::config::ReasoningEffort::default(),
         );
         let hooks = HookRunner::default();
         let mut conversation = Conversation::new();
@@ -2073,6 +2074,7 @@ mod tests {
         let context_config = context::ContextConfig::for_model_with_runtime(
             Some(orca_core::model::FLASH_MODEL),
             &runtime,
+            orca_core::config::ReasoningEffort::default(),
         );
         let hooks = HookRunner::default();
         let mut conversation = Conversation::new();
@@ -2223,6 +2225,7 @@ mod tests {
             context_window: Some(128_000),
             auto_compact_token_limit: Some(96_000),
             soft_compact_token_limit: None,
+            max_output_tokens: None,
         };
         let mcp_registry = McpRegistry::default();
 

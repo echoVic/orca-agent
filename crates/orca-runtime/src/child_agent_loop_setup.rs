@@ -161,8 +161,11 @@ fn build_child_agent_loop_setup(
     };
 
     let budget_model = config.model.as_option();
-    let context_config =
-        ContextConfig::for_model_with_runtime(budget_model.as_deref(), &config.model_runtime);
+    let context_config = ContextConfig::for_model_with_runtime(
+        budget_model.as_deref(),
+        &config.model_runtime,
+        config.reasoning_effort,
+    );
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
 

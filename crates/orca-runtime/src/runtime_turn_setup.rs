@@ -32,6 +32,7 @@ impl RuntimeTurnSetupStep {
         let context_config = context::ContextConfig::for_model_with_runtime(
             budget_model.as_deref(),
             &config.model_runtime,
+            config.reasoning_effort,
         );
         let policy = policy_for_tool_execution(config);
         let provider_config = provider_config_for_agent_loop(

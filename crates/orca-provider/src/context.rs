@@ -5,7 +5,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use orca_core::cancel::CancelToken;
-use orca_core::config::{ModelRuntimeConfig, ProviderKind};
+use orca_core::config::{ModelRuntimeConfig, ProviderKind, ReasoningEffort};
 use orca_core::conversation::{
     Conversation, ImageDetail, ImageInput, Message, SummaryState, normalize_tool_boundaries,
 };
@@ -15,14 +15,25 @@ use tiktoken_rs::cl100k_base_singleton;
 use crate::ProviderConfig;
 
 const DEFAULT_MAX_TOKENS: usize = 1_000_000;
-// Hard compaction ceiling as a fraction of the context window (safety net).
-// Aligns with codex (90%) and grok/claude (~85-95%). Compaction is normally
-// driven by the soft line below; this is the last line before prompt-too-long.
+// Hard compaction ceiling as a fraction of the context window. The reply
+// reservation comes off it, so the soft line below never sits where a prompt
+// plus its reply would overflow the window.
 const COMPACTION_THRESHOLD: f64 = 0.90;
-// Small response/overhead headroom subtracted when deriving the hard ceiling.
-// Output length is NOT reserved here (that would gut the usable window); the
-// real per-request output cap is sent as the API `max_tokens` parameter.
+// Reply reservation for configs built without a model or reasoning effort
+// (the `Default` impl, used by tests).
 const RESERVED_FOR_RESPONSE: usize = 4096;
+// Reply tokens reserved per request, by reasoning effort. DeepSeek V4 accepts
+// up to 384K, but reserving that much leaves a 1M window about 620K of prompt
+// before the provider rejects the request, which is how a long session died
+// on 2026-09-29. Codewhale and Reasonix reserve 64K.
+const LOW_EFFORT_REPLY_TOKENS: usize = 32_768;
+const HIGH_EFFORT_REPLY_TOKENS: usize = 65_536;
+const MAX_EFFORT_REPLY_TOKENS: usize = 131_072;
+// The default reservation never takes more than this share of the window, so
+// a small custom window keeps room for its prompt.
+const MAX_REPLY_WINDOW_FRACTION: f64 = 0.15;
+// Window room every request leaves beyond prompt and reply, for estimate error.
+const REQUEST_MARGIN_TOKENS: usize = 8_192;
 // Soft compaction line as a fraction of the context window. This is the line
 // that actually triggers compaction in normal use. Keying it off the window
 // (rather than a fixed absolute) is how codex/grok/claude scale with the
@@ -30,6 +41,18 @@ const RESERVED_FOR_RESPONSE: usize = 4096;
 const DEFAULT_SOFT_COMPACT_FRACTION: f64 = 0.80;
 const STALE_TOOL_OUTPUT_BYTES: usize = 2048;
 const MAX_HISTORY_IMAGE_TOKENS: usize = 8_192;
+
+/// The reply tokens a request reserves when the configuration names none.
+pub fn default_reply_budget(effort: ReasoningEffort, context_window: usize) -> usize {
+    let by_effort = match effort {
+        ReasoningEffort::Low => LOW_EFFORT_REPLY_TOKENS,
+        ReasoningEffort::High => HIGH_EFFORT_REPLY_TOKENS,
+        ReasoningEffort::Max => MAX_EFFORT_REPLY_TOKENS,
+    };
+    by_effort
+        .min((context_window as f64 * MAX_REPLY_WINDOW_FRACTION) as usize)
+        .max(1)
+}
 
 // Deep-compaction target: a FIXED amount of recent context to keep, NOT a
 // window fraction. "Enough recent context to resume work" is an absolute
@@ -362,10 +385,11 @@ pub struct ContextConfig {
 
 impl ContextConfig {
     pub fn for_model(model: Option<&str>) -> Self {
+        let max_tokens = orca_core::model::max_context_tokens(model);
         Self {
-            max_tokens: orca_core::model::max_context_tokens(model),
+            max_tokens,
             compaction_threshold: COMPACTION_THRESHOLD,
-            reserved_for_response: RESERVED_FOR_RESPONSE,
+            reserved_for_response: default_reply_budget(ReasoningEffort::default(), max_tokens),
             auto_compact_token_limit: None,
             // None => soft line derived from the window fraction. An absolute
             // override is opt-in via `soft_compact_token_limit`.
@@ -373,16 +397,42 @@ impl ContextConfig {
         }
     }
 
-    pub fn for_model_with_runtime(model: Option<&str>, runtime: &ModelRuntimeConfig) -> Self {
+    pub fn for_model_with_runtime(
+        model: Option<&str>,
+        runtime: &ModelRuntimeConfig,
+        effort: ReasoningEffort,
+    ) -> Self {
         let mut config = Self::for_model(model);
         if let Some(context_window) = runtime.context_window {
             config.max_tokens = context_window.max(1);
         }
+        config.reserved_for_response = runtime
+            .max_output_tokens
+            .map(|tokens| {
+                tokens.clamp(
+                    ModelRuntimeConfig::MIN_OUTPUT_TOKENS,
+                    ModelRuntimeConfig::MAX_OUTPUT_TOKENS,
+                )
+            })
+            .unwrap_or_else(|| default_reply_budget(effort, config.max_tokens));
         config.auto_compact_token_limit = runtime.auto_compact_token_limit;
         if let Some(limit) = runtime.soft_compact_token_limit {
             config.soft_compact_token_limit = Some(limit);
         }
         config
+    }
+
+    /// Reply tokens one request can reserve once its prompt measures
+    /// `prompt_tokens`: the reply reservation, trimmed to the room the window
+    /// has left. `None` when not even a minimal reply fits; the request has
+    /// to shed context first.
+    pub fn request_reply_budget(&self, prompt_tokens: usize) -> Option<usize> {
+        let room = self
+            .max_tokens
+            .saturating_sub(prompt_tokens.saturating_add(REQUEST_MARGIN_TOKENS));
+        let budget = self.reserved_for_response.min(room);
+        let minimum = ModelRuntimeConfig::MIN_OUTPUT_TOKENS.min(self.reserved_for_response);
+        (budget >= minimum).then_some(budget)
     }
 
     pub fn effective_limit(&self) -> usize {
@@ -1974,9 +2024,14 @@ mod tests {
             context_window: Some(128_000),
             auto_compact_token_limit: Some(96_000),
             soft_compact_token_limit: Some(64_000),
+            max_output_tokens: None,
         };
 
-        let config = ContextConfig::for_model_with_runtime(Some("deepseek-v4-pro"), &runtime);
+        let config = ContextConfig::for_model_with_runtime(
+            Some("deepseek-v4-pro"),
+            &runtime,
+            ReasoningEffort::default(),
+        );
 
         assert_eq!(config.max_tokens, 128_000);
         assert_eq!(config.effective_limit(), 96_000);
@@ -1984,29 +2039,115 @@ mod tests {
     }
 
     #[test]
+    fn reply_budget_follows_reasoning_effort_and_override() {
+        let runtime = ModelRuntimeConfig::default();
+        let budget = |effort| {
+            ContextConfig::for_model_with_runtime(
+                Some(orca_core::model::FLASH_MODEL),
+                &runtime,
+                effort,
+            )
+            .reserved_for_response
+        };
+        assert_eq!(budget(ReasoningEffort::Low), 32_768);
+        assert_eq!(budget(ReasoningEffort::High), 65_536);
+        assert_eq!(budget(ReasoningEffort::Max), 131_072);
+
+        let runtime = ModelRuntimeConfig {
+            max_output_tokens: Some(200_000),
+            ..ModelRuntimeConfig::default()
+        };
+        let config = ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::FLASH_MODEL),
+            &runtime,
+            ReasoningEffort::Low,
+        );
+        assert_eq!(config.reserved_for_response, 200_000);
+    }
+
+    #[test]
+    fn compaction_line_leaves_room_for_the_reply() {
+        let runtime = ModelRuntimeConfig::default();
+        // 0.9 x 1_000_000 - 131_072: the reply comes off the input budget.
+        let max = ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::FLASH_MODEL),
+            &runtime,
+            ReasoningEffort::Max,
+        );
+        assert_eq!(max.effective_limit(), 768_928);
+        assert_eq!(max.soft_limit(), 768_928);
+        let high = ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::FLASH_MODEL),
+            &runtime,
+            ReasoningEffort::High,
+        );
+        assert_eq!(high.soft_limit(), 800_000);
+        // A 384K reservation pulls the line down to 516K instead of letting
+        // prompts between 616K and 800K fail at the provider.
+        let wide = ModelRuntimeConfig {
+            max_output_tokens: Some(384_000),
+            ..ModelRuntimeConfig::default()
+        };
+        let wide = ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::FLASH_MODEL),
+            &wide,
+            ReasoningEffort::Max,
+        );
+        assert_eq!(wide.soft_limit(), 516_000);
+    }
+
+    #[test]
+    fn request_reply_budget_trims_to_the_room_left() {
+        let config = ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::FLASH_MODEL),
+            &ModelRuntimeConfig::default(),
+            ReasoningEffort::Max,
+        );
+        // The 2026-09-29 request: 664,935 prompt tokens now go out with the
+        // full reservation, 796,007 in all.
+        assert_eq!(config.request_reply_budget(664_935), Some(131_072));
+        // 1_000_000 - 900_000 - 8_192 = 91_808.
+        assert_eq!(config.request_reply_budget(900_000), Some(91_808));
+        // 11,808 left is below the 16,384 minimum reply.
+        assert_eq!(config.request_reply_budget(980_000), None);
+    }
+
+    #[test]
+    fn default_reply_budget_stays_small_in_a_small_window() {
+        assert_eq!(
+            default_reply_budget(ReasoningEffort::Max, 1_000_000),
+            131_072
+        );
+        assert_eq!(default_reply_budget(ReasoningEffort::Max, 200_000), 30_000);
+        assert_eq!(default_reply_budget(ReasoningEffort::Low, 40_000), 6_000);
+    }
+
+    #[test]
     fn for_model_derives_soft_line_from_window_fraction() {
-        // Compaction scales with the window: no fixed absolute soft line.
         let config = ContextConfig::for_model(Some(orca_core::model::PRO_MODEL));
         assert_eq!(config.max_tokens, 1_000_000);
-        // Small headroom only; the output cap is NOT reserved from input budget.
-        assert_eq!(config.reserved_for_response, 4096);
-        // Hard ceiling = 1_000_000 * 0.90 - 4096 = 895_904 (safety net).
-        assert_eq!(config.effective_limit(), 895_904);
-        // Soft line (the real trigger) = 1_000_000 * 0.80 = 800_000.
-        assert_eq!(config.soft_limit(), 800_000);
+        // The default reasoning effort (max) reserves 131,072 reply tokens.
+        assert_eq!(config.reserved_for_response, 131_072);
+        // Hard ceiling = 1_000_000 * 0.90 - 131_072 = 768_928.
+        assert_eq!(config.effective_limit(), 768_928);
+        // The soft line may not sit above the hard ceiling.
+        assert_eq!(config.soft_limit(), 768_928);
     }
 
     #[test]
     fn soft_line_scales_down_with_a_smaller_window() {
-        // A 200k window compacts near 160k, not a fixed 96k.
+        // A 200k window reserves at most 15% (30,000) for the reply and
+        // compacts at 0.9 x 200_000 - 30_000.
         let runtime = ModelRuntimeConfig {
             context_window: Some(200_000),
-            auto_compact_token_limit: None,
-            soft_compact_token_limit: None,
+            ..ModelRuntimeConfig::default()
         };
-        let config =
-            ContextConfig::for_model_with_runtime(Some(orca_core::model::PRO_MODEL), &runtime);
-        assert_eq!(config.soft_limit(), 160_000); // 200_000 * 0.80
+        let config = ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::PRO_MODEL),
+            &runtime,
+            ReasoningEffort::default(),
+        );
+        assert_eq!(config.soft_limit(), 150_000);
     }
 
     #[test]
@@ -2022,9 +2163,13 @@ mod tests {
             context_window: Some(200_000),
             auto_compact_token_limit: None,
             soft_compact_token_limit: None,
+            max_output_tokens: None,
         };
-        let small =
-            ContextConfig::for_model_with_runtime(Some(orca_core::model::PRO_MODEL), &runtime);
+        let small = ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::PRO_MODEL),
+            &runtime,
+            ReasoningEffort::default(),
+        );
         assert_eq!(small.target_compaction_limit(), 48_000);
         assert!(small.target_compaction_limit() < small.soft_limit());
     }
@@ -2033,16 +2178,18 @@ mod tests {
     fn deep_compaction_target_preserves_headroom_for_tiny_windows() {
         let runtime = ModelRuntimeConfig {
             context_window: Some(40_000),
-            auto_compact_token_limit: None,
-            soft_compact_token_limit: None,
+            ..ModelRuntimeConfig::default()
         };
-        let config =
-            ContextConfig::for_model_with_runtime(Some(orca_core::model::PRO_MODEL), &runtime);
+        let config = ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::PRO_MODEL),
+            &runtime,
+            ReasoningEffort::default(),
+        );
 
-        // The 90% hard ceiling minus 4,096 headroom (31,904) is slightly below
-        // the derived 80% soft line (32,000), so it becomes the effective line.
-        assert_eq!(config.soft_limit(), 31_904);
-        assert_eq!(config.target_compaction_limit(), 19_142);
+        // 0.9 x 40_000 - 6_000 (15% of the window) = 30_000, below the 80%
+        // soft line (32,000), so it becomes the effective line.
+        assert_eq!(config.soft_limit(), 30_000);
+        assert_eq!(config.target_compaction_limit(), 18_000);
         assert!(config.target_compaction_limit() < config.soft_limit());
     }
 
@@ -2053,9 +2200,13 @@ mod tests {
             context_window: None,
             auto_compact_token_limit: None,
             soft_compact_token_limit: Some(96_000),
+            max_output_tokens: None,
         };
-        let config =
-            ContextConfig::for_model_with_runtime(Some(orca_core::model::PRO_MODEL), &runtime);
+        let config = ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::PRO_MODEL),
+            &runtime,
+            ReasoningEffort::default(),
+        );
         assert_eq!(config.soft_limit(), 96_000);
     }
 

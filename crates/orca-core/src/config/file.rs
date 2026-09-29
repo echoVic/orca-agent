@@ -1180,11 +1180,13 @@ shell_timeout_secs = 999999
 context_window = 128000
 auto_compact_token_limit = 96000
 soft_compact_token_limit = 64000
+max_output_tokens = 200000
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.model_runtime.context_window, Some(128_000));
         assert_eq!(config.model_runtime.auto_compact_token_limit, Some(96_000));
         assert_eq!(config.model_runtime.soft_compact_token_limit, Some(64_000));
+        assert_eq!(config.model_runtime.max_output_tokens, Some(200_000));
     }
 
     #[test]
