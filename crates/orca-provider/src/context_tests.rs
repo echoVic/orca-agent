@@ -371,6 +371,120 @@ fn micro_compaction_exempts_the_current_turn_openers_images() {
     );
 }
 
+fn tool_output<'a>(conversation: &'a Conversation, id: &str) -> &'a str {
+    conversation
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            Message::Tool {
+                tool_call_id,
+                content,
+                ..
+            } if tool_call_id == id => Some(content.as_str()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{id} has no tool result"))
+}
+
+fn shortened_outputs(conversation: &Conversation) -> usize {
+    conversation
+        .messages
+        .iter()
+        .filter(|message| {
+            matches!(message,
+            Message::Tool { content, .. } if content.starts_with("[tool output micro-compact]"))
+        })
+        .count()
+}
+
+#[test]
+fn micro_compaction_keeps_the_current_turns_recent_tool_output() {
+    let mut conversation = Conversation::new();
+    conversation.add_system("immutable instructions".to_string());
+    conversation.add_user("refactor the whole module".to_string());
+    for index in 0..8 {
+        conversation.add_assistant(
+            None,
+            Some("next step".to_string()),
+            vec![RawToolCall {
+                id: format!("call-{index}"),
+                function_name: "read_file".to_string(),
+                arguments: format!(r#"{{"path":"file-{index}.rs"}}"#),
+            }],
+        );
+        conversation.add_tool_result(format!("call-{index}"), "evidence ".repeat(1_000));
+    }
+    let messages = &conversation.messages;
+    let unit = message_tokens(&messages[messages.len() - 2])
+        + message_tokens(&messages[messages.len() - 1]);
+    // The retention budget, 6/10 of the soft line, holds three and a half of
+    // these units: the three newest are the turn's recent tail.
+    let soft = unit * 35 / 6;
+
+    let result = compact_with_summary(
+        ProviderKind::DeepSeek,
+        &conversation,
+        &config(soft, soft * 2),
+        &provider(),
+    );
+
+    assert!(matches!(result.kind, CompactionKind::LocalTruncation));
+    assert_eq!(
+        result.conversation.messages.len(),
+        conversation.messages.len()
+    );
+    let full = "evidence ".repeat(1_000);
+    for id in ["call-5", "call-6", "call-7"] {
+        assert!(
+            tool_output(&result.conversation, id) == full,
+            "{id} is in the recent tail"
+        );
+    }
+    // Older units of the same turn are shortened, newest first.
+    assert!(tool_output(&result.conversation, "call-4").starts_with("[tool output micro-compact]"));
+}
+
+#[test]
+fn calibrated_micro_compaction_stops_once_the_scaled_estimate_is_under_target() {
+    let mut conversation = tool_fixture();
+    let provider = provider();
+    let estimated = wire_equivalent_tokens(&conversation, &provider);
+    // The provider counted half again the estimate, a ratio the anchor accepts.
+    conversation.record_usage_anchor(
+        (estimated * 3 / 2) as u64,
+        estimated,
+        conversation.messages.len(),
+    );
+    let ratio = measure_prompt(&conversation, &provider).tokens as f64 / estimated as f64;
+    // Every tool output is the same size, so each shortening saves the same.
+    let mut shortened = conversation.clone();
+    let last_output = shortened
+        .messages
+        .iter_mut()
+        .rev()
+        .find_map(|message| match message {
+            Message::Tool { content, .. } => Some(content),
+            _ => None,
+        })
+        .unwrap();
+    *last_output = micro_compact_tool_output(last_output);
+    let saving = estimated - wire_equivalent_tokens(&shortened, &provider);
+    // The micro target (9/10 of the soft line) sits halfway between two and
+    // three shortened outputs on the provider's scale.
+    let target = ((estimated as f64 - 2.5 * saving as f64) * ratio) as usize;
+    let soft = target * 10 / 9 + 1;
+
+    let result = compact_with_summary(
+        ProviderKind::DeepSeek,
+        &conversation,
+        &config(soft, soft * 2),
+        &provider,
+    );
+
+    assert!(matches!(result.kind, CompactionKind::LocalTruncation));
+    assert_eq!(shortened_outputs(&result.conversation), 3);
+}
+
 #[test]
 fn image_detail_budgets_apply_without_tokenizing_payload_and_keep_current_images() {
     let mut image = ImageInput {
@@ -423,7 +537,7 @@ fn historical_image_budget_prefers_recent_evidence_and_replayed_reasoning_is_cou
     conversation.add_user_with_images("older image".to_string(), vec![image.clone()]);
     conversation.add_user_with_images("recent image".to_string(), vec![image]);
     conversation.add_user("current".to_string());
-    let reduced = cache_aware_micro_compaction(&conversation, 0, 1_536, conversation_tokens);
+    let reduced = cache_aware_micro_compaction(&conversation, 0, 1_536, 1.0, conversation_tokens);
     assert!(matches!(&reduced.messages[0], Message::User { images, .. } if images.is_empty()));
     assert!(matches!(&reduced.messages[1], Message::User { images, .. } if images.len() == 1));
     let mut tool = Conversation::new();

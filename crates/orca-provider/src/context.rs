@@ -834,6 +834,7 @@ fn compact_with_summary_inner(
         &normalized,
         micro_target,
         context_config.target_compaction_limit(),
+        ratio,
         count,
     );
     if count(&micro_compacted) <= micro_target {
@@ -1854,6 +1855,7 @@ pub fn compact_with_counter(
         &normalized,
         target,
         config.target_compaction_limit(),
+        1.0,
         |candidate| conversation_tokens_with_counter(candidate, counter),
     );
     if conversation_tokens_with_counter(&micro, counter) <= target {
@@ -1936,26 +1938,49 @@ fn normalized_for_compaction(conversation: &Conversation) -> Conversation {
     normalized
 }
 
+/// `count` measures a candidate on the scale `target` is set in; `ratio` is
+/// how far that scale runs above Orca's estimate, so a rewrite's estimated
+/// saving is scaled by it before it comes off the tracked count.
 fn cache_aware_micro_compaction(
     conversation: &Conversation,
     target: usize,
     retention_budget: usize,
+    ratio: f64,
     count: impl Fn(&Conversation) -> usize,
 ) -> Conversation {
     let mut result = conversation.clone();
     let units = compaction_units(&result.messages);
-    // The unit that opened the current turn is exempt from the image pass
-    // just like the newest unit: it may sit several units behind the newest
-    // one (e.g. a tool call/result pair answering it), but it is still the
-    // live request the reply is about, so its images must survive verbatim.
+    // The current turn's recent units are the evidence the model is working
+    // from: its newest units that fit in the retention budget (always the
+    // newest one) stay verbatim, like the message that opened the turn. That
+    // opener may sit several units behind the newest one, but it is still
+    // the live request the reply is about.
     let current_opener = units.iter().rposition(|unit| unit.opens_turn);
+    let turn_start = current_opener.map_or(0, |opener| opener + 1);
+    let unit_tokens = |unit: &CompactionUnit| {
+        result.messages[unit.range.clone()]
+            .iter()
+            .map(message_tokens)
+            .sum::<usize>()
+    };
+    let mut tail_start = units.len().saturating_sub(1);
+    let mut tail_tokens = units.last().map_or(0, unit_tokens);
+    while tail_start > turn_start {
+        let tokens = tail_tokens.saturating_add(unit_tokens(&units[tail_start - 1]));
+        if tokens > retention_budget {
+            break;
+        }
+        tail_tokens = tokens;
+        tail_start -= 1;
+    }
+    let exempt = |index: usize| index >= tail_start || Some(index) == current_opener;
     let image_budget = MAX_HISTORY_IMAGE_TOKENS.min(retention_budget / 4);
     let mut remaining_images = image_budget;
     // Evidence recency takes priority over prefix reuse for images. The
-    // newest unit, the current turn's opener, and pinned messages are
-    // exempt; otherwise keep whole image groups within the allowance.
-    for (index, unit) in units.iter().enumerate().rev().skip(1) {
-        if Some(index) == current_opener {
+    // exempt units and pinned messages keep theirs; otherwise keep whole
+    // image groups within the allowance.
+    for (index, unit) in units.iter().enumerate().rev() {
+        if exempt(index) {
             continue;
         }
         for message in result.messages[unit.range.clone()].iter_mut().rev() {
@@ -1979,14 +2004,18 @@ fn cache_aware_micro_compaction(
             }
         }
     }
-    // Work backwards only until enough capacity is recovered. Everything
-    // before the first changed unit remains an exact, useful cache prefix.
-    // Track the estimate by the tokens each rewrite saves instead of
-    // re-counting the whole conversation per unit.
+    // Work backwards only until enough capacity is recovered: the current
+    // turn's older units go before earlier turns, and everything before the
+    // first changed unit remains an exact, useful cache prefix. Track the
+    // count by the tokens each rewrite saves instead of re-counting the
+    // whole conversation per unit.
     let mut estimate = count(&result);
-    for unit in units.iter().rev().skip(1) {
+    for (index, unit) in units.iter().enumerate().rev() {
         if estimate <= target {
             break;
+        }
+        if exempt(index) {
+            continue;
         }
         for message in &mut result.messages[unit.range.clone()] {
             if let Message::Tool {
@@ -2002,7 +2031,7 @@ fn cache_aware_micro_compaction(
                 let after = DefaultTokenCounter.count_text(&reduced);
                 if after < before {
                     *content = reduced;
-                    estimate = estimate.saturating_sub(before - after);
+                    estimate = estimate.saturating_sub(((before - after) as f64 * ratio) as usize);
                 }
             }
         }
@@ -2637,7 +2666,7 @@ mod tests {
         }
         conv.add_user("continue".to_string());
 
-        let compacted = cache_aware_micro_compaction(&conv, 0, 100, conversation_tokens);
+        let compacted = cache_aware_micro_compaction(&conv, 0, 100, 1.0, conversation_tokens);
         let tool_outputs = compacted
             .messages
             .iter()
@@ -2681,7 +2710,7 @@ mod tests {
         conv.add_tool_result_with_terminal(&result, "word ".repeat(STALE_TOOL_OUTPUT_BYTES));
         conv.add_user("continue".to_string());
 
-        let compacted = cache_aware_micro_compaction(&conv, 0, 100, conversation_tokens);
+        let compacted = cache_aware_micro_compaction(&conv, 0, 100, 1.0, conversation_tokens);
 
         assert!(matches!(
             &compacted.messages[2],
