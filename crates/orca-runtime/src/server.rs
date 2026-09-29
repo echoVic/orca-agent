@@ -129,22 +129,25 @@ impl PermissionRuleValue {
         }
     }
 
+    /// The rule this value adds. Without a pattern, it covers every call of
+    /// the tool, as a config rule without one does.
     fn into_rule(self, behavior: Decision) -> PermissionRule {
-        PermissionRule::new(
-            self.tool,
-            self.pattern.unwrap_or_else(|| "*".to_string()),
-            behavior,
-        )
+        PermissionRule {
+            tool: self.tool,
+            pattern: self.pattern,
+            decision: behavior,
+        }
     }
 
+    /// Whether this value selects `rule` to remove: a value without a
+    /// pattern selects every rule for its tool.
     fn matches_rule(&self, rule: &PermissionRule, behavior: Decision) -> bool {
         rule.decision == behavior
             && rule.tool == self.tool
             && self
                 .pattern
                 .as_deref()
-                .map(|pattern| pattern == rule.pattern)
-                .unwrap_or(true)
+                .is_none_or(|pattern| rule.pattern.as_deref() == Some(pattern))
     }
 }
 

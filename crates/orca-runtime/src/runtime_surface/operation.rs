@@ -1023,7 +1023,11 @@ pub struct SurfaceActivePermissionProfile {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfacePermissionRule {
     pub tool: NonEmptyText,
-    pub pattern: NonEmptyText,
+    /// `None` covers every call of the tool, as a config rule without a
+    /// `pattern` does. Omitted on the wire then, so a rule with a pattern is
+    /// written as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<NonEmptyText>,
     pub decision: SurfacePermissionDecision,
 }
 

@@ -11106,11 +11106,14 @@ fn initial_surface_snapshot(
                         message: format!("invalid permission rule tool: {error:?}"),
                     }
                 })?,
-                pattern: surface::NonEmptyText::try_new(rule.pattern.clone()).map_err(|error| {
-                    RuntimeHostError::ThreadStartFailed {
+                pattern: rule
+                    .pattern
+                    .clone()
+                    .map(surface::NonEmptyText::try_new)
+                    .transpose()
+                    .map_err(|error| RuntimeHostError::ThreadStartFailed {
                         message: format!("invalid permission rule pattern: {error:?}"),
-                    }
-                })?,
+                    })?,
                 decision: match rule.decision {
                     orca_core::approval_types::Decision::Allow => {
                         surface::SurfacePermissionDecision::Allow
@@ -11348,22 +11351,23 @@ fn apply_runtime_settings_patch(
             config.permission_rules = orca_core::approval_rules::PermissionRules {
                 rules: rules
                     .iter()
-                    .map(|rule| {
-                        orca_core::approval_rules::PermissionRule::new(
-                            rule.tool.as_str(),
-                            rule.pattern.as_str(),
-                            match rule.decision {
-                                surface::SurfacePermissionDecision::Allow => {
-                                    orca_core::approval_types::Decision::Allow
-                                }
-                                surface::SurfacePermissionDecision::Prompt => {
-                                    orca_core::approval_types::Decision::Prompt
-                                }
-                                surface::SurfacePermissionDecision::Deny => {
-                                    orca_core::approval_types::Decision::Deny
-                                }
-                            },
-                        )
+                    .map(|rule| orca_core::approval_rules::PermissionRule {
+                        tool: rule.tool.as_str().to_string(),
+                        pattern: rule
+                            .pattern
+                            .as_ref()
+                            .map(|pattern| pattern.as_str().to_string()),
+                        decision: match rule.decision {
+                            surface::SurfacePermissionDecision::Allow => {
+                                orca_core::approval_types::Decision::Allow
+                            }
+                            surface::SurfacePermissionDecision::Prompt => {
+                                orca_core::approval_types::Decision::Prompt
+                            }
+                            surface::SurfacePermissionDecision::Deny => {
+                                orca_core::approval_types::Decision::Deny
+                            }
+                        },
                     })
                     .collect(),
             };
@@ -11535,22 +11539,23 @@ fn persist_surface_settings_metadata(
                         .permission_rules
                         .ordered_rules
                         .iter()
-                        .map(|rule| {
-                            orca_core::approval_rules::PermissionRule::new(
-                                rule.tool.as_str(),
-                                rule.pattern.as_str(),
-                                match rule.decision {
-                                    surface::SurfacePermissionDecision::Allow => {
-                                        orca_core::approval_types::Decision::Allow
-                                    }
-                                    surface::SurfacePermissionDecision::Prompt => {
-                                        orca_core::approval_types::Decision::Prompt
-                                    }
-                                    surface::SurfacePermissionDecision::Deny => {
-                                        orca_core::approval_types::Decision::Deny
-                                    }
-                                },
-                            )
+                        .map(|rule| orca_core::approval_rules::PermissionRule {
+                            tool: rule.tool.as_str().to_string(),
+                            pattern: rule
+                                .pattern
+                                .as_ref()
+                                .map(|pattern| pattern.as_str().to_string()),
+                            decision: match rule.decision {
+                                surface::SurfacePermissionDecision::Allow => {
+                                    orca_core::approval_types::Decision::Allow
+                                }
+                                surface::SurfacePermissionDecision::Prompt => {
+                                    orca_core::approval_types::Decision::Prompt
+                                }
+                                surface::SurfacePermissionDecision::Deny => {
+                                    orca_core::approval_types::Decision::Deny
+                                }
+                            },
                         })
                         .collect(),
                 }),

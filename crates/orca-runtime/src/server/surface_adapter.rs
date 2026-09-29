@@ -891,22 +891,23 @@ fn apply_surface_settings_to_run_config(
             .permission_rules
             .ordered_rules
             .iter()
-            .map(|rule| {
-                orca_core::approval_rules::PermissionRule::new(
-                    rule.tool.as_str(),
-                    rule.pattern.as_str(),
-                    match rule.decision {
-                        crate::surface::SurfacePermissionDecision::Allow => {
-                            orca_core::approval_types::Decision::Allow
-                        }
-                        crate::surface::SurfacePermissionDecision::Prompt => {
-                            orca_core::approval_types::Decision::Prompt
-                        }
-                        crate::surface::SurfacePermissionDecision::Deny => {
-                            orca_core::approval_types::Decision::Deny
-                        }
-                    },
-                )
+            .map(|rule| orca_core::approval_rules::PermissionRule {
+                tool: rule.tool.as_str().to_string(),
+                pattern: rule
+                    .pattern
+                    .as_ref()
+                    .map(|pattern| pattern.as_str().to_string()),
+                decision: match rule.decision {
+                    crate::surface::SurfacePermissionDecision::Allow => {
+                        orca_core::approval_types::Decision::Allow
+                    }
+                    crate::surface::SurfacePermissionDecision::Prompt => {
+                        orca_core::approval_types::Decision::Prompt
+                    }
+                    crate::surface::SurfacePermissionDecision::Deny => {
+                        orca_core::approval_types::Decision::Deny
+                    }
+                },
             })
             .collect(),
     };
@@ -2737,7 +2738,11 @@ fn settings_patches(
         .map(|rule| {
             Ok(crate::surface::SurfacePermissionRule {
                 tool: crate::surface::NonEmptyText::try_new(rule.tool.clone())?,
-                pattern: crate::surface::NonEmptyText::try_new(rule.pattern.clone())?,
+                pattern: rule
+                    .pattern
+                    .clone()
+                    .map(crate::surface::NonEmptyText::try_new)
+                    .transpose()?,
                 decision: match rule.decision {
                     orca_core::approval_types::Decision::Allow => {
                         crate::surface::SurfacePermissionDecision::Allow

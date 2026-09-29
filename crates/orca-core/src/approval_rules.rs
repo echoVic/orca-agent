@@ -6,22 +6,32 @@ use crate::mcp_types::mcp_tool_server;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PermissionRule {
     pub tool: String,
-    #[serde(default = "any_target")]
-    pub pattern: String,
+    /// The glob a call's target must match. Without one (no `pattern` in the
+    /// config), the rule covers every call of the tool, whatever its target
+    /// and whether or not it has one: every path, nested or absolute, and
+    /// every command. That is not the glob `*`, which in a path stays within
+    /// one directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
     pub decision: Decision,
 }
 
-/// Default for `PermissionRule::pattern`: matches any target, including a
-/// call that carries none (MCP tool calls have no target).
-fn any_target() -> String {
-    "*".to_string()
-}
-
 impl PermissionRule {
+    /// A rule for the calls of `tool` whose target matches `pattern`.
     pub fn new(tool: impl Into<String>, pattern: impl Into<String>, decision: Decision) -> Self {
         Self {
             tool: tool.into(),
-            pattern: pattern.into(),
+            pattern: Some(pattern.into()),
+            decision,
+        }
+    }
+
+    /// A rule for every call of `tool`, as a config rule without a
+    /// `pattern` is.
+    pub fn whole_tool(tool: impl Into<String>, decision: Decision) -> Self {
+        Self {
+            tool: tool.into(),
+            pattern: None,
             decision,
         }
     }
@@ -41,7 +51,8 @@ pub struct CompiledPermissionRules {
 #[derive(Clone, Debug)]
 struct CompiledPermissionRule {
     tool: String,
-    pattern: CompiledGlob,
+    /// `None` covers every target.
+    pattern: Option<CompiledGlob>,
     decision: Decision,
 }
 
@@ -92,13 +103,21 @@ impl CompiledPermissionRule {
         };
         Self {
             tool: rule.tool,
-            pattern: CompiledGlob::new(rule.pattern, target),
+            pattern: rule
+                .pattern
+                .map(|pattern| CompiledGlob::new(pattern, target)),
             decision: rule.decision,
         }
     }
 
+    /// A call without a target is matched as an empty one, so a pattern
+    /// such as `src/**` never matches it.
     fn matches(&self, tool: &str, target: Option<&str>) -> bool {
-        self.matches_tool(tool) && self.pattern.matches(target.unwrap_or(""))
+        self.matches_tool(tool)
+            && self
+                .pattern
+                .as_ref()
+                .is_none_or(|pattern| pattern.matches(target.unwrap_or("")))
     }
 
     /// A rule's `tool` matches a call's tool name either literally, or, for
@@ -391,6 +410,123 @@ decision = "allow"
             compiled.matching_decision("mcp__github__create_issue", None),
             Some(Decision::Allow)
         );
+    }
+
+    fn rules_from_toml(source: &str) -> CompiledPermissionRules {
+        let rules: PermissionRules = toml::from_str(source).expect("permission rules");
+        CompiledPermissionRules::from_rules(rules)
+    }
+
+    #[test]
+    fn a_deny_rule_without_a_pattern_covers_nested_and_absolute_paths() {
+        let compiled = rules_from_toml(
+            r#"
+[[rules]]
+tool = "write_file"
+decision = "deny"
+"#,
+        );
+
+        for target in [
+            "main.rs",
+            "src/main.rs",
+            "src/nested/main.rs",
+            "/Users/x/a.rs",
+        ] {
+            assert_eq!(
+                compiled.matching_decision("write_file", Some(target)),
+                Some(Decision::Deny),
+                "{target}"
+            );
+        }
+        assert_eq!(
+            compiled.matching_decision("write_file", None),
+            Some(Decision::Deny)
+        );
+        assert_eq!(compiled.matching_decision("edit", Some("main.rs")), None);
+    }
+
+    #[test]
+    fn a_bash_allow_rule_without_a_pattern_allows_every_command() {
+        let compiled = rules_from_toml(
+            r#"
+[[rules]]
+tool = "bash"
+decision = "allow"
+"#,
+        );
+
+        for command in [
+            "cargo test",
+            "rm -rf /tmp/build",
+            "git push origin feature/x",
+        ] {
+            assert_eq!(
+                compiled.matching_decision("bash", Some(command)),
+                Some(Decision::Allow),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_star_keeps_its_glob_meaning() {
+        let compiled = rules_from_toml(
+            r#"
+[[rules]]
+tool = "write_file"
+pattern = "*"
+decision = "deny"
+"#,
+        );
+
+        assert_eq!(
+            compiled.matching_decision("write_file", Some("main.rs")),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            compiled.matching_decision("write_file", Some("src/main.rs")),
+            None
+        );
+        assert_eq!(
+            compiled.matching_decision("write_file", Some("/Users/x/a.rs")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rule_keeps_its_pattern_or_its_absence_when_saved_and_loaded() {
+        let rules: PermissionRules = toml::from_str(
+            r#"
+[[rules]]
+tool = "bash"
+decision = "allow"
+
+[[rules]]
+tool = "write_file"
+pattern = "*"
+decision = "deny"
+"#,
+        )
+        .expect("permission rules");
+        assert_eq!(
+            rules.rules,
+            [
+                PermissionRule::whole_tool("bash", Decision::Allow),
+                PermissionRule::new("write_file", "*", Decision::Deny),
+            ]
+        );
+
+        let saved = serde_json::to_value(&rules).expect("serialize the rules");
+        assert_eq!(
+            saved,
+            serde_json::json!({"rules": [
+                {"tool": "bash", "decision": "allow"},
+                {"tool": "write_file", "pattern": "*", "decision": "deny"},
+            ]})
+        );
+        let loaded: PermissionRules = serde_json::from_value(saved).expect("load the rules");
+        assert_eq!(loaded, rules);
     }
 
     #[test]

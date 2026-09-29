@@ -2740,7 +2740,7 @@ SurfaceActivePermissionProfile {
 
 SurfacePermissionRule {
   tool: NonEmptyText,
-  pattern: NonEmptyText,
+  pattern: Option<NonEmptyText>, // None covers every call of the tool
   decision: SurfacePermissionDecision,
 }
 

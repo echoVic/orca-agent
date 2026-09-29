@@ -757,13 +757,19 @@ decision = "deny"
         let config: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.permissions.rules.len(), 2);
         assert_eq!(config.permissions.rules[0].tool, "bash");
-        assert_eq!(config.permissions.rules[0].pattern, "cargo *");
+        assert_eq!(
+            config.permissions.rules[0].pattern.as_deref(),
+            Some("cargo *")
+        );
         assert_eq!(
             config.permissions.rules[0].decision,
             crate::approval_types::Decision::Allow
         );
         assert_eq!(config.permissions.rules[1].tool, "write_file");
-        assert_eq!(config.permissions.rules[1].pattern, "/etc/**");
+        assert_eq!(
+            config.permissions.rules[1].pattern.as_deref(),
+            Some("/etc/**")
+        );
         assert_eq!(
             config.permissions.rules[1].decision,
             crate::approval_types::Decision::Deny
@@ -1608,7 +1614,10 @@ enabled = true
             Some(crate::approval_types::ApprovalMode::Suggest)
         );
         assert_eq!(config.permissions.rules.len(), 1);
-        assert_eq!(config.permissions.rules[0].pattern, "rm -rf *");
+        assert_eq!(
+            config.permissions.rules[0].pattern.as_deref(),
+            Some("rm -rf *")
+        );
         assert!(config.hooks.is_empty());
         assert!(config.mcp_servers.is_empty());
         assert!(!config.workflows.resolved().enabled);
@@ -1650,7 +1659,10 @@ decision = "allow"
 
         assert_eq!(config.model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(config.permissions.rules.len(), 1);
-        assert_eq!(config.permissions.rules[0].pattern, "rm -rf *");
+        assert_eq!(
+            config.permissions.rules[0].pattern.as_deref(),
+            Some("rm -rf *")
+        );
     }
 
     #[test]
@@ -1723,7 +1735,10 @@ decision = "allow"
         let config = load_layered_config_from_paths(&user_path, &project_dir);
 
         assert_eq!(config.permissions.rules.len(), 1);
-        assert_eq!(config.permissions.rules[0].pattern, "rm -rf *");
+        assert_eq!(
+            config.permissions.rules[0].pattern.as_deref(),
+            Some("rm -rf *")
+        );
         assert_eq!(
             config.permissions.rules[0].decision,
             crate::approval_types::Decision::Deny

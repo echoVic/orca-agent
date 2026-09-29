@@ -376,46 +376,91 @@ mod tests {
         assert!(res.reason.contains("permission deny rule"));
     }
 
+    /// A call to the MCP tool `tool`, as the runtime asks about it: its
+    /// target is the tool's own name (`orca_tools::schema::tool_target`).
+    fn mcp_request(tool: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            id: format!("{tool}-call"),
+            action: ActionKind::Write,
+            description: format!("call {tool}"),
+            tool: Some(tool.to_string()),
+            target: Some(tool.to_string()),
+            preview: None,
+        }
+    }
+
+    fn resolve_mcp(policy: &ApprovalPolicy, tool: &str) -> ApprovalDecision {
+        policy
+            .resolve_for_tool(&mcp_request(tool), tool, Some(tool))
+            .decision
+    }
+
     #[test]
     fn a_rule_can_allow_an_mcp_tool_in_suggest_mode() {
-        let policy =
-            ApprovalPolicy::new(ApprovalMode::Suggest).with_rules(vec![PermissionRule::new(
-                "mcp__github__*",
-                "*",
-                Decision::Allow,
-            )]);
-        let req = ApprovalRequest {
-            id: "mcp-suggest".to_string(),
-            action: ActionKind::Write,
-            description: "call an MCP tool".to_string(),
-            tool: Some("mcp__github__create_issue".to_string()),
-            target: None,
-            preview: None,
-        };
+        let policy = ApprovalPolicy::new(ApprovalMode::Suggest).with_rules(vec![
+            PermissionRule::whole_tool("mcp__github__*", Decision::Allow),
+        ]);
 
-        let res = policy.resolve_for_tool(&req, "mcp__github__create_issue", None);
-
-        assert_eq!(res.decision, ApprovalDecision::Allow);
+        assert_eq!(
+            resolve_mcp(&policy, "mcp__github__create_issue"),
+            ApprovalDecision::Allow
+        );
     }
 
     #[test]
     fn a_rule_cannot_lift_plan_for_an_mcp_tool() {
-        let policy = ApprovalPolicy::new(ApprovalMode::Plan).with_rules(vec![PermissionRule::new(
-            "mcp__github__*",
-            "*",
-            Decision::Allow,
-        )]);
-        let req = ApprovalRequest {
-            id: "mcp-plan".to_string(),
-            action: ActionKind::Write,
-            description: "call an MCP tool".to_string(),
-            tool: Some("mcp__github__create_issue".to_string()),
-            target: None,
-            preview: None,
-        };
+        let policy =
+            ApprovalPolicy::new(ApprovalMode::Plan).with_rules(vec![PermissionRule::whole_tool(
+                "mcp__github__*",
+                Decision::Allow,
+            )]);
 
-        let res = policy.resolve_for_tool(&req, "mcp__github__create_issue", None);
+        assert_eq!(
+            resolve_mcp(&policy, "mcp__github__create_issue"),
+            ApprovalDecision::Deny
+        );
+    }
 
-        assert_eq!(res.decision, ApprovalDecision::Deny);
+    #[test]
+    fn mcp_rules_without_a_pattern_match_calls_by_tool_name() {
+        let policy = ApprovalPolicy::new(ApprovalMode::Suggest).with_rules(vec![
+            PermissionRule::whole_tool("mcp__github__*", Decision::Allow),
+            PermissionRule::whole_tool("mcp__github__delete_repo", Decision::Deny),
+        ]);
+
+        assert_eq!(
+            resolve_mcp(&policy, "mcp__github__create_issue"),
+            ApprovalDecision::Allow
+        );
+        assert_eq!(
+            resolve_mcp(&policy, "mcp__github__delete_repo"),
+            ApprovalDecision::Deny
+        );
+        assert_eq!(
+            resolve_mcp(&policy, "mcp__gitlab__create_issue"),
+            ApprovalDecision::Ask
+        );
+    }
+
+    #[test]
+    fn a_deny_rule_without_a_pattern_stops_every_write_in_full_auto() {
+        let policy = ApprovalPolicy::new(ApprovalMode::FullAuto).with_rules(vec![
+            PermissionRule::whole_tool("write_file", Decision::Deny),
+        ]);
+
+        for path in ["main.rs", "src/nested/main.rs", "/Users/x/a.rs"] {
+            let request = ApprovalRequest {
+                id: "write".to_string(),
+                action: ActionKind::Write,
+                description: format!("write {path}"),
+                tool: Some("write_file".to_string()),
+                target: Some(path.to_string()),
+                preview: None,
+            };
+
+            let resolution = policy.resolve_for_tool(&request, "write_file", Some(path));
+
+            assert_eq!(resolution.decision, ApprovalDecision::Deny, "{path}");
+        }
     }
 }

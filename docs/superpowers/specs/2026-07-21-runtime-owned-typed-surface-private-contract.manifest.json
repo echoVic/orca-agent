@@ -10461,7 +10461,7 @@
   },
   "artifact_bundle": {
     "private_contract_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-    "private_contract_sha256": "fa60f3275f381e6960ab94ddf167efd9f7dacb1acfe1c9a657d4d521a4c07bd6",
+    "private_contract_sha256": "d1e4073cf4adff17ee6d55df879cf783f9e9a2344a801180556df8c520c4adf5",
     "parent_design_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md",
     "parent_design_commit": "89979d6062246ec4a9b98032ee62cc6d45c1e3ba",
     "parent_design_blob": "bf80af4ce1fde3607af3fd75874abddfaf79b450",

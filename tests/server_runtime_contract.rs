@@ -959,8 +959,8 @@ fn server_thread_runtime_resume_and_fork_apply_explicit_permission_override() {
         );
         assert_eq!(resumed.meta.approval_mode, Some(ApprovalMode::AutoEdit));
         assert_eq!(
-            resumed.meta.permission_rules.rules[0].pattern,
-            "cargo test *"
+            resumed.meta.permission_rules.rules[0].pattern.as_deref(),
+            Some("cargo test *")
         );
         assert_eq!(
             resumed.meta.permission_rules.rules[0].decision,
@@ -977,8 +977,8 @@ fn server_thread_runtime_resume_and_fork_apply_explicit_permission_override() {
         );
         assert_eq!(forked.meta.approval_mode, Some(ApprovalMode::AutoEdit));
         assert_eq!(
-            forked.meta.permission_rules.rules[0].pattern,
-            "cargo test *"
+            forked.meta.permission_rules.rules[0].pattern.as_deref(),
+            Some("cargo test *")
         );
         assert_eq!(
             forked.meta.permission_rules.rules[0].decision,
@@ -1027,8 +1027,8 @@ fn server_thread_runtime_turn_start_applies_persistent_permission_override() {
         assert_eq!(persisted.meta.approval_mode, Some(ApprovalMode::FullAuto));
         assert_eq!(persisted.meta.permission_rules.rules.len(), 1);
         assert_eq!(
-            persisted.meta.permission_rules.rules[0].pattern,
-            "cargo test *"
+            persisted.meta.permission_rules.rules[0].pattern.as_deref(),
+            Some("cargo test *")
         );
 
         let summaries = store
@@ -1117,6 +1117,53 @@ fn server_thread_runtime_turn_start_applies_incremental_permission_updates() {
                 PermissionRule::new("bash", "rm -rf *", Decision::Deny),
                 PermissionRule::new("bash", "cargo test *", Decision::Allow),
                 PermissionRule::new("write_file", "/workspace/**", Decision::Prompt),
+            ]
+        );
+    });
+}
+
+#[test]
+fn server_thread_runtime_keeps_rules_without_a_pattern_for_the_whole_tool() {
+    with_orca_home(|home| {
+        let mut runtime = start_server_runtime();
+        let mut config = test_run_config(home);
+        config.history_mode = HistoryMode::Record;
+        config.permission_rules = PermissionRules {
+            rules: vec![PermissionRule::whole_tool("write_file", Decision::Deny)],
+        };
+        let thread_id = runtime.start_thread(&config).expect("start thread");
+        let override_profile = PermissionProfileOverride {
+            active_permission_profile: None,
+            approval_mode: None,
+            runtime_workspace_roots: None,
+            permission_rules: None,
+            permission_updates: vec![PermissionUpdate::AddRules {
+                destination: "session".to_string(),
+                behavior: Decision::Prompt,
+                rules: vec![PermissionRuleValue::new("edit", None::<String>)],
+            }],
+        };
+
+        runtime
+            .run_turn_with_permissions(
+                &config,
+                &thread_id,
+                "mock_history_echo",
+                override_profile,
+                Vec::new(),
+            )
+            .expect("run turn with a rule for a whole tool");
+
+        // Neither rule comes back as the glob `*`, which in a path covers
+        // only one directory.
+        let persisted = SessionStore::new()
+            .load_session(&thread_id)
+            .expect("load session");
+        assert_eq!(
+            persisted.meta.permission_rules.rules,
+            vec![
+                PermissionRule::whole_tool("write_file", Decision::Deny),
+                PermissionRule::whole_tool("edit", Decision::Prompt),
             ]
         );
     });

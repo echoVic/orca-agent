@@ -252,8 +252,8 @@ fn session_store_thread_store_updates_permission_metadata_by_thread_id() {
         );
         assert_eq!(transcript.meta.approval_mode, Some(ApprovalMode::AutoEdit));
         assert_eq!(
-            transcript.meta.permission_rules.rules[0].pattern,
-            "cargo test *"
+            transcript.meta.permission_rules.rules[0].pattern.as_deref(),
+            Some("cargo test *")
         );
         assert_eq!(
             transcript.meta.permission_rules.rules[0].decision,

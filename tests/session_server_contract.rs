@@ -8439,14 +8439,17 @@ fn server_mode_turn_start_applies_package3_permission_updates() {
         let persisted = SessionStore::new()
             .load_session(&thread_id)
             .expect("load persisted thread");
-        assert_eq!(persisted.meta.permission_rules.rules[0].pattern, "rm -rf *");
         assert_eq!(
-            persisted.meta.permission_rules.rules[1].pattern,
-            "cargo test *"
+            persisted.meta.permission_rules.rules[0].pattern.as_deref(),
+            Some("rm -rf *")
         );
         assert_eq!(
-            persisted.meta.permission_rules.rules[2].pattern,
-            "/workspace/**"
+            persisted.meta.permission_rules.rules[1].pattern.as_deref(),
+            Some("cargo test *")
+        );
+        assert_eq!(
+            persisted.meta.permission_rules.rules[2].pattern.as_deref(),
+            Some("/workspace/**")
         );
         let active_profile = persisted
             .meta

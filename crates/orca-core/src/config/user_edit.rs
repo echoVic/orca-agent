@@ -169,9 +169,8 @@ pub fn add_user_allow_rule(tool: &str) -> io::Result<bool> {
 
 /// Add an allow rule for `tool` to the `[[permissions.rules]]` array of the
 /// config file under `dir`. The rule is written with no `pattern`, so it
-/// matches any target (`PermissionRule`'s default). Returns `false` without
-/// writing when an equivalent allow rule already exists: same `tool`,
-/// `decision = "allow"`, and `pattern` either absent or `"*"`.
+/// covers every call of the tool. Returns `false` without writing when an
+/// equivalent allow rule already exists (see `is_equivalent_allow_rule`).
 pub fn add_user_allow_rule_in(dir: &Path, tool: &str) -> io::Result<bool> {
     let path = user_config_path_in(dir);
     let mut appended = false;
@@ -193,16 +192,19 @@ pub fn add_user_allow_rule_in(dir: &Path, tool: &str) -> io::Result<bool> {
     Ok(appended)
 }
 
-/// Whether `table` is already an allow rule for `tool` with no specific
-/// pattern: the shape `add_user_allow_rule_in` writes, or a hand-written
-/// equivalent (`pattern = "*"`).
+/// Whether `table` is already an allow rule for every call of `tool`: the
+/// shape `add_user_allow_rule_in` writes, without a `pattern`, or, for an
+/// MCP tool or server, a hand-written `pattern = "*"`. An MCP call's target
+/// is its tool name, which has no `/`, so `*` covers it; for a tool whose
+/// target is a path, `*` stays within one directory and covers less.
 fn is_equivalent_allow_rule(table: &Table, tool: &str) -> bool {
+    let covers_every_call = match table.get("pattern") {
+        None => true,
+        Some(pattern) => tool.starts_with("mcp__") && pattern.as_str() == Some("*"),
+    };
     table.get("tool").and_then(Item::as_str) == Some(tool)
         && table.get("decision").and_then(Item::as_str) == Some("allow")
-        && matches!(
-            table.get("pattern").and_then(Item::as_str),
-            None | Some("*")
-        )
+        && covers_every_call
 }
 
 fn resolve_config_dir() -> io::Result<PathBuf> {
@@ -373,6 +375,26 @@ mod tests {
         )
         .unwrap();
         assert!(!add_user_allow_rule_in(dir.path(), "mcp__docs__search").unwrap());
+
+        // For a tool whose target is a path, `*` covers only one directory,
+        // so it is not the rule the caller asked for.
+        std::fs::write(
+            &path,
+            concat!(
+                "[[permissions.rules]]\n",
+                "tool = \"write_file\"\n",
+                "pattern = \"*\"\n",
+                "decision = \"allow\"\n",
+            ),
+        )
+        .unwrap();
+        assert!(add_user_allow_rule_in(dir.path(), "write_file").unwrap());
+        let document: DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        let rules = document["permissions"]["rules"]
+            .as_array_of_tables()
+            .unwrap();
+        assert_eq!(rules.len(), 2, "{document}");
+        assert!(rules.get(1).unwrap().get("pattern").is_none(), "{document}");
     }
 
     #[test]

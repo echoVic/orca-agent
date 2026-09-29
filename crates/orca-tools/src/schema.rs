@@ -326,6 +326,19 @@ mod tests {
     }
 
     #[test]
+    fn an_mcp_call_targets_its_own_tool_name() {
+        // Permission rules match an MCP call by this target, whatever the
+        // arguments hold.
+        assert_eq!(
+            tool_target(
+                &ToolName::Mcp("mcp__github__create_issue".to_string()),
+                &serde_json::json!({"title": "src/main.rs"}),
+            ),
+            Some("mcp__github__create_issue".to_string())
+        );
+    }
+
+    #[test]
     fn command_and_task_tools_extract_a_stable_target() {
         // Every task tool addresses work by task_id, so the audit target is the
         // task identity rather than a second session id.

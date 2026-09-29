@@ -1669,7 +1669,7 @@ mod tests {
                 );
                 let rules = permissions.permission_rules.expect("permission rules");
                 assert_eq!(rules.rules.len(), 1);
-                assert_eq!(rules.rules[0].pattern, "cargo test *");
+                assert_eq!(rules.rules[0].pattern.as_deref(), Some("cargo test *"));
             }
             other => panic!("expected submit, got {other:?}"),
         }
@@ -1999,7 +1999,7 @@ mod tests {
                 );
                 let rules = permissions.permission_rules.expect("permission rules");
                 assert_eq!(rules.rules.len(), 1);
-                assert_eq!(rules.rules[0].pattern, "cargo test *");
+                assert_eq!(rules.rules[0].pattern.as_deref(), Some("cargo test *"));
                 assert_eq!(
                     rules.rules[0].decision,
                     orca_core::approval_types::Decision::Prompt
