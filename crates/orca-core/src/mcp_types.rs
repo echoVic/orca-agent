@@ -269,6 +269,29 @@ impl McpToolDescriptor {
     }
 }
 
+/// The canonical form of an MCP server or tool name, which a tool's runtime
+/// name (`mcp__<server>__<tool>`) is built from: ASCII letters and digits,
+/// lowercased, with each run of other characters turned into one `_`, and
+/// no `_` at either end. `My-Server` becomes `my_server`, and
+/// `search.repos` becomes `search_repos`. A name without a letter or a digit
+/// has an empty canonical form.
+pub fn canonical_mcp_name(name: &str) -> String {
+    let mut canonical = String::new();
+    let mut last_was_underscore = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            canonical.push(character.to_ascii_lowercase());
+            last_was_underscore = false;
+        } else {
+            if !last_was_underscore {
+                canonical.push('_');
+            }
+            last_was_underscore = true;
+        }
+    }
+    canonical.trim_matches('_').to_string()
+}
+
 /// Extracts the server name from an MCP tool's runtime name, which the
 /// registry builds as `mcp__<server>__<tool>` (see
 /// `orca_mcp::client::connect_server`): the segment after `mcp__` and before
@@ -359,6 +382,18 @@ mod tests {
             serde_json::from_str(r#"{"name":"a","annotations":{"readOnlyHint":false}}"#)
                 .expect("descriptor with readOnlyHint false");
         assert!(!hint_false.is_read_only());
+    }
+
+    #[test]
+    fn canonical_mcp_names_are_lowercase_with_underscores() {
+        assert_eq!(canonical_mcp_name("GitHub Files"), "github_files");
+        assert_eq!(canonical_mcp_name("search.repos"), "search_repos");
+        assert_eq!(canonical_mcp_name("My-Server"), "my_server");
+        assert_eq!(canonical_mcp_name("my_server"), "my_server");
+        assert_eq!(canonical_mcp_name("a__b"), "a_b");
+        assert_eq!(canonical_mcp_name("-docs-"), "docs");
+        assert_eq!(canonical_mcp_name("_"), "");
+        assert_eq!(canonical_mcp_name("-"), "");
     }
 
     #[test]

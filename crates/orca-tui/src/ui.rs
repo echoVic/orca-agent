@@ -1127,9 +1127,9 @@ fn mcp_server_status_text(state: &AppState, server: &crate::types::McpPanelServe
 }
 
 /// The server's status in full, with the authorization url a login waits
-/// on, its tools (read-only ones marked) and prompts, and the tool filters
-/// its config entry sets. Before the server connects, its tools and prompts
-/// are not known yet.
+/// on, its tools, each with the name a permission rule gives it (read-only
+/// ones marked), its prompts, and the tool filters its config entry sets.
+/// Before the server connects, its tools and prompts are not known yet.
 fn mcp_server_details(
     state: &AppState,
     server: &crate::types::McpPanelServer,
@@ -1143,7 +1143,11 @@ fn mcp_server_details(
         .map(|tool| {
             (
                 tool.name.as_str(),
-                if tool.read_only { "read-only" } else { "" },
+                if tool.read_only {
+                    format!("{} · read-only", tool.rule_name)
+                } else {
+                    tool.rule_name.clone()
+                },
             )
         })
         .collect::<Vec<_>>();
@@ -1181,8 +1185,12 @@ fn mcp_server_details(
     .collect::<Vec<_>>();
     let label_width = tools
         .iter()
-        .chain(&prompts)
         .map(|(name, _)| UnicodeWidthStr::width(*name))
+        .chain(
+            prompts
+                .iter()
+                .map(|(name, _)| UnicodeWidthStr::width(*name)),
+        )
         .chain(filters.iter().map(|(label, _)| label.len()))
         .max()
         .unwrap_or(0)
@@ -1230,8 +1238,13 @@ fn mcp_server_details(
     } else if tools.is_empty() {
         lines.push(Line::from(Span::styled("No tools.", theme.muted_style())));
     } else {
-        lines.push(heading("Tools"));
-        lines.extend(tools.iter().map(|(name, mark)| row(name, mark)));
+        let mut tools_heading = heading("Tools");
+        tools_heading.spans.push(Span::styled(
+            " · permission rules use the names on the right",
+            theme.muted_style(),
+        ));
+        lines.push(tools_heading);
+        lines.extend(tools.iter().map(|(name, rule_name)| row(name, rule_name)));
     }
     if !prompts.is_empty() {
         lines.push(heading("Prompts"));
@@ -9246,6 +9259,10 @@ mod tests {
         crate::surface_projection::McpToolView {
             server: server.to_string(),
             name: name.to_string(),
+            rule_name: format!(
+                "mcp__{server}__{}",
+                orca_core::mcp_types::canonical_mcp_name(name)
+            ),
             read_only,
         }
     }
@@ -9611,6 +9628,7 @@ mod tests {
             tools: vec![
                 mcp_tool_view("github", "list_issues", true),
                 mcp_tool_view("github", "create_issue", false),
+                mcp_tool_view("github", "deleteRepo", false),
                 mcp_tool_view("docs", "search_docs", true),
             ],
             prompts: vec![McpPromptView {
@@ -9646,8 +9664,25 @@ mod tests {
                 .to_string()
         };
 
-        assert!(row("list_issues").contains("read-only"), "{frame}");
+        assert!(
+            row("list_issues").contains("mcp__github__list_issues · read-only"),
+            "{frame}"
+        );
+        assert!(
+            row("create_issue").contains("mcp__github__create_issue"),
+            "{frame}"
+        );
         assert!(!row("create_issue").contains("read-only"), "{frame}");
+        // A rule names a tool as Orca does, which is not always the server's
+        // own spelling.
+        assert!(
+            row("deleteRepo").contains("mcp__github__deleterepo"),
+            "{frame}"
+        );
+        assert!(
+            row("Tools").contains("permission rules use the names on the right"),
+            "{frame}"
+        );
         assert!(
             row("review_pr").contains("Review a pull request"),
             "{frame}"

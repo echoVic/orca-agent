@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table};
 
+use crate::approval_rules::canonical_rule_tool;
 use crate::config::file::USER_CONFIG_FILE;
 use crate::mcp_types::{McpServerConfig, McpTransportKind};
 
@@ -196,13 +197,17 @@ pub fn add_user_allow_rule_in(dir: &Path, tool: &str) -> io::Result<bool> {
 /// shape `add_user_allow_rule_in` writes, without a `pattern`, or, for an
 /// MCP tool or server, a hand-written `pattern = "*"`. An MCP call's target
 /// is its tool name, which has no `/`, so `*` covers it; for a tool whose
-/// target is a path, `*` stays within one directory and covers less.
+/// target is a path, `*` stays within one directory and covers less. MCP
+/// names are compared in canonical form, as rules match them.
 fn is_equivalent_allow_rule(table: &Table, tool: &str) -> bool {
     let covers_every_call = match table.get("pattern") {
         None => true,
         Some(pattern) => tool.starts_with("mcp__") && pattern.as_str() == Some("*"),
     };
-    table.get("tool").and_then(Item::as_str) == Some(tool)
+    table
+        .get("tool")
+        .and_then(Item::as_str)
+        .is_some_and(|written| canonical_rule_tool(written) == canonical_rule_tool(tool))
         && table.get("decision").and_then(Item::as_str) == Some("allow")
         && covers_every_call
 }
@@ -375,6 +380,18 @@ mod tests {
         )
         .unwrap();
         assert!(!add_user_allow_rule_in(dir.path(), "mcp__docs__search").unwrap());
+
+        // A server rule written with the config name is the same rule.
+        std::fs::write(
+            &path,
+            concat!(
+                "[[permissions.rules]]\n",
+                "tool = \"mcp__My-Docs__*\"\n",
+                "decision = \"allow\"\n",
+            ),
+        )
+        .unwrap();
+        assert!(!add_user_allow_rule_in(dir.path(), "mcp__my_docs__*").unwrap());
 
         // For a tool whose target is a path, `*` covers only one directory,
         // so it is not the rule the caller asked for.

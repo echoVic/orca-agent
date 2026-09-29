@@ -1,7 +1,9 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::approval_types::Decision;
-use crate::mcp_types::mcp_tool_server;
+use crate::mcp_types::{canonical_mcp_name, mcp_tool_server};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PermissionRule {
@@ -102,7 +104,7 @@ impl CompiledPermissionRule {
             GlobTarget::Path
         };
         Self {
-            tool: rule.tool,
+            tool: canonical_rule_tool(&rule.tool).into_owned(),
             pattern: rule
                 .pattern
                 .map(|pattern| CompiledGlob::new(pattern, target)),
@@ -120,15 +122,37 @@ impl CompiledPermissionRule {
                 .is_none_or(|pattern| pattern.matches(target.unwrap_or("")))
     }
 
-    /// A rule's `tool` matches a call's tool name either literally, or, for
-    /// a server-level rule (`mcp__<server>` or `mcp__<server>__*`), when the
-    /// call is for a tool on that server.
+    /// A rule's `tool`, in canonical form, matches a call's tool name either
+    /// literally, or, for a server-level rule (`mcp__<server>` or
+    /// `mcp__<server>__*`), when the call is for a tool on that server.
     fn matches_tool(&self, tool: &str) -> bool {
         if self.tool == tool {
             return true;
         }
         mcp_server_rule_name(&self.tool).is_some_and(|server| mcp_tool_server(tool) == Some(server))
     }
+}
+
+/// `tool`, a rule's tool name, with the server and tool segments of an
+/// `mcp__…` name in the canonical form Orca names MCP tools with (see
+/// [`canonical_mcp_name`]): `mcp__GitHub__deleteRepo` is
+/// `mcp__github__deleterepo`, and the server rules `mcp__My-Server` and
+/// `mcp__My-Server__*` are `mcp__my_server` and `mcp__my_server__*`. The
+/// server segment ends at the first `__`. Any other name is returned as it
+/// is.
+pub(crate) fn canonical_rule_tool(tool: &str) -> Cow<'_, str> {
+    let Some(rest) = tool.strip_prefix("mcp__") else {
+        return Cow::Borrowed(tool);
+    };
+    Cow::Owned(match rest.split_once("__") {
+        None => format!("mcp__{}", canonical_mcp_name(rest)),
+        Some((server, "*")) => format!("mcp__{}__*", canonical_mcp_name(server)),
+        Some((server, local)) => format!(
+            "mcp__{}__{}",
+            canonical_mcp_name(server),
+            canonical_mcp_name(local)
+        ),
+    })
 }
 
 /// Returns `Some(server)` when `rule_tool` names an entire MCP server,
@@ -568,6 +592,88 @@ decision = "allow"
                     "{rule_tool} should not match {tool}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn mcp_rule_tool_names_take_the_canonical_form() {
+        for (written, canonical) in [
+            ("mcp__GitHub__deleteRepo", "mcp__github__deleterepo"),
+            (
+                "mcp__My-Server__search.repos",
+                "mcp__my_server__search_repos",
+            ),
+            ("mcp__My-Server__*", "mcp__my_server__*"),
+            ("mcp__My-Server", "mcp__my_server"),
+            ("mcp__github__create_issue", "mcp__github__create_issue"),
+            ("bash", "bash"),
+            ("write_file", "write_file"),
+            ("Bash", "Bash"),
+        ] {
+            assert_eq!(canonical_rule_tool(written), canonical, "{written}");
+        }
+    }
+
+    /// How the runtime asks about a call to the MCP tool `tool`: its target
+    /// is the tool's own name.
+    fn mcp_decision(compiled: &CompiledPermissionRules, tool: &str) -> Option<Decision> {
+        compiled.matching_decision(tool, Some(tool))
+    }
+
+    #[test]
+    fn a_deny_rule_matches_an_mcp_tool_however_its_name_is_spelled() {
+        // Orca names the tools of server `My-Server` `mcp__my_server__…`,
+        // lowercased, with other characters turned into `_`.
+        let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+            rules: vec![
+                PermissionRule::whole_tool("mcp__My-Server__*", Decision::Allow),
+                PermissionRule::whole_tool("mcp__My-Server__deleteRepo", Decision::Deny),
+                PermissionRule::whole_tool("mcp__My-Server__drop-table", Decision::Deny),
+            ],
+        });
+
+        assert_eq!(
+            mcp_decision(&compiled, "mcp__my_server__deleterepo"),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            mcp_decision(&compiled, "mcp__my_server__drop_table"),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            mcp_decision(&compiled, "mcp__my_server__list_repos"),
+            Some(Decision::Allow)
+        );
+        assert_eq!(mcp_decision(&compiled, "mcp__other__deleterepo"), None);
+    }
+
+    #[test]
+    fn a_server_rule_written_with_the_config_name_matches_its_tools() {
+        for rule_tool in [
+            "mcp__GitHub",
+            "mcp__GitHub__*",
+            "mcp__My-Server",
+            "mcp__My-Server__*",
+        ] {
+            let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+                rules: vec![PermissionRule::whole_tool(rule_tool, Decision::Allow)],
+            });
+            let tool = if rule_tool.contains("GitHub") {
+                "mcp__github__create_issue"
+            } else {
+                "mcp__my_server__create_issue"
+            };
+
+            assert_eq!(
+                mcp_decision(&compiled, tool),
+                Some(Decision::Allow),
+                "{rule_tool} should match {tool}"
+            );
+            assert_eq!(
+                mcp_decision(&compiled, "mcp__gitlab__create_issue"),
+                None,
+                "{rule_tool}"
+            );
         }
     }
 

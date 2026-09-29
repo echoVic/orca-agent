@@ -79,7 +79,12 @@ pub(crate) enum McpServerStatusView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct McpToolView {
     pub(crate) server: String,
+    /// The server's own name for the tool, which `enabled_tools` and
+    /// `disabled_tools` take.
     pub(crate) name: String,
+    /// The tool's name in Orca (`mcp__<server>__<tool>`, canonical), which
+    /// a permission rule names it by.
+    pub(crate) rule_name: String,
     pub(crate) read_only: bool,
 }
 
@@ -110,6 +115,7 @@ impl McpCatalogView {
                 .map(|tool| McpToolView {
                     server: tool.server.as_str().to_string(),
                     name: tool.name.as_str().to_string(),
+                    rule_name: tool.schema_name.as_str().to_string(),
                     read_only: tool.read_only,
                 })
                 .collect(),
@@ -2934,11 +2940,13 @@ mod tests {
                     McpToolView {
                         server: "docs".to_string(),
                         name: "search".to_string(),
+                        rule_name: "mcp__docs__search".to_string(),
                         read_only: true,
                     },
                     McpToolView {
                         server: "docs".to_string(),
                         name: "write_page".to_string(),
+                        rule_name: "mcp__docs__write_page".to_string(),
                         read_only: false,
                     },
                 ],

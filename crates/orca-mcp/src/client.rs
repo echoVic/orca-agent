@@ -14,7 +14,7 @@ use orca_core::mcp_types::{
     CallToolResult, GetPromptResult, McpContent, McpPrompt, McpPromptContent, McpResource,
     McpResourceTemplate, McpServerConfig, McpTool, McpToolRef, McpTransportKind, PromptsListResult,
     ReadResourceResult, ResourceTemplatesListResult, ResourcesListResult, ToolsListResult,
-    tool_is_enabled,
+    canonical_mcp_name, tool_is_enabled,
 };
 use orca_core::tool_images::tool_image;
 
@@ -187,7 +187,7 @@ pub(crate) fn initialize_registry_with_credentials(
     // disabled one.
     let mut owners: HashMap<String, usize> = HashMap::new();
     for (index, config) in configs.iter().enumerate() {
-        let server_name = sanitize_name(&config.name);
+        let server_name = canonical_mcp_name(&config.name);
         if server_name.is_empty() {
             continue;
         }
@@ -198,7 +198,7 @@ pub(crate) fn initialize_registry_with_credentials(
     }
     let mut taken = HashSet::new();
     for (index, config) in configs.iter().enumerate() {
-        let server_name = sanitize_name(&config.name);
+        let server_name = canonical_mcp_name(&config.name);
         if server_name.is_empty() {
             if !config.disabled {
                 inner
@@ -337,7 +337,7 @@ fn connect_server_with_transport(
         .into_iter()
         .filter(|tool| tool_is_enabled(config, &tool.name))
         .map(|tool| {
-            let tool_name = sanitize_name(&tool.name);
+            let tool_name = canonical_mcp_name(&tool.name);
             let read_only = tool.is_read_only();
             McpTool {
                 server: server_name.to_string(),
@@ -641,7 +641,7 @@ impl McpRegistry {
         prompt: &str,
         arguments: &BTreeMap<String, String>,
     ) -> Result<McpPromptExpansion, String> {
-        let server_name = sanitize_name(server);
+        let server_name = canonical_mcp_name(server);
         let client = {
             let inner = self.read();
             let entry = inner
@@ -695,7 +695,7 @@ impl McpRegistry {
     /// client or tools until it is reconnected, and its state says why.
     /// Other servers are left as they are.
     pub fn reconnect_server(&self, name: &str) -> Result<(), String> {
-        let server_name = sanitize_name(name);
+        let server_name = canonical_mcp_name(name);
         let (config, credentials_path) = {
             let inner = self.read();
             let server = inner
@@ -1484,26 +1484,10 @@ fn normalize_schema(schema: Value) -> Value {
     }
 }
 
-fn sanitize_name(name: &str) -> String {
-    let mut sanitized = String::new();
-    let mut last_was_underscore = false;
-    for ch in name.chars() {
-        let next = if ch.is_ascii_alphanumeric() { ch } else { '_' };
-        if next == '_' {
-            if !last_was_underscore {
-                sanitized.push(next);
-            }
-            last_was_underscore = true;
-        } else {
-            sanitized.push(next.to_ascii_lowercase());
-            last_was_underscore = false;
-        }
-    }
-    sanitized.trim_matches('_').to_string()
-}
-
+/// The name Orca gives the server configured as `name`, the one in its
+/// tools' names (see [`canonical_mcp_name`]).
 pub fn canonical_server_name(name: &str) -> String {
-    sanitize_name(name)
+    canonical_mcp_name(name)
 }
 
 #[cfg(test)]
@@ -1651,12 +1635,6 @@ done
 
         let names: Vec<String> = registry.tools().into_iter().map(|tool| tool.name).collect();
         assert_eq!(names, vec!["a", "c"]);
-    }
-
-    #[test]
-    fn sanitizes_mcp_schema_names() {
-        assert_eq!(sanitize_name("GitHub Files"), "github_files");
-        assert_eq!(sanitize_name("search.repos"), "search_repos");
     }
 
     #[test]
