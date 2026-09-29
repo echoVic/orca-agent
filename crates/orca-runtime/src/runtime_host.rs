@@ -5592,7 +5592,12 @@ async fn run_host_supervisor(
                         continue;
                     }
                     // A recovered context keeps the ceiling its ledger recorded.
-                    refresh_recovered_context_limit(&mut resident.coordinator, &actor_config);
+                    if let Err(error) =
+                        refresh_recovered_context_limit(&mut resident.coordinator, &actor_config)
+                    {
+                        let _ = reply.send(Err(error));
+                        continue;
+                    }
                 }
                 startup_warnings.extend(
                     crate::shell_readiness::ShellReadiness::run_startup_warnings(&actor_config),
@@ -10911,33 +10916,38 @@ fn surface_context_limit_event(
 
 /// Commits a recovered thread's ceiling refresh. Ledger failures are retried
 /// like other actor commits, since a partial append or failed checkpoint
-/// leaves the batch incomplete and blocks later commits. A final failure is
-/// only logged: a stale meter must not stop the thread starting.
-fn refresh_recovered_context_limit(
-    coordinator: &mut surface::RuntimeCommitCoordinator<
-        'static,
-        surface::RuntimeSurfaceCommitLedger,
-    >,
+/// leaves the batch incomplete and blocks later commits. A final failure that
+/// leaves the coordinator clean is only logged: a stale meter must not stop
+/// the thread starting. One that leaves the batch incomplete fails the start,
+/// since the thread could commit nothing after it.
+fn refresh_recovered_context_limit<L: surface::SurfaceCommitLedger>(
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, L>,
     config: &RunConfig,
-) {
+) -> Result<(), RuntimeHostError> {
     let Some(event) = surface_context_limit_event(coordinator.state().snapshot(), config) else {
-        return;
+        return Ok(());
     };
     let batch = runtime_surface_event_batch(coordinator.state().snapshot(), vec![event], None);
     for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
         match coordinator.commit_actor_batch(&batch) {
-            Ok(_) => return,
+            Ok(_) => return Ok(()),
             Err(surface::SurfaceCommitError::Ledger(
                 surface::SurfaceLedgerError::AppendFailed
                 | surface::SurfaceLedgerError::PartialAppend
                 | surface::SurfaceLedgerError::CheckpointFailed,
             )) if attempt + 1 < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS => {}
+            Err(error) if coordinator.has_incomplete_batch() => {
+                return Err(RuntimeHostError::ThreadStartFailed {
+                    message: format!("failed to refresh the context limit: {error:?}"),
+                });
+            }
             Err(error) => {
                 eprintln!("orca: failed to refresh the context limit: {error:?}");
-                return;
+                return Ok(());
             }
         }
     }
+    Ok(())
 }
 
 fn initial_surface_snapshot(
@@ -23548,6 +23558,105 @@ mod tests {
         assert_eq!(context.limit_tokens, 768_928);
         assert_eq!(context.used_tokens, 768_928);
         assert_eq!(context.revision.get(), snapshot.context.revision.get() + 1);
+    }
+
+    /// Fails the first appends and checkpoints it is told to, then commits in
+    /// memory.
+    struct FlakyContextLedger {
+        inner: surface::InMemorySurfaceCommitLedger,
+        append_failures: usize,
+        checkpoint_failures: usize,
+    }
+
+    impl surface::SurfaceCommitLedger for FlakyContextLedger {
+        fn append_complete_batch(
+            &mut self,
+            batch: &surface::SurfaceCommitBatch,
+        ) -> Result<surface::SurfaceBatchReceipt, surface::SurfaceLedgerError> {
+            if self.append_failures > 0 {
+                self.append_failures -= 1;
+                return Err(surface::SurfaceLedgerError::AppendFailed);
+            }
+            self.inner.append_complete_batch(batch)
+        }
+
+        fn checkpoint(
+            &mut self,
+            receipt: &surface::SurfaceBatchReceipt,
+        ) -> Result<(), surface::SurfaceLedgerError> {
+            if self.checkpoint_failures > 0 {
+                self.checkpoint_failures -= 1;
+                return Err(surface::SurfaceLedgerError::CheckpointFailed);
+            }
+            self.inner.checkpoint(receipt)
+        }
+
+        fn probe_commit(
+            &self,
+            commit_id: &surface::SurfaceCommitId,
+            digest: &surface::Sha256Digest,
+        ) -> surface::CommitProbe {
+            self.inner.probe_commit(commit_id, digest)
+        }
+    }
+
+    #[test]
+    fn ceiling_refresh_fails_the_start_only_when_it_leaves_a_batch_incomplete() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled);
+        let attempts = SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS;
+        // (append failures, checkpoint failures, ceiling after, start fails)
+        for (append_failures, checkpoint_failures, limit_tokens, fails) in [
+            // Retried, then committed.
+            (0, 1, 768_928, false),
+            // Never appended: a stale meter on a clean coordinator.
+            (attempts, 0, 1_000_000, false),
+            // Appended but never checkpointed: every later commit is refused.
+            (0, attempts, 1_000_000, true),
+        ] {
+            let raw_thread_id = uuid::Uuid::now_v7();
+            let thread_id =
+                surface::SurfaceThreadId::try_from_bytes(*raw_thread_id.as_bytes()).unwrap();
+            let owner_lease = surface::ExclusiveOwnerLease::acquire_process_local_thread(
+                thread_id.clone(),
+                &HostSurfaceClock::now(),
+            )
+            .unwrap();
+            let mut snapshot = initial_surface_snapshot(
+                thread_id,
+                surface::SurfaceIncarnation::try_from_bytes(*raw_thread_id.as_bytes()).unwrap(),
+                surface::ThreadOwnerEpoch::new(owner_lease.owner_epoch()),
+                surface::ThreadPersistence::EphemeralAttached,
+                &config,
+                "ceiling refresh",
+                None,
+            )
+            .unwrap();
+            // The ceiling a ledger from a full-window build recorded.
+            snapshot.context.limit_tokens = 1_000_000;
+            let ledger = FlakyContextLedger {
+                inner: surface::InMemorySurfaceCommitLedger::new(snapshot.cursor.clone()),
+                append_failures,
+                checkpoint_failures,
+            };
+            let mut coordinator = surface::RuntimeCommitCoordinator::new_with_owned_lease(
+                ledger,
+                surface::SurfaceReducerState::new(snapshot),
+                owner_lease,
+            )
+            .unwrap();
+
+            let refreshed = refresh_recovered_context_limit(&mut coordinator, &config);
+
+            let case = format!("{append_failures} append, {checkpoint_failures} checkpoint");
+            assert_eq!(refreshed.is_err(), fails, "{case}");
+            assert_eq!(coordinator.has_incomplete_batch(), fails, "{case}");
+            assert_eq!(
+                coordinator.state().snapshot().context.limit_tokens,
+                limit_tokens,
+                "{case}"
+            );
+        }
     }
 
     fn test_absolute_path(name: &str) -> PathBuf {
