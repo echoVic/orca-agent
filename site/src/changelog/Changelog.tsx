@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.5":
+        "Every request now reserves reply tokens by reasoning effort — 128K at Max, 64K at High, 32K at Low — instead of a fixed 384K, so the compaction line sits where it actually matters. Compaction works by conversational unit so a pinned message no longer freezes its whole turn, earlier tool outputs lose detail before the ones you are working with, and the active turn's recent outputs are always kept. Task and subagent completion notices are ordinary messages again and survive session resume. Emergency compaction now either shrinks the prompt or tells you to start a new session instead of silently failing. The context meter shows room left before compaction, not a fraction of the raw window, and it updates on resume and when you switch reasoning effort.",
       "v0.5.4":
         "In auto-edit and suggest, a git write such as git commit asks once and runs, instead of failing against the read-only .git. The grant covers that one command and keeps .git/config, hooks, and modules read-only; in suggest, approving the command also grants it. The model updates the plan as each step finishes, and the reminder for a stale plan fires again. Plan, goal, memory, and mode context now go at the end of each DeepSeek request, so changing them no longer makes the whole history a cache miss.",
       "v0.5.3":
@@ -684,6 +686,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.5":
+        "每次请求的回复预留改为按思考强度决定——Max 为 128K、High 为 64K、Low 为 32K，不再固定发 384K，压缩触发线因此落在了真正有意义的位置。压缩改为按对话单元操作，一条 pinned 消息不再冻结整轮内容；优先缩短较早的工具输出，当前轮次最近用到的内容始终保留。任务通知和子 agent 完成消息改为普通消息，会话恢复后模型上下文不再丢失。紧急压缩现在要么真正缩小提示词，要么明确提示开启新会话，而不是悄悄失败。上下文仪表改为显示距离自动压缩的余量，并在会话恢复和切换思考强度时同步刷新。",
       "v0.5.4":
         "在 auto-edit 和 suggest 模式下，git commit 这类写 git 的命令不再撞上只读的 .git 而失败，而是先询问一次再运行。授权只对这一条命令生效，.git/config、hooks 和 modules 仍然只读；suggest 模式下，批准命令本身即完成授权。模型每完成一步就更新计划，计划久未更新时的提醒重新生效。计划、goal、记忆和模式上下文改放在每次 DeepSeek 请求的末尾，修改它们不再让整段历史缓存失效。",
       "v0.5.3":

@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.4";
+export const releaseVersion = "v0.5.5";
 
 export const releases = [
+  {
+    version: "v0.5.5",
+    date: "2026-09-30",
+    title: "Context budget and compaction overhaul",
+    body: "Every request reserves reply tokens by reasoning effort instead of a fixed 384K, so the compaction line now sits where it should. Compaction works by unit so a pinned message never freezes its turn, task notices are ordinary messages again, and the model context survives session resume. Emergency compaction either shrinks the prompt or tells you to start a new session instead of silently failing. The context meter shows room left before compaction, not a fraction of the raw window.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.5",
+  },
   {
     version: "v0.5.4",
     date: "2026-09-29",
