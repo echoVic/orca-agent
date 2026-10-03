@@ -490,6 +490,13 @@ pub(crate) fn announce_runtime_ready(
             )));
         }
     }
+    // The MCP servers' warnings come once none is still connecting.
+    let mcp_warnings_tx = event_tx.clone();
+    thread.on_mcp_startup_warnings(move |warnings| {
+        for warning in warnings {
+            let _ = mcp_warnings_tx.send(TuiEvent::StartupWarning(warning));
+        }
+    });
 }
 
 pub(crate) fn read_hosted_projection_batch(

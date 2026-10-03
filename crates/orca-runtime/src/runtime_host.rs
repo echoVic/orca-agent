@@ -3406,6 +3406,40 @@ fn headless_interaction_capabilities() -> BTreeSet<surface::SurfaceInteractionKi
     ])
 }
 
+/// The warnings `registry` leaves once its servers' startup has ended: its
+/// errors, in its words. The error of a server that failed to start is
+/// prefixed with the server's name when it does not name it, as "MCP server
+/// closed stdout" does not; the error of one that needs a login names it in
+/// the `orca mcp login` it asks for.
+fn mcp_startup_warnings(registry: &McpRegistry) -> Vec<String> {
+    // Such a server's error is its failure message, and the registry lists
+    // the servers' errors in config order, so equal messages pair up in turn.
+    let mut unmatched = registry
+        .server_statuses()
+        .into_iter()
+        .filter_map(|server| match server.state {
+            orca_mcp::McpServerState::Failed { message } => Some((server.name, message)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    registry
+        .errors()
+        .into_iter()
+        .map(|error| {
+            let server = unmatched
+                .iter()
+                .position(|(_, message)| *message == error)
+                .map(|index| unmatched.remove(index).0);
+            match server {
+                Some(name) if !error.contains(&format!("'{name}'")) => {
+                    format!("MCP server '{name}': {error}")
+                }
+                _ => error,
+            }
+        })
+        .collect()
+}
+
 impl RuntimeThreadHandle {
     pub fn thread_id(&self) -> &str {
         &self.thread_id
@@ -3458,8 +3492,66 @@ impl RuntimeThreadHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = handlers;
     }
 
+    /// Warnings known when the thread started. Those of its MCP servers
+    /// come once their startup ends: [`Self::on_mcp_startup_warnings`].
     pub fn startup_warnings(&self) -> &[String] {
         self.startup_warnings.as_slice()
+    }
+
+    /// Calls `report` once none of the session's MCP servers is still making
+    /// its first connection, at once if none is, with the warnings their
+    /// startup leaves: the registry's errors, worded as the startup warnings
+    /// put them when the thread start waited for the servers, among them the
+    /// error of each server that failed to start or needs a login. The error
+    /// of a server that failed to start is prefixed with its name when it
+    /// does not name it.
+    /// `report` is called only once: a later change, such as a reconnect,
+    /// shows in the MCP catalog instead. The registry is held only weakly
+    /// meanwhile, so the wait keeps no server running.
+    pub fn on_mcp_startup_warnings(&self, report: impl FnOnce(Vec<String>) + Send + 'static) {
+        let report = Mutex::new(Some(report));
+        let subscription = Arc::new(Mutex::new(None::<orca_mcp::McpChangeSubscription>));
+        let report_once = {
+            let subscription = Arc::clone(&subscription);
+            Arc::new(move |registry: &McpRegistry| {
+                if registry.is_starting() {
+                    return;
+                }
+                let report = report
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                if let Some(report) = report {
+                    report(mcp_startup_warnings(registry));
+                }
+                // Startup is over, so the subscription ends, whichever call
+                // this is.
+                let ended = subscription
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                drop(ended);
+            })
+        };
+        let subscribed = self.mcp_registry.subscribe(report_once.clone());
+        *subscription
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(subscribed);
+        // Startup may have ended before the subscription began.
+        report_once(&self.mcp_registry);
+    }
+
+    /// Waits until none of the session's MCP servers is still making its
+    /// first connection, and returns the warnings their startup leaves, as
+    /// [`Self::on_mcp_startup_warnings`] reports them. Returns `None` as soon
+    /// as `should_cancel` says to stop waiting.
+    pub fn wait_for_mcp_startup_warnings(
+        &self,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Option<Vec<String>> {
+        self.mcp_registry
+            .wait_for_startup(should_cancel)
+            .then(|| mcp_startup_warnings(&self.mcp_registry))
     }
 
     pub fn task_registry(&self) -> TaskRegistry {
@@ -5576,7 +5668,6 @@ async fn run_host_supervisor(
                 }
                 let task_registry = thread.session().task_registry().clone();
                 let mcp_registry = thread.session().mcp_registry().clone();
-                let mut startup_warnings = thread.session().mcp_registry().errors();
                 if actors.contains_key(&thread_id) {
                     let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
                         message: format!("duplicate runtime thread id: {thread_id}"),
@@ -5635,10 +5726,11 @@ async fn run_host_supervisor(
                         continue;
                     }
                 }
-                startup_warnings.extend(
+                // The MCP servers' warnings come once their startup ends:
+                // `RuntimeThreadHandle::on_mcp_startup_warnings`.
+                let startup_warnings = Arc::new(
                     crate::shell_readiness::ShellReadiness::run_startup_warnings(&actor_config),
                 );
-                let startup_warnings = Arc::new(startup_warnings);
                 let handle = RuntimeThreadHandle {
                     thread_id: thread_id.clone(),
                     session_id,
@@ -41289,6 +41381,104 @@ done
             "{:?}",
             catalog.servers
         );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A stdio MCP server that reads the `initialize` request and exits
+    /// without answering it.
+    #[cfg(unix)]
+    fn exiting_mcp_server(
+        name: &str,
+        dir: &std::path::Path,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        let state = catalog_mcp_server_dir(name, dir);
+        fs::create_dir_all(&state).expect("MCP fixture directory");
+        let script = state.join("server.sh");
+        fs::write(&script, "#!/bin/sh\nread -r line\nexit 0\n").expect("write the MCP fixture");
+        orca_core::mcp_types::McpServerConfig {
+            name: name.to_string(),
+            command: Some("/bin/sh".to_string()),
+            args: vec![script.to_string_lossy().into_owned()],
+            startup_timeout_ms: Some(15_000),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_startup_warnings_come_once_startup_ends() {
+        use orca_mcp::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
+
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let remote = OAuthTestServer::start(OAuthTestBehavior::default());
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.mcp_servers = vec![
+            exiting_mcp_server("broken", cwd.path()),
+            orca_core::mcp_types::McpServerConfig {
+                name: "gone".to_string(),
+                command: Some(
+                    cwd.path()
+                        .join("missing-server")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..Default::default()
+            },
+            remote.config("remote"),
+            slow_mcp_server("slow", cwd.path(), Some(2)),
+        ];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp startup warnings")
+            .expect("start the thread");
+        let (report_tx, report_rx) = mpsc::channel();
+        thread.on_mcp_startup_warnings(move |warnings| {
+            let _ = report_tx.send(warnings);
+        });
+
+        // Nothing is said while a server is still connecting, and the thread
+        // start says nothing of the servers.
+        assert!(report_rx.recv_timeout(Duration::from_millis(500)).is_err());
+        assert!(thread.mcp_registry().is_starting());
+        assert!(
+            thread
+                .startup_warnings()
+                .iter()
+                .all(|warning| !warning.contains("MCP")),
+            "{:?}",
+            thread.startup_warnings()
+        );
+
+        let warnings = report_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("the warnings once startup ends");
+        assert!(
+            matches!(
+                warnings.as_slice(),
+                [broken, gone, remote]
+                    if broken == "MCP server 'broken': MCP server closed stdout"
+                        && gone.starts_with("failed to start MCP server 'gone': ")
+                        && remote
+                            == "MCP server requires login: run 'orca mcp login remote', or log in from /mcp"
+            ),
+            "{warnings:?}"
+        );
+        // Said once: the report is dropped, with its sender, once it has run
+        // on the thread that ended startup.
+        assert_eq!(
+            report_rx.recv_timeout(SURFACE_TEST_TIMEOUT),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+        // Asked after startup, the same warnings come at once.
+        let (late_tx, late_rx) = mpsc::channel();
+        thread.on_mcp_startup_warnings(move |warnings| {
+            let _ = late_tx.send(warnings);
+        });
+        assert_eq!(late_rx.try_recv(), Ok(warnings));
         host.shutdown().expect("shutdown runtime host");
     }
 }

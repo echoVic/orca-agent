@@ -1,7 +1,8 @@
 //! End-to-end coverage for `orca mcp` and MCP approvals, driven through the
 //! real `orca` binary: config round trips, a read-only tool running without
 //! approval in suggest mode, a write tool still asking, a permission rule
-//! lifting that ask, and a remote streamable HTTP server added by url.
+//! lifting that ask, a remote streamable HTTP server added by url, and a
+//! server that fails to start being reported.
 //!
 //! Every test gets its own `ORCA_HOME` and working directory. Every `orca`
 //! invocation is bounded by [`ORCA_TIMEOUT`]: these tests spawn real MCP
@@ -185,6 +186,27 @@ fn a_remote_http_server_added_by_url_works() {
         exec.stdout_text()
     );
     assert_eq!(events.last().unwrap()["payload"]["status"], "success");
+}
+
+#[test]
+fn orca_exec_reports_a_server_that_failed_to_start() {
+    let fixture = Fixture::new();
+    let server = write_exiting_mcp_server(fixture.workspace.path());
+    fixture.add_stdio_server("broken", &server);
+
+    let exec = fixture.run(&["exec", "--provider", "mock", "hello"]);
+
+    // The run goes on without the server, and says once why it is missing.
+    assert_eq!(exec.code(), Some(0), "stderr: {}", exec.stderr_text());
+    let stderr = exec.stderr_text();
+    let warnings = stderr
+        .lines()
+        .filter(|line| line.starts_with("orca: warning: ") && line.contains("'broken'"))
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(warnings.as_slice(), [warning] if warning.contains("MCP server closed stdout")),
+        "{stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +405,16 @@ done
 "#,
     )
     .expect("write fx MCP fixture");
+    make_executable(&server);
+    server
+}
+
+/// Writes a stdio MCP "server" that reads the `initialize` request and exits
+/// without answering it, so it fails to start the same way every time.
+fn write_exiting_mcp_server(dir: &Path) -> PathBuf {
+    let server = dir.join("exiting_mcp_server.sh");
+    std::fs::write(&server, "#!/bin/sh\nread -r line\nexit 0\n")
+        .expect("write the exiting MCP fixture");
     make_executable(&server);
     server
 }

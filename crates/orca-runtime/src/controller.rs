@@ -1590,6 +1590,14 @@ fn run_inner<W: io::Write>(
         for error in thread.startup_warnings() {
             eprintln!("orca: warning: {error}");
         }
+        // The MCP servers connect in the background: their warnings come
+        // once none is still connecting, before the turn, which would wait
+        // for them anyway.
+        let mcp_warnings =
+            thread.wait_for_mcp_startup_warnings(&|| interrupted_exit_code(&interrupted).is_some());
+        for error in mcp_warnings.unwrap_or_default() {
+            eprintln!("orca: warning: {error}");
+        }
     }
     if let Some(exit_code) = interrupted_exit_code(&interrupted) {
         // The signal arrived before the turn was admitted: stop here instead of

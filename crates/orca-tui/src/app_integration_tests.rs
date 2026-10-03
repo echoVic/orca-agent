@@ -1020,6 +1020,50 @@ fn test_task_surface() -> (
 }
 
 #[test]
+fn runtime_ready_warns_about_an_mcp_server_that_failed_to_start() {
+    with_orca_home(|home| {
+        let mut config = test_config(HistoryMode::Record);
+        config.cwd = Some(home.to_path_buf());
+        config.mcp_servers = vec![orca_core::mcp_types::McpServerConfig {
+            name: "gone".to_string(),
+            command: Some(home.join("missing-server").to_string_lossy().into_owned()),
+            ..Default::default()
+        }];
+        let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "runtime-ready MCP warning")
+            .expect("runtime thread");
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let control = crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test();
+
+        announce_runtime_ready(&thread, &event_tx, &control);
+
+        // The server fails in the background; the warning comes once it has.
+        let warnings = std::iter::from_fn(|| event_rx.recv_timeout(Duration::from_secs(10)).ok())
+            .filter_map(|event| match event {
+                TuiEvent::StartupWarning(warning) if warning.contains("MCP server") => {
+                    Some(warning)
+                }
+                _ => None,
+            })
+            .take(1)
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                warnings.as_slice(),
+                [warning] if warning.starts_with("failed to start MCP server 'gone': ")
+            ),
+            "{warnings:?}"
+        );
+
+        thread.shutdown().expect("runtime thread shutdown");
+        control.shutdown();
+        host.shutdown().expect("runtime host shutdown");
+    });
+}
+
+#[test]
 fn runtime_ready_emits_attachment_queue_settings_and_snapshot_projection() {
     with_orca_home(|home| {
         let mut config = test_config(HistoryMode::Record);
