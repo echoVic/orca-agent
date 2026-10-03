@@ -244,7 +244,7 @@ pub use projection::{
     SurfaceGoalVerification, SurfaceHealthClearProof, SurfaceHealthIssue, SurfaceHealthIssueId,
     SurfaceItem, SurfaceItemOrigin, SurfaceMcpCatalogDiagnostic, SurfaceMcpCatalogDiagnosticCode,
     SurfaceMcpCatalogEntryKind, SurfaceMcpCatalogSnapshot, SurfaceMcpPrompt,
-    SurfaceMcpPromptArgument, SurfaceMcpResource, SurfaceMcpResourceTemplate,
+    SurfaceMcpPromptArgument, SurfaceMcpResource, SurfaceMcpResourceTemplate, SurfaceMcpServer,
     SurfaceMcpServerStatus, SurfaceMcpTool, SurfaceOperationCompletionProof,
     SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfacePinnedContextSnapshot,
     SurfacePlanItem, SurfacePlanPriority, SurfacePlanSnapshot, SurfacePlanStatus,

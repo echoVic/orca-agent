@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use orca_core::mcp_types::{McpPrompt, McpTool};
-use orca_mcp::{McpRegistry, McpServerState};
+use orca_mcp::{McpRegistry, McpServerState, McpServerStatus};
 use serde_json::{Map, Value};
 
 use crate::agent_continuation::canonical_json_bytes;
@@ -13,8 +13,8 @@ use crate::runtime_surface::{
     DisplayText, FiniteF64, McpCatalogRevision, NonEmptyText, NonEmptyVec, Sha256Digest,
     SurfaceCatalogEntryId, SurfaceMcpCatalogDiagnostic, SurfaceMcpCatalogDiagnosticCode,
     SurfaceMcpCatalogEntryKind, SurfaceMcpCatalogSnapshot, SurfaceMcpPrompt,
-    SurfaceMcpPromptArgument, SurfaceMcpServerStatus, SurfaceMcpTool, SurfaceSchema,
-    SurfaceSchemaInteger, SurfaceSchemaProperty,
+    SurfaceMcpPromptArgument, SurfaceMcpServer, SurfaceMcpServerStatus, SurfaceMcpTool,
+    SurfaceSchema, SurfaceSchemaInteger, SurfaceSchemaProperty,
 };
 
 /// The catalog that follows `current`, or `None` while `registry` still
@@ -35,11 +35,7 @@ pub(crate) fn next_mcp_catalog(
 /// listed yet.
 fn mcp_catalog(registry: &McpRegistry, revision: McpCatalogRevision) -> SurfaceMcpCatalogSnapshot {
     catalog_of(
-        registry
-            .server_statuses()
-            .into_iter()
-            .map(|status| (status.name, status.state))
-            .collect(),
+        registry.server_statuses(),
         registry.tools(),
         registry.prompts(),
         revision,
@@ -47,7 +43,7 @@ fn mcp_catalog(registry: &McpRegistry, revision: McpCatalogRevision) -> SurfaceM
 }
 
 fn catalog_of(
-    states: Vec<(String, McpServerState)>,
+    statuses: Vec<McpServerStatus>,
     registry_tools: Vec<McpTool>,
     registry_prompts: Vec<McpPrompt>,
     revision: McpCatalogRevision,
@@ -96,12 +92,15 @@ fn catalog_of(
                 diagnostic_code_rank(right.code),
             ))
     });
-    let servers = states
+    let servers = statuses
         .into_iter()
-        .filter_map(|(name, state)| {
-            let status = match (surface_server_status(state), omitted.get(&name)) {
-                // A server some of whose tools cannot be shown is degraded.
-                (SurfaceMcpServerStatus::Ready, Some(&count)) => SurfaceMcpServerStatus::Degraded {
+        .filter_map(|server| {
+            let status = match (
+                surface_server_status(server.state),
+                omitted.get(&server.name),
+            ) {
+                // A server some of whose tools cannot be shown has failed.
+                (SurfaceMcpServerStatus::Ready, Some(&count)) => SurfaceMcpServerStatus::Failed {
                     message: DisplayText::new(if count == 1 {
                         "1 tool could not be listed".to_string()
                     } else {
@@ -110,7 +109,11 @@ fn catalog_of(
                 },
                 (status, _) => status,
             };
-            Some((NonEmptyText::try_new(name).ok()?, status))
+            Some(SurfaceMcpServer {
+                name: NonEmptyText::try_new(server.name).ok()?,
+                status,
+                prompts_error: server.prompts_error.map(DisplayText::new),
+            })
         })
         .collect();
     SurfaceMcpCatalogSnapshot {
@@ -131,10 +134,10 @@ fn surface_server_status(state: McpServerState) -> SurfaceMcpServerStatus {
     match state {
         McpServerState::Starting => SurfaceMcpServerStatus::Starting,
         McpServerState::Ready => SurfaceMcpServerStatus::Ready,
-        McpServerState::Failed { message } => SurfaceMcpServerStatus::Degraded {
+        McpServerState::Failed { message } => SurfaceMcpServerStatus::Failed {
             message: DisplayText::new(message),
         },
-        McpServerState::NeedsLogin => SurfaceMcpServerStatus::AuthRequired,
+        McpServerState::NeedsLogin => SurfaceMcpServerStatus::NeedsLogin,
         McpServerState::Disabled => SurfaceMcpServerStatus::Disabled,
     }
 }
@@ -487,6 +490,25 @@ mod tests {
         NonEmptyText::try_new(value).unwrap()
     }
 
+    /// A connected server whose prompts were listed.
+    fn ready(name: &str) -> McpServerStatus {
+        McpServerStatus {
+            name: name.to_string(),
+            state: McpServerState::Ready,
+            prompts_error: None,
+        }
+    }
+
+    /// `name` as the catalog lists it with `status`, and no prompt-list
+    /// error.
+    fn listed(name: &str, status: SurfaceMcpServerStatus) -> SurfaceMcpServer {
+        SurfaceMcpServer {
+            name: text(name),
+            status,
+            prompts_error: None,
+        }
+    }
+
     #[test]
     fn a_level_the_closed_form_cannot_carry_is_unsupported_and_the_rest_keeps_its_shape() {
         let schema = serde_json::json!({
@@ -631,10 +653,7 @@ mod tests {
             read_only: false,
         };
         let catalog = catalog_of(
-            vec![
-                ("docs".to_string(), McpServerState::Ready),
-                ("other".to_string(), McpServerState::Ready),
-            ],
+            vec![ready("docs"), ready("other")],
             vec![tool("lookup"), tool(" ")],
             Vec::new(),
             McpCatalogRevision::try_new(2).unwrap(),
@@ -643,13 +662,13 @@ mod tests {
         assert_eq!(
             catalog.servers,
             [
-                (
-                    text("docs"),
-                    SurfaceMcpServerStatus::Degraded {
+                listed(
+                    "docs",
+                    SurfaceMcpServerStatus::Failed {
                         message: DisplayText::new("1 tool could not be listed"),
                     }
                 ),
-                (text("other"), SurfaceMcpServerStatus::Ready),
+                listed("other", SurfaceMcpServerStatus::Ready),
             ]
         );
         assert_eq!(
@@ -675,9 +694,66 @@ mod tests {
     }
 
     #[test]
+    fn catalog_reports_starting_failed_and_needs_login() {
+        let status = |name: &str, state, prompts_error: Option<&str>| McpServerStatus {
+            name: name.to_string(),
+            state,
+            prompts_error: prompts_error.map(str::to_string),
+        };
+        let catalog = catalog_of(
+            vec![
+                status("slow", McpServerState::Starting, None),
+                status(
+                    "docs",
+                    McpServerState::Ready,
+                    Some("MCP request 'prompts/list' failed: boom"),
+                ),
+                status(
+                    "broken",
+                    McpServerState::Failed {
+                        message: "connection refused".to_string(),
+                    },
+                    None,
+                ),
+                status("linear", McpServerState::NeedsLogin, None),
+                status("archive", McpServerState::Disabled, None),
+            ],
+            Vec::new(),
+            Vec::new(),
+            McpCatalogRevision::try_new(2).unwrap(),
+        );
+
+        let server = |name: &str, status, prompts_error: Option<&str>| SurfaceMcpServer {
+            name: text(name),
+            status,
+            prompts_error: prompts_error.map(DisplayText::new),
+        };
+        assert_eq!(
+            catalog.servers,
+            [
+                server("slow", SurfaceMcpServerStatus::Starting, None),
+                server(
+                    "docs",
+                    SurfaceMcpServerStatus::Ready,
+                    Some("MCP request 'prompts/list' failed: boom"),
+                ),
+                server(
+                    "broken",
+                    SurfaceMcpServerStatus::Failed {
+                        message: DisplayText::new("connection refused"),
+                    },
+                    None,
+                ),
+                server("linear", SurfaceMcpServerStatus::NeedsLogin, None),
+                server("archive", SurfaceMcpServerStatus::Disabled, None),
+            ]
+        );
+    }
+
+    #[test]
     fn prompts_are_listed_with_their_arguments() {
         let catalog = catalog_of(
-            vec![("docs".to_string(), McpServerState::Ready)],
+            vec![ready("docs")],
             Vec::new(),
             vec![
                 McpPrompt {
@@ -737,37 +813,35 @@ mod tests {
         );
         assert_eq!(
             catalog.servers,
-            [(text("docs"), SurfaceMcpServerStatus::Ready)]
+            [listed("docs", SurfaceMcpServerStatus::Ready)]
         );
     }
 
     #[test]
-    fn an_old_catalog_without_prompts_still_deserializes() {
+    fn a_catalog_without_prompts_leaves_them_off_the_wire() {
         let catalog = SurfaceMcpCatalogSnapshot {
             revision: McpCatalogRevision::try_new(3).unwrap(),
-            servers: vec![(text("docs"), SurfaceMcpServerStatus::Ready)],
+            servers: vec![listed("docs", SurfaceMcpServerStatus::Ready)],
             tools: Vec::new(),
             prompts: Vec::new(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
             diagnostics: Vec::new(),
         };
-        // As an Orca that knew nothing of prompts wrote it.
-        let old = serde_json::json!({
+        let without_prompts = serde_json::json!({
             "revision": 3,
-            "servers": [["docs", "Ready"]],
+            "servers": [{"name": "docs", "status": "Ready", "prompts_error": null}],
             "tools": [],
             "resources": [],
             "resource_templates": [],
             "diagnostics": []
         });
 
+        assert_eq!(serde_json::to_value(&catalog).unwrap(), without_prompts);
         assert_eq!(
-            serde_json::from_value::<SurfaceMcpCatalogSnapshot>(old.clone()).unwrap(),
+            serde_json::from_value::<SurfaceMcpCatalogSnapshot>(without_prompts).unwrap(),
             catalog
         );
-        // A catalog without prompts is written as before.
-        assert_eq!(serde_json::to_value(&catalog).unwrap(), old);
         let with_prompts = SurfaceMcpCatalogSnapshot {
             prompts: vec![SurfaceMcpPrompt {
                 server: text("docs"),

@@ -2495,14 +2495,13 @@ impl RuntimeThreadStartRequest {
 
     fn start(self) -> io::Result<RuntimeThread> {
         let inherited_conversation = self.inherited_conversation;
+        // The servers connect in the background. A turn waits, before its
+        // first model request, only for those still connecting.
         let mcp_registry = self.mcp_registry.unwrap_or_else(|| {
-            let mcp_registry = orca_mcp::initialize_registry(
+            orca_mcp::initialize_registry(
                 &self.config.mcp_servers,
                 self.config.mcp_credentials_path.clone(),
-            );
-            // The thread starts once each server has connected or failed.
-            mcp_registry.wait_for_startup(&|| false);
-            mcp_registry
+            )
         });
         let mut thread = RuntimeThread::start_with_prepared_history_and_runtime_id(
             &self.config,
@@ -5589,6 +5588,13 @@ async fn run_host_supervisor(
                     crate::prompt_queue::PromptQueueSnapshot::default(),
                 );
                 let (capability_change_tx, capability_change_rx) = tokio_mpsc::channel(1);
+                // Each change to the session's MCP servers wakes the actor,
+                // which publishes the catalog as the registry then stands, so
+                // one pending wake covers any number of changes.
+                let (mcp_change_tx, mcp_change_rx) = tokio_mpsc::channel(1);
+                let mcp_subscription = mcp_registry.subscribe(Arc::new(move |_: &McpRegistry| {
+                    let _ = mcp_change_tx.try_send(());
+                }));
                 let (surface_handle, resident_surface) = if let Some(surface_owner) = surface_owner
                 {
                     match bootstrap_runtime_surface(
@@ -5682,6 +5688,8 @@ async fn run_host_supervisor(
                 };
                 let join = tokio::spawn(async move {
                     let _actor_exit = actor_exit;
+                    // The actor hears of MCP changes until it ends.
+                    let _mcp_subscription = mcp_subscription;
                     ThreadActor::new(
                         thread,
                         actor_config,
@@ -5693,7 +5701,7 @@ async fn run_host_supervisor(
                         #[cfg(test)]
                         ephemeral_close_commit_failures,
                     )
-                    .run(actor_rx, capability_change_rx)
+                    .run(actor_rx, capability_change_rx, mcp_change_rx)
                     .await;
                 });
                 actors.insert(
@@ -17456,11 +17464,13 @@ impl ThreadActor {
         mut self,
         mut command_rx: tokio_mpsc::Receiver<ThreadCommand>,
         mut capability_change_rx: tokio_mpsc::Receiver<()>,
+        mut mcp_change_rx: tokio_mpsc::Receiver<()>,
     ) {
         let mut subscription_seal_reason = surface::SurfaceSubscriptionSealReason::ThreadClosed;
         let mut subagent_relay_poll = subagent_relay_poll_interval();
-        // The surface is live: show the MCP servers the session connected.
-        // Should the commit fail, the next reconnect publishes the catalog.
+        // The surface is live: show the session's MCP servers, connected or
+        // still connecting. Should the commit fail, the next change to them
+        // publishes the catalog.
         let _ = self.publish_mcp_catalog();
         loop {
             if self.active.is_none() {
@@ -17522,6 +17532,16 @@ impl ThreadActor {
                             && self.operation_recovery.pending_manual_compaction.is_none()
                         {
                             self.reconcile_surface_interaction_capabilities(None);
+                        }
+                    }
+                    wake = mcp_change_rx.recv(), if !mcp_change_rx.is_closed() => {
+                        // Nothing may commit before a manual compaction's
+                        // pending batch; the end of its operation publishes
+                        // the catalog instead.
+                        if wake.is_some()
+                            && self.operation_recovery.pending_manual_compaction.is_none()
+                        {
+                            let _ = self.publish_mcp_catalog();
                         }
                     }
                     completion = self.goal_controller.completion_receiver().recv(), if goal_blocking_in_flight => {
@@ -17798,6 +17818,16 @@ impl ThreadActor {
                         && active.surface_manual_compaction_prepared.is_none()
                     {
                         self.reconcile_surface_interaction_capabilities(Some(&mut active));
+                    }
+                    self.active = Some(active);
+                }
+                wake = mcp_change_rx.recv(), if !mcp_change_rx.is_closed() => {
+                    // Nothing may commit before the batch a manual compaction
+                    // prepared; the operation's end publishes the catalog.
+                    if wake.is_some()
+                        && active.surface_manual_compaction_prepared.is_none()
+                    {
+                        let _ = self.publish_mcp_catalog();
                     }
                     self.active = Some(active);
                 }
@@ -21341,8 +21371,9 @@ impl ThreadActor {
         if result.is_err() {
             self.goal_controller.clear_active(operation_id);
         } else {
-            // A tool call may have found that an MCP server needs a login
-            // again. Nothing is committed while the catalog still matches.
+            // Publishes an MCP change whose wake came while a manual
+            // compaction kept the catalog from being committed. Nothing is
+            // committed while the catalog still matches.
             let _ = self.publish_mcp_catalog();
         }
         result
@@ -40382,13 +40413,38 @@ done
         surface::NonEmptyText::try_new(value).expect("non-empty surface text")
     }
 
+    /// `name` as the catalog lists it with `status`, and no prompt-list
+    /// error.
+    #[cfg(unix)]
+    fn catalog_server(
+        name: &str,
+        status: surface::SurfaceMcpServerStatus,
+    ) -> surface::SurfaceMcpServer {
+        surface::SurfaceMcpServer {
+            name: surface_text(name),
+            status,
+            prompts_error: None,
+        }
+    }
+
     /// The MCP catalog of a fresh attachment, once `ready` accepts it.
     #[cfg(unix)]
     fn wait_for_mcp_catalog(
         surface: &surface::RuntimeSurfaceHandle,
         ready: impl Fn(&surface::SurfaceMcpCatalogSnapshot) -> bool,
     ) -> surface::SurfaceMcpCatalogSnapshot {
-        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        wait_for_mcp_catalog_within(surface, SURFACE_TEST_TIMEOUT, ready)
+    }
+
+    /// The MCP catalog of a fresh attachment, once `ready` accepts it, which
+    /// must happen within `timeout`.
+    #[cfg(unix)]
+    fn wait_for_mcp_catalog_within(
+        surface: &surface::RuntimeSurfaceHandle,
+        timeout: Duration,
+        ready: impl Fn(&surface::SurfaceMcpCatalogSnapshot) -> bool,
+    ) -> surface::SurfaceMcpCatalogSnapshot {
+        let deadline = Instant::now() + timeout;
         loop {
             let catalog = fresh_surface_attachment_with_capabilities(
                 surface,
@@ -40407,6 +40463,21 @@ done
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The MCP catalog of a fresh attachment, once no server in it is still
+    /// making its first connection.
+    #[cfg(unix)]
+    fn wait_for_mcp_startup(
+        surface: &surface::RuntimeSurfaceHandle,
+    ) -> surface::SurfaceMcpCatalogSnapshot {
+        wait_for_mcp_catalog(surface, |catalog| {
+            !catalog.servers.is_empty()
+                && catalog
+                    .servers
+                    .iter()
+                    .all(|server| server.status != surface::SurfaceMcpServerStatus::Starting)
+        })
     }
 
     #[cfg(unix)]
@@ -40458,7 +40529,7 @@ done
             .start_thread(config, "mcp catalog")
             .expect("start the thread");
 
-        let catalog = wait_for_mcp_catalog(&thread.surface(), |catalog| catalog.revision.get() > 1);
+        let catalog = wait_for_mcp_startup(&thread.surface());
 
         let broken = thread
             .mcp_registry()
@@ -40469,21 +40540,15 @@ done
         assert_eq!(
             catalog.servers,
             [
-                (surface_text("docs"), surface::SurfaceMcpServerStatus::Ready),
-                (
-                    surface_text("remote"),
-                    surface::SurfaceMcpServerStatus::AuthRequired
-                ),
-                (
-                    surface_text("broken"),
-                    surface::SurfaceMcpServerStatus::Degraded {
+                catalog_server("docs", surface::SurfaceMcpServerStatus::Ready),
+                catalog_server("remote", surface::SurfaceMcpServerStatus::NeedsLogin),
+                catalog_server(
+                    "broken",
+                    surface::SurfaceMcpServerStatus::Failed {
                         message: surface::DisplayText::new(broken),
                     }
                 ),
-                (
-                    surface_text("off"),
-                    surface::SurfaceMcpServerStatus::Disabled
-                ),
+                catalog_server("off", surface::SurfaceMcpServerStatus::Disabled),
             ]
         );
         assert_eq!(
@@ -40593,7 +40658,11 @@ done
             .expect("start the thread");
         let surface = thread.surface();
         wait_for_mcp_catalog(&surface, |catalog| {
-            catalog.servers == [(surface_text("docs"), surface::SurfaceMcpServerStatus::Ready)]
+            catalog.servers
+                == [catalog_server(
+                    "docs",
+                    surface::SurfaceMcpServerStatus::Ready,
+                )]
         });
 
         // The login is revoked, so the model's call to the tool fails.
@@ -40603,9 +40672,9 @@ done
 
         let catalog = wait_for_mcp_catalog(&surface, |catalog| {
             catalog.servers
-                == [(
-                    surface_text("docs"),
-                    surface::SurfaceMcpServerStatus::AuthRequired,
+                == [catalog_server(
+                    "docs",
+                    surface::SurfaceMcpServerStatus::NeedsLogin,
                 )]
         });
         assert_eq!(catalog_tool_names(&catalog), ["mcp__docs__echo"]);
@@ -40669,7 +40738,10 @@ done
         assert_eq!(catalog_tool_names(&catalog), ["mcp__docs__after"]);
         assert_eq!(
             catalog.servers,
-            [(surface_text("docs"), surface::SurfaceMcpServerStatus::Ready)]
+            [catalog_server(
+                "docs",
+                surface::SurfaceMcpServerStatus::Ready
+            )]
         );
 
         // A name no server has changes nothing.
@@ -40683,7 +40755,7 @@ done
             .expect("reconnect an unknown server");
         assert_eq!(
             unknown,
-            surface::SurfaceMcpServerStatus::Degraded {
+            surface::SurfaceMcpServerStatus::Failed {
                 message: surface::DisplayText::new("no MCP server named 'nope'"),
             }
         );
@@ -40708,6 +40780,7 @@ done
             .handle()
             .start_thread(config.clone(), "mcp next request")
             .expect("start the thread");
+        wait_for_mcp_startup(&thread.surface());
         // What each turn builds its provider request from.
         let registry = thread.mcp_registry();
         let requested_mcp_tools = || {
@@ -40831,7 +40904,7 @@ done
             .start_thread(config, "mcp prompts")
             .expect("start the thread");
 
-        let catalog = wait_for_mcp_catalog(&thread.surface(), |catalog| catalog.revision.get() > 1);
+        let catalog = wait_for_mcp_startup(&thread.surface());
 
         assert_eq!(
             catalog.prompts,
@@ -40856,11 +40929,8 @@ done
         assert_eq!(
             catalog.servers,
             [
-                (surface_text("docs"), surface::SurfaceMcpServerStatus::Ready),
-                (
-                    surface_text("lookup"),
-                    surface::SurfaceMcpServerStatus::Ready
-                ),
+                catalog_server("docs", surface::SurfaceMcpServerStatus::Ready),
+                catalog_server("lookup", surface::SurfaceMcpServerStatus::Ready),
             ]
         );
         assert_eq!(catalog_tool_names(&catalog), ["mcp__lookup__find"]);
@@ -40892,6 +40962,7 @@ done
             .start_thread(config, "mcp prompt expansion")
             .expect("start the thread");
         let surface = thread.surface();
+        wait_for_mcp_startup(&surface);
         // Expanding a prompt takes the same right as reading a transcript.
         let reader = fresh_surface_attachment_with_capabilities(
             &surface,
@@ -40955,6 +41026,268 @@ done
                 Vec::new(),
             ),
             Err(surface::SurfaceClientCommandError::Unauthorized)
+        );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// What the tool of [`slow_mcp_server`] answers.
+    #[cfg(unix)]
+    const SLOW_MCP_TOOL_OUTPUT: &str = "the slow server answered";
+
+    /// A stdio MCP server that answers `initialize` only after
+    /// `initialize_delay_secs`, or never when that is `None`, and offers one
+    /// tool, `wait`, which answers [`SLOW_MCP_TOOL_OUTPUT`].
+    #[cfg(unix)]
+    fn slow_mcp_server(
+        name: &str,
+        dir: &std::path::Path,
+        initialize_delay_secs: Option<u64>,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        let state = catalog_mcp_server_dir(name, dir);
+        fs::create_dir_all(&state).expect("MCP fixture directory");
+        let script = state.join("server.sh");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+delay="$1"
+while IFS= read -r line; do
+  id=${{line#*'"id":'}}
+  id=${{id%%,*}}
+  case "$line" in
+    *'"method":"initialize"'*)
+      if [ "$delay" != never ]; then
+        sleep "$delay"
+        printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"slow","version":"1"}}}}}}\n' "$id"
+      fi
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{{"name":"wait","inputSchema":{{"type":"object"}}}}]}}}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"{SLOW_MCP_TOOL_OUTPUT}"}}]}}}}\n' "$id"
+      ;;
+  esac
+done
+"#
+            ),
+        )
+        .expect("write the MCP fixture");
+        orca_core::mcp_types::McpServerConfig {
+            name: name.to_string(),
+            command: Some("/bin/sh".to_string()),
+            args: vec![
+                script.to_string_lossy().into_owned(),
+                initialize_delay_secs
+                    .map_or_else(|| "never".to_string(), |delay| delay.to_string()),
+            ],
+            startup_timeout_ms: Some(15_000),
+            tool_timeout_ms: Some(15_000),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn thread_start_does_not_wait_for_servers() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.mcp_servers = vec![slow_mcp_server("slow", cwd.path(), Some(2))];
+        let host = RuntimeHost::start().expect("start runtime host");
+
+        let started = Instant::now();
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp start")
+            .expect("start the thread");
+
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(1),
+            "the thread start took {took:?}"
+        );
+        assert!(
+            thread.mcp_registry().is_starting(),
+            "the server is still connecting"
+        );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_catalog_updates_when_a_server_finishes_connecting() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.mcp_servers = vec![slow_mcp_server("slow", cwd.path(), Some(2))];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp catalog updates")
+            .expect("start the thread");
+        let surface = thread.surface();
+
+        // Nothing is asked of the thread: the catalog follows the server.
+        wait_for_mcp_catalog(&surface, |catalog| {
+            catalog.servers
+                == [catalog_server(
+                    "slow",
+                    surface::SurfaceMcpServerStatus::Starting,
+                )]
+        });
+        let catalog = wait_for_mcp_catalog_within(&surface, Duration::from_secs(3), |catalog| {
+            catalog.servers
+                == [catalog_server(
+                    "slow",
+                    surface::SurfaceMcpServerStatus::Ready,
+                )]
+        });
+
+        assert_eq!(catalog_tool_names(&catalog), ["mcp__slow__wait"]);
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_first_request_sees_a_slow_servers_tools() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.mcp_servers = vec![slow_mcp_server("slow", cwd.path(), Some(1))];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp first request")
+            .expect("start the thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+
+        // The model calls the server's tool in its first reply, while the
+        // server is still connecting.
+        run_surface_turn_to_success(&surface, &attachment, "mcp__slow__wait");
+
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let results = snapshot
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                surface::SurfaceItem::ToolResultMessage {
+                    content, terminal, ..
+                } => Some((terminal.kind, content.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                results.as_slice(),
+                [(surface::SurfaceToolResultKind::Success, content)]
+                    if content.contains(SLOW_MCP_TOOL_OUTPUT)
+            ),
+            "{results:?}"
+        );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_a_turn_while_servers_connect_stops_waiting() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.mcp_servers = vec![slow_mcp_server("slow", cwd.path(), Some(5))];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp cancel while connecting")
+            .expect("start the thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let (operation_id, _) = admit_surface_turn(&surface, &attachment, "hello");
+        std::thread::sleep(Duration::from_millis(300));
+
+        let cancelled_at = Instant::now();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .cancel_operation(surface_request_id(), operation_id.clone())
+                .expect("cancel the turn"),
+        );
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait for the turn");
+
+        let took = cancelled_at.elapsed();
+        let surface::WaitOperationTerminalResult::Terminal { value } = terminal else {
+            panic!("the turn has no terminal");
+        };
+        assert!(
+            matches!(value.terminal, surface::OperationTerminal::Cancelled { .. }),
+            "the turn ended as {:?}",
+            value.terminal
+        );
+        assert!(
+            took < Duration::from_secs(1),
+            "the turn took {took:?} to stop"
+        );
+        assert!(
+            thread.mcp_registry().is_starting(),
+            "the server is still connecting"
+        );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_server_fails_after_its_startup_timeout_and_the_turn_goes_on() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        let mut hung = slow_mcp_server("hung", cwd.path(), None);
+        hung.startup_timeout_ms = Some(300);
+        config.mcp_servers = vec![hung];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp hung server")
+            .expect("start the thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+
+        let started = Instant::now();
+        run_surface_turn_to_success(&surface, &attachment, "hello");
+
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(2), "the turn took {took:?}");
+        let catalog = wait_for_mcp_startup(&surface);
+        assert!(
+            matches!(
+                catalog.servers.as_slice(),
+                [surface::SurfaceMcpServer {
+                    name,
+                    status: surface::SurfaceMcpServerStatus::Failed { message },
+                    ..
+                }] if name.as_str() == "hung" && message.as_str().contains("timed out")
+            ),
+            "{:?}",
+            catalog.servers
         );
         host.shutdown().expect("shutdown runtime host");
     }

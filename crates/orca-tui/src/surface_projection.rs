@@ -104,9 +104,9 @@ impl McpCatalogView {
             servers: catalog
                 .servers
                 .iter()
-                .map(|(name, status)| McpServerView {
-                    name: name.as_str().to_string(),
-                    status: McpServerStatusView::from_surface(status),
+                .map(|server| McpServerView {
+                    name: server.name.as_str().to_string(),
+                    status: McpServerStatusView::from_surface(&server.status),
                 })
                 .collect(),
             tools: catalog
@@ -159,15 +159,13 @@ impl McpCatalogView {
 }
 
 impl McpServerStatusView {
-    /// A stopped server serves no tools, so it reads as a failure.
     pub(crate) fn from_surface(status: &SurfaceMcpServerStatus) -> Self {
         match status {
             SurfaceMcpServerStatus::Ready => Self::Connected,
-            SurfaceMcpServerStatus::Degraded { message } => {
+            SurfaceMcpServerStatus::Failed { message } => {
                 Self::Failed(message.as_str().to_string())
             }
-            SurfaceMcpServerStatus::Stopped => Self::Failed("stopped".to_string()),
-            SurfaceMcpServerStatus::AuthRequired => Self::NeedsLogin,
+            SurfaceMcpServerStatus::NeedsLogin => Self::NeedsLogin,
             SurfaceMcpServerStatus::Disabled => Self::Disabled,
             SurfaceMcpServerStatus::Starting => Self::Starting,
         }
@@ -2855,8 +2853,8 @@ mod tests {
     #[test]
     fn the_catalog_from_the_projection_reaches_app_state() {
         use orca_runtime::surface::{
-            SurfaceCatalogEntryId, SurfaceMcpPrompt, SurfaceMcpPromptArgument, SurfaceMcpTool,
-            SurfaceSchema,
+            SurfaceCatalogEntryId, SurfaceMcpPrompt, SurfaceMcpPromptArgument, SurfaceMcpServer,
+            SurfaceMcpTool, SurfaceSchema,
         };
         let text = |value: &str| NonEmptyText::try_new(value).unwrap();
         let tool = |server: &str, name: &str, read_only| SurfaceMcpTool {
@@ -2871,19 +2869,23 @@ mod tests {
             },
             read_only,
         };
+        let listed = |name: &str, status| SurfaceMcpServer {
+            name: text(name),
+            status,
+            prompts_error: None,
+        };
         let mut snapshot = goal_projection_snapshot();
         snapshot.mcp_catalog.servers = vec![
-            (text("docs"), SurfaceMcpServerStatus::Ready),
-            (
-                text("github"),
-                SurfaceMcpServerStatus::Degraded {
+            listed("docs", SurfaceMcpServerStatus::Ready),
+            listed(
+                "github",
+                SurfaceMcpServerStatus::Failed {
                     message: DisplayText::new("connection refused"),
                 },
             ),
-            (text("jira"), SurfaceMcpServerStatus::Stopped),
-            (text("linear"), SurfaceMcpServerStatus::AuthRequired),
-            (text("archive"), SurfaceMcpServerStatus::Disabled),
-            (text("slow"), SurfaceMcpServerStatus::Starting),
+            listed("linear", SurfaceMcpServerStatus::NeedsLogin),
+            listed("archive", SurfaceMcpServerStatus::Disabled),
+            listed("slow", SurfaceMcpServerStatus::Starting),
         ];
         snapshot.mcp_catalog.tools = vec![
             tool("docs", "search", true),
@@ -2931,7 +2933,6 @@ mod tests {
                         "github",
                         McpServerStatusView::Failed("connection refused".to_string()),
                     ),
-                    server("jira", McpServerStatusView::Failed("stopped".to_string())),
                     server("linear", McpServerStatusView::NeedsLogin),
                     server("archive", McpServerStatusView::Disabled),
                     server("slow", McpServerStatusView::Starting),

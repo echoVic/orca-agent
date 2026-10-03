@@ -49,14 +49,14 @@ use super::projection::{
     SurfaceGoalOuterTurnReceipt, SurfaceGoalOuterTurnReceiptOrigin, SurfaceGoalPauseReason,
     SurfaceGoalReceiptState, SurfaceGoalRun, SurfaceGoalRunOrigin, SurfaceGoalRunPhase,
     SurfaceGoalState, SurfaceGoalStoreReceipt, SurfaceHealthIssue, SurfaceHealthIssueId,
-    SurfaceItem, SurfaceItemOrigin, SurfacePinnedContextEntry, SurfacePinnedContextKind,
-    SurfacePlanSnapshot, SurfaceRemoteTerminalLease, SurfaceRemoteTerminalLeaseState,
-    SurfaceSubagent, SurfaceSubagentOwner, SurfaceSubagentSource, SurfaceSubagentStatus,
-    SurfaceSubagentTerminalStatus, SurfaceTask, SurfaceTaskStatus, SurfaceTaskType,
-    SurfaceToolResultKind, SurfaceToolView, SurfaceToolViewState, SurfaceUsageSnapshot,
-    SurfaceUserInputState, SurfaceVerificationResult, SurfaceWorkflow, SurfaceWorkflowAgent,
-    SurfaceWorkflowAgentStatus, SurfaceWorkflowStatus, TaskPatch, ToolInvocationStarted, ToolPatch,
-    WorkflowPatch,
+    SurfaceItem, SurfaceItemOrigin, SurfaceMcpServer, SurfacePinnedContextEntry,
+    SurfacePinnedContextKind, SurfacePlanSnapshot, SurfaceRemoteTerminalLease,
+    SurfaceRemoteTerminalLeaseState, SurfaceSubagent, SurfaceSubagentOwner, SurfaceSubagentSource,
+    SurfaceSubagentStatus, SurfaceSubagentTerminalStatus, SurfaceTask, SurfaceTaskStatus,
+    SurfaceTaskType, SurfaceToolResultKind, SurfaceToolView, SurfaceToolViewState,
+    SurfaceUsageSnapshot, SurfaceUserInputState, SurfaceVerificationResult, SurfaceWorkflow,
+    SurfaceWorkflowAgent, SurfaceWorkflowAgentStatus, SurfaceWorkflowStatus, TaskPatch,
+    ToolInvocationStarted, ToolPatch, WorkflowPatch,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -3801,18 +3801,19 @@ fn apply_mcp_catalog_patch(
                     "MCP server status revision is stale",
                 ));
             }
-            if let Some((_, current)) = snapshot
+            if let Some(current) = snapshot
                 .mcp_catalog
                 .servers
                 .iter_mut()
-                .find(|(name, _)| name == server)
+                .find(|current| current.name == *server)
             {
-                *current = status.clone();
+                current.status = status.clone();
             } else {
-                snapshot
-                    .mcp_catalog
-                    .servers
-                    .push((server.clone(), status.clone()));
+                snapshot.mcp_catalog.servers.push(SurfaceMcpServer {
+                    name: server.clone(),
+                    status: status.clone(),
+                    prompts_error: None,
+                });
             }
             snapshot.mcp_catalog.revision = *next_revision;
             Ok(())

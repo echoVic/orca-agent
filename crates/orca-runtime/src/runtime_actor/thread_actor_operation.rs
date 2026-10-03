@@ -3685,11 +3685,11 @@ impl ThreadActor {
             .mcp_catalog
             .servers
             .iter()
-            .find(|(name, _)| name.as_str() == canonical)
-            .map(|(_, status)| status.clone());
+            .find(|listed| listed.name.as_str() == canonical)
+            .map(|listed| listed.status.clone());
         match (status, result) {
             (Some(status), _) => Ok(status),
-            (None, Err(error)) => Ok(surface::SurfaceMcpServerStatus::Degraded {
+            (None, Err(error)) => Ok(surface::SurfaceMcpServerStatus::Failed {
                 message: surface::DisplayText::new(error),
             }),
             (None, Ok(())) => Err(surface::SurfaceClientCommandError::RuntimeUnavailable),

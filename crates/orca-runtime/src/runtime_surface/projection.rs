@@ -2056,15 +2056,28 @@ pub struct GoalPatchEnvelope {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum SurfaceMcpServerStatus {
+    /// Its first connection is still being made.
     Starting,
+    /// Connected, with its tools listed.
     Ready,
-    Degraded {
-        message: DisplayText,
-    },
-    Stopped,
-    Disabled,
+    /// It could not be connected, or some of its tools cannot be shown;
+    /// `message` says which.
+    Failed { message: DisplayText },
     /// The server wants the user to log in before it can connect.
-    AuthRequired,
+    NeedsLogin,
+    /// Turned off in the config, so never connected.
+    Disabled,
+}
+
+/// A configured MCP server and how it stands.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceMcpServer {
+    /// The canonical name, as in its tools' names.
+    pub name: NonEmptyText,
+    pub status: SurfaceMcpServerStatus,
+    /// Why its prompts could not be listed, when it connected but
+    /// `prompts/list` failed.
+    pub prompts_error: Option<DisplayText>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2147,10 +2160,10 @@ pub struct SurfaceMcpCatalogDiagnostic {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceMcpCatalogSnapshot {
     pub revision: McpCatalogRevision,
-    pub servers: Vec<(NonEmptyText, SurfaceMcpServerStatus)>,
+    /// In config order.
+    pub servers: Vec<SurfaceMcpServer>,
     pub tools: Vec<SurfaceMcpTool>,
-    /// Omitted on the wire when empty, so a catalog without prompts is
-    /// written as before.
+    /// Omitted on the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prompts: Vec<SurfaceMcpPrompt>,
     pub resources: Vec<SurfaceMcpResource>,

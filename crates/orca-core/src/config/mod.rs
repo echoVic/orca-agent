@@ -456,7 +456,7 @@ pub struct RunConfig {
 
 /// A config that does only what it is told to: the mock provider, no
 /// history, no MCP servers, hooks or notifications, and no MCP credentials
-/// path, so nothing built from it reads or writes the user's Orca directory.
+/// path, so no MCP connection made with it reads or writes a stored login.
 impl Default for RunConfig {
     fn default() -> Self {
         let approval_mode = ApprovalMode::default();

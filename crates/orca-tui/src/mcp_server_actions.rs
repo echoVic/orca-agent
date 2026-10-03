@@ -512,17 +512,13 @@ mod tests {
                 "MCP server docs: connected",
             ),
             (
-                Ok(SurfaceMcpServerStatus::Degraded {
+                Ok(SurfaceMcpServerStatus::Failed {
                     message: DisplayText::new("no MCP server named 'docs'"),
                 }),
                 "MCP server docs: failed: no MCP server named 'docs'",
             ),
             (
-                Ok(SurfaceMcpServerStatus::Stopped),
-                "MCP server docs: failed: stopped",
-            ),
-            (
-                Ok(SurfaceMcpServerStatus::AuthRequired),
+                Ok(SurfaceMcpServerStatus::NeedsLogin),
                 "MCP server docs: needs login",
             ),
             (

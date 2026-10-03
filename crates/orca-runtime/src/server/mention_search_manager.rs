@@ -231,8 +231,12 @@ fn relay_search_snapshots<W: Write>(
     stopped: Arc<AtomicBool>,
     wake_rx: mpsc::Receiver<()>,
 ) {
-    let catalog = MentionCatalog::discover(&roots, &mcp_registry);
-    let errors = catalog.errors().to_vec();
+    // A server still making its first connection lists its resources once
+    // it is done, so the catalog is discovered again then. Asked before the
+    // first discovery, so a server done in between is not missed.
+    let mut mcp_starting = mcp_registry.is_starting();
+    let mut catalog = MentionCatalog::discover(&roots, &mcp_registry);
+    let mut errors = catalog.errors().to_vec();
     let mut observed_revision = u64::MAX;
     let mut last_completed_revision = u64::MAX;
     let mut last_files = Vec::new();
@@ -247,6 +251,11 @@ fn relay_search_snapshots<W: Write>(
         }
         if stopped.load(Ordering::Acquire) {
             break;
+        }
+        if mcp_starting && !mcp_registry.is_starting() {
+            mcp_starting = false;
+            catalog = MentionCatalog::discover(&roots, &mcp_registry);
+            errors = catalog.errors().to_vec();
         }
 
         let current_query = query
@@ -425,5 +434,100 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("stop_all joined the relay");
         waiter.join().unwrap();
+    }
+
+    /// A stdio MCP server that answers `initialize` only after `delay_secs`,
+    /// then lists one resource, `memo://orca/one`.
+    #[cfg(unix)]
+    fn slow_resource_server(
+        dir: &std::path::Path,
+        delay_secs: u64,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        let script = dir.join("resources.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=${line#*'"id":'}
+  id=${id%%,*}
+  case "$line" in
+    *'"method":"initialize"'*)
+      sleep "$1"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"resources":{}},"serverInfo":{"name":"resources","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$id"
+      ;;
+    *'"method":"resources/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resources":[{"uri":"memo://orca/one","name":"memo one"}]}}\n' "$id"
+      ;;
+    *'"method":"resources/templates/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resourceTemplates":[]}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        orca_core::mcp_types::McpServerConfig {
+            name: "resources".to_string(),
+            command: Some("/bin/sh".to_string()),
+            args: vec![
+                script.to_string_lossy().into_owned(),
+                delay_secs.to_string(),
+            ],
+            startup_timeout_ms: Some(15_000),
+            tool_timeout_ms: Some(15_000),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_search_lists_the_resources_of_a_server_that_connects_after_it_starts() {
+        let _env = crate::history::lock_test_env();
+        crate::history::isolated_test_orca_home();
+        let root = tempdir().unwrap();
+        let registry = orca_mcp::initialize_registry(&[slow_resource_server(root.path(), 1)], None);
+        assert!(registry.is_starting(), "the server is still connecting");
+        let writer = Arc::new(Mutex::new(Vec::new()));
+        let mut manager = MentionSearchManager::default();
+        manager
+            .start(
+                "mentions".to_string(),
+                vec![root.path().to_path_buf()],
+                registry,
+                Vec::new(),
+                true,
+                12,
+                json!("mentions-start"),
+                Arc::clone(&writer),
+            )
+            .unwrap();
+        manager.update("mentions", "memo".to_string()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let resource = loop {
+            let written = String::from_utf8(writer.lock().unwrap().clone()).unwrap();
+            let resource = written
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|event| {
+                    event["event"] == "mention_search_session_updated" && event["query"] == "memo"
+                })
+                .flat_map(|event| event["candidates"].as_array().cloned().unwrap_or_default())
+                .find(|candidate| candidate["kind"] == "resource");
+            if let Some(resource) = resource {
+                break resource;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no resource was listed: {written}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        manager.stop_all();
+
+        assert_eq!(resource["target"]["uri"], "memo://orca/one");
     }
 }

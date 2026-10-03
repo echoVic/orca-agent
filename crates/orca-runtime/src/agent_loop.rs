@@ -85,6 +85,22 @@ pub(crate) fn run_agent_loop(
             .as_deref()
             .or(turn_context.root_task_id),
     );
+    // The first model request offers the tools of the session's MCP
+    // servers, so wait for those still making their first connection; each
+    // request sent to a server while it connects is bounded by its startup
+    // timeout. A cancel stops the wait and ends the turn as one seen in the
+    // loop does.
+    if !turn_deps
+        .mcp_registry
+        .wait_for_startup(&|| cancel.is_cancelled())
+    {
+        return finish_agent_loop(
+            &mut operation,
+            &turn_id,
+            defer_cancel_terminal,
+            cancelled_agent_loop(),
+        );
+    }
     let setup = RuntimeTurnSetupStep::new().prepare(
         config,
         subagent_depth,
@@ -145,7 +161,7 @@ pub(crate) fn run_agent_loop(
         },
         RuntimeTurnLoopExecutors::new(execute_child_agent_loop, execute_child_agent_loop),
     );
-    let mut outcome = match outcome {
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         // Once it cancels a generation, the runtime refuses whatever the loop
         // still tries to record -- a provider response that raced the cancel,
@@ -153,15 +169,29 @@ pub(crate) fn run_agent_loop(
         // loop, not a failure of the turn: end the turn the way a cancel seen
         // in time ends it.
         Err(error) if error.kind() == io::ErrorKind::Interrupted && cancel.is_cancelled() => {
-            AgentLoopOutcome::Completed(AgentLoopResult::terminal(
-                RunStatus::Cancelled,
-                TurnEndReason::Cancelled,
-                Some("turn cancelled".to_string()),
-            ))
+            cancelled_agent_loop()
         }
         Err(error) => return Err(error),
     };
+    finish_agent_loop(&mut operation, &turn_id, defer_cancel_terminal, outcome)
+}
 
+/// How a cancel seen in time ends the loop.
+fn cancelled_agent_loop() -> AgentLoopOutcome {
+    AgentLoopOutcome::Completed(AgentLoopResult::terminal(
+        RunStatus::Cancelled,
+        TurnEndReason::Cancelled,
+        Some("turn cancelled".to_string()),
+    ))
+}
+
+/// Commits the typed terminal `outcome` ends `operation` with.
+fn finish_agent_loop(
+    operation: &mut crate::operation_context::OperationContext,
+    turn_id: &TurnId,
+    defer_cancel_terminal: bool,
+    mut outcome: AgentLoopOutcome,
+) -> io::Result<AgentLoopOutcome> {
     // The loop always ends with a typed terminal: budget stops already
     // committed `checkpoint.created` + `operation.terminal` durably before
     // surfacing, so every other exit appends the terminal once here. The
