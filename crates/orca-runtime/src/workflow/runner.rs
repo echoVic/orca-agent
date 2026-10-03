@@ -2396,7 +2396,11 @@ impl WorkflowRunner {
         delegation: &DelegationSnapshot,
     ) -> (RunConfig, orca_mcp::McpRegistry) {
         let workflow_child_config = Self::workflow_child_config(config, delegation);
-        let mcp_registry = orca_mcp::initialize_registry(&workflow_child_config.mcp_servers);
+        let mcp_registry = orca_mcp::initialize_registry(
+            &workflow_child_config.mcp_servers,
+            workflow_child_config.mcp_credentials_path.clone(),
+        );
+        mcp_registry.wait_for_startup(&|| false);
         (workflow_child_config, mcp_registry)
     }
 
@@ -4386,6 +4390,7 @@ mod tests {
             api_key: None,
             base_url: None,
             mcp_servers: Vec::new(),
+            mcp_credentials_path: None,
             hooks: Vec::new(),
             external_tools: Vec::new(),
             history_mode: HistoryMode::Disabled,

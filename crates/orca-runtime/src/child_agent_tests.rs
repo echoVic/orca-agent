@@ -50,6 +50,7 @@ fn config(model: Option<&str>) -> RunConfig {
         api_key: None,
         base_url: None,
         mcp_servers: Vec::<McpServerConfig>::new(),
+        mcp_credentials_path: None,
         hooks: Vec::<HookConfig>::new(),
         external_tools: Vec::<ExternalToolConfig>::new(),
         history_mode: HistoryMode::Disabled,

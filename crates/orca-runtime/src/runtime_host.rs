@@ -2495,9 +2495,15 @@ impl RuntimeThreadStartRequest {
 
     fn start(self) -> io::Result<RuntimeThread> {
         let inherited_conversation = self.inherited_conversation;
-        let mcp_registry = self
-            .mcp_registry
-            .unwrap_or_else(|| orca_mcp::initialize_registry(&self.config.mcp_servers));
+        let mcp_registry = self.mcp_registry.unwrap_or_else(|| {
+            let mcp_registry = orca_mcp::initialize_registry(
+                &self.config.mcp_servers,
+                self.config.mcp_credentials_path.clone(),
+            );
+            // The thread starts once each server has connected or failed.
+            mcp_registry.wait_for_startup(&|| false);
+            mcp_registry
+        });
         let mut thread = RuntimeThread::start_with_prepared_history_and_runtime_id(
             &self.config,
             self.title,
@@ -25916,6 +25922,7 @@ mod tests {
             api_key: None,
             base_url: None,
             mcp_servers: Vec::new(),
+            mcp_credentials_path: None,
             hooks: Vec::new(),
             external_tools: Vec::new(),
             history_mode,
@@ -40544,7 +40551,7 @@ done
     #[test]
     fn a_tool_call_that_finds_the_login_gone_shows_in_the_catalog() {
         use orca_core::config::mcp_credentials::{
-            McpCredential, mcp_credentials_path, save_mcp_credential,
+            MCP_CREDENTIALS_FILE, McpCredential, save_mcp_credential,
         };
         use orca_mcp::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
 
@@ -40557,16 +40564,9 @@ done
             refuse_refresh: true,
             ..Default::default()
         });
-        // The session's servers read logins through the `ORCA_HOME`
-        // variable, never the thread's override: point it at the isolated
-        // test home before resolving the path, so no real login is touched.
-        let isolated_home = crate::history::isolated_test_orca_home();
-        let credentials = mcp_credentials_path().expect("the credentials path");
-        assert!(
-            credentials.starts_with(isolated_home),
-            "{}",
-            credentials.display()
-        );
+        // The session's servers read logins where the config says, so no
+        // real login is touched.
+        let credentials = home.path().join(MCP_CREDENTIALS_FILE);
         save_mcp_credential(
             &credentials,
             "docs",
@@ -40585,6 +40585,7 @@ done
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
         config.approval_mode = ApprovalMode::FullAuto;
         config.mcp_servers = vec![remote.config("docs")];
+        config.mcp_credentials_path = Some(credentials);
         let host = RuntimeHost::start().expect("start runtime host");
         let thread = host
             .handle()

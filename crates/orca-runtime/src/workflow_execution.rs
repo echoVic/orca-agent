@@ -928,6 +928,7 @@ mod tests {
             additional_working_directories: Vec::new(),
             budget: Default::default(),
             mcp_servers: Vec::new(),
+            mcp_credentials_path: None,
             hooks: Vec::new(),
             external_tools: Vec::new(),
             subagents: Default::default(),

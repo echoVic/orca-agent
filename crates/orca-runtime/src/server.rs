@@ -2716,7 +2716,11 @@ fn run_stateless_submit_async<W: Write + Send + 'static>(
             .clone()
             .filter(|roots| !roots.is_empty())
             .unwrap_or_else(|| vec![cwd.clone()]);
-        let mcp_registry = orca_mcp::initialize_registry(&run_config.mcp_servers);
+        let mcp_registry = orca_mcp::initialize_registry(
+            &run_config.mcp_servers,
+            run_config.mcp_credentials_path.clone(),
+        );
+        mcp_registry.wait_for_startup(&|| false);
         prompt =
             match crate::mentions::expand_mentions(&prompt, &bindings, &cwd, &roots, &mcp_registry)
             {
@@ -8500,6 +8504,7 @@ rl.on("line", (line) => {
             api_key: None,
             base_url: None,
             mcp_servers: Vec::new(),
+            mcp_credentials_path: None,
             hooks: Vec::new(),
             external_tools: Vec::new(),
             history_mode: HistoryMode::Disabled,

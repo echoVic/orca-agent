@@ -572,20 +572,24 @@ done
             fs::set_permissions(&server, permissions).expect("chmod MCP fixture");
         }
 
-        let registry = orca_mcp::initialize_registry(&[McpServerConfig {
-            name: "slow".to_string(),
-            transport: McpTransportKind::Stdio,
-            command: Some(server.to_string_lossy().into_owned()),
-            args: Vec::new(),
-            url: None,
-            env: Default::default(),
-            headers: Default::default(),
-            disabled: false,
-            capabilities: Default::default(),
-            startup_timeout_ms: None,
-            tool_timeout_ms: None,
-            ..Default::default()
-        }]);
+        let registry = orca_mcp::initialize_registry(
+            &[McpServerConfig {
+                name: "slow".to_string(),
+                transport: McpTransportKind::Stdio,
+                command: Some(server.to_string_lossy().into_owned()),
+                args: Vec::new(),
+                url: None,
+                env: Default::default(),
+                headers: Default::default(),
+                disabled: false,
+                capabilities: Default::default(),
+                startup_timeout_ms: None,
+                tool_timeout_ms: None,
+                ..Default::default()
+            }],
+            None,
+        );
+        assert!(registry.wait_for_startup(&|| false));
         assert!(
             registry.errors().is_empty(),
             "registry errors: {:?}",

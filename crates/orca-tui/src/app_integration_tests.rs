@@ -618,6 +618,7 @@ fn test_config(history_mode: HistoryMode) -> RunConfig {
         api_key: Some("sk-test".to_string()),
         base_url: None,
         mcp_servers: Vec::new(),
+        mcp_credentials_path: None,
         hooks: Vec::new(),
         external_tools: Vec::new(),
         history_mode,

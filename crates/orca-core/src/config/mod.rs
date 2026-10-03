@@ -428,6 +428,10 @@ pub struct RunConfig {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Where the logins of remote MCP servers are stored
+    /// (`$ORCA_HOME/mcp-credentials.json`), set when the config is loaded.
+    /// Without one, no MCP server finds a stored login.
+    pub mcp_credentials_path: Option<PathBuf>,
     pub hooks: Vec<HookConfig>,
     pub external_tools: Vec<ExternalToolConfig>,
     pub history_mode: HistoryMode,
@@ -448,6 +452,54 @@ pub struct RunConfig {
     pub desktop_notifications: bool,
     pub terminal_notifications: bool,
     pub auto_memory: bool,
+}
+
+/// A config that does only what it is told to: the mock provider, no
+/// history, no MCP servers, hooks or notifications, and no MCP credentials
+/// path, so nothing built from it reads or writes the user's Orca directory.
+impl Default for RunConfig {
+    fn default() -> Self {
+        let approval_mode = ApprovalMode::default();
+        Self {
+            app_version: String::new(),
+            prompt: String::new(),
+            cwd: None,
+            output_format: OutputFormat::Text,
+            approval_mode,
+            execution_profile: crate::capability::ExecutionProfile::for_approval_mode(
+                approval_mode,
+            ),
+            provider: ProviderKind::default(),
+            verifier: None,
+            model: ModelSelection::from_unchecked(None),
+            model_runtime: ModelRuntimeConfig::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            api_key: None,
+            base_url: None,
+            mcp_servers: Vec::new(),
+            mcp_credentials_path: None,
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: HashMap::new(),
+            runtime_workspace_roots: None,
+            permission_rules: PermissionRules::default(),
+            additional_working_directories: Vec::new(),
+            budget: BudgetConfig::default(),
+            subagents: SubagentConfig::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::default(),
+            vim_mode: false,
+            vim_insert_escape: None,
+            update_check: false,
+            desktop_notifications: false,
+            terminal_notifications: false,
+            auto_memory: false,
+        }
+    }
 }
 
 /// Immutable execution policy captured when work is delegated to another
@@ -1051,6 +1103,7 @@ mod tests {
             api_key: Some("sk-secret".to_string()),
             base_url: Some("https://api.example".to_string()),
             mcp_servers: Vec::new(),
+            mcp_credentials_path: None,
             hooks: Vec::new(),
             external_tools: Vec::new(),
             history_mode: HistoryMode::Disabled,
@@ -1117,6 +1170,11 @@ mod tests {
     }
 
     #[test]
+    fn a_default_run_config_has_no_credentials_path() {
+        assert_eq!(RunConfig::default().mcp_credentials_path, None);
+    }
+
+    #[test]
     fn delegation_snapshot_carries_the_policy_to_a_child() {
         let parent = RunConfig {
             app_version: "test".to_string(),
@@ -1133,6 +1191,7 @@ mod tests {
             api_key: None,
             base_url: None,
             mcp_servers: Vec::new(),
+            mcp_credentials_path: None,
             hooks: Vec::new(),
             external_tools: Vec::new(),
             history_mode: HistoryMode::Disabled,
@@ -1215,6 +1274,7 @@ mod tests {
             api_key: None,
             base_url: None,
             mcp_servers: Vec::new(),
+            mcp_credentials_path: None,
             hooks: Vec::new(),
             external_tools: Vec::new(),
             history_mode: HistoryMode::Disabled,

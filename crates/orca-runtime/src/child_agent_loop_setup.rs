@@ -140,7 +140,9 @@ fn build_child_agent_loop_setup(
     continuation: Option<ChildAgentContinuationRuntimeState>,
     turn: u32,
 ) -> ChildAgentLoopSetup {
-    let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
+    let mcp_registry =
+        orca_mcp::initialize_registry(&config.mcp_servers, config.mcp_credentials_path.clone());
+    mcp_registry.wait_for_startup(&|| false);
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),

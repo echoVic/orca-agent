@@ -35,7 +35,11 @@ pub(crate) fn next_mcp_catalog(
 /// listed yet.
 fn mcp_catalog(registry: &McpRegistry, revision: McpCatalogRevision) -> SurfaceMcpCatalogSnapshot {
     catalog_of(
-        registry.server_states(),
+        registry
+            .server_statuses()
+            .into_iter()
+            .map(|status| (status.name, status.state))
+            .collect(),
         registry.tools(),
         registry.prompts(),
         revision,
@@ -125,6 +129,7 @@ fn catalog_of(
 
 fn surface_server_status(state: McpServerState) -> SurfaceMcpServerStatus {
     match state {
+        McpServerState::Starting => SurfaceMcpServerStatus::Starting,
         McpServerState::Ready => SurfaceMcpServerStatus::Ready,
         McpServerState::Failed { message } => SurfaceMcpServerStatus::Degraded {
             message: DisplayText::new(message),

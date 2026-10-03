@@ -1928,6 +1928,7 @@ mod tests {
             api_key: None,
             base_url: None,
             mcp_servers: Vec::new(),
+            mcp_credentials_path: None,
             hooks: Vec::new(),
             external_tools: Vec::new(),
             history_mode: HistoryMode::Disabled,

@@ -87,6 +87,7 @@ mod tests {
             runtime_workspace_roots: None,
             theme: ThemeName::Dark,
             mcp_servers: Vec::new(),
+            mcp_credentials_path: None,
             permission_rules: PermissionRules::default(),
             additional_working_directories: Vec::new(),
             budget: Default::default(),

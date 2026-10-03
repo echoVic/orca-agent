@@ -483,7 +483,9 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         config.hooks.clone(),
         CapabilitySet::for_approval_mode(config.approval_mode),
     );
-    let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
+    let mcp_registry =
+        orca_mcp::initialize_registry(&config.mcp_servers, config.mcp_credentials_path.clone());
+    mcp_registry.wait_for_startup(&|| false);
     let child_request = ChildAgentRequest {
         prompt: request.prompt,
         subagent_type: request.subagent_type,
@@ -1139,7 +1141,9 @@ fn launch_admitted_async_subagent(
         .as_ref()
         .map(|source| source.compatibility.isolation)
         .unwrap_or(request.isolation);
-    let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
+    let mcp_registry =
+        orca_mcp::initialize_registry(&config.mcp_servers, config.mcp_credentials_path.clone());
+    mcp_registry.wait_for_startup(&|| false);
     let freeze_result = if let Some(source) = &source {
         subagent::restore_frozen_agent(config, source).map(|frozen| {
             request.frozen_agent = frozen;
@@ -2517,6 +2521,7 @@ mod tests {
             api_key: None,
             base_url: None,
             mcp_servers: Vec::new(),
+            mcp_credentials_path: None,
             hooks: Vec::new(),
             external_tools: Vec::new(),
             history_mode: HistoryMode::Disabled,

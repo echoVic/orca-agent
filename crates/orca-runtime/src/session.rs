@@ -200,7 +200,9 @@ impl InteractiveSession {
         prompt_for_title: &str,
         preloaded: Option<SessionTranscript>,
     ) -> io::Result<Self> {
-        let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
+        let mcp_registry =
+            orca_mcp::initialize_registry(&config.mcp_servers, config.mcp_credentials_path.clone());
+        mcp_registry.wait_for_startup(&|| false);
         Self::new_with_preloaded_and_mcp_registry(config, prompt_for_title, preloaded, mcp_registry)
     }
 
@@ -923,6 +925,7 @@ mod tests {
             api_key: None,
             base_url: None,
             mcp_servers: Vec::new(),
+            mcp_credentials_path: None,
             hooks: Vec::new(),
             external_tools: Vec::new(),
             history_mode,

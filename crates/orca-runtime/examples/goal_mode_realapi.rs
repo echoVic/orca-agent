@@ -220,6 +220,7 @@ fn real_api_config(api_key: String, max_cost_usd_micros: u64) -> Result<RunConfi
         api_key: Some(api_key),
         base_url: None,
         mcp_servers: Vec::new(),
+        mcp_credentials_path: None,
         hooks: Vec::new(),
         external_tools: Vec::new(),
         history_mode: HistoryMode::Record,

@@ -105,6 +105,7 @@ pub fn assemble_run_config(
             budget
         },
         mcp_servers: file.mcp_servers,
+        mcp_credentials_path: orca_core::config::mcp_credentials::mcp_credentials_path(),
         hooks: file.hooks,
         external_tools: orca_tools::external::load_default_external_tools(),
         subagents: file.subagents.normalized(),

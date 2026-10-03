@@ -26,6 +26,7 @@ fn config(cwd: &Path) -> RunConfig {
         api_key: Some("key-from-environment-or-auth".to_string()),
         base_url: None,
         mcp_servers: Vec::new(),
+        mcp_credentials_path: None,
         hooks: Vec::new(),
         external_tools: Vec::new(),
         history_mode: HistoryMode::Disabled,

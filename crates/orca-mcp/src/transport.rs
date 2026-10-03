@@ -16,7 +16,6 @@ use reqwest::header::{ACCEPT, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use orca_core::capability::{CapabilityReceipt, EnforcementState};
-use orca_core::config::mcp_credentials::mcp_credentials_path;
 use orca_core::execution_broker::ExecutionBroker;
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
 use orca_platform::process::ProcessJob;
@@ -179,12 +178,8 @@ pub trait McpTransport: Send + Sync {
     }
 }
 
-pub fn connect(config: &McpServerConfig) -> Result<Box<dyn McpTransport>, String> {
-    connect_with_credentials(config, mcp_credentials_path())
-}
-
-/// Connects as [`connect`] does, reading a stored OAuth login from
-/// `credentials_path`.
+/// Connects to the server `config` describes: starts a stdio server, or
+/// opens a remote one, reading a stored OAuth login from `credentials_path`.
 pub(crate) fn connect_with_credentials(
     config: &McpServerConfig,
     credentials_path: Option<PathBuf>,
@@ -2130,6 +2125,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const STDIO_TEST_STARTUP_TIMEOUT_MS: u64 = 15_000;
+
+    /// Connects to `config` with no stored logins, so that no test reads the
+    /// user's.
+    fn connect(config: &McpServerConfig) -> Result<Box<dyn McpTransport>, String> {
+        connect_with_credentials(config, None)
+    }
 
     #[test]
     fn stdio_json_line_limit_is_enforced_across_small_read_buffers() {
@@ -4716,7 +4717,8 @@ while IFS= read -r line; do :; done
             close_stream_on: Some("tools/call"),
             ..Default::default()
         });
-        let registry = crate::initialize_registry(&[legacy_sse_config("reopening", &server)]);
+        let registry = crate::initialize_registry(&[legacy_sse_config("reopening", &server)], None);
+        assert!(registry.wait_for_startup(&|| false));
         assert!(registry.errors().is_empty(), "{:?}", registry.errors());
         let echo = registry
             .resolve_tool("mcp__reopening__echo")

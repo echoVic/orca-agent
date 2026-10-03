@@ -1344,6 +1344,7 @@ mod tests {
             additional_working_directories: Vec::new(),
             budget: Default::default(),
             mcp_servers: Vec::<McpServerConfig>::new(),
+            mcp_credentials_path: None,
             external_tools: Vec::<ExternalToolConfig>::new(),
             hooks: Vec::<HookConfig>::new(),
             subagents: SubagentConfig::default(),
