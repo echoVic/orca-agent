@@ -19,6 +19,10 @@ presentation and model selection; it cannot grant credentials, change approval
 mode, add MCP servers, loosen permissions, or configure process-launching
 surfaces.
 
+Both `config.toml` files are UTF-8 TOML. One Orca cannot read, such as one
+saved as UTF-16 (which Windows PowerShell 5.1's `>` writes), or cannot parse,
+is left out with a warning when Orca starts: none of its settings apply.
+
 For an individual setting, precedence is:
 
 1. CLI option

@@ -412,8 +412,8 @@ fn file_config_from_value(value: Value) -> Result<FileConfig, String> {
         .map_err(|error| super::error_text::data_error_text(&error))
 }
 
-/// The config file at `path` as a TOML value, if it is one. A file that is
-/// not TOML is left out, with a warning.
+/// The config file at `path` as a TOML value, if it is one. A file that
+/// cannot be read, or is not TOML, is left out, with a warning.
 fn load_toml_value(path: &Path) -> Option<Value> {
     read_toml_value(path).unwrap_or_else(|warning| {
         eprintln!("orca: warning: {warning}");
@@ -421,14 +421,16 @@ fn load_toml_value(path: &Path) -> Option<Value> {
     })
 }
 
-/// The config file at `path` as a TOML value: `None` when it cannot be
-/// read, and a warning when it is not TOML, which says where it is wrong
-/// and never quotes it. The warning is printed when Orca starts, so it
-/// lands in logs and bug reports, and the line the parser stopped at can
+/// The config file at `path` as a TOML value: `None` when there is none,
+/// and a warning when it cannot be read or is not TOML, which says where it
+/// is wrong and never quotes it. The warning is printed when Orca starts, so
+/// it lands in logs and bug reports, and the line the parser stopped at can
 /// be a secret.
 fn read_toml_value(path: &Path) -> Result<Option<Value>, String> {
-    let Ok(content) = fs::read_to_string(path) else {
-        return Ok(None);
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(config_read_warning(path, &error)),
     };
     let mut value = toml::from_str(&content).map_err(|error| {
         format!(
@@ -439,6 +441,23 @@ fn read_toml_value(path: &Path) -> Result<Option<Value>, String> {
     })?;
     fold_legacy_workflow_settings_into_value(&mut value);
     Ok(Some(value))
+}
+
+/// Why the config file at `path` was left out, when reading it failed with
+/// `error`: an I/O error names no part of the file. Text that is not UTF-8,
+/// as PowerShell 5.1's `>` writes UTF-16, is named as such.
+fn config_read_warning(path: &Path, error: &io::Error) -> String {
+    if error.kind() == io::ErrorKind::InvalidData {
+        format!(
+            "config file {} is not UTF-8 text, ignoring it; save it as UTF-8",
+            path.display()
+        )
+    } else {
+        format!(
+            "cannot read config file {}, ignoring it: {error}",
+            path.display()
+        )
+    }
 }
 
 fn merge_toml_values(base: &mut Value, overlay: Value) {
@@ -1970,6 +1989,41 @@ workflowKeywordTriggerEnabled = true
         assert!(!warning.contains("abc-SECRET"), "{warning}");
         // No file is nothing to warn about.
         assert_eq!(read_toml_value(&dir.path().join("absent.toml")), Ok(None));
+    }
+
+    /// A config file that cannot be read is left out with a warning, never
+    /// in silence: every setting in it, deny rules and MCP servers among
+    /// them, would vanish unseen. PowerShell 5.1's `>` writes UTF-16LE.
+    #[test]
+    fn a_config_that_is_not_utf8_is_reported_and_never_quoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(USER_CONFIG_FILE);
+        let text = "api_key = \"abc-SECRET\"\n";
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        fs::write(&path, utf16).unwrap();
+
+        let warning = read_toml_value(&path).unwrap_err();
+
+        assert_eq!(
+            warning,
+            format!(
+                "config file {} is not UTF-8 text, ignoring it; save it as UTF-8",
+                path.display()
+            )
+        );
+        assert!(!warning.contains("SECRET"), "{warning}");
+        // A folder where the file should be cannot be read either.
+        let folder = dir.path().join("folder.toml");
+        fs::create_dir(&folder).unwrap();
+        let warning = read_toml_value(&folder).unwrap_err();
+        assert!(
+            warning.starts_with(&format!(
+                "cannot read config file {}, ignoring it: ",
+                folder.display()
+            )),
+            "{warning}"
+        );
     }
 
     #[test]
