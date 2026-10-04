@@ -149,7 +149,9 @@ pub fn call(
     config: &ProviderConfig,
 ) -> ProviderResponse {
     match kind {
-        ProviderKind::Mock => mock_call(conversation),
+        ProviderKind::Mock => {
+            mock_offered_tools(conversation, config).unwrap_or_else(|| mock_call(conversation))
+        }
         ProviderKind::DeepSeekFixture => {
             let has_tool_results = conversation
                 .messages
@@ -823,6 +825,34 @@ fn mock_repeat_read_state(conversation: &Conversation) -> Option<(usize, usize, 
         })
         .count();
     Some((requested_tools, request_number, completed_tools))
+}
+
+/// `mock_offered_tools`: a reply that names the tools the request offers
+/// the model, its `tools_override`, in order, as `Mock offered tools: a, b`.
+/// Every other mock reply ignores the tools offered, so this is how a test
+/// sees which tools a request carried.
+fn mock_offered_tools(
+    conversation: &Conversation,
+    config: &ProviderConfig,
+) -> Option<ProviderResponse> {
+    if conversation.last_user_message()?.trim() != "mock_offered_tools" {
+        return None;
+    }
+    let names = config
+        .tools_override
+        .iter()
+        .flatten()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let message = format!("Mock offered tools: {names}");
+    Some(ProviderResponse {
+        steps: vec![ProviderStep::MessageDelta(message.clone())],
+        assistant_content: Some(message),
+        assistant_reasoning: None,
+        tool_calls: Vec::new(),
+        usage: None,
+    })
 }
 
 fn mock_call(conversation: &Conversation) -> ProviderResponse {

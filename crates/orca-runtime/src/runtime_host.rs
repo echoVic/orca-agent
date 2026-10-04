@@ -41244,6 +41244,61 @@ done
         host.shutdown().expect("shutdown runtime host");
     }
 
+    /// The tools a turn offers the model are read once its servers have
+    /// connected: a server still starting when the turn begins has its tools
+    /// in the first request.
+    #[cfg(unix)]
+    #[test]
+    fn the_first_request_offers_a_slow_servers_tools() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.mcp_servers = vec![slow_mcp_server("slow", cwd.path(), Some(1))];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp offered tools")
+            .expect("start the thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        assert!(
+            thread.mcp_registry().is_starting(),
+            "the server is still connecting as the turn starts"
+        );
+
+        // The mock model answers with the names of the tools it is offered.
+        run_surface_turn_to_success(&surface, &attachment, "mock_offered_tools");
+
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let replies = snapshot
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                surface::SurfaceItem::AssistantMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [reply] = replies.as_slice() else {
+            panic!("one reply: {replies:?}");
+        };
+        let offered = reply
+            .strip_prefix("Mock offered tools: ")
+            .unwrap_or_else(|| panic!("not a list of offered tools: {reply}"))
+            .split(", ")
+            .collect::<Vec<_>>();
+        assert!(offered.contains(&"mcp__slow__wait"), "{offered:?}");
+        // The list is the turn's whole tool list, not the MCP tools alone.
+        assert!(offered.contains(&"read_file"), "{offered:?}");
+        host.shutdown().expect("shutdown runtime host");
+    }
+
     #[cfg(unix)]
     #[test]
     fn cancelling_a_turn_while_servers_connect_stops_waiting() {
