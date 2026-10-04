@@ -182,6 +182,20 @@ line reports only a status word (`oauth: logged in`, `oauth: not logged in`,
 `get` also shows `enabled_tools` and `disabled_tools`: `-` for one that is not
 set, and `none` for an empty list.
 
+An entry that does not load as a server, such as one without a `name` or with
+a value of the wrong type, does not hide the others. `list` shows the servers
+that load, names each such entry on stderr by its place among the
+`mcp_servers` entries and by its name when it has one, and exits with status 1:
+
+```text
+orca: /home/me/.orca/config.toml: invalid MCP server entry 2 ('github'): invalid type in `env`, expected a map
+```
+
+`get` of that name shows the same, and `get`, `login` and `logout` of any
+other server work as usual. The message says where the entry is wrong, never
+what it holds. A session does not load such a config: Orca warns and starts
+with the defaults, so no MCP server connects until the entry is fixed.
+
 `login` opens the server's authorization page in your browser and prints the
 url in case it does not open; it refuses a stdio server or one with a
 configured `Authorization` header or `bearer_token_env_var`, since those do

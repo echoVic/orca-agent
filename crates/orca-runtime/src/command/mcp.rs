@@ -140,6 +140,9 @@ fn add(
     }
 }
 
+/// Lists the servers whose entries load, and names each entry that does
+/// not, on stderr, which then makes `list` fail: the runtime does not load
+/// a config with such an entry at all.
 fn list(
     config_dir: &Path,
     credentials_path: &Path,
@@ -147,13 +150,29 @@ fn list(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
-    let (path, servers) = match orca_core::config::user_edit::list_user_mcp_servers_in(config_dir) {
-        Ok(result) => result,
+    let listed = match orca_core::config::user_edit::list_user_mcp_servers_in(config_dir) {
+        Ok(listed) => listed,
         Err(error) => return fail(stderr, &error.to_string()),
     };
+    let code = list_servers(&listed, credentials_path, json, stdout, stderr);
+    for entry in &listed.invalid {
+        fail(stderr, &entry.message);
+    }
+    if listed.invalid.is_empty() { code } else { 1 }
+}
+
+/// Writes `listed`'s servers, as JSON or a line each.
+fn list_servers(
+    listed: &orca_core::config::user_edit::UserMcpServers,
+    credentials_path: &Path,
+    json: bool,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    let servers = &listed.servers;
     if json {
         let mut entries = Vec::with_capacity(servers.len());
-        for server in &servers {
+        for server in servers {
             match to_json(server, credentials_path) {
                 Ok(entry) => entries.push(entry),
                 Err(error) => return fail(stderr, &error.to_string()),
@@ -161,13 +180,13 @@ fn list(
         }
         return write_json(stdout, stderr, &entries);
     }
-    if servers.is_empty() {
+    if servers.is_empty() && listed.invalid.is_empty() {
         return success(
             stdout,
-            format_args!("no MCP servers configured in {}", path.display()),
+            format_args!("no MCP servers configured in {}", listed.path.display()),
         );
     }
-    for server in &servers {
+    for server in servers {
         let target = server_target(server);
         let transport = transport_str(&server.transport);
         let auth = match auth_status(server, credentials_path) {
@@ -282,16 +301,31 @@ fn logout(
     }
 }
 
-/// The configured server named `name`, or the "no MCP server named" error
-/// that `get`, `remove`, `login`, and `logout` all report the same way for
-/// one that does not exist.
+/// The configured server named `name`; for an entry by that name that does
+/// not load, what is wrong with it; or the "no MCP server named" error that
+/// `get`, `remove`, `login`, and `logout` all report the same way for one
+/// that does not exist. Another entry that does not load is no matter.
 fn find_configured_server(config_dir: &Path, name: &str) -> Result<McpServerConfig, String> {
-    let (path, servers) = orca_core::config::user_edit::list_user_mcp_servers_in(config_dir)
+    let listed = orca_core::config::user_edit::list_user_mcp_servers_in(config_dir)
         .map_err(|error| error.to_string())?;
-    servers
+    if let Some(server) = listed
+        .servers
         .into_iter()
         .find(|server| server.name == name)
-        .ok_or_else(|| format!("no MCP server named '{name}' in {}", path.display()))
+    {
+        return Ok(server);
+    }
+    match listed
+        .invalid
+        .into_iter()
+        .find(|entry| entry.name.as_deref() == Some(name))
+    {
+        Some(entry) => Err(entry.message),
+        None => Err(format!(
+            "no MCP server named '{name}' in {}",
+            listed.path.display()
+        )),
+    }
 }
 
 /// The auth status shown in `list`'s trailing column, `get`'s `auth:` line,
@@ -1110,6 +1144,103 @@ mod tests {
                 assert!(!stdout.contains(value), "{request:?}: {stdout}");
             }
         }
+    }
+
+    /// An entry that does not load leaves the others usable. `list` shows
+    /// them, and names the broken entries, by their place among the
+    /// `mcp_servers` entries and by name when they have one, without what
+    /// they hold. `get`, `login` and `logout` of another server work.
+    #[test]
+    fn a_broken_server_entry_is_named_and_the_others_still_work() {
+        let temp = tempdir().unwrap();
+        let oauth = OAuthTestServer::start(OAuthTestBehavior::default());
+        let path = config_path(temp.path());
+        fs::write(
+            &path,
+            format!(
+                concat!(
+                    "[[mcp_servers]]\nname = \"docs\"\ncommand = \"docs-server\"\n\n",
+                    "[[mcp_servers]]\nname = \"github\"\ncommand = \"gh\"\nenv = \"TOKEN=abc-SECRET\"\n\n",
+                    "[[mcp_servers]]\ncommand = \"abc-SECRET\"\n\n",
+                    "[[mcp_servers]]\nname = \"linear\"\ntransport = \"http\"\nurl = \"{}\"\n",
+                ),
+                oauth.mcp_url()
+            ),
+        )
+        .unwrap();
+        let broken = [
+            format!(
+                "orca: {}: invalid MCP server entry 2 ('github'): invalid type in `env`, expected a map",
+                path.display()
+            ),
+            format!(
+                "orca: {}: invalid MCP server entry 3: missing field `name`",
+                path.display()
+            ),
+        ];
+
+        let (code, stdout, stderr) = run(temp.path(), McpCommandRequest::List { json: false });
+        assert_eq!(code, 1, "{stderr}");
+        let listed = stdout
+            .lines()
+            .map(|line| line.split('\t').next().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(listed, ["docs", "linear"], "{stdout}");
+        assert_eq!(stderr.lines().collect::<Vec<_>>(), broken, "{stderr}");
+
+        let (code, stdout, stderr) = run(temp.path(), McpCommandRequest::List { json: true });
+        assert_eq!(code, 1, "{stderr}");
+        let listed = serde_json::from_str::<serde_json::Value>(&stdout)
+            .expect("the servers that load, as JSON");
+        let names = listed
+            .as_array()
+            .expect("a JSON array")
+            .iter()
+            .map(|server| server["name"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["docs", "linear"], "{stdout}");
+        assert_eq!(stderr.lines().collect::<Vec<_>>(), broken, "{stderr}");
+        assert!(!format!("{stdout}{stderr}").contains("abc-SECRET"));
+
+        // The broken entry says what is wrong with it, by its name.
+        let (code, _stdout, stderr) = run(
+            temp.path(),
+            McpCommandRequest::Get {
+                name: "github".to_string(),
+                json: false,
+            },
+        );
+        assert_eq!(code, 1);
+        assert_eq!(stderr.trim_end(), broken[0]);
+
+        // The others work as ever.
+        let (code, stdout, stderr) = run(
+            temp.path(),
+            McpCommandRequest::Get {
+                name: "docs".to_string(),
+                json: false,
+            },
+        );
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("name: docs"), "{stdout}");
+        let (browser, _page) = test_browser();
+        let (code, stdout, stderr) = run_with_browser(
+            temp.path(),
+            McpCommandRequest::Login {
+                name: "linear".to_string(),
+            },
+            browser,
+        );
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(stdout.trim_end(), "logged in to MCP server linear");
+        let (code, stdout, stderr) = run(
+            temp.path(),
+            McpCommandRequest::Logout {
+                name: "linear".to_string(),
+            },
+        );
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(stdout.trim_end(), "logged out of MCP server linear");
     }
 
     #[test]

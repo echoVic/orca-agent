@@ -181,60 +181,102 @@ pub fn remove_user_mcp_server_in(dir: &Path, name: &str) -> io::Result<PathBuf> 
     })
 }
 
+/// The `mcp_servers` entries of a user config: the servers the ones that
+/// load are, and what is wrong with each of the others.
+#[derive(Debug)]
+pub struct UserMcpServers {
+    /// The config file they were read from.
+    pub path: PathBuf,
+    /// Each entry that loads, in the order of the file.
+    pub servers: Vec<McpServerConfig>,
+    /// Each entry that does not, in the order of the file.
+    pub invalid: Vec<InvalidMcpServerEntry>,
+}
+
+/// An `mcp_servers` entry that does not load as a server. One such entry
+/// leaves the others usable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidMcpServerEntry {
+    /// The entry's `name`, when it has one that reads as a name: a string,
+    /// with no control characters.
+    pub name: Option<String>,
+    /// What is wrong, and with which entry, by its place among the entries
+    /// (the first is 1) and its name: `<path>: invalid MCP server entry 2
+    /// ('github'): invalid type in `env`, expected a map`. It shows nothing
+    /// else the entry holds: `orca mcp list` and `get` print it, and a value
+    /// can be a secret.
+    pub message: String,
+}
+
 /// List every `mcp_servers` entry in the user-owned config.
-pub fn list_user_mcp_servers() -> io::Result<(PathBuf, Vec<McpServerConfig>)> {
+pub fn list_user_mcp_servers() -> io::Result<UserMcpServers> {
     let dir = resolve_config_dir()?;
     list_user_mcp_servers_in(&dir)
 }
 
 /// List every `mcp_servers` entry in the config file under `dir`. This never
-/// writes: a missing file yields an empty list instead of creating one.
+/// writes: a missing file yields an empty list instead of creating one. An
+/// entry that does not load is listed among the invalid ones, and the others
+/// are read all the same; only a file that is not TOML, or an
+/// `mcp_servers` that is not an array, is an error.
 ///
 /// The runtime loads the file with serde, so each entry is read that way
 /// too, as the `McpServerConfig` it loads as. However the entry is written,
 /// as a table with sub-tables (`[mcp_servers.env]`) or dotted keys, or
 /// inline, in `[[mcp_servers]]` tables or in an inline array, it reads back
 /// the same.
-pub fn list_user_mcp_servers_in(dir: &Path) -> io::Result<(PathBuf, Vec<McpServerConfig>)> {
+pub fn list_user_mcp_servers_in(dir: &Path) -> io::Result<UserMcpServers> {
     let path = user_config_path_in(dir);
-    let Some(content) = read_config_text(&path)? else {
-        return Ok((path, Vec::new()));
+    let mut listed = UserMcpServers {
+        path,
+        servers: Vec::new(),
+        invalid: Vec::new(),
+    };
+    let Some(content) = read_config_text(&listed.path)? else {
+        return Ok(listed);
     };
     let mut config: toml::Table = toml::from_str(&content).map_err(|error| {
         unparsable_config_error(
-            &path,
+            &listed.path,
             &syntax_error_text(error.message(), error.span(), &content),
         )
     })?;
-    let servers = match config.remove("mcp_servers") {
+    let entries = match config.remove("mcp_servers") {
         None => Vec::new(),
-        Some(toml::Value::Array(entries)) => entries
-            .into_iter()
-            .map(|entry| read_server_entry(&path, entry))
-            .collect::<io::Result<Vec<_>>>()?,
-        Some(_) => return Err(not_an_array_error(&path, "mcp_servers")),
+        Some(toml::Value::Array(entries)) => entries,
+        Some(_) => return Err(not_an_array_error(&listed.path, "mcp_servers")),
     };
-    Ok((path, servers))
+    for (index, entry) in entries.into_iter().enumerate() {
+        let name = entry
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .filter(|name| !name.chars().any(char::is_control))
+            .map(str::to_string);
+        match read_server_entry(entry) {
+            Ok(server) => listed.servers.push(server),
+            Err(reason) => {
+                let entry = match &name {
+                    Some(name) => format!("{} ('{name}')", index + 1),
+                    None => (index + 1).to_string(),
+                };
+                let message = format!(
+                    "{}: invalid MCP server entry {entry}: {reason}",
+                    listed.path.display()
+                );
+                listed.invalid.push(InvalidMcpServerEntry { name, message });
+            }
+        }
+    }
+    Ok(listed)
 }
 
 /// One `mcp_servers` entry as the server it loads as. When it does not load,
-/// the error says where and what was expected, and shows nothing the entry
-/// holds: `orca mcp list` and `get` print it, and a value can be a secret.
-fn read_server_entry(path: &Path, entry: toml::Value) -> io::Result<McpServerConfig> {
-    let invalid = |reason: &str| {
-        io::Error::other(format!(
-            "{}: invalid MCP server entry: {reason}",
-            path.display()
-        ))
-    };
+/// the error says where in the entry and what was expected, and shows
+/// nothing the entry holds.
+fn read_server_entry(entry: toml::Value) -> Result<McpServerConfig, String> {
     match entry {
-        toml::Value::Table(_) => entry
-            .try_into()
-            .map_err(|error| invalid(&data_error_text(&error))),
-        other => Err(invalid(&format!(
-            "expected a table, found {}",
-            other.type_str()
-        ))),
+        toml::Value::Table(_) => entry.try_into().map_err(|error| data_error_text(&error)),
+        other => Err(format!("expected a table, found {}", other.type_str())),
     }
 }
 
@@ -744,7 +786,7 @@ mod tests {
     }
 
     fn listed_names(dir: &Path) -> Vec<String> {
-        let (_, servers) = list_user_mcp_servers_in(dir).unwrap();
+        let servers = list_user_mcp_servers_in(dir).unwrap().servers;
         servers.into_iter().map(|server| server.name).collect()
     }
 
@@ -841,8 +883,13 @@ mod tests {
         )
         .unwrap();
 
-        let (listed_path, servers) = list_user_mcp_servers_in(dir.path()).unwrap();
+        let UserMcpServers {
+            path: listed_path,
+            servers,
+            invalid,
+        } = list_user_mcp_servers_in(dir.path()).unwrap();
         assert_eq!(listed_path, path);
+        assert_eq!(invalid, []);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "a");
         assert_eq!(servers[0].command.as_deref(), Some("x"));
@@ -898,7 +945,7 @@ mod tests {
         )
         .unwrap();
 
-        let (_, servers) = list_user_mcp_servers_in(dir.path()).unwrap();
+        let servers = list_user_mcp_servers_in(dir.path()).unwrap().servers;
 
         assert_eq!(servers.len(), 2);
         let docs = &servers[0];
@@ -1008,23 +1055,33 @@ mod tests {
 
     #[test]
     fn an_mcp_servers_value_that_is_not_a_list_of_tables_is_reported_and_kept() {
-        for (content, reported) in [
-            ("mcp_servers = \"docs\"\n", "is not an array of tables"),
-            (
-                "mcp_servers = [\"docs\"]\n",
-                "expected a table, found string",
-            ),
-            (
-                "[mcp_servers.docs]\ncommand = \"x\"\n",
-                "is not an array of tables",
-            ),
+        for content in [
+            "mcp_servers = \"docs\"\n",
+            "mcp_servers = [\"docs\"]\n",
+            "[mcp_servers.docs]\ncommand = \"x\"\n",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join(USER_CONFIG_FILE);
             std::fs::write(&path, content).unwrap();
 
-            let error = list_user_mcp_servers_in(dir.path()).unwrap_err();
-            assert!(error.to_string().contains(reported), "{content}: {error}");
+            // An array is read entry by entry; anything else is no list.
+            match list_user_mcp_servers_in(dir.path()) {
+                Ok(listed) => assert_eq!(
+                    listed.invalid,
+                    [InvalidMcpServerEntry {
+                        name: None,
+                        message: format!(
+                            "{}: invalid MCP server entry 1: expected a table, found string",
+                            path.display()
+                        ),
+                    }],
+                    "{content}"
+                ),
+                Err(error) => assert!(
+                    error.to_string().contains("is not an array of tables"),
+                    "{content}: {error}"
+                ),
+            }
             let error = add_user_mcp_server_in(dir.path(), &stdio_server("b", "y")).unwrap_err();
             assert!(
                 error.to_string().contains("is not an array of tables"),
@@ -1090,7 +1147,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join(USER_CONFIG_FILE), &form).unwrap();
 
-            let (_, servers) = list_user_mcp_servers_in(dir.path()).unwrap();
+            let servers = list_user_mcp_servers_in(dir.path()).unwrap().servers;
 
             assert_eq!(servers.len(), 1, "{form}");
             let docs = &servers[0];
@@ -1116,9 +1173,14 @@ mod tests {
         let path = dir.path().join(USER_CONFIG_FILE);
 
         // No file is no servers, and no file is made.
-        let (listed_path, servers) = list_user_mcp_servers_in(dir.path()).unwrap();
+        let UserMcpServers {
+            path: listed_path,
+            servers,
+            invalid,
+        } = list_user_mcp_servers_in(dir.path()).unwrap();
         assert_eq!(listed_path, path);
         assert!(servers.is_empty());
+        assert!(invalid.is_empty());
         assert!(!path.exists());
         assert!(!user_config_lock_path_in(dir.path()).exists());
 
@@ -1133,24 +1195,59 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "model = [\n");
     }
 
+    /// An entry that does not load is named by its place among the entries,
+    /// and by its name when it has one that reads as a name, and the entries
+    /// around it still load, however the file writes them.
     #[test]
-    fn an_mcp_server_entry_that_does_not_load_is_reported() {
-        for (content, reason) in [
-            ("[[mcp_servers]]\ncommand = \"x\"\n", "missing field `name`"),
-            (
-                "mcp_servers = [{ name = \"a\", args = \"-y\" }]\n",
-                "invalid type in `args`, expected a sequence",
-            ),
-        ] {
+    fn an_mcp_server_entry_that_does_not_load_is_named_and_the_others_still_load() {
+        let tables = concat!(
+            "[[mcp_servers]]\nname = \"docs\"\ncommand = \"x\"\n\n",
+            "[[mcp_servers]]\ncommand = \"x\"\n\n",
+            "[[mcp_servers]]\nname = \"github\"\ncommand = \"x\"\nargs = \"-y\"\n\n",
+            "[[mcp_servers]]\nname = 5\ncommand = \"x\"\n\n",
+            "[[mcp_servers]]\nname = \"bad\\nname\"\ncommand = \"x\"\nargs = \"-y\"\n\n",
+            "[[mcp_servers]]\nname = \"web\"\ncommand = \"y\"\n",
+        );
+        let inline = concat!(
+            "mcp_servers = [\n",
+            "  { name = \"docs\", command = \"x\" },\n",
+            "  { command = \"x\" },\n",
+            "  { name = \"github\", command = \"x\", args = \"-y\" },\n",
+            "  { name = 5, command = \"x\" },\n",
+            "  { name = \"bad\\nname\", command = \"x\", args = \"-y\" },\n",
+            "  { name = \"web\", command = \"y\" },\n",
+            "]\n",
+        );
+        for content in [tables, inline] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join(USER_CONFIG_FILE);
             std::fs::write(&path, content).unwrap();
 
-            let error = list_user_mcp_servers_in(dir.path()).unwrap_err();
+            let listed = list_user_mcp_servers_in(dir.path()).unwrap();
 
+            let names = listed
+                .servers
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["docs", "web"], "{content}");
+            let invalid = |name: Option<&str>, message: &str| InvalidMcpServerEntry {
+                name: name.map(str::to_string),
+                message: format!("{}: invalid MCP server entry {message}", path.display()),
+            };
             assert_eq!(
-                error.to_string(),
-                format!("{}: invalid MCP server entry: {reason}", path.display())
+                listed.invalid,
+                [
+                    invalid(None, "2: missing field `name`"),
+                    invalid(
+                        Some("github"),
+                        "3 ('github'): invalid type in `args`, expected a sequence"
+                    ),
+                    invalid(None, "4: invalid type in `name`, expected a string"),
+                    // A name that does not read as one is not shown.
+                    invalid(None, "5: invalid type in `args`, expected a sequence"),
+                ],
+                "{content}"
             );
         }
     }
@@ -1229,14 +1326,21 @@ mod tests {
             )
             .unwrap();
 
-            let error = list_user_mcp_servers_in(dir.path()).unwrap_err();
+            let listed = list_user_mcp_servers_in(dir.path()).unwrap();
 
+            assert!(listed.servers.is_empty(), "{entry}");
+            let [invalid] = listed.invalid.as_slice() else {
+                panic!("{entry}: {:?}", listed.invalid);
+            };
             assert_eq!(
-                error.to_string(),
-                format!("{}: invalid MCP server entry: {reported}", path.display()),
+                invalid.message,
+                format!(
+                    "{}: invalid MCP server entry 1 ('a'): {reported}",
+                    path.display()
+                ),
                 "{entry}"
             );
-            assert!(!error.to_string().contains(value), "{entry}: {error}");
+            assert!(!invalid.message.contains(value), "{entry}: {invalid:?}");
         }
     }
 
@@ -1305,7 +1409,7 @@ mod tests {
         remove_user_mcp_server_in(dir.path(), "a").unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(!content.contains("A_KEY"), "{content}");
-        let (_, servers) = list_user_mcp_servers_in(dir.path()).unwrap();
+        let servers = list_user_mcp_servers_in(dir.path()).unwrap().servers;
         assert_eq!(servers.len(), 1, "{content}");
         assert_eq!(servers[0].env["C_KEY"], "3", "{content}");
 
@@ -1313,7 +1417,7 @@ mod tests {
         // take them.
         add_user_mcp_server_in(dir.path(), &stdio_server("b", "y")).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
-        let (_, servers) = list_user_mcp_servers_in(dir.path()).unwrap();
+        let servers = list_user_mcp_servers_in(dir.path()).unwrap().servers;
         assert_eq!(listed_names(dir.path()), ["c", "b"], "{content}");
         assert_eq!(servers[0].env["C_KEY"], "3", "{content}");
         assert!(servers[1].env.is_empty(), "{content}");

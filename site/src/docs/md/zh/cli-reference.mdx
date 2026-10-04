@@ -172,6 +172,18 @@ orca mcp logout NAME
 `bearer: $VAR`、`static header`，stdio 服务器则是 `-`），绝不显示 token。`get` 还会
 显示 `enabled_tools` 和 `disabled_tools`：没设置的显示 `-`，空列表显示 `none`。
 
+某个条目读不成服务器时（比如缺少 `name`，或某个值的类型不对），不会连带其他条目。
+`list` 照常列出能读的服务器，在 stderr 上逐个指出出错的条目：按它在 `mcp_servers`
+里排第几，有名字时再加上名字，然后以状态码 1 退出：
+
+```text
+orca: /home/me/.orca/config.toml: invalid MCP server entry 2 ('github'): invalid type in `env`, expected a map
+```
+
+对这个名字执行 `get` 也显示同样的信息，对其他服务器的 `get`、`login`、`logout` 照常
+可用。提示只说条目哪里不对，绝不显示它的值。会话不会加载这样的配置：Orca 会给出警告，
+改用默认设置启动，所以条目修好之前，MCP 服务器都不会连接。
+
 `login` 会在浏览器里打开服务器的授权页面，并把地址打印出来以防没有自动打开；
 对 stdio 服务器，或配置了静态 `Authorization` 请求头、`bearer_token_env_var` 的
 服务器，它会拒绝执行，因为这些服务器不使用 OAuth。`logout` 删除保存的登录；
