@@ -51,14 +51,15 @@ impl fmt::Debug for PrestartedMcp {
 /// not started yet. `event_tx` hears of each change, as
 /// `McpCatalogPrestart`, starting with how they stand now, and, once none
 /// is still connecting, what their startup left to report, as
-/// `StartupWarning`. `None` when no server is enabled: there is nothing to
-/// connect.
+/// `StartupWarning`. A disabled server is listed, as the thread's catalog
+/// lists it, and never connected. `None` when the config has no MCP server:
+/// there is nothing to list.
 pub(crate) fn start_prestart_mcp(
     configs: &[McpServerConfig],
     credentials_path: Option<PathBuf>,
     event_tx: mpsc::Sender<TuiEvent>,
 ) -> Option<PrestartedMcp> {
-    if configs.iter().all(|config| config.disabled) {
+    if configs.is_empty() {
         return None;
     }
     let registry = orca_mcp::initialize_registry(configs, credentials_path);
@@ -185,18 +186,70 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn no_enabled_server_starts_nothing() {
+    fn no_configured_server_starts_nothing() {
         let (event_tx, events) = crossbeam_channel::unbounded();
-        let disabled = McpServerConfig {
-            name: "archive".to_string(),
-            command: Some("/bin/sh".to_string()),
+
+        assert!(start_prestart_mcp(&[], None, event_tx).is_none());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn before_the_first_message_disabled_servers_are_listed() {
+        let (event_tx, events) = crossbeam_channel::unbounded();
+        // Never run: it is disabled.
+        let archive = McpServerConfig {
+            name: "Archive".to_string(),
+            command: Some("archive-mcp-server".to_string()),
             disabled: true,
             ..McpServerConfig::default()
         };
 
-        assert!(start_prestart_mcp(&[], None, event_tx.clone()).is_none());
-        assert!(start_prestart_mcp(&[disabled], None, event_tx).is_none());
-        assert!(events.try_recv().is_err());
+        // The panel lists it from launch, as the thread's catalog will,
+        // though nothing connects.
+        let prestarted = start_prestart_mcp(std::slice::from_ref(&archive), None, event_tx)
+            .expect("a configured server is listed before the first message");
+        assert!(!prestarted.registry().is_starting());
+        let mut state = app_state();
+        for event in events.try_iter() {
+            state.update(event);
+        }
+        assert_eq!(
+            state.mcp_catalog,
+            catalog("archive", McpServerStatusView::Disabled)
+        );
+
+        let mut config = crate::test_support::test_run_config();
+        config.mcp_servers = vec![archive];
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let action_tx = state.event_tx.clone();
+        crate::slash_command_actions::handle_slash_command(
+            "/mcp",
+            &mut config,
+            &shared,
+            &mut state,
+            &action_tx,
+        );
+        let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = tui_textarea::TextArea::default();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(
+            screen
+                .iter()
+                .any(|row| row.contains("› Archive") && row.contains("disabled")),
+            "{}",
+            screen.join("\n")
+        );
     }
 
     #[test]

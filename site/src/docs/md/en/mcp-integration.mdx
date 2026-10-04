@@ -124,8 +124,9 @@ up the change by reconnecting the server from the `/mcp` panel.
 
 A session's servers connect in the background, all at once, as the session
 starts: the interactive TUI starts them as soon as it opens, before your
-first message. A server is `starting` until it connects, fails, or turns out
-to need a login, and each request it is sent while connecting
+first message. An enabled server is `starting` until it connects, fails, or
+turns out to need a login (a disabled one is listed as `disabled` and never
+connected), and each request it is sent while connecting
 (`initialize`, `tools/list`, `prompts/list`) is bounded by its
 `startup_timeout_ms`, 30 seconds unless set. A turn waits, before its first
 model request, only for the servers still connecting, so the model is

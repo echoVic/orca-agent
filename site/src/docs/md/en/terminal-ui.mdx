@@ -246,8 +246,9 @@ logs in with OAuth; see
 `/mcp` opens between turns. The servers of the configuration Orca started
 with begin connecting as soon as the TUI opens, all at once and in the
 background, so the panel shows them from the start, before your first
-message too: each reads `starting` until it connects, fails, or needs a
-login, and its details list its tools and prompts once it has connected.
+message too: each enabled one reads `starting` until it connects, fails, or
+needs a login, and its details list its tools and prompts once it has
+connected; a disabled one reads `disabled` and is never connected.
 `r`, `l`, and `o` work right away, and the conversation your first message
 starts takes the servers over as they are, without connecting them again;
 quitting before then stops them. A server added with `orca mcp add` while
