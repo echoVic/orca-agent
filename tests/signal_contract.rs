@@ -166,3 +166,102 @@ fn sigint_cancels_the_running_command_and_commits_a_terminal() {
 fn sigterm_cancels_the_running_command_and_commits_a_terminal() {
     run_interrupted("TERM", 143);
 }
+
+/// `orca exec` with a stdio MCP server, configured in `fixture`'s ORCA_HOME,
+/// that reads nothing for `SLEEP_SECONDS`: the run waits for it to connect.
+/// Text output waits before the turn; JSONL output waits inside it. The
+/// server writes its pid to `<cwd>/mcp.pid` only after two seconds, by which
+/// time `orca` has long installed its signal handler: a signal before that
+/// would end it as any process, without its cleanup.
+fn spawn_orca_with_a_slow_mcp_server(fixture: &Fixture, output_format: &str) -> Child {
+    let script = fixture.cwd.path().join("slow-mcp.sh");
+    fs::write(
+        &script,
+        format!(
+            "sleep 2\nprintf '%s\\n' \"$$\" > \"$1/mcp.pid\"\nsleep {SLEEP_SECONDS}\nwhile IFS= read -r line; do :; done\n"
+        ),
+    )
+    .expect("write the MCP server");
+    fs::write(
+        fixture._home.path().join("config.toml"),
+        format!(
+            "[[mcp_servers]]\nname = \"slow\"\ntransport = \"stdio\"\ncommand = \"/bin/sh\"\nargs = [{:?}, {:?}]\n",
+            script.display().to_string(),
+            fixture.cwd.path().display().to_string(),
+        ),
+    )
+    .expect("configure the MCP server");
+    Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--provider",
+            "mock",
+            "--output-format",
+            output_format,
+            "--no-history",
+            "--cwd",
+        ])
+        .arg(fixture.cwd.path())
+        .arg("--")
+        .arg("hello")
+        .env("ORCA_HOME", fixture._home.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca")
+}
+
+fn sigint_while_waiting_for_mcp_servers_stops_them(output_format: &str) {
+    let fixture = Fixture::new();
+    let child = spawn_orca_with_a_slow_mcp_server(&fixture, output_format);
+    let pid_file = fixture.cwd.path().join("mcp.pid");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let server_pid = loop {
+        if let Ok(text) = fs::read_to_string(&pid_file)
+            && let Ok(pid) = text.trim().parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the MCP server never started");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .expect("send SIGINT");
+    let output = child.wait_with_output().expect("wait for orca");
+
+    // It was still connecting, and would have read nothing for a minute.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while process_is_alive(server_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survived = process_is_alive(server_pid);
+    if survived {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{server_pid}")])
+            .status();
+    }
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !survived,
+        "SIGINT left the MCP server (pid {server_pid}) running after orca exited"
+    );
+}
+
+#[test]
+fn sigint_during_the_mcp_startup_wait_stops_the_servers() {
+    sigint_while_waiting_for_mcp_servers_stops_them("text");
+}
+
+#[test]
+fn sigint_while_a_turn_waits_for_mcp_servers_stops_them() {
+    sigint_while_waiting_for_mcp_servers_stops_them("jsonl");
+}

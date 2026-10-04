@@ -56,9 +56,9 @@ pub(crate) fn ensure_hosted_thread(
             &TuiSurfaceActions::new(started.typed_surface()),
             event_tx,
         );
-        *thread = Some(started);
         // The thread has the MCP servers that started with the TUI now.
-        drop(control.take_prestart_mcp());
+        control.hand_over_prestart_mcp(&started);
+        *thread = Some(started);
     }
     Ok(())
 }
@@ -97,7 +97,7 @@ pub(crate) fn start_new_hosted_session(
         preloaded,
         pending_workflow_notifications,
     )?;
-    drop(control.take_prestart_mcp());
+    control.hand_over_prestart_mcp(thread.as_ref().expect("installed hosted thread"));
     Ok(projection)
 }
 
@@ -268,7 +268,7 @@ pub(crate) fn start_forked_hosted_session(
         preloaded,
         pending_workflow_notifications,
     )?;
-    drop(control.take_prestart_mcp());
+    control.hand_over_prestart_mcp(thread.as_ref().expect("installed hosted thread"));
     Ok((mode, projection))
 }
 
@@ -322,7 +322,7 @@ pub(crate) fn switch_saved_hosted_session(
         preloaded,
         pending_workflow_notifications,
     )?;
-    drop(control.take_prestart_mcp());
+    control.hand_over_prestart_mcp(thread.as_ref().expect("installed hosted thread"));
     Ok((mode, projection))
 }
 
@@ -694,7 +694,7 @@ pub(crate) fn resume_latest_active_goal_hosted(
         let _ = event_tx.send(TuiEvent::Error(error));
         return;
     }
-    drop(control.take_prestart_mcp());
+    control.hand_over_prestart_mcp(thread.as_ref().expect("restored goal thread"));
     if let Some(runtime_thread) = thread.as_ref() {
         let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
         if let Err(error) = actions.resume_goal_and_run_with_started(

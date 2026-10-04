@@ -1601,7 +1601,10 @@ fn run_inner<W: io::Write>(
     }
     if let Some(exit_code) = interrupted_exit_code(&interrupted) {
         // The signal arrived before the turn was admitted: stop here instead of
-        // starting work the operator has already cancelled.
+        // starting work the operator has already cancelled. The MCP servers
+        // stop first, those still connecting too: the signal thread holds
+        // the thread, and its registry, until the process exits.
+        thread.mcp_registry().close();
         let _ = host.shutdown();
         return Ok(exit_code);
     }

@@ -1063,8 +1063,9 @@ pub(crate) fn hosted_tui_controller_loop(
         let _ = runtime_thread.shutdown();
     }
     // Quitting before a thread took the MCP servers that started with the
-    // TUI stops them; after, the thread's go with it.
-    drop(control.take_prestart_mcp());
+    // TUI stops them, those still connecting too; after, the thread stops
+    // them as it ends.
+    control.close_prestart_mcp();
     control.release_runtime_thread();
 }
 

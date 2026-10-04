@@ -30,7 +30,8 @@ pub(crate) const WAIT: Duration = Duration::from_secs(20);
 /// `dir`. It adds its process id to `<dir>/pids` as it starts, waits
 /// `delay_secs`, and then offers one tool, `search`, and one prompt,
 /// `review_pr <pr>`, which it expands to "Review pull request <pr>."
-/// While `<dir>/refuse` exists, it exits at once instead.
+/// While `<dir>/refuse` exists, it exits at once instead, and while
+/// `<dir>/silent` exists, it never answers.
 #[cfg(unix)]
 pub(crate) fn mcp_server(name: &str, dir: &Path, delay_secs: u64) -> McpServerConfig {
     let script = dir.join("server.sh");
@@ -39,6 +40,10 @@ pub(crate) fn mcp_server(name: &str, dir: &Path, delay_secs: u64) -> McpServerCo
         r#"state_dir="$1"
 printf '%s\n' "$$" >> "$state_dir/pids"
 [ -f "$state_dir/refuse" ] && exit 0
+if [ -f "$state_dir/silent" ]; then
+  while IFS= read -r line; do :; done
+  exit 0
+fi
 sleep "$2"
 while IFS= read -r line; do
   id=${line#*'"id":'}

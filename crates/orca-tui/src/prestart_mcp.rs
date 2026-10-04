@@ -3,7 +3,8 @@
 //! servers start with the TUI: they connect in the background, `/mcp` shows
 //! them as they do and acts on them, and their prompts run, all before the
 //! first message. The first thread to start then takes them over, so none
-//! connects twice; quitting before that stops them.
+//! connects twice, and stops them when it ends; quitting before that stops
+//! them, those still connecting too.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -31,10 +32,10 @@ impl PrestartedMcp {
         &self.registry
     }
 
-    /// The servers, for a thread to take: the renderer hears no more of
-    /// them from here.
-    pub(crate) fn into_registry(self) -> McpRegistry {
-        self.registry
+    /// Stops the servers, those still connecting too, however many workers
+    /// still hold them: the renderer hears no more of them.
+    pub(crate) fn close(self) {
+        self.registry.close();
     }
 }
 
@@ -124,8 +125,9 @@ pub(crate) enum McpServers {
 /// `request`, with the MCP servers that started with the TUI while no
 /// thread has taken them yet. They are only lent: once the thread has
 /// started, and is the conversation's, the caller hands them over with
-/// [`TuiSurfaceTaskControl::take_prestart_mcp`]. Until then, a start that
-/// fails leaves them running for the next.
+/// [`TuiSurfaceTaskControl::hand_over_prestart_mcp`]. Until then, a start
+/// that fails, or a thread shut down before then, leaves them running for
+/// the next.
 pub(crate) fn offer_prestarted_mcp(
     request: RuntimeThreadStartRequest,
     control: &TuiSurfaceTaskControl,
@@ -502,12 +504,12 @@ mod tests {
         fn quitting_while_servers_are_still_starting_stops_them() {
             let home = crate::test_support::isolate_orca_home();
             let fixtures = [(); 3].map(|_| tempfile::tempdir().unwrap());
-            // Each answers `initialize` two seconds after it starts, well
-            // within its startup timeout.
+            // Each answers `initialize` only after its startup timeout, so
+            // its connection would wait that long for it.
             let servers = fixtures
                 .iter()
                 .enumerate()
-                .map(|(index, fixture)| mcp_server(&format!("slow{index}"), fixture.path(), 2))
+                .map(|(index, fixture)| mcp_server(&format!("slow{index}"), fixture.path(), 30))
                 .collect();
             let mut tui = Tui::start(config(home.path(), servers));
             let pids = fixtures
@@ -535,9 +537,38 @@ mod tests {
 
             tui.quit();
 
-            // A connection under way ends with its server's answer, once
-            // nothing wants it: none outlives its two seconds by much.
-            wait_until_gone(&pids, Duration::from_millis(2_500));
+            // Quitting stopped them, though their connections were still
+            // under way, on threads `orca` does not wait for as it exits.
+            wait_until_gone(&pids, Duration::from_secs(1));
+        }
+
+        #[test]
+        fn quitting_while_the_thread_reconnects_a_server_stops_it() {
+            let home = crate::test_support::isolate_orca_home();
+            let fixture = tempfile::tempdir().unwrap();
+            let mut tui = Tui::start(config(
+                home.path(),
+                vec![mcp_server("docs", fixture.path(), 0)],
+            ));
+            tui.until("the server to connect", |state| connected(state, "docs"));
+            tui.send("hello");
+            tui.until_event("the first turn to end", |event| {
+                matches!(event, TuiEvent::SessionCompleted { .. })
+            });
+            tui.thread_catalog(thread_lists_docs_connected);
+            // Its next start never answers.
+            std::fs::write(fixture.path().join("silent"), "").expect("silence the server");
+
+            tui.command("/mcp");
+            tui.press('r');
+            let pids = wait_for_launches(fixture.path(), 2);
+
+            tui.quit();
+
+            // The thread took the servers over, and stopped them as it
+            // ended: the one its reconnect was still starting too, which the
+            // reconnect's worker still held.
+            wait_until_gone(&pids, Duration::from_secs(1));
         }
 
         #[test]

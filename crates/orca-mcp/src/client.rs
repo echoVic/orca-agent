@@ -24,6 +24,9 @@ use orca_core::tool_images::tool_image;
 /// so a server reconnected through any clone serves every holder's next
 /// call. Each server connects in the background, on a thread of its own;
 /// [`McpRegistry::subscribe`] hears of each change.
+///
+/// Its servers stop once the last clone is dropped, those still connecting
+/// too, or as soon as one holder closes it ([`McpRegistry::close`]).
 #[derive(Clone, Default)]
 pub struct McpRegistry {
     shared: Arc<McpRegistryShared>,
@@ -43,6 +46,19 @@ impl McpRegistryShared {
         self.subscribers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Drop for McpRegistryShared {
+    fn drop(&mut self) {
+        // The last clone is gone, so no one can use a server any more. A
+        // connection still being made is stopped now: its thread holds the
+        // registry only weakly, and the process may be about to exit, which
+        // would end the thread and leave its server running.
+        let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
+        for server in &inner.servers {
+            server.stop.stop();
+        }
     }
 }
 
@@ -117,6 +133,9 @@ struct McpRegistryInner {
     errors: Vec<String>,
     /// Where a connection looks for a stored OAuth login.
     credentials_path: Option<PathBuf>,
+    /// Whether the registry was closed ([`McpRegistry::close`]): its servers
+    /// are stopped for good, and no connection is put in place any more.
+    closed: bool,
 }
 
 #[derive(Clone)]
@@ -156,8 +175,11 @@ impl McpRegistryInner {
     }
 
     /// The index of `server_name`, while connection attempt `generation` is
-    /// still the one it takes its state from.
+    /// still the one it takes its state from, and the registry is open.
     fn current_attempt(&self, server_name: &str, generation: u64) -> Option<usize> {
+        if self.closed {
+            return None;
+        }
         self.servers
             .iter()
             .position(|server| server.name == server_name && server.generation == generation)
@@ -252,9 +274,7 @@ impl McpConnectionStop {
     ) -> Result<Arc<dyn McpTransport>, String> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.stopped {
-            return Err(format!(
-                "MCP server '{server_name}' was stopped to be reconnected"
-            ));
+            return Err(format!("MCP server '{server_name}' was stopped"));
         }
         let transport = Arc::<dyn McpTransport>::from(start()?);
         state.transport = Some(Arc::downgrade(&transport));
@@ -736,8 +756,9 @@ impl McpRegistry {
 
     /// Connects `server_name` with `config`, its first connection, under
     /// `stop`, on a thread of its own. The thread holds the registry
-    /// weakly: once every holder has dropped the registry, the connection
-    /// it makes is dropped too, which stops the server.
+    /// weakly, so it keeps no server running: once every holder has dropped
+    /// the registry, or one has closed it, `stop` stops the server at once,
+    /// and the connection, should it still be made, is dropped.
     fn connect_in_background(
         &self,
         server_name: String,
@@ -775,10 +796,11 @@ impl McpRegistry {
     }
 
     /// Puts what connection attempt `generation` of `server_name` came to
-    /// in place, unless a newer attempt has started since, and returns how
-    /// it went. Subscribers hear of the change once the lock is released.
-    /// The client it replaced, or the connection of an overtaken attempt,
-    /// is dropped after that, which stops its server.
+    /// in place, unless a newer attempt has started since, or the registry
+    /// was closed, and returns how it went. Subscribers hear of the change
+    /// once the lock is released. The client it replaced, or the connection
+    /// of an overtaken attempt, is dropped after that, which stops its
+    /// server.
     fn finish_connecting(
         &self,
         server_name: &str,
@@ -837,6 +859,51 @@ impl McpRegistry {
             }
             std::thread::sleep(STARTUP_POLL);
         }
+    }
+
+    /// Stops every server for good, through every clone: each stdio server's
+    /// process is ended at once, those still connecting or reconnecting
+    /// too, and a connection made after this is dropped. From then on each
+    /// server is [`McpServerState::Failed`], none has a client, tools or
+    /// prompts, and none can be reconnected. Dropping the last clone stops
+    /// the servers too; an owner that is done with the registry closes it,
+    /// as a clone may outlive it on a thread that the process ends without
+    /// waiting for. Subscribers are not told: the registry is done.
+    pub fn close(&self) {
+        let (stops, clients) = {
+            let mut inner = self.write();
+            if inner.closed {
+                return;
+            }
+            inner.closed = true;
+            for server in &mut inner.servers {
+                if server.state != McpServerState::Disabled {
+                    server.state = McpServerState::Failed {
+                        message: format!("MCP server '{}' was stopped", server.name),
+                    };
+                }
+                server.tools.clear();
+                server.prompts.clear();
+                server.prompts_error = None;
+            }
+            inner.index_tools();
+            let stops = inner
+                .servers
+                .iter()
+                .map(|server| Arc::clone(&server.stop))
+                .collect::<Vec<_>>();
+            (stops, std::mem::take(&mut inner.clients))
+        };
+        // Stopping a server waits for its process to end, so no lock is held.
+        for stop in stops {
+            stop.stop();
+        }
+        drop(clients);
+    }
+
+    /// Whether `other` is a clone of this registry.
+    pub fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
     }
 
     /// The connected client of `server`.
@@ -1094,7 +1161,8 @@ impl McpRegistry {
     /// client until the new one is in, and is [`McpServerState::Starting`]
     /// meanwhile, which subscribers hear. A connection still being made for
     /// it is stopped too. A remote server keeps serving through its client,
-    /// and keeps its state, until the new one replaces it.
+    /// and keeps its state, until the new one replaces it. A closed registry
+    /// reconnects nothing.
     pub fn reconnect_server(&self, name: &str) -> Result<(), String> {
         let server_name = canonical_mcp_name(name);
         let (config, credentials_path, generation, stop, stopped, now_starting) = {
@@ -1107,6 +1175,9 @@ impl McpRegistry {
                 .ok_or_else(|| format!("no MCP server named '{name}'"))?;
             if server.config.disabled {
                 return Err(format!("MCP server '{name}' is disabled"));
+            }
+            if inner.closed {
+                return Err(format!("MCP server '{name}' was stopped"));
             }
             server.generation += 1;
             let stop = Arc::new(McpConnectionStop::default());
@@ -4790,27 +4861,60 @@ done
         assert_eq!(starts(temp_dir.path(), "x"), 2);
     }
 
+    /// A stdio server that adds its pid to `<dir>/<name>/starts` as it
+    /// starts, and then reads what it is sent without ever answering, so
+    /// that it is connecting until it is stopped, or until its startup
+    /// timeout.
+    #[cfg(unix)]
+    fn silent_server_config(name: &str, dir: &std::path::Path) -> McpServerConfig {
+        let state = dir.join(name);
+        std::fs::create_dir_all(&state).expect("state dir");
+        let script = dir.join(format!("{name}.sh"));
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> \"$1/starts\"\nwhile IFS= read -r line; do :; done\n",
+        )
+        .expect("write MCP fixture");
+        let mut config = stdio_fixture_config(name, &script);
+        config.args.push(state.to_string_lossy().into_owned());
+        config
+    }
+
+    /// Fails the test, saying `what`, unless the process `pid` is gone
+    /// within half a second.
+    #[cfg(unix)]
+    fn assert_gone_soon(pid: &str, what: &str) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while process_is_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "{what}: process {pid} still runs"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn dropping_the_registry_stops_a_server_that_connects_later() {
+    fn dropping_the_registry_stops_a_server_still_connecting() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let config = listing_server_config("slow", temp_dir.path(), "[]");
-        delay_starts(temp_dir.path(), "slow", 1);
-        let registry = initialize_registry(&[config], None);
+        let registry =
+            initialize_registry(&[silent_server_config("silent", temp_dir.path())], None);
         wait_for("the server to start", || {
-            start_pids(temp_dir.path(), "slow").len() == 1
+            starts(temp_dir.path(), "silent") == 1
         });
-        let pid = start_pids(temp_dir.path(), "slow").remove(0);
+        let pid = start_pids(temp_dir.path(), "silent").remove(0);
         assert_eq!(
             registry.server_statuses(),
-            [status("slow", McpServerState::Starting)]
+            [status("silent", McpServerState::Starting)]
         );
 
         drop(registry);
 
-        // The server answers after a second; its connection then has no
-        // registry to join.
-        wait_for("the server to stop", || !process_is_alive(&pid));
+        // Its connection would have waited for `initialize` for its whole
+        // startup timeout, on a thread a process that exits does not wait
+        // for.
+        assert_gone_soon(&pid, "the server outlived the registry");
     }
 
     #[cfg(unix)]
@@ -4818,8 +4922,7 @@ done
     fn dropping_the_registry_keeps_no_strong_reference_in_connect_threads() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let fast = listing_server_config("fast", temp_dir.path(), "[]");
-        let slow = listing_server_config("slow", temp_dir.path(), "[]");
-        delay_starts(temp_dir.path(), "slow", 2);
+        let slow = silent_server_config("slow", temp_dir.path());
         let registry = initialize_registry(&[fast, slow], None);
         wait_for("the fast server to connect", || {
             registry.server_statuses()[0].state == McpServerState::Ready
@@ -4829,25 +4932,117 @@ done
         });
         let fast = start_pids(temp_dir.path(), "fast").remove(0);
         let slow = start_pids(temp_dir.path(), "slow").remove(0);
-        let dropped = Instant::now();
+        assert!(registry.is_starting());
 
         drop(registry);
 
-        // The slow server's thread goes on connecting for two seconds: had it
-        // held the registry, the fast server's connection would have lived
-        // as long.
-        while process_is_alive(&fast) {
-            assert!(
-                dropped.elapsed() < Duration::from_secs(1),
-                "the fast server outlived the registry while the slow one was starting"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            process_is_alive(&slow),
-            "the slow server answered before the fast one stopped"
+        // Had the slow server's thread, still connecting, held the registry,
+        // this would not have been the last holder, and neither server would
+        // have stopped.
+        assert_gone_soon(&fast, "the fast server outlived the registry");
+        assert_gone_soon(&slow, "the slow server outlived the registry");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_the_registry_stops_its_servers_whoever_still_holds_it() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let echo = r#"[{"name":"echo","inputSchema":{"type":"object"}}]"#;
+        let registry = initialize_registry(
+            &[
+                listing_server_config("ready", temp_dir.path(), echo),
+                silent_server_config("silent", temp_dir.path()),
+            ],
+            None,
         );
-        wait_for("the slow server to stop", || !process_is_alive(&slow));
+        wait_for("the ready server to connect", || {
+            registry.server_statuses()[0].state == McpServerState::Ready
+        });
+        wait_for("the silent server to start", || {
+            starts(temp_dir.path(), "silent") == 1
+        });
+        let ready = start_pids(temp_dir.path(), "ready").remove(0);
+        let silent = start_pids(temp_dir.path(), "silent").remove(0);
+        // Another holder, as a worker that the process does not wait for
+        // when it exits.
+        let holder = registry.clone();
+        let (_subscription, changes) = count_changes(&registry);
+
+        registry.close();
+
+        assert_gone_soon(&ready, "the connected server outlived the close");
+        assert_gone_soon(&silent, "the server still connecting outlived the close");
+        let stopped = |name: &str| {
+            status(
+                name,
+                McpServerState::Failed {
+                    message: format!("MCP server '{name}' was stopped"),
+                },
+            )
+        };
+        assert_eq!(
+            holder.server_statuses(),
+            [stopped("ready"), stopped("silent")]
+        );
+        assert!(holder.wait_for_startup(&|| true), "a server is starting");
+        assert!(holder.tools().is_empty());
+        assert_eq!(
+            holder.reconnect_server("ready"),
+            Err("MCP server 'ready' was stopped".to_string())
+        );
+        assert_eq!(
+            starts(temp_dir.path(), "ready"),
+            1,
+            "a server started again"
+        );
+        assert_eq!(changes.load(Ordering::SeqCst), 0, "a subscriber was told");
+
+        // A connection that is made all the same, as one to a remote server
+        // can be, is dropped.
+        struct EchoTransport;
+
+        impl McpTransport for EchoTransport {
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"capabilities": {}}))
+            }
+
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": [
+                    {"name": "echo", "inputSchema": {"type": "object"}}
+                ]}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+        }
+        let late = connect_server_with_transport(
+            &McpServerConfig {
+                name: "ready".to_string(),
+                ..Default::default()
+            },
+            "ready",
+            None,
+            Arc::new(EchoTransport),
+            Arc::default(),
+        );
+        assert!(late.is_ok());
+        let _ = holder.finish_connecting("ready", FIRST_CONNECTION, late);
+        assert_eq!(holder.server_statuses()[0], stopped("ready"));
+        assert!(holder.tools().is_empty());
+        assert!(holder.client("ready").is_none());
     }
 
     #[cfg(unix)]

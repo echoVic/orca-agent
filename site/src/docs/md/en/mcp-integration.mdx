@@ -135,8 +135,9 @@ model request, only for the servers still connecting, so the model is
 offered every tool they bring; the TUI's status line says
 `connecting MCP servers` meanwhile, and `Esc` interrupts the turn, wait
 included. The conversation your first message starts in the TUI takes over
-the servers already connected rather than connecting them again; quitting
-before then stops them.
+the servers as they stand, connected or still connecting, rather than
+connecting them again. Quitting stops every stdio server, those still
+connecting too, and so does `Ctrl+C` while `orca exec` waits for them.
 
 ## Manage servers in the TUI
 

@@ -765,6 +765,114 @@ fn tui_recap_command_draws_the_strip_and_detail_and_esc_closes_the_detail() {
     assert_eq!(status.code(), Some(130), "TUI exited with {status}");
 }
 
+#[test]
+fn tui_quit_stops_an_mcp_server_that_is_still_starting() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let fixture = tempfile::tempdir().expect("MCP fixture directory");
+    let server = SlowMcpServer::configure(home.path(), fixture.path());
+    let mut process =
+        PtyProcess::spawn_without_prompt(home.path(), cwd.path()).expect("spawn TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "TUI did not ask to review the new workspace",
+    );
+    process.write(b"\r").expect("trust the workspace");
+    let pid = server.wait_for_start();
+
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+
+    // It was still starting, and would have read nothing for 30 s.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while process_is_alive(&pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the MCP server {pid} outlived the TUI"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A stdio MCP server, in the user config of an ORCA_HOME, that adds its
+/// process id to a file as it starts, and reads nothing for 30 seconds:
+/// until then it is starting. Dropping it kills the server's process group,
+/// should a failed test have left it running.
+struct SlowMcpServer {
+    pids: std::path::PathBuf,
+}
+
+impl SlowMcpServer {
+    fn configure(home: &std::path::Path, dir: &std::path::Path) -> Self {
+        let script = dir.join("slow.sh");
+        std::fs::write(
+            &script,
+            "printf '%s\\n' \"$$\" >> \"$1/pids\"\nsleep 30\nwhile IFS= read -r line; do :; done\n",
+        )
+        .expect("write the MCP server");
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "[[mcp_servers]]\nname = \"slow\"\ntransport = \"stdio\"\ncommand = \"/bin/sh\"\nargs = [{:?}, {:?}]\n",
+                script.display().to_string(),
+                dir.display().to_string(),
+            ),
+        )
+        .expect("configure the MCP server");
+        Self {
+            pids: dir.join("pids"),
+        }
+    }
+
+    fn started(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.pids)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The process id of the server's first start, once it has started.
+    fn wait_for_start(&self) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(pid) = self.started().into_iter().next() {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "the MCP server never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for SlowMcpServer {
+    fn drop(&mut self) {
+        for pid in self.started() {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+fn process_is_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn assert_screen_shows(process: &PtyProcess, output: &mut Vec<u8>, expected: &str, failure: &str) {
     // PTY contracts run in parallel and the mock child may not publish its
     // first activity frame until other test binaries release the CPU. Wait for
@@ -972,13 +1080,6 @@ impl PtyProcess {
         model: Option<&str>,
         prompt: &str,
     ) -> io::Result<Self> {
-        let (master, slave) = open_pty(120, 40)?;
-        let stdout = duplicate_fd(&slave)?;
-        let stderr = duplicate_fd(&slave)?;
-        let writer = File::from(duplicate_fd(&master)?);
-        let mut terminal_reader = File::from(master);
-        let stdin = File::from(slave);
-
         let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
         command.args(["--provider", "mock", "--cwd"]).arg(cwd);
         if let Some(model) = model {
@@ -987,8 +1088,27 @@ impl PtyProcess {
         if let Some(selector) = resume {
             command.args(["--resume", selector]);
         }
+        command.arg(prompt);
+        Self::spawn_command(command, home)
+    }
+
+    /// `orca` in `cwd` with no prompt, as a user opens it.
+    fn spawn_without_prompt(home: &std::path::Path, cwd: &std::path::Path) -> io::Result<Self> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
+        command.args(["--provider", "mock", "--cwd"]).arg(cwd);
+        Self::spawn_command(command, home)
+    }
+
+    /// Runs `command` on a terminal of its own, with `home` as its ORCA_HOME.
+    fn spawn_command(mut command: Command, home: &std::path::Path) -> io::Result<Self> {
+        let (master, slave) = open_pty(120, 40)?;
+        let stdout = duplicate_fd(&slave)?;
+        let stderr = duplicate_fd(&slave)?;
+        let writer = File::from(duplicate_fd(&master)?);
+        let mut terminal_reader = File::from(master);
+        let stdin = File::from(slave);
+
         let child = command
-            .arg(prompt)
             .env("ORCA_HOME", home)
             .env("ORCA_API_KEY", "pty-test-key")
             .env("TERM", "xterm-256color")

@@ -331,7 +331,9 @@ impl TuiSurfaceTaskControl {
     pub(crate) fn set_prestart_mcp(&self, prestarted: PrestartedMcp) {
         let replaced = self.lock_hosted().prestart_mcp.replace(prestarted);
         // Stopping servers takes no lock of the controller's.
-        drop(replaced);
+        if let Some(replaced) = replaced {
+            replaced.close();
+        }
     }
 
     /// The MCP servers that started with the TUI, while no thread has taken
@@ -343,11 +345,37 @@ impl TuiSurfaceTaskControl {
             .map(|prestarted| prestarted.registry().clone())
     }
 
-    /// Hands the MCP servers that started with the TUI over, to the thread
-    /// that now has them: the renderer hears no more of them from here.
-    pub(crate) fn take_prestart_mcp(&self) -> Option<orca_mcp::McpRegistry> {
+    /// Hands the MCP servers that started with the TUI over to `thread`,
+    /// when it is the thread that took them: it closes them when it ends,
+    /// and the renderer hears no more of them from here.
+    pub(crate) fn hand_over_prestart_mcp(
+        &self,
+        thread: &orca_runtime::runtime_host::RuntimeThreadHandle,
+    ) {
+        let handed = {
+            let mut hosted = self.lock_hosted();
+            let taken = hosted
+                .prestart_mcp
+                .as_ref()
+                .is_some_and(|prestarted| prestarted.registry().is_same(&thread.mcp_registry()));
+            if taken {
+                // The thread owns them before the TUI lets go, so that
+                // they are never left to no one.
+                thread.adopt_mcp_registry();
+            }
+            taken.then(|| hosted.prestart_mcp.take()).flatten()
+        };
+        drop(handed);
+    }
+
+    /// Stops the MCP servers that started with the TUI, those still
+    /// connecting too, unless a thread has taken them, as quitting does.
+    pub(crate) fn close_prestart_mcp(&self) {
         let prestarted = self.lock_hosted().prestart_mcp.take();
-        prestarted.map(PrestartedMcp::into_registry)
+        // Stopping servers takes no lock of the controller's.
+        if let Some(prestarted) = prestarted {
+            prestarted.close();
+        }
     }
 
     /// The MCP servers `/mcp` and the MCP prompt commands act on now: those
@@ -405,7 +433,7 @@ impl TuiSurfaceTaskControl {
 
     pub(crate) fn shutdown(&self) {
         // The MCP servers no thread took stop, with no lock held.
-        drop(self.take_prestart_mcp());
+        self.close_prestart_mcp();
         let _transition = self
             .hosted
             .surface_presentation_transition

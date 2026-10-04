@@ -2475,6 +2475,10 @@ impl RuntimeThreadStartRequest {
         self
     }
 
+    /// Lends the thread `mcp_registry`, in place of the one it would start
+    /// for its config. The lender still owns it: the thread does not close
+    /// it when it ends, until the lender hands it over with
+    /// [`RuntimeThreadHandle::adopt_mcp_registry`].
     pub fn with_mcp_registry(mut self, mcp_registry: McpRegistry) -> Self {
         self.mcp_registry = Some(mcp_registry);
         self
@@ -3152,6 +3156,10 @@ pub struct RuntimeThreadHandle {
     startup_warnings: Arc<Vec<String>>,
     task_registry: TaskRegistry,
     mcp_registry: McpRegistry,
+    /// Whether the thread owns `mcp_registry`, and so closes it when its
+    /// actor ends: one it started itself, or one handed over to it with
+    /// [`Self::adopt_mcp_registry`], but not one only lent to it.
+    mcp_registry_owned: Arc<AtomicBool>,
     /// What the MCP servers left to report when their startup ended.
     mcp_startup: Arc<crate::mcp_startup::McpStartupWarnings>,
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
@@ -3500,6 +3508,13 @@ impl RuntimeThreadHandle {
 
     pub fn mcp_registry(&self) -> McpRegistry {
         self.mcp_registry.clone()
+    }
+
+    /// Hands the MCP registry lent to the thread
+    /// ([`RuntimeThreadStartRequest::with_mcp_registry`]) over to it: the
+    /// thread closes it when it ends, as it does one it started itself.
+    pub fn adopt_mcp_registry(&self) {
+        self.mcp_registry_owned.store(true, Ordering::Release);
     }
 
     pub fn surface(&self) -> surface::RuntimeSurfaceHandle {
@@ -5406,6 +5421,24 @@ impl Drop for ThreadActorExitNotifier {
     }
 }
 
+/// The MCP servers of a thread, which stop when its actor ends, even should
+/// it panic: those still connecting or reconnecting too, whoever still
+/// holds the registry, such as a reconnect's worker that the process does
+/// not wait for when it exits. A registry only lent to the thread is left
+/// to its owner.
+struct ThreadMcpServers {
+    registry: McpRegistry,
+    owned: Arc<AtomicBool>,
+}
+
+impl Drop for ThreadMcpServers {
+    fn drop(&mut self) {
+        if self.owned.load(Ordering::Acquire) {
+            self.registry.close();
+        }
+    }
+}
+
 enum HostShutdownActorState {
     NeedsDispatch,
     Awaiting(mpsc::Receiver<ThreadShutdownAck>),
@@ -5419,6 +5452,9 @@ struct HostShutdownActor {
 
 struct PreparedStartedRuntimeThread {
     thread: RuntimeThread,
+    /// Whether the thread started its MCP registry itself, rather than was
+    /// lent one.
+    mcp_registry_owned: bool,
     actor_config: RunConfig,
     actor_title: String,
     parent_thread_id: Option<String>,
@@ -5452,6 +5488,7 @@ fn prepare_and_start_runtime_thread(
     let agent_task_id = request.agent_task_id.clone();
     let agent_task_registry = request.agent_task_registry.clone();
     let actor_config = request.config.clone();
+    let mcp_registry_owned = request.mcp_registry.is_none();
     let thread = request
         .start()
         .map_err(|error| RuntimeHostError::ThreadStartFailed {
@@ -5480,6 +5517,7 @@ fn prepare_and_start_runtime_thread(
     }
     Ok(PreparedStartedRuntimeThread {
         thread,
+        mcp_registry_owned,
         actor_config,
         actor_title,
         parent_thread_id,
@@ -5572,6 +5610,7 @@ async fn run_host_supervisor(
             HostCommand::PreparedThreadStart { prepared, reply } => {
                 let PreparedStartedRuntimeThread {
                     mut thread,
+                    mcp_registry_owned,
                     mut actor_config,
                     actor_title,
                     parent_thread_id,
@@ -5679,6 +5718,7 @@ async fn run_host_supervisor(
                     startup_warnings,
                     task_registry,
                     mcp_registry,
+                    mcp_registry_owned: Arc::new(AtomicBool::new(mcp_registry_owned)),
                     mcp_startup,
                     command_tx: thread_command_tx.clone(),
                     surface: surface_handle,
@@ -5720,10 +5760,17 @@ async fn run_host_supervisor(
                     thread_id: thread_id.clone(),
                     exit_tx: actor_exit_tx.clone(),
                 };
+                let mcp_servers = ThreadMcpServers {
+                    registry: handle.mcp_registry.clone(),
+                    owned: Arc::clone(&handle.mcp_registry_owned),
+                };
                 let join = tokio::spawn(async move {
                     let _actor_exit = actor_exit;
                     // The actor hears of MCP changes until it ends.
                     let _mcp_subscription = mcp_subscription;
+                    // Once it ends, the MCP servers the thread owns stop,
+                    // before the host hears that it has ended.
+                    let _mcp_servers = mcp_servers;
                     ThreadActor::new(
                         thread,
                         actor_config,
@@ -39698,6 +39745,7 @@ mod tests {
             startup_warnings: Arc::new(Vec::new()),
             task_registry: TaskRegistry::new(thread_id.clone()),
             mcp_registry: McpRegistry::default(),
+            mcp_registry_owned: Arc::new(AtomicBool::new(true)),
             mcp_startup: crate::mcp_startup::McpStartupWarnings::watch(&McpRegistry::default()),
             command_tx,
             surface: unavailable_surface_handle(
@@ -40801,6 +40849,122 @@ done
             surface::SurfaceMcpServerStatus::Failed {
                 message: surface::DisplayText::new("no MCP server named 'nope'"),
             }
+        );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// Whether the process `pid` still runs.
+    #[cfg(unix)]
+    fn process_is_alive(pid: &str) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stdio_reconnect_still_under_way_stops_with_the_thread() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        // It adds its pid to `starts` as it starts, and answers only until
+        // `silent` exists: from then on it never answers `initialize`.
+        let state = catalog_mcp_server_dir("docs", cwd.path());
+        fs::create_dir_all(&state).expect("MCP fixture directory");
+        let script = state.join("server.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+state_dir="$1"
+printf '%s\n' "$$" >> "$state_dir/starts"
+if [ -f "$state_dir/silent" ]; then
+  while IFS= read -r line; do :; done
+  exit 0
+fi
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"docs","version":"1"}}}\n'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write the MCP fixture");
+        let starts = || {
+            fs::read_to_string(state.join("starts"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.mcp_servers = vec![orca_core::mcp_types::McpServerConfig {
+            name: "docs".to_string(),
+            command: Some("/bin/sh".to_string()),
+            args: vec![
+                script.to_string_lossy().into_owned(),
+                state.to_string_lossy().into_owned(),
+            ],
+            startup_timeout_ms: Some(15_000),
+            ..Default::default()
+        }];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp reconnect at shutdown")
+            .expect("start the thread");
+        let surface = thread.surface();
+        wait_for_mcp_catalog(&surface, |catalog| {
+            catalog.servers
+                == [catalog_server(
+                    "docs",
+                    surface::SurfaceMcpServerStatus::Ready,
+                )]
+        });
+        fs::write(state.join("silent"), "").expect("silence the next start");
+
+        // The reconnect's worker holds the thread's registry while the new
+        // server never answers.
+        let (result_tx, result_rx) = mpsc::channel();
+        let manager = fresh_surface_attachment(&surface);
+        thread::spawn(move || {
+            let _ = result_tx.send(manager.client.mcp_server_control(
+                surface_request_id(),
+                surface_text("docs"),
+                surface::SurfaceMcpServerAction::Reconnect,
+            ));
+        });
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while starts().len() < 2 {
+            assert!(Instant::now() < deadline, "the server never started again");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let reconnecting = starts().remove(1);
+
+        thread.shutdown().expect("shut the thread down");
+
+        // Its connection would have waited for `initialize` for the whole
+        // startup timeout, on a worker the process does not wait for.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process_is_alive(&reconnecting) {
+            assert!(
+                Instant::now() < deadline,
+                "the server being reconnected outlived its thread"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(starts().len(), 2, "the server started again");
+        assert!(
+            result_rx.recv_timeout(SURFACE_TEST_TIMEOUT).is_ok(),
+            "the reconnect never answered"
         );
         host.shutdown().expect("shutdown runtime host");
     }
