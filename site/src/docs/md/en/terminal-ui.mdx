@@ -233,7 +233,7 @@ status:
 | `↑` / `↓` | Select a server. |
 | `Enter` | Show the selected server's details (below). `Enter` again returns to the list. |
 | `r` | Reconnect the server. |
-| `l` | Log in to the server with OAuth in your browser, then reconnect it. The authorization url also appears in the conversation, to open by hand. While the login waits for your browser, `l` again cancels it. |
+| `l` | Log in to the server with OAuth in your browser, then reconnect it. The authorization url also appears in the conversation, to open by hand. While the login waits for your browser, `l` again cancels it; once your browser is back, the login finishes and can no longer be cancelled. |
 | `o` | Delete the server's saved login, then reconnect it; it then needs a login again. |
 | `Esc` | Close the panel. |
 
@@ -285,8 +285,9 @@ starts takes the servers over as they are, without connecting them again;
 quitting before then stops them. A server added with `orca mcp add` while
 the TUI is open appears after you restart it. While an action runs, the
 server's row and details show it (`reconnecting…`;
-`waiting for browser login… (l to cancel)` with the authorization url, and
-`cancelling login…` once you cancel it; or `logging out…`). A TUI attached
+`waiting for browser login… (l to cancel)` with the authorization url,
+`cancelling login…` once you cancel it, and `finishing login…` once your
+browser is back; or `logging out…`). A TUI attached
 to a daemon session with `orca attach`
 cannot manage the daemon's servers. The daemon connects a session's servers
 when it opens the session, so after `orca mcp login <name>` on this machine,

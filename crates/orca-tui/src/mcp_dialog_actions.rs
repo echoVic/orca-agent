@@ -7,10 +7,11 @@
 use crossbeam_channel as mpsc;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use orca_mcp::McpAuthKind;
+use orca_mcp::oauth::McpLoginCancel;
 
 use crate::protocol::UserAction;
 use crate::transcript_state::ChatMessage;
-use crate::types::{AppState, McpActionInFlight, McpLoginCancel};
+use crate::types::{AppState, McpActionInFlight};
 
 #[derive(Clone, Copy)]
 enum McpServerAction {
@@ -58,8 +59,10 @@ pub(crate) fn handle_mcp_dialog_key(
 /// it, which answers first: an older reconnect could otherwise overwrite a
 /// newer one. The one exception is `l` on a login that waits for the
 /// browser, which cancels it; its worker still ends it, and frees the
-/// server. Logging in and out uses the server's config entry, under whose
-/// name its login is saved, and only for a server that logs in with OAuth.
+/// server. Once the browser is back with the code the login finishes, and
+/// `l` finds it running like any other action. Logging in and out uses the
+/// server's config entry, under whose name its login is saved, and only for
+/// a server that logs in with OAuth.
 fn start_action(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
@@ -107,7 +110,7 @@ fn start_action(
                         Ok((
                             UserAction::McpLogin {
                                 server: config.clone(),
-                                cancel: cancel.flag(),
+                                cancel: cancel.clone(),
                             },
                             McpActionInFlight::LoggingIn {
                                 authorization_url: None,

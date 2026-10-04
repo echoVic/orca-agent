@@ -54,3 +54,4 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 tempfile = { workspace = true }
+orca-mcp = { path = "../orca-mcp", features = ["test-utils"] }

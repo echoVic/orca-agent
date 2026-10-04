@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 #[cfg(test)]
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -20,6 +19,7 @@ use orca_core::plan_types::PlanItem;
 use orca_core::proposed_plan::ProposedPlanStreamParser;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_file_search::{SearchPhase, SearchProgress};
+use orca_mcp::oauth::McpLoginCancel;
 use orca_runtime::history::SessionSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCandidate};
 use orca_runtime::onboarding::FirstRunState;
@@ -286,44 +286,15 @@ pub(crate) struct McpPanelServer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum McpActionInFlight {
     Reconnecting,
-    /// Waiting for the browser, with the authorization url once the login
-    /// has asked the browser to open it, until `cancel` stops it.
+    /// Logging in, with the authorization url once the login has asked the
+    /// browser to open it. `l` again stops it with `cancel` until the browser
+    /// comes back with a code; from then on it finishes, reconnect included.
     LoggingIn {
         authorization_url: Option<String>,
         cancel: McpLoginCancel,
     },
     LoggingOut,
 }
-
-/// What stops a login `/mcp` runs: `l` again sets it, and the login, which
-/// checks it while it waits for the browser, then ends.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct McpLoginCancel(Arc<AtomicBool>);
-
-impl McpLoginCancel {
-    /// The flag the login checks.
-    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.0)
-    }
-
-    /// Stops the login; `false` when it was stopped already.
-    pub(crate) fn cancel(&self) -> bool {
-        !self.0.swap(true, Ordering::AcqRel)
-    }
-
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-}
-
-/// Two are equal when they stop the same login.
-impl PartialEq for McpLoginCancel {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl Eq for McpLoginCancel {}
 
 /// An MCP prompt run in the conversation `attachment`, whose expansion has
 /// not come back yet.
@@ -344,6 +315,7 @@ impl McpActionInFlight {
         match self {
             Self::Reconnecting => "reconnecting…",
             Self::LoggingIn { cancel, .. } if cancel.is_cancelled() => "cancelling login…",
+            Self::LoggingIn { cancel, .. } if cancel.is_finishing() => "finishing login…",
             Self::LoggingIn { .. } => "waiting for browser login… (l to cancel)",
             Self::LoggingOut => "logging out…",
         }

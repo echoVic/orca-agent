@@ -29,7 +29,7 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -82,25 +82,80 @@ pub struct McpLoginOptions {
     pub open_browser: OpenBrowser,
     /// How long to wait for the browser to come back.
     pub callback_timeout: Duration,
-    /// Set to stop the login. It is checked as the login starts, before it
-    /// opens the browser, and over and over while it waits for the browser
-    /// to come back: a login cancelled then stops at once, and frees the
-    /// callback's port.
-    pub cancel: Arc<AtomicBool>,
+    /// Stops the login. It is checked as the login starts, after each step
+    /// before it opens the browser, and over and over while it waits for the
+    /// browser to come back: a login cancelled then stops at once, and frees
+    /// the callback's port. Once the browser is back with a code, the login
+    /// finishes, and no longer stops.
+    pub cancel: McpLoginCancel,
 }
 
 impl McpLoginOptions {
     /// Options that wait [`DEFAULT_CALLBACK_TIMEOUT`] for the browser, and
-    /// that nothing cancels until `cancel` is set.
+    /// that only their `cancel` stops.
     pub fn new(credentials_path: PathBuf, open_browser: OpenBrowser) -> Self {
         Self {
             credentials_path,
             open_browser,
             callback_timeout: DEFAULT_CALLBACK_TIMEOUT,
-            cancel: Arc::default(),
+            cancel: McpLoginCancel::default(),
         }
     }
 }
+
+/// What stops a [`login`], until the browser comes back with a code. The
+/// login then claims the code, and finishes: exactly one of a cancel and the
+/// code wins, so a caller never reports cancelled a login that goes on to
+/// log in. Clones stop the same login.
+#[derive(Clone, Debug, Default)]
+pub struct McpLoginCancel(Arc<AtomicU8>);
+
+impl McpLoginCancel {
+    const WAITING: u8 = 0;
+    const CANCELLED: u8 = 1;
+    const FINISHING: u8 = 2;
+
+    /// Stops the login, and says whether this did: `false` when it was
+    /// stopped already, or is past stopping, the browser being back with
+    /// its code.
+    pub fn cancel(&self) -> bool {
+        self.claim(Self::CANCELLED)
+    }
+
+    /// Whether the login was stopped.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::CANCELLED
+    }
+
+    /// Whether the browser came back with a code: the login is finishing,
+    /// and no longer stops.
+    pub fn is_finishing(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::FINISHING
+    }
+
+    /// Claims the code the browser came back with: from now on the login
+    /// finishes. `false` when it was stopped first.
+    fn finish(&self) -> bool {
+        self.claim(Self::FINISHING)
+    }
+
+    /// Moves a login still waiting to `state`; `false` when it is not
+    /// waiting anymore.
+    fn claim(&self, state: u8) -> bool {
+        self.0
+            .compare_exchange(Self::WAITING, state, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+/// Two are equal when they stop the same login.
+impl PartialEq for McpLoginCancel {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for McpLoginCancel {}
 
 /// Logs in to the remote MCP server `server` in the user's browser, and
 /// stores the tokens in `options.credentials_path` under the server's name
@@ -232,14 +287,19 @@ pub fn login(server: &McpServerConfig, options: McpLoginOptions) -> Result<(), S
         .map_err(|error| format!("failed to save the login for MCP server '{name}': {error}"))
 }
 
-/// Why the login of the MCP server named `name` stops, once `cancel` is
-/// set.
-fn stop_if_cancelled(cancel: &AtomicBool, name: &str) -> Result<(), String> {
-    if cancel.load(Ordering::Acquire) {
-        Err(format!("login to MCP server '{name}' cancelled"))
+/// Why the login of the MCP server named `name` stops, once `cancel` has
+/// stopped it.
+fn stop_if_cancelled(cancel: &McpLoginCancel, name: &str) -> Result<(), String> {
+    if cancel.is_cancelled() {
+        Err(cancelled(name))
     } else {
         Ok(())
     }
+}
+
+/// What a login of the MCP server named `name` that was stopped returns.
+fn cancelled(name: &str) -> String {
+    format!("login to MCP server '{name}' cancelled")
 }
 
 /// Replaces `credential`, the login in use, with a fresh one, and returns
@@ -794,7 +854,8 @@ impl Callback {
     }
 
     /// Waits up to `timeout` for the browser to come back to `/callback`
-    /// with the `state` sent and a code, or until `cancel` is set. Any other
+    /// with the `state` sent and a code, which it claims (see
+    /// [`McpLoginCancel`]), or until `cancel` stops the login. Any other
     /// request is answered with 404, and a callback with another state with
     /// an error page; the wait goes on after both. However it ends, the
     /// port is freed.
@@ -803,7 +864,7 @@ impl Callback {
         name: &str,
         state: &str,
         timeout: Duration,
-        cancel: &AtomicBool,
+        cancel: &McpLoginCancel,
     ) -> Result<String, String> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -831,13 +892,14 @@ impl Callback {
 /// Answers one connection to the callback listener, and returns what the
 /// browser came back with: `None` for a request that is not the callback
 /// for this login, that never arrives, or that is still arriving when
-/// `cancel` is set.
+/// `cancel` stops the login. A code is claimed before the page says the
+/// login is complete; one that comes after a cancel is turned away.
 fn answer_callback(
     mut stream: TcpStream,
     name: &str,
     state: &str,
     remaining: Duration,
-    cancel: &AtomicBool,
+    cancel: &McpLoginCancel,
 ) -> Option<Result<String, String>> {
     // An accepted socket may or may not inherit the listener's nonblocking
     // mode. It is read without blocking (see `read_request_line`), and
@@ -865,7 +927,14 @@ fn answer_callback(
         );
         return None;
     }
-    let outcome = callback_code(name, &params);
+    // From here the login finishes, unless a cancel came first.
+    let outcome = callback_code(name, &params).and_then(|code| {
+        if cancel.finish() {
+            Ok(code)
+        } else {
+            Err(cancelled(name))
+        }
+    });
     match &outcome {
         Ok(_) => respond(
             &mut stream,
@@ -913,16 +982,13 @@ fn callback_code(name: &str, params: &HashMap<String, String>) -> Result<String,
 fn read_request_line(
     stream: &mut TcpStream,
     deadline: Instant,
-    cancel: &AtomicBool,
+    cancel: &McpLoginCancel,
 ) -> Option<(String, String)> {
     let mut head = Vec::new();
     let mut chunk = [0u8; 1024];
     while !head.windows(4).any(|window| window == b"\r\n\r\n") {
         let left = deadline.saturating_duration_since(Instant::now());
-        if head.len() > MAX_CALLBACK_REQUEST_BYTES
-            || left.is_zero()
-            || cancel.load(Ordering::Acquire)
-        {
+        if head.len() > MAX_CALLBACK_REQUEST_BYTES || left.is_zero() || cancel.is_cancelled() {
             return None;
         }
         match stream.read(&mut chunk) {
@@ -1311,7 +1377,7 @@ mod tests {
     fn start_a_waiting_login(
         config: McpServerConfig,
         credentials: PathBuf,
-        cancel: Arc<AtomicBool>,
+        cancel: McpLoginCancel,
     ) -> mpsc::Receiver<Result<(), String>> {
         let (opened_tx, opened) = mpsc::channel();
         let browser: OpenBrowser = Box::new(move |_: &str| {
@@ -1339,18 +1405,18 @@ mod tests {
         let port = free_port();
         let mut config = server.config("docs");
         config.oauth_callback_port = Some(port);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = McpLoginCancel::default();
         let outcome = start_a_waiting_login(
             config,
             home.path().join("mcp-credentials.json"),
-            Arc::clone(&cancel),
+            cancel.clone(),
         );
         assert!(
             outcome.recv_timeout(Duration::from_millis(100)).is_err(),
             "the login stopped waiting for the browser by itself"
         );
 
-        cancel.store(true, Ordering::SeqCst);
+        assert!(cancel.cancel());
         let cancelled = Instant::now();
         let outcome = outcome
             .recv_timeout(Duration::from_millis(500))
@@ -1372,18 +1438,18 @@ mod tests {
         let port = free_port();
         let mut config = server.config("docs");
         config.oauth_callback_port = Some(port);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = McpLoginCancel::default();
         let outcome = start_a_waiting_login(
             config,
             home.path().join("mcp-credentials.json"),
-            Arc::clone(&cancel),
+            cancel.clone(),
         );
         // A connection to the callback that never sends its request: the
         // login reads it for up to five seconds, once it has taken it.
         let silent = TcpStream::connect(("127.0.0.1", port)).expect("connect to the callback");
         std::thread::sleep(Duration::from_millis(200));
 
-        cancel.store(true, Ordering::SeqCst);
+        assert!(cancel.cancel());
 
         assert_eq!(
             outcome
@@ -1402,7 +1468,11 @@ mod tests {
             panic!("a cancelled login opened the browser")
         });
         let options = McpLoginOptions {
-            cancel: Arc::new(AtomicBool::new(true)),
+            cancel: {
+                let cancel = McpLoginCancel::default();
+                cancel.cancel();
+                cancel
+            },
             ..options(&home.path().join("mcp-credentials.json"), browser)
         };
 
@@ -1411,6 +1481,43 @@ mod tests {
             Err("login to MCP server 'docs' cancelled".to_string())
         );
         assert!(server.requests().is_empty(), "{:?}", server.trail());
+    }
+
+    /// Once the browser is back with a code the login finishes: a cancel
+    /// then says it stopped nothing, and the login stores its tokens.
+    #[test]
+    fn a_login_whose_browser_came_back_is_past_cancelling() {
+        let gate = super::test_server::TokenGate::default();
+        let server = OAuthTestServer::start(OAuthTestBehavior {
+            hold_token_requests: Some(gate.clone()),
+            ..Default::default()
+        });
+        let home = tempfile::tempdir().expect("temp dir");
+        let credentials = home.path().join("mcp-credentials.json");
+        let cancel = McpLoginCancel::default();
+        let (browser, _page) = test_browser();
+        let login = std::thread::spawn({
+            let config = server.config("docs");
+            let options = McpLoginOptions {
+                cancel: cancel.clone(),
+                ..options(&credentials, browser)
+            };
+            move || login(&config, options)
+        });
+        // The code is being exchanged for tokens, which the server holds.
+        assert!(server.wait_for_request("/token"), "{:?}", server.trail());
+
+        assert!(cancel.is_finishing());
+        assert!(!cancel.cancel(), "a cancel stopped a finishing login");
+        assert!(!cancel.is_cancelled());
+        gate.release();
+
+        assert_eq!(login.join().expect("the login"), Ok(()));
+        assert!(
+            load_mcp_credential(&credentials, "docs", &server.mcp_url())
+                .expect("read the credentials")
+                .is_some()
+        );
     }
 
     /// A cancel that comes while the login looks the server up stops it once
@@ -1432,9 +1539,9 @@ mod tests {
             ("/.well-known/oauth-authorization-server/tenant", 3, true),
             ("/register", 4, false),
         ] {
-            let cancel = Arc::new(AtomicBool::new(false));
+            let cancel = McpLoginCancel::default();
             let server = OAuthTestServer::start(OAuthTestBehavior {
-                cancel_on: Some((path.to_string(), Arc::clone(&cancel))),
+                cancel_on: Some((path.to_string(), cancel.clone())),
                 ..Default::default()
             });
             let home = tempfile::tempdir().expect("temp dir");

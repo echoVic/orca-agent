@@ -9,13 +9,11 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::Sender;
 use orca_core::config::mcp_credentials::delete_mcp_credential;
 use orca_core::mcp_types::McpServerConfig;
-use orca_mcp::oauth::{McpLoginOptions, OpenBrowser};
+use orca_mcp::oauth::{McpLoginCancel, McpLoginOptions, OpenBrowser};
 use orca_runtime::runtime_host::RuntimeThreadHandle;
 
 use crate::prestart_mcp::McpServers;
@@ -87,7 +85,7 @@ fn run_mcp_server_worker(
     servers: &dyn Fn() -> Option<McpServers>,
     credentials_path: Option<&Path>,
     event_tx: &Sender<TuiEvent>,
-    log_in: impl FnOnce(&McpServerConfig, &Arc<AtomicBool>) -> Result<(), String>,
+    log_in: impl FnOnce(&McpServerConfig, &McpLoginCancel) -> Result<(), String>,
 ) {
     let Some(name) = action_server_name(&action) else {
         return;
@@ -123,7 +121,7 @@ fn run_mcp_server_action(
     servers: &dyn Fn() -> Option<McpServers>,
     credentials_path: Option<&Path>,
     event_tx: &Sender<TuiEvent>,
-    log_in: impl FnOnce(&McpServerConfig, &Arc<AtomicBool>) -> Result<(), String>,
+    log_in: impl FnOnce(&McpServerConfig, &McpLoginCancel) -> Result<(), String>,
 ) {
     let notice = |text: String| {
         let _ = event_tx.send(TuiEvent::Notice(text));
@@ -234,7 +232,7 @@ const OVERTAKEN_RECONNECT_POLL: std::time::Duration = std::time::Duration::from_
 /// frees its callback's port.
 fn log_in_with_browser(
     server: &McpServerConfig,
-    cancel: &Arc<AtomicBool>,
+    cancel: &McpLoginCancel,
     credentials_path: Option<&Path>,
     event_tx: &Sender<TuiEvent>,
 ) -> Result<(), String> {
@@ -247,7 +245,7 @@ fn log_in_with_browser(
     orca_mcp::oauth::login(
         server,
         McpLoginOptions {
-            cancel: Arc::clone(cancel),
+            cancel: cancel.clone(),
             ..McpLoginOptions::new(credentials_path, open_browser)
         },
     )
@@ -282,7 +280,7 @@ fn log_in_then_reconnect(
     server: &str,
     login: impl FnOnce() -> Result<(), String>,
     reconnect: impl FnOnce() -> String,
-    cancel: &AtomicBool,
+    cancel: &McpLoginCancel,
     notice: &dyn Fn(String),
 ) {
     notice(format!("waiting for browser login for {server}…"));
@@ -291,7 +289,7 @@ fn log_in_then_reconnect(
             notice(format!("logged in to MCP server {server}"));
             notice(reconnect());
         }
-        Err(_) if cancel.load(Ordering::Acquire) => {}
+        Err(_) if cancel.is_cancelled() => {}
         Err(error) => notice(error),
     }
 }
@@ -386,7 +384,7 @@ mod tests {
                     reconnects.set(reconnects.get() + 1);
                     "MCP server linear: connected · 2 tools".to_string()
                 },
-                &AtomicBool::new(false),
+                &McpLoginCancel::default(),
                 notice,
             )
         });
@@ -409,7 +407,7 @@ mod tests {
                 "linear",
                 || Err("timed out waiting for the browser login for MCP server 'linear'".into()),
                 || -> String { panic!("a failed login reconnected the server") },
-                &AtomicBool::new(false),
+                &McpLoginCancel::default(),
                 notice,
             )
         });
@@ -530,7 +528,7 @@ mod tests {
                     url: Some(url.to_string()),
                     ..Default::default()
                 },
-                &Arc::default(),
+                &McpLoginCancel::default(),
                 None,
                 &event_tx,
             ),
@@ -593,6 +591,23 @@ mod tests {
         UserAction,
         crossbeam_channel::Receiver<UserAction>,
     ) {
+        login_pressed_on(orca_core::mcp_types::McpServerConfig {
+            name: "linear".to_string(),
+            transport: orca_core::mcp_types::McpTransportKind::Http,
+            url: Some("https://linear.example/mcp".to_string()),
+            ..Default::default()
+        })
+    }
+
+    /// As [`login_pressed_before_the_first_message`], with `linear`'s config
+    /// entry `server`.
+    fn login_pressed_on(
+        server: orca_core::mcp_types::McpServerConfig,
+    ) -> (
+        crate::types::AppState,
+        UserAction,
+        crossbeam_channel::Receiver<UserAction>,
+    ) {
         use std::sync::{Arc, Mutex};
 
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -616,12 +631,7 @@ mod tests {
             ..McpCatalogView::default()
         }));
         let mut config = crate::test_support::test_run_config();
-        config.mcp_servers = vec![orca_core::mcp_types::McpServerConfig {
-            name: "linear".to_string(),
-            transport: orca_core::mcp_types::McpTransportKind::Http,
-            url: Some("https://linear.example/mcp".to_string()),
-            ..Default::default()
-        }];
+        config.mcp_servers = vec![server];
         let shared = Arc::new(Mutex::new(config.clone()));
         crate::slash_command_actions::handle_slash_command(
             "/mcp",
@@ -674,7 +684,7 @@ mod tests {
         let UserAction::McpLogin { cancel, .. } = &login else {
             unreachable!("`l` sent a login");
         };
-        let cancel = Arc::clone(cancel);
+        let cancel = cancel.clone();
         assert!(
             panel_rows(&mut state)
                 .iter()
@@ -689,7 +699,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             run_mcp_server_worker(login, &|| None, None, &event_tx, |server, cancel| {
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                while !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                while !cancel.is_cancelled() {
                     if std::time::Instant::now() > deadline {
                         return Err("the login was never cancelled".to_string());
                     }
@@ -716,12 +726,12 @@ mod tests {
                 Some("an MCP action for linear is already running")
             );
         }
-        assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!cancel.is_cancelled());
 
         // `l` cancels it.
         press(&mut state, 'l');
         assert!(sent.try_recv().is_err(), "`l` started another login");
-        assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(cancel.is_cancelled());
         assert_eq!(
             last_notice(&state),
             Some("login to MCP server linear cancelled")
@@ -753,8 +763,98 @@ mod tests {
         assert!(matches!(
             sent.try_recv(),
             Ok(UserAction::McpLogin { server, cancel }) if server.name == "linear"
-                && !cancel.load(std::sync::atomic::Ordering::SeqCst)
+                && !cancel.is_cancelled()
         ));
+    }
+
+    /// Once the browser has come back with the code, the login finishes:
+    /// `/mcp` no longer offers to cancel it, and `l` then only says that an
+    /// action is running, never that a login which goes on was cancelled.
+    #[test]
+    fn a_login_past_the_browser_is_no_longer_offered_to_cancel() {
+        use orca_mcp::oauth::test_server::{
+            FIXTURE_WAIT, OAuthTestBehavior, OAuthTestServer, TokenGate, test_browser,
+        };
+
+        let gate = TokenGate::default();
+        let oauth = OAuthTestServer::start(OAuthTestBehavior {
+            hold_token_requests: Some(gate.clone()),
+            ..Default::default()
+        });
+        let home = tempfile::tempdir().unwrap();
+        let credentials = home.path().join(MCP_CREDENTIALS_FILE);
+        let (mut state, login, sent) = login_pressed_on(oauth.config("linear"));
+        let (event_tx, events) = crossbeam_channel::unbounded();
+        let worker = std::thread::spawn({
+            let credentials = credentials.clone();
+            move || {
+                let (browser, _page) = test_browser();
+                run_mcp_server_worker(login, &|| None, None, &event_tx, |server, cancel| {
+                    orca_mcp::oauth::login(
+                        server,
+                        McpLoginOptions {
+                            cancel: cancel.clone(),
+                            callback_timeout: FIXTURE_WAIT,
+                            ..McpLoginOptions::new(credentials, browser)
+                        },
+                    )
+                });
+            }
+        });
+        // The browser has come back with the code, and the login is
+        // exchanging it for tokens, which the server holds.
+        assert!(oauth.wait_for_request("/token"), "{:?}", oauth.trail());
+        for event in events.try_iter() {
+            state.update(event);
+        }
+
+        let rows = panel_rows(&mut state);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("linear") && row.contains("finishing login…")),
+            "{}",
+            rows.join("\n")
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("to cancel")),
+            "{}",
+            rows.join("\n")
+        );
+        press(&mut state, 'l');
+        assert!(sent.try_recv().is_err(), "`l` sent an action");
+        assert_eq!(
+            last_notice(&state),
+            Some("an MCP action for linear is already running")
+        );
+
+        gate.release();
+        worker.join().expect("the login worker");
+        for event in events.try_iter() {
+            state.update(event);
+        }
+        let notices = state
+            .transcript
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                crate::transcript_state::ChatMessage::System { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            notices.contains(&"logged in to MCP server linear"),
+            "{notices:?}"
+        );
+        assert!(
+            !notices.iter().any(|notice| notice.contains("cancelled")),
+            "{notices:?}"
+        );
+        assert!(state.mcp_actions_in_flight.is_empty());
+        assert!(
+            load_mcp_credential(&credentials, "linear", &oauth.mcp_url())
+                .expect("read the credentials")
+                .is_some()
+        );
     }
 
     #[test]
@@ -776,7 +876,11 @@ mod tests {
         assert_eq!(
             log_in_with_browser(
                 &server,
-                &Arc::new(AtomicBool::new(true)),
+                &{
+                    let cancel = McpLoginCancel::default();
+                    cancel.cancel();
+                    cancel
+                },
                 Some(&home.path().join(MCP_CREDENTIALS_FILE)),
                 &event_tx,
             ),
@@ -1162,7 +1266,7 @@ done
         run_mcp_server_worker(
             UserAction::McpLogin {
                 server,
-                cancel: Arc::default(),
+                cancel: McpLoginCancel::default(),
             },
             &|| Some(servers.clone()),
             None,
@@ -1213,7 +1317,7 @@ done
             run_mcp_server_worker(
                 UserAction::McpLogin {
                     server,
-                    cancel: Arc::default(),
+                    cancel: McpLoginCancel::default(),
                 },
                 &|| control.mcp_servers(),
                 None,

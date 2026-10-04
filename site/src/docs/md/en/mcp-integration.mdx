@@ -150,8 +150,9 @@ the `enabled_tools`/`disabled_tools` its configuration sets. `r` reconnects
 the selected server, `l` logs in to it with OAuth and then reconnects it, and
 `o` deletes its saved login and then reconnects it. While a login waits for
 the browser, `l` again cancels it: it stops waiting at once and frees the
-callback port. All of this works
-before your first message too: the servers are connecting by then, and a
+callback port. Once the browser is back with the code, the login finishes
+and `l` no longer cancels it. All of this works before your first message
+too: the servers are connecting by then, and a
 login there reconnects the server the conversation then keeps. `/mcp` lists
 the servers of the configuration Orca started with: one added while the TUI
 is open appears after you restart it. See

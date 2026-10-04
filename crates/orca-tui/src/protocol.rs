@@ -726,10 +726,11 @@ pub enum UserAction {
         server: String,
     },
     /// `l` in `/mcp`: log in to the MCP server with OAuth in the browser,
-    /// then reconnect it. Setting `cancel` stops the login.
+    /// then reconnect it. `cancel` stops the login until the browser is back
+    /// with a code.
     McpLogin {
         server: McpServerConfig,
-        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        cancel: orca_mcp::oauth::McpLoginCancel,
     },
     /// `o` in `/mcp`: delete the login saved for the MCP server with this
     /// config name, then reconnect it.
