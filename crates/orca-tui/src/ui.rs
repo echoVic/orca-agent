@@ -1212,8 +1212,8 @@ fn mcp_server_details(
     };
     // Each part lines its rows up on its own: a prompt's arguments do not
     // push the tools' rule names to the panel's edge. Among the tools, the
-    // rule names get the room they need first, and a tool's own name gives
-    // way, down to a few columns.
+    // rule names get the room they need first, and the tools' own names give
+    // way, down to none at all.
     let row = |label: &str, column: usize, detail: &str| {
         crate::chrome::option_line(theme, false, "", label, column, detail, width)
     };
@@ -1222,11 +1222,8 @@ fn mcp_server_details(
         .map(|(_, rule_name)| UnicodeWidthStr::width(rule_name.as_str()))
         .max()
         .unwrap_or(0);
-    let tools_column = mcp_details_column(tools.iter().map(|(name, _)| *name), width).min(
-        width
-            .saturating_sub(MCP_DETAILS_ROW_CHROME + widest_rule)
-            .max(MCP_DETAILS_MIN_TOOL_NAME),
-    );
+    let tools_column = mcp_details_column(tools.iter().map(|(name, _)| *name), width)
+        .min(width.saturating_sub(MCP_DETAILS_ROW_CHROME + widest_rule));
     let prompts_column = mcp_details_column(prompts.iter().map(|(usage, _)| usage.as_str()), width);
     let filters_column = mcp_details_column(filters.iter().map(|(label, _)| *label), width);
 
@@ -1312,10 +1309,6 @@ fn mcp_server_details(
 /// What a `/mcp` details row takes besides its two columns: the marker, a
 /// space, and the gap between the columns (see `chrome::option_line`).
 const MCP_DETAILS_ROW_CHROME: usize = 4;
-
-/// The fewest columns a tool's own name keeps in the `/mcp` details, however
-/// long the rule names beside it.
-const MCP_DETAILS_MIN_TOOL_NAME: usize = 12;
 
 /// How wide the first column of the `/mcp` details rows labelled `labels`
 /// is: as wide as the widest label, up to half of `width`.
@@ -9886,6 +9879,59 @@ mod tests {
         for line in frame.lines().filter(|line| line.contains("mcp__github__")) {
             assert!(line.ends_with('│'), "{line}\n{frame}");
         }
+    }
+
+    /// At 80 columns a rule name as long as
+    /// `mcp__github_enterprise__list_secret_scanning_alerts` stays whole,
+    /// `read-only` mark included: the tools' own names give way, down to
+    /// none at all if they must.
+    #[test]
+    fn details_keep_a_long_rule_name_whole_at_80_columns() {
+        use crate::surface_projection::McpServerStatusView;
+        let mut state = test_state();
+        state.mcp_catalog = crate::surface_projection::McpCatalogView {
+            servers: vec![mcp_server_view(
+                "github_enterprise",
+                McpServerStatusView::Connected,
+            )],
+            tools: vec![
+                mcp_tool_view("github_enterprise", "list_secret_scanning_alerts", true),
+                mcp_tool_view("github_enterprise", "get_me", false),
+            ],
+            prompts: Vec::new(),
+        };
+        state.mcp_dialog = Some(crate::types::McpDialog {
+            selected: 0,
+            showing_details: true,
+        });
+
+        let frame = frame_string(&mut state, 80, 30);
+
+        let rows = panel_rows(&frame);
+        assert!(
+            rows.iter().any(|row| row
+                .ends_with("read-only · mcp__github_enterprise__list_secret_scanning_alerts")),
+            "{frame}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.ends_with("mcp__github_enterprise__get_me")),
+            "{frame}"
+        );
+        for line in frame
+            .lines()
+            .filter(|line| line.contains("mcp__github_enterprise__"))
+        {
+            assert!(line.ends_with('│'), "{line}\n{frame}");
+        }
+        // Five columns narrower, the rule name takes every column a row has,
+        // and the tools' own names none.
+        let frame = frame_string(&mut state, 75, 30);
+        assert!(
+            panel_rows(&frame)
+                .contains(&"read-only · mcp__github_enterprise__list_secret_scanning_alerts"),
+            "{frame}"
+        );
     }
 
     #[test]
