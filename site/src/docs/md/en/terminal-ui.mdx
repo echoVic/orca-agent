@@ -90,6 +90,10 @@ A running turn shows an activity line above the input:
 ~~~
 
 - `Esc` (or `Ctrl+G`) interrupts the turn.
+- Before its first model request, a turn waits for any MCP server still
+  connecting, so the model is offered its tools; the activity line says
+  `connecting MCP servers` meanwhile, and `Esc` interrupts the wait with the
+  turn.
 - `Enter` queues your message. Queued messages run in order once the turn
   finishes, and each appears in the conversation as your next message.
   Interrupting pauses the queue; sending a new message resumes it, and
@@ -239,17 +243,20 @@ server, that server takes no other. `l` and `o` apply only to a server that
 logs in with OAuth; see
 [MCP integration](mcp-integration.md#remote-servers-and-login).
 
-`/mcp` opens between turns. MCP servers connect when the conversation starts,
-so before your first message the panel lists the servers in the configuration
-Orca started with as `not connected yet` (or `disabled`), and their details
-show only the tool filters; a server added with `orca mcp add` while the TUI
-is open appears after you restart it. `l` and `o` already work then: the
-server uses the login when it connects. `r` waits for the conversation to
-start. While an action runs, the server's row and details show it
-(`reconnecting…`, `waiting for browser login…` with the authorization url, or
-`logging out…`). A TUI attached to a daemon session with `orca attach` cannot
-manage the daemon's servers. The daemon connects a session's servers when it
-opens the session, so after `orca mcp login <name>` on this machine,
+`/mcp` opens between turns. The servers of the configuration Orca started
+with begin connecting as soon as the TUI opens, all at once and in the
+background, so the panel shows them from the start, before your first
+message too: each reads `starting` until it connects, fails, or needs a
+login, and its details list its tools and prompts once it has connected.
+`r`, `l`, and `o` work right away, and the conversation your first message
+starts takes the servers over as they are, without connecting them again;
+quitting before then stops them. A server added with `orca mcp add` while
+the TUI is open appears after you restart it. While an action runs, the
+server's row and details show it (`reconnecting…`,
+`waiting for browser login…` with the authorization url, or
+`logging out…`). A TUI attached to a daemon session with `orca attach`
+cannot manage the daemon's servers. The daemon connects a session's servers
+when it opens the session, so after `orca mcp login <name>` on this machine,
 `orca attach new` starts a daemon session that uses the login; a session the
 daemon already has open uses it once the daemon restarts and you reattach.
 
@@ -287,9 +294,12 @@ empty or more than one message can carry (over 1,048,576 characters of
 text, more than 600 images, or images over 5 MiB in all), the conversation
 says why and nothing is sent.
 
-Prompts appear once the conversation starts and their server connects;
-before your first message, `/mcp__…` says so. A TUI attached to a daemon
-session with `orca attach` has no MCP prompt commands.
+A server's prompts appear as soon as it connects, before your first
+message too. Run one then, and what the server returns is your first
+message, which starts the conversation. While a server is still connecting
+and has listed no prompts yet, `/mcp__<server>__…` says
+`MCP server <name> is still connecting; try again in a moment.` A TUI
+attached to a daemon session with `orca attach` has no MCP prompt commands.
 
 ## Moving around the conversation
 

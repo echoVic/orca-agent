@@ -120,6 +120,21 @@ MCP server requires login: run 'orca mcp login <name>', or log in from /mcp
 never touch a session that is already running. A running TUI session picks
 up the change by reconnecting the server from the `/mcp` panel.
 
+## When servers connect
+
+A session's servers connect in the background, all at once, as the session
+starts: the interactive TUI starts them as soon as it opens, before your
+first message. A server is `starting` until it connects, fails, or turns out
+to need a login, and each request it is sent while connecting
+(`initialize`, `tools/list`, `prompts/list`) is bounded by its
+`startup_timeout_ms`, 30 seconds unless set. A turn waits, before its first
+model request, only for the servers still connecting, so the model is
+offered every tool they bring; the TUI's status line says
+`connecting MCP servers` meanwhile, and `Esc` interrupts the turn, wait
+included. The conversation your first message starts in the TUI takes over
+the servers already connected rather than connecting them again; quitting
+before then stops them.
+
 ## Manage servers in the TUI
 
 In the interactive TUI, `/mcp` lists the conversation's servers and how each
@@ -128,12 +143,11 @@ login; or disabled. `Enter` shows a server's tools, each with the name a
 permission rule uses for it and the read-only ones marked, its prompts, and
 the `enabled_tools`/`disabled_tools` its configuration sets. `r` reconnects
 the selected server, `l` logs in to it with OAuth and then reconnects it, and
-`o` deletes its saved login and then reconnects it. Before your first message no server has connected yet: the
-panel lists the configured ones as `not connected yet`, and `l` already logs
-in, so a server added with `orca mcp add` before you start `orca` can be
-logged in to before the conversation starts, and connects with that login.
-`/mcp` lists the servers of the configuration Orca started with: one added
-while the TUI is open appears after you restart it. See
+`o` deletes its saved login and then reconnects it. All of this works
+before your first message too: the servers are connecting by then, and a
+login there reconnects the server the conversation then keeps. `/mcp` lists
+the servers of the configuration Orca started with: one added while the TUI
+is open appears after you restart it. See
 [Terminal UI](terminal-ui.md#mcp-servers) for the panel and its keys.
 
 ## Prompts
@@ -147,7 +161,9 @@ of the text, and a missing required argument shows the usage instead of
 running anything. Orca asks the server for the prompt (`prompts/get`) and
 sends what it returns as your message: its text parts joined by blank lines,
 the text of any embedded resource, and its images as attachments. When the
-server reports an error, the conversation says so and nothing is sent. See
+server reports an error, the conversation says so and nothing is sent. A
+prompt can run before your first message: what it returns is that message,
+and starts the conversation. See
 [Terminal UI](terminal-ui.md#mcp-prompts) for the argument rules and limits.
 
 ## Images from tools

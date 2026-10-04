@@ -129,8 +129,21 @@ impl MentionSearchManager {
         self.begin_stop();
     }
 
+    /// How many times the catalog has been asked for.
+    #[cfg(test)]
+    pub(crate) fn catalog_generation(&self) -> u64 {
+        self.catalog_generation
+    }
+
     pub(crate) fn install_runtime_actions(&mut self, actions: TuiSurfaceActions) {
         self.catalog_actions = Some(actions);
+        self.refresh_catalog_async();
+    }
+
+    /// Discovers the catalog again, as the runtime now has it: once the
+    /// runtime is ready, that is. The MCP resources it lists come from the
+    /// servers connected at the time.
+    pub(crate) fn rediscover_catalog(&mut self) {
         self.refresh_catalog_async();
     }
 

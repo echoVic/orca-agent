@@ -763,6 +763,13 @@ impl AppState {
                 attachment,
                 message,
             } => self.submit_mcp_prompt_expansion(&server, &prompt, attachment, message),
+            // Once a thread's catalog is in view the servers are its: a
+            // prestart catalog sent before it took them is out of date.
+            TuiEvent::McpCatalogPrestart(catalog) => {
+                if self.mcp_servers_before_start() {
+                    self.mcp_catalog = catalog;
+                }
+            }
             TuiEvent::McpLoginUrl { server, url } => {
                 if let Some(crate::types::McpActionInFlight::LoggingIn { authorization_url }) =
                     self.mcp_actions_in_flight.get_mut(&server)
@@ -1142,6 +1149,7 @@ impl AppState {
         self.surface_workflow_tasks = surface_workflow_tasks;
         self.surface_metrics.apply_projection(&projection);
         self.mcp_catalog.clone_from(&projection.mcp_catalog);
+        self.surface_mcp_catalog_applied = true;
         let goal_effect = self.surface_goal.apply_projection(&projection);
         self.apply_workflow_tasks_update(projection.workflow_tasks.clone());
         match operation_apply {

@@ -93,9 +93,15 @@ pub(crate) fn handle_hosted_queued_prompt(
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    if let Err(error) =
-        ensure_hosted_thread(thread, host, &cfg, preloaded, submitted.prompt(), event_tx)
-    {
+    if let Err(error) = ensure_hosted_thread(
+        thread,
+        host,
+        &cfg,
+        preloaded,
+        submitted.prompt(),
+        event_tx,
+        control,
+    ) {
         let _ = event_tx.send(TuiEvent::SubmissionRejected {
             queued_id: None,
             prompt: rejection_prompt,
@@ -176,7 +182,15 @@ pub(crate) fn handle_hosted_submitted_turn(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let title_seed = submitted_turn.title_seed(submitted_turn.prompt());
-    if let Err(error) = ensure_hosted_thread(thread, host, &cfg, preloaded, &title_seed, event_tx) {
+    if let Err(error) = ensure_hosted_thread(
+        thread,
+        host,
+        &cfg,
+        preloaded,
+        &title_seed,
+        event_tx,
+        control,
+    ) {
         send_submission_error_with_images(
             event_tx,
             queued_id,

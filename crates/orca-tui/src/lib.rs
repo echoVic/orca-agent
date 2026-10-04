@@ -70,6 +70,7 @@ mod operation_controller;
 mod plan_approval_actions;
 mod plan_panel;
 mod presentation;
+mod prestart_mcp;
 mod protocol;
 mod queued_input;
 mod queued_input_actions;

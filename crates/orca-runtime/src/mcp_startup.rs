@@ -2,7 +2,7 @@
 //! the warnings `orca exec` prints, and the TUI shows, for servers that did
 //! not start as configured.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use orca_mcp::{McpChangeSubscription, McpRegistry, McpServerState};
 
@@ -12,7 +12,7 @@ use orca_mcp::{McpChangeSubscription, McpRegistry, McpServerState};
 /// that started left out. A failure that does not name its server, as "MCP
 /// server closed stdout" does not, is prefixed with the server's name; the
 /// login a server needs names it in the `orca mcp login` it asks for.
-pub(crate) fn mcp_startup_warnings(registry: &McpRegistry) -> Vec<String> {
+pub fn mcp_startup_warnings(registry: &McpRegistry) -> Vec<String> {
     let mut warnings = registry.config_errors();
     for server in registry.server_statuses() {
         match server.state {
@@ -31,44 +31,125 @@ pub(crate) fn mcp_startup_warnings(registry: &McpRegistry) -> Vec<String> {
     warnings
 }
 
-/// Calls `report` with [`mcp_startup_warnings`] once none of `registry`'s
-/// servers is still making its first connection, at once if none is.
-/// `report` is called only once. The registry is held only weakly meanwhile,
-/// so the wait keeps no server running.
-pub(crate) fn report_mcp_startup_warnings(
-    registry: &McpRegistry,
-    report: impl FnOnce(Vec<String>) + Send + 'static,
-) {
-    let report = Mutex::new(Some(report));
-    let subscription = Arc::new(Mutex::new(None::<McpChangeSubscription>));
-    let report_once = {
-        let subscription = Arc::clone(&subscription);
-        Arc::new(move |registry: &McpRegistry| {
-            if registry.is_starting() {
+/// Who waits for the warnings a startup leaves.
+type WarningsReport = Box<dyn FnOnce(Vec<String>) + Send>;
+
+/// The warnings a session's MCP servers leave once their startup has ended
+/// ([`mcp_startup_warnings`]), taken once, when it ends: what happens to
+/// the servers since, such as a reconnect that fails, does not change them.
+/// So a surface that shows the thread again hears the same ones.
+pub(crate) struct McpStartupWarnings {
+    state: Mutex<StartupState>,
+}
+
+enum StartupState {
+    /// A server is still starting. The reports wait for the warnings, and
+    /// the subscription watches the registry until then.
+    Starting {
+        reports: Vec<WarningsReport>,
+        subscription: Option<McpChangeSubscription>,
+    },
+    /// Startup ended, and left these.
+    Ended(Vec<String>),
+}
+
+impl McpStartupWarnings {
+    /// Watches `registry` until none of its servers is starting, and takes
+    /// the warnings then, at once if none is now. The registry is held only
+    /// weakly meanwhile, so the watch keeps no server running.
+    pub(crate) fn watch(registry: &McpRegistry) -> Arc<Self> {
+        let watch = Arc::new(Self {
+            state: Mutex::new(StartupState::Starting {
+                reports: Vec::new(),
+                subscription: None,
+            }),
+        });
+        let watcher = Arc::downgrade(&watch);
+        let subscription = registry.subscribe(Arc::new(move |registry: &McpRegistry| {
+            if let Some(watch) = watcher.upgrade() {
+                watch.observe(registry);
+            }
+        }));
+        let ended = match &mut *watch.lock() {
+            StartupState::Starting {
+                subscription: watching,
+                ..
+            } => {
+                *watching = Some(subscription);
+                None
+            }
+            // It ended meanwhile, and the subscription with it.
+            StartupState::Ended(_) => Some(subscription),
+        };
+        drop(ended);
+        // Startup may have ended before the subscription began.
+        watch.observe(registry);
+        watch
+    }
+
+    fn lock(&self) -> MutexGuard<'_, StartupState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes the warnings, once, should `registry`'s startup have ended,
+    /// and hands them to each report waiting for them.
+    fn observe(&self, registry: &McpRegistry) {
+        if registry.is_starting() {
+            return;
+        }
+        let (reports, subscription, warnings) = {
+            let mut state = self.lock();
+            let StartupState::Starting {
+                reports,
+                subscription,
+            } = &mut *state
+            else {
                 return;
+            };
+            let reports = std::mem::take(reports);
+            let subscription = subscription.take();
+            let warnings = mcp_startup_warnings(registry);
+            *state = StartupState::Ended(warnings.clone());
+            (reports, subscription, warnings)
+        };
+        // Startup is over, so the subscription ends, whichever call this is.
+        drop(subscription);
+        for report in reports {
+            report(warnings.clone());
+        }
+    }
+
+    /// Calls `report` with the warnings once the startup of `registry`, the
+    /// one watched, has ended, at once if it has. `report` is called only
+    /// once.
+    pub(crate) fn on_ended(
+        &self,
+        registry: &McpRegistry,
+        report: impl FnOnce(Vec<String>) + Send + 'static,
+    ) {
+        // The change that ended startup may not have been heard yet.
+        self.observe(registry);
+        let mut state = self.lock();
+        match &mut *state {
+            StartupState::Starting { reports, .. } => reports.push(Box::new(report)),
+            StartupState::Ended(warnings) => {
+                let warnings = warnings.clone();
+                drop(state);
+                report(warnings);
             }
-            let report = report
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            if let Some(report) = report {
-                report(mcp_startup_warnings(registry));
-            }
-            // Startup is over, so the subscription ends, whichever call
-            // this is.
-            let ended = subscription
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            drop(ended);
-        })
-    };
-    let subscribed = registry.subscribe(report_once.clone());
-    *subscription
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(subscribed);
-    // Startup may have ended before the subscription began.
-    report_once(registry);
+        }
+    }
+
+    /// The warnings, for a caller that has waited for `registry`'s startup
+    /// to end: those taken when it ended, or, should a server have started
+    /// connecting again before they were, the registry's now.
+    pub(crate) fn after_startup(&self, registry: &McpRegistry) -> Vec<String> {
+        self.observe(registry);
+        match &*self.lock() {
+            StartupState::Ended(warnings) => warnings.clone(),
+            StartupState::Starting { .. } => mcp_startup_warnings(registry),
+        }
+    }
 }
 
 // The servers are shell scripts.

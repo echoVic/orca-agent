@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -9,6 +10,7 @@ use std::{
 use crossbeam_channel::Sender;
 use orca_core::cancel::{OperationId, OperationIdAllocator};
 
+use crate::prestart_mcp::{McpServers, PrestartedMcp};
 use crate::protocol::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
 use crate::surface_projection::{SurfaceProjectionState, TuiStreamDeliveryWatermark};
 
@@ -62,6 +64,11 @@ struct HostedOperationInner {
     queue_watcher_stop: Option<Arc<AtomicBool>>,
     queue_interactions:
         HashMap<TuiInteractionKey, std::sync::mpsc::SyncSender<io::Result<TuiInteractionResponse>>>,
+    /// The MCP servers that started with the TUI, until a thread takes them.
+    prestart_mcp: Option<PrestartedMcp>,
+    /// Where `/mcp` saves and deletes MCP logins: the config's
+    /// `mcp_credentials_path`.
+    mcp_credentials_path: Option<PathBuf>,
     shutdown: bool,
 }
 
@@ -299,10 +306,75 @@ impl TuiSurfaceTaskControl {
         ))
     }
 
-    /// The runtime thread in view, whose MCP servers `/mcp` acts on. `None`
-    /// before the conversation starts.
+    /// The runtime thread in view. `None` before the conversation starts.
+    #[cfg(test)]
     pub(crate) fn runtime_thread(&self) -> Option<orca_runtime::runtime_host::RuntimeThreadHandle> {
         self.lock_hosted().queue_runtime.clone()
+    }
+
+    /// Lets go of the runtime thread in view, and it of this control, as the
+    /// controller ends. Its prompt queue's interaction handlers hold the
+    /// control, which holds the thread: otherwise neither would be dropped
+    /// on quitting, nor the thread's MCP servers stopped.
+    pub(crate) fn release_runtime_thread(&self) {
+        let runtime = self.lock_hosted().queue_runtime.take();
+        if let Some(runtime) = runtime {
+            runtime.set_prompt_queue_interaction_handlers(
+                orca_runtime::runtime_host::PromptQueueInteractionHandlers::default(),
+            );
+        }
+    }
+
+    /// Keeps `prestarted`, the MCP servers that started with the TUI, for
+    /// `/mcp` and the MCP prompt commands to use, and for the first thread
+    /// to take.
+    pub(crate) fn set_prestart_mcp(&self, prestarted: PrestartedMcp) {
+        let replaced = self.lock_hosted().prestart_mcp.replace(prestarted);
+        // Stopping servers takes no lock of the controller's.
+        drop(replaced);
+    }
+
+    /// The MCP servers that started with the TUI, while no thread has taken
+    /// them.
+    pub(crate) fn prestart_mcp_registry(&self) -> Option<orca_mcp::McpRegistry> {
+        self.lock_hosted()
+            .prestart_mcp
+            .as_ref()
+            .map(|prestarted| prestarted.registry().clone())
+    }
+
+    /// Hands the MCP servers that started with the TUI over, to the thread
+    /// that now has them: the renderer hears no more of them from here.
+    pub(crate) fn take_prestart_mcp(&self) -> Option<orca_mcp::McpRegistry> {
+        let prestarted = self.lock_hosted().prestart_mcp.take();
+        prestarted.map(PrestartedMcp::into_registry)
+    }
+
+    /// The MCP servers `/mcp` and the MCP prompt commands act on now: those
+    /// of the runtime thread in view, or, before a thread has started, those
+    /// that started with the TUI.
+    pub(crate) fn mcp_servers(&self) -> Option<McpServers> {
+        let hosted = self.lock_hosted();
+        hosted
+            .queue_runtime
+            .clone()
+            .map(|runtime| McpServers::Thread(Box::new(runtime)))
+            .or_else(|| {
+                hosted
+                    .prestart_mcp
+                    .as_ref()
+                    .map(|prestarted| McpServers::Prestarted(prestarted.registry().clone()))
+            })
+    }
+
+    pub(crate) fn set_mcp_credentials_path(&self, credentials_path: Option<PathBuf>) {
+        self.lock_hosted().mcp_credentials_path = credentials_path;
+    }
+
+    /// Where `/mcp` saves and deletes MCP logins: the config's
+    /// `mcp_credentials_path`, which a test config leaves unset.
+    pub(crate) fn mcp_credentials_path(&self) -> Option<PathBuf> {
+        self.lock_hosted().mcp_credentials_path.clone()
     }
 
     pub(crate) fn pause_current_goal(&self) -> io::Result<bool> {
@@ -332,6 +404,8 @@ impl TuiSurfaceTaskControl {
     }
 
     pub(crate) fn shutdown(&self) {
+        // The MCP servers no thread took stop, with no lock held.
+        drop(self.take_prestart_mcp());
         let _transition = self
             .hosted
             .surface_presentation_transition

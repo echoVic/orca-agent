@@ -747,6 +747,7 @@ done
         let host_handle = host.handle();
         let mut thread = None;
 
+        let control = TuiSurfaceTaskControl::isolated_for_test();
         ensure_hosted_thread(
             &mut thread,
             &host_handle,
@@ -754,6 +755,7 @@ done
             &preloaded,
             "First MCP session",
             &event_tx,
+            &control,
         )
         .expect("first hosted session");
 
@@ -778,8 +780,15 @@ done
 
         config.lock().unwrap().mcp_servers =
             vec![stdio_mcp_server("next-session", &script, &second_pid_file)];
-        start_new_hosted_session(&mut thread, &host_handle, &config, &preloaded, &pending)
-            .expect("replacement hosted session");
+        start_new_hosted_session(
+            &mut thread,
+            &host_handle,
+            &config,
+            &preloaded,
+            &pending,
+            &control,
+        )
+        .expect("replacement hosted session");
 
         let second_pid = wait_for_mcp_pid(&second_pid_file);
         let next_registry = thread
@@ -1055,6 +1064,51 @@ fn runtime_ready_warns_about_an_mcp_server_that_failed_to_start() {
                 [warning] if warning.starts_with("failed to start MCP server 'gone': ")
             ),
             "{warnings:?}"
+        );
+
+        thread.shutdown().expect("runtime thread shutdown");
+        control.shutdown();
+        host.shutdown().expect("runtime host shutdown");
+    });
+}
+
+#[test]
+fn runtime_ready_reports_mcp_startup_warnings_only_with_its_projection() {
+    with_orca_home(|home| {
+        // A thread that records no history has no typed surface to project.
+        let mut config = test_config(HistoryMode::Disabled);
+        config.cwd = Some(home.to_path_buf());
+        config.mcp_servers = vec![orca_core::mcp_types::McpServerConfig {
+            name: "gone".to_string(),
+            command: Some(home.join("missing-server").to_string_lossy().into_owned()),
+            ..Default::default()
+        }];
+        let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "runtime-ready MCP warning without projection")
+            .expect("runtime thread");
+        // Startup is over, so its warnings would come at once.
+        assert!(thread.mcp_registry().wait_for_startup(&|| false));
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let control = crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test();
+
+        announce_runtime_ready(&thread, &event_tx, &control);
+
+        // As the thread start's own warnings, they come with the projection.
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                TuiEvent::Error(error) if error.starts_with("failed to project the active conversation")
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TuiEvent::StartupWarning(_))),
+            "{events:?}"
         );
 
         thread.shutdown().expect("runtime thread shutdown");

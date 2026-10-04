@@ -18,6 +18,7 @@ use crate::hosted_goal::{goal_continuation_prompt, send_goal_history_error};
 use crate::hosted_runtime::emit_hosted_operation_error;
 use crate::hosted_session::{announce_runtime_ready, emit_typed_history_snapshot};
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::prestart_mcp::offer_prestarted_mcp;
 use crate::protocol::SessionAttachmentId;
 use crate::protocol::TuiEvent;
 use crate::surface_actions::{TuiHostActions, TuiSurfaceActions};
@@ -31,9 +32,13 @@ pub(crate) fn ensure_hosted_thread(
     _preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     title: &str,
     event_tx: &mpsc::Sender<TuiEvent>,
+    control: &TuiSurfaceTaskControl,
 ) -> Result<(), String> {
     if thread.is_none() {
-        let request = RuntimeThreadStartRequest::new(config.clone(), title);
+        let request = offer_prestarted_mcp(
+            RuntimeThreadStartRequest::new(config.clone(), title),
+            control,
+        );
         #[cfg(test)]
         let request = if let Some(transcript) = _preloaded.lock().unwrap().clone() {
             request.with_preloaded(transcript)
@@ -52,6 +57,8 @@ pub(crate) fn ensure_hosted_thread(
             event_tx,
         );
         *thread = Some(started);
+        // The thread has the MCP servers that started with the TUI now.
+        drop(control.take_prestart_mcp());
     }
     Ok(())
 }
@@ -65,6 +72,7 @@ pub(crate) fn start_new_hosted_session(
     config: &Arc<Mutex<RunConfig>>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    control: &TuiSurfaceTaskControl,
 ) -> Result<SurfaceProjectionState, String> {
     ensure_current_session_switchable(thread.as_ref())?;
 
@@ -72,7 +80,10 @@ pub(crate) fn start_new_hosted_session(
     next_config.history_mode = HistoryMode::Record;
     next_config.prompt.clear();
     next_config.show_session_picker = false;
-    let request = RuntimeThreadStartRequest::new(next_config.clone(), NEW_CONVERSATION_TITLE);
+    let request = offer_prestarted_mcp(
+        RuntimeThreadStartRequest::new(next_config.clone(), NEW_CONVERSATION_TITLE),
+        control,
+    );
     let started = host
         .start_thread_with_request(request)
         .map_err(|error| format!("failed to start a new conversation: {error}"))?;
@@ -86,6 +97,7 @@ pub(crate) fn start_new_hosted_session(
         preloaded,
         pending_workflow_notifications,
     )?;
+    drop(control.take_prestart_mcp());
     Ok(projection)
 }
 
@@ -225,6 +237,7 @@ pub(crate) fn start_forked_hosted_session(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     title: Option<String>,
+    control: &TuiSurfaceTaskControl,
 ) -> Result<(HistoryMode, SurfaceProjectionState), String> {
     ensure_current_session_switchable(thread.as_ref())?;
     let source_id = thread
@@ -238,7 +251,10 @@ pub(crate) fn start_forked_hosted_session(
     next_config.history_mode = mode.clone();
     next_config.prompt.clear();
     next_config.show_session_picker = false;
-    let request = RuntimeThreadStartRequest::new(next_config.clone(), fork_title.clone());
+    let request = offer_prestarted_mcp(
+        RuntimeThreadStartRequest::new(next_config.clone(), fork_title.clone()),
+        control,
+    );
     let started = host
         .start_thread_with_request(request)
         .map_err(|error| format!("failed to fork conversation: {error}"))?;
@@ -252,6 +268,7 @@ pub(crate) fn start_forked_hosted_session(
         preloaded,
         pending_workflow_notifications,
     )?;
+    drop(control.take_prestart_mcp());
     Ok((mode, projection))
 }
 
@@ -264,6 +281,7 @@ pub(crate) fn switch_saved_hosted_session(
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     mode: HistoryMode,
     title: Option<String>,
+    control: &TuiSurfaceTaskControl,
 ) -> Result<(HistoryMode, SurfaceProjectionState), String> {
     ensure_current_session_switchable(thread.as_ref())?;
     let selector = match &mode {
@@ -286,8 +304,11 @@ pub(crate) fn switch_saved_hosted_session(
     next_config.history_mode = mode.clone();
     next_config.prompt.clear();
     next_config.show_session_picker = false;
-    let request = RuntimeThreadStartRequest::new(next_config.clone(), switch_title)
-        .with_preloaded(transcript);
+    let request = offer_prestarted_mcp(
+        RuntimeThreadStartRequest::new(next_config.clone(), switch_title)
+            .with_preloaded(transcript),
+        control,
+    );
     let started = host
         .start_thread_with_request(request)
         .map_err(|error| format!("failed to switch saved conversation: {error}"))?;
@@ -301,6 +322,7 @@ pub(crate) fn switch_saved_hosted_session(
         preloaded,
         pending_workflow_notifications,
     )?;
+    drop(control.take_prestart_mcp());
     Ok((mode, projection))
 }
 
@@ -358,6 +380,7 @@ pub(crate) fn handle_hosted_session_action(
             config,
             preloaded,
             pending_workflow_notifications,
+            control,
         ) {
             Ok(projection) => {
                 rotate_attached_event_sender(
@@ -385,6 +408,7 @@ pub(crate) fn handle_hosted_session_action(
             preloaded,
             pending_workflow_notifications,
             title,
+            control,
         ) {
             Ok((mode, projection)) => {
                 rotate_attached_event_sender(
@@ -458,6 +482,7 @@ pub(crate) fn handle_hosted_session_action(
                 pending_workflow_notifications,
                 HistoryMode::Resume(session_id),
                 None,
+                control,
             ) {
                 Ok((mode, projection)) => {
                     rotate_attached_event_sender(
@@ -494,6 +519,7 @@ pub(crate) fn handle_hosted_session_action(
                 pending_workflow_notifications,
                 HistoryMode::Fork(session_id),
                 None,
+                control,
             ) {
                 Ok((mode, projection)) => {
                     rotate_attached_event_sender(
@@ -622,8 +648,10 @@ pub(crate) fn resume_latest_active_goal_hosted(
     };
     let mut cfg = config.lock().unwrap().clone();
     cfg.history_mode = HistoryMode::Resume(goal.session_id.clone());
-    let request =
-        RuntimeThreadStartRequest::new(cfg.clone(), &goal.objective).with_preloaded(transcript);
+    let request = offer_prestarted_mcp(
+        RuntimeThreadStartRequest::new(cfg.clone(), &goal.objective).with_preloaded(transcript),
+        control,
+    );
     let resumed = match host.start_thread_with_request(request) {
         Ok(thread) => thread,
         Err(error) => {
@@ -666,6 +694,7 @@ pub(crate) fn resume_latest_active_goal_hosted(
         let _ = event_tx.send(TuiEvent::Error(error));
         return;
     }
+    drop(control.take_prestart_mcp());
     if let Some(runtime_thread) = thread.as_ref() {
         let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
         if let Err(error) = actions.resume_goal_and_run_with_started(

@@ -1137,6 +1137,9 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
     1,
   ],
   ["crates/orca-tui/src/hosted_session_lifecycle.rs:reap_hosted_thread:thread.shutdown", 2],
+  // The MCP servers of a conversation not started yet: the TUI connects them
+  // at launch, and the first thread to start takes the registry over.
+  ["crates/orca-tui/src/prestart_mcp.rs:start_prestart_mcp:catalog.mutate", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:user_action.route", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:host.shutdown", 1],
   ["crates/orca-tui/src/background_tasks.rs:handle_hosted_task_action:task.mutate", 5],

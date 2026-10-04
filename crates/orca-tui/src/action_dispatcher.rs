@@ -439,9 +439,14 @@ fn route_action(
         action @ (UserAction::McpReconnect { .. }
         | UserAction::McpLogin { .. }
         | UserAction::McpLogout { .. }) => {
+            // The worker asks for the servers when it gets to them: a login
+            // started before the first message reconnects the server in the
+            // conversation it finishes in.
+            let servers = controller.clone();
             if let Err(not_started) = crate::mcp_server_actions::spawn_mcp_server_action(
                 action,
-                controller.runtime_thread(),
+                move || servers.mcp_servers(),
+                controller.mcp_credentials_path(),
                 event_tx.clone(),
             ) {
                 // No worker will free the server: its finish must arrive,
@@ -469,7 +474,7 @@ fn route_action(
                 prompt,
                 arguments,
                 attachment,
-                controller.runtime_thread(),
+                controller.mcp_servers(),
                 event_tx.clone(),
             ) {
                 // No worker will report on the prompt, so this must arrive.
@@ -752,10 +757,12 @@ mod tests {
             })
             .unwrap();
 
+        // With neither a thread nor servers that started with the TUI, there
+        // is nothing to reconnect.
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(5)),
             Ok(TuiEvent::Notice(notice))
-                if notice == crate::mcp_server_actions::MCP_SERVERS_NOT_STARTED
+                if notice == "failed to reconnect MCP server My-Server: the conversation is unavailable"
         ));
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(5)),
@@ -783,9 +790,10 @@ mod tests {
             })
             .unwrap();
 
-        // With no runtime yet, the worker says so, for the conversation the
-        // prompt ran in; the hosted controller, which a running turn keeps
-        // busy, never sees the prompt.
+        // With neither a thread nor servers that started with the TUI, the
+        // worker says so, for the conversation the prompt ran in; the hosted
+        // controller, which a running turn keeps busy, never sees the
+        // prompt.
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(5)),
             Ok(TuiEvent::McpPromptExpanded {
@@ -796,7 +804,7 @@ mod tests {
             }) if server == "github"
                 && prompt == "review_pr"
                 && reported == attachment
-                && reason == "MCP prompt /mcp__github__review_pr failed: the conversation has not started"
+                && reason == "MCP prompt /mcp__github__review_pr failed: the conversation is unavailable"
         ));
         assert!(command_rx.try_recv().is_err());
         dispatcher.shutdown().unwrap();

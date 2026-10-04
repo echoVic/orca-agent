@@ -17,6 +17,7 @@ use crate::protocol::{TuiEvent, UserAction};
 use crate::queued_input_actions::enqueue_composer_follow_up_to_runtime;
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::surface_actions::TuiSurfaceActions;
+use crate::surface_projection::{McpServerStatusView, McpServerView};
 use crate::terminal_presentation::TerminalPresentation;
 use crate::theme::Theme;
 use crate::transcript_state::ChatMessage;
@@ -28,6 +29,9 @@ pub(crate) struct RendererRuntimeEventOwner {
     mention_search: MentionSearchManager,
     pending_initial_prompt: Option<String>,
     local_shell_readiness: bool,
+    /// The MCP servers in view when the mention catalog last looked at
+    /// them.
+    mcp_servers_seen: Vec<McpServerView>,
 }
 
 impl RendererRuntimeEventOwner {
@@ -39,6 +43,7 @@ impl RendererRuntimeEventOwner {
             mention_search,
             pending_initial_prompt,
             local_shell_readiness: true,
+            mcp_servers_seen: Vec::new(),
         }
     }
 
@@ -172,6 +177,24 @@ impl RendererRuntimeEventOwner {
         crate::background_approval_actions::continue_allowed_background_approvals(
             state, config, action_tx,
         );
+        self.discover_mentions_after_mcp_changes(state);
+    }
+
+    /// Has the mention catalog discovered again once the MCP servers in view
+    /// have changed and none is still connecting: a server that connected
+    /// after it was discovered offers resources it lacks.
+    fn discover_mentions_after_mcp_changes(&mut self, state: &AppState) {
+        if state.mcp_catalog.servers == self.mcp_servers_seen {
+            return;
+        }
+        self.mcp_servers_seen.clone_from(&state.mcp_catalog.servers);
+        if !self
+            .mcp_servers_seen
+            .iter()
+            .any(|server| server.status == McpServerStatusView::Starting)
+        {
+            self.mention_search.rediscover_catalog();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -617,5 +640,106 @@ mod tests {
         assert_eq!(state.reasoning_effort, ReasoningEffort::High);
         assert_eq!(state.approval_mode, ApprovalMode::FullAuto);
         owner.shutdown();
+    }
+
+    #[test]
+    fn the_mention_catalog_is_discovered_again_once_mcp_servers_have_connected() {
+        use crate::surface_projection::{
+            McpCatalogView, McpServerStatusView, McpServerView, SurfaceProjectionState,
+        };
+
+        let home = crate::test_support::isolate_orca_home();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = orca_core::config::HistoryMode::Record;
+        let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "mention catalog")
+            .expect("runtime thread");
+        let (mention_event_tx, _mention_event_rx) = mpsc::unbounded();
+        let mut owner = RendererRuntimeEventOwner::new(
+            MentionSearchManager::new(home.path().to_path_buf(), mention_event_tx),
+            None,
+        );
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim_state = VimState::new(false);
+        let mut textarea = TextArea::default();
+        let mut terminal = presentation();
+        let mut handle = |owner: &mut RendererRuntimeEventOwner, event| {
+            owner.handle(
+                event,
+                &mut state,
+                &mut config,
+                &action_tx,
+                &pending,
+                &mut textarea,
+                &mut vim_state,
+                &theme,
+                &mut terminal,
+            );
+            owner.mention_search.catalog_generation()
+        };
+        // The thread's projections, as its MCP servers connect.
+        let projection = |seq: u64, status: McpServerStatusView| {
+            TuiEvent::SurfaceProjectionSynced(Box::new(SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(seq),
+                session_id: Some("session-1".to_string()),
+                title: "New conversation".to_string(),
+                usage_revision: 0,
+                usage: Default::default(),
+                context_revision: 0,
+                context_used_tokens: 0,
+                context_limit_tokens: 0,
+                workflow_tasks: Vec::new(),
+                current_goal: None,
+                foreground_operation_id: None,
+                recoverable_operation_id: None,
+                goal_presentation: None,
+                session_presentation: None,
+                mcp_catalog: McpCatalogView {
+                    servers: vec![McpServerView {
+                        name: "docs".to_string(),
+                        status,
+                    }],
+                    ..McpCatalogView::default()
+                },
+            }))
+        };
+
+        // The runtime is ready: the catalog is discovered.
+        assert_eq!(
+            handle(
+                &mut owner,
+                TuiEvent::MentionRuntimeReady(thread.typed_surface())
+            ),
+            1
+        );
+        // A server still connecting will list its resources once it is done.
+        assert_eq!(
+            handle(&mut owner, projection(1, McpServerStatusView::Starting)),
+            1
+        );
+        // It is: the catalog is discovered again, with them.
+        assert_eq!(
+            handle(&mut owner, projection(2, McpServerStatusView::Connected)),
+            2
+        );
+        // Nothing changed for the servers since.
+        assert_eq!(
+            handle(&mut owner, projection(3, McpServerStatusView::Connected)),
+            2
+        );
+
+        owner.shutdown();
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
     }
 }

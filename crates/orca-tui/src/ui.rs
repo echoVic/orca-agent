@@ -1106,30 +1106,25 @@ fn mcp_server_rows(
 
 /// While an action runs for the server, what it does: `reconnecting…`,
 /// `waiting for browser login…` or `logging out…`. Otherwise
-/// `connected · 2 tools`, `failed: {message}`, `needs login`, `disabled`,
-/// `starting` or `not connected yet`, on one line whatever the message
-/// holds.
+/// `connected · 2 tools`, `failed: {message}`, `needs login`, `disabled` or
+/// `starting`, on one line whatever the message holds.
 fn mcp_server_status_text(state: &AppState, server: &crate::types::McpPanelServer) -> String {
     if let Some(action) = state.mcp_actions_in_flight.get(&server.key) {
         return action.label().to_string();
     }
-    if server.status != crate::surface_projection::McpServerStatusView::Connected {
-        return server
-            .status
-            .label()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-    }
     let tools = state.mcp_catalog.server_tools(&server.key).count();
-    let noun = if tools == 1 { "tool" } else { "tools" };
-    format!("{} · {tools} {noun}", server.status.label())
+    server
+        .status
+        .summary(Some(tools))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The server's status in full, with the authorization url a login waits
 /// on, its tools, each with the name a permission rule gives it (read-only
 /// ones marked), its prompts, and the tool filters its config entry sets.
-/// Before the server connects, its tools and prompts are not known yet.
+/// Until a server first connects, its tools and prompts are not known yet.
 fn mcp_server_details(
     state: &AppState,
     server: &crate::types::McpPanelServer,
@@ -1230,7 +1225,12 @@ fn mcp_server_details(
         );
     }
     lines.push(Line::from(""));
-    if server.status == crate::surface_projection::McpServerStatusView::NotConnectedYet {
+    // A stdio server being reconnected is starting too, and keeps its tools
+    // meanwhile.
+    if server.status == crate::surface_projection::McpServerStatusView::Starting
+        && tools.is_empty()
+        && prompts.is_empty()
+    {
         lines.push(Line::from(Span::styled(
             "Tools and prompts appear once the server connects.",
             theme.muted_style(),
@@ -5591,8 +5591,39 @@ fn stream_phase_label(state: &AppState) -> &'static str {
     match state.transcript.messages.last() {
         Some(ChatMessage::Reasoning { .. }) => "thinking",
         Some(ChatMessage::AssistantChunk { .. }) | Some(ChatMessage::Assistant(_)) => "writing",
+        // Before its first model request, a turn waits for the MCP servers
+        // still connecting.
+        _ if !turn_has_model_output(state)
+            && state.mcp_catalog.servers.iter().any(|server| {
+                server.status == crate::surface_projection::McpServerStatusView::Starting
+            }) =>
+        {
+            "connecting MCP servers"
+        }
         _ => "working",
     }
+}
+
+/// Whether the model has said or done anything since the user's last
+/// message: thought, written, planned, or called a tool.
+fn turn_has_model_output(state: &AppState) -> bool {
+    state
+        .transcript
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| !matches!(message, ChatMessage::User(_)))
+        .any(|message| {
+            matches!(
+                message,
+                ChatMessage::Reasoning { .. }
+                    | ChatMessage::Assistant(_)
+                    | ChatMessage::AssistantChunk { .. }
+                    | ChatMessage::ProposedPlan(_)
+                    | ChatMessage::ToolCall { .. }
+                    | ChatMessage::PlanUpdate { .. }
+            )
+        })
 }
 
 fn foreground_activity_line(state: &AppState, theme: &Theme) -> Option<Line<'static>> {
@@ -9348,7 +9379,8 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_before_the_runtime_starts_lists_the_configured_servers() {
+    fn a_server_still_connecting_says_its_tools_come_once_it_does() {
+        use crate::surface_projection::McpServerStatusView;
         let mut state = test_state();
         let remote = |name: &str| orca_core::mcp_types::McpServerConfig {
             name: name.to_string(),
@@ -9367,11 +9399,19 @@ mod tests {
                 ..remote("archive")
             },
         ];
+        // No message sent yet: the catalog is that of the servers that
+        // started with the TUI, one still connecting.
+        state.update(TuiEvent::McpCatalogPrestart(
+            crate::surface_projection::McpCatalogView {
+                servers: vec![
+                    mcp_server_view("my_server", McpServerStatusView::Starting),
+                    mcp_server_view("archive", McpServerStatusView::Disabled),
+                ],
+                ..Default::default()
+            },
+        ));
         let shared = Arc::new(Mutex::new(config.clone()));
         let (action_tx, _action_rx) = mpsc::unbounded();
-
-        // No message sent yet: the runtime, and with it the catalog, is not
-        // there.
         crate::slash_command_actions::handle_slash_command(
             "/mcp",
             &mut config,
@@ -9384,7 +9424,7 @@ mod tests {
         assert!(
             frame
                 .lines()
-                .any(|line| line.contains("› My-Server") && line.contains("not connected yet")),
+                .any(|line| line.contains("› My-Server") && line.contains("starting")),
             "{frame}"
         );
         assert!(
@@ -9393,6 +9433,7 @@ mod tests {
                 .any(|line| line.contains("archive") && line.contains("disabled")),
             "{frame}"
         );
+        assert!(!frame.contains("not connected yet"), "{frame}");
 
         state.mcp_dialog = Some(crate::types::McpDialog {
             selected: 0,
@@ -9400,7 +9441,6 @@ mod tests {
         });
         let frame = frame_string(&mut state, 100, 30);
         assert!(frame.contains("My-Server"), "{frame}");
-        assert!(frame.contains("not connected yet"), "{frame}");
         assert!(
             frame.contains("Tools and prompts appear once the server connects."),
             "{frame}"
@@ -9535,7 +9575,8 @@ mod tests {
     }
 
     #[test]
-    fn before_start_entries_sharing_a_name_each_show_their_own() {
+    fn entries_sharing_a_name_show_as_the_one_server_they_name() {
+        use crate::surface_projection::McpServerStatusView;
         let mut state = test_state();
         let remote = |name: &str| orca_core::mcp_types::McpServerConfig {
             name: name.to_string(),
@@ -9545,6 +9586,14 @@ mod tests {
         };
         let mut config = crate::test_support::test_run_config();
         config.mcp_servers = vec![remote("My-Server"), remote("my_server")];
+        // The registry connects the first, under the name both make.
+        state.mcp_catalog = crate::surface_projection::McpCatalogView {
+            servers: vec![mcp_server_view(
+                "my_server",
+                McpServerStatusView::NeedsLogin,
+            )],
+            ..Default::default()
+        };
         let shared = Arc::new(Mutex::new(config.clone()));
         let (action_tx, action_rx) = mpsc::unbounded();
         crate::slash_command_actions::handle_slash_command(
@@ -9555,19 +9604,16 @@ mod tests {
             &action_tx,
         );
 
+        // Either entry could be the one the name means, so the panel shows
+        // the catalog's name, and asks which to log in to.
         let frame = frame_string(&mut state, 100, 30);
-        let row = |name: &str| {
+        assert!(
             frame
                 .lines()
-                .position(|line| {
-                    line.split_whitespace().any(|word| word == name)
-                        && line.contains("not connected yet")
-                })
-                .unwrap_or_else(|| panic!("no row for {name}:\n{frame}"))
-        };
-        assert_ne!(row("My-Server"), row("my_server"), "{frame}");
-
-        // Either entry could be the one the name means.
+                .any(|line| line.contains("› my_server") && line.contains("needs login")),
+            "{frame}"
+        );
+        assert!(!frame.contains("My-Server"), "{frame}");
         crate::mcp_dialog_actions::handle_mcp_dialog_key(
             &crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Char('l'),
@@ -9580,7 +9626,7 @@ mod tests {
         assert!(matches!(
             state.transcript.messages.last(),
             Some(crate::transcript_state::ChatMessage::System { text, .. })
-                if text == "no single configured MCP server matches My-Server"
+                if text == "no single configured MCP server matches my_server"
         ));
     }
 
@@ -13168,6 +13214,80 @@ mod tests {
         });
         let text = activity_line(&state, &Theme::named(ThemeName::Dark)).expect("activity");
         assert_eq!(text, " ⠋ Running 3s · thinking · Esc interrupt");
+    }
+
+    #[test]
+    fn the_status_line_says_connecting_while_servers_start() {
+        use crate::surface_projection::{McpCatalogView, McpServerStatusView, McpServerView};
+        let theme = Theme::named(ThemeName::Dark);
+        let mut state = test_state();
+        state.status = AppStatus::Running;
+        state.running_started_at = Some(Instant::now() - Duration::from_secs(3));
+        let catalog = |status| McpCatalogView {
+            servers: vec![
+                McpServerView {
+                    name: "docs".to_string(),
+                    status: McpServerStatusView::Connected,
+                },
+                McpServerView {
+                    name: "slow".to_string(),
+                    status,
+                },
+            ],
+            ..McpCatalogView::default()
+        };
+        state.push_message(ChatMessage::User("hello".to_string()));
+        state.mcp_catalog = catalog(McpServerStatusView::Starting);
+
+        // The turn waits for the server before its first model request.
+        assert_eq!(
+            activity_line(&state, &theme).as_deref(),
+            Some(" ⠋ Running 3s · connecting MCP servers · Esc interrupt")
+        );
+        // A notice in between is no model output.
+        state.push_message(ChatMessage::System {
+            text: "running MCP prompt /mcp__docs__review_pr…".to_string(),
+            expanded: false,
+        });
+        assert_eq!(
+            activity_line(&state, &theme).as_deref(),
+            Some(" ⠋ Running 3s · connecting MCP servers · Esc interrupt")
+        );
+
+        // Once the model has answered, the turn is past that wait.
+        state.push_message(ChatMessage::Reasoning {
+            text: "hmm".into(),
+            expanded: false,
+        });
+        assert_eq!(
+            activity_line(&state, &theme).as_deref(),
+            Some(" ⠋ Running 3s · thinking · Esc interrupt")
+        );
+        state.push_message(ChatMessage::ToolCall {
+            id: "call-1".to_string(),
+            name: "mcp__docs__search".to_string(),
+            target: None,
+            status: "done".to_string(),
+            output: Some("found".to_string()),
+            diff: None,
+            kind: None,
+            expanded: false,
+        });
+        assert_eq!(
+            activity_line(&state, &theme).as_deref(),
+            Some(" ⠋ Running 3s · working · Esc interrupt")
+        );
+
+        // With every server connected, it is just working.
+        let mut state = test_state();
+        state.status = AppStatus::Running;
+        state.running_started_at = Some(Instant::now() - Duration::from_secs(3));
+        state.push_message(ChatMessage::User("hello".to_string()));
+        state.mcp_catalog = catalog(McpServerStatusView::Connected);
+        assert_eq!(
+            activity_line(&state, &theme).as_deref(),
+            Some(" ⠋ Running 3s · working · Esc interrupt")
+        );
     }
 
     #[test]

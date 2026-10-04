@@ -38,6 +38,7 @@ use crate::hosted_side::{
 use crate::hosted_submission::{handle_hosted_queued_prompt, handle_hosted_submitted_turn};
 use crate::hosted_workflow::{HostedWorkflowAction, handle_hosted_workflow_action};
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::prestart_mcp::start_prestart_mcp;
 use crate::protocol::{SessionAttachmentId, TaskTranscriptResult, TuiEvent, UserAction};
 use crate::slash_command_actions::decode_settings_intent;
 use crate::submitted_turn::SubmittedTurn;
@@ -229,7 +230,15 @@ pub(crate) fn hosted_tui_controller_loop(
             .map(|transcript| transcript.meta.title)
             .map_err(|error| format!("failed to load saved session metadata: {error}"))
             .and_then(|title| {
-                ensure_hosted_thread(&mut thread, &host, &cfg, &preloaded, &title, &event_tx)
+                ensure_hosted_thread(
+                    &mut thread,
+                    &host,
+                    &cfg,
+                    &preloaded,
+                    &title,
+                    &event_tx,
+                    &control,
+                )
             })
             .and_then(|_| {
                 synchronize_shared_config_from_surface(
@@ -257,6 +266,20 @@ pub(crate) fn hosted_tui_controller_loop(
             let runtime_thread = thread.as_ref().expect("startup hosted thread");
             announce_runtime_ready(runtime_thread, &event_tx, &control);
         }
+    }
+    let (mcp_servers, mcp_credentials_path) = {
+        let cfg = config.lock().unwrap();
+        (cfg.mcp_servers.clone(), cfg.mcp_credentials_path.clone())
+    };
+    control.set_mcp_credentials_path(mcp_credentials_path.clone());
+    // A new conversation's thread starts with its first message, but its MCP
+    // servers connect now: `/mcp` and the MCP prompt commands use them
+    // meanwhile, and the first thread to start takes them.
+    if thread.is_none()
+        && let Some(prestarted) =
+            start_prestart_mcp(&mcp_servers, mcp_credentials_path, event_tx.clone())
+    {
+        control.set_prestart_mcp(prestarted);
     }
 
     loop {
@@ -1037,6 +1060,10 @@ pub(crate) fn hosted_tui_controller_loop(
     } else if let Some(runtime_thread) = thread {
         let _ = runtime_thread.shutdown();
     }
+    // Quitting before a thread took the MCP servers that started with the
+    // TUI stops them; after, the thread's go with it.
+    drop(control.take_prestart_mcp());
+    control.release_runtime_thread();
 }
 
 #[cfg(test)]

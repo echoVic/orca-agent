@@ -488,6 +488,10 @@ pub enum TuiEvent {
         attachment: Option<SessionAttachmentId>,
         message: Result<(String, Vec<ComposerImageAttachment>), ChatMessage>,
     },
+    /// How the MCP servers that started with the TUI stand now, before a
+    /// thread has taken them: once a thread's catalog is in view, it is the
+    /// one `/mcp` shows.
+    McpCatalogPrestart(crate::surface_projection::McpCatalogView),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

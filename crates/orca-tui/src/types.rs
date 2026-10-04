@@ -241,6 +241,27 @@ pub struct ConfigDialog {
     pub approval_mode: ApprovalMode,
 }
 
+/// The entry of `configs` for the MCP server the catalog names `server`:
+/// the one whose name is `server` once made canonical. `None` when no
+/// entry, or more than one, is.
+fn mcp_server_config_in<'a>(
+    configs: &'a [McpServerConfig],
+    server: &str,
+) -> Option<&'a McpServerConfig> {
+    let mut entries = configs
+        .iter()
+        .filter(|config| orca_mcp::canonical_server_name(&config.name) == server);
+    let entry = entries.next()?;
+    entries.next().is_none().then_some(entry)
+}
+
+/// What the user calls the MCP server the catalog names `server`: the name
+/// its entry in `configs` gives it, as `orca mcp list` shows it, or else the
+/// catalog's.
+pub(crate) fn mcp_config_name<'a>(configs: &'a [McpServerConfig], server: &'a str) -> &'a str {
+    mcp_server_config_in(configs, server).map_or(server, |config| config.name.as_str())
+}
+
 /// The `/mcp` panel: the server selected in the list, and whether that
 /// server's details show in place of the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,8 +544,12 @@ pub struct AppState {
     pub config_dialog: Option<ConfigDialog>,
     pub(crate) mcp_dialog: Option<McpDialog>,
     /// The MCP servers of the thread in view, with their tools and prompts,
-    /// from its latest projection.
+    /// from its latest projection; before a thread, those that started with
+    /// the TUI, as they stand.
     pub(crate) mcp_catalog: McpCatalogView,
+    /// Whether a thread's catalog has been in view: from then on, it is the
+    /// one `/mcp` shows.
+    pub(crate) surface_mcp_catalog_applied: bool,
     /// The MCP server entries of the TUI's config when `/mcp` last opened:
     /// the panel names servers and shows tool filters from them, and logs
     /// in and out with them.
@@ -874,58 +899,33 @@ impl AppState {
     /// one entry whose name is `server` once made canonical. `None` when no
     /// entry, or more than one, is.
     pub(crate) fn mcp_server_config(&self, server: &str) -> Option<&McpServerConfig> {
-        let mut entries = self
-            .mcp_server_configs
-            .iter()
-            .filter(|config| orca_mcp::canonical_server_name(&config.name) == server);
-        let entry = entries.next()?;
-        entries.next().is_none().then_some(entry)
+        mcp_server_config_in(&self.mcp_server_configs, server)
     }
 
     /// What `/mcp` calls the MCP server the catalog names `server`: the name
     /// its config entry gives it, as `orca mcp list` shows it, or else the
     /// catalog's.
     pub(crate) fn mcp_server_display_name<'a>(&'a self, server: &'a str) -> &'a str {
-        self.mcp_server_config(server)
-            .map_or(server, |config| config.name.as_str())
+        mcp_config_name(&self.mcp_server_configs, server)
     }
 
-    /// Whether `/mcp` lists the config's servers because the conversation's
-    /// runtime has not started, so none has connected yet.
+    /// Whether no thread is in view yet, its catalog with it: before the
+    /// first message, `/mcp` shows the MCP servers that started with the
+    /// TUI.
     pub(crate) fn mcp_servers_before_start(&self) -> bool {
-        self.mcp_catalog.servers.is_empty()
+        !self.surface_mcp_catalog_applied
     }
 
-    /// The servers `/mcp` lists: the catalog's, or, before the
-    /// conversation's runtime starts, one for each entry in the config, as
-    /// not connected yet or disabled, under the entry's own name.
+    /// The servers `/mcp` lists: the catalog's, under the names their config
+    /// entries give them.
     pub(crate) fn mcp_panel_servers(&self) -> Vec<McpPanelServer> {
-        if !self.mcp_servers_before_start() {
-            return self
-                .mcp_catalog
-                .servers
-                .iter()
-                .map(|server| McpPanelServer {
-                    key: server.name.clone(),
-                    name: self.mcp_server_display_name(&server.name).to_string(),
-                    status: server.status.clone(),
-                })
-                .collect();
-        }
-        self.mcp_server_configs
+        self.mcp_catalog
+            .servers
             .iter()
-            .filter_map(|config| {
-                let key = orca_mcp::canonical_server_name(&config.name);
-                let status = if config.disabled {
-                    McpServerStatusView::Disabled
-                } else {
-                    McpServerStatusView::NotConnectedYet
-                };
-                (!key.is_empty()).then(|| McpPanelServer {
-                    key,
-                    name: config.name.clone(),
-                    status,
-                })
+            .map(|server| McpPanelServer {
+                key: server.name.clone(),
+                name: self.mcp_server_display_name(&server.name).to_string(),
+                status: server.status.clone(),
             })
             .collect()
     }
@@ -971,6 +971,7 @@ impl AppState {
             config_dialog: None,
             mcp_dialog: None,
             mcp_catalog: McpCatalogView::default(),
+            surface_mcp_catalog_applied: false,
             mcp_server_configs: Vec::new(),
             mcp_actions_in_flight: std::collections::HashMap::new(),
             attached_session: false,

@@ -31,6 +31,16 @@ pub(crate) fn next_mcp_catalog(
     Some(next)
 }
 
+/// The catalog `registry` stands for, its first revision: what a surface
+/// that shows MCP servers no thread has taken yet lists, as a thread that
+/// takes them will. The TUI shows those that start with it so.
+pub fn mcp_catalog_snapshot(registry: &McpRegistry) -> SurfaceMcpCatalogSnapshot {
+    mcp_catalog(
+        registry,
+        McpCatalogRevision::try_new(1).expect("one is a valid revision"),
+    )
+}
+
 /// The catalog `registry` stands for, at `revision`. Resources are not
 /// listed yet.
 fn mcp_catalog(registry: &McpRegistry, revision: McpCatalogRevision) -> SurfaceMcpCatalogSnapshot {

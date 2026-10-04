@@ -43,6 +43,7 @@ pub(crate) fn handle_hosted_context_action(
                     preloaded,
                     "Remembered context",
                     event_tx,
+                    control,
                 )
             {
                 let _ = event_tx.send(TuiEvent::Error(error));

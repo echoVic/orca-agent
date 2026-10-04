@@ -37,6 +37,7 @@ pub(crate) fn handle_hosted_workflow_action(
                 preloaded,
                 &format!("Run saved workflow `{name}`"),
                 event_tx,
+                control,
             ) {
                 let _ = event_tx.send(TuiEvent::OperationRejected(error));
                 return;

@@ -1,16 +1,18 @@
 //! What `/mcp__{server}__{prompt}` does once its arguments fit the prompt.
-//! The runtime of the thread in view has the MCP server expand the prompt,
-//! which can take up to the server's tool timeout, so it runs on a worker of
-//! its own, off the UI thread and the action dispatcher. The worker checks
-//! the expansion against what one message can carry, attaches its images,
-//! and always reports back with `McpPromptExpanded`. The UI thread sends the
-//! message only into the conversation the prompt was run in, the way the
-//! composer sends one: at once between turns, or queued while a turn runs.
+//! The MCP server expands the prompt, asked through the runtime of the
+//! thread in view, or, before the first message, directly, as one of the
+//! servers that started with the TUI. That can take up to the server's tool
+//! timeout, so it runs on a worker of its own, off the UI thread and the
+//! action dispatcher. The worker checks the expansion against what one
+//! message can carry, attaches its images, and always reports back with
+//! `McpPromptExpanded`. The UI thread sends the message only into the
+//! conversation the prompt was run in, the way the composer sends one: at
+//! once between turns, which starts the conversation's thread when it is
+//! the first message, or queued while a turn runs.
 
 use crossbeam_channel::Sender;
 use orca_core::conversation::{ImageInput, ImageSource};
 use orca_runtime::mentions::MentionBindings;
-use orca_runtime::runtime_host::RuntimeThreadHandle;
 use orca_runtime::surface::SurfaceMcpPromptExpansion;
 
 use crate::clipboard_image::{MAX_COMPOSER_IMAGE_BYTES, MAX_COMPOSER_IMAGE_COUNT};
@@ -18,6 +20,7 @@ use crate::commands::mcp_prompt_command;
 use crate::composer_images::{ComposerImageAttachment, ComposerImageState};
 use crate::composer_textarea::MAX_USER_INPUT_TEXT_CHARS;
 use crate::idle_submit_actions::submit_user_message;
+use crate::prestart_mcp::McpServers;
 use crate::protocol::{SessionAttachmentId, TuiEvent};
 use crate::queued_input::QueuedUserMessage;
 use crate::queued_input_actions::{FollowUp, dispatch_follow_up};
@@ -33,15 +36,15 @@ const WORKER_STOPPED: &str = "its worker stopped unexpectedly";
 
 /// Starts expanding the prompt `prompt` of the MCP server the catalog names
 /// `server`, with `arguments` (name, value), for the conversation
-/// `attachment`, on the MCP servers of `runtime`, the thread in view, on a
-/// worker of its own. When no worker starts, the report it would have sent
-/// comes back, for the caller to deliver.
+/// `attachment`, on `servers`, the MCP servers in view, on a worker of its
+/// own. When no worker starts, the report it would have sent comes back,
+/// for the caller to deliver.
 pub(crate) fn spawn_mcp_prompt_expansion(
     server: String,
     prompt: String,
     arguments: Vec<(String, String)>,
     attachment: Option<SessionAttachmentId>,
-    runtime: Option<RuntimeThreadHandle>,
+    servers: Option<McpServers>,
     event_tx: Sender<TuiEvent>,
 ) -> Result<(), Box<TuiEvent>> {
     let (failed_server, failed_prompt) = (server.clone(), prompt.clone());
@@ -49,15 +52,7 @@ pub(crate) fn spawn_mcp_prompt_expansion(
         .name("orca-tui-mcp-prompt".to_string())
         .spawn(move || {
             run_mcp_prompt_worker(server, prompt, attachment, &event_tx, |server, prompt| {
-                match runtime {
-                    Some(runtime) => crate::surface_client::expand_mcp_prompt(
-                        &runtime.typed_surface(),
-                        server,
-                        prompt,
-                        arguments,
-                    ),
-                    None => Err("the conversation has not started".to_string()),
-                }
+                expand_prompt_on(servers, server, prompt, arguments)
             });
         })
         .map(|_| ())
@@ -73,6 +68,33 @@ pub(crate) fn spawn_mcp_prompt_expansion(
                 )),
             })
         })
+}
+
+/// Has `server` (its catalog name), one of `servers`, expand its prompt
+/// `prompt` with `arguments` (name, value).
+fn expand_prompt_on(
+    servers: Option<McpServers>,
+    server: &str,
+    prompt: &str,
+    arguments: Vec<(String, String)>,
+) -> Result<SurfaceMcpPromptExpansion, String> {
+    match servers {
+        Some(McpServers::Thread(runtime)) => crate::surface_client::expand_mcp_prompt(
+            &runtime.typed_surface(),
+            server,
+            prompt,
+            arguments,
+        ),
+        Some(McpServers::Prestarted(registry)) => registry
+            .get_prompt(server, prompt, &arguments.into_iter().collect())
+            .map(|expansion| SurfaceMcpPromptExpansion {
+                text: expansion.text,
+                images: expansion.images,
+            }),
+        // Neither a thread nor servers that started with the TUI, as while
+        // a thread is taking them over.
+        None => Err("the conversation is unavailable".to_string()),
+    }
 }
 
 /// A worker's whole run: `expand` the prompt, then report the message it
@@ -850,7 +872,7 @@ done
             prompt,
             arguments,
             attachment,
-            Some(thread.clone()),
+            Some(McpServers::Thread(Box::new(thread.clone()))),
             event_tx,
         )
         .expect("start the MCP prompt worker");

@@ -255,7 +255,7 @@ pub(crate) fn handle_hosted_goal_action(
             let cfg = config.lock().unwrap().clone();
             let thread_was_missing = thread.is_none();
             if let Err(error) =
-                ensure_hosted_thread(thread, host, &cfg, preloaded, &objective, event_tx)
+                ensure_hosted_thread(thread, host, &cfg, preloaded, &objective, event_tx, control)
             {
                 let _ = event_tx.send(TuiEvent::OperationRejected(error));
                 return;
@@ -303,9 +303,9 @@ pub(crate) fn handle_hosted_goal_action(
             let objective = materialized.objective().to_string();
             if thread.is_none() {
                 let cfg = config.lock().unwrap().clone();
-                if let Err(error) =
-                    ensure_hosted_thread(thread, host, &cfg, preloaded, &objective, event_tx)
-                {
+                if let Err(error) = ensure_hosted_thread(
+                    thread, host, &cfg, preloaded, &objective, event_tx, control,
+                ) {
                     let _ = event_tx.send(TuiEvent::OperationRejected(error));
                     return;
                 }
@@ -344,9 +344,15 @@ pub(crate) fn handle_hosted_goal_action(
             };
             if thread.is_none() {
                 let cfg = config.lock().unwrap().clone();
-                if let Err(error) =
-                    ensure_hosted_thread(thread, host, &cfg, preloaded, "clear Goal", event_tx)
-                {
+                if let Err(error) = ensure_hosted_thread(
+                    thread,
+                    host,
+                    &cfg,
+                    preloaded,
+                    "clear Goal",
+                    event_tx,
+                    control,
+                ) {
                     let _ = event_tx.send(TuiEvent::OperationRejected(error));
                     return;
                 }
@@ -378,9 +384,15 @@ pub(crate) fn handle_hosted_goal_action(
             };
             if thread.is_none() {
                 let cfg = config.lock().unwrap().clone();
-                if let Err(error) =
-                    ensure_hosted_thread(thread, host, &cfg, preloaded, "pause Goal", event_tx)
-                {
+                if let Err(error) = ensure_hosted_thread(
+                    thread,
+                    host,
+                    &cfg,
+                    preloaded,
+                    "pause Goal",
+                    event_tx,
+                    control,
+                ) {
                     let _ = event_tx.send(TuiEvent::OperationRejected(error));
                     return;
                 }

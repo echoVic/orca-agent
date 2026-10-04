@@ -3152,6 +3152,8 @@ pub struct RuntimeThreadHandle {
     startup_warnings: Arc<Vec<String>>,
     task_registry: TaskRegistry,
     mcp_registry: McpRegistry,
+    /// What the MCP servers left to report when their startup ended.
+    mcp_startup: Arc<crate::mcp_startup::McpStartupWarnings>,
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     surface: surface::RuntimeSurfaceHandle,
     prompt_queue_updates: tokio::sync::watch::Sender<crate::prompt_queue::PromptQueueSnapshot>,
@@ -3471,11 +3473,12 @@ impl RuntimeThreadHandle {
     /// error of each server that failed to start or needs a login. The error
     /// of a server that failed to start is prefixed with its name when it
     /// does not name it.
-    /// `report` is called only once: a later change, such as a reconnect,
-    /// shows in the MCP catalog instead. The registry is held only weakly
-    /// meanwhile, so the wait keeps no server running.
+    /// They are taken once, when startup ends, and each call reports those:
+    /// a later change, such as a reconnect, shows in the MCP catalog
+    /// instead. `report` is called only once. The registry is held only
+    /// weakly meanwhile, so the wait keeps no server running.
     pub fn on_mcp_startup_warnings(&self, report: impl FnOnce(Vec<String>) + Send + 'static) {
-        crate::mcp_startup::report_mcp_startup_warnings(&self.mcp_registry, report);
+        self.mcp_startup.on_ended(&self.mcp_registry, report);
     }
 
     /// Waits until none of the session's MCP servers is still making its
@@ -3488,7 +3491,7 @@ impl RuntimeThreadHandle {
     ) -> Option<Vec<String>> {
         self.mcp_registry
             .wait_for_startup(should_cancel)
-            .then(|| crate::mcp_startup::mcp_startup_warnings(&self.mcp_registry))
+            .then(|| self.mcp_startup.after_startup(&self.mcp_registry))
     }
 
     pub fn task_registry(&self) -> TaskRegistry {
@@ -5668,6 +5671,7 @@ async fn run_host_supervisor(
                 let startup_warnings = Arc::new(
                     crate::shell_readiness::ShellReadiness::run_startup_warnings(&actor_config),
                 );
+                let mcp_startup = crate::mcp_startup::McpStartupWarnings::watch(&mcp_registry);
                 let handle = RuntimeThreadHandle {
                     thread_id: thread_id.clone(),
                     session_id,
@@ -5675,6 +5679,7 @@ async fn run_host_supervisor(
                     startup_warnings,
                     task_registry,
                     mcp_registry,
+                    mcp_startup,
                     command_tx: thread_command_tx.clone(),
                     surface: surface_handle,
                     prompt_queue_updates,
@@ -39693,6 +39698,7 @@ mod tests {
             startup_warnings: Arc::new(Vec::new()),
             task_registry: TaskRegistry::new(thread_id.clone()),
             mcp_registry: McpRegistry::default(),
+            mcp_startup: crate::mcp_startup::McpStartupWarnings::watch(&McpRegistry::default()),
             command_tx,
             surface: unavailable_surface_handle(
                 surface::HostIncarnation::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
@@ -41424,6 +41430,58 @@ done
             let _ = late_tx.send(warnings);
         });
         assert_eq!(late_rx.try_recv(), Ok(warnings));
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// The startup warnings of `thread`, as a surface that shows it hears
+    /// them.
+    #[cfg(unix)]
+    fn mcp_startup_warnings_of(thread: &RuntimeThreadHandle) -> Vec<String> {
+        let (report_tx, report_rx) = mpsc::channel();
+        thread.on_mcp_startup_warnings(move |warnings| {
+            let _ = report_tx.send(warnings);
+        });
+        report_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("the warnings once startup ends")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_startup_warnings_stay_those_startup_left() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.mcp_servers = vec![catalog_mcp_server(
+            "docs",
+            cwd.path(),
+            r#"[{"name":"lookup","inputSchema":{"type":"object"}}]"#,
+        )];
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp startup warnings stay")
+            .expect("start the thread");
+        assert_eq!(mcp_startup_warnings_of(&thread), Vec::<String>::new());
+
+        // The server now lists its tools wrongly, so connecting it again
+        // fails, after startup.
+        fs::write(
+            catalog_mcp_server_dir("docs", cwd.path()).join("tools.json"),
+            "not a tool list",
+        )
+        .expect("break the MCP tool list");
+        assert!(thread.mcp_registry().reconnect_server("docs").is_err());
+
+        // A surface that shows the thread again, and `orca exec`, hear what
+        // startup left, not what went wrong since.
+        assert_eq!(mcp_startup_warnings_of(&thread), Vec::<String>::new());
+        assert_eq!(
+            thread.wait_for_mcp_startup_warnings(&|| false),
+            Some(Vec::new())
+        );
         host.shutdown().expect("shutdown runtime host");
     }
 }

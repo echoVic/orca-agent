@@ -52,7 +52,8 @@ pub struct SurfaceProjectionState {
 /// of the connected ones. Servers, tools and prompts are all keyed by the
 /// catalog's server name, which is canonical (`My-Server` is `my_server`).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct McpCatalogView {
+#[doc(hidden)]
+pub struct McpCatalogView {
     pub(crate) servers: Vec<McpServerView>,
     pub(crate) tools: Vec<McpToolView>,
     pub(crate) prompts: Vec<McpPromptView>,
@@ -71,9 +72,6 @@ pub(crate) enum McpServerStatusView {
     NeedsLogin,
     Disabled,
     Starting,
-    /// A configured server before the conversation's runtime has started:
-    /// servers connect when it does. The catalog never reports it.
-    NotConnectedYet,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,6 +137,13 @@ impl McpCatalogView {
         }
     }
 
+    /// The catalog of `registry`, the MCP servers that started with the
+    /// TUI, before a thread has taken them: as the thread that takes them
+    /// will list them.
+    pub(crate) fn from_registry(registry: &orca_mcp::McpRegistry) -> Self {
+        Self::from_surface(&orca_runtime::mcp_catalog_snapshot(registry))
+    }
+
     /// The tools of the server the catalog names `server`.
     pub(crate) fn server_tools<'a>(
         &'a self,
@@ -171,8 +176,21 @@ impl McpServerStatusView {
         }
     }
 
+    /// How `/mcp`'s list words the status of a server with `tools` tools:
+    /// `connected · 2 tools` for a connected one, or else as [`Self::label`]
+    /// does. With `tools` unknown, a connected one is just `connected`.
+    pub(crate) fn summary(&self, tools: Option<usize>) -> String {
+        match (self, tools) {
+            (Self::Connected, Some(tools)) => {
+                let noun = if tools == 1 { "tool" } else { "tools" };
+                format!("{} · {tools} {noun}", self.label())
+            }
+            _ => self.label(),
+        }
+    }
+
     /// How `/mcp` words the status: `connected`, `failed: {message}`,
-    /// `needs login`, `disabled`, `starting` or `not connected yet`.
+    /// `needs login`, `disabled` or `starting`.
     pub(crate) fn label(&self) -> String {
         match self {
             Self::Connected => "connected".to_string(),
@@ -180,7 +198,6 @@ impl McpServerStatusView {
             Self::NeedsLogin => "needs login".to_string(),
             Self::Disabled => "disabled".to_string(),
             Self::Starting => "starting".to_string(),
-            Self::NotConnectedYet => "not connected yet".to_string(),
         }
     }
 }

@@ -1,15 +1,12 @@
 //! Keys of the `/mcp` panel. `r`, `l` and `o` hand a reconnect, a login or
 //! a logout of the selected server to a worker (see `mcp_server_actions`);
-//! the panel's list only ever changes with the catalog the next projection
-//! brings. Before the conversation's runtime starts, the panel lists the
-//! config's servers, which can be logged in to and out of but not yet
-//! reconnected.
+//! the panel's list only ever changes with the catalog: the thread's, or,
+//! before the first message, that of the servers that started with the TUI.
 
 use crossbeam_channel as mpsc;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use orca_mcp::McpAuthKind;
 
-use crate::mcp_server_actions::MCP_SERVERS_NOT_STARTED;
 use crate::protocol::UserAction;
 use crate::transcript_state::ChatMessage;
 use crate::types::{AppState, McpActionInFlight};
@@ -60,8 +57,7 @@ pub(crate) fn handle_mcp_dialog_key(
 /// it, which answers first: an older reconnect could otherwise overwrite a
 /// newer one. Logging in and out uses the server's config entry, under
 /// whose name its login is saved, and only for a server that logs in with
-/// OAuth. Before the conversation's runtime starts, there is nothing to
-/// reconnect.
+/// OAuth.
 fn start_action(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
@@ -77,9 +73,6 @@ fn start_action(
         ))
     } else {
         match action {
-            McpServerAction::Reconnect if state.mcp_servers_before_start() => {
-                Err(MCP_SERVERS_NOT_STARTED.to_string())
-            }
             McpServerAction::Reconnect => Ok((
                 UserAction::McpReconnect {
                     server: server.name.clone(),
@@ -297,7 +290,7 @@ mod tests {
         assert!(state.mcp_actions_in_flight.is_empty());
 
         // A running action answers first, before the checks `l` and `o`
-        // make of a server that does not log in with OAuth…
+        // make of a server that does not log in with OAuth.
         let (mut state, action_tx, action_rx) = open_panel(
             vec![server("local", McpServerStatusView::Connected)],
             vec![stdio("local")],
@@ -312,17 +305,6 @@ mod tests {
                 Some("an MCP action for local is already running")
             );
         }
-
-        // …and before `r`'s answer before the conversation starts.
-        let (mut state, action_tx, action_rx) = open_panel(Vec::new(), vec![remote("linear")]);
-        press(&mut state, &action_tx, KeyCode::Char('l'));
-        assert!(action_rx.try_recv().is_ok());
-        press(&mut state, &action_tx, KeyCode::Char('r'));
-        assert!(action_rx.try_recv().is_err());
-        assert_eq!(
-            last_notice(&state),
-            Some("an MCP action for linear is already running")
-        );
     }
 
     #[test]
@@ -384,18 +366,30 @@ mod tests {
     }
 
     #[test]
-    fn r_before_the_runtime_starts_says_when_servers_connect_and_sends_nothing() {
-        // No catalog yet: the panel lists the config's servers.
-        let (mut state, action_tx, action_rx) = open_panel(Vec::new(), vec![remote("linear")]);
+    fn before_the_first_message_the_panel_acts_on_the_servers_that_started() {
+        // No thread yet: the catalog is that of the servers that started
+        // with the TUI.
+        let (mut state, action_tx, action_rx) = open_panel(Vec::new(), vec![stdio("local")]);
+        assert!(state.mcp_panel_servers().is_empty());
+        state.update(TuiEvent::McpCatalogPrestart(McpCatalogView {
+            servers: vec![server(
+                "local",
+                McpServerStatusView::Failed("MCP server closed stdout".to_string()),
+            )],
+            ..McpCatalogView::default()
+        }));
+        assert!(!state.surface_mcp_catalog_applied);
 
         press(&mut state, &action_tx, KeyCode::Char('r'));
 
-        assert!(action_rx.try_recv().is_err());
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::McpReconnect { server }) if server == "local"
+        ));
         assert_eq!(
-            last_notice(&state),
-            Some("MCP servers connect when the conversation starts; send a message first.")
+            state.mcp_actions_in_flight.get("local"),
+            Some(&McpActionInFlight::Reconnecting)
         );
-        assert!(state.mcp_actions_in_flight.is_empty());
     }
 
     #[test]
