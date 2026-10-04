@@ -121,6 +121,19 @@ pub struct McpServerStatus {
     pub errors: Vec<String>,
 }
 
+/// How a registry stands at one moment ([`McpRegistry::snapshot`]): every
+/// configured server and how it stands, and the tools and prompts of the
+/// connected ones, all read together.
+#[derive(Clone, Debug, Default)]
+pub struct McpRegistrySnapshot {
+    /// As [`McpRegistry::server_statuses`] lists them.
+    pub servers: Vec<McpServerStatus>,
+    /// As [`McpRegistry::tools`] lists them.
+    pub tools: Vec<McpTool>,
+    /// As [`McpRegistry::prompts`] lists them.
+    pub prompts: Vec<McpPrompt>,
+}
+
 #[derive(Clone, Default)]
 struct McpRegistryInner {
     /// Every configured server that has a name, in config order.
@@ -172,6 +185,27 @@ impl McpRegistryInner {
             .flat_map(|server| server.tools.iter().cloned())
             .collect();
         self.lookup = tool_lookup(&self.tools);
+    }
+
+    /// Every configured server and how it stands, in config order.
+    fn server_statuses(&self) -> Vec<McpServerStatus> {
+        self.servers
+            .iter()
+            .map(|server| McpServerStatus {
+                name: server.name.clone(),
+                state: server.state.clone(),
+                prompts_error: server.prompts_error.clone(),
+                errors: server.errors.clone(),
+            })
+            .collect()
+    }
+
+    /// The prompts of every connected server, in config order.
+    fn prompts(&self) -> Vec<McpPrompt> {
+        self.servers
+            .iter()
+            .flat_map(|server| server.prompts.iter().cloned())
+            .collect()
     }
 
     /// The index of `server_name`, while connection attempt `generation` is
@@ -239,6 +273,10 @@ struct McpClient {
     capabilities: McpServerCapabilities,
     /// Stops its server, through whichever transport it has.
     stop: Arc<McpConnectionStop>,
+    /// Why the last reconnect of a stdio server failed, until the registry
+    /// takes it to mark the server failed: the stopped server's transport is
+    /// still in place then, and no request goes through it.
+    reconnect_failure: Mutex<Option<String>>,
     /// Held for the whole of each request, so that a reconnect puts a new
     /// transport in place between requests.
     transport: Mutex<Arc<dyn McpTransport>>,
@@ -569,11 +607,13 @@ fn connect_server_with_transport(
         server_name: server_name.to_string(),
         credentials_path,
         capabilities,
+        reconnect_failure: Mutex::default(),
         stop,
         transport: Mutex::new(transport),
     };
     // A server whose prompts cannot be listed still serves its tools: a
-    // failure that stopped its transport has connected it again.
+    // failure that stopped its transport has connected it again, when it
+    // could.
     let (prompts, prompts_error) = if client.capabilities.prompts {
         let listed = collect_pages(|cursor| {
             let list: PromptsListResult = serde_json::from_value(client.list_prompts(cursor)?)
@@ -594,6 +634,12 @@ fn connect_server_with_transport(
     } else {
         (Vec::new(), None)
     };
+
+    // A failure that stopped the server, which could not then be started
+    // again, leaves no server to serve the tools.
+    if let Some(error) = client.take_reconnect_failure() {
+        return Err(error);
+    }
 
     Ok(ConnectedServer {
         client,
@@ -1004,6 +1050,7 @@ impl McpRegistry {
                     server_name: server.clone(),
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceTransport {
                         server,
@@ -1037,6 +1084,7 @@ impl McpRegistry {
                         server_name: server,
                         credentials_path: None,
                         capabilities: McpServerCapabilities::resource_capable_for_test(),
+                        reconnect_failure: Mutex::default(),
                         stop: Arc::default(),
                         transport: Mutex::new(Arc::from(transport)),
                     }),
@@ -1066,11 +1114,19 @@ impl McpRegistry {
 
     /// The prompts of every connected server, in config order.
     pub fn prompts(&self) -> Vec<McpPrompt> {
-        self.read()
-            .servers
-            .iter()
-            .flat_map(|server| server.prompts.iter().cloned())
-            .collect()
+        self.read().prompts()
+    }
+
+    /// How every server stands, with the tools and prompts of the connected
+    /// ones, read at one moment: a server that connects or fails meanwhile
+    /// shows in all three, or in none.
+    pub fn snapshot(&self) -> McpRegistrySnapshot {
+        let inner = self.read();
+        McpRegistrySnapshot {
+            servers: inner.server_statuses(),
+            tools: inner.tools.clone(),
+            prompts: inner.prompts(),
+        }
     }
 
     /// Asks `server` (its canonical or configured name) to expand its prompt
@@ -1135,16 +1191,7 @@ impl McpRegistry {
     /// still starting, servers that failed to connect, and disabled servers
     /// are listed too.
     pub fn server_statuses(&self) -> Vec<McpServerStatus> {
-        self.read()
-            .servers
-            .iter()
-            .map(|server| McpServerStatus {
-                name: server.name.clone(),
-                state: server.state.clone(),
-                prompts_error: server.prompts_error.clone(),
-                errors: server.errors.clone(),
-            })
-            .collect()
+        self.read().server_statuses()
     }
 
     /// Connects `name` again with its saved config, and replaces its client
@@ -1212,15 +1259,20 @@ impl McpRegistry {
     }
 
     /// Notes what the answer to a request sent to `server` (its canonical
-    /// name) through `client` says of the server's login: one that finds
-    /// the login gone marks the server as needing a login, and any that
-    /// goes through marks it ready again.
+    /// name) through `client` says of the server: one after which its stdio
+    /// server could not be started again marks it as failed, one that finds
+    /// the login gone marks it as needing a login, and any that goes through
+    /// marks it ready again.
     fn note_answer<T, E: fmt::Display>(
         &self,
         server: &str,
         client: &Arc<McpClient>,
         answer: &Result<T, E>,
     ) {
+        if let Some(error) = client.take_reconnect_failure() {
+            self.fail_through(server, client, error);
+            return;
+        }
         match answer {
             Ok(_) => self.mark_ready_after_success(server, client),
             Err(error) if is_auth_required(&error.to_string()) => {
@@ -1228,6 +1280,30 @@ impl McpRegistry {
             }
             Err(_) => {}
         }
+    }
+
+    /// Marks `server` (its canonical name) as failed with `error`, once a
+    /// reconnect of `client`, a stdio server's, could not start the server
+    /// again, and then tells the subscribers. As after a failed connection,
+    /// the server has no client, tools or prompts until it is reconnected,
+    /// and its state says why. A client that a reconnect of the registry's
+    /// has replaced since speaks for a connection that is gone, so its
+    /// failure changes nothing.
+    fn fail_through(&self, server: &str, client: &Arc<McpClient>, error: String) {
+        let replaced = {
+            let mut inner = self.write();
+            let current = inner
+                .clients
+                .get(server)
+                .is_some_and(|current| Arc::ptr_eq(current, client));
+            let index = inner.servers.iter().position(|entry| entry.name == server);
+            match index {
+                Some(index) if current => inner.apply_connection(index, Err(error)),
+                _ => return,
+            }
+        };
+        self.notify_subscribers();
+        drop(replaced);
     }
 
     /// Marks `server` (its canonical name) as needing a login, once a
@@ -1434,6 +1510,7 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceListingTransport {
                         resources,
@@ -1459,6 +1536,7 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceListingTransport {
                         resources: Vec::new(),
@@ -1552,6 +1630,7 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceTemplateListingTransport {
                         resource_templates,
@@ -1577,6 +1656,7 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceTemplateListingTransport {
                         resource_templates: Vec::new(),
@@ -1990,39 +2070,55 @@ impl McpClient {
 
     /// Sends `request` over the transport. An error that leaves the
     /// transport unusable, or after which it closed itself, reconnects it
-    /// before the error is returned.
+    /// before the error is returned. A stdio server that cannot be started
+    /// again leaves why in [`Self::take_reconnect_failure`].
     fn request(
         &self,
         request: impl FnOnce(&dyn McpTransport) -> Result<Value, String>,
     ) -> Result<Value, McpRequestError> {
-        let (result, closed) = {
+        let (result, failed) = {
             let transport = self.lock_transport().map_err(McpRequestError::Failed)?;
             let result = request(transport.as_ref());
-            let closed = result.is_err() && transport.is_closed();
-            (result, closed)
+            // The transport the request failed on, and whether it closed
+            // itself.
+            let failed = result
+                .is_err()
+                .then(|| (Arc::clone(&*transport), transport.is_closed()));
+            (result, failed)
         };
-        match result {
-            Err(error)
+        match (result, failed) {
+            (Err(error), Some((failed, closed)))
                 if closed || should_reconnect_after_mcp_error(&self.config.transport, &error) =>
             {
                 let startup_timeout_cap_ms = (self.config.transport == McpTransportKind::Stdio
                     && error == MCP_TOOL_CALL_CANCELLED)
                     .then_some(CANCELLED_STDIO_RECONNECT_TIMEOUT_MS);
-                let _ = self.reconnect(startup_timeout_cap_ms);
+                let reconnected = self.reconnect(&failed, startup_timeout_cap_ms);
+                if self.config.transport == McpTransportKind::Stdio {
+                    *self.lock_reconnect_failure() = reconnected.err();
+                }
                 Err(McpRequestError::from_message(error))
             }
-            Ok(result) => Ok(result),
-            Err(error) => Err(McpRequestError::from_message(error)),
+            (Ok(result), _) => Ok(result),
+            (Err(error), _) => Err(McpRequestError::from_message(error)),
         }
     }
 
     /// Connects the server again, with its startup timeout capped at
     /// `startup_timeout_cap_ms` when given, and puts the new transport in
-    /// place of the old one. A stdio server is stopped first, and requests
-    /// wait for the new one, so that a server that listens on a fixed port
-    /// can start again. A remote server keeps serving through the old
-    /// transport until the new one is ready.
-    fn reconnect(&self, startup_timeout_cap_ms: Option<u64>) -> Result<(), String> {
+    /// place of `failed`, the one a request failed on. A stdio server is
+    /// stopped first, and requests wait for the new one, so that a server
+    /// that listens on a fixed port can start again. A remote server keeps
+    /// serving through the old transport until the new one is ready.
+    ///
+    /// Once `failed` is no longer the current transport, another request
+    /// that failed on it has reconnected the server already, and nothing is
+    /// done: stopping the server it started would fail its requests.
+    fn reconnect(
+        &self,
+        failed: &Arc<dyn McpTransport>,
+        startup_timeout_cap_ms: Option<u64>,
+    ) -> Result<(), String> {
         let mut config = self.config.clone();
         if let Some(cap_ms) = startup_timeout_cap_ms {
             config.startup_timeout_ms =
@@ -2030,13 +2126,34 @@ impl McpClient {
         }
         if config.transport == McpTransportKind::Stdio {
             let mut current = self.lock_transport()?;
+            if !Arc::ptr_eq(&current, failed) {
+                return Ok(());
+            }
             current.terminate();
             *current = self.connect(&config)?;
         } else {
+            if !Arc::ptr_eq(&*self.lock_transport()?, failed) {
+                return Ok(());
+            }
             let transport = self.connect(&config)?;
-            *self.lock_transport()? = transport;
+            let mut current = self.lock_transport()?;
+            if Arc::ptr_eq(&current, failed) {
+                *current = transport;
+            }
         }
         Ok(())
+    }
+
+    /// Why the last reconnect of the stdio server failed, once: its server
+    /// is stopped, and the client is of no more use.
+    fn take_reconnect_failure(&self) -> Option<String> {
+        self.lock_reconnect_failure().take()
+    }
+
+    fn lock_reconnect_failure(&self) -> MutexGuard<'_, Option<String>> {
+        self.reconnect_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// A new transport to the server `config` describes, started under the
@@ -2372,6 +2489,7 @@ done
                     server_name: "slow".to_string(),
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(CleanupAwareTransport {
                         active: Arc::clone(&active),
@@ -2472,6 +2590,7 @@ done
                     server_name: "screen".to_string(),
                     credentials_path: None,
                     capabilities: McpServerCapabilities::default(),
+                    reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticCallToolTransport { content })),
                 }),
@@ -3013,6 +3132,7 @@ done
                     server_name: "prompts".to_string(),
                     credentials_path: None,
                     capabilities: McpServerCapabilities::default(),
+                    reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(ElicitingTransport)),
                 }),
@@ -4288,6 +4408,7 @@ done
             config,
             credentials_path: None,
             capabilities: McpServerCapabilities::default(),
+            reconnect_failure: Mutex::default(),
             stop: Arc::default(),
             transport: Mutex::new(Arc::new(transport)),
         })
@@ -5060,10 +5181,10 @@ done
             .reconnect_server("x")
             .expect("reconnect through the registry");
         let after_the_registry = overlapping_starts(temp_dir.path(), "x");
-        registry
-            .client("x")
-            .expect("the server's client")
-            .reconnect(None)
+        let client = registry.client("x").expect("the server's client");
+        let current = client.lock_transport().expect("its transport").clone();
+        client
+            .reconnect(&current, None)
             .expect("reconnect through the client");
         let after_the_client = overlapping_starts(temp_dir.path(), "x");
 
@@ -5841,6 +5962,250 @@ done
             logged_methods(temp_dir.path()),
             [expected, vec!["tools/call".to_string()]].concat()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_failures_on_one_transport_restart_its_server_once() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = listing_server_config(
+            "x",
+            temp_dir.path(),
+            r#"[{"name":"echo","inputSchema":{"type":"object"}}]"#,
+        );
+        let registry = connected_registry(&[config], None);
+        let client = registry.client("x").expect("the server's client");
+        // Two requests failed on the same transport, and each reconnects
+        // the server, at once.
+        let failed = client.lock_transport().expect("its transport").clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let reconnects = [(); 2].map(|_| {
+            let client = Arc::clone(&client);
+            let failed = Arc::clone(&failed);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                client.reconnect(&failed, None)
+            })
+        });
+        for reconnect in reconnects {
+            reconnect
+                .join()
+                .expect("a reconnect's thread")
+                .expect("reconnect the server");
+        }
+
+        // The one that came second found the server started again, and left
+        // it running.
+        let starts = start_pids(temp_dir.path(), "x");
+        assert_eq!(starts.len(), 2, "{starts:?}");
+        assert!(
+            !process_is_alive(&starts[0]),
+            "the failed server still runs"
+        );
+        assert!(
+            process_is_alive(&starts[1]),
+            "the restarted server was stopped"
+        );
+        let current = client.lock_transport().expect("its transport").clone();
+        assert!(!Arc::ptr_eq(&current, &failed));
+        assert!(!current.is_closed());
+    }
+
+    /// A stdio server that serves its first start, answering its first tool
+    /// call with no result, which stops it; started again, it reads
+    /// `initialize` and exits without answering it.
+    #[cfg(unix)]
+    fn tool_server_that_cannot_start_again(dir: &std::path::Path) -> McpServerConfig {
+        let script = dir.join("once.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+state_dir="$1"
+if [ -f "$state_dir/started" ]; then
+  read -r line
+  exit 0
+fi
+: > "$state_dir/started"
+while IFS= read -r line; do
+  id=${line#*'"id":'}
+  id=${id%%,*}
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"once","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let mut config = stdio_fixture_config("once", &script);
+        config.args.push(dir.to_string_lossy().into_owned());
+        config.tool_timeout_ms = Some(STDIO_TEST_STARTUP_TIMEOUT_MS);
+        config
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stdio_server_that_cannot_start_again_after_a_call_is_failed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let registry = connected_registry(
+            &[tool_server_that_cannot_start_again(temp_dir.path())],
+            None,
+        );
+        let echo = registry
+            .resolve_tool("mcp__once__echo")
+            .expect("the echo tool");
+        let (_subscription, changes) = count_changes(&registry);
+
+        let error = registry
+            .call_tool(&echo, serde_json::json!({}))
+            .expect_err("the call is answered with no result");
+
+        assert_eq!(error, "MCP request 'tools/call' missing result");
+        // Its server stopped, and could not be started again: the server
+        // says why, rather than stay connected with every call failing.
+        assert_eq!(
+            registry.server_statuses(),
+            [failed("once", "MCP server closed stdout")]
+        );
+        assert_eq!(changes.load(Ordering::SeqCst), 1, "no subscriber was told");
+        assert!(registry.tools().is_empty());
+        assert!(registry.client("once").is_none());
+        assert_eq!(
+            registry
+                .call_tool(&echo, serde_json::json!({}))
+                .expect_err("the server is not connected"),
+            "MCP server 'once' is not connected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_reconnect_of_a_replaced_client_leaves_the_new_one() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = listing_server_config(
+            "x",
+            temp_dir.path(),
+            r#"[{"name":"echo","inputSchema":{"type":"object"}}]"#,
+        );
+        let registry = connected_registry(&[config], None);
+        let replaced = registry.client("x").expect("the first client");
+        registry
+            .reconnect_server("x")
+            .expect("reconnect the server");
+        let (_subscription, changes) = count_changes(&registry);
+
+        // A request still under way on the replaced client failed, and its
+        // reconnect could not start the server.
+        *replaced.lock_reconnect_failure() = Some("MCP server closed stdout".to_string());
+        registry.note_answer(
+            "x",
+            &replaced,
+            &Err::<(), _>("MCP server closed stdout".to_string()),
+        );
+
+        assert_eq!(
+            registry.server_statuses(),
+            [status("x", McpServerState::Ready)]
+        );
+        assert_eq!(schema_names(&registry), ["mcp__x__echo"]);
+        assert_eq!(changes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_snapshot_never_mixes_two_states_of_a_server() {
+        struct PromptingTransport;
+
+        impl McpTransport for PromptingTransport {
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"capabilities": {"prompts": {}}}))
+            }
+
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": [
+                    {"name": "echo", "inputSchema": {"type": "object"}}
+                ]}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+
+            fn list_prompts(&self, _cursor: Option<&str>) -> Result<Value, String> {
+                Ok(serde_json::json!({"prompts": [{"name": "review"}]}))
+            }
+        }
+
+        let config = McpServerConfig {
+            name: "x".to_string(),
+            ..Default::default()
+        };
+        let registry = McpRegistry::from_inner(McpRegistryInner {
+            servers: vec![McpServerEntry {
+                name: "x".to_string(),
+                config: config.clone(),
+                state: McpServerState::Starting,
+                generation: FIRST_CONNECTION,
+                stop: Arc::default(),
+                tools: Vec::new(),
+                prompts: Vec::new(),
+                prompts_error: None,
+                errors: Vec::new(),
+            }],
+            ..Default::default()
+        });
+        // The server connects and fails, over and over, while the registry
+        // is read.
+        let done = Arc::new(AtomicBool::new(false));
+        let flipper = std::thread::spawn({
+            let registry = registry.clone();
+            let done = Arc::clone(&done);
+            move || {
+                for _ in 0..5_000 {
+                    let connected = connect_server_with_transport(
+                        &config,
+                        "x",
+                        None,
+                        Arc::new(PromptingTransport),
+                        Arc::default(),
+                    );
+                    let _ = registry.finish_connecting("x", FIRST_CONNECTION, connected);
+                    let _ =
+                        registry.finish_connecting("x", FIRST_CONNECTION, Err("down".to_string()));
+                }
+                done.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let mut read = 0;
+        while !done.load(Ordering::SeqCst) {
+            let snapshot = registry.snapshot();
+            let ready = snapshot.servers[0].state == McpServerState::Ready;
+            assert_eq!(ready, !snapshot.tools.is_empty(), "{snapshot:?}");
+            assert_eq!(ready, !snapshot.prompts.is_empty(), "{snapshot:?}");
+            read += 1;
+        }
+        flipper.join().expect("the flipping thread");
+        assert!(read > 0);
     }
 
     /// A stdio server whose lists come a page at a time. It declares prompts

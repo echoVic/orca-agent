@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use orca_core::mcp_types::{McpPrompt, McpTool};
-use orca_mcp::{McpRegistry, McpServerState, McpServerStatus};
+use orca_mcp::{McpRegistry, McpRegistrySnapshot, McpServerState, McpServerStatus};
 use serde_json::{Map, Value};
 
 use crate::agent_continuation::canonical_json_bytes;
@@ -41,15 +41,16 @@ pub fn mcp_catalog_snapshot(registry: &McpRegistry) -> SurfaceMcpCatalogSnapshot
     )
 }
 
-/// The catalog `registry` stands for, at `revision`. Resources are not
+/// The catalog `registry` stands for, at `revision`, read at one moment, so
+/// that a revision never mixes two states of a server. Resources are not
 /// listed yet.
 fn mcp_catalog(registry: &McpRegistry, revision: McpCatalogRevision) -> SurfaceMcpCatalogSnapshot {
-    catalog_of(
-        registry.server_statuses(),
-        registry.tools(),
-        registry.prompts(),
-        revision,
-    )
+    let McpRegistrySnapshot {
+        servers,
+        tools,
+        prompts,
+    } = registry.snapshot();
+    catalog_of(servers, tools, prompts, revision)
 }
 
 fn catalog_of(
