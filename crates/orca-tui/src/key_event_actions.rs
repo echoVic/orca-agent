@@ -83,7 +83,7 @@ mod tests {
     use crate::protocol::{TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
     use crate::selection::{SelectionPos, TranscriptSelection};
     use crate::status_key_actions::handle_status_key;
-    use crate::test_support::test_run_config;
+    use crate::test_support::{last_notice, test_run_config};
     use crate::theme::Theme;
     use crate::transcript_state::ChatMessage;
     use crate::transcript_view::TranscriptRenderContext;
@@ -1346,13 +1346,6 @@ mod tests {
             attachment: Some(crate::protocol::SessionAttachmentId::new(1)),
             token,
             message: Ok(("Review pull request 123.".to_string(), Vec::new())),
-        }
-    }
-
-    fn last_notice(state: &AppState) -> Option<&str> {
-        match state.transcript.messages.last() {
-            Some(ChatMessage::System { text, .. }) => Some(text.as_str()),
-            _ => None,
         }
     }
 

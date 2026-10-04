@@ -219,6 +219,28 @@ pub(crate) mod test_support {
             .join("\n")
     }
 
+    /// The text of the conversation's last message, when it is a notice.
+    pub(crate) fn last_notice(state: &crate::types::AppState) -> Option<&str> {
+        match state.transcript.messages.last() {
+            Some(crate::transcript_state::ChatMessage::System { text, .. }) => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Presses `code` in the `/mcp` panel of `state`, which sends what that
+    /// asks for on the state's own action channel.
+    pub(crate) fn press_in_mcp_panel(
+        state: &mut crate::types::AppState,
+        code: crossterm::event::KeyCode,
+    ) {
+        let action_tx = state.event_tx.clone();
+        crate::mcp_dialog_actions::handle_mcp_dialog_key(
+            &crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            state,
+            &action_tx,
+        );
+    }
+
     pub(crate) fn test_run_config() -> RunConfig {
         RunConfig {
             app_version: "0.0.0-test".to_string(),

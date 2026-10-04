@@ -340,6 +340,10 @@ mod tests {
     };
     use orca_runtime::surface::{DisplayText, SurfaceMcpServerStatus};
 
+    use crossterm::event::KeyCode;
+
+    use crate::test_support::{last_notice, press_in_mcp_panel};
+
     /// Runs `step`, and returns the notices it showed, in order.
     fn notices_of(step: impl FnOnce(&dyn Fn(String))) -> Vec<String> {
         let notices = RefCell::new(Vec::new());
@@ -651,31 +655,13 @@ mod tests {
         (state, action, action_rx)
     }
 
-    /// The `/mcp` panel `state` shows, at 100x30, a row per line.
-    fn panel_rows(state: &mut crate::types::AppState) -> Vec<String> {
+    /// The rows of the whole frame `state` shows at 100x30, `/mcp` panel
+    /// included.
+    fn frame_rows(state: &mut crate::types::AppState) -> Vec<String> {
         crate::test_support::frame_string(state, 100, 30)
             .lines()
             .map(str::to_string)
             .collect()
-    }
-
-    fn press(state: &mut crate::types::AppState, key: char) {
-        let action_tx = state.event_tx.clone();
-        crate::mcp_dialog_actions::handle_mcp_dialog_key(
-            &crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char(key),
-                crossterm::event::KeyModifiers::NONE,
-            ),
-            state,
-            &action_tx,
-        );
-    }
-
-    fn last_notice(state: &crate::types::AppState) -> Option<&str> {
-        match state.transcript.messages.last() {
-            Some(crate::transcript_state::ChatMessage::System { text, .. }) => Some(text.as_str()),
-            _ => None,
-        }
     }
 
     #[test]
@@ -686,12 +672,12 @@ mod tests {
         };
         let cancel = cancel.clone();
         assert!(
-            panel_rows(&mut state)
+            frame_rows(&mut state)
                 .iter()
                 .any(|row| row.contains("linear")
                     && row.contains("waiting for browser login… (l to cancel)")),
             "{}",
-            panel_rows(&mut state).join("\n")
+            frame_rows(&mut state).join("\n")
         );
         // The login waits for the browser, as `orca_mcp::oauth::login` does,
         // until it is cancelled.
@@ -719,7 +705,7 @@ mod tests {
 
         // `r` and `o` still wait for it to end.
         for key in ['r', 'o'] {
-            press(&mut state, key);
+            press_in_mcp_panel(&mut state, KeyCode::Char(key));
             assert!(sent.try_recv().is_err(), "'{key}' sent an action");
             assert_eq!(
                 last_notice(&state),
@@ -729,7 +715,7 @@ mod tests {
         assert!(!cancel.is_cancelled());
 
         // `l` cancels it.
-        press(&mut state, 'l');
+        press_in_mcp_panel(&mut state, KeyCode::Char('l'));
         assert!(sent.try_recv().is_err(), "`l` started another login");
         assert!(cancel.is_cancelled());
         assert_eq!(
@@ -737,11 +723,11 @@ mod tests {
             Some("login to MCP server linear cancelled")
         );
         assert!(
-            panel_rows(&mut state)
+            frame_rows(&mut state)
                 .iter()
                 .any(|row| row.contains("linear") && row.contains("cancelling login…")),
             "{}",
-            panel_rows(&mut state).join("\n")
+            frame_rows(&mut state).join("\n")
         );
 
         // The login ends at that, and its server is freed; the conversation
@@ -759,7 +745,7 @@ mod tests {
         );
 
         // `l` logs in again.
-        press(&mut state, 'l');
+        press_in_mcp_panel(&mut state, KeyCode::Char('l'));
         assert!(matches!(
             sent.try_recv(),
             Ok(UserAction::McpLogin { server, cancel }) if server.name == "linear"
@@ -808,7 +794,7 @@ mod tests {
             state.update(event);
         }
 
-        let rows = panel_rows(&mut state);
+        let rows = frame_rows(&mut state);
         assert!(
             rows.iter()
                 .any(|row| row.contains("linear") && row.contains("finishing login…")),
@@ -820,7 +806,7 @@ mod tests {
             "{}",
             rows.join("\n")
         );
-        press(&mut state, 'l');
+        press_in_mcp_panel(&mut state, KeyCode::Char('l'));
         assert!(sent.try_recv().is_err(), "`l` sent an action");
         assert_eq!(
             last_notice(&state),

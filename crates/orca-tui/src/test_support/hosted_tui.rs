@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyCode;
 use orca_core::config::RunConfig;
 use orca_core::mcp_types::McpServerConfig;
 
@@ -318,13 +318,9 @@ impl Tui {
         );
     }
 
+    /// Presses `key` in the `/mcp` panel.
     pub(crate) fn press(&mut self, key: char) {
-        let action_tx = self.state.event_tx.clone();
-        crate::mcp_dialog_actions::handle_mcp_dialog_key(
-            &KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
-            &mut self.state,
-            &action_tx,
-        );
+        super::press_in_mcp_panel(&mut self.state, KeyCode::Char(key));
     }
 
     /// The thread the conversation has, with its catalog once
