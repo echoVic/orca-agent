@@ -1338,6 +1338,39 @@ mod tests {
     }
 
     #[test]
+    fn metadata_requests_follow_10_redirects_and_no_more() {
+        let server = OAuthTestServer::start(OAuthTestBehavior::default());
+        let config = server.config("docs");
+        let metadata = http_client(&config, true).expect("a client for metadata");
+        let hops =
+            |count: usize| Url::parse(&format!("{}/hops/{count}", server.url())).expect("a url");
+
+        let followed: Value = get_json(&metadata, &hops(10)).expect("ten redirects are followed");
+        let error = get_json::<Value>(&metadata, &hops(11)).expect_err("an eleventh is not");
+
+        assert_eq!(followed, json!({}));
+        // reqwest names only the url the request was sent to; why the
+        // redirect was not followed comes after it.
+        assert_eq!(
+            error,
+            format!(
+                "error following redirect for url ({}): too many redirects",
+                hops(11)
+            )
+        );
+        let sent = server
+            .requests()
+            .iter()
+            .filter(|request| request.path.starts_with("/hops/"))
+            .count();
+        assert_eq!(sent, 11 + 11);
+        // A request that carries a code or a token follows no redirect.
+        let tokens = http_client(&config, false).expect("a client for tokens");
+        let answer = tokens.get(hops(1)).send().expect("an answer");
+        assert_eq!(answer.status(), StatusCode::FOUND);
+    }
+
+    #[test]
     fn metadata_redirects_never_drop_to_http() {
         let url = |url: &str| Url::parse(url).expect("a url");
 

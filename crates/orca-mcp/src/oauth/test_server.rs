@@ -367,7 +367,21 @@ fn route(state: &ServerState, request: &RecordedRequest, base: &str) -> String {
         ),
         ("GET", "/authorize") => authorize(state, request),
         ("POST", "/token") => token(state, request),
+        ("GET", path) if path.starts_with("/hops/") => hops(path),
         _ => empty_response(404),
+    }
+}
+
+/// `GET /hops/<n>`: a redirect to `/hops/<n - 1>`, and at `/hops/0` an empty
+/// JSON object, so that a request to `/hops/<n>` is redirected `n` times.
+fn hops(path: &str) -> String {
+    match path.trim_start_matches("/hops/").parse::<usize>() {
+        Ok(0) => json_response(200, &json!({})),
+        Ok(hops) => format!(
+            "HTTP/1.1 302 Found\r\nlocation: /hops/{}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            hops - 1
+        ),
+        Err(_) => empty_response(404),
     }
 }
 

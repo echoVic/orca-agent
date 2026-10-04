@@ -745,18 +745,21 @@ impl StdioTransport {
             };
             iterations += 1;
             if is_server_request(&response) {
-                let answered = if is_elicitation_create_request(&response) {
-                    handle_elicitation_create_request(
+                if is_elicitation_create_request(&response) {
+                    // The server waits for the answer, so one that cannot
+                    // reach it ends the request.
+                    if let Err(error) = handle_elicitation_create_request(
                         &self.server_name,
                         &mut state.stdin,
                         &response,
                         elicitation_handler,
-                    )
+                    ) {
+                        return state.terminal_error(error);
+                    }
                 } else {
-                    write_json_line(&mut state.stdin, &server_request_reply(&response))
-                };
-                if let Err(error) = answered {
-                    return state.terminal_error(error);
+                    // Best effort: the request under way may be answered
+                    // all the same.
+                    let _ = write_json_line(&mut state.stdin, &server_request_reply(&response));
                 }
                 continue;
             }
@@ -827,7 +830,8 @@ pub(crate) fn is_response_to(message: &Value, id: u64) -> bool {
 /// The answer to `request`, a request from the server other than
 /// `elicitation/create`, which each transport answers its own way: `ping`
 /// gets an empty result, and any other method -32601, since Orca serves no
-/// other.
+/// other. Each transport sends it best effort: one that does not reach the
+/// server fails no request of Orca's, which may be answered all the same.
 pub(crate) fn server_request_reply(request: &Value) -> Value {
     if request.get("method").and_then(Value::as_str) == Some("ping") {
         json!({
@@ -1952,7 +1956,7 @@ async fn read_sse_stream(
                 continue;
             };
             if is_server_request(&message) {
-                let reply = if is_elicitation_create_request(&message) {
+                if is_elicitation_create_request(&message) {
                     // The handler is asked on the thread that sent the request.
                     let (sender, receiver) = tokio::sync::oneshot::channel();
                     elicitation_sender
@@ -1961,18 +1965,29 @@ async fn read_sse_stream(
                             response: sender,
                         })
                         .map_err(|_| "MCP SSE elicitation handler stopped".to_string())?;
-                    await_sse_elicitation_response(receiver, cancel).await?
+                    let answer = await_sse_elicitation_response(receiver, cancel).await?;
+                    // The server waits for the answer, so one that cannot
+                    // reach it ends the request.
+                    post_sse_message(
+                        &context.endpoint,
+                        &context.headers,
+                        answer,
+                        context.timeout,
+                        cancel,
+                    )
+                    .await?;
                 } else {
-                    server_request_reply(&message)
-                };
-                post_sse_message(
-                    &context.endpoint,
-                    &context.headers,
-                    reply,
-                    context.timeout,
-                    cancel,
-                )
-                .await?;
+                    // Best effort: the request under way may be answered
+                    // all the same. A cancel shows at the next read.
+                    let _ = post_sse_message(
+                        &context.endpoint,
+                        &context.headers,
+                        server_request_reply(&message),
+                        context.timeout,
+                        cancel,
+                    )
+                    .await;
+                }
             } else if is_response_to(&message, context.id) {
                 return parse_terminal_message(message, &context.method, context.id);
             }
@@ -2196,8 +2211,8 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
 /// keep the stream open after it. Each request the server sends first is
 /// answered with a POST that carries `reply_headers`: a question
 /// (`elicitation/create`) is declined, as no one is there to ask, and any
-/// other request is answered as [`server_request_reply`] says. Notifications,
-/// and responses to other requests, are skipped. At most
+/// other request is answered as [`server_request_reply`] says, best effort.
+/// Notifications, and responses to other requests, are skipped. At most
 /// [`MAX_SSE_RESPONSE_BYTES`] are read.
 fn read_sse_response(
     client: &reqwest::blocking::Client,
@@ -2235,18 +2250,24 @@ fn read_sse_response(
                 continue;
             };
             if is_server_request(&message) {
-                let reply = if is_elicitation_create_request(&message) {
-                    resolve_sse_elicitation(server_name, &message, None)
-                } else {
-                    server_request_reply(&message)
+                let reply = |answer: &Value| {
+                    post_sse_reply(
+                        client,
+                        &context.endpoint,
+                        reply_headers,
+                        answer,
+                        context.timeout,
+                    )
                 };
-                post_sse_reply(
-                    client,
-                    &context.endpoint,
-                    reply_headers,
-                    &reply,
-                    context.timeout,
-                )?;
+                if is_elicitation_create_request(&message) {
+                    // The server waits for the answer, so one that cannot
+                    // reach it ends the request.
+                    reply(&resolve_sse_elicitation(server_name, &message, None))?;
+                } else {
+                    // Best effort: the request under way may be answered
+                    // all the same.
+                    let _ = reply(&server_request_reply(&message));
+                }
             } else if is_response_to(&message, context.id) {
                 return parse_terminal_message(message, method, context.id);
             }
@@ -2881,6 +2902,44 @@ done
         transport
             .list_tools(None)
             .expect("the server still answers");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_ping_that_cannot_be_answered_does_not_fail_the_request() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("deaf_mcp_server.sh");
+        // It stops reading before it pings, so the answer cannot be written,
+        // and then answers `tools/list` all the same.
+        write_executable_stdio_fixture(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=${line#*'"id":'}
+  id=${id%%,*}
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"deaf","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      exec 0<&-
+      printf '{"jsonrpc":"2.0","id":"p1","method":"ping"}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+        let transport =
+            StdioTransport::start(&stdio_test_config("deaf", &server, Vec::new(), 5_000))
+                .expect("start the stdio server");
+        transport.initialize().expect("initialize");
+
+        let tools = transport
+            .list_tools(None)
+            .expect("tools/list after a ping that could not be answered");
+
+        assert_eq!(tools["tools"][0]["name"], "echo");
     }
 
     #[cfg(unix)]
@@ -4410,53 +4469,143 @@ done
         assert_eq!(reply.header("mcp-protocol-version"), Some("2025-03-26"));
     }
 
-    #[test]
-    fn http_answers_a_ping_inside_a_response_stream() {
+    /// Makes each kind of request a streamable HTTP server may answer with
+    /// an event stream, to a server that first sends a request of its own
+    /// with `method` in each: `initialize` and `tools/list` are read on the
+    /// calling thread, and a tool call and a resource listing that can be
+    /// cancelled on a thread of their own. Each goes through. Returns the
+    /// body of each answer the server got, in order.
+    fn answers_to_server_requests(method: &'static str) -> Vec<Value> {
         let server = StreamableHttpServer::start(StreamableHttpBehavior {
             sessions: vec!["s1"],
-            ping: true,
+            asks_first: Some(method),
             ..Default::default()
         });
         let transport =
-            connect(&streamable_http_config("pinged", &server)).expect("connect HTTP MCP");
+            connect(&streamable_http_config("asked", &server)).expect("connect HTTP MCP");
 
-        // Each of these reads its response its own way: `initialize` and
-        // `tools/list` on the calling thread, a tool call and a resource
-        // listing that can be cancelled on a thread of their own.
-        transport.initialize().expect("initialize after a ping");
-        transport.list_tools(None).expect("tools/list after a ping");
+        transport
+            .initialize()
+            .unwrap_or_else(|error| panic!("initialize after {method}: {error}"));
+        transport
+            .list_tools(None)
+            .unwrap_or_else(|error| panic!("tools/list after {method}: {error}"));
         let called = transport
             .call_tool("echo", json!({"text": "hi"}))
-            .expect("tools/call after a ping");
+            .unwrap_or_else(|error| panic!("tools/call after {method}: {error}"));
         let resources = transport
             .list_resources_or_cancel(None, &|| false)
-            .expect("resources/list after a ping");
+            .unwrap_or_else(|error| panic!("resources/list after {method}: {error}"));
 
         assert_eq!(called["content"][0]["text"], "hi");
         assert_eq!(resources, json!({"resources": []}));
-        let replies = server
+        let answers = answers_to_the_server(&server);
+        // Even the answer to the request in the `initialize` response goes
+        // to the session that response started.
+        for answer in &answers {
+            assert_eq!(answer.header("mcp-session-id"), Some("s1"), "{answer:?}");
+        }
+        answers.into_iter().map(|answer| answer.body).collect()
+    }
+
+    /// What the client sent the fixture in answer to its requests.
+    fn answers_to_the_server(server: &HttpFixture) -> Vec<HttpExchange> {
+        server
             .requests()
             .into_iter()
             .filter(|request| {
                 request.body["id"]
                     .as_str()
-                    .is_some_and(|id| id.starts_with("ping-"))
+                    .is_some_and(|id| id.starts_with("ask-"))
+                    && request.rpc_method().is_none()
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    /// The answers [`answers_to_server_requests`] expects, `answer` for each
+    /// of its four requests, whose ids are 1 to 4.
+    fn answers_for_each_request(answer: impl Fn(String) -> Value) -> Vec<Value> {
+        (1..=4).map(|id| answer(format!("ask-{id}"))).collect()
+    }
+
+    #[test]
+    fn http_answers_a_ping_inside_a_response_stream() {
         assert_eq!(
-            replies
-                .iter()
-                .map(|reply| reply.body.clone())
-                .collect::<Vec<_>>(),
-            (1..=4)
-                .map(|id| json!({"jsonrpc": "2.0", "id": format!("ping-{id}"), "result": {}}))
-                .collect::<Vec<_>>()
+            answers_to_server_requests("ping"),
+            answers_for_each_request(|id| json!({"jsonrpc": "2.0", "id": id, "result": {}}))
         );
-        // Even the reply to the ping in the `initialize` response goes to the
-        // session that response started.
-        for reply in &replies {
-            assert_eq!(reply.header("mcp-session-id"), Some("s1"), "{reply:?}");
-        }
+    }
+
+    #[test]
+    fn http_answers_an_unknown_server_request_with_method_not_found() {
+        assert_eq!(
+            answers_to_server_requests("roots/list"),
+            answers_for_each_request(|id| json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32601, "message": "Method not found"}
+            }))
+        );
+    }
+
+    #[test]
+    fn http_declines_a_question_when_no_one_can_answer_it() {
+        // Only a tool call can have someone to ask, and this one has not.
+        assert_eq!(
+            answers_to_server_requests("elicitation/create"),
+            answers_for_each_request(|id| json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {"action": "decline"}
+            }))
+        );
+    }
+
+    #[test]
+    fn a_refused_answer_to_a_ping_does_not_fail_the_request() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            asks_first: Some("ping"),
+            refuses_replies: true,
+            ..Default::default()
+        });
+        let transport =
+            connect(&streamable_http_config("refusing", &server)).expect("connect HTTP MCP");
+
+        // The server turns away each answer to its ping, and then answers
+        // the request all the same.
+        transport.initialize().expect("initialize");
+        transport.list_tools(None).expect("tools/list");
+        let called = transport
+            .call_tool("echo", json!({"text": "hi"}))
+            .expect("the tool call");
+        let resources = transport
+            .list_resources_or_cancel(None, &|| false)
+            .expect("resources/list");
+
+        assert_eq!(called["content"][0]["text"], "hi");
+        assert_eq!(resources, json!({"resources": []}));
+        assert_eq!(answers_to_the_server(&server).len(), 4);
+    }
+
+    #[test]
+    fn a_refused_answer_to_a_question_fails_the_request() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            asks_first: Some("elicitation/create"),
+            refuses_replies: true,
+            ..Default::default()
+        });
+        let transport =
+            connect(&streamable_http_config("refusing", &server)).expect("connect HTTP MCP");
+
+        // The server waits for the answer, which did not reach it.
+        let error = transport
+            .initialize()
+            .expect_err("the answer to the question was turned away");
+
+        assert_eq!(
+            error,
+            "failed to write MCP SSE response: server returned 500 Internal Server Error"
+        );
     }
 
     #[test]
@@ -4920,30 +5069,48 @@ while IFS= read -r line; do :; done
         );
     }
 
-    #[test]
-    fn legacy_sse_answers_a_ping() {
+    /// What the legacy server got in answer to the request with `method` it
+    /// sent during a tool call, which went through.
+    fn legacy_answer_to_a_server_request(method: &'static str) -> HttpExchange {
         let server = LegacySseServer::start(LegacySseBehavior {
-            ping: true,
+            asks_first: Some(method),
             ..Default::default()
         });
         let transport =
-            legacy_sse(&legacy_sse_config("pinged", &server)).expect("open the event stream");
+            legacy_sse(&legacy_sse_config("asked", &server)).expect("open the event stream");
         transport.initialize().expect("initialize");
 
         let called = transport
             .call_tool("echo", json!({"text": "hi"}))
-            .expect("tool result after the ping was answered");
+            .unwrap_or_else(|error| panic!("tools/call after {method}: {error}"));
 
         assert_eq!(called["content"][0]["text"], "hi");
-        let reply = server
+        let answer = server
             .requests()
             .into_iter()
-            .find(|request| request.body["id"] == "ping-1")
-            .expect("the ping was answered");
-        assert_eq!(reply.path, "/messages?sessionId=legacy-1");
+            .find(|request| request.body["id"] == "ask-1")
+            .unwrap_or_else(|| panic!("{method} was answered"));
+        assert_eq!(answer.path, "/messages?sessionId=legacy-1");
+        answer
+    }
+
+    #[test]
+    fn legacy_sse_answers_a_ping() {
         assert_eq!(
-            reply.body,
-            json!({"jsonrpc": "2.0", "id": "ping-1", "result": {}})
+            legacy_answer_to_a_server_request("ping").body,
+            json!({"jsonrpc": "2.0", "id": "ask-1", "result": {}})
+        );
+    }
+
+    #[test]
+    fn legacy_sse_answers_an_unknown_server_request_with_method_not_found() {
+        assert_eq!(
+            legacy_answer_to_a_server_request("roots/list").body,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "ask-1",
+                "error": {"code": -32601, "message": "Method not found"}
+            })
         );
     }
 
@@ -5370,10 +5537,14 @@ while IFS= read -r line; do :; done
         /// Ask the client a question during `tools/call`, and answer the call
         /// with the action the client replied with.
         elicit: bool,
-        /// Answer each request with an event stream that pings the client
-        /// first, as `ping-<the request's id>`, and carries the response only
-        /// once the client has answered the ping.
-        ping: bool,
+        /// Answer each request with an event stream that first sends the
+        /// client a request of the server's with this method, as
+        /// `ask-<the id of the client's request>`, and carries the response
+        /// only once the client has answered it.
+        asks_first: Option<&'static str>,
+        /// Turn away each answer the client sends to a request of the
+        /// server's, with 500.
+        refuses_replies: bool,
     }
 
     impl Default for StreamableHttpBehavior {
@@ -5385,7 +5556,8 @@ while IFS= read -r line; do :; done
                 notification_status: 202,
                 event_stream: false,
                 elicit: false,
-                ping: false,
+                asks_first: None,
+                refuses_replies: false,
             }
         }
     }
@@ -5608,11 +5780,11 @@ while IFS= read -r line; do :; done
             }
         }
         if !is_request {
-            let status = if request.rpc_method().is_some() {
-                behavior.notification_status
-            } else {
+            let status = match request.rpc_method() {
+                Some(_) => behavior.notification_status,
                 // The client's reply to a request from the server.
-                202
+                None if behavior.refuses_replies => 500,
+                None => 202,
             };
             return write_http_status(stream, status);
         }
@@ -5652,15 +5824,15 @@ while IFS= read -r line; do :; done
         let session = session
             .map(|session| format!("mcp-session-id: {session}\r\n"))
             .unwrap_or_default();
-        if behavior.ping {
-            let ping_id = format!("ping-{}", id.unwrap_or_default());
-            let ping = json!({"jsonrpc": "2.0", "id": ping_id, "method": "ping"});
+        if let Some(method) = behavior.asks_first {
+            let asked = format!("ask-{}", id.unwrap_or_default());
+            let request = server_request(&asked, method);
             let _ = write!(
                 stream,
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n{session}connection: close\r\n\r\nevent: message\ndata: {ping}\n\n"
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n{session}connection: close\r\n\r\nevent: message\ndata: {request}\n\n"
             );
             let _ = stream.flush();
-            if wait_in_log(log, |request| request.body["id"] == ping_id).is_some() {
+            if wait_in_log(log, |request| request.body["id"] == asked).is_some() {
                 let _ = write!(stream, "event: message\ndata: {response}\n\n");
             }
             return;
@@ -5825,9 +5997,10 @@ while IFS= read -r line; do :; done
         elicit: bool,
         /// Ask the client a question as soon as the stream opens.
         elicit_unprompted: bool,
-        /// Ping the client during `tools/call`, as `ping-1`, and answer the
-        /// call only once the client has answered the ping.
-        ping: bool,
+        /// During `tools/call`, send the client a request of the server's
+        /// with this method, as `ask-1`, and answer the call only once the
+        /// client has answered it.
+        asks_first: Option<&'static str>,
     }
 
     impl Default for LegacySseBehavior {
@@ -5839,7 +6012,7 @@ while IFS= read -r line; do :; done
                 unanswered: None,
                 elicit: false,
                 elicit_unprompted: false,
-                ping: false,
+                asks_first: None,
             }
         }
     }
@@ -5996,8 +6169,8 @@ while IFS= read -r line; do :; done
             "tools/call" if behavior.elicit => {
                 return ask_before_answering(stream, id, state, log, events);
             }
-            "tools/call" if behavior.ping => {
-                return ping_before_answering(stream, request, id, log, events);
+            "tools/call" if behavior.asks_first.is_some() => {
+                return ask_first_then_answer(stream, request, id, behavior, log, events);
             }
             "tools/call" => json!({
                 "content": [{
@@ -6051,20 +6224,21 @@ while IFS= read -r line; do :; done
         }))));
     }
 
-    /// Pings the client on the event stream, waits for its answer, and then
-    /// answers the call with its text.
-    fn ping_before_answering(
+    /// Sends the client the request `behavior.asks_first` names on the event
+    /// stream, waits for its answer, and then answers the call with its
+    /// text.
+    fn ask_first_then_answer(
         stream: &mut TcpStream,
         request: &HttpExchange,
         id: Value,
+        behavior: &LegacySseBehavior,
         log: &StdMutex<Vec<HttpExchange>>,
         events: &mpsc::Sender<Option<String>>,
     ) {
-        let _ = events.send(Some(legacy_event(
-            &json!({"jsonrpc": "2.0", "id": "ping-1", "method": "ping"}),
-        )));
+        let method = behavior.asks_first.unwrap_or("ping");
+        let _ = events.send(Some(legacy_event(&server_request("ask-1", method))));
         write_http_status(stream, 202);
-        if wait_in_log(log, |request| request.body["id"] == "ping-1").is_none() {
+        if wait_in_log(log, |request| request.body["id"] == "ask-1").is_none() {
             return;
         }
         let text = request.body["params"]["arguments"]["text"].clone();
@@ -6073,6 +6247,17 @@ while IFS= read -r line; do :; done
             "id": id,
             "result": {"content": [{"type": "text", "text": text}], "isError": false}
         }))));
+    }
+
+    /// A request of the server's with `method`, as `id`. A question
+    /// (`elicitation/create`) asks "Proceed?".
+    fn server_request(id: &str, method: &str) -> Value {
+        let mut request = json!({"jsonrpc": "2.0", "id": id, "method": method});
+        if method == "elicitation/create" {
+            request["params"] =
+                json!({"message": "Proceed?", "requestedSchema": {"type": "object"}});
+        }
+        request
     }
 
     fn legacy_event(message: &Value) -> String {

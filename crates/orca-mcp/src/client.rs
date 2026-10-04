@@ -100,7 +100,8 @@ pub struct McpServerStatus {
     pub prompts_error: Option<String>,
     /// What went wrong when it was last connected, as
     /// [`McpRegistry::errors`] lists it: why it failed to connect or needs a
-    /// login, or the tools and prompts it offered that were left out.
+    /// login, or the tools and prompts it offered that were left out; and
+    /// since then, the resource lists it gave only part of.
     pub errors: Vec<String>,
 }
 
@@ -137,7 +138,9 @@ struct McpServerEntry {
     /// Why its prompts could not be listed, when `prompts/list` failed.
     prompts_error: Option<String>,
     /// What went wrong when it was last connected: the failure, or tools
-    /// and prompts left out because their names were taken or missing.
+    /// and prompts left out because their names were taken or missing, or
+    /// lists it gave only part of; and since then, the resource lists it
+    /// gave only part of.
     errors: Vec<String>,
 }
 
@@ -586,11 +589,12 @@ const MAX_LIST_PAGES: usize = 100;
 
 /// Reads a list a page at a time: `fetch` is asked for the page that starts
 /// at a cursor, the first time for the first page, and answers with its
-/// items and the cursor of the next page, if there is one. Returns the
-/// items of every page read, and a warning when the list was cut off: when
-/// the server named a cursor it had named before, which would go round
-/// forever, or once [`MAX_LIST_PAGES`] pages are read. A page that cannot be
-/// read fails the list.
+/// items and the cursor of the next page, if there is one. An empty cursor
+/// ends the list too, as other MCP clients take it. Returns the items of
+/// every page read, and a warning when the list was cut off: when the
+/// server named a cursor it had named before, which would go round forever,
+/// or once [`MAX_LIST_PAGES`] pages are read. A page that cannot be read
+/// fails the list.
 fn collect_pages<T>(
     mut fetch: impl FnMut(Option<&str>) -> Result<(Vec<T>, Option<String>), String>,
 ) -> Result<(Vec<T>, Option<String>), String> {
@@ -600,7 +604,7 @@ fn collect_pages<T>(
     for _ in 0..MAX_LIST_PAGES {
         let (page, next) = fetch(cursor.as_deref())?;
         items.extend(page);
-        let Some(next) = next else {
+        let Some(next) = next.filter(|next| !next.is_empty()) else {
             return Ok((items, None));
         };
         if !cursors.insert(next.clone()) {
@@ -1219,6 +1223,30 @@ impl McpRegistry {
         }
     }
 
+    /// Adds `note` to the errors of `server` (its canonical name), unless
+    /// they hold it already, while `client` is still its client, and then
+    /// tells the subscribers. A client that a reconnect has replaced since
+    /// speaks for a connection that is gone, and so do its notes.
+    fn note_server_error(&self, server: &str, client: &Arc<McpClient>, note: String) {
+        let changed = {
+            let mut inner = self.write();
+            let current = inner
+                .clients
+                .get(server)
+                .is_some_and(|current| Arc::ptr_eq(current, client));
+            match inner.servers.iter_mut().find(|entry| entry.name == server) {
+                Some(entry) if current && !entry.errors.contains(&note) => {
+                    entry.errors.push(note);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.notify_subscribers();
+        }
+    }
+
     pub fn resolve_tool(&self, schema_name: &str) -> Option<McpToolRef> {
         self.read().lookup.get(schema_name).cloned()
     }
@@ -1582,10 +1610,11 @@ impl McpRegistry {
             let (listed, warning) = self
                 .listed_resources(&server, &client, should_cancel)
                 .map_err(McpRequestError::from_message)?;
-            // A list the server gave only part of is an error here, where
-            // there is nowhere else to say so.
+            // What the server gave of a list it cut short is kept, and noted
+            // on the server, as the listing has no errors of its own.
             if let Some(warning) = warning {
-                return Err(McpRequestError::Failed(format!("{server}: {warning}")));
+                let note = incomplete_list(&server, "resources/list", &warning);
+                self.note_server_error(&server, &client, note);
             }
             resources.extend(listed);
         }
@@ -1706,10 +1735,11 @@ impl McpRegistry {
             let (listed, warning) = self
                 .listed_resource_templates(&server, &client, should_cancel)
                 .map_err(McpRequestError::from_message)?;
-            // A list the server gave only part of is an error here, where
-            // there is nowhere else to say so.
+            // What the server gave of a list it cut short is kept, and noted
+            // on the server, as the listing has no errors of its own.
             if let Some(warning) = warning {
-                return Err(McpRequestError::Failed(format!("{server}: {warning}")));
+                let note = incomplete_list(&server, "resources/templates/list", &warning);
+                self.note_server_error(&server, &client, note);
             }
             resource_templates.extend(listed);
         }
@@ -4315,6 +4345,95 @@ done
     }
 
     #[test]
+    fn a_list_cut_short_on_a_replaced_connection_is_not_noted_on_the_new_one() {
+        use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
+
+        /// A connection that names the same cursor on every page, and runs
+        /// `during_second_page` while it reads the second.
+        struct RepeatingCursor {
+            during_second_page: Box<dyn Fn() + Send + Sync>,
+        }
+
+        impl McpTransport for RepeatingCursor {
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({}))
+            }
+
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": []}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                Err("not asked for".to_string())
+            }
+
+            fn list_resources(&self, cursor: Option<&str>) -> Result<Value, String> {
+                if cursor.is_some() {
+                    (self.during_second_page)();
+                }
+                Ok(serde_json::json!({
+                    "resources": [{"uri": "memo://1", "name": "one"}],
+                    "nextCursor": "c1"
+                }))
+            }
+
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
+                Err("not asked for".to_string())
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Err("not asked for".to_string())
+            }
+        }
+
+        // The server takes the configured token, so each connection to it
+        // works.
+        let server = OAuthTestServer::start(OAuthTestBehavior {
+            accepted_tokens: vec!["at-configured".to_string()],
+            ..Default::default()
+        });
+        let mut config = server.config("docs");
+        config.headers.insert(
+            "Authorization".to_string(),
+            "Bearer at-configured".to_string(),
+        );
+        let registry = connected_registry(std::slice::from_ref(&config), None);
+        // A listing is under way on the server's connection when the server
+        // is reconnected, and then finds the list cut short.
+        let reconnect = {
+            let registry = Arc::downgrade(&registry.shared);
+            move || {
+                let shared = registry.upgrade().expect("the registry");
+                McpRegistry { shared }
+                    .reconnect_server("docs")
+                    .expect("reconnect the server");
+            }
+        };
+        let old = client_with(
+            config,
+            RepeatingCursor {
+                during_second_page: Box::new(reconnect),
+            },
+        );
+        let replaced = registry.write().clients.insert("docs".to_string(), old);
+        drop(replaced);
+        let (_subscription, changes) = count_changes(&registry);
+
+        let resources = registry
+            .list_resources(Some("docs"))
+            .expect("the resources read");
+
+        assert_eq!(resources.len(), 2);
+        assert_eq!(
+            registry.server_statuses(),
+            [status("docs", McpServerState::Ready)],
+            "the new connection's list is not the one cut short"
+        );
+        // The reconnect, and nothing else.
+        assert_eq!(changes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn a_prompt_or_resource_request_that_needs_login_marks_the_server() {
         use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
 
@@ -5811,27 +5930,92 @@ done
                     "resources-r1",
                     serde_json::json!({"resources": [{"uri": "memo://2", "name": "two"}], "nextCursor": "r1"}),
                 ),
+                (
+                    "templates-start",
+                    serde_json::json!({"resourceTemplates": [{"uriTemplate": "memo://{a}", "name": "a"}], "nextCursor": "t1"}),
+                ),
+                (
+                    "templates-t1",
+                    serde_json::json!({"resourceTemplates": [{"uriTemplate": "memo://{b}", "name": "b"}], "nextCursor": "t1"}),
+                ),
             ],
         );
         let registry = connected_registry(&[config], None);
-
-        let listing = registry.list_resources_with_errors(Some("paged"));
-        let strict = registry.list_resources(Some("paged"));
+        let (_subscription, changes) = count_changes(&registry);
+        let uris = |resources: &[McpResource]| {
+            resources
+                .iter()
+                .map(|resource| resource.uri.clone())
+                .collect::<Vec<_>>()
+        };
 
         // A listing with errors keeps what it read, and says why it stopped.
-        assert_eq!(
-            listing
-                .resources
-                .iter()
-                .map(|resource| resource.uri.as_str())
-                .collect::<Vec<_>>(),
-            ["memo://1", "memo://2"]
-        );
+        let listing = registry.list_resources_with_errors(Some("paged"));
+        assert_eq!(uris(&listing.resources), ["memo://1", "memo://2"]);
         assert_eq!(listing.errors, ["paged: MCP server repeated a list cursor"]);
-        // One that lists all or fails, fails.
+        assert_eq!(changes.load(Ordering::SeqCst), 0);
+
+        // One without errors of its own keeps what it read too, and the
+        // server's errors say why it stopped.
+        let resources = registry
+            .list_resources(Some("paged"))
+            .expect("the resources read");
+        let templates = registry
+            .list_resource_templates(Some("paged"))
+            .expect("the resource templates read");
+
+        assert_eq!(uris(&resources), ["memo://1", "memo://2"]);
         assert_eq!(
-            strict.map(|resources| resources.len()),
-            Err("paged: MCP server repeated a list cursor".to_string())
+            templates
+                .iter()
+                .map(|template| template.uri_template.as_str())
+                .collect::<Vec<_>>(),
+            ["memo://{a}", "memo://{b}"]
+        );
+        assert_eq!(
+            registry.server_statuses(),
+            [McpServerStatus {
+                errors: vec![
+                    "incomplete resources/list result for 'paged': MCP server repeated a list cursor"
+                        .to_string(),
+                    "incomplete resources/templates/list result for 'paged': MCP server repeated a list cursor"
+                        .to_string(),
+                ],
+                ..status("paged", McpServerState::Ready)
+            }]
+        );
+        assert_eq!(changes.load(Ordering::SeqCst), 2);
+        // Noted already: listing again changes nothing, and tells no one.
+        registry
+            .list_resources(Some("paged"))
+            .expect("the resources read again");
+        assert_eq!(registry.server_statuses()[0].errors.len(), 2);
+        assert_eq!(changes.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_cursor_ends_a_list() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = paged_server_config(
+            "paged",
+            temp_dir.path(),
+            &[(
+                "tools-start",
+                serde_json::json!({"tools": [listed_tool("a")], "nextCursor": ""}),
+            )],
+        );
+
+        let registry = connected_registry(&[config], None);
+
+        assert_eq!(
+            list_params_sent(temp_dir.path(), "paged", "tools/list"),
+            [serde_json::json!({})]
+        );
+        assert_eq!(schema_names(&registry), ["mcp__paged__a"]);
+        assert_eq!(
+            registry.server_statuses(),
+            [status("paged", McpServerState::Ready)]
         );
     }
 }
