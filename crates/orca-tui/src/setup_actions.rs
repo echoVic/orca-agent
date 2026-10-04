@@ -189,6 +189,8 @@ pub(crate) fn handle_setup_key(
 /// Leave the first-run flow and enter the main interactive UI. Shared by the
 /// "API key saved" confirmation step and the welcome step when a key is already
 /// configured, so both paths reset state identically and honor `initial_prompt`.
+/// The MCP servers held back until setup was done start then, ahead of the
+/// initial prompt, whose conversation takes them over.
 fn finish_setup(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
@@ -200,6 +202,7 @@ fn finish_setup(
     state.set_status(AppStatus::Idle);
     state.setup_step = 0;
     *textarea = make_textarea(vim_state, theme);
+    let _ = action_tx.send(UserAction::SetupFinished);
 
     if let Some(prompt) = initial_prompt {
         state.push_message(ChatMessage::User(prompt.clone()));
@@ -334,7 +337,7 @@ mod tests {
         let mut state = welcome_state();
         state.setup_step = 2;
         state.set_status(AppStatus::Setup);
-        let (action_tx, _action_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let vim_state = VimState::new(false);
         let mut textarea = make_textarea(&vim_state, &theme);
@@ -353,6 +356,43 @@ mod tests {
         // configured key.
         assert_eq!(state.status, AppStatus::Idle);
         assert_eq!(state.setup_step, 0);
+        // The MCP servers held back for setup start now.
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SetupFinished)
+        ));
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn exit_from_setup_sends_nothing() {
+        let mut state = welcome_state();
+        let mut config = crate::test_support::test_run_config();
+        let shared = Arc::new(Mutex::new(crate::test_support::test_run_config()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let vim_state = VimState::new(false);
+        let mut textarea = make_textarea(&vim_state, &theme);
+        for code in [KeyCode::Char('e'), KeyCode::Esc] {
+            let (event, key) = press(code);
+            let flow = handle_setup_key(
+                &event,
+                &key,
+                &mut state,
+                &mut config,
+                &shared,
+                &action_tx,
+                &mut textarea,
+                &vim_state,
+                &theme,
+                Some("hello".to_string()),
+            )
+            .expect("handle setup key");
+
+            assert!(matches!(flow, SetupFlow::Exit(0)), "{code:?}");
+        }
+        // Nothing runs: no MCP server starts, and no prompt is sent.
+        assert!(action_rx.try_recv().is_err());
     }
 
     #[test]
@@ -372,6 +412,12 @@ mod tests {
             Some("hello".to_string()),
         );
 
+        // The MCP servers start first, so that the prompt's conversation
+        // takes them over.
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SetupFinished)
+        ));
         assert!(matches!(
             action_rx.try_recv(),
             Ok(UserAction::Submit(prompt)) if prompt == "hello"

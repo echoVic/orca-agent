@@ -66,6 +66,9 @@ struct HostedOperationInner {
         HashMap<TuiInteractionKey, std::sync::mpsc::SyncSender<io::Result<TuiInteractionResponse>>>,
     /// The MCP servers that started with the TUI, until a thread takes them.
     prestart_mcp: Option<PrestartedMcp>,
+    /// Whether those servers wait for first-run setup to be done before
+    /// they start.
+    mcp_prestart_held: bool,
     /// Where `/mcp` saves and deletes MCP logins: the config's
     /// `mcp_credentials_path`.
     mcp_credentials_path: Option<PathBuf>,
@@ -323,6 +326,25 @@ impl TuiSurfaceTaskControl {
                 orca_runtime::runtime_host::PromptQueueInteractionHandlers::default(),
             );
         }
+    }
+
+    /// Keeps the MCP servers of the config from starting with the TUI until
+    /// first-run setup is done ([`crate::protocol::UserAction::SetupFinished`]):
+    /// nothing a workspace's config runs starts before the user has accepted
+    /// the workspace.
+    pub(crate) fn hold_mcp_prestart(&self) {
+        self.lock_hosted().mcp_prestart_held = true;
+    }
+
+    /// Whether the MCP servers wait for first-run setup to be done.
+    pub(crate) fn mcp_prestart_held(&self) -> bool {
+        self.lock_hosted().mcp_prestart_held
+    }
+
+    /// Lets the MCP servers held back for first-run setup start. Returns
+    /// whether they were held back, once.
+    pub(crate) fn release_mcp_prestart(&self) -> bool {
+        std::mem::take(&mut self.lock_hosted().mcp_prestart_held)
     }
 
     /// Keeps `prestarted`, the MCP servers that started with the TUI, for

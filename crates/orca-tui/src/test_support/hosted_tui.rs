@@ -196,6 +196,29 @@ pub(crate) struct Tui {
 
 impl Tui {
     pub(crate) fn start(config: RunConfig) -> Self {
+        Self::start_with_control(config, TuiSurfaceTaskControl::new())
+    }
+
+    /// `orca` with `config` on a first run, before setup is done: its MCP
+    /// servers wait for it, as `orca` has them do. The workspace is `config`'s
+    /// cwd, reviewed against the ORCA_HOME the test set.
+    pub(crate) fn start_in_setup(config: RunConfig) -> Self {
+        let first_run =
+            orca_runtime::onboarding::inspect_first_run(&config).expect("first-run state");
+        assert!(
+            !first_run.acknowledged,
+            "the workspace was accepted already"
+        );
+        let control = TuiSurfaceTaskControl::new();
+        control.hold_mcp_prestart();
+        let mut tui = Self::start_with_control(config, control);
+        tui.state.status = crate::types::AppStatus::Setup;
+        tui.state.setup_step = 0;
+        tui.state.first_run = Some(first_run);
+        tui
+    }
+
+    fn start_with_control(config: RunConfig, control: TuiSurfaceTaskControl) -> Self {
         let (event_tx, events) = crossbeam_channel::unbounded();
         let (action_tx, action_rx) = crossbeam_channel::unbounded();
         let shared = Arc::new(Mutex::new(config.clone()));
@@ -203,7 +226,7 @@ impl Tui {
             action_rx,
             event_tx.clone(),
             8,
-            TuiSurfaceTaskControl::new(),
+            control,
             move |control, commands, host| {
                 crate::hosted_controller::hosted_tui_controller_loop(
                     shared,
@@ -326,6 +349,29 @@ impl Tui {
     /// Presses `key` in the `/mcp` panel.
     pub(crate) fn press(&mut self, key: char) {
         super::press_in_mcp_panel(&mut self.state, KeyCode::Char(key));
+    }
+
+    /// Presses `key` on the first-run setup screen, as the renderer does.
+    pub(crate) fn press_in_setup(&mut self, key: KeyCode) -> crate::setup_actions::SetupFlow {
+        let key = crossterm::event::KeyEvent::new(key, crossterm::event::KeyModifiers::NONE);
+        let shared = Arc::new(Mutex::new(self.config.clone()));
+        let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
+        let vim_state = crate::vim::VimState::new(false);
+        let mut textarea = crate::composer_textarea::make_textarea(&vim_state, &theme);
+        let action_tx = self.state.event_tx.clone();
+        crate::setup_actions::handle_setup_key(
+            &crossterm::event::Event::Key(key),
+            &key,
+            &mut self.state,
+            &mut self.config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &vim_state,
+            &theme,
+            None,
+        )
+        .expect("handle the setup key")
     }
 
     /// The thread the conversation has, with its catalog once

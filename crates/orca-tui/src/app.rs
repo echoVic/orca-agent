@@ -247,6 +247,12 @@ fn run_tui_inner(
     let agent_event_tx = event_tx.clone();
     let agent_workflow_notifications = pending_workflow_notifications.clone();
     let agent_controller = TuiSurfaceTaskControl::new();
+    // Nothing the workspace's config runs starts before the user has
+    // accepted the workspace: on a first run, its MCP servers start once
+    // setup is done.
+    if needs_setup {
+        agent_controller.hold_mcp_prestart();
+    }
 
     let local_runtime = remote.is_none();
     let runtime = if let Some(remote) = remote {

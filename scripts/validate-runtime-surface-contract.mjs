@@ -1200,7 +1200,9 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/session_picker_actions.rs:activate_action:user_action.route", 2],
   ["crates/orca-tui/src/session_picker_actions.rs:dispatch_selected_resume:user_action.route", 1],
   ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:credentials.update", 2],
-  ["crates/orca-tui/src/setup_actions.rs:finish_setup:user_action.route", 1],
+  // Ending first-run setup starts the MCP servers held back for it
+  // (SetupFinished), and then sends the initial prompt.
+  ["crates/orca-tui/src/setup_actions.rs:finish_setup:user_action.route", 2],
   ["crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:user_action.route", 14],
   ["crates/orca-tui/src/slash_command_actions.rs:request_recap:user_action.route", 1],
   ["crates/orca-tui/src/mcp_dialog_actions.rs:start_action:user_action.route", 1],
@@ -1898,11 +1900,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 53 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 54 unique variants matching UserAction at baseline",
         (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 53,
-          "current_tui_user_actions must contain 53 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 54,
+          "current_tui_user_actions must contain 54 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,

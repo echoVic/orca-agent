@@ -277,7 +277,8 @@
       "McpReconnect",
       "McpLogin",
       "McpLogout",
-      "RunMcpPrompt"
+      "RunMcpPrompt",
+      "SetupFinished"
     ],
     "required_tui_user_action_additions": [],
     "task_source_target_variants": [
@@ -5156,6 +5157,24 @@
       "Result<SurfaceMcpPromptExpansion, DisplayText>",
       "TuiEvent::McpPromptExpanded with the attachment the prompt ran in, from a drop guard on the worker, or from the dispatcher when no worker starts; the reducer sends the message only to that attachment (never while the session picker or setup is open), as literal text (no mention bindings) with its images attached, as UserAction::SubmitWithMentions between turns or UserAction::QueuePrompt while a turn runs, or shows why nothing is sent",
       "none"
+    ],
+    [
+      "SetupFinished",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:754",
+        "crates/orca-tui/src/setup_actions.rs:205",
+        "crates/orca-tui/src/hosted_controller.rs:742"
+      ],
+      "host_lifecycle_mutation",
+      "UserAction::SetupFinished",
+      "on the hosted controller, once, while no thread has started: the MCP servers of the config start connecting, as they do at launch when no first-run setup is needed (TuiSurfaceTaskControl::hold_mcp_prestart holds them back until then)",
+      "orca_mcp::initialize_registry(mcp_servers, mcp_credentials_path) through start_prestart_mcp; no runtime surface command",
+      [],
+      [],
+      "PrestartedMcp",
+      "TuiEvent::McpCatalogPrestart for each change to the servers, then TuiEvent::StartupWarning once none is still connecting; the first thread to start takes the registry over",
+      "none"
     ]
   ],
   "tui_entrypoint_columns": [
@@ -7835,7 +7854,7 @@
   ],
   "phase_0a_manifest_invariants": [
     "source_facts has exactly 58 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 53 unique variants matching UserAction at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 54 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",

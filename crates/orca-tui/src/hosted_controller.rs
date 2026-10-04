@@ -177,6 +177,28 @@ fn clear_completed_recap_request(
     }
 }
 
+/// Starts connecting the MCP servers of `config` for the conversation not
+/// started yet, while no `thread` has: see [`start_prestart_mcp`].
+fn prestart_mcp_servers(
+    thread: Option<&RuntimeThreadHandle>,
+    config: &Arc<Mutex<RunConfig>>,
+    control: &TuiSurfaceTaskControl,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) {
+    if thread.is_some() {
+        return;
+    }
+    let (mcp_servers, mcp_credentials_path) = {
+        let cfg = config.lock().unwrap();
+        (cfg.mcp_servers.clone(), cfg.mcp_credentials_path.clone())
+    };
+    if let Some(prestarted) =
+        start_prestart_mcp(&mcp_servers, mcp_credentials_path, event_tx.clone())
+    {
+        control.set_prestart_mcp(prestarted);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hosted_tui_controller_loop(
     config: Arc<Mutex<RunConfig>>,
@@ -270,18 +292,13 @@ pub(crate) fn hosted_tui_controller_loop(
             announce_runtime_ready(runtime_thread, &event_tx, &control);
         }
     }
-    let (mcp_servers, mcp_credentials_path) = {
-        let cfg = config.lock().unwrap();
-        (cfg.mcp_servers.clone(), cfg.mcp_credentials_path.clone())
-    };
     // A new conversation's thread starts with its first message, but its MCP
     // servers connect now: `/mcp` and the MCP prompt commands use them
-    // meanwhile, and the first thread to start takes them.
-    if thread.is_none()
-        && let Some(prestarted) =
-            start_prestart_mcp(&mcp_servers, mcp_credentials_path, event_tx.clone())
-    {
-        control.set_prestart_mcp(prestarted);
+    // meanwhile, and the first thread to start takes them. On a first run
+    // they wait for setup to be done: the user has not accepted the
+    // workspace yet.
+    if !control.mcp_prestart_held() {
+        prestart_mcp_servers(thread.as_ref(), &config, &control, &event_tx);
     }
 
     loop {
@@ -722,6 +739,11 @@ pub(crate) fn hosted_tui_controller_loop(
             | Ok(UserAction::McpLogin { .. })
             | Ok(UserAction::McpLogout { .. })
             | Ok(UserAction::RunMcpPrompt { .. }) => {}
+            Ok(UserAction::SetupFinished) => {
+                if control.release_mcp_prestart() {
+                    prestart_mcp_servers(thread.as_ref(), &config, &control, &event_tx);
+                }
+            }
             Ok(UserAction::ResumeOperation { operation_id }) => {
                 handle_hosted_operation_action(
                     HostedOperationAction::Resume { operation_id },

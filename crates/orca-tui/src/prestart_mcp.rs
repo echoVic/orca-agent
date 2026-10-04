@@ -542,6 +542,82 @@ mod tests {
             wait_until_gone(&pids, Duration::from_secs(1));
         }
 
+        /// Has the controller answer an action sent after every one before
+        /// it: once it has, it has acted on those, and on its launch.
+        fn settle(tui: &mut Tui) {
+            tui.state
+                .event_tx
+                .send(crate::protocol::UserAction::GoalShow)
+                .expect("the controller runs");
+            tui.until_event("the controller to answer", |event| {
+                matches!(event, TuiEvent::GoalStatus(None))
+            });
+        }
+
+        #[test]
+        fn mcp_servers_wait_for_first_run_setup_and_then_start_once() {
+            let home = crate::test_support::isolate_orca_home();
+            let fixture = tempfile::tempdir().unwrap();
+            let mut tui = Tui::start_in_setup(config(
+                home.path(),
+                vec![mcp_server("docs", fixture.path(), 0)],
+            ));
+
+            // The workspace is not accepted yet: nothing it configures runs.
+            settle(&mut tui);
+            assert!(tui.control().prestart_mcp_registry().is_none());
+            assert_eq!(launches(fixture.path()), Vec::<String>::new());
+
+            // Accepting it, with a key set, ends setup.
+            assert!(matches!(
+                tui.press_in_setup(crossterm::event::KeyCode::Enter),
+                crate::setup_actions::SetupFlow::Continue
+            ));
+            assert_eq!(tui.state.status, AppStatus::Idle);
+            tui.until("the server to connect", |state| connected(state, "docs"));
+            let started = tui
+                .control()
+                .prestart_mcp_registry()
+                .expect("the servers that started");
+            // Setup ends once: word of it again starts nothing more.
+            tui.state
+                .event_tx
+                .send(crate::protocol::UserAction::SetupFinished)
+                .expect("the controller runs");
+            settle(&mut tui);
+            assert!(
+                tui.control()
+                    .prestart_mcp_registry()
+                    .is_some_and(|registry| registry.is_same(&started)),
+                "the servers started again"
+            );
+            let pids = launches(fixture.path());
+            assert_eq!(pids.len(), 1, "{pids:?}");
+            assert!(alive(&pids[0]), "the server was stopped");
+            tui.quit();
+            wait_until_gone(&pids, Duration::from_secs(5));
+        }
+
+        #[test]
+        fn choosing_exit_on_first_run_setup_starts_no_mcp_server() {
+            let home = crate::test_support::isolate_orca_home();
+            let fixture = tempfile::tempdir().unwrap();
+            let mut tui = Tui::start_in_setup(config(
+                home.path(),
+                vec![mcp_server("docs", fixture.path(), 0)],
+            ));
+
+            assert!(matches!(
+                tui.press_in_setup(crossterm::event::KeyCode::Char('e')),
+                crate::setup_actions::SetupFlow::Exit(0)
+            ));
+            settle(&mut tui);
+            assert!(tui.control().prestart_mcp_registry().is_none());
+            tui.quit();
+
+            assert_eq!(launches(fixture.path()), Vec::<String>::new());
+        }
+
         #[test]
         fn quitting_while_the_thread_reconnects_a_server_stops_it() {
             let home = crate::test_support::isolate_orca_home();

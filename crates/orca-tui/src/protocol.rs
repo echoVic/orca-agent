@@ -748,4 +748,8 @@ pub enum UserAction {
         attachment: Option<SessionAttachmentId>,
         token: u64,
     },
+    /// First-run setup is done: the workspace's security disclosure was
+    /// accepted and an API key is set. The MCP servers held back until then
+    /// start connecting.
+    SetupFinished,
 }

@@ -26,6 +26,10 @@ Trusting a folder lets Orca load that project's configuration, instructions,
 skills, agents, and workflows. It does not enable or bypass the OS sandbox.
 See [Approval modes](approval-modes.md) and [Configuration](configuration.md).
 
+The MCP servers a new conversation starts with wait until you have answered
+(and, when no API key is set, entered one): choosing `E` exits without
+starting any of them.
+
 ## The screen
 
 A conversation reads top to bottom, with the input and the status bar at the
@@ -275,8 +279,9 @@ A rule name keeps its room in an 80-column terminal: a long tool name is cut
 short before it is.
 
 `/mcp` opens between turns. The servers of the configuration Orca started
-with begin connecting as soon as the TUI opens, all at once and in the
-background, so the panel shows them from the start, before your first
+with begin connecting as soon as the TUI opens (on a first run in a folder,
+once setup is done), all at once and in the background, so the panel shows
+them from the start, before your first
 message too: each enabled one reads `starting` until it connects, fails, or
 needs a login, and its details list its tools and prompts once it has
 connected; a disabled one reads `disabled` and is never connected.

@@ -801,6 +801,45 @@ fn tui_quit_stops_an_mcp_server_that_is_still_starting() {
     }
 }
 
+#[test]
+fn tui_exit_from_first_run_setup_starts_no_mcp_server() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let fixture = tempfile::tempdir().expect("MCP fixture directory");
+    let server = SlowMcpServer::configure(home.path(), fixture.path());
+    let mut process =
+        PtyProcess::spawn_without_prompt(home.path(), cwd.path()).expect("spawn TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "TUI did not ask to review the new workspace",
+    );
+    // A server started with the TUI would have started by now.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        assert_eq!(
+            server.started(),
+            Vec::<String>::new(),
+            "an MCP server started before the workspace was accepted"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    process.write(b"e").expect("choose Exit");
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+
+    assert_eq!(status.code(), Some(0), "TUI exited with {status}");
+    assert_eq!(
+        server.started(),
+        Vec::<String>::new(),
+        "choosing Exit started an MCP server"
+    );
+}
+
 /// A stdio MCP server, in the user config of an ORCA_HOME, that adds its
 /// process id to a file as it starts, and reads nothing for 30 seconds:
 /// until then it is starting. Dropping it kills the server's process group,
