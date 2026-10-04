@@ -13,6 +13,7 @@ use crate::model::ModelSelection;
 use crate::subagent_config::SubagentConfig;
 use crate::tool_types::ToolOutputTruncation;
 
+pub mod error_text;
 pub mod file;
 pub mod folder_trust;
 pub mod mcp_credentials;

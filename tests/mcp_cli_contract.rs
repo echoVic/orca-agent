@@ -1,8 +1,8 @@
 //! End-to-end coverage for `orca mcp` and MCP approvals, driven through the
-//! real `orca` binary: config round trips, a read-only tool running without
-//! approval in suggest mode, a write tool still asking, a permission rule
-//! lifting that ask, a remote streamable HTTP server added by url, and a
-//! server that fails to start being reported.
+//! real `orca` binary: config round trips, several processes adding servers at
+//! once, a read-only tool running without approval in suggest mode, a write
+//! tool still asking, a permission rule lifting that ask, a remote streamable
+//! HTTP server added by url, and a server that fails to start being reported.
 //!
 //! Every test gets its own `ORCA_HOME` and working directory. Every `orca`
 //! invocation is bounded by [`ORCA_TIMEOUT`]: these tests spawn real MCP
@@ -97,6 +97,58 @@ fn mcp_commands_round_trip_the_user_config() {
         "{}",
         list_after_remove.stdout_text()
     );
+}
+
+/// Eight `orca mcp add` processes write the one `config.toml` at once. Each
+/// reads the file, adds its server, and replaces the file whole, so without
+/// the lock on `config.toml.lock` a process replaces the file with one that
+/// lacks what another process added after it read.
+#[test]
+fn eight_orca_processes_adding_servers_at_once_lose_none() {
+    const PROCESSES: usize = 8;
+    let fixture = Fixture::new();
+    // Every process is started together, so all of them read the file before
+    // any of them has written it.
+    let start = std::sync::Barrier::new(PROCESSES);
+
+    let adds: Vec<FinishedProcess> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..PROCESSES)
+            .map(|index| {
+                let (fixture, start) = (&fixture, &start);
+                scope.spawn(move || {
+                    let name = format!("server{index}");
+                    start.wait();
+                    fixture.run(&["mcp", "add", &name, "--", "true"])
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("join an orca mcp add"))
+            .collect()
+    });
+    for (index, add) in adds.iter().enumerate() {
+        assert_eq!(
+            add.code(),
+            Some(0),
+            "orca mcp add server{index}: stderr: {}",
+            add.stderr_text()
+        );
+    }
+
+    let list = fixture.run(&["mcp", "list"]);
+    assert_eq!(list.code(), Some(0), "stderr: {}", list.stderr_text());
+    let stdout = list.stdout_text();
+    let mut listed: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.split('\t').next())
+        .collect();
+    listed.sort_unstable();
+    let mut expected: Vec<String> = (0..PROCESSES)
+        .map(|index| format!("server{index}"))
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(listed, expected, "{stdout}");
 }
 
 #[test]

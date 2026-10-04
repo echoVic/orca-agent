@@ -1058,6 +1058,60 @@ mod tests {
         assert!(!stdout.contains("secret"), "{stdout}");
     }
 
+    /// A config that does not load is reported by where and what, never by
+    /// what it holds: what these commands print lands in logs and bug
+    /// reports, and a value can be a secret.
+    #[test]
+    fn a_config_error_never_prints_a_value() {
+        let temp = tempdir().unwrap();
+        // (the config, how the problem is reported, what must not be shown)
+        let cases = [
+            (
+                "[[mcp_servers]]\nname = \"a\"\ncommand = \"x\"\nenv = \"TOKEN=abc-SECRET\"\n",
+                "invalid type in `env`, expected a map",
+                "abc-SECRET",
+            ),
+            (
+                "[[mcp_servers]]\nname = \"a\"\ncommand = \"x\"\n\n[mcp_servers.env]\nPIN = 12345678\n",
+                "invalid type in `env.PIN`, expected a string",
+                "12345678",
+            ),
+            (
+                "[[mcp_servers]]\nname = \"a\"\ncommand = \"x\"\nargs = \"--token=abc-SECRET\"\n",
+                "invalid type in `args`, expected a sequence",
+                "abc-SECRET",
+            ),
+            (
+                "[[mcp_servers]]\nname = \"a\"\ncommand = \"x\"\nenv = { TOKEN = \"abc-SECRET }\n",
+                "line 4, column 30",
+                "abc-SECRET",
+            ),
+        ];
+        for (config, reported, value) in cases {
+            fs::write(config_path(temp.path()), config).unwrap();
+            let requests = [
+                McpCommandRequest::List { json: false },
+                McpCommandRequest::List { json: true },
+                McpCommandRequest::Get {
+                    name: "a".to_string(),
+                    json: false,
+                },
+                McpCommandRequest::Get {
+                    name: "a".to_string(),
+                    json: true,
+                },
+            ];
+            for request in requests {
+                let (code, stdout, stderr) = run(temp.path(), request.clone());
+
+                assert_eq!(code, 1, "{request:?}: {config}");
+                assert!(stderr.contains(reported), "{request:?}: {stderr}");
+                assert!(!stderr.contains(value), "{request:?}: {stderr}");
+                assert!(!stdout.contains(value), "{request:?}: {stdout}");
+            }
+        }
+    }
+
     #[test]
     fn get_shows_an_empty_tool_filter_as_none() {
         let temp = tempdir().unwrap();

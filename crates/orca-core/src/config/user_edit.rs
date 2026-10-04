@@ -7,6 +7,7 @@ use toml_edit::{
 };
 
 use crate::approval_rules::canonical_rule_tool;
+use crate::config::error_text::{data_error_text, syntax_error_text};
 use crate::config::file::USER_CONFIG_FILE;
 use crate::mcp_types::{McpServerConfig, McpTransportKind, canonical_mcp_name};
 
@@ -60,9 +61,12 @@ fn user_config_lock_path_in(dir: &Path) -> PathBuf {
 /// every caller in this module reports config corruption consistently.
 fn read_document(path: &Path) -> io::Result<DocumentMut> {
     match read_config_text(path)? {
-        Some(content) => content
-            .parse::<DocumentMut>()
-            .map_err(|error| unparsable_config_error(path, &error)),
+        Some(content) => content.parse::<DocumentMut>().map_err(|error| {
+            unparsable_config_error(
+                path,
+                &syntax_error_text(error.message(), error.span(), &content),
+            )
+        }),
         None => Ok(DocumentMut::new()),
     }
 }
@@ -76,9 +80,11 @@ fn read_config_text(path: &Path) -> io::Result<Option<String>> {
     }
 }
 
-fn unparsable_config_error(path: &Path, error: &dyn std::fmt::Display) -> io::Error {
+/// `what` is where and what the syntax error is, as `syntax_error_text` says
+/// it: the config is never quoted, since it can hold secrets.
+fn unparsable_config_error(path: &Path, what: &str) -> io::Error {
     io::Error::other(format!(
-        "{}: existing config cannot be parsed; fix or remove it before persisting settings ({error})",
+        "{}: existing config cannot be parsed; fix or remove it before persisting settings ({what})",
         path.display()
     ))
 }
@@ -194,8 +200,12 @@ pub fn list_user_mcp_servers_in(dir: &Path) -> io::Result<(PathBuf, Vec<McpServe
     let Some(content) = read_config_text(&path)? else {
         return Ok((path, Vec::new()));
     };
-    let mut config: toml::Table =
-        toml::from_str(&content).map_err(|error| unparsable_config_error(&path, &error))?;
+    let mut config: toml::Table = toml::from_str(&content).map_err(|error| {
+        unparsable_config_error(
+            &path,
+            &syntax_error_text(error.message(), error.span(), &content),
+        )
+    })?;
     let servers = match config.remove("mcp_servers") {
         None => Vec::new(),
         Some(toml::Value::Array(entries)) => entries
@@ -207,16 +217,21 @@ pub fn list_user_mcp_servers_in(dir: &Path) -> io::Result<(PathBuf, Vec<McpServe
     Ok((path, servers))
 }
 
+/// One `mcp_servers` entry as the server it loads as. When it does not load,
+/// the error says where and what was expected, and shows nothing the entry
+/// holds: `orca mcp list` and `get` print it, and a value can be a secret.
 fn read_server_entry(path: &Path, entry: toml::Value) -> io::Result<McpServerConfig> {
-    let invalid = |reason: &dyn std::fmt::Display| {
+    let invalid = |reason: &str| {
         io::Error::other(format!(
             "{}: invalid MCP server entry: {reason}",
             path.display()
         ))
     };
     match entry {
-        toml::Value::Table(_) => entry.try_into().map_err(|error| invalid(&error)),
-        other => Err(invalid(&format_args!(
+        toml::Value::Table(_) => entry
+            .try_into()
+            .map_err(|error| invalid(&data_error_text(&error))),
+        other => Err(invalid(&format!(
             "expected a table, found {}",
             other.type_str()
         ))),
@@ -1038,24 +1053,146 @@ mod tests {
 
     #[test]
     fn an_mcp_server_entry_that_does_not_load_is_reported() {
-        for (content, reported) in [
+        for (content, reason) in [
             ("[[mcp_servers]]\ncommand = \"x\"\n", "missing field `name`"),
             (
                 "mcp_servers = [{ name = \"a\", args = \"-y\" }]\n",
-                "invalid MCP server entry",
+                "invalid type in `args`, expected a sequence",
             ),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join(USER_CONFIG_FILE), content).unwrap();
+            let path = dir.path().join(USER_CONFIG_FILE);
+            std::fs::write(&path, content).unwrap();
 
             let error = list_user_mcp_servers_in(dir.path()).unwrap_err();
 
-            assert!(
-                error.to_string().contains("invalid MCP server entry"),
-                "{error}"
+            assert_eq!(
+                error.to_string(),
+                format!("{}: invalid MCP server entry: {reason}", path.display())
             );
-            assert!(error.to_string().contains(reported), "{error}");
         }
+    }
+
+    /// What `orca mcp list` and `get` say about an entry that does not load is
+    /// where it is and what was expected, never what the config holds there:
+    /// the text lands in logs and bug reports, and a value can be a secret.
+    #[test]
+    fn an_mcp_server_entry_that_does_not_load_is_reported_without_its_values() {
+        // (the entry, how it is reported, what must not be shown)
+        let cases = [
+            (
+                "env = \"TOKEN=abc-SECRET\"",
+                "invalid type in `env`, expected a map",
+                "abc-SECRET",
+            ),
+            (
+                "headers = \"Authorization: abc-SECRET\"",
+                "invalid type in `headers`, expected a map",
+                "abc-SECRET",
+            ),
+            (
+                "args = \"--token=abc-SECRET\"",
+                "invalid type in `args`, expected a sequence",
+                "abc-SECRET",
+            ),
+            (
+                "args = [\"ok\", 12345678]",
+                "invalid type in `args`, expected a string",
+                "12345678",
+            ),
+            (
+                "[mcp_servers.env]\nPIN = 12345678",
+                "invalid type in `env.PIN`, expected a string",
+                "12345678",
+            ),
+            (
+                "[mcp_servers.headers]\nAuthorization = 12345678",
+                "invalid type in `headers.Authorization`, expected a string",
+                "12345678",
+            ),
+            (
+                "disabled = \"abc-SECRET\"",
+                "invalid type in `disabled`, expected a boolean",
+                "abc-SECRET",
+            ),
+            (
+                "capabilities = { read = \"abc-SECRET\", write = true, metadata_write = false, network = false, shell = false, agent = false }",
+                "invalid type in `capabilities.read`, expected a boolean",
+                "abc-SECRET",
+            ),
+            (
+                "oauth_callback_port = 70000",
+                "invalid value in `oauth_callback_port`, expected u16",
+                "70000",
+            ),
+            (
+                "startup_timeout_ms = -123456",
+                "invalid value in `startup_timeout_ms`, expected u64",
+                "123456",
+            ),
+            // The name of a variant the config does not have is the config's,
+            // too: it is not shown, and the ones it could have been are.
+            (
+                "transport = \"abc-SECRET\"",
+                "unknown variant in `transport`, expected one of `stdio`, `sse`, `http`",
+                "abc-SECRET",
+            ),
+        ];
+        for (entry, reported, value) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(USER_CONFIG_FILE);
+            std::fs::write(
+                &path,
+                format!("[[mcp_servers]]\nname = \"a\"\ncommand = \"x\"\n{entry}\n"),
+            )
+            .unwrap();
+
+            let error = list_user_mcp_servers_in(dir.path()).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!("{}: invalid MCP server entry: {reported}", path.display()),
+                "{entry}"
+            );
+            assert!(!error.to_string().contains(value), "{entry}: {error}");
+        }
+    }
+
+    /// A config that cannot be parsed is reported by line and column, and its
+    /// text is never quoted: the line the parser stopped at can be a secret.
+    #[test]
+    fn a_config_that_cannot_be_parsed_is_reported_by_line_and_never_quoted() {
+        let content = concat!(
+            "# a comment\n",
+            "model = \"m\"\n",
+            "\n",
+            "[[mcp_servers]]\n",
+            "name = \"a\"\n",
+            "command = \"x\"\n",
+            "env = { TOKEN = \"abc-SECRET }\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(USER_CONFIG_FILE);
+        std::fs::write(&path, content).unwrap();
+
+        // Reading it, and every way of editing it, say the same.
+        let errors = [
+            list_user_mcp_servers_in(dir.path()).unwrap_err(),
+            add_user_mcp_server_in(dir.path(), &stdio_server("b", "y")).unwrap_err(),
+            remove_user_mcp_server_in(dir.path(), "a").unwrap_err(),
+            add_user_allow_rule_in(dir.path(), "bash").unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "{}: existing config cannot be parsed; fix or remove it before persisting settings (TOML syntax error at line 7, column 30: invalid basic string)",
+                    path.display()
+                )
+            );
+        }
+        // And the file is as it was.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
     }
 
     #[test]

@@ -388,7 +388,7 @@ fn load_layered_config_from_optional_paths(
         merge_toml_values(&mut merged, project);
     }
 
-    let mut config: FileConfig = match merged.try_into() {
+    let mut config = match file_config_from_value(merged) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("orca: warning: config parse error, using defaults: {error}");
@@ -401,6 +401,15 @@ fn load_layered_config_from_optional_paths(
         }
     }
     config
+}
+
+/// The config `value` holds, or what is wrong with it: where, and what was
+/// expected, never a value from the config. The text is printed when Orca
+/// starts, so it lands in logs and bug reports, and a value can be a secret.
+fn file_config_from_value(value: Value) -> Result<FileConfig, String> {
+    value
+        .try_into()
+        .map_err(|error| super::error_text::data_error_text(&error))
 }
 
 fn load_toml_value(path: &Path) -> Option<Value> {
@@ -1875,6 +1884,49 @@ workflowKeywordTriggerEnabled = true
         }
     }
 
+    /// The warning printed at start when the config does not load says where
+    /// and what, never a value in the config: it lands in logs and bug
+    /// reports, and a value can be a secret.
+    #[test]
+    fn a_config_that_does_not_load_is_reported_without_its_values() {
+        // (the config, how the problem is reported, what must not be shown)
+        let cases = [
+            (
+                "[[mcp_servers]]\nname = \"a\"\ncommand = \"x\"\nenv = \"TOKEN=abc-SECRET\"\n",
+                "invalid type in `mcp_servers.env`, expected a map",
+                "abc-SECRET",
+            ),
+            (
+                "api_key = 12345678\n",
+                "invalid type in `api_key`, expected a string",
+                "12345678",
+            ),
+            (
+                "reasoning_effort = \"abc-SECRET\"\n",
+                "unknown variant in `reasoning_effort`, expected one of `low`, `high`, `max`",
+                "abc-SECRET",
+            ),
+            (
+                "[[permissions.rules]]\ntool = \"bash\"\n",
+                "missing field `decision` in `permissions.rules`",
+                "bash",
+            ),
+            // What the config's own types say is not known to hold no value,
+            // so only where the problem is is reported.
+            (
+                "vim_insert_escape = \"abc-SECRET\"\n",
+                "invalid value in `vim_insert_escape`",
+                "abc-SECRET",
+            ),
+        ];
+        for (config, reported, value) in cases {
+            let error = file_config_from_value(toml::from_str(config).unwrap()).unwrap_err();
+
+            assert_eq!(error, reported, "{config}");
+            assert!(!error.contains(value), "{config}: {error}");
+        }
+    }
+
     #[test]
     fn persist_user_model_settings_rejects_unparseable_existing_config() {
         let _guard = EFFECTIVE_CONFIG_ENV_LOCK.lock().unwrap();
@@ -1894,6 +1946,19 @@ workflowKeywordTriggerEnabled = true
             error.to_string().contains("cannot be parsed"),
             "unexpected error: {error}"
         );
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+
+        // The line the parser stops at is reported by number, not quoted: it
+        // can hold a secret.
+        let broken = "model = \"m\"\napi_key = \"abc-SECRET\n";
+        fs::write(&path, broken).unwrap();
+        let error = persist_user_model_settings(Some("deepseek-flash"), None)
+            .expect_err("unparseable config must be rejected");
+        assert!(
+            error.to_string().contains("line 2, column"),
+            "unexpected error: {error}"
+        );
+        assert!(!error.to_string().contains("abc-SECRET"), "{error}");
         assert_eq!(fs::read_to_string(&path).unwrap(), broken);
         unsafe {
             std::env::remove_var(ORCA_HOME_ENV);
