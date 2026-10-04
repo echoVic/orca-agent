@@ -1222,6 +1222,73 @@ mod tests {
     }
 
     #[test]
+    fn orca_mcp_list_reads_an_inline_array() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            config_path(temp.path()),
+            "mcp_servers = [{ name = \"a\", command = \"x\" }]\n",
+        )
+        .unwrap();
+
+        let (code, stdout, stderr) = run(temp.path(), McpCommandRequest::List { json: false });
+
+        assert_eq!(code, 0, "stderr: {stderr}");
+        assert_eq!(stdout.trim_end(), "a\tstdio\tx\t-");
+    }
+
+    #[test]
+    fn orca_mcp_get_add_and_remove_work_on_an_inline_array() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            config_path(temp.path()),
+            "# keep me\nmcp_servers = [{ name = \"a\", command = \"x\" }]\n",
+        )
+        .unwrap();
+
+        let (code, stdout, stderr) = run(
+            temp.path(),
+            McpCommandRequest::Get {
+                name: "a".to_string(),
+                json: false,
+            },
+        );
+        assert_eq!(code, 0, "stderr: {stderr}");
+        assert!(stdout.contains("name: a\n"), "{stdout}");
+        assert!(stdout.contains("command: x\n"), "{stdout}");
+
+        // The new server joins the array the file already has, and the name
+        // checks see the server that is in it.
+        let (code, _stdout, stderr) = run(temp.path(), add_request("b", &["y", "--flag"]));
+        assert_eq!(code, 0, "stderr: {stderr}");
+        let (code, _stdout, stderr) = run(temp.path(), add_request("A", &["z"]));
+        assert_eq!(code, 1);
+        assert!(stderr.contains("clashes with 'a'"), "{stderr}");
+        let content = fs::read_to_string(config_path(temp.path())).unwrap();
+        assert!(content.contains("# keep me"), "{content}");
+        assert!(!content.contains("[[mcp_servers]]"), "{content}");
+        let config = read_config(temp.path());
+        let names: Vec<_> = config.mcp_servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(config.mcp_servers[1].args, vec!["--flag".to_string()]);
+
+        let (code, stdout, stderr) = run(
+            temp.path(),
+            McpCommandRequest::Remove {
+                name: "a".to_string(),
+            },
+        );
+        assert_eq!(code, 0, "stderr: {stderr}");
+        let path = config_path(temp.path()).display().to_string();
+        assert_eq!(
+            stdout.trim_end(),
+            format!("removed MCP server a from {path}")
+        );
+        let config = read_config(temp.path());
+        let names: Vec<_> = config.mcp_servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["b"]);
+    }
+
+    #[test]
     fn login_stores_a_credential_and_logout_removes_it() {
         let temp = tempdir().unwrap();
         let server = OAuthTestServer::start(OAuthTestBehavior::default());
