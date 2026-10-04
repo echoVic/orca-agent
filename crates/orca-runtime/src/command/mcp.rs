@@ -967,6 +967,98 @@ mod tests {
     }
 
     #[test]
+    fn list_and_get_read_sub_tables() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            config_path(temp.path()),
+            concat!(
+                "[[mcp_servers]]\n",
+                "name = \"docs\"\n",
+                "command = \"npx\"\n",
+                "args = [\"-y\", \"docs-mcp\"]\n",
+                "\n",
+                "[mcp_servers.env]\n",
+                "API_KEY = \"env-secret\"\n",
+                "REGION = \"env-secret-2\"\n",
+                "\n",
+                "[[mcp_servers]]\n",
+                "name = \"remote\"\n",
+                "transport = \"http\"\n",
+                "url = \"https://example.com/mcp\"\n",
+                "enabled_tools = [\"search\"]\n",
+                "\n",
+                "[mcp_servers.headers]\n",
+                "Authorization = \"Bearer header-secret\"\n",
+                "X-Team = \"header-secret-2\"\n",
+            ),
+        )
+        .unwrap();
+        let get = |name: &str, json: bool| {
+            let (code, stdout, stderr) = run(
+                temp.path(),
+                McpCommandRequest::Get {
+                    name: name.to_string(),
+                    json,
+                },
+            );
+            assert_eq!(code, 0, "stderr: {stderr}");
+            assert!(!stdout.contains("secret"), "{stdout}");
+            stdout
+        };
+
+        // The env of a stdio server, as a sub-table: key names, never values.
+        let docs = get("docs", false);
+        assert!(
+            docs.lines().any(|line| line == "env: API_KEY,REGION"),
+            "{docs}"
+        );
+        let docs: serde_json::Value = serde_json::from_str(&get("docs", true)).unwrap();
+        assert_eq!(docs["env_keys"], serde_json::json!(["API_KEY", "REGION"]));
+
+        // So are the headers of a remote one, which also decide how it
+        // authenticates.
+        let remote = get("remote", false);
+        assert!(
+            remote
+                .lines()
+                .any(|line| line == "headers: Authorization,X-Team"),
+            "{remote}"
+        );
+        assert!(
+            remote.lines().any(|line| line == "auth: static header"),
+            "{remote}"
+        );
+        assert!(
+            remote.lines().any(|line| line == "enabled_tools: search"),
+            "{remote}"
+        );
+        let remote: serde_json::Value = serde_json::from_str(&get("remote", true)).unwrap();
+        assert_eq!(
+            remote["header_names"],
+            serde_json::json!(["Authorization", "X-Team"])
+        );
+        assert_eq!(remote["auth"], "static header");
+
+        let (code, stdout, stderr) = run(temp.path(), McpCommandRequest::List { json: false });
+        assert_eq!(code, 0, "stderr: {stderr}");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == "remote\thttp\thttps://example.com/mcp\tstatic header"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("secret"), "{stdout}");
+        let (code, stdout, stderr) = run(temp.path(), McpCommandRequest::List { json: true });
+        assert_eq!(code, 0, "stderr: {stderr}");
+        let listed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(
+            listed[0]["env_keys"],
+            serde_json::json!(["API_KEY", "REGION"])
+        );
+        assert!(!stdout.contains("secret"), "{stdout}");
+    }
+
+    #[test]
     fn get_shows_an_empty_tool_filter_as_none() {
         let temp = tempdir().unwrap();
         fs::write(

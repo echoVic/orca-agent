@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, RawString, Table, Value};
+use toml_edit::{
+    Array, ArrayOfTables, DocumentMut, InlineTable, Item, RawString, Table, TableLike, Value,
+};
 
 use crate::approval_rules::canonical_rule_tool;
 use crate::config::file::USER_CONFIG_FILE;
@@ -57,16 +59,28 @@ fn user_config_lock_path_in(dir: &Path) -> PathBuf {
 /// is rejected with the same wording `persist_user_model_settings` uses, so
 /// every caller in this module reports config corruption consistently.
 fn read_document(path: &Path) -> io::Result<DocumentMut> {
+    match read_config_text(path)? {
+        Some(content) => content
+            .parse::<DocumentMut>()
+            .map_err(|error| unparsable_config_error(path, &error)),
+        None => Ok(DocumentMut::new()),
+    }
+}
+
+/// The text of the config file at `path`, or `None` when it does not exist.
+fn read_config_text(path: &Path) -> io::Result<Option<String>> {
     match std::fs::read_to_string(path) {
-        Ok(content) => content.parse::<DocumentMut>().map_err(|error| {
-            io::Error::other(format!(
-                "{}: existing config cannot be parsed; fix or remove it before persisting settings ({error})",
-                path.display()
-            ))
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DocumentMut::new()),
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn unparsable_config_error(path: &Path, error: &dyn std::fmt::Display) -> io::Error {
+    io::Error::other(format!(
+        "{}: existing config cannot be parsed; fix or remove it before persisting settings ({error})",
+        path.display()
+    ))
 }
 
 /// Validate an MCP server name: letters, digits, `-`, and `_`, without a
@@ -132,7 +146,7 @@ pub fn add_user_mcp_server_in(dir: &Path, server: &McpServerConfig) -> io::Resul
                 path.display(),
             )));
         }
-        servers.push(server);
+        servers.push(server_to_table(server));
         Ok(())
     })
 }
@@ -149,7 +163,9 @@ pub fn remove_user_mcp_server(name: &str) -> io::Result<PathBuf> {
 pub fn remove_user_mcp_server_in(dir: &Path, name: &str) -> io::Result<PathBuf> {
     let path = user_config_path_in(dir);
     edit_user_config_in(dir, |document| {
-        if mcp_servers_mut(document, &path)?.remove(name) == 0 {
+        if mcp_servers_mut(document, &path)?.remove_where(|table| table_name(table) == Some(name))
+            == 0
+        {
             return Err(io::Error::other(format!(
                 "no MCP server named '{name}' in {}",
                 path.display()
@@ -165,69 +181,73 @@ pub fn list_user_mcp_servers() -> io::Result<(PathBuf, Vec<McpServerConfig>)> {
     list_user_mcp_servers_in(&dir)
 }
 
-/// List every `mcp_servers` entry in the config file under `dir`, whichever
-/// form the file writes them in. This never writes: a missing file yields an
-/// empty list instead of creating one.
+/// List every `mcp_servers` entry in the config file under `dir`. This never
+/// writes: a missing file yields an empty list instead of creating one.
+///
+/// The runtime loads the file with serde, so each entry is read that way
+/// too, as the `McpServerConfig` it loads as. However the entry is written,
+/// as a table with sub-tables (`[mcp_servers.env]`) or dotted keys, or
+/// inline, in `[[mcp_servers]]` tables or in an inline array, it reads back
+/// the same.
 pub fn list_user_mcp_servers_in(dir: &Path) -> io::Result<(PathBuf, Vec<McpServerConfig>)> {
     let path = user_config_path_in(dir);
-    let document = read_document(&path)?;
-    let servers = match document.get("mcp_servers") {
+    let Some(content) = read_config_text(&path)? else {
+        return Ok((path, Vec::new()));
+    };
+    let mut config: toml::Table =
+        toml::from_str(&content).map_err(|error| unparsable_config_error(&path, &error))?;
+    let servers = match config.remove("mcp_servers") {
         None => Vec::new(),
-        Some(Item::ArrayOfTables(tables)) => tables
-            .iter()
-            .map(|table| parse_server_entry(&path, &table.to_string()))
-            .collect::<io::Result<Vec<_>>>()?,
-        Some(Item::Value(Value::Array(entries))) => entries
-            .iter()
-            .map(|entry| match entry {
-                // An inline table prints as `{ … }`, which is not a document;
-                // as a table, it prints as the `key = value` lines of one.
-                Value::InlineTable(table) => {
-                    parse_server_entry(&path, &table.clone().into_table().to_string())
-                }
-                other => Err(io::Error::other(format!(
-                    "{}: invalid MCP server entry: expected a table, found {}",
-                    path.display(),
-                    other.type_name()
-                ))),
-            })
+        Some(toml::Value::Array(entries)) => entries
+            .into_iter()
+            .map(|entry| read_server_entry(&path, entry))
             .collect::<io::Result<Vec<_>>>()?,
         Some(_) => return Err(not_an_array_error(&path, "mcp_servers")),
     };
     Ok((path, servers))
 }
 
-/// Read one server from the text of its entry: the `key = value` lines of a
-/// table.
-fn parse_server_entry(path: &Path, entry: &str) -> io::Result<McpServerConfig> {
-    toml::from_str(entry).map_err(|error| {
+fn read_server_entry(path: &Path, entry: toml::Value) -> io::Result<McpServerConfig> {
+    let invalid = |reason: &dyn std::fmt::Display| {
         io::Error::other(format!(
-            "{}: invalid MCP server entry: {error}",
+            "{}: invalid MCP server entry: {reason}",
             path.display()
         ))
-    })
+    };
+    match entry {
+        toml::Value::Table(_) => entry.try_into().map_err(|error| invalid(&error)),
+        other => Err(invalid(&format_args!(
+            "expected a table, found {}",
+            other.type_str()
+        ))),
+    }
 }
 
 /// Add an allow rule for `tool` to the user-owned config's
-/// `[[permissions.rules]]` array. Once loaded (the next session, or now, for
-/// a caller that also grants it locally), it lets the matching tool call run
-/// without asking.
+/// `permissions.rules`. Once loaded (the next session, or now, for a caller
+/// that also grants it locally), it lets the matching tool call run without
+/// asking.
 pub fn add_user_allow_rule(tool: &str) -> io::Result<bool> {
     let dir = resolve_config_dir()?;
     add_user_allow_rule_in(&dir, tool)
 }
 
-/// Add an allow rule for `tool` to the `[[permissions.rules]]` array of the
-/// config file under `dir`. The rule is written with no `pattern`, so it
-/// covers every call of the tool. Returns `false` without writing when an
-/// equivalent allow rule already exists (see `is_equivalent_allow_rule`).
+/// Add an allow rule for `tool` to the `permissions.rules` of the config
+/// file under `dir`, in the form the file already writes them: `rules` as
+/// `[[permissions.rules]]` tables, or as an inline array, in a `[permissions]`
+/// table or in an inline or dotted one. A file without rules gets
+/// `[[permissions.rules]]` tables. The rule is written with no `pattern`, so
+/// it covers every call of the tool. Returns `false` without writing when an
+/// equivalent allow rule already exists, written either way (see
+/// `is_equivalent_allow_rule`).
 pub fn add_user_allow_rule_in(dir: &Path, tool: &str) -> io::Result<bool> {
     let path = user_config_path_in(dir);
     let mut appended = false;
     edit_user_config_in(dir, |document| {
-        let rules = permission_rules_array_mut(document, &path)?;
+        let mut rules = permission_rules_mut(document, &path)?;
         if rules
-            .iter()
+            .tables()
+            .into_iter()
             .any(|table| is_equivalent_allow_rule(table, tool))
         {
             return Ok(());
@@ -248,7 +268,7 @@ pub fn add_user_allow_rule_in(dir: &Path, tool: &str) -> io::Result<bool> {
 /// is its tool name, which has no `/`, so `*` covers it; for a tool whose
 /// target is a path, `*` stays within one directory and covers less. MCP
 /// names are compared in canonical form, as rules match them.
-fn is_equivalent_allow_rule(table: &Table, tool: &str) -> bool {
+fn is_equivalent_allow_rule(table: &dyn TableLike, tool: &str) -> bool {
     let covers_every_call = match table.get("pattern") {
         None => true,
         Some(pattern) => tool.starts_with("mcp__") && pattern.as_str() == Some("*"),
@@ -266,48 +286,55 @@ fn resolve_config_dir() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other("could not resolve the Orca configuration directory"))
 }
 
-/// The entries of a document's `mcp_servers`, in the form the file writes
-/// them: an array of tables (`[[mcp_servers]]`) or an inline array
-/// (`mcp_servers = [{ name = "a", command = "x" }]`). Orca loads both, so an
-/// edit handles both, and leaves the file in the form it found.
-enum McpServerEntries<'a> {
+/// An array of tables in a document, in the form the file writes it: tables
+/// (`[[mcp_servers]]`) or an inline array (`mcp_servers = [{ name = "a" }]`).
+/// Orca loads both, so an edit handles both, and leaves the file in the form
+/// it found.
+enum TableArray<'a> {
     Tables(&'a mut ArrayOfTables),
     Inline(&'a mut Array),
 }
 
-impl McpServerEntries<'_> {
-    /// The names of the entries that have one.
-    fn names(&self) -> Vec<&str> {
+impl TableArray<'_> {
+    /// Every table in the array.
+    fn tables(&self) -> Vec<&dyn TableLike> {
         match self {
-            Self::Tables(tables) => tables.iter().filter_map(table_name).collect(),
-            Self::Inline(entries) => entries.iter().filter_map(inline_entry_name).collect(),
+            Self::Tables(tables) => tables.iter().map(|table| table as &dyn TableLike).collect(),
+            Self::Inline(entries) => entries
+                .iter()
+                .filter_map(Value::as_inline_table)
+                .map(|table| table as &dyn TableLike)
+                .collect(),
         }
     }
 
-    /// Append `server`, written as a table, or as an inline table in an
-    /// inline array.
-    fn push(&mut self, server: &McpServerConfig) {
-        let table = server_to_table(server);
+    /// The names of the tables that have one.
+    fn names(&self) -> Vec<&str> {
+        self.tables().into_iter().filter_map(table_name).collect()
+    }
+
+    /// Append `table`, as a table, or as an inline table in an inline array.
+    fn push(&mut self, table: Table) {
         match self {
             Self::Tables(tables) => tables.push(table),
             Self::Inline(entries) => push_inline_entry(entries, table.into_inline_table()),
         }
     }
 
-    /// Remove every entry named `name`, and return how many there were.
-    fn remove(&mut self, name: &str) -> usize {
+    /// Remove every table `is_match` accepts, and return how many there were.
+    fn remove_where(&mut self, is_match: impl Fn(&dyn TableLike) -> bool) -> usize {
         match self {
             Self::Tables(tables) => {
                 let before = tables.len();
-                tables.retain(|table| table_name(table) != Some(name));
+                tables.retain(|table| !is_match(table));
                 before - tables.len()
             }
             Self::Inline(entries) => {
                 let mut removed = 0;
                 loop {
-                    let found = entries
-                        .iter()
-                        .position(|entry| inline_entry_name(entry) == Some(name));
+                    let found = entries.iter().position(|entry| {
+                        entry.as_inline_table().is_some_and(|table| is_match(table))
+                    });
                     let Some(index) = found else {
                         return removed;
                     };
@@ -319,23 +346,55 @@ impl McpServerEntries<'_> {
     }
 }
 
-/// Borrow the document's `mcp_servers` entries, creating an empty array of
-/// tables when the key is absent. Errors when the existing value is some
-/// other TOML type instead of silently discarding it.
-fn mcp_servers_mut<'a>(
+/// Borrow the array of tables in `item`, in whichever form it is written.
+/// Errors when the item is some other TOML type instead of silently
+/// discarding it, or an inline array with something else in it. `field`
+/// names the item in the error.
+fn table_array_in<'a>(item: &'a mut Item, path: &Path, field: &str) -> io::Result<TableArray<'a>> {
+    match item {
+        Item::ArrayOfTables(tables) => Ok(TableArray::Tables(tables)),
+        Item::Value(Value::Array(entries)) if entries.iter().all(Value::is_inline_table) => {
+            Ok(TableArray::Inline(entries))
+        }
+        _ => Err(not_an_array_error(path, field)),
+    }
+}
+
+/// Borrow the document's `mcp_servers`, creating an empty array of tables
+/// when the key is absent.
+fn mcp_servers_mut<'a>(document: &'a mut DocumentMut, path: &Path) -> io::Result<TableArray<'a>> {
+    let servers = document
+        .entry("mcp_servers")
+        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+    table_array_in(servers, path, "mcp_servers")
+}
+
+/// Borrow the document's `permissions.rules`, creating the `permissions`
+/// table and/or the `rules` array when either is absent. A new `rules` is
+/// written as the table around it is: a value in an inline or a dotted
+/// table, tables under a `[permissions]` header. Errors when an existing
+/// value along that path is some other TOML type instead of silently
+/// discarding it.
+fn permission_rules_mut<'a>(
     document: &'a mut DocumentMut,
     path: &Path,
-) -> io::Result<McpServerEntries<'a>> {
-    match document
-        .entry("mcp_servers")
-        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()))
-    {
-        Item::ArrayOfTables(tables) => Ok(McpServerEntries::Tables(tables)),
-        Item::Value(Value::Array(entries)) if entries.iter().all(Value::is_inline_table) => {
-            Ok(McpServerEntries::Inline(entries))
+) -> io::Result<TableArray<'a>> {
+    let permissions = document
+        .entry("permissions")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let written_as_values =
+        permissions.is_inline_table() || permissions.as_table().is_some_and(Table::is_dotted);
+    let permissions = permissions
+        .as_table_like_mut()
+        .ok_or_else(|| not_an_array_error(path, "permissions"))?;
+    let rules = permissions.entry("rules").or_insert_with(|| {
+        if written_as_values {
+            Item::Value(Value::Array(Array::new()))
+        } else {
+            Item::ArrayOfTables(ArrayOfTables::new())
         }
-        _ => Err(not_an_array_error(path, "mcp_servers")),
-    }
+    });
+    table_array_in(rules, path, "permissions.rules")
 }
 
 /// The text before `entry` and the text after it: the whitespace and
@@ -403,28 +462,6 @@ fn remove_inline_entry(entries: &mut Array, index: usize) {
     }
 }
 
-/// Borrow the document's `permissions.rules` array of tables, creating the
-/// `permissions` table and/or the `rules` array when either is absent.
-/// Errors when an existing value along that path is some other TOML type
-/// instead of silently discarding it.
-fn permission_rules_array_mut<'a>(
-    document: &'a mut DocumentMut,
-    path: &Path,
-) -> io::Result<&'a mut ArrayOfTables> {
-    let permissions = document
-        .entry("permissions")
-        .or_insert_with(|| Item::Table(Table::new()));
-    let permissions = permissions
-        .as_table_mut()
-        .ok_or_else(|| not_an_array_error(path, "permissions"))?;
-    let rules = permissions
-        .entry("rules")
-        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
-    rules
-        .as_array_of_tables_mut()
-        .ok_or_else(|| not_an_array_error(path, "permissions.rules"))
-}
-
 fn not_an_array_error(path: &Path, field: &str) -> io::Error {
     io::Error::other(format!(
         "{field} in {} is not an array of tables; edit it by hand",
@@ -432,12 +469,8 @@ fn not_an_array_error(path: &Path, field: &str) -> io::Error {
     ))
 }
 
-fn table_name(table: &Table) -> Option<&str> {
+fn table_name(table: &dyn TableLike) -> Option<&str> {
     table.get("name").and_then(Item::as_str)
-}
-
-fn inline_entry_name(entry: &Value) -> Option<&str> {
-    entry.as_inline_table()?.get("name")?.as_str()
 }
 
 fn server_to_table(server: &McpServerConfig) -> Table {
@@ -501,6 +534,8 @@ fn transport_str(transport: &McpTransportKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval_rules::PermissionRule;
+    use crate::approval_types::Decision;
 
     #[test]
     fn validate_mcp_server_name_accepts_letters_digits_dash_and_underscore() {
@@ -899,6 +934,297 @@ mod tests {
                 "{content}: {error}"
             );
             assert!(remove_user_mcp_server_in(dir.path(), "docs").is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        }
+    }
+
+    /// Everything `orca mcp list` and `get` show is read the way the runtime
+    /// loads the file, so a server reads back the same however its entry is
+    /// written.
+    #[test]
+    fn mcp_servers_are_read_however_they_are_written() {
+        const CAPABILITIES: [&str; 6] = [
+            "read = true",
+            "write = true",
+            "metadata_write = false",
+            "network = false",
+            "shell = false",
+            "agent = false",
+        ];
+        let table_head = concat!(
+            "[[mcp_servers]]\n",
+            "name = \"docs\"\n",
+            "command = \"npx\"\n",
+            "args = [\"-y\", \"docs-mcp\"]\n",
+            "enabled_tools = [\"search\"]\n",
+        );
+        let forms = [
+            // Sub-tables of the entry.
+            format!(
+                "{table_head}\n[mcp_servers.env]\nAPI_KEY = \"k\"\n\n[mcp_servers.headers]\nX-Team = \"a\"\n\n[mcp_servers.capabilities]\n{}\n",
+                CAPABILITIES.join("\n")
+            ),
+            // Dotted keys.
+            format!(
+                "{table_head}env.API_KEY = \"k\"\nheaders.X-Team = \"a\"\n{}\n",
+                CAPABILITIES
+                    .map(|line| format!("capabilities.{line}"))
+                    .join("\n")
+            ),
+            // Inline tables.
+            format!(
+                "{table_head}env = {{ API_KEY = \"k\" }}\nheaders = {{ X-Team = \"a\" }}\ncapabilities = {{ {} }}\n",
+                CAPABILITIES.join(", ")
+            ),
+            // An inline array, with inline tables.
+            format!(
+                "mcp_servers = [{{ name = \"docs\", command = \"npx\", args = [\"-y\", \"docs-mcp\"], enabled_tools = [\"search\"], env = {{ API_KEY = \"k\" }}, headers = {{ X-Team = \"a\" }}, capabilities = {{ {} }} }}]\n",
+                CAPABILITIES.join(", ")
+            ),
+            // An inline array, with dotted keys.
+            format!(
+                "mcp_servers = [{{ name = \"docs\", command = \"npx\", args = [\"-y\", \"docs-mcp\"], enabled_tools = [\"search\"], env.API_KEY = \"k\", headers.X-Team = \"a\", {} }}]\n",
+                CAPABILITIES
+                    .map(|line| format!("capabilities.{line}"))
+                    .join(", ")
+            ),
+        ];
+        for form in forms {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(USER_CONFIG_FILE), &form).unwrap();
+
+            let (_, servers) = list_user_mcp_servers_in(dir.path()).unwrap();
+
+            assert_eq!(servers.len(), 1, "{form}");
+            let docs = &servers[0];
+            assert_eq!(docs.name, "docs", "{form}");
+            assert_eq!(docs.command.as_deref(), Some("npx"), "{form}");
+            assert_eq!(docs.args, ["-y", "docs-mcp"], "{form}");
+            assert_eq!(
+                docs.enabled_tools,
+                Some(vec!["search".to_string()]),
+                "{form}"
+            );
+            assert_eq!(docs.env.len(), 1, "{form}");
+            assert_eq!(docs.env["API_KEY"], "k", "{form}");
+            assert_eq!(docs.headers.len(), 1, "{form}");
+            assert_eq!(docs.headers["X-Team"], "a", "{form}");
+            assert!(docs.capabilities.write, "{form}");
+        }
+    }
+
+    #[test]
+    fn listing_servers_never_writes_and_reports_a_config_that_cannot_be_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(USER_CONFIG_FILE);
+
+        // No file is no servers, and no file is made.
+        let (listed_path, servers) = list_user_mcp_servers_in(dir.path()).unwrap();
+        assert_eq!(listed_path, path);
+        assert!(servers.is_empty());
+        assert!(!path.exists());
+        assert!(!user_config_lock_path_in(dir.path()).exists());
+
+        std::fs::write(&path, "model = [\n").unwrap();
+        let error = list_user_mcp_servers_in(dir.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("existing config cannot be parsed"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "model = [\n");
+    }
+
+    #[test]
+    fn an_mcp_server_entry_that_does_not_load_is_reported() {
+        for (content, reported) in [
+            ("[[mcp_servers]]\ncommand = \"x\"\n", "missing field `name`"),
+            (
+                "mcp_servers = [{ name = \"a\", args = \"-y\" }]\n",
+                "invalid MCP server entry",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(USER_CONFIG_FILE), content).unwrap();
+
+            let error = list_user_mcp_servers_in(dir.path()).unwrap_err();
+
+            assert!(
+                error.to_string().contains("invalid MCP server entry"),
+                "{error}"
+            );
+            assert!(error.to_string().contains(reported), "{error}");
+        }
+    }
+
+    #[test]
+    fn removing_and_adding_an_mcp_server_keep_the_sub_tables_of_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(USER_CONFIG_FILE);
+        std::fs::write(
+            &path,
+            concat!(
+                "[[mcp_servers]]\n",
+                "name = \"a\"\n",
+                "command = \"x\"\n",
+                "\n",
+                "[mcp_servers.env]\n",
+                "A_KEY = \"1\"\n",
+                "\n",
+                "[[mcp_servers]]\n",
+                "name = \"c\"\n",
+                "command = \"z\"\n",
+                "\n",
+                "[mcp_servers.env]\n",
+                "C_KEY = \"3\"\n",
+            ),
+        )
+        .unwrap();
+
+        // The sub-table goes with its entry.
+        remove_user_mcp_server_in(dir.path(), "a").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("A_KEY"), "{content}");
+        let (_, servers) = list_user_mcp_servers_in(dir.path()).unwrap();
+        assert_eq!(servers.len(), 1, "{content}");
+        assert_eq!(servers[0].env["C_KEY"], "3", "{content}");
+
+        // A new entry follows the sub-tables of the last, and does not
+        // take them.
+        add_user_mcp_server_in(dir.path(), &stdio_server("b", "y")).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let (_, servers) = list_user_mcp_servers_in(dir.path()).unwrap();
+        assert_eq!(listed_names(dir.path()), ["c", "b"], "{content}");
+        assert_eq!(servers[0].env["C_KEY"], "3", "{content}");
+        assert!(servers[1].env.is_empty(), "{content}");
+    }
+
+    /// The rule saved by `add_user_allow_rule_in`, written as a table.
+    const SAVED_RULE: &str = "{ tool = \"mcp__github__create_issue\", decision = \"allow\" }";
+
+    #[test]
+    fn an_allow_rule_is_saved_into_an_inline_rules_array() {
+        const BASH: &str = "{ tool = \"bash\", pattern = \"cargo *\", decision = \"allow\" }";
+        // What the file holds, and what it holds once the rule is saved.
+        let cases = [
+            (
+                format!("permissions = {{ rules = [{BASH}] }}\n"),
+                format!("permissions = {{ rules = [{BASH}, {SAVED_RULE}] }}\n"),
+            ),
+            (
+                format!("[permissions]\nrules = [{BASH}]\n"),
+                format!("[permissions]\nrules = [{BASH}, {SAVED_RULE}]\n"),
+            ),
+            (
+                format!("permissions.rules = [{BASH}]\n"),
+                format!("permissions.rules = [{BASH}, {SAVED_RULE}]\n"),
+            ),
+            // One rule to a line.
+            (
+                format!("[permissions]\nrules = [\n  {BASH},\n]\n"),
+                format!("[permissions]\nrules = [\n  {BASH},\n  {SAVED_RULE},\n]\n"),
+            ),
+            // No rule yet, in a table written inline or with dotted keys.
+            (
+                "permissions = {}\n".to_string(),
+                format!("permissions = {{ rules = [{SAVED_RULE}] }}\n"),
+            ),
+            (
+                "permissions.rules = []\n".to_string(),
+                format!("permissions.rules = [{SAVED_RULE}]\n"),
+            ),
+        ];
+        for (before, after) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(USER_CONFIG_FILE);
+            std::fs::write(&path, &before).unwrap();
+
+            assert!(
+                add_user_allow_rule_in(dir.path(), "mcp__github__create_issue").unwrap(),
+                "{before}"
+            );
+
+            let saved = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(saved, after);
+            // Once saved, the rule is in the file the runtime loads.
+            let config: crate::config::file::FileConfig = toml::from_str(&saved).unwrap();
+            assert!(
+                config
+                    .permissions
+                    .rules
+                    .contains(&PermissionRule::whole_tool(
+                        "mcp__github__create_issue",
+                        Decision::Allow
+                    )),
+                "{saved}"
+            );
+            // And saving it again changes nothing.
+            assert!(!add_user_allow_rule_in(dir.path(), "mcp__github__create_issue").unwrap());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        }
+    }
+
+    #[test]
+    fn an_inline_rule_counts_as_an_allow_rule_already_saved() {
+        // (the rule in the file, the tool to save, whether the file changes)
+        let cases = [
+            (
+                "{ tool = \"mcp__docs__search\", pattern = \"*\", decision = \"allow\" }",
+                "mcp__docs__search",
+                false,
+            ),
+            (
+                "{ tool = \"mcp__My-Docs__*\", decision = \"allow\" }",
+                "mcp__my_docs__*",
+                false,
+            ),
+            (
+                "{ tool = \"write_file\", pattern = \"*\", decision = \"allow\" }",
+                "write_file",
+                true,
+            ),
+            (
+                "{ tool = \"mcp__docs__search\", decision = \"deny\" }",
+                "mcp__docs__search",
+                true,
+            ),
+        ];
+        for (rule, tool, saved) in cases {
+            for layout in [
+                format!("permissions = {{ rules = [{rule}] }}\n"),
+                format!("[permissions]\nrules = [{rule}]\n"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join(USER_CONFIG_FILE), &layout).unwrap();
+
+                assert_eq!(
+                    add_user_allow_rule_in(dir.path(), tool).unwrap(),
+                    saved,
+                    "{layout}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_allow_rule_is_not_saved_into_a_value_that_is_not_a_list_of_tables() {
+        for content in [
+            "permissions = \"allow\"\n",
+            "[permissions]\nrules = \"bash\"\n",
+            "permissions = { rules = [\"bash\"] }\n",
+            "[permissions.rules]\ntool = \"bash\"\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(USER_CONFIG_FILE);
+            std::fs::write(&path, content).unwrap();
+
+            let error = add_user_allow_rule_in(dir.path(), "bash").unwrap_err();
+
+            assert!(
+                error.to_string().contains("is not an array of tables"),
+                "{content}: {error}"
+            );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
         }
     }
