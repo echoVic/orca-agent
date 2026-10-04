@@ -1458,6 +1458,8 @@ for (const [label, functionName, item] of [
   ["credential function items cannot evade detection", "synthetic_credential_function_item", "crate::save_api_key"],
   ["Goal helper function items cannot evade detection", "synthetic_goal_helper_function_item", "crate::update_goal_status_for_session"],
   ["catalog function items cannot evade detection", "synthetic_catalog_function_item", "orca_mcp::initialize_registry"],
+  ["MCP reconnect function items cannot evade detection", "synthetic_mcp_reconnect_function_item", "orca_mcp::McpRegistry::reconnect_server"],
+  ["MCP prompt function items cannot evade detection", "synthetic_mcp_prompt_function_item", "McpRegistry::get_prompt"],
 ]) {
   expectUnlistedRuntimeMutation(label, functionName, `let authority = ${item};`);
 }
@@ -2827,6 +2829,8 @@ for (const [family, functionName, body] of [
   ["background approval mutation", "synthetic_background_approval", "submit_background_approval_response_for_tui(registry, id, approved, event_tx);"],
   ["session transition", "synthetic_session_transition", "resume_selected_session(state, config, shared, preloaded, clear);"],
   ["catalog mutation", "synthetic_catalog_mutation", "mention_search.install_registry(registry);"],
+  ["MCP server reconnect", "synthetic_mcp_reconnect", "registry.reconnect_server(server);"],
+  ["MCP prompt expansion", "synthetic_mcp_prompt", "registry.get_prompt(server, prompt, &arguments);"],
   ["input history mutation", "synthetic_input_history", "state.record_prompt(prompt);"],
   ["approval allowlist mutation", "synthetic_allowlist_mutation", "state.approval_allowlist.insert(key);"],
 ]) {

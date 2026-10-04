@@ -949,9 +949,18 @@ const TUI_RUNTIME_MUTATION_APIS = new Map([
     [/\bsubmit_background_approval_response_for_tui\s*\(/g],
   ],
   ["session.resume", [/\bresume_selected_session\s*\(/g]],
+  // The MCP servers: creating or installing a registry, and acting on one
+  // directly. A reconnect republishes a server, and a prompts/get can mark it
+  // as needing a login or ready again, so both change the catalog; once a
+  // thread has the servers, the TUI must go through its typed surface.
   [
     "catalog.mutate",
-    [/\.\s*install_registry\s*\(/g, /(?<!:)\binitialize_registry\s*\(/g],
+    [
+      /\.\s*install_registry\s*\(/g,
+      /(?<!:)\binitialize_registry\s*\(/g,
+      /\.\s*reconnect_server\s*\(/g,
+      /\.\s*get_prompt\s*\(/g,
+    ],
   ],
   ["input_history.record", [/\.\s*record_prompt\s*\(/g]],
 ]);
@@ -1085,6 +1094,8 @@ function tuiRuntimeAssociatedMethods() {
   );
   addUnqualified("resume_selected_session", "session.resume");
   addUnqualified("initialize_registry", "catalog.mutate");
+  addUnqualified("reconnect_server", "catalog.mutate");
+  addUnqualified("get_prompt", "catalog.mutate");
   methods.set("send", []);
   return methods;
 }
@@ -1138,8 +1149,12 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ],
   ["crates/orca-tui/src/hosted_session_lifecycle.rs:reap_hosted_thread:thread.shutdown", 2],
   // The MCP servers of a conversation not started yet: the TUI connects them
-  // at launch, and the first thread to start takes the registry over.
+  // at launch, and the first thread to start takes the registry over. Until
+  // then `/mcp` reconnects them, and a prompt command expands their prompts,
+  // on that registry; after, both go through the thread.
   ["crates/orca-tui/src/prestart_mcp.rs:start_prestart_mcp:catalog.mutate", 1],
+  ["crates/orca-tui/src/mcp_server_actions.rs:reconnect_prestarted:catalog.mutate", 1],
+  ["crates/orca-tui/src/mcp_prompt_actions.rs:expand_prompt_on:catalog.mutate", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:user_action.route", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:host.shutdown", 1],
   ["crates/orca-tui/src/background_tasks.rs:handle_hosted_task_action:task.mutate", 5],
