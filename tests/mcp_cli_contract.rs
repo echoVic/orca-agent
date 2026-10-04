@@ -15,8 +15,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,9 @@ const ORCA_TIMEOUT: Duration = Duration::from_secs(30);
 /// connection: bounds `read_http_request` so a client that stops mid-request
 /// cannot block a fixture thread forever.
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The `Mcp-Session-Id` the HTTP fixture hands out on `initialize`.
+const FIXTURE_SESSION_ID: &str = "fixture-session";
 
 /// The text both fixture MCP servers return from every `tools/call`,
 /// regardless of which tool or arguments came in, so a test can prove the
@@ -238,6 +241,33 @@ fn a_remote_http_server_added_by_url_works() {
         exec.stdout_text()
     );
     assert_eq!(events.last().unwrap()["payload"]["status"], "success");
+
+    // `initialize` starts the session without an ID, and every request
+    // after it carries the one the server handed out, the tool call
+    // included.
+    let requests = server.requests();
+    let initialize = requests
+        .iter()
+        .position(|request| request.rpc_method.as_deref() == Some("initialize"))
+        .unwrap_or_else(|| panic!("no initialize: {requests:#?}"));
+    assert_eq!(requests[initialize].session, None, "{requests:#?}");
+    let in_session = &requests[initialize + 1..];
+    let methods = in_session
+        .iter()
+        .filter_map(|request| request.rpc_method.as_deref())
+        .collect::<Vec<_>>();
+    for method in ["notifications/initialized", "tools/list", "tools/call"] {
+        assert!(methods.contains(&method), "no {method}: {requests:#?}");
+    }
+    for request in in_session {
+        assert_eq!(
+            request.session.as_deref(),
+            Some(FIXTURE_SESSION_ID),
+            "{} {:?} in {requests:#?}",
+            request.method,
+            request.rpc_method
+        );
+    }
 }
 
 #[test]
@@ -505,11 +535,23 @@ impl HttpRequest {
     }
 }
 
+/// What the fixture keeps of each request it reads, in the order they
+/// arrive: the HTTP method, the JSON-RPC method (none for `DELETE`), and
+/// the `Mcp-Session-Id` it carried.
+#[derive(Clone, Debug)]
+struct SeenRequest {
+    method: String,
+    rpc_method: Option<String>,
+    session: Option<String>,
+}
+
 /// A hand-rolled streamable HTTP MCP server, following the client in
 /// `crates/orca-mcp/src/transport.rs` (`StreamableHttpTransport`): it checks
 /// `Accept`, hands out a session ID on `initialize`, answers a notification
 /// with 202, accepts the closing `DELETE`, and answers everything with a
 /// plain `application/json` body. It advertises one read-only tool, `fetch`.
+/// It keeps every request it reads, before it answers it, so a test can
+/// check what the client sent.
 ///
 /// The client may open more than one connection — its blocking client for
 /// `initialize`/`list_tools`, then a fresh async client for `tools/call` —
@@ -533,6 +575,7 @@ impl HttpRequest {
 struct HttpMcpFixture {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
+    requests: Arc<Mutex<Vec<SeenRequest>>>,
 }
 
 impl HttpMcpFixture {
@@ -543,12 +586,15 @@ impl HttpMcpFixture {
             .expect("set MCP HTTP fixture nonblocking");
         let addr = listener.local_addr().expect("MCP HTTP fixture address");
         let stop = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let worker_stop = Arc::clone(&stop);
+        let worker_requests = Arc::clone(&requests);
         thread::spawn(move || {
             while !worker_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        thread::spawn(move || serve_one_mcp_http_request(stream));
+                        let requests = Arc::clone(&worker_requests);
+                        thread::spawn(move || serve_one_mcp_http_request(stream, &requests));
                     }
                     // `stop` is the only intended way to end this loop: an
                     // `accept()` failure — `WouldBlock` from the
@@ -562,12 +608,24 @@ impl HttpMcpFixture {
                 }
             }
         });
-        Self { addr, stop }
+        Self {
+            addr,
+            stop,
+            requests,
+        }
     }
 
     /// The MCP endpoint url `orca mcp add --url` should point at.
     fn url(&self) -> String {
         format!("http://{}/mcp", self.addr)
+    }
+
+    /// Every request read so far, in the order they arrived.
+    fn requests(&self) -> Vec<SeenRequest> {
+        self.requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -581,7 +639,7 @@ impl Drop for HttpMcpFixture {
     }
 }
 
-fn serve_one_mcp_http_request(mut stream: TcpStream) {
+fn serve_one_mcp_http_request(mut stream: TcpStream, requests: &Mutex<Vec<SeenRequest>>) {
     // Un-inherit the listener's non-blocking mode before reading — see
     // `HttpMcpFixture`'s doc comment for why this is load-bearing.
     if stream.set_nonblocking(false).is_err() {
@@ -591,6 +649,16 @@ fn serve_one_mcp_http_request(mut stream: TcpStream) {
     let Some(request) = read_http_request(&mut stream) else {
         return;
     };
+    // Kept before the answer: the client sends its next request only once
+    // it has this one's, so the order kept is the order sent.
+    requests
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(SeenRequest {
+            method: request.method.clone(),
+            rpc_method: request.rpc_method().map(str::to_string),
+            session: request.header("mcp-session-id").map(str::to_string),
+        });
 
     if request.method == "DELETE" {
         return write_status_only(&mut stream, 200);
@@ -613,7 +681,7 @@ fn serve_one_mcp_http_request(mut stream: TcpStream) {
                     "serverInfo": {"name": "web", "version": "1"}
                 }
             });
-            write_json_response(&mut stream, Some("fixture-session"), &result);
+            write_json_response(&mut stream, Some(FIXTURE_SESSION_ID), &result);
         }
         Some("notifications/initialized") => write_status_only(&mut stream, 202),
         Some("tools/list") => {

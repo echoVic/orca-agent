@@ -94,12 +94,14 @@ OAuth token 保存在 `$ORCA_HOME/mcp-credentials.json`，与 `config.toml` 同�
 （`oauth: logged in`、`oauth: not logged in`、`bearer: $VAR`、`static header`，
 stdio 服务器则是 `-`），但绝不显示 token 本身。
 
-会话进行中，保存的登录失效且刷新不了时，工具调用会报下面的错，这一轮结束后
-`/mcp` 会把该服务器显示为 `needs login`：
+会话进行中，保存的登录失效且刷新不了时，工具调用会报下面的错：
 
 ~~~text
 MCP server requires login: run 'orca mcp login <name>', or log in from /mcp
 ~~~
+
+`/mcp` 随即把该服务器显示为 `needs login`：服务器的状态一有变化，`/mcp` 里就立即
+更新，一轮还在运行时也是如此。
 
 `login` 和 `logout` 只改动配置或凭据存储，不会影响已经在运行的会话。已经打开的
 TUI 会话可以在 `/mcp` 面板里重新连接该服务器，从而应用这次改动。

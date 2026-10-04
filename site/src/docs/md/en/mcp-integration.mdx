@@ -109,12 +109,14 @@ moving a server to a new url invalidates the login saved under the old one.
 or `-` for a stdio server) without ever printing the token itself.
 
 When a saved login stops working during a session and cannot be refreshed,
-the tool call fails with this error, and `/mcp` shows the server as
-`needs login` once that turn ends:
+the tool call fails with this error:
 
 ~~~text
 MCP server requires login: run 'orca mcp login <name>', or log in from /mcp
 ~~~
+
+`/mcp` then shows the server as `needs login` right away: a server's status
+there updates as soon as it changes, while a turn runs too.
 
 `login` and `logout` only change configuration or the credential store; they
 never touch a session that is already running. A running TUI session picks
