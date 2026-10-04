@@ -117,10 +117,14 @@ pub fn login(server: &McpServerConfig, options: McpLoginOptions) -> Result<(), S
         .map_err(|error| format!("MCP server '{name}' has an invalid url: {error}"))?;
     let client = http_client(server, true)?;
 
+    // Each step before the browser opens waits on a server, or takes a
+    // port; a cancel that came in meanwhile stops the login before the next.
     let metadata_url = discover(&client, server, &resource)?;
+    stop_if_cancelled(&options.cancel, name)?;
     let protected: ProtectedResource = get_json(&client, &metadata_url).map_err(|why| {
         format!("failed to read the protected resource metadata of MCP server '{name}' from {metadata_url}: {why}")
     })?;
+    stop_if_cancelled(&options.cancel, name)?;
     // The metadata must be for this server (RFC 9728 §3.3), so that a
     // server cannot have Orca log in to another resource for it.
     match protected.resource.as_deref() {
@@ -149,6 +153,7 @@ pub fn login(server: &McpServerConfig, options: McpLoginOptions) -> Result<(), S
         )
     })?;
     let endpoints = authorization_server(&client, server, issuer, &issuer_url)?;
+    stop_if_cancelled(&options.cancel, name)?;
     if endpoints
         .code_challenge_methods_supported
         .as_ref()
@@ -166,6 +171,7 @@ pub fn login(server: &McpServerConfig, options: McpLoginOptions) -> Result<(), S
     oauth_url(&endpoints.token_endpoint).ok_or_else(|| insecure("token endpoint"))?;
 
     let callback = Callback::listen(server)?;
+    stop_if_cancelled(&options.cancel, name)?;
     let redirect_uri = callback.redirect_uri.clone();
     let client_id = match &server.oauth_client_id {
         Some(client_id) => client_id.clone(),
@@ -833,11 +839,14 @@ fn answer_callback(
     remaining: Duration,
     cancel: &AtomicBool,
 ) -> Option<Result<String, String>> {
-    // An accepted socket may inherit the listener's nonblocking mode.
-    stream.set_nonblocking(false).ok()?;
+    // An accepted socket may or may not inherit the listener's nonblocking
+    // mode. It is read without blocking (see `read_request_line`), and
+    // answered blocking, which its write timeout bounds.
+    stream.set_nonblocking(true).ok()?;
     stream.set_write_timeout(Some(CALLBACK_READ_TIMEOUT)).ok()?;
     let read_by = Instant::now() + remaining.clamp(Duration::from_millis(1), CALLBACK_READ_TIMEOUT);
     let (method, target) = read_request_line(&mut stream, read_by, cancel)?;
+    stream.set_nonblocking(false).ok()?;
     let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
     if method != "GET" || path != "/callback" {
         respond(&mut stream, "404 Not Found", "Not found.");
@@ -894,10 +903,13 @@ fn callback_code(name: &str, params: &HashMap<String, String>) -> Result<String,
         })
 }
 
-/// Reads a request's head, and returns its method and target: `None` when
-/// the head is not whole by `deadline`, or once `cancel` is set. It reads a
-/// little at a time, so that a connection that sends nothing does not keep
-/// a cancelled login waiting.
+/// Reads a request's head from `stream`, which does not block, and returns
+/// its method and target: `None` when the head is not whole by `deadline`,
+/// or once `cancel` is set. While nothing more has come it sleeps a poll and
+/// looks again, as the accept loop does, so a connection that sends nothing
+/// keeps a cancelled login waiting a poll at most. A read that waited with a
+/// timeout instead would do as much, but Windows leaves a socket whose
+/// receive timed out in an indeterminate state, not to be read again.
 fn read_request_line(
     stream: &mut TcpStream,
     deadline: Instant,
@@ -913,20 +925,14 @@ fn read_request_line(
         {
             return None;
         }
-        stream
-            .set_read_timeout(Some(left.min(CALLBACK_POLL)))
-            .ok()?;
         match stream.read(&mut chunk) {
             Ok(0) => return None,
             Ok(read) => head.extend_from_slice(&chunk[..read]),
             // Nothing more yet.
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(CALLBACK_POLL.min(left));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return None,
         }
     }
@@ -1167,6 +1173,71 @@ mod tests {
         (Box::new(browser), pages)
     }
 
+    /// A browser that goes to the authorization url, then sends the request
+    /// of the callback it is sent back to itself, in two pieces, a few of
+    /// the callback's polls apart, as a slow connection might. It hands back
+    /// the page it gets.
+    fn browser_with_a_slow_callback() -> (OpenBrowser, std::sync::mpsc::Receiver<String>) {
+        let (page_sender, page) = std::sync::mpsc::channel();
+        let browser = move |url: &str| {
+            let url = url.to_string();
+            std::thread::spawn(move || {
+                let Ok(client) = Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(FIXTURE_WAIT)
+                    .build()
+                else {
+                    return;
+                };
+                let Some(callback) = client.get(&url).send().ok().and_then(|response| {
+                    let location = response.headers().get(reqwest::header::LOCATION)?;
+                    url::Url::parse(location.to_str().ok()?).ok()
+                }) else {
+                    return;
+                };
+                let Ok(mut stream) =
+                    TcpStream::connect(("127.0.0.1", callback.port().unwrap_or_default()))
+                else {
+                    return;
+                };
+                let _ = stream.set_read_timeout(Some(FIXTURE_WAIT));
+                let request = format!(
+                    "GET {}?{} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                    callback.path(),
+                    callback.query().unwrap_or_default()
+                );
+                let (first, rest) = request.split_at(request.len() / 2);
+                let _ = stream.write_all(first.as_bytes());
+                std::thread::sleep(CALLBACK_POLL * 5);
+                let _ = stream.write_all(rest.as_bytes());
+                let mut text = String::new();
+                let _ = stream.read_to_string(&mut text);
+                let _ = page_sender.send(text);
+            });
+            Ok(())
+        };
+        (Box::new(browser), page)
+    }
+
+    #[test]
+    fn a_callback_that_arrives_in_pieces_is_read_whole() {
+        let server = OAuthTestServer::start(OAuthTestBehavior::default());
+        let home = tempfile::tempdir().expect("temp dir");
+        let credentials = home.path().join("mcp-credentials.json");
+        let (browser, page) = browser_with_a_slow_callback();
+
+        login(&server.config("docs"), options(&credentials, browser)).expect("log in");
+
+        let page = page.recv_timeout(FIXTURE_WAIT).expect("the callback page");
+        assert!(page.starts_with("HTTP/1.1 200 OK"), "{page}");
+        assert!(page.contains("Login complete."), "{page}");
+        assert!(
+            load_mcp_credential(&credentials, "docs", &server.mcp_url())
+                .expect("read the credentials")
+                .is_some()
+        );
+    }
+
     #[test]
     fn a_callback_with_another_state_is_turned_away_and_the_login_waits_on() {
         let server = OAuthTestServer::start(OAuthTestBehavior {
@@ -1340,6 +1411,55 @@ mod tests {
             Err("login to MCP server 'docs' cancelled".to_string())
         );
         assert!(server.requests().is_empty(), "{:?}", server.trail());
+    }
+
+    /// A cancel that comes while the login looks the server up stops it once
+    /// the step under way ends, before the next one starts: nothing more is
+    /// asked of the servers, no port is taken, and no browser opens.
+    #[test]
+    fn a_login_cancelled_while_it_looks_the_server_up_stops_after_that_step() {
+        let trail = [
+            "POST /mcp",
+            "GET /.well-known/oauth-protected-resource/mcp",
+            "GET /.well-known/oauth-authorization-server/tenant",
+            "POST /register",
+        ];
+        // (the step the cancel comes in, as the path of its request; how
+        // many requests the login makes; whether it would listen next)
+        for (path, made, listens_next) in [
+            ("/mcp", 1, false),
+            ("/.well-known/oauth-protected-resource/mcp", 2, false),
+            ("/.well-known/oauth-authorization-server/tenant", 3, true),
+            ("/register", 4, false),
+        ] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let server = OAuthTestServer::start(OAuthTestBehavior {
+                cancel_on: Some((path.to_string(), Arc::clone(&cancel))),
+                ..Default::default()
+            });
+            let home = tempfile::tempdir().expect("temp dir");
+            // The callback's port is taken, so a login that went on to
+            // listen there would fail for that instead.
+            let taken = TcpListener::bind("127.0.0.1:0").expect("take a port");
+            let mut config = server.config("docs");
+            if listens_next {
+                config.oauth_callback_port = Some(taken.local_addr().expect("port").port());
+            }
+            let browser: OpenBrowser = Box::new(|_: &str| -> io::Result<()> {
+                panic!("a cancelled login opened the browser")
+            });
+            let options = McpLoginOptions {
+                cancel,
+                ..options(&home.path().join("mcp-credentials.json"), browser)
+            };
+
+            assert_eq!(
+                login(&config, options),
+                Err("login to MCP server 'docs' cancelled".to_string()),
+                "{path}"
+            );
+            assert_eq!(server.trail(), trail[..made], "{path}");
+        }
     }
 
     #[test]

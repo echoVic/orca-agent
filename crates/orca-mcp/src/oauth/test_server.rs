@@ -60,6 +60,9 @@ pub struct OAuthTestBehavior {
     /// `/mcp` declares prompts, listing `review`, and resources, besides
     /// its tool.
     pub offers_prompts_and_resources: bool,
+    /// Sets the flag when a request to the path comes in, before it is
+    /// answered: as a user who cancels a login while that step runs.
+    pub cancel_on: Option<(String, Arc<AtomicBool>)>,
 }
 
 /// Holds requests until released, so that a test can act while one is in
@@ -306,6 +309,11 @@ fn serve(mut stream: TcpStream, state: &ServerState, base: &str) {
         return;
     };
     lock(&state.requests).push(request.clone());
+    if let Some((path, cancel)) = &state.behavior.cancel_on
+        && request.path == *path
+    {
+        cancel.store(true, Ordering::SeqCst);
+    }
     let response = route(state, &request, base);
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
