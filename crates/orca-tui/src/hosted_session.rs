@@ -428,6 +428,10 @@ pub(crate) fn announce_runtime_ready(
     control: &TuiSurfaceTaskControl,
 ) {
     let watcher_stop = control.bind_prompt_queue_runtime(thread.clone(), event_tx);
+    // `/mcp` acts on the thread's servers from now on, so the MCP servers
+    // that started with the TUI, should the thread have taken them, are its
+    // own: no moment comes between when neither has them.
+    control.hand_over_prestart_mcp(thread);
     thread.set_prompt_queue_interaction_handlers(PromptQueueInteractionHandlers {
         approval: Some(Arc::new(QueueApprovalHandler {
             control: control.clone(),

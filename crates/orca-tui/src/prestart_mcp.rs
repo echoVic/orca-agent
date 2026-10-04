@@ -124,10 +124,10 @@ pub(crate) enum McpServers {
 
 /// `request`, with the MCP servers that started with the TUI while no
 /// thread has taken them yet. They are only lent: once the thread has
-/// started, and is the conversation's, the caller hands them over with
-/// [`TuiSurfaceTaskControl::hand_over_prestart_mcp`]. Until then, a start
-/// that fails, or a thread shut down before then, leaves them running for
-/// the next.
+/// started, and is announced as the conversation's, they are handed over
+/// with [`TuiSurfaceTaskControl::hand_over_prestart_mcp`]. Until then, a
+/// start that fails, or a thread shut down before then, leaves them running
+/// for the next.
 pub(crate) fn offer_prestarted_mcp(
     request: RuntimeThreadStartRequest,
     control: &TuiSurfaceTaskControl,
@@ -616,6 +616,55 @@ mod tests {
             tui.quit();
 
             assert_eq!(launches(fixture.path()), Vec::<String>::new());
+        }
+
+        #[test]
+        fn the_servers_change_hands_once_the_thread_is_the_conversation_s() {
+            let home = crate::test_support::isolate_orca_home();
+            let fixture = tempfile::tempdir().unwrap();
+            let config = config(home.path(), vec![mcp_server("docs", fixture.path(), 0)]);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let control = TuiSurfaceTaskControl::new();
+            let (event_tx, _events) = crossbeam_channel::unbounded();
+            let prestarted = start_prestart_mcp(&config.mcp_servers, None, event_tx.clone())
+                .expect("an enabled server starts with the TUI");
+            let registry = prestarted.registry().clone();
+            control.set_prestart_mcp(prestarted);
+            let is_prestarted = |servers: Option<McpServers>| matches!(servers, Some(McpServers::Prestarted(servers)) if servers.is_same(&registry));
+
+            let mut thread = None;
+            crate::hosted_session_lifecycle::ensure_hosted_thread(
+                &mut thread,
+                &host.handle(),
+                &config,
+                &Arc::new(Mutex::new(None)),
+                "hello",
+                &event_tx,
+                &control,
+            )
+            .expect("start the thread");
+            let started = thread.as_ref().expect("the thread");
+
+            // Started, with the servers lent to it, but not yet the
+            // conversation's: `/mcp` still acts on them through the TUI.
+            assert!(started.mcp_registry().is_same(&registry));
+            assert!(is_prestarted(control.mcp_servers()));
+
+            crate::hosted_session::announce_runtime_ready(started, &event_tx, &control);
+
+            // Now through the thread, which has them for good.
+            assert!(control.prestart_mcp_registry().is_none());
+            assert!(matches!(
+                control.mcp_servers(),
+                Some(McpServers::Thread(bound)) if bound.mcp_registry().is_same(&registry)
+            ));
+            let pids = wait_for_launches(fixture.path(), 1);
+            control.shutdown();
+            control.release_runtime_thread();
+            drop(thread);
+            host.shutdown().expect("shut the runtime host down");
+            // The thread took them over, so its end stopped them.
+            wait_until_gone(&pids, Duration::from_secs(1));
         }
 
         #[test]
