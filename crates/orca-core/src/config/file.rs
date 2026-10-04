@@ -412,11 +412,33 @@ fn file_config_from_value(value: Value) -> Result<FileConfig, String> {
         .map_err(|error| super::error_text::data_error_text(&error))
 }
 
+/// The config file at `path` as a TOML value, if it is one. A file that is
+/// not TOML is left out, with a warning.
 fn load_toml_value(path: &Path) -> Option<Value> {
-    let content = fs::read_to_string(path).ok()?;
-    let mut value = toml::from_str(&content).ok()?;
+    read_toml_value(path).unwrap_or_else(|warning| {
+        eprintln!("orca: warning: {warning}");
+        None
+    })
+}
+
+/// The config file at `path` as a TOML value: `None` when it cannot be
+/// read, and a warning when it is not TOML, which says where it is wrong
+/// and never quotes it. The warning is printed when Orca starts, so it
+/// lands in logs and bug reports, and the line the parser stopped at can
+/// be a secret.
+fn read_toml_value(path: &Path) -> Result<Option<Value>, String> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let mut value = toml::from_str(&content).map_err(|error| {
+        format!(
+            "config parse error in {}, ignoring it: {}",
+            path.display(),
+            super::error_text::syntax_error_text(error.message(), error.span(), &content)
+        )
+    })?;
     fold_legacy_workflow_settings_into_value(&mut value);
-    Some(value)
+    Ok(Some(value))
 }
 
 fn merge_toml_values(base: &mut Value, overlay: Value) {
@@ -1925,6 +1947,29 @@ workflowKeywordTriggerEnabled = true
             assert_eq!(error, reported, "{config}");
             assert!(!error.contains(value), "{config}: {error}");
         }
+    }
+
+    /// A config file that is not TOML is left out with a warning that says
+    /// where it is wrong, by line and column, and never quotes it: the line
+    /// the parser stopped at can be a secret.
+    #[test]
+    fn a_config_with_a_syntax_error_is_reported_by_line_and_never_quoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(USER_CONFIG_FILE);
+        fs::write(&path, "model = \"m\"\napi_key = \"abc-SECRET\n").unwrap();
+
+        let warning = read_toml_value(&path).unwrap_err();
+
+        assert_eq!(
+            warning,
+            format!(
+                "config parse error in {}, ignoring it: TOML syntax error at line 2, column 22: invalid basic string",
+                path.display()
+            )
+        );
+        assert!(!warning.contains("abc-SECRET"), "{warning}");
+        // No file is nothing to warn about.
+        assert_eq!(read_toml_value(&dir.path().join("absent.toml")), Ok(None));
     }
 
     #[test]

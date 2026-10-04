@@ -296,10 +296,14 @@ fn is_equivalent_allow_rule(table: &dyn TableLike, tool: &str) -> bool {
         && covers_every_call
 }
 
-/// The permission rules of the user-owned config, read as a session loads
-/// them. A session's approvals follow the strictest of the rules that match
-/// a call, so an allow rule saved there does not decide a call one of the
-/// others asks about or denies.
+/// The permission rules of the user-owned config: its `permissions` table,
+/// read on its own, so a value of the wrong type elsewhere in the file does
+/// not keep them from being read here (a syntax error does). A session
+/// loads the whole file instead: one that cannot, for a syntax error or a
+/// value of the wrong type anywhere in it, starts with the defaults, and
+/// none of these rules. A session's approvals follow the strictest of the
+/// rules that match a call, so an allow rule saved there does not decide a
+/// call one of the others asks about or denies.
 pub fn user_permission_rules() -> io::Result<PermissionRules> {
     let dir = resolve_config_dir()?;
     user_permission_rules_in(&dir)

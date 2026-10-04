@@ -45,6 +45,12 @@ pub fn syntax_error_text(message: &str, span: Option<Range<usize>>, source: &str
 /// the config does not have; the ones it could have been are. A message that
 /// is not in a shape `serde` writes itself is only `invalid value`, with the
 /// key path.
+///
+/// `error` must come from `toml::Value::try_into` (or `toml::Table`'s): only
+/// such an error names the key path, below its message. One from parsing
+/// text, as `toml::from_str` returns, names no path and quotes the line it
+/// stopped at; parse the text to a `toml::Table` first, report a syntax
+/// error with [`syntax_error_text`], and then load the table.
 pub fn data_error_text(error: &toml::de::Error) -> String {
     let message = error.message();
     let at = key_path(&error.to_string(), message)
@@ -67,6 +73,14 @@ pub fn data_error_text(error: &toml::de::Error) -> String {
         ("unknown field `", "unknown field"),
     ] {
         if message.starts_with(start) {
+            // An unknown variant or field of a type that has none ends with
+            // this instead of what was expected: any `, expected ` before it
+            // is the found value's.
+            if message.ends_with(", there are no variants")
+                || message.ends_with(", there are no fields")
+            {
+                return format!("{problem}{at}");
+            }
             return match message.rsplit_once(", expected ") {
                 Some((_, expected)) => format!("{problem}{at}, expected {expected}"),
                 None => format!("{problem}{at}"),
@@ -246,12 +260,18 @@ mod tests {
         ] {
             let found = toml::de::Error::invalid_type(Unexpected::Str(value), &"a map");
             let variant = toml::de::Error::unknown_variant(value, &["fast", "medium", "slow"]);
+            // With nothing to expect, serde ends the message without an
+            // expected part, so every `, expected ` in it is the value's.
+            let no_variant = toml::de::Error::unknown_variant(value, &[]);
+            let no_field = toml::de::Error::unknown_field(value, &[]);
 
             assert_eq!(data_error_text(&found), "invalid type, expected a map");
             assert_eq!(
                 data_error_text(&variant),
                 "unknown variant, expected one of `fast`, `medium`, `slow`"
             );
+            assert_eq!(data_error_text(&no_variant), "unknown variant", "{value}");
+            assert_eq!(data_error_text(&no_field), "unknown field", "{value}");
         }
     }
 

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use orca_core::config::error_text::{data_error_text, syntax_error_text};
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{
     ToolOutputTruncation, ToolRequest, ToolResult, truncate_output_with_policy,
@@ -48,27 +49,37 @@ pub fn load_external_tools_dir(dir: &Path) -> Vec<ExternalToolConfig> {
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("toml"))
         .filter_map(|path| {
             let content = fs::read_to_string(&path).ok()?;
-            match toml::from_str::<ExternalToolConfig>(&content) {
-                Ok(tool) if is_valid_tool_name(&tool.name) => Some(tool),
-                Ok(tool) => {
-                    eprintln!(
-                        "orca: warning: ignoring external tool with invalid name '{}'",
-                        tool.name
-                    );
-                    None
-                }
-                Err(error) => {
-                    eprintln!(
-                        "orca: warning: failed to parse external tool '{}': {error}",
-                        path.display()
-                    );
-                    None
-                }
-            }
+            read_external_tool(&path, &content)
+                .map_err(|warning| eprintln!("orca: warning: {warning}"))
+                .ok()
         })
         .collect::<Vec<_>>();
     tools.sort_by(|a, b| a.name.cmp(&b.name));
     tools
+}
+
+/// The tool the external tool file at `path` holds, `content`, or the
+/// warning that says why it is not loaded. What is wrong is said by line and
+/// column, or by key, and never by what the file holds: the warning lands
+/// in logs and bug reports, and a tool's command can hold a token.
+fn read_external_tool(path: &Path, content: &str) -> Result<ExternalToolConfig, String> {
+    let failed =
+        |what: String| format!("failed to parse external tool '{}': {what}", path.display());
+    // Parsed to a table first, so that a value of the wrong type is named
+    // by its key (see `data_error_text`).
+    let table = content
+        .parse::<toml::Table>()
+        .map_err(|error| failed(syntax_error_text(error.message(), error.span(), content)))?;
+    let tool = toml::Value::Table(table)
+        .try_into::<ExternalToolConfig>()
+        .map_err(|error| failed(data_error_text(&error)))?;
+    if !is_valid_tool_name(&tool.name) {
+        return Err(format!(
+            "ignoring external tool with invalid name '{}'",
+            tool.name
+        ));
+    }
+    Ok(tool)
 }
 
 pub fn execute_external_tool(
@@ -345,6 +356,73 @@ mod tests {
 
     fn platform_delay(unix_ms: u64, windows_ms: u64) -> Duration {
         Duration::from_millis(if cfg!(windows) { windows_ms } else { unix_ms })
+    }
+
+    #[test]
+    fn an_external_tool_file_reads_back_as_its_tool() {
+        let content = r#"
+name = "deploy"
+description = "Deploy the current branch"
+action_kind = "write"
+command = "./scripts/deploy.sh"
+schema = { env = { type = "string", description = "environment" } }
+"#;
+
+        let tool = read_external_tool(Path::new("deploy.toml"), content).expect("loads");
+
+        assert_eq!(tool.name, "deploy");
+        assert_eq!(tool.description, "Deploy the current branch");
+        assert_eq!(tool.action_kind, ActionKind::Write);
+        assert_eq!(tool.command, "./scripts/deploy.sh");
+        assert_eq!(
+            tool.schema,
+            serde_json::json!({"env": {"type": "string", "description": "environment"}})
+        );
+    }
+
+    /// What is wrong with an external tool file is said by line and column,
+    /// or by key, and never by what the file holds: the warning lands in
+    /// logs and bug reports, and a tool's command can hold a token.
+    #[test]
+    fn an_external_tool_that_does_not_load_is_reported_without_its_values() {
+        let path = Path::new("/home/me/.orca/tools/lookup.toml");
+        let head = "name = \"lookup\"\ndescription = \"looks up\"\n";
+        // (the file, how it is reported, what must not be shown)
+        let cases = [
+            (
+                format!("{head}action_kind = \"read\"\ncommand = \"abc-SECRET\n"),
+                "TOML syntax error at line 4, column 22: invalid basic string",
+                "abc-SECRET",
+            ),
+            (
+                format!("{head}action_kind = \"read\"\ncommand = [\"abc-SECRET\"]\n"),
+                "invalid type in `command`, expected a string",
+                "abc-SECRET",
+            ),
+            (
+                format!("{head}action_kind = \"abc-SECRET\"\ncommand = \"echo\"\n"),
+                "unknown variant in `action_kind`, expected one of `read`, `write`, `network`, `agent`, `shell`",
+                "abc-SECRET",
+            ),
+            (
+                format!("{head}command = \"abc-SECRET\"\n"),
+                "missing field `action_kind`",
+                "abc-SECRET",
+            ),
+        ];
+        for (content, reported, value) in cases {
+            let warning = read_external_tool(path, &content).unwrap_err();
+
+            assert_eq!(
+                warning,
+                format!(
+                    "failed to parse external tool '{}': {reported}",
+                    path.display()
+                ),
+                "{content}"
+            );
+            assert!(!warning.contains(value), "{content}: {warning}");
+        }
     }
 
     #[test]
