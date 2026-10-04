@@ -48,6 +48,7 @@ pub mod instructions;
 mod investigation_convergence;
 pub mod lifecycle;
 mod mcp_catalog;
+mod mcp_startup;
 pub mod memory;
 pub mod mentions;
 pub mod model_response;

@@ -3406,40 +3406,6 @@ fn headless_interaction_capabilities() -> BTreeSet<surface::SurfaceInteractionKi
     ])
 }
 
-/// The warnings `registry` leaves once its servers' startup has ended: its
-/// errors, in its words. The error of a server that failed to start is
-/// prefixed with the server's name when it does not name it, as "MCP server
-/// closed stdout" does not; the error of one that needs a login names it in
-/// the `orca mcp login` it asks for.
-fn mcp_startup_warnings(registry: &McpRegistry) -> Vec<String> {
-    // Such a server's error is its failure message, and the registry lists
-    // the servers' errors in config order, so equal messages pair up in turn.
-    let mut unmatched = registry
-        .server_statuses()
-        .into_iter()
-        .filter_map(|server| match server.state {
-            orca_mcp::McpServerState::Failed { message } => Some((server.name, message)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    registry
-        .errors()
-        .into_iter()
-        .map(|error| {
-            let server = unmatched
-                .iter()
-                .position(|(_, message)| *message == error)
-                .map(|index| unmatched.remove(index).0);
-            match server {
-                Some(name) if !error.contains(&format!("'{name}'")) => {
-                    format!("MCP server '{name}': {error}")
-                }
-                _ => error,
-            }
-        })
-        .collect()
-}
-
 impl RuntimeThreadHandle {
     pub fn thread_id(&self) -> &str {
         &self.thread_id
@@ -3509,36 +3475,7 @@ impl RuntimeThreadHandle {
     /// shows in the MCP catalog instead. The registry is held only weakly
     /// meanwhile, so the wait keeps no server running.
     pub fn on_mcp_startup_warnings(&self, report: impl FnOnce(Vec<String>) + Send + 'static) {
-        let report = Mutex::new(Some(report));
-        let subscription = Arc::new(Mutex::new(None::<orca_mcp::McpChangeSubscription>));
-        let report_once = {
-            let subscription = Arc::clone(&subscription);
-            Arc::new(move |registry: &McpRegistry| {
-                if registry.is_starting() {
-                    return;
-                }
-                let report = report
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                if let Some(report) = report {
-                    report(mcp_startup_warnings(registry));
-                }
-                // Startup is over, so the subscription ends, whichever call
-                // this is.
-                let ended = subscription
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                drop(ended);
-            })
-        };
-        let subscribed = self.mcp_registry.subscribe(report_once.clone());
-        *subscription
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(subscribed);
-        // Startup may have ended before the subscription began.
-        report_once(&self.mcp_registry);
+        crate::mcp_startup::report_mcp_startup_warnings(&self.mcp_registry, report);
     }
 
     /// Waits until none of the session's MCP servers is still making its
@@ -3551,7 +3488,7 @@ impl RuntimeThreadHandle {
     ) -> Option<Vec<String>> {
         self.mcp_registry
             .wait_for_startup(should_cancel)
-            .then(|| mcp_startup_warnings(&self.mcp_registry))
+            .then(|| crate::mcp_startup::mcp_startup_warnings(&self.mcp_registry))
     }
 
     pub fn task_registry(&self) -> TaskRegistry {

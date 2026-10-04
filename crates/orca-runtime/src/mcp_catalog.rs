@@ -496,6 +496,7 @@ mod tests {
             name: name.to_string(),
             state: McpServerState::Ready,
             prompts_error: None,
+            errors: Vec::new(),
         }
     }
 
@@ -699,6 +700,7 @@ mod tests {
             name: name.to_string(),
             state,
             prompts_error: prompts_error.map(str::to_string),
+            errors: Vec::new(),
         };
         let catalog = catalog_of(
             vec![

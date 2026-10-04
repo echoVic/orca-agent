@@ -57,6 +57,9 @@ pub struct OAuthTestBehavior {
     pub plain_pkce_only: bool,
     /// The token type the token endpoint issues, instead of `Bearer`.
     pub token_type: Option<String>,
+    /// `/mcp` declares prompts, listing `review`, and resources, besides
+    /// its tool.
+    pub offers_prompts_and_resources: bool,
 }
 
 /// Holds requests until released, so that a test can act while one is in
@@ -233,6 +236,12 @@ impl OAuthTestServer {
         lock(&self.state.accepted).clear();
     }
 
+    /// Takes `token` from now on, as a server does once the user logs in
+    /// again.
+    pub fn accept_token(&self, token: &str) {
+        lock(&self.state.accepted).push(token.to_string());
+    }
+
     /// Each request received: its method and path.
     pub fn trail(&self) -> Vec<String> {
         self.requests()
@@ -391,10 +400,15 @@ fn mcp(state: &ServerState, request: &RecordedRequest, base: &str) -> String {
         // A notification.
         return empty_response(202);
     };
+    let capabilities = if state.behavior.offers_prompts_and_resources {
+        json!({"tools": {}, "prompts": {}, "resources": {}})
+    } else {
+        json!({"tools": {}})
+    };
     let result = match message["method"].as_str() {
         Some("initialize") => json!({
             "protocolVersion": "2025-06-18",
-            "capabilities": {"tools": {}},
+            "capabilities": capabilities,
             "serverInfo": {"name": "oauth-fixture", "version": "1"}
         }),
         Some("tools/list") => json!({"tools": [{
@@ -402,6 +416,7 @@ fn mcp(state: &ServerState, request: &RecordedRequest, base: &str) -> String {
             "description": "echoes its text",
             "inputSchema": {"type": "object"}
         }]}),
+        Some("prompts/list") => json!({"prompts": [{"name": "review"}]}),
         _ => json!({}),
     };
     json_response(200, &json!({"jsonrpc": "2.0", "id": id, "result": result}))

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Mutex, MutexGuard, OnceLock, PoisonError,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -176,6 +176,10 @@ pub trait McpTransport: Send + Sync {
     fn is_closed(&self) -> bool {
         false
     }
+    /// Stops the server at once, even while a request to it is under way,
+    /// which then fails. Only a stdio server, a process of Orca's own, is
+    /// stopped: a remote one is left as it is.
+    fn terminate(&self) {}
 }
 
 /// Connects to the server `config` describes: starts a stdio server, or
@@ -249,13 +253,17 @@ pub(crate) fn negotiated_protocol_version(
 struct StdioTransport {
     server_name: String,
     capability_receipt: CapabilityReceipt,
+    /// The server's process, which `state` holds too. A request holds
+    /// `state` until it is answered, so [`McpTransport::terminate`] stops
+    /// the process through this one.
+    child: Arc<Mutex<StdioChild>>,
     state: Mutex<StdioState>,
     startup_timeout: Duration,
     tool_timeout: Duration,
 }
 
 struct StdioState {
-    child: StdioChild,
+    child: Arc<Mutex<StdioChild>>,
     stdin: ChildStdin,
     responses: Option<mpsc::Receiver<Result<Value, String>>>,
     reader_worker: Option<std::thread::JoinHandle<()>>,
@@ -265,7 +273,7 @@ struct StdioState {
 impl StdioState {
     fn terminate(&mut self) {
         self.responses.take();
-        self.child.terminate();
+        lock_child(&self.child).terminate();
         if let Some(worker) = self.reader_worker.take() {
             let _ = worker.join();
         }
@@ -316,6 +324,18 @@ impl Drop for StdioChild {
     }
 }
 
+fn lock_child(child: &Mutex<StdioChild>) -> MutexGuard<'_, StdioChild> {
+    child.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Held while a stdio server is launched, so that launches take turns:
+/// servers connect in parallel. On some platforms, macOS among them, the
+/// pipes of a new process, and the one its launch reads an exec failure
+/// from, are created before they are marked close-on-exec, so a server
+/// launched at that moment on another thread would inherit them, and the
+/// first launch would then wait until that server exits.
+static STDIO_LAUNCH: Mutex<()> = Mutex::new(());
+
 impl StdioTransport {
     fn start(config: &McpServerConfig) -> Result<Self, String> {
         let command = config
@@ -355,14 +375,16 @@ impl StdioTransport {
             EnforcementState::Advisory,
             "mcp-user-trusted-integration",
         );
-        let launched = broker
-            .launch_user_trusted(
+        let launched = {
+            let _launching = STDIO_LAUNCH.lock().unwrap_or_else(PoisonError::into_inner);
+            broker.launch_user_trusted(
                 child_command,
                 format!("mcp:{}", config.name),
                 cwd,
                 config.capabilities.clone(),
             )
-            .map_err(|error| format!("failed to start MCP server '{}': {error:?}", config.name))?;
+        }
+        .map_err(|error| format!("failed to start MCP server '{}': {error:?}", config.name))?;
         let receipt = launched.receipt;
         let (child, process_job) = (launched.child, launched.process_job);
         let mut child = StdioChild::new(child, process_job);
@@ -395,9 +417,11 @@ impl StdioTransport {
             }
         });
 
+        let child = Arc::new(Mutex::new(child));
         Ok(Self {
             server_name: config.name.clone(),
             capability_receipt: receipt,
+            child: Arc::clone(&child),
             state: Mutex::new(StdioState {
                 child,
                 stdin,
@@ -567,6 +591,11 @@ impl McpTransport for StdioTransport {
         self.state
             .lock()
             .map_or(true, |state| state.responses.is_none())
+    }
+
+    fn terminate(&self) {
+        // A request under way then reads the end of the server's output.
+        lock_child(&self.child).terminate();
     }
 }
 

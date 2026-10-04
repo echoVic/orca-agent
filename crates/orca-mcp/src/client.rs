@@ -96,6 +96,10 @@ pub struct McpServerStatus {
     /// Why its prompts could not be listed, when it connected but
     /// `prompts/list` failed.
     pub prompts_error: Option<String>,
+    /// What went wrong when it was last connected, as
+    /// [`McpRegistry::errors`] lists it: why it failed to connect or needs a
+    /// login, or the tools and prompts it offered that were left out.
+    pub errors: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -122,6 +126,8 @@ struct McpServerEntry {
     /// first, one more for each reconnect. An attempt whose number is no
     /// longer this one was overtaken, and is dropped when it is done.
     generation: u64,
+    /// Stops the server of that attempt, and of the client it became.
+    stop: Arc<McpConnectionStop>,
     /// Its registered tools.
     tools: Vec<McpTool>,
     /// The prompts it offers.
@@ -204,7 +210,65 @@ struct McpClient {
     /// Where a reconnect looks for a stored OAuth login.
     credentials_path: Option<PathBuf>,
     capabilities: McpServerCapabilities,
-    transport: Mutex<Box<dyn McpTransport>>,
+    /// Stops its server, through whichever transport it has.
+    stop: Arc<McpConnectionStop>,
+    /// Held for the whole of each request, so that a reconnect puts a new
+    /// transport in place between requests.
+    transport: Mutex<Arc<dyn McpTransport>>,
+}
+
+/// Stops the server of one connection, when it is a stdio server (see
+/// [`McpTransport::terminate`]): that of the attempt that makes the
+/// connection, then that of the client the attempt becomes, through each
+/// transport the client reconnects to. A stopped connection starts no
+/// transport again, so once [`McpConnectionStop::stop`] returns, none of
+/// its servers runs.
+#[derive(Default)]
+struct McpConnectionStop {
+    state: Mutex<McpConnectionStopState>,
+}
+
+#[derive(Default)]
+struct McpConnectionStopState {
+    stopped: bool,
+    /// The transport started last. It is held weakly: its holder stops its
+    /// server by dropping it.
+    transport: Option<Weak<dyn McpTransport>>,
+}
+
+impl McpConnectionStop {
+    /// Starts a transport to `server_name` with `start`, unless the
+    /// connection was stopped. The lock is held while it starts, so that a
+    /// stop waits for the transport and then stops it too.
+    fn start(
+        &self,
+        server_name: &str,
+        start: impl FnOnce() -> Result<Box<dyn McpTransport>, String>,
+    ) -> Result<Arc<dyn McpTransport>, String> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.stopped {
+            return Err(format!(
+                "MCP server '{server_name}' was stopped to be reconnected"
+            ));
+        }
+        let transport = Arc::<dyn McpTransport>::from(start()?);
+        state.transport = Some(Arc::downgrade(&transport));
+        Ok(transport)
+    }
+
+    /// Stops the server of the transport started last at once, even while
+    /// a request to it is under way, which then fails, and keeps the
+    /// connection from starting another.
+    fn stop(&self) {
+        let transport = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.stopped = true;
+            state.transport.take()
+        };
+        if let Some(transport) = transport.and_then(|transport| transport.upgrade()) {
+            transport.terminate();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -335,10 +399,11 @@ pub fn initialize_registry(
             }
             continue;
         }
+        let stop = Arc::new(McpConnectionStop::default());
         let (state, generation) = if config.disabled {
             (McpServerState::Disabled, 0)
         } else {
-            starting.push((server_name.clone(), config.clone()));
+            starting.push((server_name.clone(), config.clone(), Arc::clone(&stop)));
             (McpServerState::Starting, FIRST_CONNECTION)
         };
         inner.servers.push(McpServerEntry {
@@ -346,6 +411,7 @@ pub fn initialize_registry(
             config: config.clone(),
             state,
             generation,
+            stop,
             tools: Vec::new(),
             prompts: Vec::new(),
             prompts_error: None,
@@ -353,8 +419,8 @@ pub fn initialize_registry(
         });
     }
     let registry = McpRegistry::from_inner(inner);
-    for (server_name, config) in starting {
-        registry.connect_in_background(server_name, config);
+    for (server_name, config, stop) in starting {
+        registry.connect_in_background(server_name, config, stop);
     }
     registry
 }
@@ -420,16 +486,21 @@ struct ConnectedServer {
     warnings: Vec<String>,
 }
 
+/// Connects to the server `config` describes, under `stop`, which then
+/// stops the server of the client this makes.
 fn connect_server(
     config: &McpServerConfig,
     server_name: &str,
     credentials_path: Option<PathBuf>,
+    stop: Arc<McpConnectionStop>,
 ) -> Result<ConnectedServer, String> {
     // An attempt must end, even in a panic: a server left starting would
     // keep `wait_for_startup` waiting for good.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let transport = transport::connect_with_credentials(config, credentials_path.clone())?;
-        connect_server_with_transport(config, server_name, credentials_path, transport)
+        let transport = stop.start(server_name, || {
+            transport::connect_with_credentials(config, credentials_path.clone())
+        })?;
+        connect_server_with_transport(config, server_name, credentials_path, transport, stop)
     }))
     .unwrap_or_else(|_| Err(format!("connecting to MCP server '{server_name}' panicked")))
 }
@@ -438,7 +509,8 @@ fn connect_server_with_transport(
     config: &McpServerConfig,
     server_name: &str,
     credentials_path: Option<PathBuf>,
-    transport: Box<dyn McpTransport>,
+    transport: Arc<dyn McpTransport>,
+    stop: Arc<McpConnectionStop>,
 ) -> Result<ConnectedServer, String> {
     let initialize_result = transport.initialize()?;
     let capabilities = McpServerCapabilities::from_initialize_result(&initialize_result);
@@ -469,6 +541,7 @@ fn connect_server_with_transport(
         server_name: server_name.to_string(),
         credentials_path,
         capabilities,
+        stop,
         transport: Mutex::new(transport),
     };
     // A server whose prompts cannot be listed still serves its tools: a
@@ -608,11 +681,16 @@ impl McpRegistry {
         }
     }
 
-    /// Connects `server_name` with `config`, its first connection, on a
-    /// thread of its own. The thread holds the registry weakly: once every
-    /// holder has dropped the registry, the connection it makes is dropped
-    /// too, which stops the server.
-    fn connect_in_background(&self, server_name: String, config: McpServerConfig) {
+    /// Connects `server_name` with `config`, its first connection, under
+    /// `stop`, on a thread of its own. The thread holds the registry
+    /// weakly: once every holder has dropped the registry, the connection
+    /// it makes is dropped too, which stops the server.
+    fn connect_in_background(
+        &self,
+        server_name: String,
+        config: McpServerConfig,
+        stop: Arc<McpConnectionStop>,
+    ) {
         let credentials_path = self.read().credentials_path.clone();
         let registry = Arc::downgrade(&self.shared);
         let spawned = std::thread::Builder::new()
@@ -620,7 +698,7 @@ impl McpRegistry {
             .spawn({
                 let server_name = server_name.clone();
                 move || {
-                    let connected = connect_server(&config, &server_name, credentials_path);
+                    let connected = connect_server(&config, &server_name, credentials_path, stop);
                     let Some(shared) = registry.upgrade() else {
                         // Dropping the connection stops the server.
                         return;
@@ -805,7 +883,8 @@ impl McpRegistry {
                     server_name: server.clone(),
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
-                    transport: Mutex::new(Box::new(StaticResourceTransport {
+                    stop: Arc::default(),
+                    transport: Mutex::new(Arc::new(StaticResourceTransport {
                         server,
                         resources,
                         reads: reads.clone(),
@@ -837,7 +916,8 @@ impl McpRegistry {
                         server_name: server,
                         credentials_path: None,
                         capabilities: McpServerCapabilities::resource_capable_for_test(),
-                        transport: Mutex::new(transport),
+                        stop: Arc::default(),
+                        transport: Mutex::new(Arc::from(transport)),
                     }),
                 )
             })
@@ -905,10 +985,17 @@ impl McpRegistry {
             client
         };
         // The request can take the server's whole timeout, so no lock is held.
-        let result = client.get_prompt(prompt, serde_json::json!(arguments))?;
-        let result: GetPromptResult = serde_json::from_value(result)
+        let result = client.get_prompt(prompt, serde_json::json!(arguments));
+        self.note_answer(&server_name, &client, &result);
+        let result: GetPromptResult = serde_json::from_value(result?)
             .map_err(|error| format!("invalid prompts/get result for '{server_name}': {error}"))?;
         Ok(expand_prompt(result))
+    }
+
+    /// What is wrong with the config itself, such as a server without a
+    /// name: the first of [`Self::errors`].
+    pub fn config_errors(&self) -> Vec<String> {
+        self.read().errors.clone()
     }
 
     /// What is wrong with the config, then what went wrong when each server
@@ -934,6 +1021,7 @@ impl McpRegistry {
                 name: server.name.clone(),
                 state: server.state.clone(),
                 prompts_error: server.prompts_error.clone(),
+                errors: server.errors.clone(),
             })
             .collect()
     }
@@ -945,9 +1033,16 @@ impl McpRegistry {
     /// for the server, its first one included, is overtaken: it is dropped
     /// once made. So is this one, should another reconnect start before it
     /// is done.
+    ///
+    /// A stdio server is stopped before it is started again, so that one
+    /// that listens on a fixed port can start: its client is taken out at
+    /// once, and a call still under way on it fails. The server has no
+    /// client until the new one is in. A connection still being made for
+    /// it is stopped too. A remote server keeps serving through its client
+    /// until the new one replaces it.
     pub fn reconnect_server(&self, name: &str) -> Result<(), String> {
         let server_name = canonical_mcp_name(name);
-        let (config, credentials_path, generation) = {
+        let (config, credentials_path, generation, stop, stopped) = {
             let mut inner = self.write();
             let credentials_path = inner.credentials_path.clone();
             let server = inner
@@ -959,29 +1054,102 @@ impl McpRegistry {
                 return Err(format!("MCP server '{name}' is disabled"));
             }
             server.generation += 1;
-            (server.config.clone(), credentials_path, server.generation)
+            let stop = Arc::new(McpConnectionStop::default());
+            let overtaken = std::mem::replace(&mut server.stop, Arc::clone(&stop));
+            let (config, generation) = (server.config.clone(), server.generation);
+            let stopped = (config.transport == McpTransportKind::Stdio)
+                .then(|| (overtaken, inner.clients.remove(&server_name)));
+            (config, credentials_path, generation, stop, stopped)
         };
-        // Connecting can take up to the startup timeout, so no lock is held.
-        let connected = connect_server(&config, &server_name, credentials_path);
+        // Stopping a server, and connecting, which can take up to the
+        // startup timeout, are done with no lock held.
+        if let Some((overtaken, client)) = stopped {
+            overtaken.stop();
+            drop(client);
+        }
+        let connected = connect_server(&config, &server_name, credentials_path, stop);
         self.finish_connecting(&server_name, generation, connected)
     }
 
+    /// Notes what the answer to a request sent to `server` (its canonical
+    /// name) through `client` says of the server's login: one that finds
+    /// the login gone marks the server as needing a login, and any that
+    /// goes through marks it ready again.
+    fn note_answer<T, E: fmt::Display>(
+        &self,
+        server: &str,
+        client: &Arc<McpClient>,
+        answer: &Result<T, E>,
+    ) {
+        match answer {
+            Ok(_) => self.mark_ready_after_success(server, client),
+            Err(error) if is_auth_required(&error.to_string()) => {
+                self.mark_needs_login(server, client);
+            }
+            Err(_) => {}
+        }
+    }
+
     /// Marks `server` (its canonical name) as needing a login, once a
-    /// request to it finds that its login no longer works, and tells the
-    /// subscribers. Its client and tools stay until it is reconnected,
-    /// which a login does.
-    fn mark_needs_login(&self, server: &str) {
-        let marked = {
+    /// request sent through `client` finds that its login no longer works,
+    /// and tells the subscribers. Its client and tools stay until it is
+    /// reconnected, which a login does.
+    fn mark_needs_login(&self, server: &str, client: &Arc<McpClient>) {
+        self.change_state_through(
+            server,
+            client,
+            McpServerState::Ready,
+            McpServerState::NeedsLogin,
+        );
+    }
+
+    /// Marks `server` (its canonical name) ready again, when it was marked
+    /// as needing a login, once a request sent through `client` goes
+    /// through: its login works again, as when the user has logged in
+    /// elsewhere since. Tells the subscribers.
+    fn mark_ready_after_success(&self, server: &str, client: &Arc<McpClient>) {
+        // Most requests find the server ready, which takes no write lock.
+        let needs_login = self
+            .read()
+            .servers
+            .iter()
+            .any(|entry| entry.name == server && entry.state == McpServerState::NeedsLogin);
+        if needs_login {
+            self.change_state_through(
+                server,
+                client,
+                McpServerState::NeedsLogin,
+                McpServerState::Ready,
+            );
+        }
+    }
+
+    /// Changes the state of `server` (its canonical name) from `from` to
+    /// `to`, while `client` is still its client, and then tells the
+    /// subscribers. A client that a reconnect has replaced since speaks for
+    /// a connection that is gone, so what its requests find changes nothing.
+    fn change_state_through(
+        &self,
+        server: &str,
+        client: &Arc<McpClient>,
+        from: McpServerState,
+        to: McpServerState,
+    ) {
+        let changed = {
             let mut inner = self.write();
+            let current = inner
+                .clients
+                .get(server)
+                .is_some_and(|current| Arc::ptr_eq(current, client));
             match inner.servers.iter_mut().find(|entry| entry.name == server) {
-                Some(entry) if entry.state != McpServerState::NeedsLogin => {
-                    entry.state = McpServerState::NeedsLogin;
+                Some(entry) if current && entry.state == from => {
+                    entry.state = to;
                     true
                 }
                 _ => false,
             }
         };
-        if marked {
+        if changed {
             self.notify_subscribers();
         }
     }
@@ -1102,7 +1270,8 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
-                    transport: Mutex::new(Box::new(StaticResourceListingTransport {
+                    stop: Arc::default(),
+                    transport: Mutex::new(Arc::new(StaticResourceListingTransport {
                         resources,
                         error: None,
                     })),
@@ -1126,7 +1295,8 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
-                    transport: Mutex::new(Box::new(StaticResourceListingTransport {
+                    stop: Arc::default(),
+                    transport: Mutex::new(Arc::new(StaticResourceListingTransport {
                         resources: Vec::new(),
                         error: Some(
                             error
@@ -1218,7 +1388,8 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
-                    transport: Mutex::new(Box::new(StaticResourceTemplateListingTransport {
+                    stop: Arc::default(),
+                    transport: Mutex::new(Arc::new(StaticResourceTemplateListingTransport {
                         resource_templates,
                         error: None,
                     })),
@@ -1242,7 +1413,8 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
-                    transport: Mutex::new(Box::new(StaticResourceTemplateListingTransport {
+                    stop: Arc::default(),
+                    transport: Mutex::new(Arc::new(StaticResourceTemplateListingTransport {
                         resource_templates: Vec::new(),
                         error: Some(
                             error
@@ -1271,19 +1443,14 @@ impl McpRegistry {
         let client = self
             .client(&tool_ref.server)
             .ok_or_else(|| format!("MCP server '{}' is not connected", tool_ref.server))?;
-        let result = client
-            .call_tool(
-                &tool_ref.tool,
-                arguments,
-                elicitation_handler,
-                should_cancel,
-            )
-            .inspect_err(|error| {
-                if is_auth_required(error) {
-                    self.mark_needs_login(&tool_ref.server);
-                }
-            })?;
-        let result: CallToolResult = serde_json::from_value(result)
+        let result = client.call_tool(
+            &tool_ref.tool,
+            arguments,
+            elicitation_handler,
+            should_cancel,
+        );
+        self.note_answer(&tool_ref.server, &client, &result);
+        let result: CallToolResult = serde_json::from_value(result?)
             .map_err(|error| format!("invalid MCP tool result: {error}"))?;
 
         let mut texts = Vec::new();
@@ -1347,8 +1514,9 @@ impl McpRegistry {
 
         let mut resources = Vec::new();
         for (server, client) in clients {
-            let result = client.list_resources_or_cancel(should_cancel)?;
-            let result: ResourcesListResult = serde_json::from_value(result).map_err(|error| {
+            let result = client.list_resources_or_cancel(should_cancel);
+            self.note_answer(&server, &client, &result);
+            let result: ResourcesListResult = serde_json::from_value(result?).map_err(|error| {
                 McpRequestError::Failed(format!("invalid MCP resources/list result: {error}"))
             })?;
             resources.extend(result.resources.into_iter().map(|resource| McpResource {
@@ -1398,7 +1566,9 @@ impl McpRegistry {
             },
         };
         for (server, client) in clients {
-            match client.list_resources_or_cancel(should_cancel) {
+            let result = client.list_resources_or_cancel(should_cancel);
+            self.note_answer(&server, &client, &result);
+            match result {
                 Ok(result) => match serde_json::from_value::<ResourcesListResult>(result) {
                     Ok(result) => {
                         listing
@@ -1450,9 +1620,10 @@ impl McpRegistry {
 
         let mut resource_templates = Vec::new();
         for (server, client) in clients {
-            let result = client.list_resource_templates_or_cancel(should_cancel)?;
+            let result = client.list_resource_templates_or_cancel(should_cancel);
+            self.note_answer(&server, &client, &result);
             let result: ResourceTemplatesListResult =
-                serde_json::from_value(result).map_err(|error| {
+                serde_json::from_value(result?).map_err(|error| {
                     McpRequestError::Failed(format!(
                         "invalid MCP resources/templates/list result: {error}"
                     ))
@@ -1509,7 +1680,9 @@ impl McpRegistry {
             },
         };
         for (server, client) in clients {
-            match client.list_resource_templates_or_cancel(should_cancel) {
+            let result = client.list_resource_templates_or_cancel(should_cancel);
+            self.note_answer(&server, &client, &result);
+            match result {
                 Ok(result) => match serde_json::from_value::<ResourceTemplatesListResult>(result) {
                     Ok(result) => {
                         listing.resource_templates.extend(
@@ -1552,14 +1725,18 @@ impl McpRegistry {
         let client = self.client(server).ok_or_else(|| {
             McpRequestError::Failed(format!("MCP server '{server}' is not connected"))
         })?;
-        let result = client.read_resource_or_cancel(uri, should_cancel)?;
-        serde_json::from_value(result).map_err(|error| {
+        let result = client.read_resource_or_cancel(uri, should_cancel);
+        self.note_answer(server, &client, &result);
+        serde_json::from_value(result?).map_err(|error| {
             McpRequestError::Failed(format!("invalid MCP resources/read result: {error}"))
         })
     }
 }
 
 impl McpClient {
+    /// Calls the tool `name`. A failed call is never sent again, but a
+    /// failure that stopped the server connects it again first, as
+    /// [`Self::request`] does, so that the next call can go through.
     fn call_tool(
         &self,
         name: &str,
@@ -1567,30 +1744,7 @@ impl McpClient {
         elicitation_handler: Option<&dyn McpElicitationHandler>,
         should_cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<Value, String> {
-        match self.call_tool_once(name, arguments, elicitation_handler, should_cancel) {
-            Err(error) if should_reconnect_after_mcp_error(&self.config.transport, &error) => {
-                let startup_timeout_cap_ms = (self.config.transport == McpTransportKind::Stdio
-                    && error == MCP_TOOL_CALL_CANCELLED)
-                    .then_some(CANCELLED_STDIO_RECONNECT_TIMEOUT_MS);
-                let _ = self.reconnect(startup_timeout_cap_ms);
-                Err(error)
-            }
-            result => result,
-        }
-    }
-
-    fn call_tool_once(
-        &self,
-        name: &str,
-        arguments: Value,
-        elicitation_handler: Option<&dyn McpElicitationHandler>,
-        should_cancel: Option<&dyn Fn() -> bool>,
-    ) -> Result<Value, String> {
-        let transport = self
-            .transport
-            .lock()
-            .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))?;
-        match should_cancel {
+        self.request(|transport| match should_cancel {
             Some(should_cancel) => transport.call_tool_with_elicitation_handler_or_cancel(
                 name,
                 arguments,
@@ -1600,7 +1754,8 @@ impl McpClient {
             None => {
                 transport.call_tool_with_elicitation_handler(name, arguments, elicitation_handler)
             }
-        }
+        })
+        .map_err(|error| error.to_string())
     }
 
     fn list_resources_or_cancel(
@@ -1643,12 +1798,7 @@ impl McpClient {
         request: impl FnOnce(&dyn McpTransport) -> Result<Value, String>,
     ) -> Result<Value, McpRequestError> {
         let (result, closed) = {
-            let transport = self.transport.lock().map_err(|_| {
-                McpRequestError::Failed(format!(
-                    "MCP server '{}' transport lock poisoned",
-                    self.server_name
-                ))
-            })?;
+            let transport = self.lock_transport().map_err(McpRequestError::Failed)?;
             let result = request(transport.as_ref());
             let closed = result.is_err() && transport.is_closed();
             (result, closed)
@@ -1668,22 +1818,44 @@ impl McpClient {
         }
     }
 
+    /// Connects the server again, with its startup timeout capped at
+    /// `startup_timeout_cap_ms` when given, and puts the new transport in
+    /// place of the old one. A stdio server is stopped first, and requests
+    /// wait for the new one, so that a server that listens on a fixed port
+    /// can start again. A remote server keeps serving through the old
+    /// transport until the new one is ready.
     fn reconnect(&self, startup_timeout_cap_ms: Option<u64>) -> Result<(), String> {
         let mut config = self.config.clone();
         if let Some(cap_ms) = startup_timeout_cap_ms {
             config.startup_timeout_ms =
                 Some(config.startup_timeout_ms.unwrap_or(cap_ms).min(cap_ms));
         }
-        let transport =
-            transport::connect_with_credentials(&config, self.credentials_path.clone())?;
+        if config.transport == McpTransportKind::Stdio {
+            let mut current = self.lock_transport()?;
+            current.terminate();
+            *current = self.connect(&config)?;
+        } else {
+            let transport = self.connect(&config)?;
+            *self.lock_transport()? = transport;
+        }
+        Ok(())
+    }
+
+    /// A new transport to the server `config` describes, started under the
+    /// client's stop, once it has answered `initialize` and `tools/list`.
+    fn connect(&self, config: &McpServerConfig) -> Result<Arc<dyn McpTransport>, String> {
+        let transport = self.stop.start(&self.server_name, || {
+            transport::connect_with_credentials(config, self.credentials_path.clone())
+        })?;
         transport.initialize()?;
         let _ = transport.list_tools()?;
-        let mut current = self
-            .transport
+        Ok(transport)
+    }
+
+    fn lock_transport(&self) -> Result<MutexGuard<'_, Arc<dyn McpTransport>>, String> {
+        self.transport
             .lock()
-            .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))?;
-        *current = transport;
-        Ok(())
+            .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))
     }
 }
 
@@ -1739,7 +1911,7 @@ mod tests {
         McpElicitationHandler, McpElicitationMode, McpElicitationRequest, McpElicitationResponse,
         McpTransport,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     const STDIO_TEST_STARTUP_TIMEOUT_MS: u64 = 15_000;
@@ -1862,9 +2034,14 @@ done
             ..Default::default()
         };
 
-        let ConnectedServer { client, tools, .. } =
-            connect_server_with_transport(&config, "filtered", None, Box::new(FixedToolsTransport))
-                .expect("connect with fixed tools transport");
+        let ConnectedServer { client, tools, .. } = connect_server_with_transport(
+            &config,
+            "filtered",
+            None,
+            Arc::new(FixedToolsTransport),
+            Arc::default(),
+        )
+        .expect("connect with fixed tools transport");
         let lookup = tools
             .iter()
             .map(|tool| {
@@ -1997,7 +2174,8 @@ done
                     server_name: "slow".to_string(),
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
-                    transport: Mutex::new(Box::new(CleanupAwareTransport {
+                    stop: Arc::default(),
+                    transport: Mutex::new(Arc::new(CleanupAwareTransport {
                         active: Arc::clone(&active),
                         release: Arc::clone(&release),
                     })),
@@ -2096,7 +2274,8 @@ done
                     server_name: "screen".to_string(),
                     credentials_path: None,
                     capabilities: McpServerCapabilities::default(),
-                    transport: Mutex::new(Box::new(StaticCallToolTransport { content })),
+                    stop: Arc::default(),
+                    transport: Mutex::new(Arc::new(StaticCallToolTransport { content })),
                 }),
             )]),
             tools: vec![tool.clone()],
@@ -2636,7 +2815,8 @@ done
                     server_name: "prompts".to_string(),
                     credentials_path: None,
                     capabilities: McpServerCapabilities::default(),
-                    transport: Mutex::new(Box::new(ElicitingTransport)),
+                    stop: Arc::default(),
+                    transport: Mutex::new(Arc::new(ElicitingTransport)),
                 }),
             )]),
             tools: vec![tool.clone()],
@@ -3521,11 +3701,13 @@ done
         assert_eq!(runs, "2");
     }
 
-    /// A stdio server that lists the tools in `<dir>/<name>/tools.json`. Each
-    /// time it starts, it reads its tools and the seconds in
-    /// `<dir>/<name>/delay`, if there is one, adds its pid to
-    /// `<dir>/<name>/starts`, and then waits that long before it answers
-    /// anything, `initialize` included.
+    /// A stdio server that lists the tools in `<dir>/<name>/tools.json`, and
+    /// never answers a tool call. Each time it starts, it reads its tools
+    /// and the seconds in `<dir>/<name>/delay`, if there is one, adds its
+    /// pid to `<dir>/<name>/starts`, and to `<dir>/<name>/overlaps` too when
+    /// the start before it is still running, and then waits that long
+    /// before it answers anything, `initialize` included. Each message it
+    /// gets is added to `<dir>/<name>/requests`.
     #[cfg(unix)]
     fn listing_server_config(name: &str, dir: &std::path::Path, tools: &str) -> McpServerConfig {
         let state = dir.join(name);
@@ -3538,11 +3720,16 @@ done
 state_dir="$1"
 tools=$(cat "$state_dir/tools.json")
 delay=$(cat "$state_dir/delay" 2>/dev/null)
+previous=$(tail -n 1 "$state_dir/starts" 2>/dev/null)
+if [ -n "$previous" ] && kill -0 "$previous" 2>/dev/null; then
+  printf '%s\n' "$$" >> "$state_dir/overlaps"
+fi
 printf '%s\n' "$$" >> "$state_dir/starts"
 if [ -n "$delay" ]; then
   sleep "$delay"
 fi
 while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$state_dir/requests"
   case "$line" in
     *'"method":"initialize"'*)
       printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"listing","version":"1"}}}\n'
@@ -3577,6 +3764,17 @@ done
             .collect()
     }
 
+    /// The pid of each start of the listing server `name` that found the
+    /// start before it still running.
+    #[cfg(unix)]
+    fn overlapping_starts(dir: &std::path::Path, name: &str) -> Vec<String> {
+        std::fs::read_to_string(dir.join(name).join("overlaps"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Has the listing server `name` wait `seconds` before it answers, from
     /// its next start on.
     #[cfg(unix)]
@@ -3596,12 +3794,27 @@ done
         }
     }
 
-    /// `name` in `state`, with its prompts listed.
+    /// `name` in `state`, with its prompts listed, and nothing gone wrong
+    /// when it was last connected.
     fn status(name: &str, state: McpServerState) -> McpServerStatus {
         McpServerStatus {
             name: name.to_string(),
             state,
             prompts_error: None,
+            errors: Vec::new(),
+        }
+    }
+
+    /// `name`, which `error` kept from connecting.
+    fn failed(name: &str, error: &str) -> McpServerStatus {
+        McpServerStatus {
+            errors: vec![error.to_string()],
+            ..status(
+                name,
+                McpServerState::Failed {
+                    message: error.to_string(),
+                },
+            )
         }
     }
 
@@ -3689,15 +3902,7 @@ done
             errors[0].starts_with("failed to start MCP server 'broken'"),
             "{errors:?}"
         );
-        assert_eq!(
-            registry.server_statuses(),
-            [status(
-                "broken",
-                McpServerState::Failed {
-                    message: errors[0].clone()
-                }
-            )]
-        );
+        assert_eq!(registry.server_statuses(), [failed("broken", &errors[0])]);
 
         let error = registry
             .reconnect_server("broken")
@@ -3706,10 +3911,7 @@ done
             error.starts_with("failed to start MCP server 'broken'"),
             "{error}"
         );
-        assert_eq!(
-            registry.server_statuses(),
-            [status("broken", McpServerState::Failed { message: error })]
-        );
+        assert_eq!(registry.server_statuses(), [failed("broken", &error)]);
         assert!(registry.tools().is_empty());
     }
 
@@ -3728,12 +3930,12 @@ done
 
         assert_eq!(
             registry.server_statuses(),
-            [status("docs", McpServerState::NeedsLogin)]
+            [McpServerStatus {
+                errors: vec![LOGIN_REQUIRED.to_string()],
+                ..status("docs", McpServerState::NeedsLogin)
+            }]
         );
-        assert_eq!(
-            registry.errors(),
-            ["MCP server requires login: run 'orca mcp login docs', or log in from /mcp"]
-        );
+        assert_eq!(registry.errors(), [LOGIN_REQUIRED]);
         assert!(registry.tools().is_empty());
 
         // After `orca mcp login`, a reconnect sends the stored token.
@@ -3814,6 +4016,290 @@ done
             registry.server_statuses(),
             [status("docs", McpServerState::NeedsLogin)]
         );
+    }
+
+    /// What a request to the OAuth test server, as "docs", fails with once
+    /// its login is gone.
+    const LOGIN_REQUIRED: &str =
+        "MCP server requires login: run 'orca mcp login docs', or log in from /mcp";
+
+    /// Stores a login with `access_token`, and no refresh token, for the
+    /// OAuth test server as "docs".
+    fn store_login(
+        credentials: &std::path::Path,
+        server: &crate::oauth::test_server::OAuthTestServer,
+        access_token: &str,
+    ) {
+        use orca_core::config::mcp_credentials::{McpCredential, save_mcp_credential};
+
+        save_mcp_credential(
+            credentials,
+            "docs",
+            &McpCredential {
+                server_url: server.mcp_url(),
+                access_token: access_token.to_string(),
+                refresh_token: None,
+                expires_at: None,
+                token_endpoint: format!("{}/token", server.url()),
+                client_id: "configured-client".to_string(),
+                resource: server.mcp_url(),
+                scope: None,
+            },
+        )
+        .expect("store a login");
+    }
+
+    /// The OAuth test server as "docs", connected with the stored login
+    /// `at-stored`, which the server must take, and the directory that
+    /// holds the login, in `mcp-credentials.json`.
+    fn logged_in_registry(
+        server: &crate::oauth::test_server::OAuthTestServer,
+    ) -> (McpRegistry, tempfile::TempDir) {
+        let home = tempfile::tempdir().expect("temp dir");
+        let credentials = home.path().join("mcp-credentials.json");
+        store_login(&credentials, server, "at-stored");
+        let registry = connected_registry(&[server.config("docs")], Some(credentials));
+        assert_eq!(
+            registry.server_statuses(),
+            [status("docs", McpServerState::Ready)]
+        );
+        (registry, home)
+    }
+
+    /// Counts the changes `registry` tells a subscriber of, for as long as
+    /// the subscription lasts.
+    fn count_changes(registry: &McpRegistry) -> (McpChangeSubscription, Arc<AtomicUsize>) {
+        let changes = Arc::new(AtomicUsize::new(0));
+        let subscription = registry.subscribe(Arc::new({
+            let changes = Arc::clone(&changes);
+            move |_: &McpRegistry| {
+                changes.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        (subscription, changes)
+    }
+
+    /// A client of the server `config` describes, talking through
+    /// `transport`.
+    fn client_with(
+        config: McpServerConfig,
+        transport: impl McpTransport + 'static,
+    ) -> Arc<McpClient> {
+        Arc::new(McpClient {
+            server_name: canonical_mcp_name(&config.name),
+            config,
+            credentials_path: None,
+            capabilities: McpServerCapabilities::default(),
+            stop: Arc::default(),
+            transport: Mutex::new(Arc::new(transport)),
+        })
+    }
+
+    #[test]
+    fn marking_needs_login_notifies_subscribers() {
+        use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
+
+        let server = OAuthTestServer::start(OAuthTestBehavior {
+            accepted_tokens: vec!["at-stored".to_string()],
+            ..Default::default()
+        });
+        let (registry, _home) = logged_in_registry(&server);
+        let (_subscription, changes) = count_changes(&registry);
+        let echo = registry
+            .resolve_tool("mcp__docs__echo")
+            .expect("the echo tool");
+        server.revoke_tokens();
+
+        registry
+            .call_tool(&echo, serde_json::json!({}))
+            .expect_err("the server turns the token away");
+
+        assert_eq!(
+            registry.server_statuses(),
+            [status("docs", McpServerState::NeedsLogin)]
+        );
+        assert_eq!(changes.load(Ordering::SeqCst), 1);
+        // Marked already: another refusal changes nothing, and tells no one.
+        registry
+            .call_tool(&echo, serde_json::json!({}))
+            .expect_err("the server still turns the token away");
+        assert_eq!(changes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_failure_on_a_replaced_connection_does_not_mark_the_new_one() {
+        use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
+
+        /// A connection whose tool calls run `during_call`, and then find
+        /// the login gone.
+        struct LoginGoneDuringCall {
+            during_call: Box<dyn Fn() + Send + Sync>,
+        }
+
+        impl McpTransport for LoginGoneDuringCall {
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({}))
+            }
+
+            fn list_tools(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": []}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                (self.during_call)();
+                Err(LOGIN_REQUIRED.to_string())
+            }
+
+            fn list_resources(&self) -> Result<Value, String> {
+                Err("not asked for".to_string())
+            }
+
+            fn list_resource_templates(&self) -> Result<Value, String> {
+                Err("not asked for".to_string())
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Err("not asked for".to_string())
+            }
+        }
+
+        // The server takes the configured token, so each connection to it
+        // works.
+        let server = OAuthTestServer::start(OAuthTestBehavior {
+            accepted_tokens: vec!["at-configured".to_string()],
+            ..Default::default()
+        });
+        let mut config = server.config("docs");
+        config.headers.insert(
+            "Authorization".to_string(),
+            "Bearer at-configured".to_string(),
+        );
+        let registry = connected_registry(std::slice::from_ref(&config), None);
+        assert_eq!(
+            registry.server_statuses(),
+            [status("docs", McpServerState::Ready)]
+        );
+        // A call is under way on the server's connection when the server is
+        // reconnected, and then finds the login gone.
+        let reconnect = {
+            let registry = Arc::downgrade(&registry.shared);
+            move || {
+                let shared = registry.upgrade().expect("the registry");
+                McpRegistry { shared }
+                    .reconnect_server("docs")
+                    .expect("reconnect the server");
+            }
+        };
+        let old = client_with(
+            config,
+            LoginGoneDuringCall {
+                during_call: Box::new(reconnect),
+            },
+        );
+        let replaced = registry.write().clients.insert("docs".to_string(), old);
+        drop(replaced);
+        let echo = registry
+            .resolve_tool("mcp__docs__echo")
+            .expect("the echo tool");
+
+        let error = registry
+            .call_tool(&echo, serde_json::json!({}))
+            .expect_err("the old connection finds the login gone");
+
+        assert_eq!(error, LOGIN_REQUIRED);
+        assert_eq!(
+            registry.server_statuses(),
+            [status("docs", McpServerState::Ready)],
+            "the new connection's login works"
+        );
+        registry
+            .call_tool(&echo, serde_json::json!({}))
+            .expect("the new connection serves the next call");
+    }
+
+    #[test]
+    fn a_prompt_or_resource_request_that_needs_login_marks_the_server() {
+        use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
+
+        for method in ["prompts/get", "resources/list"] {
+            let server = OAuthTestServer::start(OAuthTestBehavior {
+                accepted_tokens: vec!["at-stored".to_string()],
+                offers_prompts_and_resources: true,
+                ..Default::default()
+            });
+            let (registry, _home) = logged_in_registry(&server);
+            server.revoke_tokens();
+
+            let error = match method {
+                "prompts/get" => registry
+                    .get_prompt("docs", "review", &BTreeMap::new())
+                    .map(drop),
+                _ => registry.list_resources(Some("docs")).map(drop),
+            }
+            .expect_err("the server turns the token away");
+
+            assert_eq!(error, LOGIN_REQUIRED, "{method}");
+            assert_eq!(
+                registry.server_statuses(),
+                [status("docs", McpServerState::NeedsLogin)],
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_successful_request_clears_needs_login() {
+        use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
+
+        let server = OAuthTestServer::start(OAuthTestBehavior {
+            accepted_tokens: vec!["at-stored".to_string()],
+            ..Default::default()
+        });
+        let (registry, home) = logged_in_registry(&server);
+        let (_subscription, changes) = count_changes(&registry);
+        let echo = registry
+            .resolve_tool("mcp__docs__echo")
+            .expect("the echo tool");
+        server.revoke_tokens();
+        let error = registry
+            .call_tool(&echo, serde_json::json!({}))
+            .expect_err("the server turns the token away");
+        assert_eq!(error, LOGIN_REQUIRED);
+        assert_eq!(
+            registry.server_statuses(),
+            [status("docs", McpServerState::NeedsLogin)]
+        );
+        assert_eq!(changes.load(Ordering::SeqCst), 1);
+
+        // The user logs in again, from another Orca: the connection picks
+        // the new login up on its next request.
+        server.accept_token("at-again");
+        store_login(
+            &home.path().join("mcp-credentials.json"),
+            &server,
+            "at-again",
+        );
+        registry
+            .call_tool(&echo, serde_json::json!({}))
+            .expect("the same connection goes through with the new login");
+
+        assert_eq!(
+            registry.server_statuses(),
+            [status("docs", McpServerState::Ready)]
+        );
+        assert_eq!(changes.load(Ordering::SeqCst), 2);
+        // Ready already: another success changes nothing, and tells no one.
+        registry
+            .call_tool(&echo, serde_json::json!({}))
+            .expect("the next call goes through too");
+        assert_eq!(changes.load(Ordering::SeqCst), 2);
+        // All of it went through the first connection.
+        let initializations = server
+            .requests_to("/mcp")
+            .iter()
+            .filter(|request| request.json()["method"] == "initialize")
+            .count();
+        assert_eq!(initializations, 1);
     }
 
     #[test]
@@ -3928,6 +4414,10 @@ done
         let _subscription = registry.subscribe(Arc::new({
             let heard = Arc::clone(&heard);
             move |registry: &McpRegistry| {
+                // `heard` is locked before the registry is read, so that two
+                // calls made at once, by the two servers' threads, push their
+                // reads in the order they made them: each read finds at least
+                // the servers finished that the one before it found.
                 heard
                     .lock()
                     .expect("the calls heard")
@@ -3956,6 +4446,29 @@ done
                 status("one", McpServerState::Ready),
                 status("two", McpServerState::Ready),
             ]
+        );
+    }
+
+    #[test]
+    fn dropping_a_subscription_stops_its_calls() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let registry =
+            connected_registry(&[missing_server_config("broken", temp_dir.path())], None);
+        let (subscription, changes) = count_changes(&registry);
+        registry
+            .reconnect_server("broken")
+            .expect_err("its command is still missing");
+        assert_eq!(changes.load(Ordering::SeqCst), 1);
+
+        drop(subscription);
+        registry
+            .reconnect_server("broken")
+            .expect_err("its command is still missing");
+
+        assert_eq!(
+            changes.load(Ordering::SeqCst),
+            1,
+            "a dropped subscription is called no more"
         );
     }
 
@@ -4018,10 +4531,14 @@ done
             .reconnect_server("x")
             .expect("reconnect the server");
 
-        // The first start's connection is dropped once it is made, which
-        // stops that server.
+        // The reconnect stopped the first start before it started the server
+        // again; the first start's connection, overtaken, is dropped.
         let first = start_pids(temp_dir.path(), "x").remove(0);
         wait_for("the first start to stop", || !process_is_alive(&first));
+        assert_eq!(
+            overlapping_starts(temp_dir.path(), "x"),
+            Vec::<String>::new()
+        );
         assert_eq!(schema_names(&registry), ["mcp__x__second"]);
         assert_eq!(
             registry.server_statuses(),
@@ -4053,6 +4570,133 @@ done
         wait_for("the server to stop", || !process_is_alive(&pid));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_registry_keeps_no_strong_reference_in_connect_threads() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let fast = listing_server_config("fast", temp_dir.path(), "[]");
+        let slow = listing_server_config("slow", temp_dir.path(), "[]");
+        delay_starts(temp_dir.path(), "slow", 2);
+        let registry = initialize_registry(&[fast, slow], None);
+        wait_for("the fast server to connect", || {
+            registry.server_statuses()[0].state == McpServerState::Ready
+        });
+        wait_for("the slow server to start", || {
+            starts(temp_dir.path(), "slow") == 1
+        });
+        let fast = start_pids(temp_dir.path(), "fast").remove(0);
+        let slow = start_pids(temp_dir.path(), "slow").remove(0);
+        let dropped = Instant::now();
+
+        drop(registry);
+
+        // The slow server's thread goes on connecting for two seconds: had it
+        // held the registry, the fast server's connection would have lived
+        // as long.
+        while process_is_alive(&fast) {
+            assert!(
+                dropped.elapsed() < Duration::from_secs(1),
+                "the fast server outlived the registry while the slow one was starting"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            process_is_alive(&slow),
+            "the slow server answered before the fast one stopped"
+        );
+        wait_for("the slow server to stop", || !process_is_alive(&slow));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnecting_a_stdio_server_stops_the_old_process_first() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = listing_server_config(
+            "x",
+            temp_dir.path(),
+            r#"[{"name":"echo","inputSchema":{"type":"object"}}]"#,
+        );
+        let registry = connected_registry(&[config], None);
+
+        registry
+            .reconnect_server("x")
+            .expect("reconnect through the registry");
+        let after_the_registry = overlapping_starts(temp_dir.path(), "x");
+        registry
+            .client("x")
+            .expect("the server's client")
+            .reconnect(None)
+            .expect("reconnect through the client");
+        let after_the_client = overlapping_starts(temp_dir.path(), "x");
+
+        // Each start found the one before it stopped, so a server that
+        // listens on a fixed port could start again.
+        assert_eq!(starts(temp_dir.path(), "x"), 3);
+        assert!(
+            after_the_registry.is_empty() && after_the_client.is_empty(),
+            "starts that found the one before still running: {after_the_registry:?} through the registry, then {after_the_client:?} through the client"
+        );
+        assert_eq!(
+            registry.server_statuses(),
+            [status("x", McpServerState::Ready)]
+        );
+        assert_eq!(schema_names(&registry), ["mcp__x__echo"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnecting_a_stdio_server_fails_a_call_still_under_way() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = listing_server_config(
+            "x",
+            temp_dir.path(),
+            r#"[{"name":"wait","inputSchema":{"type":"object"}}]"#,
+        );
+        // The server never answers a call, which would wait this long.
+        config.tool_timeout_ms = Some(STDIO_TEST_STARTUP_TIMEOUT_MS);
+        let registry = connected_registry(&[config], None);
+        let wait = registry
+            .resolve_tool("mcp__x__wait")
+            .expect("the wait tool");
+        let call = std::thread::spawn({
+            let registry = registry.clone();
+            move || registry.call_tool(&wait, serde_json::json!({}))
+        });
+        let state = temp_dir.path().join("x");
+        wait_for("the call to reach the server", || {
+            logged_methods(&state)
+                .iter()
+                .any(|method| method == "tools/call")
+        });
+        let reconnecting = Instant::now();
+
+        registry
+            .reconnect_server("x")
+            .expect("reconnect the server");
+
+        let error = call
+            .join()
+            .expect("the call's thread")
+            .expect_err("the call's server was stopped");
+        let waited = reconnecting.elapsed();
+        assert_eq!(error, "MCP server closed stdout");
+        assert!(
+            waited < Duration::from_secs(5),
+            "the call went on {waited:?} after the reconnect began"
+        );
+        // Its server stopped before the new one started, and its connection,
+        // stopped, started no other.
+        assert_eq!(
+            overlapping_starts(temp_dir.path(), "x"),
+            Vec::<String>::new()
+        );
+        assert_eq!(starts(temp_dir.path(), "x"), 2);
+        assert_eq!(
+            registry.server_statuses(),
+            [status("x", McpServerState::Ready)]
+        );
+    }
+
     #[test]
     fn a_server_that_needs_login_ends_startup_as_needs_login() {
         use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
@@ -4064,7 +4708,10 @@ done
         assert!(registry.wait_for_startup(&|| false));
         assert_eq!(
             registry.server_statuses(),
-            [status("docs", McpServerState::NeedsLogin)]
+            [McpServerStatus {
+                errors: vec![LOGIN_REQUIRED.to_string()],
+                ..status("docs", McpServerState::NeedsLogin)
+            }]
         );
         assert!(registry.tools().is_empty());
     }
@@ -4091,6 +4738,7 @@ done
                     r#"MCP request 'prompts/list' failed: {"code":-32601,"message":"Method not found"}"#
                         .to_string()
                 ),
+                errors: Vec::new(),
             }]
         );
         assert!(registry.errors().is_empty(), "{:?}", registry.errors());
@@ -4540,6 +5188,7 @@ done
                 name: "broken".to_string(),
                 state: McpServerState::Ready,
                 prompts_error: Some("MCP request 'prompts/list' timed out after 1s".to_string()),
+                errors: Vec::new(),
             }]
         );
         assert!(registry.errors().is_empty(), "{:?}", registry.errors());
@@ -4596,6 +5245,7 @@ done
                     name: "broken".to_string(),
                     state: McpServerState::Ready,
                     prompts_error: Some(error.to_string()),
+                    errors: Vec::new(),
                 }],
                 "{reply}"
             );
@@ -4629,5 +5279,80 @@ done
             .collect::<Vec<_>>();
             assert_eq!(logged_methods(temp_dir.path()), expected, "{reply}");
         }
+    }
+
+    /// A stdio server that serves the tool `echo`, and answers the first
+    /// call to it with no result, which stops the stdio transport; it
+    /// answers the calls after that. Each message it gets is added to
+    /// `<dir>/requests`.
+    #[cfg(unix)]
+    fn tool_server_that_breaks_once(dir: &std::path::Path) -> McpServerConfig {
+        let script = dir.join("breaks_once.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+state_dir="$1"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$state_dir/requests"
+  id=${line#*'"id":'}
+  id=${id%%,*}
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"breaks","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      if [ -f "$state_dir/broke" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echoed"}],"isError":false}}\n' "$id"
+      else
+        : > "$state_dir/broke"
+        printf '{"jsonrpc":"2.0","id":%s}\n' "$id"
+      fi
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let mut config = stdio_fixture_config("breaks", &script);
+        config.args.push(dir.to_string_lossy().into_owned());
+        config.tool_timeout_ms = Some(STDIO_TEST_STARTUP_TIMEOUT_MS);
+        config
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_call_that_stops_the_server_reconnects_before_returning() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let registry = connected_registry(&[tool_server_that_breaks_once(temp_dir.path())], None);
+        let echo = registry
+            .resolve_tool("mcp__breaks__echo")
+            .expect("the echo tool");
+
+        let first = registry
+            .call_tool(&echo, serde_json::json!({}))
+            .expect_err("the first call is answered with no result");
+        let logged_by_then = logged_methods(temp_dir.path());
+        let second = registry.call_tool(&echo, serde_json::json!({}));
+
+        assert_eq!(first, "MCP request 'tools/call' missing result");
+        // The next call goes to a new server, instead of failing on a broken
+        // pipe to the stopped one, and the failed call is not sent again.
+        let second = second.unwrap_or_else(|error| panic!("the next call failed: {error}"));
+        assert_eq!(second.output, "echoed");
+        let started_again = ["initialize", "notifications/initialized", "tools/list"];
+        let expected = started_again
+            .iter()
+            .chain(&["tools/call"])
+            .chain(&started_again)
+            .map(|method| method.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(logged_by_then, expected, "started again before it returned");
+        assert_eq!(
+            logged_methods(temp_dir.path()),
+            [expected, vec!["tools/call".to_string()]].concat()
+        );
     }
 }
