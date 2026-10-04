@@ -1,7 +1,8 @@
 //! Keys of the `/mcp` panel. `r`, `l` and `o` hand a reconnect, a login or
-//! a logout of the selected server to a worker (see `mcp_server_actions`);
-//! the panel's list only ever changes with the catalog: the thread's, or,
-//! before the first message, that of the servers that started with the TUI.
+//! a logout of the selected server to a worker (see `mcp_server_actions`),
+//! and `l` again cancels a login that waits for the browser; the panel's
+//! list only ever changes with the catalog: the thread's, or, before the
+//! first message, that of the servers that started with the TUI.
 
 use crossbeam_channel as mpsc;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -9,7 +10,7 @@ use orca_mcp::McpAuthKind;
 
 use crate::protocol::UserAction;
 use crate::transcript_state::ChatMessage;
-use crate::types::{AppState, McpActionInFlight};
+use crate::types::{AppState, McpActionInFlight, McpLoginCancel};
 
 #[derive(Clone, Copy)]
 enum McpServerAction {
@@ -55,9 +56,10 @@ pub(crate) fn handle_mcp_dialog_key(
 
 /// Sends `action` for the selected server, unless one is still running for
 /// it, which answers first: an older reconnect could otherwise overwrite a
-/// newer one. Logging in and out uses the server's config entry, under
-/// whose name its login is saved, and only for a server that logs in with
-/// OAuth.
+/// newer one. The one exception is `l` on a login that waits for the
+/// browser, which cancels it; its worker still ends it, and frees the
+/// server. Logging in and out uses the server's config entry, under whose
+/// name its login is saved, and only for a server that logs in with OAuth.
 fn start_action(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
@@ -66,6 +68,17 @@ fn start_action(
     let Some(server) = state.selected_mcp_server() else {
         return;
     };
+    if matches!(action, McpServerAction::LogIn)
+        && let Some(McpActionInFlight::LoggingIn { cancel, .. }) =
+            state.mcp_actions_in_flight.get(&server.key)
+        && cancel.cancel()
+    {
+        state.push_message(ChatMessage::System {
+            text: format!("login to MCP server {} cancelled", server.name),
+            expanded: false,
+        });
+        return;
+    }
     let request = if state.mcp_actions_in_flight.contains_key(&server.key) {
         Err(format!(
             "an MCP action for {} is already running",
@@ -89,14 +102,19 @@ fn start_action(
                         "MCP server '{}' does not use OAuth login",
                         server.name
                     )),
-                    Some(config) if matches!(action, McpServerAction::LogIn) => Ok((
-                        UserAction::McpLogin {
-                            server: config.clone(),
-                        },
-                        McpActionInFlight::LoggingIn {
-                            authorization_url: None,
-                        },
-                    )),
+                    Some(config) if matches!(action, McpServerAction::LogIn) => {
+                        let cancel = McpLoginCancel::default();
+                        Ok((
+                            UserAction::McpLogin {
+                                server: config.clone(),
+                                cancel: cancel.flag(),
+                            },
+                            McpActionInFlight::LoggingIn {
+                                authorization_url: None,
+                                cancel,
+                            },
+                        ))
+                    }
                     Some(config) => Ok((
                         UserAction::McpLogout {
                             server: config.name.clone(),
@@ -135,6 +153,7 @@ mod tests {
         McpServerView {
             name: name.to_string(),
             status,
+            prompts_error: None,
         }
     }
 
@@ -189,25 +208,6 @@ mod tests {
         handle_mcp_dialog_key(&KeyEvent::new(code, KeyModifiers::NONE), state, action_tx);
     }
 
-    /// The whole screen, as rows of text.
-    fn screen(state: &mut AppState) -> String {
-        let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
-        let textarea = tui_textarea::TextArea::default();
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-        terminal
-            .draw(|frame| crate::ui::render(frame, state, &textarea, &theme))
-            .unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content
-            .chunks(100)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     fn last_notice(state: &AppState) -> Option<&str> {
         match state.transcript.messages.last() {
             Some(ChatMessage::System { text, .. }) => Some(text.as_str()),
@@ -249,7 +249,7 @@ mod tests {
         press(&mut state, &action_tx, KeyCode::Char('l'));
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::McpLogin { server }) if server.name == "linear"
+            Ok(UserAction::McpLogin { server, .. }) if server.name == "linear"
         ));
 
         state.update(TuiEvent::McpActionFinished {
@@ -272,7 +272,7 @@ mod tests {
         press(&mut state, &action_tx, KeyCode::Char('l'));
         assert!(action_rx.try_recv().is_ok());
 
-        for key in ['r', 'l', 'o'] {
+        for key in ['r', 'o'] {
             press(&mut state, &action_tx, KeyCode::Char(key));
             assert!(action_rx.try_recv().is_err(), "'{key}' sent an action");
             assert_eq!(
@@ -280,6 +280,20 @@ mod tests {
                 Some("an MCP action for linear is already running")
             );
         }
+        // `l` cancels the login rather than starting another; once it has,
+        // the login runs until it stops, and `l` waits too.
+        press(&mut state, &action_tx, KeyCode::Char('l'));
+        assert!(action_rx.try_recv().is_err(), "`l` sent an action");
+        assert_eq!(
+            last_notice(&state),
+            Some("login to MCP server linear cancelled")
+        );
+        press(&mut state, &action_tx, KeyCode::Char('l'));
+        assert!(action_rx.try_recv().is_err(), "`l` sent an action");
+        assert_eq!(
+            last_notice(&state),
+            Some("an MCP action for linear is already running")
+        );
 
         // Closing the panel leaves the login running; its end frees the
         // server, failed or not.
@@ -344,14 +358,14 @@ mod tests {
             vec![server("my_server", McpServerStatusView::NeedsLogin)],
             vec![remote("My-Server")],
         );
-        let shown = screen(&mut state);
+        let shown = crate::test_support::frame_string(&mut state, 100, 30);
         assert!(shown.contains("My-Server"), "{shown}");
         assert!(!shown.contains("my_server"), "{shown}");
 
         press(&mut state, &action_tx, KeyCode::Char('l'));
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::McpLogin { server }) if server.name == "My-Server"
+            Ok(UserAction::McpLogin { server, .. }) if server.name == "My-Server"
         ));
         assert!(state.mcp_actions_in_flight.contains_key("my_server"));
 

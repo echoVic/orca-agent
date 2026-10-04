@@ -1,5 +1,7 @@
 use crossbeam_channel as mpsc;
 
+use orca_core::approval_rules::CompiledPermissionRules;
+use orca_core::approval_types::Decision;
 use orca_core::mcp_types::mcp_tool_server;
 
 use crate::protocol::{
@@ -53,7 +55,7 @@ pub(crate) fn resolve_approval_option(
                 state
                     .approval_allowlist
                     .insert(AppState::approval_key_tool(tool));
-                save_allow_rule(state, tool);
+                save_allow_rule(state, tool, tool, dialog_target.as_deref());
             }
         }
         ApprovalOption::AlwaysServerSaved => {
@@ -61,9 +63,9 @@ pub(crate) fn resolve_approval_option(
                 .as_deref()
                 .and_then(mcp_tool_server)
                 .map(AppState::approval_key_mcp_server);
-            if let Some(rule_tool) = rule_tool {
+            if let (Some(rule_tool), Some(tool)) = (rule_tool, &dialog_tool) {
                 state.approval_allowlist.insert(rule_tool.clone());
-                save_allow_rule(state, &rule_tool);
+                save_allow_rule(state, &rule_tool, tool, dialog_target.as_deref());
             }
         }
         ApprovalOption::Once | ApprovalOption::Deny => {}
@@ -71,19 +73,40 @@ pub(crate) fn resolve_approval_option(
     resolve_approval(state, action_tx, option);
 }
 
-/// Persist a saved-allow rule for `tool` (a bare tool name for
+/// Persist a saved-allow rule for `rule_tool` (a bare tool name for
 /// `AlwaysToolSaved`, or `mcp__<server>__*` for `AlwaysServerSaved`) to the
-/// user config. The session grant above already stands either way, so a
-/// write failure is reported to the transcript instead of undoing it.
-fn save_allow_rule(state: &mut AppState, tool: &str) {
-    if let Err(error) = orca_core::config::user_edit::add_user_allow_rule(tool) {
-        state.push_message(ChatMessage::System {
-            text: format!(
-                "Allowed for this session, but saving the rule to the user config failed: {error}"
-            ),
-            expanded: false,
-        });
-    }
+/// user config, for the call of `tool` on `target` being approved. The
+/// session grant above already stands either way, so a write failure is
+/// reported to the transcript instead of undoing it. So is a rule of the
+/// user config that still decides that call ahead of the saved one.
+fn save_allow_rule(state: &mut AppState, rule_tool: &str, tool: &str, target: Option<&str>) {
+    let text = match orca_core::config::user_edit::add_user_allow_rule(rule_tool) {
+        Err(error) => format!(
+            "Allowed for this session, but saving the rule to the user config failed: {error}"
+        ),
+        Ok(_) if stricter_user_rule_applies(tool, target) => {
+            format!("saved, but a stricter rule in your config still applies to {tool}")
+        }
+        Ok(_) => return,
+    };
+    state.push_message(ChatMessage::System {
+        text,
+        expanded: false,
+    });
+}
+
+/// Whether a `deny` or `prompt` rule of the user config matches a call of
+/// `tool` on `target`, as the approval policy matches rules (MCP names in
+/// their canonical form, server rules, patterns): the strictest matching
+/// rule decides a call, so an allow rule saved beside it does not. A config
+/// that cannot be read is taken to have none.
+fn stricter_user_rule_applies(tool: &str, target: Option<&str>) -> bool {
+    orca_core::config::user_edit::user_permission_rules().is_ok_and(|rules| {
+        matches!(
+            CompiledPermissionRules::from_rules(rules).matching_decision(tool, target),
+            Some(Decision::Deny | Decision::Prompt)
+        )
+    })
 }
 
 fn resolve_approval(
@@ -314,6 +337,69 @@ mod tests {
             config.contains(r#"tool = "mcp__github__*""#),
             "server rule missing: {config}"
         );
+    }
+
+    #[test]
+    fn saving_an_allow_rule_under_a_stricter_rule_warns() {
+        let stricter = |tool: &str| {
+            format!("saved, but a stricter rule in your config still applies to {tool}")
+        };
+        let cases = [
+            // A prompt rule for the tool, written with Orca's other spelling.
+            (
+                "[[permissions.rules]]\ntool = \"mcp__GitHub__Create-Issue\"\ndecision = \"prompt\"\n",
+                ApprovalOption::AlwaysToolSaved,
+                Some(stricter("mcp__github__create_issue")),
+            ),
+            // A deny rule for its whole server, in an inline array.
+            (
+                "permissions.rules = [{ tool = \"mcp__github\", decision = \"deny\" }]\n",
+                ApprovalOption::AlwaysServerSaved,
+                Some(stricter("mcp__github__create_issue")),
+            ),
+            // Rules that do not match the call, as the policy matches them:
+            // another server, and a pattern its target does not match.
+            (
+                "[[permissions.rules]]\ntool = \"mcp__gitlab__*\"\ndecision = \"deny\"\n\n\
+                 [[permissions.rules]]\ntool = \"mcp__github__create_issue\"\npattern = \"src/**\"\ndecision = \"deny\"\n",
+                ApprovalOption::AlwaysToolSaved,
+                None,
+            ),
+            // An allow rule is no stricter.
+            (
+                "[[permissions.rules]]\ntool = \"mcp__github__*\"\ndecision = \"allow\"\n",
+                ApprovalOption::AlwaysToolSaved,
+                None,
+            ),
+        ];
+        for (config, option, notice) in cases {
+            let home = crate::test_support::isolate_orca_home();
+            std::fs::write(home.path().join("config.toml"), config).expect("seed config");
+            let mut state = state_awaiting_an_mcp_tool_approval("mcp__github__create_issue");
+            let (action_tx, action_rx) = mpsc::unbounded();
+
+            resolve_approval_option(&mut state, &action_tx, option);
+
+            // The call runs, and the rest of the session skips the prompt.
+            assert_eq!(state.status, AppStatus::Running, "{config}");
+            assert!(
+                state.approval_is_allowlisted("mcp__github__create_issue", None),
+                "{config}"
+            );
+            assert!(action_rx.try_recv().is_ok(), "{config}");
+            let written = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+            assert!(written.contains("decision = \"allow\""), "{written}");
+            let said = state
+                .transcript
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    crate::transcript_state::ChatMessage::System { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(said, Vec::from_iter(notice), "{config}");
+        }
     }
 
     #[test]

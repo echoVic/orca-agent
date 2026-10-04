@@ -181,15 +181,39 @@ Orca 提问时，用数字键或 `↑`/`↓` 加 `Enter` 回答；`←`/`→` �
 | 按键 | 作用 |
 | --- | --- |
 | `↑` / `↓` | 选择服务器。 |
-| `Enter` | 查看所选服务器的详情：完整的状态、它的工具（每个工具附上权限规则里用的名字，只读工具标 `read-only`）、它的 prompts，以及它的配置里设置的 `enabled_tools`/`disabled_tools`。再按一次 `Enter` 回到列表。 |
+| `Enter` | 查看所选服务器的详情（见下文）。再按一次 `Enter` 回到列表。 |
 | `r` | 重新连接该服务器。 |
-| `l` | 在浏览器里用 OAuth 登录该服务器，然后重新连接。授权地址也会显示在对话里，方便手动打开。 |
+| `l` | 在浏览器里用 OAuth 登录该服务器，然后重新连接。授权地址也会显示在对话里，方便手动打开。登录等待浏览器期间，再按一次 `l` 就取消登录。 |
 | `o` | 删除该服务器保存的登录，然后重新连接；之后它需要重新登录。 |
 | `Esc` | 关闭面板。 |
 
-重新连接、登录和退出登录都在后台进行，结果显示在对话里；关闭面板不会中止它们。一个服务器上的操作结束之前，不能再对它发起别的操作。`l` 和 `o` 只适用于用 OAuth 登录的服务器，见 [MCP 集成](mcp-integration.md#远程服务器与登录)。
+重新连接、登录和退出登录都在后台进行，结果显示在对话里；关闭面板不会中止它们。一个服务器上的操作结束之前，不能再对它发起别的操作，只有一个例外：登录等待浏览器期间，可以按 `l` 取消。取消后登录立即停止，浏览器本该回到的端口随之释放，不会重新连接，对话里提示 `login to MCP server <name> cancelled`。`l` 和 `o` 只适用于用 OAuth 登录的服务器，见 [MCP 集成](mcp-integration.md#远程服务器与登录)。
 
-`/mcp` 在轮次之间打开。Orca 启动时配置里的服务器，在 TUI 一打开就开始在后台同时连接，所以面板从一开始就列出它们，发出第一条消息之前也一样：每个启用的服务器先显示 `starting`，直到连上、连接失败或需要登录；连上之后，详情里列出它的工具和 prompts。停用的服务器显示 `disabled`，不会连接。`r`、`l`、`o` 一开始就能用。第一条消息开始的对话会原样接手这些服务器，不重新连接；在那之前退出，就结束它们。TUI 打开期间用 `orca mcp add` 添加的服务器，要重启 TUI 后才会出现。操作进行期间，服务器所在行和详情会显示它（`reconnecting…`、带授权地址的 `waiting for browser login…`，或 `logging out…`）。通过 `orca attach` 挂接到 daemon 会话的 TUI 不能管理 daemon 的服务器。daemon 在打开会话时连接它的服务器，所以在本机运行 `orca mcp login <name>` 之后，用 `orca attach new` 开的 daemon 会话会用上这次登录；daemon 已经打开的会话，要等 daemon 重启、重新挂接后才会用上。
+服务器的详情先显示完整的状态，然后依次是：
+
+- 它的工具，每个工具附上权限规则里用的名字；只读工具在名字前面标 `read-only`；
+- 它的 prompts，每个附上参数（必填的写作 `<参数>`，可选的写作 `[参数]`）和说明；
+- 服务器已连上、但列不出 prompts 时，显示 `prompts unavailable: <原因>`；
+- 它的配置里设置的 `enabled_tools`/`disabled_tools`。
+
+~~~text
+╭ MCP servers ─────────────────────────────────────────────────────────────────────╮
+│ github                                                                           │
+│ connected · 2 tools                                                              │
+│                                                                                  │
+│ Tools · permission rules use the names on the right                              │
+│   list_issues   read-only · mcp__github__list_issues                             │
+│   create_issue  mcp__github__create_issue                                        │
+│ Prompts                                                                          │
+│   review_pr <pr> [branch]  Review a pull request                                 │
+│                                                                                  │
+│ ↑↓ select · Enter details · r reconnect · l log in · o log out · Esc close       │
+╰──────────────────────────────────────────────────────────────────────────────────╯
+~~~
+
+终端只有 80 列时，规则名优先占用宽度：工具名太长就先截短工具名。
+
+`/mcp` 在轮次之间打开。Orca 启动时配置里的服务器，在 TUI 一打开就开始在后台同时连接，所以面板从一开始就列出它们，发出第一条消息之前也一样：每个启用的服务器先显示 `starting`，直到连上、连接失败或需要登录；连上之后，详情里列出它的工具和 prompts。停用的服务器显示 `disabled`，不会连接。`r`、`l`、`o` 一开始就能用。第一条消息开始的对话会原样接手这些服务器，不重新连接；在那之前退出，就结束它们。TUI 打开期间用 `orca mcp add` 添加的服务器，要重启 TUI 后才会出现。操作进行期间，服务器所在行和详情会显示它（`reconnecting…`；带授权地址的 `waiting for browser login… (l to cancel)`，取消之后是 `cancelling login…`；或 `logging out…`）。通过 `orca attach` 挂接到 daemon 会话的 TUI 不能管理 daemon 的服务器。daemon 在打开会话时连接它的服务器，所以在本机运行 `orca mcp login <name>` 之后，用 `orca attach new` 开的 daemon 会话会用上这次登录；daemon 已经打开的会话，要等 daemon 重启、重新挂接后才会用上。
 
 ## MCP prompt 命令
 
@@ -201,7 +225,7 @@ Orca 提问时，用数字键或 `↑`/`↓` 加 `Enter` 回答；`←`/`→` �
 
 参数跟在命令后面，用空格分隔，按顺序对应 prompt 的参数，最后一个参数接收剩下的全部文本，包括其中的空格。`/mcp__github__review_pr 123 main` 把 `pr` 设为 `123`，把 `branch` 设为 `main`。省略的可选参数不会发送。缺少必填参数，或者给不带参数的 prompt 加了参数时，Orca 会显示用法，比如 `usage: /mcp__github__review_pr <pr> [branch]`，不会执行。在菜单里选中带参数的 prompt，会把命令填进输入框，等你补上参数。按 `↑` 可以找回运行过的 prompt 命令，与找回消息一样。
 
-Orca 请服务器填好这个 prompt，把返回的内容当作你的消息发出：文本，加上作为附件的图片。轮次之间立即发出；轮次进行中则排队，与这时发送的消息一样。它只发到运行命令时所在的对话：服务器回应之前，如果你新建、恢复或切换到了别的对话，就不发送，对话里会说明。文本按服务器写的原样发出：其中的 `@路径` 不算引用，Orca 不会因此读取任何文件。服务器报错，或者返回的内容为空、超出一条消息能承载的上限（文本超过 1,048,576 个字符、图片超过 600 张，或图片合计超过 5 MiB）时，对话里会说明原因，不发送。
+Orca 请服务器填好这个 prompt，把返回的内容当作你的消息发出：文本，加上作为附件的图片。轮次之间立即发出；轮次进行中则排队，与这时发送的消息一样。它只发到运行命令时所在的对话：服务器回应之前，如果你新建、恢复或切换到了别的对话，就不发送，对话里会说明。服务器回应之前按 `Esc` 可以取消这个 prompt：对话里提示 `MCP prompt /mcp__<server>__<prompt> cancelled`，服务器之后返回的内容直接丢弃，服务器端的请求照常完成。这时的 `Esc` 先于清空草稿和收回消息，草稿保持不变；轮次进行中按 `Esc` 则先中断轮次，prompt 继续进行。文本按服务器写的原样发出：其中的 `@路径` 不算引用，Orca 不会因此读取任何文件。服务器报错，或者返回的内容为空、超出一条消息能承载的上限（文本超过 1,048,576 个字符、图片超过 600 张，或图片合计超过 5 MiB）时，对话里会说明原因，不发送。
 
 服务器一连上，它的 prompt 命令就出现，发出第一条消息之前也一样。这时运行 prompt 命令，服务器返回的内容就是你的第一条消息，对话随之开始。服务器还在连接、还没列出 prompts 时，输入 `/mcp__<server>__…` 会提示 `MCP server <name> is still connecting; try again in a moment.`。通过 `orca attach` 挂接到 daemon 会话的 TUI 没有 MCP prompt 命令。
 

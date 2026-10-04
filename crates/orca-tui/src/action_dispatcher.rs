@@ -468,12 +468,14 @@ fn route_action(
             prompt,
             arguments,
             attachment,
+            token,
         } => {
             if let Err(not_started) = crate::mcp_prompt_actions::spawn_mcp_prompt_expansion(
                 server,
                 prompt,
                 arguments,
                 attachment,
+                token,
                 controller.mcp_servers(),
                 event_tx.clone(),
             ) {
@@ -787,6 +789,7 @@ mod tests {
                 prompt: "review_pr".to_string(),
                 arguments: vec![("pr".to_string(), "12".to_string())],
                 attachment,
+                token: 7,
             })
             .unwrap();
 
@@ -800,6 +803,7 @@ mod tests {
                 server,
                 prompt,
                 attachment: reported,
+                token: 7,
                 message: Err(crate::transcript_state::ChatMessage::Error(reason)),
             }) if server == "github"
                 && prompt == "review_pr"

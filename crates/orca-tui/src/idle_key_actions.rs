@@ -128,6 +128,12 @@ pub(crate) fn handle_idle_key(
             | IdleShortcut::ExpandToolOutput
             | IdleShortcut::ExpandAll),
         )) => {
+            // An MCP prompt still expanding is what runs here: Esc cancels
+            // it, and leaves the draft as it is.
+            if shortcut == IdleShortcut::Backtrack && state.cancel_running_mcp_prompt() {
+                vim_state.cancel_pending_command();
+                return;
+            }
             // A non-empty draft is never silently discarded: Esc clears it
             // first (same path as Ctrl+U, so undo stays consistent) and only
             // backtracks once the composer is already empty.

@@ -141,10 +141,14 @@ before then stops them.
 In the interactive TUI, `/mcp` lists the conversation's servers and how each
 stands: connected, with its tool count; failed, with the reason; needing a
 login; or disabled. `Enter` shows a server's tools, each with the name a
-permission rule uses for it and the read-only ones marked, its prompts, and
+permission rule uses for it, marked `read-only` in front when the server
+says so; its prompts with their arguments; why its prompts could not be
+listed, when `prompts/list` failed (`prompts unavailable: <reason>`); and
 the `enabled_tools`/`disabled_tools` its configuration sets. `r` reconnects
 the selected server, `l` logs in to it with OAuth and then reconnects it, and
-`o` deletes its saved login and then reconnects it. All of this works
+`o` deletes its saved login and then reconnects it. While a login waits for
+the browser, `l` again cancels it: it stops waiting at once and frees the
+callback port. All of this works
 before your first message too: the servers are connecting by then, and a
 login there reconnects the server the conversation then keeps. `/mcp` lists
 the servers of the configuration Orca started with: one added while the TUI
@@ -162,9 +166,11 @@ of the text, and a missing required argument shows the usage instead of
 running anything. Orca asks the server for the prompt (`prompts/get`) and
 sends what it returns as your message: its text parts joined by blank lines,
 the text of any embedded resource, and its images as attachments. When the
-server reports an error, the conversation says so and nothing is sent. A
-prompt can run before your first message: what it returns is that message,
-and starts the conversation. See
+server reports an error, the conversation says so and nothing is sent.
+`Esc` cancels a prompt the server has not answered yet: what it returns is
+dropped, though its request runs to its end on the server. A prompt can run
+before your first message: what it returns is that message, and starts the
+conversation. See
 [Terminal UI](terminal-ui.md#mcp-prompts) for the argument rules and limits.
 
 ## Images from tools
@@ -253,6 +259,13 @@ a rule's `mcp__` name the same way, so `mcp__GitHub__createIssue` also names
 saved (an existing config that fails to parse, for example), the call still
 runs and the rest of this session still skips the prompt; the conversation
 explains that saving the rule failed.
+
+A call follows the strictest permission rule that matches it, so a `deny` or
+`prompt` rule in your configuration that matches the tool still applies in
+later sessions, beside the saved allow rule. Orca checks for one when it
+saves the rule, matching rules as it does for a call, and the conversation
+then says `saved, but a stricter rule in your config still applies to <tool>`.
+The call still runs, and the rest of this session still skips the prompt.
 
 ## Operate safely
 

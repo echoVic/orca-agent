@@ -1105,7 +1105,8 @@ fn mcp_server_rows(
 }
 
 /// While an action runs for the server, what it does: `reconnecting…`,
-/// `waiting for browser login…` or `logging out…`. Otherwise
+/// `waiting for browser login… (l to cancel)`, `cancelling login…` or
+/// `logging out…`. Otherwise
 /// `connected · 2 tools`, `failed: {message}`, `needs login`, `disabled` or
 /// `starting`, on one line whatever the message holds.
 fn mcp_server_status_text(state: &AppState, server: &crate::types::McpPanelServer) -> String {
@@ -1122,9 +1123,11 @@ fn mcp_server_status_text(state: &AppState, server: &crate::types::McpPanelServe
 }
 
 /// The server's status in full, with the authorization url a login waits
-/// on, its tools, each with the name a permission rule gives it (read-only
-/// ones marked), its prompts, and the tool filters its config entry sets.
-/// Until a server first connects, its tools and prompts are not known yet.
+/// on; its tools, each with the name a permission rule gives it, marked
+/// `read-only` in front, so that a long name cannot push the mark out of
+/// the panel; its prompts, each with its arguments; why its prompts could
+/// not be listed; and the tool filters its config entry sets. Until a
+/// server first connects, its tools and prompts are not known yet.
 fn mcp_server_details(
     state: &AppState,
     server: &crate::types::McpPanelServer,
@@ -1139,22 +1142,39 @@ fn mcp_server_details(
             (
                 tool.name.as_str(),
                 if tool.read_only {
-                    format!("{} · read-only", tool.rule_name)
+                    format!("read-only · {}", tool.rule_name)
                 } else {
                     tool.rule_name.clone()
                 },
             )
         })
         .collect::<Vec<_>>();
+    // As the prompt's usage writes it, `review_pr <pr> [branch]`, then its
+    // description, on one line.
     let prompts = catalog
         .server_prompts(&server.key)
         .map(|prompt| {
-            (
-                prompt.name.as_str(),
-                prompt.description.as_deref().unwrap_or(""),
-            )
+            let arguments = crate::commands::mcp_prompt_argument_hint(prompt);
+            let usage = if arguments.is_empty() {
+                prompt.name.clone()
+            } else {
+                format!("{} {arguments}", prompt.name)
+            };
+            let description = prompt
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            (usage, description)
         })
         .collect::<Vec<_>>();
+    let prompts_error = catalog
+        .servers
+        .iter()
+        .find(|listed| listed.name == server.key)
+        .and_then(|listed| listed.prompts_error.as_deref());
     let config = state.mcp_server_config(&server.key);
     let filter = |tools: &Option<Vec<String>>| {
         tools.as_ref().map(|tools| {
@@ -1178,40 +1198,47 @@ fn mcp_server_details(
     .into_iter()
     .filter_map(|(label, tools)| Some((label, tools?)))
     .collect::<Vec<_>>();
-    let label_width = tools
-        .iter()
-        .map(|(name, _)| UnicodeWidthStr::width(*name))
-        .chain(
-            prompts
-                .iter()
-                .map(|(name, _)| UnicodeWidthStr::width(*name)),
-        )
-        .chain(filters.iter().map(|(label, _)| label.len()))
-        .max()
-        .unwrap_or(0)
-        .min(width / 2);
     let heading = |title: &str| {
         Line::from(Span::styled(
             title.to_string(),
             theme.accent_style().add_modifier(Modifier::BOLD),
         ))
     };
-    let row = |name: &str, detail: &str| {
-        crate::chrome::option_line(theme, false, "", name, label_width, detail, width)
+    let muted = |text: &str| {
+        crate::display_text::wrap_to_display_width(text, width)
+            .into_iter()
+            .map(|text| Line::from(Span::styled(text, theme.muted_style())))
+            .collect::<Vec<_>>()
     };
+    // Each part lines its rows up on its own: a prompt's arguments do not
+    // push the tools' rule names to the panel's edge. Among the tools, the
+    // rule names get the room they need first, and a tool's own name gives
+    // way, down to a few columns.
+    let row = |label: &str, column: usize, detail: &str| {
+        crate::chrome::option_line(theme, false, "", label, column, detail, width)
+    };
+    let widest_rule = tools
+        .iter()
+        .map(|(_, rule_name)| UnicodeWidthStr::width(rule_name.as_str()))
+        .max()
+        .unwrap_or(0);
+    let tools_column = mcp_details_column(tools.iter().map(|(name, _)| *name), width).min(
+        width
+            .saturating_sub(MCP_DETAILS_ROW_CHROME + widest_rule)
+            .max(MCP_DETAILS_MIN_TOOL_NAME),
+    );
+    let prompts_column = mcp_details_column(prompts.iter().map(|(usage, _)| usage.as_str()), width);
+    let filters_column = mcp_details_column(filters.iter().map(|(label, _)| *label), width);
 
     let mut lines = vec![Line::from(Span::styled(
         server.name.clone(),
         Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     ))];
-    lines.extend(
-        crate::display_text::wrap_to_display_width(&mcp_server_status_text(state, server), width)
-            .into_iter()
-            .map(|text| Line::from(Span::styled(text, theme.muted_style()))),
-    );
+    lines.extend(muted(&mcp_server_status_text(state, server)));
     // In full, broken wherever it must: the user may have to open it by hand.
     if let Some(crate::types::McpActionInFlight::LoggingIn {
         authorization_url: Some(url),
+        ..
     }) = state.mcp_actions_in_flight.get(&server.key)
     {
         lines.push(Line::from(Span::styled(
@@ -1231,12 +1258,9 @@ fn mcp_server_details(
         && tools.is_empty()
         && prompts.is_empty()
     {
-        lines.push(Line::from(Span::styled(
-            "Tools and prompts appear once the server connects.",
-            theme.muted_style(),
-        )));
+        lines.extend(muted("Tools and prompts appear once the server connects."));
     } else if tools.is_empty() {
-        lines.push(Line::from(Span::styled("No tools.", theme.muted_style())));
+        lines.extend(muted("No tools."));
     } else {
         let mut tools_heading = heading("Tools");
         tools_heading.spans.push(Span::styled(
@@ -1244,25 +1268,63 @@ fn mcp_server_details(
             theme.muted_style(),
         ));
         lines.push(tools_heading);
-        lines.extend(tools.iter().map(|(name, rule_name)| row(name, rule_name)));
+        // A tool's own name gives way before its rule name does.
+        lines.extend(tools.iter().map(|(name, rule_name)| {
+            row(
+                &crate::display_text::truncate_to_display_width(name, tools_column),
+                tools_column,
+                rule_name,
+            )
+        }));
+    }
+    if let Some(reason) = prompts_error {
+        lines.extend(muted(&format!("prompts unavailable: {reason}")));
     }
     if !prompts.is_empty() {
         lines.push(heading("Prompts"));
-        lines.extend(
-            prompts
-                .iter()
-                .map(|(name, description)| row(name, description)),
-        );
+        // Its arguments before its description, up to the panel's edge.
+        lines.extend(prompts.iter().map(|(usage, description)| {
+            row(
+                &crate::display_text::truncate_to_display_width(
+                    usage,
+                    width.saturating_sub(MCP_DETAILS_ROW_CHROME),
+                ),
+                prompts_column,
+                description,
+            )
+        }));
     }
     if !filters.is_empty() {
         lines.push(heading("Tool filters"));
-        lines.extend(filters.iter().map(|(label, tools)| row(label, tools)));
+        lines.extend(
+            filters
+                .iter()
+                .map(|(label, tools)| row(label, filters_column, tools)),
+        );
     }
     if lines.len() > rows {
         lines.truncate(rows.saturating_sub(1));
         lines.push(Line::from(Span::styled("…", theme.muted_style())));
     }
     lines
+}
+
+/// What a `/mcp` details row takes besides its two columns: the marker, a
+/// space, and the gap between the columns (see `chrome::option_line`).
+const MCP_DETAILS_ROW_CHROME: usize = 4;
+
+/// The fewest columns a tool's own name keeps in the `/mcp` details, however
+/// long the rule names beside it.
+const MCP_DETAILS_MIN_TOOL_NAME: usize = 12;
+
+/// How wide the first column of the `/mcp` details rows labelled `labels`
+/// is: as wide as the widest label, up to half of `width`.
+fn mcp_details_column<'a>(labels: impl Iterator<Item = &'a str>, width: usize) -> usize {
+    labels
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0)
+        .min(width / 2)
 }
 
 fn queued_preview_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line<'static>> {
@@ -7525,6 +7587,7 @@ mod tests {
     use super::*;
     use crate::protocol::{TuiEvent, TuiInteractionKey, TuiInteractionKind};
     use crate::surface_projection::SurfaceProjectionState;
+    use crate::test_support::frame_string;
     use crate::types::{ApprovalDialog, PlanApprovalDialog, SlashMenu, SlashMenuItem};
     use chrono::Utc;
     use crossbeam_channel as mpsc;
@@ -8837,31 +8900,6 @@ mod tests {
             .collect()
     }
 
-    /// Renders the whole app to a `width`x`height` `TestBackend` and returns the
-    /// buffer as a newline-joined string (each row trimmed of trailing spaces) so
-    /// dialog tests can assert on visible text with plain `contains` checks.
-    fn frame_string(state: &mut AppState, width: u16, height: u16) -> String {
-        let theme = Theme::named(ThemeName::Dark);
-        let textarea =
-            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| render(frame, state, &textarea, &theme))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer[(x, y)].symbol().to_string())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     #[test]
     fn recovery_prompt_wraps_its_description_instead_of_clipping() {
         let mut wide_state = test_state();
@@ -9279,6 +9317,7 @@ mod tests {
         crate::surface_projection::McpServerView {
             name: name.to_string(),
             status,
+            prompts_error: None,
         }
     }
 
@@ -9471,6 +9510,7 @@ mod tests {
                 "linear".to_string(),
                 McpActionInFlight::LoggingIn {
                     authorization_url: None,
+                    cancel: Default::default(),
                 },
             ),
             ("docs".to_string(), McpActionInFlight::Reconnecting),
@@ -9711,7 +9751,7 @@ mod tests {
         };
 
         assert!(
-            row("list_issues").contains("mcp__github__list_issues · read-only"),
+            row("list_issues").contains("read-only · mcp__github__list_issues"),
             "{frame}"
         );
         assert!(
@@ -9749,6 +9789,150 @@ mod tests {
         assert!(frame.contains("search_docs"), "{frame}");
         assert!(!frame.contains("enabled_tools"), "{frame}");
         assert!(!frame.contains("disabled_tools"), "{frame}");
+    }
+
+    /// `/mcp` open on the details of the `github` server, whose tools are
+    /// `list_issues` and `search_repositories_by_topic` (read-only) and
+    /// `create_issue`, and whose prompts are `review_pr <pr> [branch]` and
+    /// `summarize_discussion <discussion> [since] [until] [format]`.
+    fn github_details() -> AppState {
+        use crate::surface_projection::{McpPromptView, McpServerStatusView};
+        let mut state = test_state();
+        let prompt = |name: &str, description: &str, arguments: &[(&str, bool)]| McpPromptView {
+            server: "github".to_string(),
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            arguments: arguments
+                .iter()
+                .map(|(name, required)| (name.to_string(), *required))
+                .collect(),
+        };
+        state.mcp_catalog = crate::surface_projection::McpCatalogView {
+            servers: vec![mcp_server_view("github", McpServerStatusView::Connected)],
+            tools: vec![
+                mcp_tool_view("github", "list_issues", true),
+                mcp_tool_view("github", "create_issue", false),
+                mcp_tool_view("github", "search_repositories_by_topic", true),
+            ],
+            prompts: vec![
+                prompt(
+                    "review_pr",
+                    "Review a\npull request",
+                    &[("pr", true), ("branch", false)],
+                ),
+                prompt(
+                    "summarize_discussion",
+                    "Summarize a discussion",
+                    &[
+                        ("discussion", true),
+                        ("since", false),
+                        ("until", false),
+                        ("format", false),
+                    ],
+                ),
+            ],
+        };
+        state.mcp_dialog = Some(crate::types::McpDialog {
+            selected: 0,
+            showing_details: true,
+        });
+        state
+    }
+
+    /// The rows of `frame` inside the `/mcp` panel, without its borders.
+    fn panel_rows(frame: &str) -> Vec<&str> {
+        frame
+            .lines()
+            .filter_map(|line| {
+                let inside = line.split_once('│')?.1;
+                Some(inside.rsplit_once('│')?.0.trim())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn details_put_read_only_before_the_rule_name() {
+        let mut state = github_details();
+
+        let frame = frame_string(&mut state, 80, 30);
+
+        let rows = panel_rows(&frame);
+        let row = |text: &str| {
+            rows.iter()
+                .find(|row| row.contains(text))
+                .unwrap_or_else(|| panic!("no row shows {text}:\n{frame}"))
+        };
+        // In full, though a prompt's arguments and a tool's name are long:
+        // that name gives way instead.
+        assert!(
+            row("list_issues").ends_with("read-only · mcp__github__list_issues"),
+            "{frame}"
+        );
+        assert!(
+            row("create_issue").ends_with("mcp__github__create_issue"),
+            "{frame}"
+        );
+        assert!(!row("create_issue").contains("read-only"), "{frame}");
+        assert!(
+            row("search_rep").ends_with("read-only · mcp__github__search_repositories_by_topic"),
+            "{frame}"
+        );
+        assert!(row("search_rep").starts_with("search_reposit…"), "{frame}");
+        assert!(
+            row("Tools").contains("permission rules use the names on the right"),
+            "{frame}"
+        );
+        // Every row of the panel stays inside it.
+        for line in frame.lines().filter(|line| line.contains("mcp__github__")) {
+            assert!(line.ends_with('│'), "{line}\n{frame}");
+        }
+    }
+
+    #[test]
+    fn details_show_prompt_arguments() {
+        let mut state = github_details();
+
+        let frame = frame_string(&mut state, 80, 30);
+
+        let rows = panel_rows(&frame);
+        // One row each, its description on one line.
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("review_pr <pr> [branch]")
+                    && row.ends_with("Review a pull request")),
+            "{frame}"
+        );
+        // A long one keeps its arguments, before its description.
+        assert!(
+            rows.iter()
+                .any(|row| row
+                    .starts_with("summarize_discussion <discussion> [since] [until] [format]")),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn details_show_why_prompts_are_unavailable() {
+        let mut state = github_details();
+        state.mcp_catalog.prompts.clear();
+        state.mcp_catalog.servers[0].prompts_error =
+            Some("MCP error -32603: the prompt index is\nrebuilding".to_string());
+
+        let frame = frame_string(&mut state, 80, 30);
+
+        assert!(
+            panel_rows(&frame)
+                .contains(&"prompts unavailable: MCP error -32603: the prompt index is rebuilding"),
+            "{frame}"
+        );
+        assert!(
+            frame.contains("read-only · mcp__github__list_issues"),
+            "{frame}"
+        );
+        // A server whose prompts were listed says nothing of the kind.
+        let mut state = github_details();
+        let frame = frame_string(&mut state, 80, 30);
+        assert!(!frame.contains("prompts unavailable"), "{frame}");
     }
 
     #[test]
@@ -13228,10 +13412,12 @@ mod tests {
                 McpServerView {
                     name: "docs".to_string(),
                     status: McpServerStatusView::Connected,
+                    prompts_error: None,
                 },
                 McpServerView {
                     name: "slow".to_string(),
                     status,
+                    prompts_error: None,
                 },
             ],
             ..McpCatalogView::default()

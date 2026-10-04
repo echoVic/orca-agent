@@ -6,7 +6,7 @@ use toml_edit::{
     Array, ArrayOfTables, DocumentMut, InlineTable, Item, RawString, Table, TableLike, Value,
 };
 
-use crate::approval_rules::canonical_rule_tool;
+use crate::approval_rules::{PermissionRules, canonical_rule_tool};
 use crate::config::error_text::{data_error_text, syntax_error_text};
 use crate::config::file::USER_CONFIG_FILE;
 use crate::mcp_types::{McpServerConfig, McpTransportKind, canonical_mcp_name};
@@ -294,6 +294,44 @@ fn is_equivalent_allow_rule(table: &dyn TableLike, tool: &str) -> bool {
         .is_some_and(|written| canonical_rule_tool(written) == canonical_rule_tool(tool))
         && table.get("decision").and_then(Item::as_str) == Some("allow")
         && covers_every_call
+}
+
+/// The permission rules of the user-owned config, read as a session loads
+/// them. A session's approvals follow the strictest of the rules that match
+/// a call, so an allow rule saved there does not decide a call one of the
+/// others asks about or denies.
+pub fn user_permission_rules() -> io::Result<PermissionRules> {
+    let dir = resolve_config_dir()?;
+    user_permission_rules_in(&dir)
+}
+
+/// The permission rules of the config file under `dir`: none when there is
+/// no file, and an error, which says where the file is wrong but never what
+/// it holds, when it cannot be read.
+pub fn user_permission_rules_in(dir: &Path) -> io::Result<PermissionRules> {
+    #[derive(serde::Deserialize)]
+    struct WithPermissions {
+        #[serde(default)]
+        permissions: PermissionRules,
+    }
+
+    let path = user_config_path_in(dir);
+    let Some(content) = read_config_text(&path)? else {
+        return Ok(PermissionRules::default());
+    };
+    let unreadable = |what: String| {
+        io::Error::other(format!(
+            "{}: cannot read the config: {what}",
+            path.display()
+        ))
+    };
+    let table = content
+        .parse::<toml::Table>()
+        .map_err(|error| unreadable(syntax_error_text(error.message(), error.span(), &content)))?;
+    toml::Value::Table(table)
+        .try_into::<WithPermissions>()
+        .map(|config| config.permissions)
+        .map_err(|error| unreadable(data_error_text(&error)))
 }
 
 fn resolve_config_dir() -> io::Result<PathBuf> {
@@ -589,6 +627,46 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn the_user_permission_rules_are_read_in_every_form_the_config_takes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(USER_CONFIG_FILE);
+        assert_eq!(
+            user_permission_rules_in(dir.path()).unwrap(),
+            PermissionRules::default()
+        );
+        for rules in [
+            "[[permissions.rules]]\ntool = \"bash\"\npattern = \"rm *\"\ndecision = \"deny\"\n",
+            "[permissions]\nrules = [{ tool = \"bash\", pattern = \"rm *\", decision = \"deny\" }]\n",
+            "permissions.rules = [{ tool = \"bash\", pattern = \"rm *\", decision = \"deny\" }]\n",
+        ] {
+            std::fs::write(&path, format!("model = \"auto\"\n{rules}")).unwrap();
+            assert_eq!(
+                user_permission_rules_in(dir.path()).unwrap().rules,
+                [PermissionRule::new("bash", "rm *", Decision::Deny)],
+                "{rules}"
+            );
+        }
+
+        // One that cannot be read says where it is, not what it holds.
+        std::fs::write(
+            &path,
+            "[[permissions.rules]]\ntool = \"bash\"\ndecision = \"token-SECRET\"\n",
+        )
+        .unwrap();
+        let error = user_permission_rules_in(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(USER_CONFIG_FILE), "{error}");
+        assert!(!error.contains("SECRET"), "{error}");
+        std::fs::write(&path, "permissions = \"token-SECRET\n").unwrap();
+        let error = user_permission_rules_in(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("TOML syntax error at line 1"), "{error}");
+        assert!(!error.contains("SECRET"), "{error}");
     }
 
     #[test]

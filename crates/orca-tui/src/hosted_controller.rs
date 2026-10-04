@@ -216,6 +216,9 @@ pub(crate) fn hosted_tui_controller_loop(
     )> = None;
     let auto_recap_successes = Arc::new(Mutex::new(HashSet::<String>::new()));
 
+    // Where `/mcp` saves and deletes logins. It is set before a thread
+    // resumed at startup is announced below: `/mcp` can act from then on.
+    control.set_mcp_credentials_path(config.lock().unwrap().mcp_credentials_path.clone());
     let startup_history_mode = config.lock().unwrap().history_mode.clone();
     if typed_history_startup_eligible(&startup_history_mode, &preloaded) {
         let cfg = config.lock().unwrap().clone();
@@ -271,7 +274,6 @@ pub(crate) fn hosted_tui_controller_loop(
         let cfg = config.lock().unwrap();
         (cfg.mcp_servers.clone(), cfg.mcp_credentials_path.clone())
     };
-    control.set_mcp_credentials_path(mcp_credentials_path.clone());
     // A new conversation's thread starts with its first message, but its MCP
     // servers connect now: `/mcp` and the MCP prompt commands use them
     // meanwhile, and the first thread to start takes them.

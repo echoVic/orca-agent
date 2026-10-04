@@ -31,9 +31,9 @@ pub(crate) fn next_mcp_catalog(
     Some(next)
 }
 
-/// The catalog `registry` stands for, its first revision: what a surface
-/// that shows MCP servers no thread has taken yet lists, as a thread that
-/// takes them will. The TUI shows those that start with it so.
+/// The catalog of `registry` at its first revision, for MCP servers that no
+/// thread has taken yet: it lists them as the thread that takes them will.
+/// The TUI uses it to show the servers it starts at launch.
 pub fn mcp_catalog_snapshot(registry: &McpRegistry) -> SurfaceMcpCatalogSnapshot {
     mcp_catalog(
         registry,

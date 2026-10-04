@@ -74,8 +74,9 @@ fn open_mcp_panel(config: &RunConfig, state: &mut AppState) {
 /// prompt with the arguments `args` gives it, off the UI thread;
 /// `McpPromptExpanded` brings the expansion back to be sent as the user's
 /// message in this conversation, which starts its thread when it is the
-/// first. Arguments that do not fit the prompt show its usage instead. A
-/// run is kept in the input history, as a skill's is.
+/// first. Until it comes, `Esc` cancels the run. Arguments that do not fit
+/// the prompt show its usage instead. A run is kept in the input history,
+/// as a skill's is.
 fn run_mcp_prompt(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
@@ -108,11 +109,13 @@ fn run_mcp_prompt(
                 text: format!("running MCP prompt {command}…"),
                 expanded: false,
             });
+            let token = state.start_mcp_prompt(command);
             let _ = action_tx.send(UserAction::RunMcpPrompt {
                 server,
                 prompt,
                 arguments,
                 attachment: state.active_session_attachment,
+                token,
             });
         }
         Err(usage) => state.push_message(ChatMessage::Error(usage)),
@@ -1086,6 +1089,7 @@ mod tests {
                 .map(|name| crate::surface_projection::McpServerView {
                     name: (*name).to_string(),
                     status: crate::surface_projection::McpServerStatusView::Connected,
+                    prompts_error: None,
                 })
                 .collect(),
             ..Default::default()
@@ -1230,6 +1234,7 @@ mod tests {
         let listed = |status| McpServerView {
             name: "github".to_string(),
             status,
+            prompts_error: None,
         };
 
         // The server is connecting, and has listed no prompt yet: the
@@ -1273,6 +1278,7 @@ mod tests {
         other.mcp_catalog.servers = vec![McpServerView {
             name: "github_enterprise".to_string(),
             status: McpServerStatusView::Starting,
+            prompts_error: None,
         }];
         let mut attached = mcp_state(&[]);
         attached.mcp_catalog.servers = vec![listed(McpServerStatusView::Starting)];

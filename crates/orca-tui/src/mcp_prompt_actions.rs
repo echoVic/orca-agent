@@ -8,7 +8,8 @@
 //! `McpPromptExpanded`. The UI thread sends the message only into the
 //! conversation the prompt was run in, the way the composer sends one: at
 //! once between turns, which starts the conversation's thread when it is
-//! the first message, or queued while a turn runs.
+//! the first message, or queued while a turn runs. `Esc` while it expands
+//! cancels it: the server's answer is then dropped.
 
 use crossbeam_channel::Sender;
 use orca_core::conversation::{ImageInput, ImageSource};
@@ -25,7 +26,7 @@ use crate::protocol::{SessionAttachmentId, TuiEvent};
 use crate::queued_input::QueuedUserMessage;
 use crate::queued_input_actions::{FollowUp, dispatch_follow_up};
 use crate::transcript_state::ChatMessage;
-use crate::types::{AppState, AppStatus};
+use crate::types::{AppState, AppStatus, PendingMcpPrompt};
 
 /// A prompt's expansion as the composer holds a message (its text, then a
 /// label for each attached image), or what the conversation says instead.
@@ -36,14 +37,15 @@ const WORKER_STOPPED: &str = "its worker stopped unexpectedly";
 
 /// Starts expanding the prompt `prompt` of the MCP server the catalog names
 /// `server`, with `arguments` (name, value), for the conversation
-/// `attachment`, on `servers`, the MCP servers in view, on a worker of its
-/// own. When no worker starts, the report it would have sent comes back,
-/// for the caller to deliver.
+/// `attachment`, as the run `token`, on `servers`, the MCP servers in view,
+/// on a worker of its own. When no worker starts, the report it would have
+/// sent comes back, for the caller to deliver.
 pub(crate) fn spawn_mcp_prompt_expansion(
     server: String,
     prompt: String,
     arguments: Vec<(String, String)>,
     attachment: Option<SessionAttachmentId>,
+    token: u64,
     servers: Option<McpServers>,
     event_tx: Sender<TuiEvent>,
 ) -> Result<(), Box<TuiEvent>> {
@@ -51,9 +53,14 @@ pub(crate) fn spawn_mcp_prompt_expansion(
     std::thread::Builder::new()
         .name("orca-tui-mcp-prompt".to_string())
         .spawn(move || {
-            run_mcp_prompt_worker(server, prompt, attachment, &event_tx, |server, prompt| {
-                expand_prompt_on(servers, server, prompt, arguments)
-            });
+            run_mcp_prompt_worker(
+                server,
+                prompt,
+                attachment,
+                token,
+                &event_tx,
+                |server, prompt| expand_prompt_on(servers, server, prompt, arguments),
+            );
         })
         .map(|_| ())
         .map_err(|error| {
@@ -62,6 +69,7 @@ pub(crate) fn spawn_mcp_prompt_expansion(
                 server: failed_server,
                 prompt: failed_prompt,
                 attachment,
+                token,
                 message: Err(failed(
                     &command,
                     &format!("could not start a worker: {error}"),
@@ -103,6 +111,7 @@ fn run_mcp_prompt_worker(
     server: String,
     prompt: String,
     attachment: Option<SessionAttachmentId>,
+    token: u64,
     event_tx: &Sender<TuiEvent>,
     expand: impl FnOnce(&str, &str) -> Result<SurfaceMcpPromptExpansion, String>,
 ) {
@@ -112,6 +121,7 @@ fn run_mcp_prompt_worker(
         server,
         prompt,
         attachment,
+        token,
         message: Err(failed(&command, WORKER_STOPPED)),
     };
     report.message =
@@ -125,6 +135,7 @@ struct ReportOnDrop {
     server: String,
     prompt: String,
     attachment: Option<SessionAttachmentId>,
+    token: u64,
     message: McpPromptMessage,
 }
 
@@ -135,6 +146,7 @@ impl Drop for ReportOnDrop {
             server: std::mem::take(&mut self.server),
             prompt: std::mem::take(&mut self.prompt),
             attachment: self.attachment,
+            token: self.token,
             message: std::mem::replace(&mut self.message, Ok(Default::default())),
         });
     }
@@ -212,19 +224,75 @@ fn inline_bytes(image: &ImageInput) -> usize {
 }
 
 impl AppState {
+    /// Notes that the MCP prompt `command` (`/mcp__{server}__{prompt}`) runs
+    /// in the conversation in view, until its expansion comes back, and
+    /// returns the token its run and its expansion carry.
+    pub(crate) fn start_mcp_prompt(&mut self, command: String) -> u64 {
+        let token = self.next_mcp_prompt_token;
+        self.next_mcp_prompt_token += 1;
+        self.pending_mcp_prompts.push(PendingMcpPrompt {
+            token,
+            attachment: self.active_session_attachment,
+            command,
+            cancelled: false,
+        });
+        token
+    }
+
+    /// `Esc` while an MCP prompt run in the conversation in view is still
+    /// expanding: cancels the latest such, and says so. What the server
+    /// makes of it is dropped when it comes; its request is left to finish.
+    /// `false` when no prompt is expanding there.
+    pub(crate) fn cancel_running_mcp_prompt(&mut self) -> bool {
+        let attachment = self.active_session_attachment;
+        let Some(pending) = self
+            .pending_mcp_prompts
+            .iter_mut()
+            .rev()
+            .find(|pending| !pending.cancelled && pending.attachment == attachment)
+        else {
+            return false;
+        };
+        pending.cancelled = true;
+        let text = format!("MCP prompt {} cancelled", pending.command);
+        self.push_message(ChatMessage::System {
+            text,
+            expanded: false,
+        });
+        true
+    }
+
+    /// The expansion of the run `token` has come back: whether `Esc`
+    /// cancelled that run.
+    fn finish_mcp_prompt(&mut self, token: u64) -> bool {
+        let Some(index) = self
+            .pending_mcp_prompts
+            .iter()
+            .position(|pending| pending.token == token)
+        else {
+            return false;
+        };
+        self.pending_mcp_prompts.remove(index).cancelled
+    }
+
     /// What the worker for `/mcp__{server}__{prompt}`, run in the
-    /// conversation `attachment`, reported: `message` is sent as the
-    /// user's, or the conversation says why it is not. Only the
+    /// conversation `attachment` as the run `token`, reported: `message` is
+    /// sent as the user's, or the conversation says why it is not. Only the
     /// conversation the prompt was run in gets it; after `/new`, a fork, a
     /// resume, or a switch to a side or child conversation, and while the
-    /// session picker or setup is open, nothing is sent.
+    /// session picker or setup is open, nothing is sent. Nothing at all is
+    /// done with a run `Esc` cancelled.
     pub(crate) fn submit_mcp_prompt_expansion(
         &mut self,
         server: &str,
         prompt: &str,
         attachment: Option<SessionAttachmentId>,
+        token: u64,
         message: McpPromptMessage,
     ) {
+        if self.finish_mcp_prompt(token) {
+            return;
+        }
         let command = mcp_prompt_command(server, prompt);
         if attachment != self.active_session_attachment
             || matches!(self.status, AppStatus::SessionPicker | AppStatus::Setup)
@@ -338,6 +406,7 @@ mod tests {
             servers: vec![McpServerView {
                 name: "github".to_string(),
                 status: McpServerStatusView::Connected,
+                prompts_error: None,
             }],
             tools: Vec::new(),
             prompts: vec![McpPromptView {
@@ -358,6 +427,7 @@ mod tests {
             "github".to_string(),
             "review_pr".to_string(),
             Some(ATTACHMENT),
+            1,
             &event_tx,
             |_, _| result,
         );
@@ -396,6 +466,7 @@ mod tests {
             prompt,
             arguments,
             attachment,
+            token,
         }) = action_rx.try_recv()
         else {
             panic!("the prompt did not run");
@@ -423,7 +494,7 @@ mod tests {
 
         // The worker's report, from the action's own run.
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        run_mcp_prompt_worker(server, prompt, attachment, &event_tx, |_, _| {
+        run_mcp_prompt_worker(server, prompt, attachment, token, &event_tx, |_, _| {
             Ok(SurfaceMcpPromptExpansion {
                 text: "Review pull request 123 against main.".to_string(),
                 images: vec![png()],
@@ -730,6 +801,7 @@ mod tests {
                 "github".to_string(),
                 "review_pr".to_string(),
                 Some(ATTACHMENT),
+                1,
                 &event_tx,
                 |_, _| -> Result<SurfaceMcpPromptExpansion, String> {
                     panic!("the MCP prompt worker panicked")
@@ -862,6 +934,7 @@ done
             prompt,
             arguments,
             attachment,
+            token,
         }) = action_rx.try_recv()
         else {
             panic!("the prompt did not run");
@@ -872,6 +945,7 @@ done
             prompt,
             arguments,
             attachment,
+            token,
             Some(McpServers::Thread(Box::new(thread.clone()))),
             event_tx,
         )

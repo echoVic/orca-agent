@@ -479,13 +479,14 @@ pub enum TuiEvent {
     },
     /// What the MCP server the catalog names `server` made of its prompt
     /// `prompt`, which `/mcp__{server}__{prompt}` ran in the conversation
-    /// `attachment`: the message to send as the user's there, as the
-    /// composer holds one (its text, then a label for each attached image),
-    /// or what the conversation says instead.
+    /// `attachment` as the run `token`: the message to send as the user's
+    /// there, as the composer holds one (its text, then a label for each
+    /// attached image), or what the conversation says instead.
     McpPromptExpanded {
         server: String,
         prompt: String,
         attachment: Option<SessionAttachmentId>,
+        token: u64,
         message: Result<(String, Vec<ComposerImageAttachment>), ChatMessage>,
     },
     /// How the MCP servers that started with the TUI stand now, before a
@@ -725,9 +726,10 @@ pub enum UserAction {
         server: String,
     },
     /// `l` in `/mcp`: log in to the MCP server with OAuth in the browser,
-    /// then reconnect it.
+    /// then reconnect it. Setting `cancel` stops the login.
     McpLogin {
         server: McpServerConfig,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
     /// `o` in `/mcp`: delete the login saved for the MCP server with this
     /// config name, then reconnect it.
@@ -737,11 +739,12 @@ pub enum UserAction {
     /// `/mcp__{server}__{prompt} args…` in the conversation `attachment`:
     /// have the MCP server the catalog names `server` expand its prompt
     /// `prompt` with `arguments` (name, value), which `McpPromptExpanded`
-    /// brings back.
+    /// brings back with the run's `token`.
     RunMcpPrompt {
         server: String,
         prompt: String,
         arguments: Vec<(String, String)>,
         attachment: Option<SessionAttachmentId>,
+        token: u64,
     },
 }

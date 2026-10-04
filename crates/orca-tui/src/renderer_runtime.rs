@@ -708,6 +708,7 @@ mod tests {
                     servers: vec![McpServerView {
                         name: "docs".to_string(),
                         status,
+                        prompts_error: None,
                     }],
                     ..McpCatalogView::default()
                 },

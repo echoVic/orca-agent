@@ -131,6 +131,8 @@ pub use composer_images::TuiImage;
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    pub(crate) mod hosted_tui;
+
     use std::ffi::OsString;
     use std::path::Path;
     use std::sync::{Mutex, MutexGuard};
@@ -186,6 +188,35 @@ pub(crate) mod test_support {
             home,
             previous,
         }
+    }
+
+    /// Renders the whole app to a `width`x`height` `TestBackend` and returns the
+    /// buffer as a newline-joined string (each row trimmed of trailing spaces) so
+    /// dialog tests can assert on visible text with plain `contains` checks.
+    pub(crate) fn frame_string(
+        state: &mut crate::types::AppState,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let theme = crate::theme::Theme::named(ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, state, &textarea, &theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub(crate) fn test_run_config() -> RunConfig {

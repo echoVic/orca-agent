@@ -1287,6 +1287,235 @@ mod tests {
 
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Backtrack)));
     }
+
+    /// An idle conversation whose MCP server `github` offers the prompt
+    /// `review_pr <pr> [branch]`, where `/mcp__github__review_pr 123` has
+    /// just run. Returns it, with the token its run was sent with.
+    fn running_an_mcp_prompt(
+        action_tx: &mpsc::Sender<UserAction>,
+        action_rx: &mpsc::Receiver<UserAction>,
+    ) -> (AppState, u64) {
+        use crate::surface_projection::{
+            McpCatalogView, McpPromptView, McpServerStatusView, McpServerView,
+        };
+
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.status = AppStatus::Idle;
+        state.active_session_attachment = Some(crate::protocol::SessionAttachmentId::new(1));
+        state.push_message(ChatMessage::User("earlier message".to_string()));
+        state.mcp_catalog = McpCatalogView {
+            servers: vec![McpServerView {
+                name: "github".to_string(),
+                status: McpServerStatusView::Connected,
+                prompts_error: None,
+            }],
+            tools: Vec::new(),
+            prompts: vec![McpPromptView {
+                server: "github".to_string(),
+                name: "review_pr".to_string(),
+                description: Some("Review a pull request".to_string()),
+                arguments: vec![("pr".to_string(), true), ("branch".to_string(), false)],
+            }],
+        };
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        crate::slash_command_actions::handle_slash_command(
+            "/mcp__github__review_pr 123",
+            &mut config,
+            &shared,
+            &mut state,
+            action_tx,
+        );
+        let Ok(UserAction::RunMcpPrompt { token, .. }) = action_rx.try_recv() else {
+            panic!("the prompt did not run");
+        };
+        (state, token)
+    }
+
+    /// What the server made of `/mcp__github__review_pr 123`, run as `token`
+    /// in the conversation of `running_an_mcp_prompt`.
+    fn the_prompt_expanded(token: u64) -> crate::protocol::TuiEvent {
+        crate::protocol::TuiEvent::McpPromptExpanded {
+            server: "github".to_string(),
+            prompt: "review_pr".to_string(),
+            attachment: Some(crate::protocol::SessionAttachmentId::new(1)),
+            token,
+            message: Ok(("Review pull request 123.".to_string(), Vec::new())),
+        }
+    }
+
+    fn last_notice(state: &AppState) -> Option<&str> {
+        match state.transcript.messages.last() {
+            Some(ChatMessage::System { text, .. }) => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn esc_cancels_a_running_prompt_expansion() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let (mut state, token) = running_an_mcp_prompt(&action_tx, &action_rx);
+        let mut config = test_run_config();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert_eq!(
+            last_notice(&state),
+            Some("MCP prompt /mcp__github__review_pr cancelled")
+        );
+        assert!(action_rx.try_recv().is_err(), "Esc also backtracked");
+
+        // What the server made of it, when it comes, goes nowhere.
+        let shown = state.transcript.messages.len();
+        state.update(the_prompt_expanded(token));
+        assert!(
+            action_rx.try_recv().is_err(),
+            "the cancelled expansion was sent"
+        );
+        assert_eq!(state.transcript.messages.len(), shown);
+        assert_eq!(state.status, AppStatus::Idle);
+
+        // With no prompt left to cancel, Esc backtracks again.
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Backtrack)));
+    }
+
+    #[test]
+    fn esc_cancels_a_running_prompt_before_it_clears_the_draft() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let (mut state, token) = running_an_mcp_prompt(&action_tx, &action_rx);
+        let mut config = test_run_config();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea =
+            crate::composer_textarea::make_textarea_with_text("next question", &vim, &theme);
+
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert_eq!(
+            last_notice(&state),
+            Some("MCP prompt /mcp__github__review_pr cancelled")
+        );
+        assert_eq!(
+            crate::composer_textarea::textarea_text(&textarea),
+            "next question"
+        );
+        state.update(the_prompt_expanded(token));
+        assert!(
+            action_rx.try_recv().is_err(),
+            "the cancelled expansion was sent"
+        );
+
+        // The next Esc is the draft's.
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert!(textarea.is_empty());
+    }
+
+    #[test]
+    fn esc_interrupts_a_turn_and_closes_a_panel_before_it_cancels_a_prompt() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut config = test_run_config();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+
+        // While a turn runs, Esc interrupts it, and the prompt runs on.
+        let (mut state, token) = running_an_mcp_prompt(&action_tx, &action_rx);
+        state.enter_running();
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+        assert_ne!(
+            last_notice(&state),
+            Some("MCP prompt /mcp__github__review_pr cancelled")
+        );
+        state.set_status(AppStatus::Idle);
+        state.update(the_prompt_expanded(token));
+        assert!(
+            matches!(
+                action_rx.try_recv(),
+                Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "Review pull request 123."
+            ),
+            "the expansion was not sent"
+        );
+
+        // An open panel closes first, and the prompt runs on.
+        while action_rx.try_recv().is_ok() {}
+        let (mut state, _token) = running_an_mcp_prompt(&action_tx, &action_rx);
+        state.mcp_dialog = Some(crate::types::McpDialog {
+            selected: 0,
+            showing_details: false,
+        });
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert!(state.mcp_dialog.is_none(), "the panel stayed open");
+        assert!(action_rx.try_recv().is_err());
+        assert_ne!(
+            last_notice(&state),
+            Some("MCP prompt /mcp__github__review_pr cancelled")
+        );
+        // The next Esc is the prompt's.
+        press_esc(
+            &mut state,
+            &mut config,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+        assert_eq!(
+            last_notice(&state),
+            Some("MCP prompt /mcp__github__review_pr cancelled")
+        );
+    }
 }
 
 /// # Esc precedence
@@ -1299,7 +1528,7 @@ mod tests {
 /// same keypress. **A new Esc meaning is a new row in the stack below, not
 /// a new branch dropped in wherever seems convenient.**
 ///
-/// At the level the spec asks for, Esc has five cases:
+/// At the level the spec asks for, Esc has six cases:
 ///
 ///   1. something is open on top of the conversation -> close only the
 ///      topmost one
@@ -1308,6 +1537,8 @@ mod tests {
 ///   4. Idle, and the composer is empty                -> backtrack
 ///   5. the session picker is open                     -> return to the
 ///      conversation
+///   6. Idle, and an MCP prompt run in this conversation is still
+///      expanding -> cancel it, the latest first, before 3 and 4
 ///
 /// Case 1's "topmost" is itself an ordered stack spanning both stages. In
 /// source order:
@@ -1341,8 +1572,11 @@ mod tests {
 ///   17. the questionnaire (user-input dialog) -> backs out one step at a
 ///       time
 ///   18. the mention popup / slash menu (inside Idle handling)
-///   19. Idle: case 3 (clear a non-empty draft) or case 4 (backtrack)
-///   20. Running/Compacting: case 2 (interrupt)
+///   19. Idle: case 6 (cancel an MCP prompt still expanding; the draft
+///       stays), else case 3 (clear a non-empty draft) or case 4
+///       (backtrack)
+///   20. Running/Compacting: case 2 (interrupt). An MCP prompt still
+///       expanding runs on; once the turn has stopped, Esc cancels it.
 pub(crate) fn handle_key_event_preflight<F>(
     key: KeyEvent,
     state: &mut AppState,

@@ -9,6 +9,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::Sender;
 use orca_core::config::mcp_credentials::delete_mcp_credential;
@@ -57,7 +59,9 @@ pub(crate) fn spawn_mcp_server_action(
                 &servers,
                 credentials_path.as_deref(),
                 &event_tx,
-                |server| log_in_with_browser(server, credentials_path.as_deref(), &event_tx),
+                |server, cancel| {
+                    log_in_with_browser(server, cancel, credentials_path.as_deref(), &event_tx)
+                },
             );
         })
         .map(|_| ())
@@ -71,7 +75,7 @@ pub(crate) fn spawn_mcp_server_action(
 fn action_server_name(action: &UserAction) -> Option<&str> {
     match action {
         UserAction::McpReconnect { server } | UserAction::McpLogout { server } => Some(server),
-        UserAction::McpLogin { server } => Some(&server.name),
+        UserAction::McpLogin { server, .. } => Some(&server.name),
         _ => None,
     }
 }
@@ -83,7 +87,7 @@ fn run_mcp_server_worker(
     servers: &dyn Fn() -> Option<McpServers>,
     credentials_path: Option<&Path>,
     event_tx: &Sender<TuiEvent>,
-    log_in: impl FnOnce(&McpServerConfig) -> Result<(), String>,
+    log_in: impl FnOnce(&McpServerConfig, &Arc<AtomicBool>) -> Result<(), String>,
 ) {
     let Some(name) = action_server_name(&action) else {
         return;
@@ -112,13 +116,14 @@ impl Drop for FinishOnDrop {
 }
 
 /// Runs `action` on the MCP servers `servers` gives when it gets to them,
-/// logging in with `log_in`, and deleting logins from `credentials_path`.
+/// logging in with `log_in`, which a login's cancel flag stops, and deleting
+/// logins from `credentials_path`.
 fn run_mcp_server_action(
     action: UserAction,
     servers: &dyn Fn() -> Option<McpServers>,
     credentials_path: Option<&Path>,
     event_tx: &Sender<TuiEvent>,
-    log_in: impl FnOnce(&McpServerConfig) -> Result<(), String>,
+    log_in: impl FnOnce(&McpServerConfig, &Arc<AtomicBool>) -> Result<(), String>,
 ) {
     let notice = |text: String| {
         let _ = event_tx.send(TuiEvent::Notice(text));
@@ -128,10 +133,11 @@ fn run_mcp_server_action(
     let reconnect = |server: &str| reconnect_on(servers(), server);
     match action {
         UserAction::McpReconnect { server } => notice(reconnect(&server)),
-        UserAction::McpLogin { server } => log_in_then_reconnect(
+        UserAction::McpLogin { server, cancel } => log_in_then_reconnect(
             &server.name,
-            || log_in(&server),
+            || log_in(&server, &cancel),
             || reconnect(&server.name),
+            &cancel,
             &notice,
         ),
         UserAction::McpLogout { server } => {
@@ -175,8 +181,7 @@ fn reconnect_on_thread(thread: &RuntimeThreadHandle, server: &str) -> String {
 
 /// Reconnects `server` (its config or catalog name) on the MCP servers that
 /// started with the TUI, and says what that left it as, as the thread's
-/// catalog would: by its status there, or, for a name no server has, by
-/// the reconnect's error.
+/// catalog would (see [`reconnect_notice`]).
 fn reconnect_prestarted(registry: &orca_mcp::McpRegistry, server: &str) -> String {
     let result = registry.reconnect_server(server);
     let name = orca_mcp::canonical_server_name(server);
@@ -193,18 +198,29 @@ fn reconnect_prestarted(registry: &orca_mcp::McpRegistry, server: &str) -> Strin
             std::thread::sleep(OVERTAKEN_RECONNECT_POLL);
         }
     }
-    let catalog = McpCatalogView::from_registry(registry);
-    match (
-        catalog.servers.iter().find(|listed| listed.name == name),
-        result,
-    ) {
-        (Some(listed), _) => status_notice(
+    reconnect_notice(server, &McpCatalogView::from_registry(registry), result)
+}
+
+/// What a reconnect of `server` (its config or catalog name) that ended
+/// with `result` says, `catalog` being how the servers stand after it: the
+/// status the catalog gives the server, with its tools. For a server the
+/// catalog does not list, such as a name no server has, it is what the
+/// reconnect itself came to.
+fn reconnect_notice(server: &str, catalog: &McpCatalogView, result: Result<(), String>) -> String {
+    let name = orca_mcp::canonical_server_name(server);
+    match catalog.servers.iter().find(|listed| listed.name == name) {
+        Some(listed) => status_notice(
             server,
             &listed.status,
             Some(catalog.server_tools(&name).count()),
         ),
-        (None, Err(error)) => status_notice(server, &McpServerStatusView::Failed(error), None),
-        (None, Ok(())) => reconnect_failed(server, MCP_SERVERS_UNAVAILABLE),
+        None => {
+            let status = match result {
+                Ok(()) => McpServerStatusView::Connected,
+                Err(error) => McpServerStatusView::Failed(error),
+            };
+            status_notice(server, &status, None)
+        }
     }
 }
 
@@ -213,9 +229,12 @@ fn reconnect_prestarted(registry: &orca_mcp::McpRegistry, server: &str) -> Strin
 const OVERTAKEN_RECONNECT_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Logs in to `server` in the browser, saving the tokens in
-/// `credentials_path` under its config name, as `orca mcp login` does.
+/// `credentials_path` under its config name, as `orca mcp login` does,
+/// until `cancel` is set: a login waiting for the browser then stops, and
+/// frees its callback's port.
 fn log_in_with_browser(
     server: &McpServerConfig,
+    cancel: &Arc<AtomicBool>,
     credentials_path: Option<&Path>,
     event_tx: &Sender<TuiEvent>,
 ) -> Result<(), String> {
@@ -225,7 +244,13 @@ fn log_in_with_browser(
         event_tx.clone(),
         orca_platform::process::open_url,
     );
-    orca_mcp::oauth::login(server, McpLoginOptions::new(credentials_path, open_browser))
+    orca_mcp::oauth::login(
+        server,
+        McpLoginOptions {
+            cancel: Arc::clone(cancel),
+            ..McpLoginOptions::new(credentials_path, open_browser)
+        },
+    )
 }
 
 /// Opens the authorization url with `open_url`, after handing it to `/mcp`
@@ -251,11 +276,13 @@ fn browser_opener(
 
 /// `l`: logs in to `server` with `login`, and once that succeeds reconnects
 /// it with `reconnect`, whose notice it shows. A login that fails is shown,
-/// and nothing is reconnected.
+/// and nothing is reconnected; one that `cancel` stopped is not, as `/mcp`
+/// said so when it was cancelled.
 fn log_in_then_reconnect(
     server: &str,
     login: impl FnOnce() -> Result<(), String>,
     reconnect: impl FnOnce() -> String,
+    cancel: &AtomicBool,
     notice: &dyn Fn(String),
 ) {
     notice(format!("waiting for browser login for {server}…"));
@@ -264,6 +291,7 @@ fn log_in_then_reconnect(
             notice(format!("logged in to MCP server {server}"));
             notice(reconnect());
         }
+        Err(_) if cancel.load(Ordering::Acquire) => {}
         Err(error) => notice(error),
     }
 }
@@ -358,6 +386,7 @@ mod tests {
                     reconnects.set(reconnects.get() + 1);
                     "MCP server linear: connected · 2 tools".to_string()
                 },
+                &AtomicBool::new(false),
                 notice,
             )
         });
@@ -380,6 +409,7 @@ mod tests {
                 "linear",
                 || Err("timed out waiting for the browser login for MCP server 'linear'".into()),
                 || -> String { panic!("a failed login reconnected the server") },
+                &AtomicBool::new(false),
                 notice,
             )
         });
@@ -466,7 +496,7 @@ mod tests {
         };
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
 
-        run_mcp_server_worker(logout(), &|| None, Some(&credentials), &event_tx, |_| {
+        run_mcp_server_worker(logout(), &|| None, Some(&credentials), &event_tx, |_, _| {
             unreachable!("a logout logs in")
         });
 
@@ -483,7 +513,7 @@ mod tests {
         );
 
         // A config without the path, as a test's, says so.
-        run_mcp_server_worker(logout(), &|| None, None, &event_tx, |_| {
+        run_mcp_server_worker(logout(), &|| None, None, &event_tx, |_, _| {
             unreachable!("a logout logs in")
         });
         assert_eq!(
@@ -500,6 +530,7 @@ mod tests {
                     url: Some(url.to_string()),
                     ..Default::default()
                 },
+                &Arc::default(),
                 None,
                 &event_tx,
             ),
@@ -507,9 +538,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_controller_deletes_logins_where_the_config_says() {
+        use crate::test_support::hosted_tui::{Tui, config, notices};
+
+        // The Orca home's own credentials file has no login.
+        let home = crate::test_support::isolate_orca_home();
+        let configured = tempfile::tempdir().unwrap();
+        let credentials = configured.path().join(MCP_CREDENTIALS_FILE);
+        let url = "https://linear.example/mcp";
+        save_mcp_credential(&credentials, "linear", &credential(url)).unwrap();
+        let mut config = config(
+            home.path(),
+            // Listed, and never connected.
+            vec![McpServerConfig {
+                name: "linear".to_string(),
+                transport: orca_core::mcp_types::McpTransportKind::Http,
+                url: Some(url.to_string()),
+                disabled: true,
+                ..Default::default()
+            }],
+        );
+        config.mcp_credentials_path = Some(credentials.clone());
+        let mut tui = Tui::start(config);
+        tui.until("the server to be listed", |state| {
+            !state.mcp_catalog.servers.is_empty()
+        });
+
+        // `o`, through the dispatcher the controller gave the path.
+        tui.command("/mcp");
+        tui.press('o');
+        tui.until("the logout to end", |state| {
+            state.mcp_actions_in_flight.is_empty()
+        });
+
+        assert!(
+            notices(&tui.state).contains(&"logged out of MCP server linear"),
+            "{:?}",
+            notices(&tui.state)
+        );
+        assert!(
+            load_mcp_credential(&credentials, "linear", url)
+                .unwrap()
+                .is_none()
+        );
+        tui.quit();
+    }
+
     /// `orca mcp add linear --url …`, `orca`, `/mcp`, `l`, before the first
-    /// message. Returns the TUI and the login `l` sent.
-    fn login_pressed_before_the_first_message() -> (crate::types::AppState, UserAction) {
+    /// message. Returns the TUI, the login `l` sent, and what the TUI sends
+    /// next.
+    fn login_pressed_before_the_first_message() -> (
+        crate::types::AppState,
+        UserAction,
+        crossbeam_channel::Receiver<UserAction>,
+    ) {
         use std::sync::{Arc, Mutex};
 
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -528,6 +611,7 @@ mod tests {
             servers: vec![McpServerView {
                 name: "linear".to_string(),
                 status: McpServerStatusView::NeedsLogin,
+                prompts_error: None,
             }],
             ..McpCatalogView::default()
         }));
@@ -552,14 +636,158 @@ mod tests {
             &action_tx,
         );
         let action = action_rx.try_recv().expect("`l` sent a login");
-        assert!(matches!(&action, UserAction::McpLogin { server } if server.name == "linear"));
+        assert!(matches!(&action, UserAction::McpLogin { server, .. } if server.name == "linear"));
         assert!(state.mcp_actions_in_flight.contains_key("linear"));
-        (state, action)
+        (state, action, action_rx)
+    }
+
+    /// The `/mcp` panel `state` shows, at 100x30, a row per line.
+    fn panel_rows(state: &mut crate::types::AppState) -> Vec<String> {
+        crate::test_support::frame_string(state, 100, 30)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn press(state: &mut crate::types::AppState, key: char) {
+        let action_tx = state.event_tx.clone();
+        crate::mcp_dialog_actions::handle_mcp_dialog_key(
+            &crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(key),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            state,
+            &action_tx,
+        );
+    }
+
+    fn last_notice(state: &crate::types::AppState) -> Option<&str> {
+        match state.transcript.messages.last() {
+            Some(crate::transcript_state::ChatMessage::System { text, .. }) => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn pressing_l_again_cancels_a_waiting_login() {
+        let (mut state, login, sent) = login_pressed_before_the_first_message();
+        let UserAction::McpLogin { cancel, .. } = &login else {
+            unreachable!("`l` sent a login");
+        };
+        let cancel = Arc::clone(cancel);
+        assert!(
+            panel_rows(&mut state)
+                .iter()
+                .any(|row| row.contains("linear")
+                    && row.contains("waiting for browser login… (l to cancel)")),
+            "{}",
+            panel_rows(&mut state).join("\n")
+        );
+        // The login waits for the browser, as `orca_mcp::oauth::login` does,
+        // until it is cancelled.
+        let (event_tx, events) = crossbeam_channel::unbounded();
+        let worker = std::thread::spawn(move || {
+            run_mcp_server_worker(login, &|| None, None, &event_tx, |server, cancel| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    if std::time::Instant::now() > deadline {
+                        return Err("the login was never cancelled".to_string());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(format!("login to MCP server '{}' cancelled", server.name))
+            });
+        });
+        let waiting = events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the login says it waits");
+        assert!(
+            matches!(&waiting, TuiEvent::Notice(text) if text == "waiting for browser login for linear…"),
+            "{waiting:?}"
+        );
+        state.update(waiting);
+
+        // `r` and `o` still wait for it to end.
+        for key in ['r', 'o'] {
+            press(&mut state, key);
+            assert!(sent.try_recv().is_err(), "'{key}' sent an action");
+            assert_eq!(
+                last_notice(&state),
+                Some("an MCP action for linear is already running")
+            );
+        }
+        assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
+
+        // `l` cancels it.
+        press(&mut state, 'l');
+        assert!(sent.try_recv().is_err(), "`l` started another login");
+        assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            last_notice(&state),
+            Some("login to MCP server linear cancelled")
+        );
+        assert!(
+            panel_rows(&mut state)
+                .iter()
+                .any(|row| row.contains("linear") && row.contains("cancelling login…")),
+            "{}",
+            panel_rows(&mut state).join("\n")
+        );
+
+        // The login ends at that, and its server is freed; the conversation
+        // has said all there is to say of it.
+        worker.join().expect("the login worker");
+        let rest = events.try_iter().collect::<Vec<_>>();
+        assert!(notices_among(rest.iter().cloned()).is_empty(), "{rest:?}");
+        for event in rest {
+            state.update(event);
+        }
+        assert!(state.mcp_actions_in_flight.is_empty());
+        assert_eq!(
+            last_notice(&state),
+            Some("login to MCP server linear cancelled")
+        );
+
+        // `l` logs in again.
+        press(&mut state, 'l');
+        assert!(matches!(
+            sent.try_recv(),
+            Ok(UserAction::McpLogin { server, cancel }) if server.name == "linear"
+                && !cancel.load(std::sync::atomic::Ordering::SeqCst)
+        ));
+    }
+
+    #[test]
+    fn the_browser_login_stops_once_cancelled() {
+        let home = tempfile::tempdir().unwrap();
+        // Nothing listens there: a login that started would fail to reach it.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .unwrap()
+            .port();
+        let server = orca_core::mcp_types::McpServerConfig {
+            name: "linear".to_string(),
+            transport: orca_core::mcp_types::McpTransportKind::Http,
+            url: Some(format!("http://127.0.0.1:{port}/mcp")),
+            ..Default::default()
+        };
+        let (event_tx, events) = crossbeam_channel::unbounded();
+
+        assert_eq!(
+            log_in_with_browser(
+                &server,
+                &Arc::new(AtomicBool::new(true)),
+                Some(&home.path().join(MCP_CREDENTIALS_FILE)),
+                &event_tx,
+            ),
+            Err("login to MCP server 'linear' cancelled".to_string())
+        );
+        assert!(events.try_recv().is_err(), "the browser opened");
     }
 
     #[test]
     fn a_login_that_panics_still_frees_its_server() {
-        let (mut state, action) = login_pressed_before_the_first_message();
+        let (mut state, action, _sent) = login_pressed_before_the_first_message();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
 
         let worker = std::thread::spawn(move || {
@@ -568,7 +796,7 @@ mod tests {
                 &|| None,
                 None,
                 &event_tx,
-                |_| -> Result<(), String> { panic!("the browser login panicked") },
+                |_, _| -> Result<(), String> { panic!("the browser login panicked") },
             )
         });
 
@@ -650,6 +878,20 @@ mod tests {
         assert_eq!(
             reconnect_failed("docs", "the conversation is unavailable"),
             "failed to reconnect MCP server docs: the conversation is unavailable"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_says_how_it_went_for_a_server_the_catalog_does_not_list() {
+        let unlisted = McpCatalogView::default();
+
+        assert_eq!(
+            reconnect_notice("docs", &unlisted, Ok(())),
+            "MCP server docs: connected"
+        );
+        assert_eq!(
+            reconnect_notice("docs", &unlisted, Err("no MCP server named 'docs'".into())),
+            "MCP server docs: failed: no MCP server named 'docs'"
         );
     }
 
@@ -875,7 +1117,7 @@ done
     #[cfg(unix)]
     #[test]
     fn a_prestart_reconnect_overtaken_says_how_the_server_ended_up() {
-        use crate::prestart_mcp::tests::with_servers::{
+        use crate::test_support::hosted_tui::{
             launches, mcp_server, wait_for_launches, wait_until_gone,
         };
 
@@ -906,7 +1148,7 @@ done
     #[cfg(unix)]
     #[test]
     fn a_login_before_the_first_message_reconnects_the_prestarted_server() {
-        use crate::prestart_mcp::tests::with_servers::{launches, mcp_server, wait_until_gone};
+        use crate::test_support::hosted_tui::{launches, mcp_server, wait_until_gone};
 
         let fixture = tempfile::tempdir().unwrap();
         // It wants a login, which it stands for by refusing to start.
@@ -918,11 +1160,14 @@ done
         let servers = McpServers::Prestarted(registry.clone());
 
         run_mcp_server_worker(
-            UserAction::McpLogin { server },
+            UserAction::McpLogin {
+                server,
+                cancel: Arc::default(),
+            },
             &|| Some(servers.clone()),
             None,
             &event_tx,
-            |_| std::fs::remove_file(fixture.path().join("refuse")).map_err(|e| e.to_string()),
+            |_, _| std::fs::remove_file(fixture.path().join("refuse")).map_err(|e| e.to_string()),
         );
 
         assert_eq!(
@@ -942,7 +1187,7 @@ done
     #[cfg(unix)]
     #[test]
     fn a_login_that_finishes_after_the_first_message_updates_the_thread() {
-        use crate::prestart_mcp::tests::with_servers::{
+        use crate::test_support::hosted_tui::{
             Tui, WAIT, config, launches, mcp_server, status_of, wait_until_gone,
         };
 
@@ -966,11 +1211,14 @@ done
         let refuse = fixture.path().join("refuse");
         let login = std::thread::spawn(move || {
             run_mcp_server_worker(
-                UserAction::McpLogin { server },
+                UserAction::McpLogin {
+                    server,
+                    cancel: Arc::default(),
+                },
                 &|| control.mcp_servers(),
                 None,
                 &event_tx,
-                |_| {
+                |_, _| {
                     browser_rx
                         .recv_timeout(WAIT)
                         .map_err(|_| "the browser never came back".to_string())?;

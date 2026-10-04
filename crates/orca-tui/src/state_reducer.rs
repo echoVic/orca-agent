@@ -761,8 +761,9 @@ impl AppState {
                 server,
                 prompt,
                 attachment,
+                token,
                 message,
-            } => self.submit_mcp_prompt_expansion(&server, &prompt, attachment, message),
+            } => self.submit_mcp_prompt_expansion(&server, &prompt, attachment, token, message),
             // Once a thread's catalog is in view the servers are its: a
             // prestart catalog sent before it took them is out of date.
             TuiEvent::McpCatalogPrestart(catalog) => {
@@ -771,8 +772,9 @@ impl AppState {
                 }
             }
             TuiEvent::McpLoginUrl { server, url } => {
-                if let Some(crate::types::McpActionInFlight::LoggingIn { authorization_url }) =
-                    self.mcp_actions_in_flight.get_mut(&server)
+                if let Some(crate::types::McpActionInFlight::LoggingIn {
+                    authorization_url, ..
+                }) = self.mcp_actions_in_flight.get_mut(&server)
                 {
                     *authorization_url = Some(url);
                 }

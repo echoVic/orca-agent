@@ -63,6 +63,9 @@ pub struct McpCatalogView {
 pub(crate) struct McpServerView {
     pub(crate) name: String,
     pub(crate) status: McpServerStatusView,
+    /// Why its prompts could not be listed, when it connected but
+    /// `prompts/list` failed.
+    pub(crate) prompts_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,6 +108,10 @@ impl McpCatalogView {
                 .map(|server| McpServerView {
                     name: server.name.as_str().to_string(),
                     status: McpServerStatusView::from_surface(&server.status),
+                    prompts_error: server
+                        .prompts_error
+                        .as_ref()
+                        .map(|reason| reason.as_str().to_string()),
                 })
                 .collect(),
             tools: catalog
@@ -2903,6 +2910,10 @@ mod tests {
             listed("linear", SurfaceMcpServerStatus::NeedsLogin),
             listed("archive", SurfaceMcpServerStatus::Disabled),
             listed("slow", SurfaceMcpServerStatus::Starting),
+            SurfaceMcpServer {
+                prompts_error: Some(DisplayText::new("MCP error -32603: index rebuilding")),
+                ..listed("wiki", SurfaceMcpServerStatus::Ready)
+            },
         ];
         snapshot.mcp_catalog.tools = vec![
             tool("docs", "search", true),
@@ -2940,6 +2951,7 @@ mod tests {
         let server = |name: &str, status| McpServerView {
             name: name.to_string(),
             status,
+            prompts_error: None,
         };
         assert_eq!(
             state.mcp_catalog,
@@ -2953,6 +2965,10 @@ mod tests {
                     server("linear", McpServerStatusView::NeedsLogin),
                     server("archive", McpServerStatusView::Disabled),
                     server("slow", McpServerStatusView::Starting),
+                    McpServerView {
+                        prompts_error: Some("MCP error -32603: index rebuilding".to_string()),
+                        ..server("wiki", McpServerStatusView::Connected)
+                    },
                 ],
                 tools: vec![
                     McpToolView {

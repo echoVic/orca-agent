@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 #[cfg(test)]
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -286,11 +287,55 @@ pub(crate) struct McpPanelServer {
 pub(crate) enum McpActionInFlight {
     Reconnecting,
     /// Waiting for the browser, with the authorization url once the login
-    /// has asked the browser to open it.
+    /// has asked the browser to open it, until `cancel` stops it.
     LoggingIn {
         authorization_url: Option<String>,
+        cancel: McpLoginCancel,
     },
     LoggingOut,
+}
+
+/// What stops a login `/mcp` runs: `l` again sets it, and the login, which
+/// checks it while it waits for the browser, then ends.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct McpLoginCancel(Arc<AtomicBool>);
+
+impl McpLoginCancel {
+    /// The flag the login checks.
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
+
+    /// Stops the login; `false` when it was stopped already.
+    pub(crate) fn cancel(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Two are equal when they stop the same login.
+impl PartialEq for McpLoginCancel {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for McpLoginCancel {}
+
+/// An MCP prompt run in the conversation `attachment`, whose expansion has
+/// not come back yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingMcpPrompt {
+    /// What its run and its expansion carry, to find each other by.
+    pub(crate) token: u64,
+    pub(crate) attachment: Option<crate::protocol::SessionAttachmentId>,
+    /// `/mcp__{server}__{prompt}`.
+    pub(crate) command: String,
+    /// `Esc` cancelled it: its expansion is dropped when it comes.
+    pub(crate) cancelled: bool,
 }
 
 impl McpActionInFlight {
@@ -298,7 +343,8 @@ impl McpActionInFlight {
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Reconnecting => "reconnecting…",
-            Self::LoggingIn { .. } => "waiting for browser login…",
+            Self::LoggingIn { cancel, .. } if cancel.is_cancelled() => "cancelling login…",
+            Self::LoggingIn { .. } => "waiting for browser login… (l to cancel)",
             Self::LoggingOut => "logging out…",
         }
     }
@@ -558,6 +604,11 @@ pub struct AppState {
     /// server's catalog name. Each worker's `McpActionFinished` clears its
     /// entry, however the action went.
     pub(crate) mcp_actions_in_flight: std::collections::HashMap<String, McpActionInFlight>,
+    /// The MCP prompts run whose expansions have not come back, oldest
+    /// first.
+    pub(crate) pending_mcp_prompts: Vec<PendingMcpPrompt>,
+    /// The token the next MCP prompt run gets.
+    pub(crate) next_mcp_prompt_token: u64,
     /// The session belongs to a daemon this TUI attached to (`orca attach`),
     /// whose MCP servers it cannot manage.
     pub(crate) attached_session: bool,
@@ -974,6 +1025,8 @@ impl AppState {
             surface_mcp_catalog_applied: false,
             mcp_server_configs: Vec::new(),
             mcp_actions_in_flight: std::collections::HashMap::new(),
+            pending_mcp_prompts: Vec::new(),
+            next_mcp_prompt_token: 1,
             attached_session: false,
             full_access_confirmation: None,
             user_input_dialog: None,

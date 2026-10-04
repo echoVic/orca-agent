@@ -347,7 +347,7 @@ fn can_type_mcp_prompt(prompt: &McpPromptView) -> bool {
 
 /// `prompt`'s arguments as its usage shows them, in order: `<required>`,
 /// `[optional]`.
-fn mcp_prompt_argument_hint(prompt: &McpPromptView) -> String {
+pub(crate) fn mcp_prompt_argument_hint(prompt: &McpPromptView) -> String {
     prompt
         .arguments
         .iter()
