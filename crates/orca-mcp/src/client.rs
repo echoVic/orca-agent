@@ -13,10 +13,10 @@ use crate::legacy_sse::MCP_SSE_EVENT_STREAM_CLOSED;
 use crate::transport::{self, McpElicitationHandler, McpTransport};
 use orca_core::conversation::ImageInput;
 use orca_core::mcp_types::{
-    CallToolResult, GetPromptResult, McpContent, McpPrompt, McpPromptContent, McpResource,
-    McpResourceTemplate, McpServerConfig, McpTool, McpToolRef, McpTransportKind, PromptsListResult,
-    ReadResourceResult, ResourceTemplatesListResult, ResourcesListResult, ToolsListResult,
-    canonical_mcp_name, tool_is_enabled,
+    CallToolResult, GetPromptResult, McpContent, McpPrompt, McpPromptContent, McpPromptDescriptor,
+    McpResource, McpResourceTemplate, McpServerConfig, McpTool, McpToolRef, McpTransportKind,
+    PromptsListResult, ReadResourceResult, ResourceTemplatesListResult, ResourcesListResult,
+    ToolsListResult, canonical_mcp_name, tool_is_enabled,
 };
 use orca_core::tool_images::tool_image;
 
@@ -75,7 +75,9 @@ impl Drop for McpChangeSubscription {
 /// How a configured MCP server stands.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum McpServerState {
-    /// Its first connection is still being made.
+    /// A connection is being made, and it has no client meanwhile: its
+    /// first, or that of a stdio server being reconnected, which is stopped
+    /// first.
     Starting,
     /// Connected, with its tools registered.
     Ready,
@@ -514,12 +516,15 @@ fn connect_server_with_transport(
 ) -> Result<ConnectedServer, String> {
     let initialize_result = transport.initialize()?;
     let capabilities = McpServerCapabilities::from_initialize_result(&initialize_result);
-    let result = transport.list_tools()?;
-    let list: ToolsListResult = serde_json::from_value(result)
-        .map_err(|error| format!("invalid tools/list result for '{server_name}': {error}"))?;
+    let mut warnings = Vec::new();
+    let (listed_tools, warning) = collect_pages(|cursor| {
+        let list: ToolsListResult = serde_json::from_value(transport.list_tools(cursor)?)
+            .map_err(|error| format!("invalid tools/list result for '{server_name}': {error}"))?;
+        Ok((list.tools, list.next_cursor))
+    })?;
+    warnings.extend(warning.map(|warning| incomplete_list(server_name, "tools/list", &warning)));
 
-    let tools = list
-        .tools
+    let tools = listed_tools
         .into_iter()
         .filter(|tool| tool_is_enabled(config, &tool.name))
         .map(|tool| {
@@ -546,13 +551,21 @@ fn connect_server_with_transport(
     };
     // A server whose prompts cannot be listed still serves its tools: a
     // failure that stopped its transport has connected it again.
-    let mut warnings = Vec::new();
     let (prompts, prompts_error) = if client.capabilities.prompts {
-        match client
-            .list_prompts()
-            .and_then(|result| listed_prompts(server_name, result, &mut warnings))
-        {
-            Ok(prompts) => (prompts, None),
+        let listed = collect_pages(|cursor| {
+            let list: PromptsListResult = serde_json::from_value(client.list_prompts(cursor)?)
+                .map_err(|error| {
+                    format!("invalid prompts/list result for '{server_name}': {error}")
+                })?;
+            Ok((list.prompts, list.next_cursor))
+        });
+        match listed {
+            Ok((listed, warning)) => {
+                warnings.extend(
+                    warning.map(|warning| incomplete_list(server_name, "prompts/list", &warning)),
+                );
+                (listed_prompts(server_name, listed, &mut warnings), None)
+            }
             Err(error) => (Vec::new(), Some(error)),
         }
     } else {
@@ -568,18 +581,54 @@ fn connect_server_with_transport(
     })
 }
 
-/// The prompts in a `prompts/list` result, under `server_name`. A prompt
-/// without a name, or with an argument without one, cannot be asked for, so
-/// it is left out, with a note in `errors`.
+/// The most pages a list is read to: a server that has more is cut off.
+const MAX_LIST_PAGES: usize = 100;
+
+/// Reads a list a page at a time: `fetch` is asked for the page that starts
+/// at a cursor, the first time for the first page, and answers with its
+/// items and the cursor of the next page, if there is one. Returns the
+/// items of every page read, and a warning when the list was cut off: when
+/// the server named a cursor it had named before, which would go round
+/// forever, or once [`MAX_LIST_PAGES`] pages are read. A page that cannot be
+/// read fails the list.
+fn collect_pages<T>(
+    mut fetch: impl FnMut(Option<&str>) -> Result<(Vec<T>, Option<String>), String>,
+) -> Result<(Vec<T>, Option<String>), String> {
+    let mut items = Vec::new();
+    let mut cursors = HashSet::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_LIST_PAGES {
+        let (page, next) = fetch(cursor.as_deref())?;
+        items.extend(page);
+        let Some(next) = next else {
+            return Ok((items, None));
+        };
+        if !cursors.insert(next.clone()) {
+            return Ok((items, Some("MCP server repeated a list cursor".to_string())));
+        }
+        cursor = Some(next);
+    }
+    Ok((
+        items,
+        Some(format!("MCP list stopped after {MAX_LIST_PAGES} pages")),
+    ))
+}
+
+/// What a server's errors say of a list it gave only part of: `warning`,
+/// from [`collect_pages`], on its `method` result.
+fn incomplete_list(server_name: &str, method: &str, warning: &str) -> String {
+    format!("incomplete {method} result for '{server_name}': {warning}")
+}
+
+/// The prompts a server listed, under `server_name`. A prompt without a
+/// name, or with an argument without one, cannot be asked for, so it is
+/// left out, with a note in `errors`.
 fn listed_prompts(
     server_name: &str,
-    result: Value,
+    prompts: Vec<McpPromptDescriptor>,
     errors: &mut Vec<String>,
-) -> Result<Vec<McpPrompt>, String> {
-    let list: PromptsListResult = serde_json::from_value(result)
-        .map_err(|error| format!("invalid prompts/list result for '{server_name}': {error}"))?;
-    Ok(list
-        .prompts
+) -> Vec<McpPrompt> {
+    prompts
         .into_iter()
         .filter(|prompt| {
             if prompt.name.trim().is_empty() {
@@ -607,7 +656,7 @@ fn listed_prompts(
             description: prompt.description,
             arguments: prompt.arguments,
         })
-        .collect())
+        .collect()
 }
 
 /// Puts the messages of an expanded prompt together, in order: their text
@@ -761,7 +810,8 @@ impl McpRegistry {
         }
     }
 
-    /// Whether a server is still making its first connection.
+    /// Whether a server is [`McpServerState::Starting`]: still making its
+    /// first connection, or a stdio server being reconnected.
     pub fn is_starting(&self) -> bool {
         self.read()
             .servers
@@ -826,7 +876,7 @@ impl McpRegistry {
                 Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
-            fn list_tools(&self) -> Result<Value, String> {
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"tools": []}))
             }
 
@@ -834,7 +884,7 @@ impl McpRegistry {
                 Err("static resource transport does not support tool calls".to_string())
             }
 
-            fn list_resources(&self) -> Result<Value, String> {
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 let resources = self
                     .resources
                     .iter()
@@ -850,7 +900,7 @@ impl McpRegistry {
                 Ok(serde_json::json!({ "resources": resources }))
             }
 
-            fn list_resource_templates(&self) -> Result<Value, String> {
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({ "resourceTemplates": [] }))
             }
 
@@ -1037,14 +1087,15 @@ impl McpRegistry {
     /// A stdio server is stopped before it is started again, so that one
     /// that listens on a fixed port can start: its client is taken out at
     /// once, and a call still under way on it fails. The server has no
-    /// client until the new one is in. A connection still being made for
-    /// it is stopped too. A remote server keeps serving through its client
-    /// until the new one replaces it.
+    /// client until the new one is in, and is [`McpServerState::Starting`]
+    /// meanwhile, which subscribers hear. A connection still being made for
+    /// it is stopped too. A remote server keeps serving through its client,
+    /// and keeps its state, until the new one replaces it.
     pub fn reconnect_server(&self, name: &str) -> Result<(), String> {
         let server_name = canonical_mcp_name(name);
-        let (config, credentials_path, generation, stop, stopped) = {
-            let mut inner = self.write();
-            let credentials_path = inner.credentials_path.clone();
+        let (config, credentials_path, generation, stop, stopped, now_starting) = {
+            let mut guard = self.write();
+            let inner = &mut *guard;
             let server = inner
                 .servers
                 .iter_mut()
@@ -1056,11 +1107,25 @@ impl McpRegistry {
             server.generation += 1;
             let stop = Arc::new(McpConnectionStop::default());
             let overtaken = std::mem::replace(&mut server.stop, Arc::clone(&stop));
-            let (config, generation) = (server.config.clone(), server.generation);
-            let stopped = (config.transport == McpTransportKind::Stdio)
-                .then(|| (overtaken, inner.clients.remove(&server_name)));
-            (config, credentials_path, generation, stop, stopped)
+            let mut stopped = None;
+            let mut now_starting = false;
+            if server.config.transport == McpTransportKind::Stdio {
+                stopped = Some((overtaken, inner.clients.remove(&server_name)));
+                now_starting = server.state != McpServerState::Starting;
+                server.state = McpServerState::Starting;
+            }
+            (
+                server.config.clone(),
+                inner.credentials_path.clone(),
+                server.generation,
+                stop,
+                stopped,
+                now_starting,
+            )
         };
+        if now_starting {
+            self.notify_subscribers();
+        }
         // Stopping a server, and connecting, which can take up to the
         // startup timeout, are done with no lock held.
         if let Some((overtaken, client)) = stopped {
@@ -1215,7 +1280,7 @@ impl McpRegistry {
                 Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
-            fn list_tools(&self) -> Result<Value, String> {
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"tools": []}))
             }
 
@@ -1223,7 +1288,7 @@ impl McpRegistry {
                 Err("static resource listing transport does not support tool calls".to_string())
             }
 
-            fn list_resources(&self) -> Result<Value, String> {
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 if let Some(error) = &self.error {
                     return Err(error.clone());
                 }
@@ -1242,7 +1307,7 @@ impl McpRegistry {
                 Ok(serde_json::json!({ "resources": resources }))
             }
 
-            fn list_resource_templates(&self) -> Result<Value, String> {
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({ "resourceTemplates": [] }))
             }
 
@@ -1330,7 +1395,7 @@ impl McpRegistry {
                 Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
-            fn list_tools(&self) -> Result<Value, String> {
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"tools": []}))
             }
 
@@ -1341,11 +1406,11 @@ impl McpRegistry {
                 )
             }
 
-            fn list_resources(&self) -> Result<Value, String> {
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({ "resources": [] }))
             }
 
-            fn list_resource_templates(&self) -> Result<Value, String> {
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 if let Some(error) = &self.error {
                     return Err(error.clone());
                 }
@@ -1514,18 +1579,15 @@ impl McpRegistry {
 
         let mut resources = Vec::new();
         for (server, client) in clients {
-            let result = client.list_resources_or_cancel(should_cancel);
-            self.note_answer(&server, &client, &result);
-            let result: ResourcesListResult = serde_json::from_value(result?).map_err(|error| {
-                McpRequestError::Failed(format!("invalid MCP resources/list result: {error}"))
-            })?;
-            resources.extend(result.resources.into_iter().map(|resource| McpResource {
-                server: server.clone(),
-                uri: resource.uri,
-                name: resource.name,
-                description: resource.description,
-                mime_type: resource.mime_type,
-            }));
+            let (listed, warning) = self
+                .listed_resources(&server, &client, should_cancel)
+                .map_err(McpRequestError::from_message)?;
+            // A list the server gave only part of is an error here, where
+            // there is nowhere else to say so.
+            if let Some(warning) = warning {
+                return Err(McpRequestError::Failed(format!("{server}: {warning}")));
+            }
+            resources.extend(listed);
         }
 
         Ok(resources)
@@ -1566,25 +1628,16 @@ impl McpRegistry {
             },
         };
         for (server, client) in clients {
-            let result = client.list_resources_or_cancel(should_cancel);
-            self.note_answer(&server, &client, &result);
-            match result {
-                Ok(result) => match serde_json::from_value::<ResourcesListResult>(result) {
-                    Ok(result) => {
-                        listing
-                            .resources
-                            .extend(result.resources.into_iter().map(|resource| McpResource {
-                                server: server.clone(),
-                                uri: resource.uri,
-                                name: resource.name,
-                                description: resource.description,
-                                mime_type: resource.mime_type,
-                            }));
-                    }
-                    Err(error) => listing.errors.push(format!(
-                        "{server}: invalid MCP resources/list result: {error}"
-                    )),
-                },
+            match self
+                .listed_resources(&server, &client, should_cancel)
+                .map_err(McpRequestError::from_message)
+            {
+                Ok((listed, warning)) => {
+                    listing.resources.extend(listed);
+                    listing
+                        .errors
+                        .extend(warning.map(|warning| format!("{server}: {warning}")));
+                }
                 Err(McpRequestError::Cancelled) => return Err(McpRequestError::Cancelled),
                 Err(McpRequestError::Failed(error)) => {
                     listing.errors.push(format!("{server}: {error}"));
@@ -1593,6 +1646,36 @@ impl McpRegistry {
         }
 
         Ok(listing)
+    }
+
+    /// The resources `server` lists through `client`, read a page at a time,
+    /// and a warning when it gave only part of them (see
+    /// [`collect_pages`]).
+    fn listed_resources(
+        &self,
+        server: &str,
+        client: &Arc<McpClient>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<(Vec<McpResource>, Option<String>), String> {
+        let (listed, warning) = collect_pages(|cursor| {
+            let result = client.list_resources_or_cancel(cursor, should_cancel);
+            self.note_answer(server, client, &result);
+            let list: ResourcesListResult =
+                serde_json::from_value(result.map_err(|error| error.to_string())?)
+                    .map_err(|error| format!("invalid MCP resources/list result: {error}"))?;
+            Ok((list.resources, list.next_cursor))
+        })?;
+        let resources = listed
+            .into_iter()
+            .map(|resource| McpResource {
+                server: server.to_string(),
+                uri: resource.uri,
+                name: resource.name,
+                description: resource.description,
+                mime_type: resource.mime_type,
+            })
+            .collect();
+        Ok((resources, warning))
     }
 
     pub fn list_resource_templates(
@@ -1620,23 +1703,15 @@ impl McpRegistry {
 
         let mut resource_templates = Vec::new();
         for (server, client) in clients {
-            let result = client.list_resource_templates_or_cancel(should_cancel);
-            self.note_answer(&server, &client, &result);
-            let result: ResourceTemplatesListResult =
-                serde_json::from_value(result?).map_err(|error| {
-                    McpRequestError::Failed(format!(
-                        "invalid MCP resources/templates/list result: {error}"
-                    ))
-                })?;
-            resource_templates.extend(result.resource_templates.into_iter().map(|template| {
-                McpResourceTemplate {
-                    server: server.clone(),
-                    uri_template: template.uri_template,
-                    name: template.name,
-                    description: template.description,
-                    mime_type: template.mime_type,
-                }
-            }));
+            let (listed, warning) = self
+                .listed_resource_templates(&server, &client, should_cancel)
+                .map_err(McpRequestError::from_message)?;
+            // A list the server gave only part of is an error here, where
+            // there is nowhere else to say so.
+            if let Some(warning) = warning {
+                return Err(McpRequestError::Failed(format!("{server}: {warning}")));
+            }
+            resource_templates.extend(listed);
         }
 
         Ok(resource_templates)
@@ -1680,27 +1755,16 @@ impl McpRegistry {
             },
         };
         for (server, client) in clients {
-            let result = client.list_resource_templates_or_cancel(should_cancel);
-            self.note_answer(&server, &client, &result);
-            match result {
-                Ok(result) => match serde_json::from_value::<ResourceTemplatesListResult>(result) {
-                    Ok(result) => {
-                        listing.resource_templates.extend(
-                            result.resource_templates.into_iter().map(|template| {
-                                McpResourceTemplate {
-                                    server: server.clone(),
-                                    uri_template: template.uri_template,
-                                    name: template.name,
-                                    description: template.description,
-                                    mime_type: template.mime_type,
-                                }
-                            }),
-                        );
-                    }
-                    Err(error) => listing.errors.push(format!(
-                        "{server}: invalid MCP resources/templates/list result: {error}"
-                    )),
-                },
+            match self
+                .listed_resource_templates(&server, &client, should_cancel)
+                .map_err(McpRequestError::from_message)
+            {
+                Ok((listed, warning)) => {
+                    listing.resource_templates.extend(listed);
+                    listing
+                        .errors
+                        .extend(warning.map(|warning| format!("{server}: {warning}")));
+                }
                 Err(McpRequestError::Cancelled) => return Err(McpRequestError::Cancelled),
                 Err(McpRequestError::Failed(error)) => {
                     listing.errors.push(format!("{server}: {error}"));
@@ -1709,6 +1773,37 @@ impl McpRegistry {
         }
 
         Ok(listing)
+    }
+
+    /// The resource templates `server` lists through `client`, read a page
+    /// at a time, and a warning when it gave only part of them (see
+    /// [`collect_pages`]).
+    fn listed_resource_templates(
+        &self,
+        server: &str,
+        client: &Arc<McpClient>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<(Vec<McpResourceTemplate>, Option<String>), String> {
+        let (listed, warning) = collect_pages(|cursor| {
+            let result = client.list_resource_templates_or_cancel(cursor, should_cancel);
+            self.note_answer(server, client, &result);
+            let list: ResourceTemplatesListResult = serde_json::from_value(
+                result.map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| format!("invalid MCP resources/templates/list result: {error}"))?;
+            Ok((list.resource_templates, list.next_cursor))
+        })?;
+        let templates = listed
+            .into_iter()
+            .map(|template| McpResourceTemplate {
+                server: server.to_string(),
+                uri_template: template.uri_template,
+                name: template.name,
+                description: template.description,
+                mime_type: template.mime_type,
+            })
+            .collect();
+        Ok((templates, warning))
     }
 
     pub fn read_resource(&self, server: &str, uri: &str) -> Result<ReadResourceResult, String> {
@@ -1760,16 +1855,18 @@ impl McpClient {
 
     fn list_resources_or_cancel(
         &self,
+        cursor: Option<&str>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, McpRequestError> {
-        self.request(|transport| transport.list_resources_or_cancel(should_cancel))
+        self.request(|transport| transport.list_resources_or_cancel(cursor, should_cancel))
     }
 
     fn list_resource_templates_or_cancel(
         &self,
+        cursor: Option<&str>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, McpRequestError> {
-        self.request(|transport| transport.list_resource_templates_or_cancel(should_cancel))
+        self.request(|transport| transport.list_resource_templates_or_cancel(cursor, should_cancel))
     }
 
     fn read_resource_or_cancel(
@@ -1780,8 +1877,8 @@ impl McpClient {
         self.request(|transport| transport.read_resource_or_cancel(uri, should_cancel))
     }
 
-    fn list_prompts(&self) -> Result<Value, String> {
-        self.request(|transport| transport.list_prompts())
+    fn list_prompts(&self, cursor: Option<&str>) -> Result<Value, String> {
+        self.request(|transport| transport.list_prompts(cursor))
             .map_err(|error| error.to_string())
     }
 
@@ -1848,7 +1945,7 @@ impl McpClient {
             transport::connect_with_credentials(config, self.credentials_path.clone())
         })?;
         transport.initialize()?;
-        let _ = transport.list_tools()?;
+        let _ = transport.list_tools(None)?;
         Ok(transport)
     }
 
@@ -2003,7 +2100,7 @@ done
                 Ok(serde_json::json!({"capabilities": {}}))
             }
 
-            fn list_tools(&self) -> Result<Value, String> {
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"tools": [
                     {"name": "a", "inputSchema": {"type": "object"}},
                     {"name": "b", "inputSchema": {"type": "object"}},
@@ -2015,11 +2112,11 @@ done
                 Err("fixed tools transport does not support tool calls".to_string())
             }
 
-            fn list_resources(&self) -> Result<Value, String> {
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"resources": []}))
             }
 
-            fn list_resource_templates(&self) -> Result<Value, String> {
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"resourceTemplates": []}))
             }
 
@@ -2109,7 +2206,7 @@ done
                 Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
-            fn list_tools(&self) -> Result<Value, String> {
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"tools": []}))
             }
 
@@ -2140,11 +2237,11 @@ done
                 Err("MCP tool call cancelled".to_string())
             }
 
-            fn list_resources(&self) -> Result<Value, String> {
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"resources": []}))
             }
 
-            fn list_resource_templates(&self) -> Result<Value, String> {
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"resourceTemplates": []}))
             }
 
@@ -2234,7 +2331,7 @@ done
                 Ok(serde_json::json!({"capabilities": {}}))
             }
 
-            fn list_tools(&self) -> Result<Value, String> {
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"tools": []}))
             }
 
@@ -2242,11 +2339,11 @@ done
                 Ok(self.content.clone())
             }
 
-            fn list_resources(&self) -> Result<Value, String> {
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"resources": []}))
             }
 
-            fn list_resource_templates(&self) -> Result<Value, String> {
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"resourceTemplates": []}))
             }
 
@@ -2735,7 +2832,7 @@ done
                 Ok(serde_json::json!({"capabilities": {}}))
             }
 
-            fn list_tools(&self) -> Result<Value, String> {
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"tools": []}))
             }
 
@@ -2769,11 +2866,11 @@ done
                 }))
             }
 
-            fn list_resources(&self) -> Result<Value, String> {
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"resources": []}))
             }
 
-            fn list_resource_templates(&self) -> Result<Value, String> {
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"resourceTemplates": []}))
             }
 
@@ -2856,7 +2953,7 @@ done
                 Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
-            fn list_tools(&self) -> Result<Value, String> {
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"tools": []}))
             }
 
@@ -2864,11 +2961,11 @@ done
                 Err("not used".to_string())
             }
 
-            fn list_resources(&self) -> Result<Value, String> {
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 self.result.clone()
             }
 
-            fn list_resource_templates(&self) -> Result<Value, String> {
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"resourceTemplates": []}))
             }
 
@@ -2926,7 +3023,7 @@ done
                 Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
-            fn list_tools(&self) -> Result<Value, String> {
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"tools": []}))
             }
 
@@ -2934,7 +3031,7 @@ done
                 Err("not used".to_string())
             }
 
-            fn list_resources(&self) -> Result<Value, String> {
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({
                     "resources": [
                         {
@@ -2947,7 +3044,7 @@ done
                 }))
             }
 
-            fn list_resource_templates(&self) -> Result<Value, String> {
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"resourceTemplates": []}))
             }
 
@@ -2990,7 +3087,7 @@ done
                 Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
-            fn list_tools(&self) -> Result<Value, String> {
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"tools": []}))
             }
 
@@ -2998,7 +3095,7 @@ done
                 Err("not used".to_string())
             }
 
-            fn list_resources(&self) -> Result<Value, String> {
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"resources": []}))
             }
 
@@ -3006,7 +3103,7 @@ done
                 Err("not used".to_string())
             }
 
-            fn list_resource_templates(&self) -> Result<Value, String> {
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 self.result.clone()
             }
         }
@@ -3060,7 +3157,7 @@ done
                 Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
-            fn list_tools(&self) -> Result<Value, String> {
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"tools": []}))
             }
 
@@ -3068,7 +3165,7 @@ done
                 Err("not used".to_string())
             }
 
-            fn list_resources(&self) -> Result<Value, String> {
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"resources": []}))
             }
 
@@ -3076,7 +3173,7 @@ done
                 Err("not used".to_string())
             }
 
-            fn list_resource_templates(&self) -> Result<Value, String> {
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({
                     "resourceTemplates": [
                         {
@@ -4141,7 +4238,7 @@ done
                 Ok(serde_json::json!({}))
             }
 
-            fn list_tools(&self) -> Result<Value, String> {
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Ok(serde_json::json!({"tools": []}))
             }
 
@@ -4150,11 +4247,11 @@ done
                 Err(LOGIN_REQUIRED.to_string())
             }
 
-            fn list_resources(&self) -> Result<Value, String> {
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Err("not asked for".to_string())
             }
 
-            fn list_resource_templates(&self) -> Result<Value, String> {
+            fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
                 Err("not asked for".to_string())
             }
 
@@ -4221,7 +4318,14 @@ done
     fn a_prompt_or_resource_request_that_needs_login_marks_the_server() {
         use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
 
-        for method in ["prompts/get", "resources/list"] {
+        for request in [
+            "prompts/get",
+            "resources/list",
+            "resources/templates/list",
+            "resources/read",
+            "resources/list with errors",
+            "resources/templates/list with errors",
+        ] {
             let server = OAuthTestServer::start(OAuthTestBehavior {
                 accepted_tokens: vec!["at-stored".to_string()],
                 offers_prompts_and_resources: true,
@@ -4230,19 +4334,38 @@ done
             let (registry, _home) = logged_in_registry(&server);
             server.revoke_tokens();
 
-            let error = match method {
+            let error = match request {
                 "prompts/get" => registry
                     .get_prompt("docs", "review", &BTreeMap::new())
                     .map(drop),
-                _ => registry.list_resources(Some("docs")).map(drop),
+                "resources/list" => registry.list_resources(Some("docs")).map(drop),
+                "resources/templates/list" => {
+                    registry.list_resource_templates(Some("docs")).map(drop)
+                }
+                "resources/read" => registry.read_resource("docs", "memo://readme").map(drop),
+                // These list what they can, with an error for each server
+                // that failed.
+                "resources/list with errors" => Err(registry
+                    .list_resources_with_errors(Some("docs"))
+                    .errors
+                    .join("\n")),
+                _ => Err(registry
+                    .list_resource_templates_with_errors(Some("docs"))
+                    .errors
+                    .join("\n")),
             }
             .expect_err("the server turns the token away");
 
-            assert_eq!(error, LOGIN_REQUIRED, "{method}");
+            let expected = if request.ends_with("with errors") {
+                format!("docs: {LOGIN_REQUIRED}")
+            } else {
+                LOGIN_REQUIRED.to_string()
+            };
+            assert_eq!(error, expected, "{request}");
             assert_eq!(
                 registry.server_statuses(),
                 [status("docs", McpServerState::NeedsLogin)],
-                "{method}"
+                "{request}"
             );
         }
     }
@@ -4458,7 +4581,8 @@ done
         registry
             .reconnect_server("broken")
             .expect_err("its command is still missing");
-        assert_eq!(changes.load(Ordering::SeqCst), 1);
+        // It was starting again, and then failed again.
+        assert_eq!(changes.load(Ordering::SeqCst), 2);
 
         drop(subscription);
         registry
@@ -4467,7 +4591,7 @@ done
 
         assert_eq!(
             changes.load(Ordering::SeqCst),
-            1,
+            2,
             "a dropped subscription is called no more"
         );
     }
@@ -4695,6 +4819,57 @@ done
             registry.server_statuses(),
             [status("x", McpServerState::Ready)]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stdio_server_is_starting_while_it_reconnects() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = listing_server_config(
+            "slow",
+            temp_dir.path(),
+            r#"[{"name":"echo","inputSchema":{"type":"object"}}]"#,
+        );
+        let registry = connected_registry(&[config], None);
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = registry.subscribe(Arc::new({
+            let heard = Arc::clone(&heard);
+            move |registry: &McpRegistry| {
+                heard
+                    .lock()
+                    .expect("the states heard")
+                    .push(registry.server_statuses()[0].state.clone());
+            }
+        }));
+        delay_starts(temp_dir.path(), "slow", 1);
+
+        let reconnect = std::thread::spawn({
+            let registry = registry.clone();
+            move || registry.reconnect_server("slow")
+        });
+
+        // Stopped, and not yet started again, it has no client, so a turn
+        // waits for it, as for a server still making its first connection.
+        wait_for("the reconnect to begin", || registry.is_starting());
+        assert_eq!(
+            registry.server_statuses(),
+            [status("slow", McpServerState::Starting)]
+        );
+        assert!(registry.wait_for_startup(&|| false));
+        assert_eq!(
+            registry.server_statuses(),
+            [status("slow", McpServerState::Ready)]
+        );
+        assert_eq!(schema_names(&registry), ["mcp__slow__echo"]);
+        reconnect
+            .join()
+            .expect("the reconnect's thread")
+            .expect("reconnect the server");
+        assert_eq!(
+            *heard.lock().expect("the states heard"),
+            [McpServerState::Starting, McpServerState::Ready]
+        );
+        assert_eq!(starts(temp_dir.path(), "slow"), 2);
     }
 
     #[test]
@@ -5080,16 +5255,14 @@ done
     #[test]
     fn prompts_without_a_name_are_left_out() {
         let mut errors = Vec::new();
-        let prompts = listed_prompts(
-            "docs",
-            serde_json::json!({"prompts": [
-                {"name": "review_pr", "arguments": [{"name": "pr"}]},
-                {"name": " "},
-                {"name": "summarize", "arguments": [{"name": ""}]}
-            ]}),
-            &mut errors,
-        )
+        let listed: PromptsListResult = serde_json::from_value(serde_json::json!({"prompts": [
+            {"name": "review_pr", "arguments": [{"name": "pr"}]},
+            {"name": " "},
+            {"name": "summarize", "arguments": [{"name": ""}]}
+        ]}))
         .expect("a prompts/list result");
+
+        let prompts = listed_prompts("docs", listed.prompts, &mut errors);
 
         assert_eq!(
             prompts
@@ -5353,6 +5526,312 @@ done
         assert_eq!(
             logged_methods(temp_dir.path()),
             [expected, vec!["tools/call".to_string()]].concat()
+        );
+    }
+
+    /// A stdio server whose lists come a page at a time. It declares prompts
+    /// and resources, and answers a list request with the result in
+    /// `<dir>/<name>/<list>-<cursor>.json`, where `<list>` is `tools`,
+    /// `prompts`, `resources` or `templates`, and `<cursor>` is the cursor
+    /// asked for, or `start` for the first page. A `tools/list` it has no page
+    /// for gets one tool, `t<n>` for its `n`th list request, and a new cursor,
+    /// `c<n>`, so that the list never ends; any other list it has no page for
+    /// is empty. Each message it gets is added to `<dir>/<name>/requests`.
+    #[cfg(unix)]
+    fn paged_server_config(
+        name: &str,
+        dir: &std::path::Path,
+        pages: &[(&str, Value)],
+    ) -> McpServerConfig {
+        let state = dir.join(name);
+        std::fs::create_dir_all(&state).expect("state dir");
+        for (page, result) in pages {
+            std::fs::write(state.join(format!("{page}.json")), result.to_string())
+                .expect("write a page");
+        }
+        let script = dir.join(format!("{name}.sh"));
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+state_dir="$1"
+listed=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$state_dir/requests"
+  id=${line#*'"id":'}
+  id=${id%%,*}
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"prompts":{},"resources":{}},"serverInfo":{"name":"paged","version":"1"}}}\n' "$id"
+      continue
+      ;;
+    *'"method":"tools/list"'*) list=tools ;;
+    *'"method":"prompts/list"'*) list=prompts ;;
+    *'"method":"resources/list"'*) list=resources ;;
+    *'"method":"resources/templates/list"'*) list=templates ;;
+    *) continue ;;
+  esac
+  listed=$((listed + 1))
+  cursor=start
+  case "$line" in
+    *'"cursor":"'*)
+      cursor=${line#*'"cursor":"'}
+      cursor=${cursor%%'"'*}
+      ;;
+  esac
+  if [ -f "$state_dir/$list-$cursor.json" ]; then
+    page=$(cat "$state_dir/$list-$cursor.json")
+  elif [ "$list" = tools ]; then
+    page="{\"tools\":[{\"name\":\"t$listed\",\"inputSchema\":{\"type\":\"object\"}}],\"nextCursor\":\"c$listed\"}"
+  else
+    page='{}'
+  fi
+  printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$page"
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let mut config = stdio_fixture_config(name, &script);
+        config.args.push(state.to_string_lossy().into_owned());
+        config
+    }
+
+    /// A tool named `name`, as a server lists it.
+    #[cfg(unix)]
+    fn listed_tool(name: &str) -> Value {
+        serde_json::json!({"name": name, "inputSchema": {"type": "object"}})
+    }
+
+    /// The params of each `method` request the paged server `name` got.
+    #[cfg(unix)]
+    fn list_params_sent(dir: &std::path::Path, name: &str, method: &str) -> Vec<Value> {
+        prompt_server_requests(dir, name, method)
+            .into_iter()
+            .map(|request| request["params"].clone())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tools_are_listed_across_pages() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = paged_server_config(
+            "paged",
+            temp_dir.path(),
+            &[
+                (
+                    "tools-start",
+                    serde_json::json!({"tools": [listed_tool("a"), listed_tool("b")], "nextCursor": "c1"}),
+                ),
+                (
+                    "tools-c1",
+                    serde_json::json!({"tools": [listed_tool("c"), listed_tool("d")], "nextCursor": "c2"}),
+                ),
+                ("tools-c2", serde_json::json!({"tools": [listed_tool("e")]})),
+            ],
+        );
+
+        let registry = connected_registry(&[config], None);
+
+        assert_eq!(
+            schema_names(&registry),
+            [
+                "mcp__paged__a",
+                "mcp__paged__b",
+                "mcp__paged__c",
+                "mcp__paged__d",
+                "mcp__paged__e"
+            ]
+        );
+        assert_eq!(
+            registry.server_statuses(),
+            [status("paged", McpServerState::Ready)]
+        );
+        assert_eq!(
+            list_params_sent(temp_dir.path(), "paged", "tools/list"),
+            [
+                serde_json::json!({}),
+                serde_json::json!({"cursor": "c1"}),
+                serde_json::json!({"cursor": "c2"})
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_cursor_stops_listing() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = paged_server_config(
+            "paged",
+            temp_dir.path(),
+            &[
+                (
+                    "tools-start",
+                    serde_json::json!({"tools": [listed_tool("a")], "nextCursor": "c1"}),
+                ),
+                // It names the cursor of this very page again.
+                (
+                    "tools-c1",
+                    serde_json::json!({"tools": [listed_tool("b")], "nextCursor": "c1"}),
+                ),
+            ],
+        );
+
+        let registry = connected_registry(&[config], None);
+
+        assert_eq!(
+            list_params_sent(temp_dir.path(), "paged", "tools/list").len(),
+            2
+        );
+        assert_eq!(schema_names(&registry), ["mcp__paged__a", "mcp__paged__b"]);
+        assert_eq!(
+            registry.server_statuses(),
+            [McpServerStatus {
+                errors: vec![
+                    "incomplete tools/list result for 'paged': MCP server repeated a list cursor"
+                        .to_string()
+                ],
+                ..status("paged", McpServerState::Ready)
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_stops_after_100_pages() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        // With no pages of its own, it names a new cursor on every page.
+        let config = paged_server_config("paged", temp_dir.path(), &[]);
+
+        let registry = connected_registry(&[config], None);
+
+        assert_eq!(
+            list_params_sent(temp_dir.path(), "paged", "tools/list").len(),
+            100
+        );
+        // The pages read are kept.
+        assert_eq!(registry.tools().len(), 100);
+        assert_eq!(
+            registry.server_statuses(),
+            [McpServerStatus {
+                errors: vec![
+                    "incomplete tools/list result for 'paged': MCP list stopped after 100 pages"
+                        .to_string()
+                ],
+                ..status("paged", McpServerState::Ready)
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompts_and_resources_are_listed_across_pages() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = paged_server_config(
+            "paged",
+            temp_dir.path(),
+            &[
+                ("tools-start", serde_json::json!({"tools": []})),
+                (
+                    "prompts-start",
+                    serde_json::json!({"prompts": [{"name": "first"}], "nextCursor": "p1"}),
+                ),
+                (
+                    "prompts-p1",
+                    serde_json::json!({"prompts": [{"name": "second"}]}),
+                ),
+                (
+                    "resources-start",
+                    serde_json::json!({"resources": [{"uri": "memo://1", "name": "one"}], "nextCursor": "r1"}),
+                ),
+                (
+                    "resources-r1",
+                    serde_json::json!({"resources": [{"uri": "memo://2", "name": "two"}]}),
+                ),
+                (
+                    "templates-start",
+                    serde_json::json!({"resourceTemplates": [{"uriTemplate": "memo://{a}", "name": "a"}], "nextCursor": "t1"}),
+                ),
+                (
+                    "templates-t1",
+                    serde_json::json!({"resourceTemplates": [{"uriTemplate": "memo://{b}", "name": "b"}]}),
+                ),
+            ],
+        );
+
+        let registry = connected_registry(&[config], None);
+        let resources = registry
+            .list_resources(Some("paged"))
+            .expect("list the resources");
+        let templates = registry.list_resource_templates_with_errors(None);
+
+        assert_eq!(prompt_names(&registry), ["first", "second"]);
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.uri.as_str())
+                .collect::<Vec<_>>(),
+            ["memo://1", "memo://2"]
+        );
+        assert!(templates.errors.is_empty(), "{:?}", templates.errors);
+        assert_eq!(
+            templates
+                .resource_templates
+                .iter()
+                .map(|template| template.uri_template.as_str())
+                .collect::<Vec<_>>(),
+            ["memo://{a}", "memo://{b}"]
+        );
+        for (method, cursor) in [
+            ("prompts/list", "p1"),
+            ("resources/list", "r1"),
+            ("resources/templates/list", "t1"),
+        ] {
+            assert_eq!(
+                list_params_sent(temp_dir.path(), "paged", method),
+                [serde_json::json!({}), serde_json::json!({"cursor": cursor})],
+                "{method}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_resource_list_cut_short_says_so_where_its_errors_go() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = paged_server_config(
+            "paged",
+            temp_dir.path(),
+            &[
+                ("tools-start", serde_json::json!({"tools": []})),
+                (
+                    "resources-start",
+                    serde_json::json!({"resources": [{"uri": "memo://1", "name": "one"}], "nextCursor": "r1"}),
+                ),
+                (
+                    "resources-r1",
+                    serde_json::json!({"resources": [{"uri": "memo://2", "name": "two"}], "nextCursor": "r1"}),
+                ),
+            ],
+        );
+        let registry = connected_registry(&[config], None);
+
+        let listing = registry.list_resources_with_errors(Some("paged"));
+        let strict = registry.list_resources(Some("paged"));
+
+        // A listing with errors keeps what it read, and says why it stopped.
+        assert_eq!(
+            listing
+                .resources
+                .iter()
+                .map(|resource| resource.uri.as_str())
+                .collect::<Vec<_>>(),
+            ["memo://1", "memo://2"]
+        );
+        assert_eq!(listing.errors, ["paged: MCP server repeated a list cursor"]);
+        // One that lists all or fails, fails.
+        assert_eq!(
+            strict.map(|resources| resources.len()),
+            Err("paged: MCP server repeated a list cursor".to_string())
         );
     }
 }

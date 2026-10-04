@@ -149,12 +149,18 @@ pub struct McpToolRef {
 pub struct ToolsListResult {
     #[serde(default)]
     pub tools: Vec<McpToolDescriptor>,
+    /// Where the next page starts, when the server has more to list.
+    #[serde(rename = "nextCursor", default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct PromptsListResult {
     #[serde(default)]
     pub prompts: Vec<McpPromptDescriptor>,
+    /// Where the next page starts, when the server has more to list.
+    #[serde(rename = "nextCursor", default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -213,12 +219,18 @@ pub struct McpEmbeddedResource {
 pub struct ResourcesListResult {
     #[serde(default)]
     pub resources: Vec<McpResourceDescriptor>,
+    /// Where the next page starts, when the server has more to list.
+    #[serde(rename = "nextCursor", default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ResourceTemplatesListResult {
     #[serde(rename = "resourceTemplates", default)]
     pub resource_templates: Vec<McpResourceTemplateDescriptor>,
+    /// Where the next page starts, when the server has more to list.
+    #[serde(rename = "nextCursor", default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -63,7 +63,6 @@ struct SseAsyncRequest {
     context: SseRequestContext,
     params: Value,
     cancel: Arc<AtomicBool>,
-    stream_events: bool,
     elicitation_sender: mpsc::Sender<SseElicitationEnvelope>,
 }
 
@@ -111,7 +110,9 @@ pub trait McpTransport: Send + Sync {
         None
     }
     fn initialize(&self) -> Result<Value, String>;
-    fn list_tools(&self) -> Result<Value, String>;
+    /// Sends `tools/list` for the page that starts at `cursor`, or for the
+    /// first page.
+    fn list_tools(&self, cursor: Option<&str>) -> Result<Value, String>;
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String>;
     fn call_tool_with_elicitation_handler(
         &self,
@@ -133,22 +134,31 @@ pub trait McpTransport: Send + Sync {
         }
         self.call_tool_with_elicitation_handler(name, arguments, handler)
     }
-    fn list_resources(&self) -> Result<Value, String>;
-    fn list_resources_or_cancel(&self, should_cancel: &dyn Fn() -> bool) -> Result<Value, String> {
-        if should_cancel() {
-            return Err("MCP tool call cancelled".to_string());
-        }
-        self.list_resources()
-    }
-    fn list_resource_templates(&self) -> Result<Value, String>;
-    fn list_resource_templates_or_cancel(
+    /// Sends `resources/list` for the page that starts at `cursor`, or for
+    /// the first page.
+    fn list_resources(&self, cursor: Option<&str>) -> Result<Value, String>;
+    fn list_resources_or_cancel(
         &self,
+        cursor: Option<&str>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, String> {
         if should_cancel() {
             return Err("MCP tool call cancelled".to_string());
         }
-        self.list_resource_templates()
+        self.list_resources(cursor)
+    }
+    /// Sends `resources/templates/list` for the page that starts at
+    /// `cursor`, or for the first page.
+    fn list_resource_templates(&self, cursor: Option<&str>) -> Result<Value, String>;
+    fn list_resource_templates_or_cancel(
+        &self,
+        cursor: Option<&str>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        if should_cancel() {
+            return Err("MCP tool call cancelled".to_string());
+        }
+        self.list_resource_templates(cursor)
     }
     fn read_resource(&self, uri: &str) -> Result<Value, String>;
     fn read_resource_or_cancel(
@@ -161,8 +171,9 @@ pub trait McpTransport: Send + Sync {
         }
         self.read_resource(uri)
     }
-    /// Sends `prompts/list`.
-    fn list_prompts(&self) -> Result<Value, String> {
+    /// Sends `prompts/list` for the page that starts at `cursor`, or for
+    /// the first page.
+    fn list_prompts(&self, _cursor: Option<&str>) -> Result<Value, String> {
         Err("prompts are not supported by this transport".to_string())
     }
     /// Sends `prompts/get` for the prompt `name`, with `arguments` (an
@@ -222,6 +233,15 @@ pub(crate) fn initialize_params() -> Value {
             "version": env!("CARGO_PKG_VERSION")
         }
     })
+}
+
+/// The params of a list request: the cursor of the page asked for, when it
+/// is not the first.
+pub(crate) fn list_params(cursor: Option<&str>) -> Value {
+    match cursor {
+        Some(cursor) => json!({ "cursor": cursor }),
+        None => json!({}),
+    }
 }
 
 /// Checks the protocol version a server answered `initialize` with. Returns
@@ -328,13 +348,26 @@ fn lock_child(child: &Mutex<StdioChild>) -> MutexGuard<'_, StdioChild> {
     child.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Held while a stdio server is launched, so that launches take turns:
-/// servers connect in parallel. On some platforms, macOS among them, the
-/// pipes of a new process, and the one its launch reads an exec failure
-/// from, are created before they are marked close-on-exec, so a server
-/// launched at that moment on another thread would inherit them, and the
-/// first launch would then wait until that server exits.
+/// Held while a stdio server is launched on macOS or iOS, so that launches
+/// take turns: servers connect in parallel. There, the pipes of a new
+/// process, and the one its launch reads an exec failure from, are created
+/// before they are marked close-on-exec, so a server launched at that moment
+/// on another thread would inherit them, and the first launch would then
+/// wait until that server exits.
 static STDIO_LAUNCH: Mutex<()> = Mutex::new(());
+
+/// Waits for this stdio launch's turn, where launches must take turns, and
+/// returns what holds it until dropped: on macOS and iOS (see
+/// [`STDIO_LAUNCH`]). Elsewhere launches go at once, and a launch that hangs
+/// holds up no other: Linux creates the pipes close-on-exec from the start
+/// (`pipe2`), and Windows starts one process at a time on its own.
+fn stdio_launch_turn() -> Option<MutexGuard<'static, ()>> {
+    if cfg!(any(target_os = "macos", target_os = "ios")) {
+        Some(STDIO_LAUNCH.lock().unwrap_or_else(PoisonError::into_inner))
+    } else {
+        None
+    }
+}
 
 impl StdioTransport {
     fn start(config: &McpServerConfig) -> Result<Self, String> {
@@ -376,7 +409,7 @@ impl StdioTransport {
             "mcp-user-trusted-integration",
         );
         let launched = {
-            let _launching = STDIO_LAUNCH.lock().unwrap_or_else(PoisonError::into_inner);
+            let _turn = stdio_launch_turn();
             broker.launch_user_trusted(
                 child_command,
                 format!("mcp:{}", config.name),
@@ -453,8 +486,14 @@ impl McpTransport for StdioTransport {
         Ok(result)
     }
 
-    fn list_tools(&self) -> Result<Value, String> {
-        self.request_with_timeout("tools/list", json!({}), self.startup_timeout, None, None)
+    fn list_tools(&self, cursor: Option<&str>) -> Result<Value, String> {
+        self.request_with_timeout(
+            "tools/list",
+            list_params(cursor),
+            self.startup_timeout,
+            None,
+            None,
+        )
     }
 
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
@@ -498,30 +537,34 @@ impl McpTransport for StdioTransport {
         )
     }
 
-    fn list_resources(&self) -> Result<Value, String> {
+    fn list_resources(&self, cursor: Option<&str>) -> Result<Value, String> {
         self.request_with_timeout(
             "resources/list",
-            json!({}),
+            list_params(cursor),
             self.startup_timeout,
             None,
             None,
         )
     }
 
-    fn list_resources_or_cancel(&self, should_cancel: &dyn Fn() -> bool) -> Result<Value, String> {
+    fn list_resources_or_cancel(
+        &self,
+        cursor: Option<&str>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
         self.request_with_timeout(
             "resources/list",
-            json!({}),
+            list_params(cursor),
             self.startup_timeout,
             None,
             Some(should_cancel),
         )
     }
 
-    fn list_resource_templates(&self) -> Result<Value, String> {
+    fn list_resource_templates(&self, cursor: Option<&str>) -> Result<Value, String> {
         self.request_with_timeout(
             "resources/templates/list",
-            json!({}),
+            list_params(cursor),
             self.startup_timeout,
             None,
             None,
@@ -530,11 +573,12 @@ impl McpTransport for StdioTransport {
 
     fn list_resource_templates_or_cancel(
         &self,
+        cursor: Option<&str>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, String> {
         self.request_with_timeout(
             "resources/templates/list",
-            json!({}),
+            list_params(cursor),
             self.startup_timeout,
             None,
             Some(should_cancel),
@@ -569,8 +613,14 @@ impl McpTransport for StdioTransport {
         )
     }
 
-    fn list_prompts(&self) -> Result<Value, String> {
-        self.request_with_timeout("prompts/list", json!({}), self.startup_timeout, None, None)
+    fn list_prompts(&self, cursor: Option<&str>) -> Result<Value, String> {
+        self.request_with_timeout(
+            "prompts/list",
+            list_params(cursor),
+            self.startup_timeout,
+            None,
+            None,
+        )
     }
 
     fn get_prompt(&self, name: &str, arguments: Value) -> Result<Value, String> {
@@ -694,18 +744,24 @@ impl StdioTransport {
                 },
             };
             iterations += 1;
-            if is_elicitation_create_request(&response) {
-                if let Err(error) = handle_elicitation_create_request(
-                    &self.server_name,
-                    &mut state.stdin,
-                    &response,
-                    elicitation_handler,
-                ) {
+            if is_server_request(&response) {
+                let answered = if is_elicitation_create_request(&response) {
+                    handle_elicitation_create_request(
+                        &self.server_name,
+                        &mut state.stdin,
+                        &response,
+                        elicitation_handler,
+                    )
+                } else {
+                    write_json_line(&mut state.stdin, &server_request_reply(&response))
+                };
+                if let Err(error) = answered {
                     return state.terminal_error(error);
                 }
                 continue;
             }
-            if response.get("id").and_then(Value::as_u64) != Some(id) {
+            // A notification, or the response to another request.
+            if !is_response_to(&response, id) {
                 continue;
             }
             if let Some(error) = response.get("error") {
@@ -747,6 +803,40 @@ fn try_recv_stdio_response(
         Err(mpsc::TryRecvError::Disconnected) => {
             Err("MCP stdio reader stopped before returning".to_string())
         }
+    }
+}
+
+/// The JSON-RPC error for a request whose method Orca does not serve.
+pub(crate) const METHOD_NOT_FOUND: i64 = -32601;
+
+/// Whether `message`, from a server, is a request Orca must answer: it names
+/// a method and has an id. A message that names a method but has no id is a
+/// notification, which is not answered, and only one that names no method is
+/// a response.
+pub(crate) fn is_server_request(message: &Value) -> bool {
+    message.get("method").is_some() && message.get("id").is_some()
+}
+
+/// Whether `message`, from a server, is the response to Orca's request `id`.
+/// A request from the server is not, even when it carries the same id: the
+/// server numbers its requests on its own.
+pub(crate) fn is_response_to(message: &Value, id: u64) -> bool {
+    message.get("method").is_none() && message.get("id").and_then(Value::as_u64) == Some(id)
+}
+
+/// The answer to `request`, a request from the server other than
+/// `elicitation/create`, which each transport answers its own way: `ping`
+/// gets an empty result, and any other method -32601, since Orca serves no
+/// other.
+pub(crate) fn server_request_reply(request: &Value) -> Value {
+    if request.get("method").and_then(Value::as_str) == Some("ping") {
+        json!({
+            "jsonrpc": "2.0",
+            "id": request.get("id").cloned().unwrap_or(Value::Null),
+            "result": {}
+        })
+    } else {
+        mcp_jsonrpc_error_response(request, METHOD_NOT_FOUND, "Method not found".to_string())
     }
 }
 
@@ -1072,8 +1162,8 @@ impl McpTransport for StreamableHttpTransport {
         self.start_session().map_err(HttpRequestError::into_message)
     }
 
-    fn list_tools(&self) -> Result<Value, String> {
-        self.request_with_timeout("tools/list", json!({}), self.startup_timeout)
+    fn list_tools(&self, cursor: Option<&str>) -> Result<Value, String> {
+        self.request_with_timeout("tools/list", list_params(cursor), self.startup_timeout)
     }
 
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
@@ -1126,31 +1216,40 @@ impl McpTransport for StreamableHttpTransport {
         )
     }
 
-    fn list_resources(&self) -> Result<Value, String> {
-        self.request_with_timeout("resources/list", json!({}), self.startup_timeout)
+    fn list_resources(&self, cursor: Option<&str>) -> Result<Value, String> {
+        self.request_with_timeout("resources/list", list_params(cursor), self.startup_timeout)
     }
 
-    fn list_resources_or_cancel(&self, should_cancel: &dyn Fn() -> bool) -> Result<Value, String> {
+    fn list_resources_or_cancel(
+        &self,
+        cursor: Option<&str>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
         self.request_with_timeout_or_cancel(
             "resources/list",
-            json!({}),
+            list_params(cursor),
             self.startup_timeout,
             None,
             should_cancel,
         )
     }
 
-    fn list_resource_templates(&self) -> Result<Value, String> {
-        self.request_with_timeout("resources/templates/list", json!({}), self.startup_timeout)
+    fn list_resource_templates(&self, cursor: Option<&str>) -> Result<Value, String> {
+        self.request_with_timeout(
+            "resources/templates/list",
+            list_params(cursor),
+            self.startup_timeout,
+        )
     }
 
     fn list_resource_templates_or_cancel(
         &self,
+        cursor: Option<&str>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, String> {
         self.request_with_timeout_or_cancel(
             "resources/templates/list",
-            json!({}),
+            list_params(cursor),
             self.startup_timeout,
             None,
             should_cancel,
@@ -1183,8 +1282,8 @@ impl McpTransport for StreamableHttpTransport {
         )
     }
 
-    fn list_prompts(&self) -> Result<Value, String> {
-        self.request_with_timeout("prompts/list", json!({}), self.startup_timeout)
+    fn list_prompts(&self, cursor: Option<&str>) -> Result<Value, String> {
+        self.request_with_timeout("prompts/list", list_params(cursor), self.startup_timeout)
     }
 
     fn get_prompt(&self, name: &str, arguments: Value) -> Result<Value, String> {
@@ -1216,7 +1315,12 @@ impl StreamableHttpTransport {
                 method: "initialize".to_string(),
                 timeout: self.startup_timeout,
             };
-            request_sse_with_client(&self.client, &context, initialize_params())
+            request_sse_with_client(
+                &self.client,
+                &self.server_name,
+                &context,
+                initialize_params(),
+            )
         })?;
         let session_id = response_headers
             .get(MCP_SESSION_ID_HEADER)
@@ -1351,7 +1455,7 @@ impl StreamableHttpTransport {
                 method: method.to_string(),
                 timeout,
             };
-            request_sse_with_client(&self.client, &context, params.clone())
+            request_sse_with_client(&self.client, &self.server_name, &context, params.clone())
                 .map(|(result, _)| result)
         })
     }
@@ -1441,7 +1545,6 @@ impl StreamableHttpTransport {
             method: method.to_string(),
             timeout,
         };
-        let stream_events = method == "tools/call";
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = mpsc::channel();
@@ -1461,7 +1564,6 @@ impl StreamableHttpTransport {
                         context,
                         params,
                         cancel: worker_cancel,
-                        stream_events,
                         elicitation_sender,
                     }))
                 });
@@ -1639,8 +1741,8 @@ impl McpTransport for SseFallbackTransport {
         Ok(result)
     }
 
-    fn list_tools(&self) -> Result<Value, String> {
-        self.transport()?.list_tools()
+    fn list_tools(&self, cursor: Option<&str>) -> Result<Value, String> {
+        self.transport()?.list_tools(cursor)
     }
 
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
@@ -1668,24 +1770,30 @@ impl McpTransport for SseFallbackTransport {
             .call_tool_with_elicitation_handler_or_cancel(name, arguments, handler, should_cancel)
     }
 
-    fn list_resources(&self) -> Result<Value, String> {
-        self.transport()?.list_resources()
+    fn list_resources(&self, cursor: Option<&str>) -> Result<Value, String> {
+        self.transport()?.list_resources(cursor)
     }
 
-    fn list_resources_or_cancel(&self, should_cancel: &dyn Fn() -> bool) -> Result<Value, String> {
-        self.transport()?.list_resources_or_cancel(should_cancel)
+    fn list_resources_or_cancel(
+        &self,
+        cursor: Option<&str>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        self.transport()?
+            .list_resources_or_cancel(cursor, should_cancel)
     }
 
-    fn list_resource_templates(&self) -> Result<Value, String> {
-        self.transport()?.list_resource_templates()
+    fn list_resource_templates(&self, cursor: Option<&str>) -> Result<Value, String> {
+        self.transport()?.list_resource_templates(cursor)
     }
 
     fn list_resource_templates_or_cancel(
         &self,
+        cursor: Option<&str>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, String> {
         self.transport()?
-            .list_resource_templates_or_cancel(should_cancel)
+            .list_resource_templates_or_cancel(cursor, should_cancel)
     }
 
     fn read_resource(&self, uri: &str) -> Result<Value, String> {
@@ -1701,8 +1809,8 @@ impl McpTransport for SseFallbackTransport {
             .read_resource_or_cancel(uri, should_cancel)
     }
 
-    fn list_prompts(&self) -> Result<Value, String> {
-        self.transport()?.list_prompts()
+    fn list_prompts(&self, cursor: Option<&str>) -> Result<Value, String> {
+        self.transport()?.list_prompts(cursor)
     }
 
     fn get_prompt(&self, name: &str, arguments: Value) -> Result<Value, String> {
@@ -1779,14 +1887,6 @@ async fn request_sse_with_async_client(
     if !status.is_success() {
         return Err(HttpRequestError::status(&request.context, status));
     }
-    if !request.stream_events {
-        let text = read_bounded_async_sse_response(response, &request.cancel).await?;
-        return Ok(parse_terminal_sse_message(
-            &text,
-            &request.context.method,
-            request.context.id,
-        )?);
-    }
     if response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1851,24 +1951,29 @@ async fn read_sse_stream(
             let Some(message) = parse_sse_event(&event)? else {
                 continue;
             };
-            if message.get("method").and_then(Value::as_str) == Some("elicitation/create") {
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-                elicitation_sender
-                    .send(SseElicitationEnvelope {
-                        request: message.clone(),
-                        response: sender,
-                    })
-                    .map_err(|_| "MCP SSE elicitation handler stopped".to_string())?;
-                let response = await_sse_elicitation_response(receiver, cancel).await?;
+            if is_server_request(&message) {
+                let reply = if is_elicitation_create_request(&message) {
+                    // The handler is asked on the thread that sent the request.
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    elicitation_sender
+                        .send(SseElicitationEnvelope {
+                            request: message,
+                            response: sender,
+                        })
+                        .map_err(|_| "MCP SSE elicitation handler stopped".to_string())?;
+                    await_sse_elicitation_response(receiver, cancel).await?
+                } else {
+                    server_request_reply(&message)
+                };
                 post_sse_message(
                     &context.endpoint,
                     &context.headers,
-                    response,
+                    reply,
                     context.timeout,
                     cancel,
                 )
                 .await?;
-            } else if message.get("id") == Some(&Value::from(context.id)) {
+            } else if is_response_to(&message, context.id) {
                 return parse_terminal_message(message, &context.method, context.id);
             }
         }
@@ -2023,10 +2128,12 @@ async fn read_bounded_async_sse_response(
         .map_err(|error| format!("MCP SSE response was not valid UTF-8: {error}"))
 }
 
-/// Sends one JSON-RPC request and reads its response, which comes back with
-/// the response headers.
+/// Sends one JSON-RPC request to the server `server_name` and reads its
+/// response, which comes back with the response headers. An event stream is
+/// read only up to the response, as [`read_sse_response`] says.
 fn request_sse_with_client(
     client: &reqwest::blocking::Client,
+    server_name: &str,
     context: &SseRequestContext,
     params: Value,
 ) -> Result<(Value, HeaderMap), HttpRequestError> {
@@ -2058,9 +2165,127 @@ fn request_sse_with_client(
         return Err(HttpRequestError::status(context, status));
     }
     let headers = response.headers().clone();
-    let text = read_bounded_sse_response(response)?;
-    let result = parse_terminal_sse_message(&text, method, context.id)?;
+    let result = if is_event_stream(&headers) {
+        // Replies go to the session the response is in, which the response
+        // to `initialize` is the first to name.
+        let mut reply_headers = context.headers.clone();
+        if let Some(session) = headers
+            .get(MCP_SESSION_ID_HEADER)
+            .filter(|session| !session.is_empty())
+        {
+            reply_headers.insert(MCP_SESSION_ID_HEADER, session.clone());
+        }
+        read_sse_response(client, server_name, context, &reply_headers, response)?
+    } else {
+        let text = read_bounded_sse_response(response)?;
+        parse_terminal_sse_message(&text, method, context.id)?
+    };
     Ok((result, headers))
+}
+
+/// Whether `headers` say the body is an event stream.
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"))
+}
+
+/// Reads the event stream the server `server_name` answers `context`'s
+/// request with, up to the response: that ends the read, as the server may
+/// keep the stream open after it. Each request the server sends first is
+/// answered with a POST that carries `reply_headers`: a question
+/// (`elicitation/create`) is declined, as no one is there to ask, and any
+/// other request is answered as [`server_request_reply`] says. Notifications,
+/// and responses to other requests, are skipped. At most
+/// [`MAX_SSE_RESPONSE_BYTES`] are read.
+fn read_sse_response(
+    client: &reqwest::blocking::Client,
+    server_name: &str,
+    context: &SseRequestContext,
+    reply_headers: &HeaderMap,
+    mut response: reqwest::blocking::Response,
+) -> Result<Value, String> {
+    let method = &context.method;
+    let mut buffer = Vec::new();
+    // How far into `buffer` there is certainly no event boundary.
+    let mut scanned = 0;
+    let mut total = 0usize;
+    let mut chunk = vec![0u8; 8 * 1024];
+    loop {
+        let read = response
+            .read(&mut chunk)
+            .map_err(|error| format!("failed to read MCP SSE response: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read);
+        if total > MAX_SSE_RESPONSE_BYTES {
+            return Err(format!(
+                "MCP SSE response exceeded maximum body size of {MAX_SSE_RESPONSE_BYTES} bytes"
+            ));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        while let Some(end) = sse_event_end(&buffer[scanned..]).map(|end| scanned + end) {
+            let event = buffer.drain(..end).collect::<Vec<_>>();
+            scanned = 0;
+            let Some(message) = parse_sse_event(&event)
+                .map_err(|error| format!("invalid MCP SSE response for '{method}': {error}"))?
+            else {
+                continue;
+            };
+            if is_server_request(&message) {
+                let reply = if is_elicitation_create_request(&message) {
+                    resolve_sse_elicitation(server_name, &message, None)
+                } else {
+                    server_request_reply(&message)
+                };
+                post_sse_reply(
+                    client,
+                    &context.endpoint,
+                    reply_headers,
+                    &reply,
+                    context.timeout,
+                )?;
+            } else if is_response_to(&message, context.id) {
+                return parse_terminal_message(message, method, context.id);
+            }
+        }
+        // A boundary may straddle this chunk and the next.
+        scanned = buffer.len().saturating_sub(3);
+    }
+    // The server ended the stream without a response. What is left, an
+    // event not followed by a blank line, is read as a whole body is.
+    if buffer.iter().all(u8::is_ascii_whitespace) {
+        return Err(format!("MCP SSE request '{method}' missing result"));
+    }
+    let text = String::from_utf8(buffer)
+        .map_err(|error| format!("MCP SSE response was not valid UTF-8: {error}"))?;
+    parse_terminal_sse_message(&text, method, context.id)
+}
+
+/// POSTs `reply`, Orca's answer to a request from the server, to `endpoint`.
+fn post_sse_reply(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    headers: &HeaderMap,
+    reply: &Value,
+    timeout: Duration,
+) -> Result<(), String> {
+    let response = client
+        .post(endpoint)
+        .headers(headers.clone())
+        .timeout(timeout)
+        .json(reply)
+        .send()
+        .map_err(|error| format!("failed to write MCP SSE response: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "failed to write MCP SSE response: server returned {}",
+            response.status()
+        ));
+    }
+    Ok(())
 }
 
 fn read_bounded_sse_response(response: reqwest::blocking::Response) -> Result<String, String> {
@@ -2430,7 +2655,7 @@ done
         ))
         .expect("connect stdio MCP");
         transport.initialize().expect("initialize MCP");
-        transport.list_tools().expect("list tools");
+        transport.list_tools(None).expect("list tools");
 
         let error = transport
             .call_tool("authorize", json!({}))
@@ -2523,15 +2748,139 @@ done
         .expect("connect stdio MCP");
         transport.initialize().expect("initialize MCP");
 
-        let error = transport.list_tools().expect_err("tools/list RPC error");
+        let error = transport
+            .list_tools(None)
+            .expect_err("tools/list RPC error");
 
         assert!(error.contains("tools unavailable"));
         assert_eq!(
             transport
-                .list_resources()
+                .list_resources(None)
                 .expect("connection remains usable after JSON-RPC error"),
             json!({ "resources": [] })
         );
+    }
+
+    /// A stdio server that, before it answers each `tools/list`, sends the
+    /// message in `<dir>/request`, in which `%s` stands for the id of the
+    /// `tools/list` it is about to answer, and adds the line it gets back to
+    /// `<dir>/replies`. It writes its pid to `<dir>/pid`.
+    #[cfg(unix)]
+    fn asking_stdio_server(dir: &std::path::Path, request: &str) -> StdioTransport {
+        fs::write(dir.join("request"), request).expect("write the server's request");
+        let server = dir.join("asking_mcp_server.sh");
+        write_executable_stdio_fixture(
+            &server,
+            r#"#!/bin/sh
+state_dir="$1"
+printf '%s\n' "$$" > "$state_dir/pid"
+while IFS= read -r line; do
+  id=${line#*'"id":'}
+  id=${id%%,*}
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"asking","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf "$(cat "$state_dir/request")\n" "$id"
+      IFS= read -r reply
+      printf '%s\n' "$reply" >> "$state_dir/replies"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+        let transport = StdioTransport::start(&stdio_test_config(
+            "asking",
+            &server,
+            vec![dir.to_string_lossy().into_owned()],
+            5_000,
+        ))
+        .expect("start the stdio server");
+        transport.initialize().expect("initialize");
+        transport
+    }
+
+    /// The replies the asking server got, in order.
+    #[cfg(unix)]
+    fn replies_to_the_server(dir: &std::path::Path) -> Vec<Value> {
+        fs::read_to_string(dir.join("replies"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON-RPC reply"))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_ping_is_answered() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let transport = asking_stdio_server(
+            temp_dir.path(),
+            r#"{"jsonrpc":"2.0","id":"p1","method":"ping"}"#,
+        );
+
+        let tools = transport
+            .list_tools(None)
+            .expect("tools/list after the ping");
+
+        assert_eq!(tools["tools"][0]["name"], "echo");
+        assert_eq!(
+            replies_to_the_server(temp_dir.path()),
+            [json!({"jsonrpc": "2.0", "id": "p1", "result": {}})]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unknown_server_request_gets_method_not_found() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let transport = asking_stdio_server(
+            temp_dir.path(),
+            r#"{"jsonrpc":"2.0","id":"r1","method":"sampling/createMessage","params":{"messages":[],"maxTokens":1}}"#,
+        );
+
+        let tools = transport
+            .list_tools(None)
+            .expect("tools/list after the request");
+
+        assert_eq!(tools["tools"][0]["name"], "echo");
+        assert_eq!(
+            replies_to_the_server(temp_dir.path()),
+            [json!({
+                "jsonrpc": "2.0",
+                "id": "r1",
+                "error": {"code": -32601, "message": "Method not found"}
+            })]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_request_with_our_id_is_not_taken_for_the_response() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        // The ping carries the id of the `tools/list` it comes before.
+        let transport = asking_stdio_server(
+            temp_dir.path(),
+            r#"{"jsonrpc":"2.0","id":%s,"method":"ping"}"#,
+        );
+
+        let tools = transport
+            .list_tools(None)
+            .expect("tools/list after a ping with its id");
+
+        assert_eq!(tools["tools"][0]["name"], "echo");
+        assert_eq!(
+            replies_to_the_server(temp_dir.path()),
+            [json!({"jsonrpc": "2.0", "id": 2, "result": {}})]
+        );
+        let pid = fs::read_to_string(temp_dir.path().join("pid")).expect("the server's pid");
+        assert!(!transport.is_closed(), "the transport was shut down");
+        assert!(process_is_alive(pid.trim()), "the server was stopped");
+        transport
+            .list_tools(None)
+            .expect("the server still answers");
     }
 
     #[cfg(unix)]
@@ -2669,7 +3018,7 @@ done
         })
         .expect("connect stdio MCP");
         transport.initialize().expect("initialize MCP");
-        transport.list_tools().expect("list tools");
+        transport.list_tools(None).expect("list tools");
         transport
     }
 
@@ -2729,7 +3078,7 @@ done
         })
         .expect("connect stdio MCP");
         transport.initialize().expect("initialize MCP");
-        transport.list_tools().expect("list tools");
+        transport.list_tools(None).expect("list tools");
         let started = Instant::now();
 
         let result = transport.call_tool_with_elicitation_handler_or_cancel(
@@ -2798,7 +3147,7 @@ done
         })
         .expect("connect stdio MCP");
         transport.initialize().expect("initialize MCP");
-        transport.list_tools().expect("list tools");
+        transport.list_tools(None).expect("list tools");
 
         let result = transport.call_tool_with_elicitation_handler_or_cancel(
             "finish",
@@ -2876,7 +3225,7 @@ done
         })
         .expect("connect stdio MCP");
         transport.initialize().expect("initialize MCP");
-        transport.list_tools().expect("list tools");
+        transport.list_tools(None).expect("list tools");
         let handler = RecordingElicitationHandler::new(McpElicitationResponse::accept(
             serde_json::json!({"code":"1234"}),
         ));
@@ -2946,7 +3295,7 @@ done
         })
         .expect("connect SSE MCP");
         transport.initialize().expect("initialize SSE MCP");
-        transport.list_tools().expect("list SSE tools");
+        transport.list_tools(None).expect("list SSE tools");
 
         let started = Instant::now();
         let result = transport.call_tool("wait", Value::Object(Default::default()));
@@ -3329,7 +3678,7 @@ done
         })
         .expect("connect SSE MCP");
         transport.initialize().expect("initialize SSE MCP");
-        transport.list_tools().expect("list SSE tools");
+        transport.list_tools(None).expect("list SSE tools");
         let started = Instant::now();
         let result = transport.call_tool_with_elicitation_handler_or_cancel(
             "wait",
@@ -3380,14 +3729,14 @@ done
         })
         .expect("connect SSE MCP");
         transport.initialize().expect("initialize SSE MCP");
-        transport.list_tools().expect("list SSE tools");
+        transport.list_tools(None).expect("list SSE tools");
         let started = Instant::now();
 
-        let result =
-            transport.list_resources_or_cancel(&|| started.elapsed() >= Duration::from_millis(50));
+        let result = transport
+            .list_resources_or_cancel(None, &|| started.elapsed() >= Duration::from_millis(50));
         let cancellation_elapsed = started.elapsed();
         let second = transport
-            .list_resources()
+            .list_resources(None)
             .expect("SSE resource transport remains usable after cancellation cleanup");
 
         assert!(
@@ -3545,29 +3894,75 @@ done
 
     #[test]
     fn sse_response_body_is_bounded() {
-        let server = OneShotSseServer::start(|stream| {
+        // A JSON body is read whole; an event stream as its events come.
+        for content_type in ["application/json", "text/event-stream"] {
+            let server = OneShotSseServer::start(move |stream| {
+                let _ = read_http_request(stream);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\nconnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(&vec![b'x'; MAX_SSE_RESPONSE_BYTES + 1]);
+            });
+
+            let error = request_sse_with_client(
+                &reqwest::blocking::Client::new(),
+                "oversized",
+                &SseRequestContext {
+                    endpoint: server.url(),
+                    headers: HeaderMap::new(),
+                    id: 1,
+                    method: "tools/list".to_string(),
+                    timeout: Duration::from_secs(2),
+                },
+                json!({}),
+            )
+            .expect_err("oversized SSE response must be rejected")
+            .into_message();
+
+            assert!(
+                error.contains("exceeded maximum body size"),
+                "unexpected oversized {content_type} response error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blocking_sse_read_ends_at_the_matching_response() {
+        let (release, released) = mpsc::channel::<()>();
+        let server = OneShotSseServer::start(move |stream| {
             let _ = read_http_request(stream);
-            let body = vec![b'x'; MAX_SSE_RESPONSE_BYTES + 1];
-            write_bytes_response(stream, &body);
+            let _ = stream.write_all(
+                concat!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"working\"}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+                )
+                .as_bytes(),
+            );
+            let _ = stream.flush();
+            // The stream stays open until the test is done.
+            let _ = released.recv_timeout(FIXTURE_WAIT);
         });
+        let config = McpServerConfig {
+            name: "held".to_string(),
+            transport: McpTransportKind::Http,
+            url: Some(server.url()),
+            startup_timeout_ms: Some(10_000),
+            ..Default::default()
+        };
+        let transport =
+            StreamableHttpTransport::new(&config, no_auth(&config)).expect("an HTTP transport");
+        let started = Instant::now();
 
-        let error = request_sse_with_client(
-            &reqwest::blocking::Client::new(),
-            &SseRequestContext {
-                endpoint: server.url(),
-                headers: HeaderMap::new(),
-                id: 1,
-                method: "tools/list".to_string(),
-                timeout: Duration::from_secs(2),
-            },
-            json!({}),
-        )
-        .expect_err("oversized SSE response must be rejected")
-        .into_message();
+        let tools = transport.list_tools(None);
 
+        let elapsed = started.elapsed();
+        drop(release);
+        assert_eq!(tools, Ok(json!({"tools": []})));
         assert!(
-            error.contains("exceeded maximum body size"),
-            "unexpected oversized response error: {error}"
+            elapsed < Duration::from_secs(1),
+            "the read waited {elapsed:?} for the stream to end"
         );
     }
 
@@ -3927,7 +4322,7 @@ done
         transport
             .initialize()
             .expect("initialize with both response types accepted");
-        transport.list_tools().expect("list tools");
+        transport.list_tools(None).expect("list tools");
         transport
             .call_tool("echo", json!({"text": "hi"}))
             .expect("call a tool");
@@ -3965,7 +4360,9 @@ done
             connect(&streamable_http_config("sessions", &server)).expect("connect HTTP MCP");
 
         transport.initialize().expect("initialize");
-        transport.list_tools().expect("list tools in the session");
+        transport
+            .list_tools(None)
+            .expect("list tools in the session");
         transport
             .call_tool("echo", json!({"text": "hi"}))
             .expect("call a tool in the session");
@@ -4014,6 +4411,55 @@ done
     }
 
     #[test]
+    fn http_answers_a_ping_inside_a_response_stream() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            sessions: vec!["s1"],
+            ping: true,
+            ..Default::default()
+        });
+        let transport =
+            connect(&streamable_http_config("pinged", &server)).expect("connect HTTP MCP");
+
+        // Each of these reads its response its own way: `initialize` and
+        // `tools/list` on the calling thread, a tool call and a resource
+        // listing that can be cancelled on a thread of their own.
+        transport.initialize().expect("initialize after a ping");
+        transport.list_tools(None).expect("tools/list after a ping");
+        let called = transport
+            .call_tool("echo", json!({"text": "hi"}))
+            .expect("tools/call after a ping");
+        let resources = transport
+            .list_resources_or_cancel(None, &|| false)
+            .expect("resources/list after a ping");
+
+        assert_eq!(called["content"][0]["text"], "hi");
+        assert_eq!(resources, json!({"resources": []}));
+        let replies = server
+            .requests()
+            .into_iter()
+            .filter(|request| {
+                request.body["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("ping-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| reply.body.clone())
+                .collect::<Vec<_>>(),
+            (1..=4)
+                .map(|id| json!({"jsonrpc": "2.0", "id": format!("ping-{id}"), "result": {}}))
+                .collect::<Vec<_>>()
+        );
+        // Even the reply to the ping in the `initialize` response goes to the
+        // session that response started.
+        for reply in &replies {
+            assert_eq!(reply.header("mcp-session-id"), Some("s1"), "{reply:?}");
+        }
+    }
+
+    #[test]
     fn http_requests_carry_the_negotiated_protocol_version() {
         let server = StreamableHttpServer::start(StreamableHttpBehavior {
             protocol_version: "2025-03-26",
@@ -4023,7 +4469,7 @@ done
             connect(&streamable_http_config("versioned", &server)).expect("connect HTTP MCP");
 
         let initialized = transport.initialize().expect("initialize");
-        transport.list_tools().expect("list tools");
+        transport.list_tools(None).expect("list tools");
         transport
             .call_tool("echo", json!({"text": "hi"}))
             .expect("call a tool");
@@ -4109,7 +4555,7 @@ done
 
         let (server, transport) = expiring_http_session(vec!["s1"]);
         let tools = transport
-            .list_tools()
+            .list_tools(None)
             .expect("tool list in the new session");
         assert_eq!(tools["tools"][0]["name"], "echo");
         assert_eq!(
@@ -4153,13 +4599,13 @@ done
                 .initialize()
                 .unwrap_or_else(|error| panic!("initialize over {format}: {error}"));
             let tools = transport
-                .list_tools()
+                .list_tools(None)
                 .unwrap_or_else(|error| panic!("tools/list over {format}: {error}"));
             let called = transport
                 .call_tool("echo", json!({"text": "hi"}))
                 .unwrap_or_else(|error| panic!("tools/call over {format}: {error}"));
             let resources = transport
-                .list_resources_or_cancel(&|| false)
+                .list_resources_or_cancel(None, &|| false)
                 .unwrap_or_else(|error| panic!("resources/list over {format}: {error}"));
 
             assert_eq!(initialized["serverInfo"]["name"], "fixture", "{format}");
@@ -4209,6 +4655,17 @@ done
             .expect("dropping the transport ends the session");
         assert_eq!(delete.header("mcp-session-id"), Some("s1"));
         assert_eq!(delete.header("mcp-protocol-version"), Some("2025-06-18"));
+    }
+
+    #[test]
+    fn stdio_launches_take_turns_only_where_pipes_are_not_made_close_on_exec_at_once() {
+        let turn = stdio_launch_turn();
+
+        assert_eq!(
+            turn.is_some(),
+            cfg!(any(target_os = "macos", target_os = "ios")),
+            "launches take turns on macOS and iOS only"
+        );
     }
 
     #[cfg(unix)]
@@ -4292,7 +4749,7 @@ while IFS= read -r line; do :; done
         let transport = connect(&config).expect("connect HTTP MCP");
 
         transport.initialize().expect("initialize");
-        transport.list_tools().expect("list tools");
+        transport.list_tools(None).expect("list tools");
 
         assert_eq!(
             server.session_trail(),
@@ -4355,7 +4812,7 @@ while IFS= read -r line; do :; done
             .initialize()
             .expect("initialize over the event stream");
         let tools = transport
-            .list_tools()
+            .list_tools(None)
             .expect("tools/list over the event stream");
         let called = transport
             .call_tool("echo", json!({"text": "hi"}))
@@ -4464,6 +4921,33 @@ while IFS= read -r line; do :; done
     }
 
     #[test]
+    fn legacy_sse_answers_a_ping() {
+        let server = LegacySseServer::start(LegacySseBehavior {
+            ping: true,
+            ..Default::default()
+        });
+        let transport =
+            legacy_sse(&legacy_sse_config("pinged", &server)).expect("open the event stream");
+        transport.initialize().expect("initialize");
+
+        let called = transport
+            .call_tool("echo", json!({"text": "hi"}))
+            .expect("tool result after the ping was answered");
+
+        assert_eq!(called["content"][0]["text"], "hi");
+        let reply = server
+            .requests()
+            .into_iter()
+            .find(|request| request.body["id"] == "ping-1")
+            .expect("the ping was answered");
+        assert_eq!(reply.path, "/messages?sessionId=legacy-1");
+        assert_eq!(
+            reply.body,
+            json!({"jsonrpc": "2.0", "id": "ping-1", "result": {}})
+        );
+    }
+
+    #[test]
     fn legacy_sse_times_out_each_request_on_its_own() {
         let server = LegacySseServer::start(LegacySseBehavior {
             unanswered: Some("tools/call"),
@@ -4487,7 +4971,7 @@ while IFS= read -r line; do :; done
         );
         // The stream stays open for the next request, which has its own timeout.
         let tools = transport
-            .list_tools()
+            .list_tools(None)
             .expect("tools/list after the timeout");
         assert_eq!(tools["tools"][0]["name"], "echo");
     }
@@ -4516,7 +5000,7 @@ while IFS= read -r line; do :; done
             "cancelling took {elapsed:?}"
         );
         let tools = transport
-            .list_tools()
+            .list_tools(None)
             .expect("tools/list after the cancellation");
         assert_eq!(tools["tools"][0]["name"], "echo");
     }
@@ -4558,7 +5042,7 @@ while IFS= read -r line; do :; done
                 .initialize()
                 .unwrap_or_else(|error| panic!("initialize after a {post_status}: {error}"));
             let tools = transport
-                .list_tools()
+                .list_tools(None)
                 .unwrap_or_else(|error| panic!("tools/list after a {post_status}: {error}"));
             let called = transport
                 .call_tool("echo", json!({"text": "hi"}))
@@ -4608,7 +5092,9 @@ while IFS= read -r line; do :; done
             connect_with_credentials(&config, Some(credentials)).expect("connect SSE MCP");
 
         transport.initialize().expect("initialize over legacy SSE");
-        transport.list_tools().expect("tools/list over legacy SSE");
+        transport
+            .list_tools(None)
+            .expect("tools/list over legacy SSE");
 
         assert_eq!(
             server.trail(),
@@ -4682,14 +5168,14 @@ while IFS= read -r line; do :; done
         // Nothing goes out until `initialize` has picked the transport.
         assert_eq!(
             transport
-                .list_tools()
+                .list_tools(None)
                 .expect_err("tools/list before initialize"),
             "MCP server 'modern' is not initialized"
         );
         assert!(server.requests().is_empty());
 
         transport.initialize().expect("initialize");
-        let tools = transport.list_tools().expect("list tools");
+        let tools = transport.list_tools(None).expect("list tools");
         let called = transport
             .call_tool("echo", json!({"text": "hi"}))
             .expect("call a tool");
@@ -4734,7 +5220,7 @@ while IFS= read -r line; do :; done
 
         // Later requests fail at once, without sending what no stream can answer.
         let later = transport
-            .list_tools()
+            .list_tools(None)
             .expect_err("the event stream is gone");
         assert_eq!(later, error);
         assert!(server.requests_for("tools/list").is_empty());
@@ -4794,7 +5280,7 @@ while IFS= read -r line; do :; done
             let transport = connect(&config).expect("connect a remote MCP server");
             transport.initialize().expect("initialize");
 
-            let listed = transport.list_prompts().expect("prompts/list");
+            let listed = transport.list_prompts(None).expect("prompts/list");
             let expanded = transport
                 .get_prompt("review_pr", json!({"pr": "123"}))
                 .expect("prompts/get");
@@ -4884,6 +5370,10 @@ while IFS= read -r line; do :; done
         /// Ask the client a question during `tools/call`, and answer the call
         /// with the action the client replied with.
         elicit: bool,
+        /// Answer each request with an event stream that pings the client
+        /// first, as `ping-<the request's id>`, and carries the response only
+        /// once the client has answered the ping.
+        ping: bool,
     }
 
     impl Default for StreamableHttpBehavior {
@@ -4895,6 +5385,7 @@ while IFS= read -r line; do :; done
                 notification_status: 202,
                 event_stream: false,
                 elicit: false,
+                ping: false,
             }
         }
     }
@@ -5103,7 +5594,7 @@ while IFS= read -r line; do :; done
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "fixture", "version": "1"}
             });
-            return write_rpc_result(stream, behavior, id, result, assigned);
+            return write_rpc_result(stream, behavior, id, result, assigned, log);
         }
         let is_request = id.is_some() && request.rpc_method().is_some();
         if !behavior.sessions.is_empty() {
@@ -5146,7 +5637,7 @@ while IFS= read -r line; do :; done
             Some("prompts/get") => fixture_prompt(&request.body),
             _ => json!({}),
         };
-        write_rpc_result(stream, behavior, id, result, None);
+        write_rpc_result(stream, behavior, id, result, None, log);
     }
 
     fn write_rpc_result(
@@ -5155,11 +5646,25 @@ while IFS= read -r line; do :; done
         id: Option<Value>,
         result: Value,
         session: Option<&str>,
+        log: &StdMutex<Vec<HttpExchange>>,
     ) {
         let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
         let session = session
             .map(|session| format!("mcp-session-id: {session}\r\n"))
             .unwrap_or_default();
+        if behavior.ping {
+            let ping_id = format!("ping-{}", id.unwrap_or_default());
+            let ping = json!({"jsonrpc": "2.0", "id": ping_id, "method": "ping"});
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n{session}connection: close\r\n\r\nevent: message\ndata: {ping}\n\n"
+            );
+            let _ = stream.flush();
+            if wait_in_log(log, |request| request.body["id"] == ping_id).is_some() {
+                let _ = write!(stream, "event: message\ndata: {response}\n\n");
+            }
+            return;
+        }
         let _ = if behavior.event_stream {
             let log = json!({
                 "jsonrpc": "2.0",
@@ -5320,6 +5825,9 @@ while IFS= read -r line; do :; done
         elicit: bool,
         /// Ask the client a question as soon as the stream opens.
         elicit_unprompted: bool,
+        /// Ping the client during `tools/call`, as `ping-1`, and answer the
+        /// call only once the client has answered the ping.
+        ping: bool,
     }
 
     impl Default for LegacySseBehavior {
@@ -5331,6 +5839,7 @@ while IFS= read -r line; do :; done
                 unanswered: None,
                 elicit: false,
                 elicit_unprompted: false,
+                ping: false,
             }
         }
     }
@@ -5487,6 +5996,9 @@ while IFS= read -r line; do :; done
             "tools/call" if behavior.elicit => {
                 return ask_before_answering(stream, id, state, log, events);
             }
+            "tools/call" if behavior.ping => {
+                return ping_before_answering(stream, request, id, log, events);
+            }
             "tools/call" => json!({
                 "content": [{
                     "type": "text",
@@ -5532,6 +6044,30 @@ while IFS= read -r line; do :; done
             .as_str()
             .or_else(|| reply.body["error"]["message"].as_str())
             .unwrap_or_default();
+        let _ = events.send(Some(legacy_event(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"content": [{"type": "text", "text": text}], "isError": false}
+        }))));
+    }
+
+    /// Pings the client on the event stream, waits for its answer, and then
+    /// answers the call with its text.
+    fn ping_before_answering(
+        stream: &mut TcpStream,
+        request: &HttpExchange,
+        id: Value,
+        log: &StdMutex<Vec<HttpExchange>>,
+        events: &mpsc::Sender<Option<String>>,
+    ) {
+        let _ = events.send(Some(legacy_event(
+            &json!({"jsonrpc": "2.0", "id": "ping-1", "method": "ping"}),
+        )));
+        write_http_status(stream, 202);
+        if wait_in_log(log, |request| request.body["id"] == "ping-1").is_none() {
+            return;
+        }
+        let text = request.body["params"]["arguments"]["text"].clone();
         let _ = events.send(Some(legacy_event(&json!({
             "jsonrpc": "2.0",
             "id": id,

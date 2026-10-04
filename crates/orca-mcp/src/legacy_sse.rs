@@ -20,10 +20,11 @@ use orca_core::mcp_types::McpServerConfig;
 
 use crate::auth::{AuthAttempt, RemoteAuth};
 use crate::transport::{
-    MAX_SSE_RESPONSE_BYTES, McpElicitationHandler, McpTransport, configured_headers,
-    format_duration, initialize_params, is_elicitation_create_request, json_rpc_id_to_string,
-    mcp_jsonrpc_error_response, negotiated_protocol_version, parse_terminal_message, remote_url,
-    resolve_sse_elicitation, sse_event_end, sse_event_parts, timeout_from_ms,
+    MAX_SSE_RESPONSE_BYTES, METHOD_NOT_FOUND, McpElicitationHandler, McpTransport,
+    configured_headers, format_duration, initialize_params, is_elicitation_create_request,
+    is_server_request, json_rpc_id_to_string, list_params, mcp_jsonrpc_error_response,
+    negotiated_protocol_version, parse_terminal_message, remote_url, resolve_sse_elicitation,
+    server_request_reply, sse_event_end, sse_event_parts, timeout_from_ms,
 };
 
 /// What every request fails with once the event stream has ended. The client
@@ -34,8 +35,6 @@ const MCP_TOOL_CALL_CANCELLED: &str = "MCP tool call cancelled";
 const EVENT_STREAM: &str = "text/event-stream";
 /// How often a waiting request checks whether it has been cancelled.
 const CANCEL_POLL: Duration = Duration::from_millis(25);
-/// The JSON-RPC error for a request the client does not answer.
-const METHOD_NOT_FOUND: i64 = -32601;
 
 /// Talks to a server over legacy SSE. A background thread reads the event
 /// stream and hands each response to the request waiting for it; each
@@ -257,10 +256,10 @@ impl McpTransport for LegacySseTransport {
         Ok(result)
     }
 
-    fn list_tools(&self) -> Result<Value, String> {
+    fn list_tools(&self, cursor: Option<&str>) -> Result<Value, String> {
         self.request(
             "tools/list",
-            json!({}),
+            list_params(cursor),
             self.startup_timeout,
             None,
             &never_cancelled,
@@ -301,31 +300,36 @@ impl McpTransport for LegacySseTransport {
         )
     }
 
-    fn list_resources(&self) -> Result<Value, String> {
-        self.list_resources_or_cancel(&never_cancelled)
+    fn list_resources(&self, cursor: Option<&str>) -> Result<Value, String> {
+        self.list_resources_or_cancel(cursor, &never_cancelled)
     }
 
-    fn list_resources_or_cancel(&self, should_cancel: &dyn Fn() -> bool) -> Result<Value, String> {
+    fn list_resources_or_cancel(
+        &self,
+        cursor: Option<&str>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
         self.request(
             "resources/list",
-            json!({}),
+            list_params(cursor),
             self.startup_timeout,
             None,
             should_cancel,
         )
     }
 
-    fn list_resource_templates(&self) -> Result<Value, String> {
-        self.list_resource_templates_or_cancel(&never_cancelled)
+    fn list_resource_templates(&self, cursor: Option<&str>) -> Result<Value, String> {
+        self.list_resource_templates_or_cancel(cursor, &never_cancelled)
     }
 
     fn list_resource_templates_or_cancel(
         &self,
+        cursor: Option<&str>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, String> {
         self.request(
             "resources/templates/list",
-            json!({}),
+            list_params(cursor),
             self.startup_timeout,
             None,
             should_cancel,
@@ -350,10 +354,10 @@ impl McpTransport for LegacySseTransport {
         )
     }
 
-    fn list_prompts(&self) -> Result<Value, String> {
+    fn list_prompts(&self, cursor: Option<&str>) -> Result<Value, String> {
         self.request(
             "prompts/list",
-            json!({}),
+            list_params(cursor),
             self.startup_timeout,
             None,
             &never_cancelled,
@@ -722,9 +726,11 @@ impl EventStreamReader {
         Ok(())
     }
 
-    /// Hands a response to the request waiting for it, and a question from
-    /// the server to a waiting request to answer. Notifications and other
-    /// requests from the server go unanswered, as on the other transports.
+    /// Hands a response to the request waiting for it, and answers a request
+    /// from the server: a question goes to a waiting request to answer, and
+    /// is turned down when none is waiting, and any other request is
+    /// answered at once, as on the other transports (see
+    /// [`server_request_reply`]). Notifications are skipped.
     fn dispatch(&self, message: Value, client: &reqwest::Client) {
         if message.get("method").is_none() {
             if let Some(id) = message.get("id").map(json_rpc_id_to_string) {
@@ -732,10 +738,12 @@ impl EventStreamReader {
             }
             return;
         }
-        if is_elicitation_create_request(&message)
-            && message.get("id").is_some()
-            && !self.stream.forward(&message)
-        {
+        if !is_server_request(&message) {
+            return;
+        }
+        if !is_elicitation_create_request(&message) {
+            self.reply(client, server_request_reply(&message));
+        } else if !self.stream.forward(&message) {
             self.reply(client, elicitation_not_supported(&message));
         }
     }

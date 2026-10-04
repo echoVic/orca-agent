@@ -332,7 +332,7 @@ mod tests {
         transport
             .initialize()
             .expect("initialize with the refreshed token");
-        transport.list_tools().expect("list tools");
+        transport.list_tools(None).expect("list tools");
 
         assert_eq!(
             server.trail(),
@@ -572,7 +572,7 @@ mod tests {
         transport
             .initialize()
             .expect("initialize with the bearer token");
-        transport.list_tools().expect("list tools");
+        transport.list_tools(None).expect("list tools");
 
         let requests = server.requests_to("/mcp");
         assert_eq!(requests.len(), 3);

@@ -468,7 +468,7 @@ mod tests {
             Ok(json!({"capabilities": {"resources": {}}}))
         }
 
-        fn list_tools(&self) -> Result<Value, String> {
+        fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
             Ok(json!({"tools": []}))
         }
 
@@ -476,7 +476,7 @@ mod tests {
             Err("blocking resource transport does not support tools".to_string())
         }
 
-        fn list_resources(&self) -> Result<Value, String> {
+        fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
             self.started.send(()).map_err(|error| error.to_string())?;
             let (lock, wake) = &*self.release;
             let mut released = lock.lock().unwrap_or_else(|error| error.into_inner());
@@ -490,6 +490,7 @@ mod tests {
 
         fn list_resources_or_cancel(
             &self,
+            _cursor: Option<&str>,
             should_cancel: &dyn Fn() -> bool,
         ) -> Result<Value, String> {
             self.started.send(()).map_err(|error| error.to_string())?;
@@ -499,7 +500,7 @@ mod tests {
             Err("MCP tool call cancelled".to_string())
         }
 
-        fn list_resource_templates(&self) -> Result<Value, String> {
+        fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
             Ok(json!({"resourceTemplates": []}))
         }
 
@@ -573,7 +574,7 @@ mod tests {
             Ok(json!({"capabilities": {"resources": {}}}))
         }
 
-        fn list_tools(&self) -> Result<Value, String> {
+        fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
             Ok(json!({"tools": []}))
         }
 
@@ -581,12 +582,13 @@ mod tests {
             Err("cleanup resource transport does not support tools".to_string())
         }
 
-        fn list_resources(&self) -> Result<Value, String> {
+        fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
             Ok(json!({"resources": []}))
         }
 
         fn list_resources_or_cancel(
             &self,
+            _cursor: Option<&str>,
             should_cancel: &dyn Fn() -> bool,
         ) -> Result<Value, String> {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -621,7 +623,7 @@ mod tests {
             Err("MCP tool call cancelled".to_string())
         }
 
-        fn list_resource_templates(&self) -> Result<Value, String> {
+        fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
             Ok(json!({"resourceTemplates": []}))
         }
 
@@ -667,7 +669,7 @@ mod tests {
             Ok(json!({"capabilities": {"resources": {}}}))
         }
 
-        fn list_tools(&self) -> Result<Value, String> {
+        fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
             Ok(json!({"tools": []}))
         }
 
@@ -675,14 +677,14 @@ mod tests {
             Err("immediate resource transport does not support tools".to_string())
         }
 
-        fn list_resources(&self) -> Result<Value, String> {
+        fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
             self.completed.complete();
             Ok(json!({
                 "resources": [{"uri": "memo://fast", "name": "fast"}]
             }))
         }
 
-        fn list_resource_templates(&self) -> Result<Value, String> {
+        fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
             Ok(json!({"resourceTemplates": []}))
         }
 

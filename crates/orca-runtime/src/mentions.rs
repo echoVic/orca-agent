@@ -1869,7 +1869,7 @@ mod tests {
                 Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
-            fn list_tools(&self) -> Result<serde_json::Value, String> {
+            fn list_tools(&self, _cursor: Option<&str>) -> Result<serde_json::Value, String> {
                 Ok(serde_json::json!({"tools": []}))
             }
 
@@ -1881,7 +1881,7 @@ mod tests {
                 Err("not used".to_string())
             }
 
-            fn list_resources(&self) -> Result<serde_json::Value, String> {
+            fn list_resources(&self, _cursor: Option<&str>) -> Result<serde_json::Value, String> {
                 Ok(serde_json::json!({
                     "resources": [{
                         "uri": "memo://one",
@@ -1891,7 +1891,10 @@ mod tests {
                 }))
             }
 
-            fn list_resource_templates(&self) -> Result<serde_json::Value, String> {
+            fn list_resource_templates(
+                &self,
+                _cursor: Option<&str>,
+            ) -> Result<serde_json::Value, String> {
                 Ok(serde_json::json!({
                     "resourceTemplates": [{
                         "uriTemplate": "memo://{id}",

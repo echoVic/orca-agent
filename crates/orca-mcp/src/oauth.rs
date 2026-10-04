@@ -21,7 +21,8 @@
 //! tokens.
 //!
 //! No token is ever part of an error, and a code or token is only ever sent
-//! to the endpoint named, never along a redirect.
+//! to the endpoint named, never along a redirect. Metadata may come after a
+//! redirect, but never after one from https to plain http.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -283,10 +284,17 @@ pub(crate) fn unix_now() -> u64 {
 }
 
 /// A client that gives each request the server's startup timeout.
-/// `follow_redirects` is false for requests that carry a code or a token.
+/// `follow_redirects` is false for requests that carry a code or a token,
+/// which are never redirected. The others, the metadata requests among them,
+/// follow redirects as [`metadata_redirect`] allows.
 fn http_client(server: &McpServerConfig, follow_redirects: bool) -> Result<Client, String> {
     let redirects = if follow_redirects {
-        reqwest::redirect::Policy::default()
+        reqwest::redirect::Policy::custom(|attempt| {
+            match metadata_redirect(attempt.previous(), attempt.url()) {
+                Ok(()) => attempt.follow(),
+                Err(why) => attempt.error(why),
+            }
+        })
     } else {
         reqwest::redirect::Policy::none()
     };
@@ -302,6 +310,44 @@ fn http_client(server: &McpServerConfig, follow_redirects: bool) -> Result<Clien
         })
 }
 
+/// The most redirects a metadata request follows: as many as reqwest
+/// follows by default.
+const MAX_METADATA_REDIRECTS: usize = 10;
+
+/// Whether a metadata request may follow the redirect to `next`, after the
+/// urls in `previous`, the first of which it was sent to. It follows up to
+/// [`MAX_METADATA_REDIRECTS`] of them, and none that
+/// [`allows_metadata_redirect`] turns down. The error says why not.
+fn metadata_redirect(previous: &[Url], next: &Url) -> Result<(), &'static str> {
+    if previous
+        .last()
+        .is_some_and(|previous| !allows_metadata_redirect(previous, next))
+    {
+        return Err("a redirect from https to http is not followed");
+    }
+    // The first url is the one the request was sent to, not a redirect.
+    if previous.len() > MAX_METADATA_REDIRECTS {
+        return Err("too many redirects");
+    }
+    Ok(())
+}
+
+/// Whether a metadata request may follow a redirect from `previous` to
+/// `next`: never from https to plain http, where anyone on the way could
+/// read the metadata or change it, and with it where the login goes.
+fn allows_metadata_redirect(previous: &Url, next: &Url) -> bool {
+    previous.scheme() != "https" || next.scheme() == "https"
+}
+
+/// What went wrong with a request, with why a redirect was not followed:
+/// reqwest names only the url.
+fn request_error(error: &reqwest::Error) -> String {
+    match std::error::Error::source(error) {
+        Some(why) if error.is_redirect() => format!("{error}: {why}"),
+        _ => error.to_string(),
+    }
+}
+
 /// Asks the server, without credentials, where its protected resource
 /// metadata is: the `resource_metadata` of the 401 it answers an
 /// `initialize` POST with, or else a GET for an event stream, as a legacy
@@ -311,8 +357,12 @@ fn discover(client: &Client, server: &McpServerConfig, url: &Url) -> Result<Url,
     let name = &server.name;
     let mut headers = configured_headers(server)?;
     headers.remove(AUTHORIZATION);
-    let unreachable =
-        |error: reqwest::Error| format!("failed to reach MCP server '{name}': {error}");
+    let unreachable = |error: reqwest::Error| {
+        format!(
+            "failed to reach MCP server '{name}': {}",
+            request_error(&error)
+        )
+    };
     let post = client
         .post(url.clone())
         .headers(headers.clone())
@@ -456,7 +506,7 @@ fn register(
             "token_endpoint_auth_method": "none"
         }))
         .send()
-        .map_err(|error| failed(error.to_string()))?;
+        .map_err(|error| failed(request_error(&error)))?;
     let status = response.status();
     if !status.is_success() {
         return Err(failed(format!("it answered {status}")));
@@ -558,7 +608,7 @@ fn get_json<T: DeserializeOwned>(client: &Client, url: &Url) -> Result<T, String
         .get(url.clone())
         .header(ACCEPT, "application/json")
         .send()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| request_error(&error))?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("it answered {status}"));
@@ -1265,6 +1315,44 @@ mod tests {
         ] {
             assert_eq!(oauth_url(url).is_some(), allowed, "{url}");
         }
+    }
+
+    #[test]
+    fn metadata_redirects_stop_after_10_and_at_a_drop_to_http() {
+        let url = |url: &str| Url::parse(url).expect("a url");
+        let sent_to = |count: usize| vec![url("https://a/meta"); count];
+
+        // The tenth redirect is followed, and not the eleventh.
+        assert_eq!(
+            metadata_redirect(&sent_to(10), &url("https://b/meta")),
+            Ok(())
+        );
+        assert_eq!(
+            metadata_redirect(&sent_to(11), &url("https://b/meta")),
+            Err("too many redirects")
+        );
+        assert_eq!(
+            metadata_redirect(&sent_to(1), &url("http://b/meta")),
+            Err("a redirect from https to http is not followed")
+        );
+    }
+
+    #[test]
+    fn metadata_redirects_never_drop_to_http() {
+        let url = |url: &str| Url::parse(url).expect("a url");
+
+        assert!(!allows_metadata_redirect(
+            &url("https://a"),
+            &url("http://b")
+        ));
+        assert!(allows_metadata_redirect(
+            &url("https://a"),
+            &url("https://b")
+        ));
+        assert!(allows_metadata_redirect(
+            &url("http://127.0.0.1"),
+            &url("http://127.0.0.1:1")
+        ));
     }
 
     #[test]

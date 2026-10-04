@@ -40763,7 +40763,15 @@ done
         assert_eq!(status, surface::SurfaceMcpServerStatus::Ready);
 
         let catalog = wait_for_mcp_catalog(&surface, |catalog| catalog.revision > started.revision);
-        assert_eq!(catalog.revision.get(), started.revision.get() + 1);
+        // A stdio server is starting while it reconnects. The actor publishes
+        // the catalog as the registry then stands, so that shows in a
+        // revision of its own only when the actor got to it before the
+        // reconnect was done.
+        let advanced = catalog.revision.get() - started.revision.get();
+        assert!(
+            matches!(advanced, 1 | 2),
+            "the catalog moved {advanced} revisions"
+        );
         assert_eq!(catalog_tool_names(&catalog), ["mcp__docs__after"]);
         assert_eq!(
             catalog.servers,
