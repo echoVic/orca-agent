@@ -20,6 +20,7 @@ fn tui_submit_renders_and_restores_the_terminal() {
     let mut process = PtyProcess::spawn(home.path(), cwd.path()).expect("spawn TUI in PTY");
 
     let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
     receive_until(
         &process,
         &mut output,
@@ -77,6 +78,7 @@ fn tui_permission_round_trips_through_the_runtime_surface() {
         .expect("spawn permission TUI in PTY");
 
     let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
     receive_until(
         &process,
         &mut output,
@@ -121,6 +123,7 @@ fn tui_cancel_returns_to_idle_through_the_runtime_surface() {
             .expect("spawn cancellable TUI in PTY");
 
     let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
     receive_until(
         &process,
         &mut output,
@@ -158,6 +161,7 @@ fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
     )
     .expect("spawn detached-subagent TUI in PTY");
     let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
     assert_screen_shows(
         &process,
         &mut output,
@@ -219,6 +223,7 @@ fn tui_docks_an_agent_that_a_queued_message_starts() {
         PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "mock_stream_delay_ms 1500")
             .expect("spawn TUI in PTY");
     let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
     assert_screen_shows(
         &process,
         &mut output,
@@ -265,6 +270,7 @@ fn tui_shows_a_background_agents_progress_while_the_parent_turn_waits_on_it() {
     )
     .expect("spawn background-agent TUI in PTY");
     let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
     assert_screen_shows(
         &process,
         &mut output,
@@ -312,6 +318,7 @@ fn tui_click_on_a_running_background_agent_opens_its_transcript() {
     )
     .expect("spawn background-agent TUI in PTY");
     let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
     assert_screen_shows(
         &process,
         &mut output,
@@ -365,6 +372,7 @@ fn tui_escape_cancels_a_running_subagent_and_keeps_the_parent_usable() {
     )
     .expect("spawn foreground-subagent TUI in PTY");
     let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
     assert_screen_shows(
         &process,
         &mut output,
@@ -441,6 +449,7 @@ fn tui_bracketed_image_path_paste_materializes_an_atomic_attachment() {
     )
     .expect("spawn vision TUI in PTY");
     let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
     receive_until(
         &process,
         &mut output,
@@ -474,6 +483,7 @@ fn tui_restart_recovers_history_from_the_runtime_snapshot() {
     let mut source = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "pty restart seed")
         .expect("spawn source TUI in PTY");
     let mut source_output = Vec::new();
+    accept_new_workspace(&mut source, &mut source_output);
     receive_until(
         &source,
         &mut source_output,
@@ -510,6 +520,7 @@ fn tui_side_conversation_is_separate_disposable_and_returns_to_parent() {
     let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "main pty seed")
         .expect("spawn parent TUI in PTY");
     let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
     receive_until(
         &process,
         &mut output,
@@ -626,6 +637,7 @@ fn tui_side_toggle_keeps_transcripts_visible_without_resubmitting() {
     let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "main pty seed")
         .expect("spawn parent TUI in PTY");
     let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
     receive_until(
         &process,
         &mut output,
@@ -711,6 +723,7 @@ fn tui_recap_command_draws_the_strip_and_detail_and_esc_closes_the_detail() {
     let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "recap pty seed")
         .expect("spawn recap TUI in PTY");
     let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
     receive_until(
         &process,
         &mut output,
@@ -766,6 +779,65 @@ fn tui_recap_command_draws_the_strip_and_detail_and_esc_closes_the_detail() {
 }
 
 #[test]
+fn a_prompt_given_on_the_command_line_waits_for_the_workspace_review() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process = PtyProcess::spawn(home.path(), cwd.path()).expect("spawn TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "a prompt on the command line skipped the review of a new workspace",
+    );
+    assert!(
+        !contains_rendered_text(&output, ASSISTANT_SENTINEL),
+        "the prompt ran before the workspace was accepted"
+    );
+
+    process.write(b"\r").expect("trust the workspace");
+    receive_until(
+        &process,
+        &mut output,
+        ASSISTANT_SENTINEL,
+        Duration::from_secs(10),
+        "the prompt did not run once the workspace was accepted",
+    );
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
+fn leaving_the_workspace_review_never_runs_the_command_line_prompt() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process = PtyProcess::spawn(home.path(), cwd.path()).expect("spawn TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "a prompt on the command line skipped the review of a new workspace",
+    );
+    process.write(b"e").expect("leave the review");
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    process.drain_output(&mut output);
+
+    assert_eq!(status.code(), Some(0), "TUI exited with {status}");
+    assert!(
+        !contains_rendered_text(&output, ASSISTANT_SENTINEL),
+        "the prompt ran although the user left the review"
+    );
+}
+
+#[test]
 fn tui_quit_stops_an_mcp_server_that_is_still_starting() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");
@@ -775,14 +847,7 @@ fn tui_quit_stops_an_mcp_server_that_is_still_starting() {
         PtyProcess::spawn_without_prompt(home.path(), cwd.path()).expect("spawn TUI in PTY");
 
     let mut output = Vec::new();
-    receive_until(
-        &process,
-        &mut output,
-        "review this workspace security boundary",
-        Duration::from_secs(20),
-        "TUI did not ask to review the new workspace",
-    );
-    process.write(b"\r").expect("trust the workspace");
+    accept_new_workspace(&mut process, &mut output);
     let pid = server.wait_for_start();
 
     arm_idle_exit(&mut process, &mut output);
@@ -1333,6 +1398,20 @@ fn await_idle_ctrl_c_exit(process: &mut PtyProcess) {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// Accepts the review of a new workspace. A TUI launched in a fresh
+/// ORCA_HOME shows it before it runs anything, a prompt given on the command
+/// line included.
+fn accept_new_workspace(process: &mut PtyProcess, output: &mut Vec<u8>) {
+    receive_until(
+        process,
+        output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "TUI did not ask to review the new workspace",
+    );
+    process.write(b"\r").expect("trust the workspace");
 }
 
 fn receive_until(

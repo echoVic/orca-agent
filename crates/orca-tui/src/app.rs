@@ -282,12 +282,16 @@ fn run_tui_inner(
             return pending_terminal_session.fail_after_agent_startup(error);
         }
     };
-    let pending_initial_prompt =
-        if typed_history_startup_eligible(&config.history_mode, &preloaded_transcript) {
-            initial_prompt.clone()
-        } else {
-            None
-        };
+    // A prompt given on the command line waits for first-run setup like
+    // everything else the workspace runs: `finish_setup` submits it once the
+    // user has accepted the workspace.
+    let pending_initial_prompt = if !needs_setup
+        && typed_history_startup_eligible(&config.history_mode, &preloaded_transcript)
+    {
+        initial_prompt.clone()
+    } else {
+        None
+    };
     let renderer_interaction_acks =
         RendererInteractionAckOwner::new(agent_runtime.interaction_ack_receiver());
     let renderer_runtime_inbox = RendererRuntimeInboxOwner::new(pending_event_rx);
@@ -297,7 +301,8 @@ fn run_tui_inner(
     let mut textarea = if needs_setup && state.setup_step == 1 {
         make_setup_textarea(pending_terminal_session.theme())
     } else {
-        if let Some(prompt) = initial_prompt.clone()
+        if !needs_setup
+            && let Some(prompt) = initial_prompt.clone()
             && pending_initial_prompt.is_none()
         {
             state.push_message(ChatMessage::User(prompt.clone()));
