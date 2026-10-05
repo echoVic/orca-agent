@@ -95,11 +95,13 @@ OS sandbox. Then type a task and press `Enter`.
   background.
 - **Approve tool calls.** A call that needs approval turns the input into an
   approval panel: allow once, allow this exact call, allow the tool for the
-  session, or deny (`Esc`). `Shift+Tab` cycles `suggest` → `auto-edit` →
-  `full-auto` → `plan`. Entering `full-auto` asks for an explicit Full Access
-  confirmation; the running task picks it up at its next tool call, while tools
-  already running and subagents already launched keep their original policy.
-  Mode changes last for the session and are never saved.
+  session, or deny (`Esc`). An MCP tool can also be always allowed, alone or
+  with its whole server, as a rule saved to your config. `Shift+Tab` cycles
+  `suggest` → `auto-edit` → `full-auto` → `plan`. Entering `full-auto` asks for
+  an explicit Full Access confirmation; the running task picks it up at its
+  next tool call, while tools already running and subagents already launched
+  keep their original policy. Mode changes last for the session and are never
+  saved.
 - **Background work.** `/tasks` shows the tasks dock under the conversation,
   where background turns, subagents, commands, monitors, and workflow children
   appear. `/agents` opens the Agent Workspace with each task's live
@@ -107,6 +109,10 @@ OS sandbox. Then type a task and press `Enter`.
   resume, retry, or a follow-up. When background agents finish while you are
   idle, Orca continues with their results. `/workflows` keeps the workflow run
   tree.
+- **MCP servers.** The servers in your config connect in the background as
+  soon as the TUI opens. `/mcp` shows how each stands, with its tools and
+  prompts, and reconnects, logs in, or logs out; each MCP prompt runs as a
+  slash command, `/mcp__<server>__<prompt>`.
 - **Plan, goals, and recap.** `/plan` investigates read-only and ends with a
   plan to approve; `/goal` sets a persistent objective; `/recap` summarizes the
   session, and Orca writes one itself when you return after a quiet spell;
@@ -179,6 +185,9 @@ recall, storage, privacy, and deletion.
   JavaScript workflows for longer tasks that need continuation or parallel work.
 - Loads project instructions, skills, plugins, custom tools, MCP tools, and MCP
   resources after the workspace is trusted.
+- Manages MCP servers with `orca mcp add`, `list`, `get`, `remove`, `login`,
+  and `logout`: local stdio servers, and remote ones over streamable HTTP or
+  legacy SSE that sign in with OAuth or a bearer token from the environment.
 - Exposes stable JSONL, app-server, and Agent Client Protocol (ACP) contracts
   for editors, harnesses, and CI.
 

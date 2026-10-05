@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.6":
+        "MCP servers are now managed from the command line with orca mcp add, list, get, remove, login and logout, for local stdio servers and remote ones alike. Remote servers use streamable HTTP as the MCP spec defines it, fall back to legacy HTTP+SSE, and sign in with OAuth or a bearer token taken from the environment. Servers connect in the background, all at once, as soon as the TUI opens: before your first message /mcp already shows each server's status, tools and prompts and can reconnect, log in or log out, and a turn waits only for the servers still connecting. Each MCP prompt is a slash command, tools a server marks read-only no longer ask in suggest mode, and the approval panel can always allow a tool or a whole server. deepseek-flash now sees the images MCP tools return. In a folder you have not reviewed, the workspace review now always comes first, for orca \"prompt\", --continue and --resume alike, and a config.toml that cannot be read or parsed is reported with a warning instead of dropped in silence.",
       "v0.5.5":
         "Every request now reserves reply tokens by reasoning effort — 128K at Max, 64K at High, 32K at Low — instead of a fixed 384K, so the compaction line sits where it actually matters. Compaction works by conversational unit so a pinned message no longer freezes its whole turn, earlier tool outputs lose detail before the ones you are working with, and the active turn's recent outputs are always kept. Task and subagent completion notices are ordinary messages again and survive session resume. Emergency compaction now either shrinks the prompt or tells you to start a new session instead of silently failing. The context meter shows room left before compaction, not a fraction of the raw window, and it updates on resume and when you switch reasoning effort.",
       "v0.5.4":
@@ -686,6 +688,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.6":
+        "MCP 服务器现在可以在命令行管理：orca mcp add、list、get、remove、login 和 logout，本地 stdio 服务器和远程服务器都支持。远程服务器按 MCP 规范使用 streamable HTTP，必要时回退到旧版 HTTP+SSE，可以用 OAuth 登录，也可以用环境变量里的 bearer token。TUI 一打开，所有服务器就在后台同时连接：发出第一条消息之前，/mcp 就能显示每个服务器的状态、工具和 prompts，也能重新连接、登录和退出登录；一轮只等还在连接的服务器。每个 MCP prompt 都是一条斜杠命令；服务器标为只读的工具在 suggest 模式下不再询问；审批面板可以总是允许某个工具或整个服务器。deepseek-flash 现在能看到 MCP 工具返回的图片。在没有确认过的目录里，无论是 orca \"提示词\"、--continue 还是 --resume，都会先等你确认工作区；读不了或解析不了的 config.toml 会给出警告，不再悄悄忽略。",
       "v0.5.5":
         "每次请求的回复预留改为按思考强度决定——Max 为 128K、High 为 64K、Low 为 32K，不再固定发 384K，压缩触发线因此落在了真正有意义的位置。压缩改为按对话单元操作，一条 pinned 消息不再冻结整轮内容；优先缩短较早的工具输出，当前轮次最近用到的内容始终保留。任务通知和子 agent 完成消息改为普通消息，会话恢复后模型上下文不再丢失。紧急压缩现在要么真正缩小提示词，要么明确提示开启新会话，而不是悄悄失败。上下文仪表改为显示距离自动压缩的余量，并在会话恢复和切换思考强度时同步刷新。",
       "v0.5.4":

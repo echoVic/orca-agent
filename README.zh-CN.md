@@ -77,8 +77,9 @@ Orca 还提供可选的[共享 ACP 会话](docs/acp-daemon.md)（Unix 上的 `or
 - **引用与命令。** `@` 引用文件、skills、插件和 MCP 资源；`$` 插入 skill；`/` 打开命令菜单；`?` 列出全部按键。`Ctrl+V` 粘贴剪贴板里的图片。
 - **查看进展。** 回复以 `●` 标记，思考过程折叠成一行 `⋯ thinking`，每个工具调用的输出显示在 `│` 竖线下方。`Ctrl+O` 展开最近一条折叠的输出，`Ctrl+Shift+O` 全部展开。状态栏显示审批模式、模型和推理强度、上下文剩余比例以及用量。
 - **引导运行中的轮次。** `Esc` 中断。`Enter` 把追加消息排进队列，等下一轮发送；`Ctrl+Enter` 把它直接送进正在运行的轮次（需要支持 kitty 键盘协议的终端）；`Ctrl+B` 把当前轮次放到后台。
-- **审批工具调用。** 需要审批的调用会把输入框变成审批面板：允许一次、允许这个调用（同一工具、同一目标以后不再询问）、本会话内允许该工具，或拒绝（`Esc`）。`Shift+Tab` 依次切换 `suggest` → `auto-edit` → `full-auto` → `plan`。进入 `full-auto` 前需要明确确认 Full Access；正在运行的任务会在下一次工具调用时生效，已经在运行的工具和已经启动的子代理继续使用原来的策略。模式变更只作用于当前会话，不会保存。
+- **审批工具调用。** 需要审批的调用会把输入框变成审批面板：允许一次、允许这个调用（同一工具、同一目标以后不再询问）、本会话内允许该工具，或拒绝（`Esc`）。MCP 工具还可以选择总是允许这个工具或它所在的整个服务器，作为规则保存到你的配置里。`Shift+Tab` 依次切换 `suggest` → `auto-edit` → `full-auto` → `plan`。进入 `full-auto` 前需要明确确认 Full Access；正在运行的任务会在下一次工具调用时生效，已经在运行的工具和已经启动的子代理继续使用原来的策略。模式变更只作用于当前会话，不会保存。
 - **后台工作。** `/tasks` 显示对话下方的任务 dock，后台轮次、子代理、命令、监控任务和 Workflow child 都在这里。`/agents` 打开 Agent Workspace，可以查看每个任务的实时对话或记录，并执行它能安全执行的操作：停止、恢复、重试或追加消息。你空闲时后台 agent 完成，Orca 会带着它们的结果继续对话。`/workflows` 保留 Workflow 运行树。
+- **MCP 服务器。** TUI 一打开，配置里的服务器就在后台开始连接。`/mcp` 显示每个服务器的状态、工具和 prompts，可以重新连接、登录或退出登录；每个 MCP prompt 都是一条斜杠命令：`/mcp__<server>__<prompt>`。
 - **计划、目标与回顾。** `/plan` 只读调查，最后给出待你批准的计划；`/goal` 设置持久目标；`/recap` 总结当前会话，你离开一段时间再回来时 Orca 也会自动写一份；`/side` 打开侧边对话，适合临时问个问题。
 - **会话。** `/new`、`/resume`（按项目分组，可分叉、重命名、归档、删除和复制 Session ID）、`/fork [名称]`、`/rename [名称]`、`/model`、`/config` 和 `/copy [N]`。模型和推理强度的选择会保存到用户 `config.toml`，新会话也会沿用。`/status` 显示实际的 execution profile、shell sandbox 和 permission profile。`Ctrl+L` 只清屏，不清除会话；退出时 Orca 会输出 `orca --resume <SESSION_ID>` 恢复命令。
 
@@ -117,6 +118,7 @@ Orca 还提供可选的[共享 ACP 会话](docs/acp-daemon.md)（Unix 上的 `or
   作用域。默认 32 个执行 lease 是容量上限而非派单目标；超出的已接受任务排队且
   不提前创建 worker，等待子任务的父代理会释放名额并在恢复前重新进入公平队列。
 - 在工作区受信任后加载项目指令、Skills、Plugins、自定义工具、MCP 工具和资源。
+- 用 `orca mcp add`、`list`、`get`、`remove`、`login` 和 `logout` 管理 MCP 服务器：本地 stdio 服务器，以及通过 streamable HTTP 或旧版 SSE 连接、用 OAuth 或环境变量里的 bearer token 登录的远程服务器。
 - 为编辑器、测试框架和 CI 提供稳定的 JSONL、app-server 与 Agent Client
   Protocol（ACP）协议。
 

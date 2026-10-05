@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.5";
+export const releaseVersion = "v0.5.6";
 
 export const releases = [
+  {
+    version: "v0.5.6",
+    date: "2026-10-05",
+    title: "MCP servers you can manage, connected at launch",
+    body: "Add, list, remove, log in to and log out of MCP servers with orca mcp. Remote servers speak streamable HTTP, fall back to legacy SSE, and sign in with OAuth or a bearer token from the environment. Servers connect in the background as soon as the TUI opens, so /mcp and MCP prompt commands work before your first message, and a turn waits only for servers still connecting. Read-only MCP tools skip approval in suggest mode, the approval panel can always allow a tool or a whole server, and deepseek-flash sees the images MCP tools return.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.6",
+  },
   {
     version: "v0.5.5",
     date: "2026-09-30",
