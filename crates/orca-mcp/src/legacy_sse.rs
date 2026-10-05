@@ -21,11 +21,11 @@ use orca_core::mcp_types::McpServerConfig;
 use crate::auth::{AuthAttempt, RemoteAuth};
 use crate::sse::{SseDecoder, SseEvent};
 use crate::transport::{
-    MAX_SSE_RESPONSE_BYTES, METHOD_NOT_FOUND, McpElicitationHandler, McpTransport,
-    configured_headers, format_duration, initialize_params, is_elicitation_create_request,
-    is_server_request, json_rpc_id_to_string, list_params, mcp_jsonrpc_error_response,
-    negotiated_protocol_version, parse_terminal_message, remote_url, resolve_sse_elicitation,
-    server_request_reply, timeout_from_ms,
+    MAX_SSE_RESPONSE_BYTES, McpElicitationHandler, McpTransport, configured_headers,
+    elicitation_not_supported, format_duration, initialize_params, is_elicitation_create_request,
+    is_server_request, json_rpc_id_to_string, list_params, negotiated_protocol_version,
+    parse_terminal_message, remote_url, resolve_sse_elicitation, server_request_reply,
+    timeout_from_ms,
 };
 
 /// What every request fails with once the event stream has ended. The client
@@ -405,15 +405,6 @@ impl Failure {
             Self::Auth(error) => error,
         }
     }
-}
-
-/// The answer to a question from the server that no one can put to the user.
-fn elicitation_not_supported(request: &Value) -> Value {
-    mcp_jsonrpc_error_response(
-        request,
-        METHOD_NOT_FOUND,
-        "elicitation is not supported".to_string(),
-    )
 }
 
 /// What the reader shares with the requests waiting on it.

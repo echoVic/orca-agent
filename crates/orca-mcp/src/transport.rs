@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, PoisonError,
@@ -296,14 +296,49 @@ struct StdioTransport {
     /// `state` until it is answered, so [`McpTransport::terminate`] stops
     /// the process through this one.
     child: Arc<Mutex<StdioChild>>,
+    /// The server's stdin, which the reader thread answers the server's
+    /// requests through too.
+    writer: StdioWriter,
+    /// Whether a request is waiting for its answer, and so can take a
+    /// question from the server (see [`read_stdio_messages`]).
+    in_flight: Arc<AtomicBool>,
     state: Mutex<StdioState>,
     startup_timeout: Duration,
     tool_timeout: Duration,
 }
 
+/// The server's stdin. Requests and the reader thread both write to it, each
+/// holding the lock only while it writes one line, so lines never
+/// interleave. A request takes it while it holds `state`, which the reader
+/// thread never takes, so the two locks cannot deadlock.
+#[derive(Clone)]
+struct StdioWriter(Arc<Mutex<ChildStdin>>);
+
+impl StdioWriter {
+    fn write_line(&self, message: &Value) -> Result<(), String> {
+        let mut stdin = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        write_json_line(&mut stdin, message)
+    }
+}
+
+/// Marks a request as waiting for its answer until dropped.
+struct InFlight<'a>(&'a AtomicBool);
+
+impl<'a> InFlight<'a> {
+    fn new(in_flight: &'a AtomicBool) -> Self {
+        in_flight.store(true, Ordering::Release);
+        Self(in_flight)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 struct StdioState {
     child: Arc<Mutex<StdioChild>>,
-    stdin: ChildStdin,
     responses: Option<mpsc::Receiver<Result<Value, String>>>,
     reader_worker: Option<std::thread::JoinHandle<()>>,
     next_id: u64,
@@ -451,22 +486,13 @@ impl StdioTransport {
             .stdout
             .take()
             .ok_or_else(|| format!("failed to open stdout for MCP server '{}'", config.name))?;
+        let writer = StdioWriter(Arc::new(Mutex::new(stdin)));
+        let in_flight = Arc::new(AtomicBool::new(false));
         let (response_tx, responses) = mpsc::sync_channel(STDIO_RESPONSE_QUEUE_CAPACITY);
-        let reader_worker = std::thread::spawn(move || {
-            let mut stdout = BufReader::new(stdout);
-            loop {
-                match read_json_line(&mut stdout) {
-                    Ok(value) => {
-                        if response_tx.send(Ok(value)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = response_tx.send(Err(error));
-                        break;
-                    }
-                }
-            }
+        let reader_worker = std::thread::spawn({
+            let writer = writer.clone();
+            let in_flight = Arc::clone(&in_flight);
+            move || read_stdio_messages(stdout, response_tx, writer, in_flight)
         });
 
         let child = Arc::new(Mutex::new(child));
@@ -474,9 +500,10 @@ impl StdioTransport {
             server_name: config.name.clone(),
             capability_receipt: receipt,
             child: Arc::clone(&child),
+            writer,
+            in_flight,
             state: Mutex::new(StdioState {
                 child,
-                stdin,
                 responses: Some(responses),
                 reader_worker: Some(reader_worker),
                 next_id: 1,
@@ -714,7 +741,9 @@ impl StdioTransport {
             "method": method,
             "params": params
         });
-        if let Err(error) = write_json_line(&mut state.stdin, &message) {
+        // The server may ask its question as soon as it reads the request.
+        let _in_flight = InFlight::new(&self.in_flight);
+        if let Err(error) = self.writer.write_line(&message) {
             return state.terminal_error(error);
         }
 
@@ -787,22 +816,20 @@ impl StdioTransport {
                 },
             };
             iterations += 1;
+            // The reader answers every request from the server but a
+            // question.
             if is_server_request(&response) {
                 if is_elicitation_create_request(&response) {
                     // The server waits for the answer, so one that cannot
                     // reach it ends the request.
                     if let Err(error) = handle_elicitation_create_request(
                         &self.server_name,
-                        &mut state.stdin,
+                        &self.writer,
                         &response,
                         elicitation_handler,
                     ) {
                         return state.terminal_error(error);
                     }
-                } else {
-                    // Best effort: the request under way may be answered
-                    // all the same.
-                    let _ = write_json_line(&mut state.stdin, &server_request_reply(&response));
                 }
                 continue;
             }
@@ -825,17 +852,54 @@ impl StdioTransport {
             .state
             .lock()
             .map_err(|_| "MCP stdio transport lock poisoned".to_string())?;
-        if let Err(error) = write_json_line(
-            &mut state.stdin,
-            &json!({
-                "jsonrpc": "2.0",
-                "method": method,
-                "params": params
-            }),
-        ) {
+        if let Err(error) = self.writer.write_line(&json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        })) {
             return state.terminal_error(error);
         }
         Ok(())
+    }
+}
+
+/// Reads the server's messages until its stdout ends, or until no one takes
+/// them any more. A request from the server is answered here at once, best
+/// effort, whether or not a request of Orca's is under way, as
+/// [`server_request_reply`] says. A question (`elicitation/create`) is the
+/// exception: it goes to the request under way, which may put it to the
+/// user, and is turned down when none is. The rest, responses and
+/// notifications, goes to `responses`.
+fn read_stdio_messages(
+    stdout: ChildStdout,
+    responses: mpsc::SyncSender<Result<Value, String>>,
+    writer: StdioWriter,
+    in_flight: Arc<AtomicBool>,
+) {
+    let mut stdout = BufReader::new(stdout);
+    loop {
+        let message = match read_json_line(&mut stdout) {
+            Ok(message) => message,
+            Err(error) => {
+                let _ = responses.send(Err(error));
+                return;
+            }
+        };
+        if is_server_request(&message) {
+            // A reply that does not reach the server fails no request of
+            // Orca's, which may be answered all the same.
+            if !is_elicitation_create_request(&message) {
+                let _ = writer.write_line(&server_request_reply(&message));
+                continue;
+            }
+            if !in_flight.load(Ordering::Acquire) {
+                let _ = writer.write_line(&elicitation_not_supported(&message));
+                continue;
+            }
+        }
+        if responses.send(Ok(message)).is_err() {
+            return;
+        }
     }
 }
 
@@ -891,9 +955,18 @@ pub(crate) fn is_elicitation_create_request(message: &Value) -> bool {
     message.get("method").and_then(Value::as_str) == Some("elicitation/create")
 }
 
+/// The answer to a question from the server that no one can put to the user.
+pub(crate) fn elicitation_not_supported(request: &Value) -> Value {
+    mcp_jsonrpc_error_response(
+        request,
+        METHOD_NOT_FOUND,
+        "elicitation is not supported".to_string(),
+    )
+}
+
 fn handle_elicitation_create_request(
     server_name: &str,
-    stdin: &mut ChildStdin,
+    writer: &StdioWriter,
     message: &Value,
     handler: Option<&dyn McpElicitationHandler>,
 ) -> Result<(), String> {
@@ -922,7 +995,7 @@ fn handle_elicitation_create_request(
             }
         }),
     };
-    write_json_line(stdin, &message)
+    writer.write_line(&message)
 }
 
 fn mcp_elicitation_request_from_json(
@@ -2970,6 +3043,109 @@ done
             .expect("tools/list after a ping that could not be answered");
 
         assert_eq!(tools["tools"][0]["name"], "echo");
+    }
+
+    /// A stdio server that, once initialized, sends `request` and writes the
+    /// line it gets back to `$REPLY_FILE`. Orca sends it nothing after
+    /// `initialize`, so no request of Orca's is under way when it asks.
+    #[cfg(unix)]
+    fn idle_asking_stdio_server(
+        dir: &std::path::Path,
+        request: &str,
+    ) -> (StdioTransport, std::path::PathBuf) {
+        let server = dir.join("idle_asking_mcp_server.sh");
+        let reply_file = dir.join("reply");
+        write_executable_stdio_fixture(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"idle-asking","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      printf '%s\n' "$1"
+      IFS= read -r reply
+      printf '%s\n' "$reply" > "$REPLY_FILE"
+      ;;
+  esac
+done
+"#,
+        );
+        let mut config =
+            stdio_test_config("idle-asking", &server, vec![request.to_string()], 5_000);
+        config.env = HashMap::from([(
+            "REPLY_FILE".to_string(),
+            reply_file.to_string_lossy().into_owned(),
+        )]);
+        let transport = StdioTransport::start(&config).expect("start the stdio server");
+        transport.initialize().expect("initialize");
+        (transport, reply_file)
+    }
+
+    /// The reply the idle asking server got, once the whole line is written.
+    /// It must come within 2 s.
+    #[cfg(unix)]
+    fn reply_to_the_idle_server(reply_file: &std::path::Path) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(reply) = fs::read_to_string(reply_file)
+                .ok()
+                .filter(|reply| reply.ends_with('\n'))
+            {
+                return serde_json::from_str(&reply).expect("a JSON-RPC reply");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the idle server's request was not answered within 2 s"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_stdio_server_gets_its_ping_answered() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (_transport, reply_file) = idle_asking_stdio_server(
+            temp_dir.path(),
+            r#"{"jsonrpc":"2.0","id":"p1","method":"ping"}"#,
+        );
+
+        assert_eq!(
+            reply_to_the_idle_server(&reply_file),
+            json!({"jsonrpc": "2.0", "id": "p1", "result": {}})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unknown_request_from_an_idle_server_gets_method_not_found() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (_transport, reply_file) = idle_asking_stdio_server(
+            temp_dir.path(),
+            r#"{"jsonrpc":"2.0","id":"u1","method":"x/unknown"}"#,
+        );
+
+        let reply = reply_to_the_idle_server(&reply_file);
+
+        assert_eq!(reply["id"], "u1");
+        assert_eq!(reply["error"]["code"], -32601);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_elicitation_from_an_idle_server_is_refused() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (_transport, reply_file) = idle_asking_stdio_server(
+            temp_dir.path(),
+            r#"{"jsonrpc":"2.0","id":"e1","method":"elicitation/create","params":{"message":"Authorize","requestedSchema":{"type":"object","properties":{}}}}"#,
+        );
+
+        let reply = reply_to_the_idle_server(&reply_file);
+
+        assert_eq!(reply["id"], "e1");
+        assert_eq!(reply["error"]["code"], -32601);
     }
 
     #[cfg(unix)]
