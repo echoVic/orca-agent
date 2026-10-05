@@ -868,8 +868,12 @@ impl StdioTransport {
 /// effort, whether or not a request of Orca's is under way, as
 /// [`server_request_reply`] says. A question (`elicitation/create`) is the
 /// exception: it goes to the request under way, which may put it to the
-/// user, and is turned down when none is. The rest, responses and
-/// notifications, goes to `responses`.
+/// user, and is turned down when none is. A notification that comes while
+/// no request is under way is dropped: a request only skips notifications,
+/// and these would fill `responses`, which no one empties until the next
+/// request, and stop the reader before the server's next request. The rest,
+/// responses and the notifications of a request under way, goes to
+/// `responses`.
 fn read_stdio_messages(
     stdout: ChildStdout,
     responses: mpsc::SyncSender<Result<Value, String>>,
@@ -896,6 +900,9 @@ fn read_stdio_messages(
                 let _ = writer.write_line(&elicitation_not_supported(&message));
                 continue;
             }
+        } else if message.get("method").is_some() && !in_flight.load(Ordering::Acquire) {
+            // A notification, with no request under way to skip it.
+            continue;
         }
         if responses.send(Ok(message)).is_err() {
             return;
@@ -2537,8 +2544,10 @@ mod tests {
         let server = temp_dir.path().join("flooding_mcp_server.sh");
         let flood = temp_dir.path().join("responses.jsonl");
         let completed = temp_dir.path().join("flood-completed");
+        // Responses to no request of Orca's: the reader queues them even with
+        // no request under way, unlike notifications, which it then drops.
         let response = format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"message\":\"{}\"}}}}\n",
+            "{{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{{\"message\":\"{}\"}}}}\n",
             "x".repeat(1024)
         );
         fs::write(&flood, response.repeat(2048)).expect("write MCP response flood");
@@ -3045,13 +3054,14 @@ done
         assert_eq!(tools["tools"][0]["name"], "echo");
     }
 
-    /// A stdio server that, once initialized, sends `request` and writes the
-    /// line it gets back to `$REPLY_FILE`. Orca sends it nothing after
-    /// `initialize`, so no request of Orca's is under way when it asks.
+    /// A stdio server that, once initialized, sends `messages`, one per line,
+    /// and writes the line it gets back to `$REPLY_FILE`. Orca sends it
+    /// nothing after `initialize`, so no request of Orca's is under way when
+    /// it asks.
     #[cfg(unix)]
     fn idle_asking_stdio_server(
         dir: &std::path::Path,
-        request: &str,
+        messages: &str,
     ) -> (StdioTransport, std::path::PathBuf) {
         let server = dir.join("idle_asking_mcp_server.sh");
         let reply_file = dir.join("reply");
@@ -3073,7 +3083,7 @@ done
 "#,
         );
         let mut config =
-            stdio_test_config("idle-asking", &server, vec![request.to_string()], 5_000);
+            stdio_test_config("idle-asking", &server, vec![messages.to_string()], 5_000);
         config.env = HashMap::from([(
             "REPLY_FILE".to_string(),
             reply_file.to_string_lossy().into_owned(),
@@ -3111,6 +3121,29 @@ done
             temp_dir.path(),
             r#"{"jsonrpc":"2.0","id":"p1","method":"ping"}"#,
         );
+
+        assert_eq!(
+            reply_to_the_idle_server(&reply_file),
+            json!({"jsonrpc": "2.0", "id": "p1", "result": {}})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_servers_ping_is_answered_after_a_burst_of_notifications() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        // More log notifications than the reader queues, as a server may send
+        // while it is idle, and then a keepalive ping.
+        let mut messages: Vec<String> = (0..20)
+            .map(|n| {
+                format!(
+                    r#"{{"jsonrpc":"2.0","method":"notifications/message","params":{{"level":"info","data":"tick {n}"}}}}"#
+                )
+            })
+            .collect();
+        messages.push(r#"{"jsonrpc":"2.0","id":"p1","method":"ping"}"#.to_string());
+        let (_transport, reply_file) =
+            idle_asking_stdio_server(temp_dir.path(), &messages.join("\n"));
 
         assert_eq!(
             reply_to_the_idle_server(&reply_file),
