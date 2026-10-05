@@ -2072,10 +2072,16 @@ impl McpClient {
     /// transport unusable, or after which it closed itself, reconnects it
     /// before the error is returned. A stdio server that cannot be started
     /// again leaves why in [`Self::take_reconnect_failure`].
+    ///
+    /// After a cancelled call, the server is only given a short time to
+    /// start again, so the call returns promptly. One that takes longer is
+    /// not failed for it: its transport stays closed, and the next request
+    /// starts it again with its full startup timeout first.
     fn request(
         &self,
         request: impl FnOnce(&dyn McpTransport) -> Result<Value, String>,
     ) -> Result<Value, McpRequestError> {
+        self.restart_closed_stdio_server()?;
         let (result, failed) = {
             let transport = self.lock_transport().map_err(McpRequestError::Failed)?;
             let result = request(transport.as_ref());
@@ -2094,7 +2100,9 @@ impl McpClient {
                     && error == MCP_TOOL_CALL_CANCELLED)
                     .then_some(CANCELLED_STDIO_RECONNECT_TIMEOUT_MS);
                 let reconnected = self.reconnect(&failed, startup_timeout_cap_ms);
-                if self.config.transport == McpTransportKind::Stdio {
+                if self.config.transport == McpTransportKind::Stdio
+                    && startup_timeout_cap_ms.is_none()
+                {
                     *self.lock_reconnect_failure() = reconnected.err();
                 }
                 Err(McpRequestError::from_message(error))
@@ -2102,6 +2110,27 @@ impl McpClient {
             (Ok(result), _) => Ok(result),
             (Err(error), _) => Err(McpRequestError::from_message(error)),
         }
+    }
+
+    /// Starts a stdio server again, with its full startup timeout, when its
+    /// transport is closed: a reconnect cut short after a cancelled call
+    /// left it so. One that cannot start leaves why in
+    /// [`Self::take_reconnect_failure`], and the request fails with it.
+    fn restart_closed_stdio_server(&self) -> Result<(), McpRequestError> {
+        if self.config.transport != McpTransportKind::Stdio {
+            return Ok(());
+        }
+        let closed = {
+            let transport = self.lock_transport().map_err(McpRequestError::Failed)?;
+            if !transport.is_closed() {
+                return Ok(());
+            }
+            Arc::clone(&*transport)
+        };
+        self.reconnect(&closed, None).map_err(|error| {
+            *self.lock_reconnect_failure() = Some(error.clone());
+            McpRequestError::from_message(error)
+        })
     }
 
     /// Connects the server again, with its startup timeout capped at
@@ -3019,6 +3048,89 @@ done
             !process_is_alive(second_pid.trim()),
             "failed reconnect server must be reaped before return"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_call_does_not_fail_a_server_slow_to_restart() {
+        // Every restart takes 1 s to answer `initialize`: longer than the
+        // capped reconnect after a cancelled call, shorter than the server's
+        // own startup timeout.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("slow_restart_mcp_server.sh");
+        let generation_file = temp_dir.path().join("generation");
+        let started_file = temp_dir.path().join("started");
+        std::fs::write(
+            &server,
+            r#"#!/bin/sh
+generation=0
+if [ -f "$GENERATION_FILE" ]; then
+  IFS= read -r generation < "$GENERATION_FILE"
+fi
+generation=$((generation + 1))
+printf '%s' "$generation" > "$GENERATION_FILE"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      if [ "$generation" -gt 1 ]; then
+        sleep 1
+      fi
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"slow","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"wait","description":"waits","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      if [ "$generation" -eq 1 ]; then
+        printf started > "$STARTED_FILE"
+        IFS= read -r ignored
+      else
+        id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"answered by %s"}],"isError":false}}\n' "$id" "$generation"
+      fi
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let mut config = stdio_fixture_config("slow", &server);
+        config.env = HashMap::from([
+            (
+                "GENERATION_FILE".to_string(),
+                generation_file.to_string_lossy().into_owned(),
+            ),
+            (
+                "STARTED_FILE".to_string(),
+                started_file.to_string_lossy().into_owned(),
+            ),
+        ]);
+        config.startup_timeout_ms = Some(5_000);
+        let registry = connected_registry(&[config], None);
+        let tool_ref = registry
+            .resolve_tool("mcp__slow__wait")
+            .expect("slow tool ref");
+
+        let cancelled =
+            registry.call_tool_or_cancel(&tool_ref, Value::Object(Default::default()), &|| {
+                started_file.exists()
+            });
+
+        assert_eq!(cancelled.unwrap_err(), "MCP tool call cancelled");
+        assert_eq!(
+            registry.server_statuses()[0].state,
+            McpServerState::Ready,
+            "a restart cut short after a cancel must not fail the server"
+        );
+
+        let answered = registry
+            .call_tool(&tool_ref, Value::Object(Default::default()))
+            .expect("the next call starts the server again and is answered");
+
+        assert_eq!(answered.output, "answered by 3");
+        assert_eq!(registry.server_statuses()[0].state, McpServerState::Ready);
     }
 
     #[cfg(unix)]
