@@ -227,7 +227,7 @@
     ],
     [
       "mcp-client-unix-fixtures",
-      "crates/orca-mcp/src/client.rs",
+      "crates/orca-mcp/src/registry/tests.rs",
       "unix_std_api",
       5,
       "process-ownership-plan"

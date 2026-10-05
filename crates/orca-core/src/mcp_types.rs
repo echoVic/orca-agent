@@ -306,7 +306,7 @@ pub fn canonical_mcp_name(name: &str) -> String {
 
 /// Extracts the server name from an MCP tool's runtime name, which the
 /// registry builds as `mcp__<server>__<tool>` (see
-/// `orca_mcp::client::connect_server`): the segment after `mcp__` and before
+/// `orca_mcp::registry::connect_server`): the segment after `mcp__` and before
 /// the next `__`. Returns `None` when `tool` does not have that shape, or
 /// when the server or tool segment is empty.
 pub fn mcp_tool_server(tool: &str) -> Option<&str> {

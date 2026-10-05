@@ -2041,8 +2041,8 @@
     ],
     [
       "mcp.registry",
-      "crates/orca-mcp/src/client.rs",
-      15,
+      "crates/orca-mcp/src/registry.rs",
+      294,
       "mcp.registry",
       "McpCatalog",
       "Reconciled",
