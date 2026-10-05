@@ -23,6 +23,7 @@ use orca_platform::shell::resolve_program;
 
 use crate::auth::{AuthAttempt, RemoteAuth, is_auth_required};
 use crate::legacy_sse::LegacySseTransport;
+use crate::sse::{SseDecoder, SseEvent};
 
 const STDIO_RESPONSE_QUEUE_CAPACITY: usize = 8;
 // The largest single MCP response either transport accepts: room for two
@@ -1961,7 +1962,7 @@ async fn read_sse_stream(
     context: SseRequestContext,
     elicitation_sender: mpsc::Sender<SseElicitationEnvelope>,
 ) -> Result<Value, String> {
-    let mut buffer = Vec::new();
+    let mut decoder = SseDecoder::new();
     let mut total = 0usize;
     loop {
         let chunk = tokio::select! {
@@ -1975,15 +1976,7 @@ async fn read_sse_stream(
             }
         };
         let Some(chunk) = chunk else {
-            if !buffer.is_empty() {
-                let text = String::from_utf8(buffer)
-                    .map_err(|error| format!("MCP SSE response was not valid UTF-8: {error}"))?;
-                return parse_terminal_sse_message(&text, &context.method, context.id);
-            }
-            return Err(format!(
-                "MCP SSE request '{}' missing result",
-                context.method
-            ));
+            return parse_unterminated_sse_event(decoder, &context.method, context.id);
         };
         total = total.saturating_add(chunk.len());
         if total > MAX_SSE_RESPONSE_BYTES {
@@ -1991,10 +1984,8 @@ async fn read_sse_stream(
                 "MCP SSE response exceeded maximum body size of {MAX_SSE_RESPONSE_BYTES} bytes"
             ));
         }
-        buffer.extend_from_slice(&chunk);
-        while let Some(end) = sse_event_end(&buffer) {
-            let event = buffer.drain(..end).collect::<Vec<_>>();
-            let Some(message) = parse_sse_event(&event)? else {
+        for event in decoder.push(&chunk)? {
+            let Some(message) = sse_event_message(&event)? else {
                 continue;
             };
             if is_server_request(&message) {
@@ -2056,41 +2047,14 @@ async fn await_sse_elicitation_response(
     }
 }
 
-pub(crate) fn sse_event_end(buffer: &[u8]) -> Option<usize> {
-    buffer
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|index| index + 2)
-        .or_else(|| {
-            buffer
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .map(|index| index + 4)
-        })
-}
-
-/// Splits one server-sent event into its type, when it names one, and its
-/// data: every `data:` line, trimmed, joined with newlines.
-pub(crate) fn sse_event_parts(event: &[u8]) -> Result<(Option<&str>, String), String> {
-    let text = std::str::from_utf8(event).map_err(|error| error.to_string())?;
-    let mut name = None;
-    let mut data = Vec::new();
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix("data:") {
-            data.push(value.trim());
-        } else if let Some(value) = line.strip_prefix("event:") {
-            name = Some(value.trim());
-        }
-    }
-    Ok((name, data.join("\n")))
-}
-
-fn parse_sse_event(event: &[u8]) -> Result<Option<Value>, String> {
-    let (_, data) = sse_event_parts(event)?;
+/// The JSON message an event carries, or `None` when it carries no data.
+/// Whitespace around the data is not part of it.
+fn sse_event_message(event: &SseEvent) -> Result<Option<Value>, String> {
+    let data = event.data.trim();
     if data.is_empty() {
         return Ok(None);
     }
-    serde_json::from_str(&data)
+    serde_json::from_str(data)
         .map(Some)
         .map_err(|error| format!("invalid MCP SSE event: {error}"))
 }
@@ -2099,6 +2063,23 @@ fn parse_terminal_sse_message(text: &str, method: &str, request_id: u64) -> Resu
     let response = parse_sse_or_json_response(text, request_id)
         .map_err(|error| format!("invalid MCP SSE response for '{method}': {error}"))?;
     parse_terminal_message(response, method, request_id)
+}
+
+/// The response of a stream that ended without one: what `decoder` has left,
+/// an event not followed by a blank line, is read as the response.
+fn parse_unterminated_sse_event(
+    decoder: SseDecoder,
+    method: &str,
+    request_id: u64,
+) -> Result<Value, String> {
+    let message = decoder
+        .finish()
+        .and_then(|event| event.as_ref().map_or(Ok(None), sse_event_message))
+        .map_err(|error| format!("invalid MCP SSE response for '{method}': {error}"))?;
+    match message {
+        Some(message) => parse_terminal_message(message, method, request_id),
+        None => Err(format!("MCP SSE request '{method}' missing result")),
+    }
 }
 
 pub(crate) fn parse_terminal_message(
@@ -2264,9 +2245,8 @@ fn read_sse_response(
     mut response: reqwest::blocking::Response,
 ) -> Result<Value, String> {
     let method = &context.method;
-    let mut buffer = Vec::new();
-    // How far into `buffer` there is certainly no event boundary.
-    let mut scanned = 0;
+    let invalid = |error: String| format!("invalid MCP SSE response for '{method}': {error}");
+    let mut decoder = SseDecoder::new();
     let mut total = 0usize;
     let mut chunk = vec![0u8; 8 * 1024];
     loop {
@@ -2282,13 +2262,8 @@ fn read_sse_response(
                 "MCP SSE response exceeded maximum body size of {MAX_SSE_RESPONSE_BYTES} bytes"
             ));
         }
-        buffer.extend_from_slice(&chunk[..read]);
-        while let Some(end) = sse_event_end(&buffer[scanned..]).map(|end| scanned + end) {
-            let event = buffer.drain(..end).collect::<Vec<_>>();
-            scanned = 0;
-            let Some(message) = parse_sse_event(&event)
-                .map_err(|error| format!("invalid MCP SSE response for '{method}': {error}"))?
-            else {
+        for event in decoder.push(&chunk[..read]).map_err(invalid)? {
+            let Some(message) = sse_event_message(&event).map_err(invalid)? else {
                 continue;
             };
             if is_server_request(&message) {
@@ -2314,17 +2289,9 @@ fn read_sse_response(
                 return parse_terminal_message(message, method, context.id);
             }
         }
-        // A boundary may straddle this chunk and the next.
-        scanned = buffer.len().saturating_sub(3);
     }
-    // The server ended the stream without a response. What is left, an
-    // event not followed by a blank line, is read as a whole body is.
-    if buffer.iter().all(u8::is_ascii_whitespace) {
-        return Err(format!("MCP SSE request '{method}' missing result"));
-    }
-    let text = String::from_utf8(buffer)
-        .map_err(|error| format!("MCP SSE response was not valid UTF-8: {error}"))?;
-    parse_terminal_sse_message(&text, method, context.id)
+    // The server ended the stream without a response.
+    parse_unterminated_sse_event(decoder, method, context.id)
 }
 
 /// POSTs `reply`, Orca's answer to a request from the server, to `endpoint`.
@@ -2400,11 +2367,11 @@ fn parse_sse_or_json_response(text: &str, request_id: u64) -> Result<Value, Stri
         return Ok(value);
     }
 
-    let mut events = text.as_bytes();
+    let mut decoder = SseDecoder::new();
+    let events = decoder.push(text.as_bytes())?;
     let mut last = None;
-    while !events.is_empty() {
-        let end = sse_event_end(events).unwrap_or(events.len());
-        if let Some(message) = parse_sse_event(&events[..end])? {
+    for event in events.into_iter().chain(decoder.finish()?) {
+        if let Some(message) = sse_event_message(&event)? {
             if message.get("id") == Some(&Value::from(request_id))
                 && message.get("method").is_none()
             {
@@ -2412,7 +2379,6 @@ fn parse_sse_or_json_response(text: &str, request_id: u64) -> Result<Value, Stri
             }
             last = Some(message);
         }
-        events = &events[end..];
     }
     last.ok_or_else(|| "response was neither JSON nor SSE data".to_string())
 }

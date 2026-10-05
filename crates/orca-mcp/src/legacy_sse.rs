@@ -19,12 +19,13 @@ use url::Url;
 use orca_core::mcp_types::McpServerConfig;
 
 use crate::auth::{AuthAttempt, RemoteAuth};
+use crate::sse::{SseDecoder, SseEvent};
 use crate::transport::{
     MAX_SSE_RESPONSE_BYTES, METHOD_NOT_FOUND, McpElicitationHandler, McpTransport,
     configured_headers, format_duration, initialize_params, is_elicitation_create_request,
     is_server_request, json_rpc_id_to_string, list_params, mcp_jsonrpc_error_response,
     negotiated_protocol_version, parse_terminal_message, remote_url, resolve_sse_elicitation,
-    server_request_reply, sse_event_end, sse_event_parts, timeout_from_ms,
+    server_request_reply, timeout_from_ms,
 };
 
 /// What every request fails with once the event stream has ended. The client
@@ -598,29 +599,34 @@ impl EventStreamReader {
             },
             _ = &mut *stop => return MCP_SSE_EVENT_STREAM_CLOSED.to_string(),
         };
-        let mut buffer = Vec::new();
-        // How far into `buffer` there is certainly no event boundary.
-        let mut scanned = 0;
+        let mut decoder = SseDecoder::new();
         loop {
             let chunk = tokio::select! {
                 chunk = response.chunk() => chunk,
                 _ = &mut *stop => return MCP_SSE_EVENT_STREAM_CLOSED.to_string(),
             };
-            match chunk {
-                Ok(Some(chunk)) => buffer.extend_from_slice(&chunk),
+            let chunk = match chunk {
+                Ok(Some(chunk)) => chunk,
                 Ok(None) => return self.ended(None),
                 Err(error) => return self.ended(Some(error)),
-            }
-            while let Some(end) = sse_event_end(&buffer[scanned..]).map(|end| scanned + end) {
-                let event = buffer.drain(..end).collect::<Vec<_>>();
-                scanned = 0;
+            };
+            let events = match decoder.push(&chunk) {
+                Ok(events) => events,
+                Err(_) => {
+                    // An event that cannot be read cannot be matched to a
+                    // request either, so it is skipped, as the reference SDK
+                    // does, along with the rest of this read. A request whose
+                    // response it was times out.
+                    decoder = SseDecoder::new();
+                    continue;
+                }
+            };
+            for event in events {
                 if let Err(reason) = self.handle(&event, &client) {
                     return reason;
                 }
             }
-            // A boundary may straddle this chunk and the next.
-            scanned = buffer.len().saturating_sub(3);
-            if buffer.len() > MAX_SSE_RESPONSE_BYTES {
+            if decoder.buffered_len() > MAX_SSE_RESPONSE_BYTES {
                 return format!(
                     "{MCP_SSE_EVENT_STREAM_CLOSED}: an event exceeded {MAX_SSE_RESPONSE_BYTES} bytes"
                 );
@@ -679,20 +685,17 @@ impl EventStreamReader {
     }
 
     /// Acts on one event. An error ends the stream.
-    fn handle(&mut self, event: &[u8], client: &reqwest::Client) -> Result<(), String> {
-        // An event that cannot be read cannot be matched to a request either,
-        // so it is skipped, as the reference SDK does. A request whose
-        // response it was times out.
-        let Ok((name, data)) = sse_event_parts(event) else {
-            return Ok(());
-        };
+    fn handle(&mut self, event: &SseEvent, client: &reqwest::Client) -> Result<(), String> {
+        // Whitespace around the data and the event's name is not part of them.
+        let data = event.data.trim();
         if data.is_empty() {
             return Ok(());
         }
+        let name = event.event.as_deref().map(str::trim);
         match name.filter(|name| !name.is_empty()).unwrap_or("message") {
-            "endpoint" => self.accept_endpoint(&data),
+            "endpoint" => self.accept_endpoint(data),
             "message" => {
-                if let Ok(message) = serde_json::from_str(&data) {
+                if let Ok(message) = serde_json::from_str(data) {
                     self.dispatch(message, client);
                 }
                 Ok(())

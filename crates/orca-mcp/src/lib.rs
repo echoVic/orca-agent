@@ -4,6 +4,7 @@ mod auth;
 pub mod client;
 mod legacy_sse;
 pub mod oauth;
+mod sse;
 pub mod transport;
 
 pub use auth::{MCP_AUTH_REQUIRED, McpAuthKind, is_auth_required};
