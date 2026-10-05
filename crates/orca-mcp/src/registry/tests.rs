@@ -1057,28 +1057,67 @@ fn a_cancel_stops_the_restart_that_follows_a_crashed_call() {
 
 #[cfg(unix)]
 #[test]
-fn a_server_that_cannot_start_again_after_a_cancel_fails_the_next_call() {
+fn a_cancellable_call_waiting_for_the_transport_returns_when_cancelled() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let (config, started_file, _) = restarting_server_config(temp_dir.path(), Some(0));
+    let registry = connected_registry(&[config], None);
+    let tool_ref = registry
+        .resolve_tool("mcp__slow__wait")
+        .expect("slow tool ref");
+    let client = registry.client("slow").expect("the server's client");
+    let cancelled = AtomicBool::new(false);
+    let (sender, receiver) = std::sync::mpsc::channel();
+
+    let answered_while_held = std::thread::scope(|scope| {
+        // Held as a restart that cannot be cancelled holds it, until the
+        // call has had its time to answer.
+        let transport = client.lock_transport().expect("its transport");
+        scope.spawn(|| {
+            let answer =
+                registry.call_tool_or_cancel(&tool_ref, Value::Object(Default::default()), &|| {
+                    cancelled.load(Ordering::SeqCst)
+                });
+            let _ = sender.send(answer);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        cancelled.store(true, Ordering::SeqCst);
+        let answered = receiver.recv_timeout(Duration::from_millis(500));
+        drop(transport);
+        answered
+    });
+
+    let answer = answered_while_held
+        .expect("the call returns within 500 ms of its cancel, with the transport still held");
+    assert_eq!(answer.unwrap_err(), "MCP tool call cancelled");
+    assert!(
+        !started_file.exists(),
+        "the cancelled call reached the server"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cancelled_calls_short_restart_that_fails_at_once_fails_the_server() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let (config, started_file, _) = restarting_server_config(temp_dir.path(), None);
     let registry = connected_registry(&[config], None);
     let tool_ref = registry
         .resolve_tool("mcp__slow__wait")
         .expect("slow tool ref");
+
     let cancelled =
         registry.call_tool_or_cancel(&tool_ref, Value::Object(Default::default()), &|| {
             started_file.exists()
         });
+
     assert_eq!(cancelled.unwrap_err(), "MCP tool call cancelled");
-    assert_eq!(registry.server_statuses()[0].state, McpServerState::Ready);
-
-    let error = registry
-        .call_tool(&tool_ref, Value::Object(Default::default()))
-        .expect_err("the server cannot start again");
-
-    assert_eq!(
-        registry.server_statuses()[0].state,
-        McpServerState::Failed { message: error },
-        "a server that cannot start again is failed with the reason"
+    // The short start that followed the cancel failed before its time was
+    // up, as a full one would: the server is failed now, not at the next
+    // call.
+    let statuses = registry.server_statuses();
+    assert!(
+        matches!(statuses[0].state, McpServerState::Failed { .. }),
+        "{statuses:?}"
     );
 }
 
@@ -4057,6 +4096,52 @@ fn two_failures_on_one_transport_restart_its_server_once() {
     let current = client.lock_transport().expect("its transport").clone();
     assert!(!Arc::ptr_eq(&current, &failed));
     assert!(!current.is_closed());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reconnect_that_found_the_transport_replaced_keeps_the_recorded_failure() {
+    use crate::client::{ReconnectFailure, Reconnected};
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let config = listing_server_config(
+        "x",
+        temp_dir.path(),
+        r#"[{"name":"echo","inputSchema":{"type":"object"}}]"#,
+    );
+    let registry = connected_registry(&[config], None);
+    let client = registry.client("x").expect("the server's client");
+    // Two requests failed on one transport. The first one's reconnect
+    // replaced it, and a later request's reconnect then failed.
+    let failed = client.lock_transport().expect("its transport").clone();
+    assert_eq!(
+        client.reconnect(&failed, None, &|| false),
+        Ok(Reconnected::Replaced)
+    );
+    *client.lock_reconnect_failure() = Some("boom".to_string());
+
+    // The second one's reconnect does nothing, and leaves that failure.
+    let outcome = client.reconnect(&failed, None, &|| false);
+    assert_eq!(outcome, Ok(Reconnected::AlreadyReplaced));
+    client.note_reconnect(&outcome);
+    assert_eq!(client.lock_reconnect_failure().as_deref(), Some("boom"));
+    // Nor does a reconnect that put no transport in place, and might yet.
+    for outcome in [
+        Err(ReconnectFailure::Cancelled),
+        Err(ReconnectFailure::CapReached("timed out".to_string())),
+    ] {
+        client.note_reconnect(&outcome);
+        assert_eq!(
+            client.lock_reconnect_failure().as_deref(),
+            Some("boom"),
+            "{outcome:?}"
+        );
+    }
+    // One that connected clears it, and one that failed replaces it.
+    client.note_reconnect(&Ok(Reconnected::Replaced));
+    assert_eq!(client.lock_reconnect_failure().as_deref(), None);
+    client.note_reconnect(&Err(ReconnectFailure::Failed("x".to_string())));
+    assert_eq!(client.lock_reconnect_failure().as_deref(), Some("x"));
 }
 
 /// A stdio server that serves its first start, answering its first tool

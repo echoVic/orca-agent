@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -21,9 +22,10 @@ pub(crate) struct McpClient {
     pub(crate) capabilities: McpServerCapabilities,
     /// Stops its server, through whichever transport it has.
     pub(crate) stop: Arc<McpConnectionStop>,
-    /// Why the last reconnect of a stdio server failed, until the registry
-    /// takes it to mark the server failed: the stopped server's transport is
-    /// still in place then, and no request goes through it.
+    /// Why a reconnect of a stdio server failed, unless one has connected
+    /// it since, until the registry takes it to mark the server failed: the
+    /// stopped server's transport is still in place then, and no request
+    /// goes through it.
     pub(crate) reconnect_failure: Mutex<Option<String>>,
     /// Held for the whole of each request, so that a reconnect puts a new
     /// transport in place between requests.
@@ -90,6 +92,27 @@ impl From<String> for McpRequestError {
     fn from(message: String) -> Self {
         Self::from_message(message)
     }
+}
+
+/// What a reconnect did when it did not fail.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Reconnected {
+    /// A new transport is in place of the one the request failed on.
+    Replaced,
+    /// Another request had put one in place first, and it was left there.
+    AlreadyReplaced,
+}
+
+/// Why a reconnect left no new transport in place.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReconnectFailure {
+    /// `should_cancel` stopped it.
+    Cancelled,
+    /// The start took the whole of its capped startup timeout: the server
+    /// may still start with its own.
+    CapReached(String),
+    /// The server could not be connected again.
+    Failed(String),
 }
 
 impl McpClient {
@@ -168,9 +191,11 @@ impl McpClient {
     /// again leaves why in [`Self::take_reconnect_failure`].
     ///
     /// After a cancelled call, the server is only given a short time to
-    /// start again, so the call returns promptly. One that takes longer is
-    /// not failed for it: its transport stays closed, and the next request
-    /// starts it again with its full startup timeout first.
+    /// start again, so the call returns promptly. A start that fails within
+    /// that time, as that of a server that exits at once does, leaves why
+    /// there too. One that takes longer is not failed for it: its transport
+    /// stays closed, and the next request starts it again with its full
+    /// startup timeout first.
     fn request(
         &self,
         request: impl FnOnce(&dyn McpTransport) -> Result<Value, String>,
@@ -179,9 +204,11 @@ impl McpClient {
     }
 
     /// [`Self::request`], for a request that `should_cancel` can stop. One
-    /// cancelled before it is sent, while its stdio server is started again
-    /// too, is never sent, and a cancel stops a stdio server being started
-    /// again after a failure, which leaves it to the next request.
+    /// cancelled before it is sent is never sent: while it waits for the
+    /// transport, which another request, or a restart that cannot be
+    /// cancelled, may hold for long, or while its stdio server is started
+    /// again. A cancel stops a stdio server being started again after a
+    /// failure too, which leaves it to the next request.
     fn request_or_cancel(
         &self,
         should_cancel: &dyn Fn() -> bool,
@@ -189,7 +216,7 @@ impl McpClient {
     ) -> Result<Value, McpRequestError> {
         self.restart_closed_stdio_server(should_cancel)?;
         let (result, failed) = {
-            let transport = self.lock_transport().map_err(McpRequestError::Failed)?;
+            let transport = self.lock_transport_or_cancel(should_cancel)?;
             // Checked with the transport held, for a request that waited for
             // another one to finish.
             if should_cancel() {
@@ -222,8 +249,11 @@ impl McpClient {
                         &|| false
                     },
                 );
-                if full_restart && !(reconnected.is_err() && should_cancel()) {
-                    *self.lock_reconnect_failure() = reconnected.err();
+                // A stdio server that its reconnect could not start again
+                // is stopped, and the registry fails it; a remote one keeps
+                // serving through its old transport.
+                if stdio {
+                    self.note_reconnect(&reconnected);
                 }
                 Err(McpRequestError::from_message(error))
             }
@@ -234,9 +264,10 @@ impl McpClient {
 
     /// Starts a stdio server again, with its full startup timeout, when its
     /// transport is closed: a reconnect cut short after a cancelled call
-    /// left it so. A cancel stops the start, and leaves the server to the
-    /// next request. One that cannot start leaves why in
-    /// [`Self::take_reconnect_failure`], and the request fails with it.
+    /// left it so. A cancel stops the start, or the wait for the transport
+    /// before it, and leaves the server to the next request. One that
+    /// cannot start leaves why in [`Self::take_reconnect_failure`], and the
+    /// request fails with it.
     fn restart_closed_stdio_server(
         &self,
         should_cancel: &dyn Fn() -> bool,
@@ -245,7 +276,7 @@ impl McpClient {
             return Ok(());
         }
         let closed = {
-            let transport = self.lock_transport().map_err(McpRequestError::Failed)?;
+            let transport = self.lock_transport_or_cancel(should_cancel)?;
             if !transport.is_closed() {
                 return Ok(());
             }
@@ -254,11 +285,12 @@ impl McpClient {
         if should_cancel() {
             return Err(McpRequestError::Cancelled);
         }
-        match self.reconnect(&closed, None, should_cancel) {
-            Ok(()) => Ok(()),
-            Err(_) if should_cancel() => Err(McpRequestError::Cancelled),
-            Err(error) => {
-                *self.lock_reconnect_failure() = Some(error.clone());
+        let restarted = self.reconnect(&closed, None, should_cancel);
+        self.note_reconnect(&restarted);
+        match restarted {
+            Ok(_) => Ok(()),
+            Err(ReconnectFailure::Cancelled) => Err(McpRequestError::Cancelled),
+            Err(ReconnectFailure::CapReached(error) | ReconnectFailure::Failed(error)) => {
                 Err(McpRequestError::from_message(error))
             }
         }
@@ -274,35 +306,71 @@ impl McpClient {
     /// Once `failed` is no longer the current transport, another request
     /// that failed on it has reconnected the server already, and nothing is
     /// done: stopping the server it started would fail its requests.
+    ///
+    /// A reconnect that fails while `should_cancel` holds was cancelled. One
+    /// with a cap that fails once the cap has passed since it began was cut
+    /// short by it, and the server may still start with its full startup
+    /// timeout; one that fails sooner found a server that cannot start.
     pub(crate) fn reconnect(
         &self,
         failed: &Arc<dyn McpTransport>,
         startup_timeout_cap_ms: Option<u64>,
         should_cancel: &dyn Fn() -> bool,
-    ) -> Result<(), String> {
+    ) -> Result<Reconnected, ReconnectFailure> {
+        let began = Instant::now();
+        let failure = |error: String| {
+            if should_cancel() {
+                ReconnectFailure::Cancelled
+            } else if startup_timeout_cap_ms
+                .is_some_and(|cap_ms| began.elapsed() >= Duration::from_millis(cap_ms))
+            {
+                ReconnectFailure::CapReached(error)
+            } else {
+                ReconnectFailure::Failed(error)
+            }
+        };
         let mut config = self.config.clone();
         if let Some(cap_ms) = startup_timeout_cap_ms {
             config.startup_timeout_ms =
                 Some(config.startup_timeout_ms.unwrap_or(cap_ms).min(cap_ms));
         }
         if config.transport == McpTransportKind::Stdio {
-            let mut current = self.lock_transport()?;
+            let mut current = self
+                .lock_transport_or_cancel(should_cancel)
+                .map_err(|error| failure(error.to_string()))?;
             if !Arc::ptr_eq(&current, failed) {
-                return Ok(());
+                return Ok(Reconnected::AlreadyReplaced);
             }
             current.terminate();
-            *current = self.connect(&config, should_cancel)?;
+            *current = self.connect(&config, should_cancel).map_err(failure)?;
         } else {
-            if !Arc::ptr_eq(&*self.lock_transport()?, failed) {
-                return Ok(());
+            if !Arc::ptr_eq(&*self.lock_transport().map_err(failure)?, failed) {
+                return Ok(Reconnected::AlreadyReplaced);
             }
-            let transport = self.connect(&config, should_cancel)?;
-            let mut current = self.lock_transport()?;
-            if Arc::ptr_eq(&current, failed) {
-                *current = transport;
+            let transport = self.connect(&config, should_cancel).map_err(failure)?;
+            let mut current = self.lock_transport().map_err(failure)?;
+            if !Arc::ptr_eq(&current, failed) {
+                return Ok(Reconnected::AlreadyReplaced);
             }
+            *current = transport;
         }
-        Ok(())
+        Ok(Reconnected::Replaced)
+    }
+
+    /// Keeps the stdio reconnect failure record in step with `outcome`:
+    /// Replaced clears it, Failed(e) sets it to e, anything else leaves it.
+    /// A reconnect that found the transport replaced did nothing, so a
+    /// failure recorded since by another one still stands; one cancelled,
+    /// or cut short by its cap, leaves the server to the next request.
+    pub(crate) fn note_reconnect(&self, outcome: &Result<Reconnected, ReconnectFailure>) {
+        match outcome {
+            Ok(Reconnected::Replaced) => *self.lock_reconnect_failure() = None,
+            Err(ReconnectFailure::Failed(error)) => {
+                *self.lock_reconnect_failure() = Some(error.clone());
+            }
+            Ok(Reconnected::AlreadyReplaced)
+            | Err(ReconnectFailure::Cancelled | ReconnectFailure::CapReached(_)) => {}
+        }
     }
 
     /// Why the last reconnect of the stdio server failed, once: its server
@@ -336,12 +404,39 @@ impl McpClient {
     pub(crate) fn lock_transport(&self) -> Result<MutexGuard<'_, Arc<dyn McpTransport>>, String> {
         self.transport
             .lock()
-            .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))
+            .map_err(|_| self.transport_lock_poisoned())
+    }
+
+    /// The transport, waiting for it in 25 ms steps while `should_cancel`
+    /// allows.
+    fn lock_transport_or_cancel(
+        &self,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<MutexGuard<'_, Arc<dyn McpTransport>>, McpRequestError> {
+        loop {
+            match self.transport.try_lock() {
+                Ok(transport) => return Ok(transport),
+                Err(TryLockError::WouldBlock) if should_cancel() => {
+                    return Err(McpRequestError::Cancelled);
+                }
+                Err(TryLockError::WouldBlock) => std::thread::sleep(TRANSPORT_WAIT_STEP),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(McpRequestError::Failed(self.transport_lock_poisoned()));
+                }
+            }
+        }
+    }
+
+    fn transport_lock_poisoned(&self) -> String {
+        format!("MCP server '{}' transport lock poisoned", self.server_name)
     }
 }
 
 const MCP_TOOL_CALL_CANCELLED: &str = "MCP tool call cancelled";
 const CANCELLED_STDIO_RECONNECT_TIMEOUT_MS: u64 = 500;
+/// How often a wait for the transport tries it again, and looks for a
+/// cancel.
+const TRANSPORT_WAIT_STEP: Duration = Duration::from_millis(25);
 
 pub(crate) fn should_reconnect_after_mcp_error(transport: &McpTransportKind, error: &str) -> bool {
     error.contains("timed out")
