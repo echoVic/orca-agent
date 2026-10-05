@@ -8,9 +8,12 @@
 //!
 //! Test builds never touch the real `~/.orca`. When no override and no
 //! `ORCA_HOME` names a home, [`orca_home`] returns a temporary directory that
-//! is private to the process. A test build is this crate's own `cfg(test)` or
-//! any build that enables the `test-utils` feature; other crates enable it
-//! through a dev-dependency, so release builds keep the `~/.orca` default.
+//! is private to the process; these live in `<temp dir>/orca-test-homes`, so
+//! one `rm -rf` clears what test runs leave behind. A test build is this
+//! crate's own `cfg(test)`, or any build that enables the `test-utils`
+//! feature while cargo or nextest is running it (see
+//! `test_utils_default_home`). Other crates enable the feature through a
+//! dev-dependency, so release builds keep the `~/.orca` default.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -71,29 +74,68 @@ fn home_from_environment() -> Option<PathBuf> {
     Some(PathBuf::from(value))
 }
 
-#[cfg(not(any(test, feature = "test-utils")))]
-fn default_orca_home() -> Option<PathBuf> {
+fn user_default_home() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".orca"))
 }
 
-/// Falls back to the process's temporary home and exports it as `ORCA_HOME`,
-/// so child processes land in the same directory rather than creating their
-/// own.
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(not(any(test, feature = "test-utils")))]
 fn default_orca_home() -> Option<PathBuf> {
+    user_default_home()
+}
+
+/// orca-core's own unit tests always get the process's temporary home.
+#[cfg(test)]
+fn default_orca_home() -> Option<PathBuf> {
+    Some(adopt_process_temp_home())
+}
+
+#[cfg(all(feature = "test-utils", not(test)))]
+fn default_orca_home() -> Option<PathBuf> {
+    test_utils_default_home()
+}
+
+/// Set by cargo and nextest for every test process they launch, and inherited
+/// by whatever those processes spawn.
+#[cfg(any(test, feature = "test-utils"))]
+const CARGO_MANIFEST_DIR_ENV: &str = "CARGO_MANIFEST_DIR";
+
+/// What a `test-utils` build falls back to when nothing names a home: the
+/// process's temporary home, but only while cargo or nextest is running it.
+///
+/// Dev-dependencies switch the feature on, so the `orca` binary that the
+/// integration tests run carries the fallback and stays in `target/` after
+/// `cargo test`. Whoever starts that binary from a terminal must still get the
+/// real `~/.orca`: a fresh temporary home on every run would hide their
+/// config, API key and first-run acknowledgement. `CARGO_MANIFEST_DIR` marks a
+/// test run (it reaches the test processes and the `orca` they spawn) and is
+/// absent in a terminal. This only resolves a path in the user's home; it
+/// creates and writes nothing there.
+#[cfg(any(test, feature = "test-utils"))]
+fn test_utils_default_home() -> Option<PathBuf> {
+    if std::env::var_os(CARGO_MANIFEST_DIR_ENV).is_some() {
+        Some(adopt_process_temp_home())
+    } else {
+        user_default_home()
+    }
+}
+
+/// Makes the process's temporary home this process's `ORCA_HOME`, so child
+/// processes land in the same directory rather than creating their own.
+#[cfg(any(test, feature = "test-utils"))]
+fn adopt_process_temp_home() -> PathBuf {
     let home = process_temp_home();
     // edition 2024: set_var is unsafe. Only reached while `ORCA_HOME` names
     // no home, and always with the same value.
     unsafe {
         std::env::set_var(ORCA_HOME_ENV, home);
     }
-    Some(home.to_path_buf())
+    home.to_path_buf()
 }
 
 /// The temporary home every test build in this process falls back to. It is
-/// created on first use and this process never removes it: a detached child
-/// may still be writing to it when this one exits. This function does not
-/// touch the environment.
+/// created on first use, inside `<temp dir>/orca-test-homes`, and this process
+/// never removes it: a detached child may still be writing to it when this one
+/// exits. This function does not touch the environment.
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub fn process_temp_home() -> &'static std::path::Path {
@@ -101,9 +143,15 @@ pub fn process_temp_home() -> &'static std::path::Path {
 
     static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
     HOME.get_or_init(|| {
-        tempfile::Builder::new()
-            .prefix("orca-test-home-")
-            .tempdir()
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("orca-test-home-");
+        let group = std::env::temp_dir().join("orca-test-homes");
+        std::fs::create_dir_all(&group)
+            .and_then(|()| builder.tempdir_in(&group))
+            // Grouping is a convenience: on a temp dir shared between users
+            // the group may belong to someone else, and the home must still
+            // be created.
+            .or_else(|_| builder.tempdir())
             .expect("create the process-wide test Orca home")
     })
     .path()
@@ -121,11 +169,13 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::MutexGuard;
 
-    /// Holds the environment lock and puts `ORCA_HOME` and this thread's
-    /// overrides back the way they were, even when the test panics.
+    /// Holds the environment lock and puts `ORCA_HOME`, `CARGO_MANIFEST_DIR`
+    /// and this thread's overrides back the way they were, even when the test
+    /// panics.
     struct HomeScope {
         _lock: MutexGuard<'static, ()>,
-        original: Option<OsString>,
+        original_home: Option<OsString>,
+        original_manifest_dir: Option<OsString>,
     }
 
     impl HomeScope {
@@ -135,7 +185,8 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             Self {
                 _lock: lock,
-                original: std::env::var_os(ORCA_HOME_ENV),
+                original_home: std::env::var_os(ORCA_HOME_ENV),
+                original_manifest_dir: std::env::var_os(CARGO_MANIFEST_DIR_ENV),
             }
         }
 
@@ -146,17 +197,30 @@ mod tests {
         fn remove_env(&self) {
             unsafe { std::env::remove_var(ORCA_HOME_ENV) };
         }
+
+        fn set_manifest_dir(&self, value: &str) {
+            unsafe { std::env::set_var(CARGO_MANIFEST_DIR_ENV, value) };
+        }
+
+        fn remove_manifest_dir(&self) {
+            unsafe { std::env::remove_var(CARGO_MANIFEST_DIR_ENV) };
+        }
     }
 
     impl Drop for HomeScope {
         fn drop(&mut self) {
             install_test_orca_home(None);
             install_host_orca_home(None);
-            unsafe {
-                match self.original.take() {
-                    Some(value) => std::env::set_var(ORCA_HOME_ENV, value),
-                    None => std::env::remove_var(ORCA_HOME_ENV),
-                }
+            restore(ORCA_HOME_ENV, self.original_home.take());
+            restore(CARGO_MANIFEST_DIR_ENV, self.original_manifest_dir.take());
+        }
+    }
+
+    fn restore(key: &str, original: Option<OsString>) {
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
             }
         }
     }
@@ -222,6 +286,47 @@ mod tests {
                 "ORCA_HOME={blank:?} names no home"
             );
         }
+    }
+
+    #[test]
+    fn orca_home_in_a_test_utils_build_keeps_the_user_default_outside_cargo() {
+        let scope = HomeScope::new();
+        scope.remove_env();
+        scope.remove_manifest_dir();
+
+        // Resolving the path is all this does: the user's real home is never
+        // created or written, and nothing is exported to child processes.
+        assert_eq!(
+            test_utils_default_home(),
+            dirs::home_dir().map(|home| home.join(".orca")),
+            "a test-utils binary run from a terminal keeps ~/.orca"
+        );
+        assert_eq!(std::env::var_os(ORCA_HOME_ENV), None);
+    }
+
+    #[test]
+    fn orca_home_in_a_test_utils_build_uses_the_temp_home_under_cargo() {
+        let scope = HomeScope::new();
+        scope.remove_env();
+        scope.set_manifest_dir("/somewhere/crates/orca-core");
+
+        let home = test_utils_default_home().expect("a test run always has a home");
+
+        assert_eq!(home, process_temp_home());
+        assert_eq!(std::env::var_os(ORCA_HOME_ENV), Some(home.into_os_string()));
+    }
+
+    #[test]
+    fn orca_home_groups_the_process_temp_homes_in_one_directory() {
+        let group = std::env::temp_dir().join("orca-test-homes");
+
+        assert_eq!(
+            process_temp_home().parent(),
+            Some(group.as_path()),
+            "{} is not inside {}",
+            process_temp_home().display(),
+            group.display()
+        );
     }
 
     #[test]
