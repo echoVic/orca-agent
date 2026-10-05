@@ -610,21 +610,26 @@ impl EventStreamReader {
                 Ok(None) => return self.ended(None),
                 Err(error) => return self.ended(Some(error)),
             };
-            let events = match decoder.push(&chunk) {
-                Ok(events) => events,
-                Err(_) => {
+            // `push` may leave events behind, after an unreadable one or the
+            // events before it, so it is asked again until it has no more.
+            let mut bytes: &[u8] = &chunk;
+            loop {
+                match decoder.push(bytes) {
+                    Ok(events) if events.is_empty() => break,
+                    Ok(events) => {
+                        for event in events {
+                            if let Err(reason) = self.handle(&event, &client) {
+                                return reason;
+                            }
+                        }
+                    }
                     // An event that cannot be read cannot be matched to a
                     // request either, so it is skipped, as the reference SDK
-                    // does, along with the rest of this read. A request whose
-                    // response it was times out.
-                    decoder = SseDecoder::new();
-                    continue;
+                    // does, and only it: the events around it are read. A
+                    // request whose response it was times out.
+                    Err(_) => {}
                 }
-            };
-            for event in events {
-                if let Err(reason) = self.handle(&event, &client) {
-                    return reason;
-                }
+                bytes = &[];
             }
             if decoder.buffered_len() > MAX_SSE_RESPONSE_BYTES {
                 return format!(

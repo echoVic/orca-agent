@@ -1984,45 +1984,56 @@ async fn read_sse_stream(
                 "MCP SSE response exceeded maximum body size of {MAX_SSE_RESPONSE_BYTES} bytes"
             ));
         }
-        for event in decoder.push(&chunk)? {
-            let Some(message) = sse_event_message(&event)? else {
-                continue;
-            };
-            if is_server_request(&message) {
-                if is_elicitation_create_request(&message) {
-                    // The handler is asked on the thread that sent the request.
-                    let (sender, receiver) = tokio::sync::oneshot::channel();
-                    elicitation_sender
-                        .send(SseElicitationEnvelope {
-                            request: message,
-                            response: sender,
-                        })
-                        .map_err(|_| "MCP SSE elicitation handler stopped".to_string())?;
-                    let answer = await_sse_elicitation_response(receiver, cancel).await?;
-                    // The server waits for the answer, so one that cannot
-                    // reach it ends the request.
-                    post_sse_message(
-                        &context.endpoint,
-                        &context.headers,
-                        answer,
-                        context.timeout,
-                        cancel,
-                    )
-                    .await?;
-                } else {
-                    // Best effort: the request under way may be answered
-                    // all the same. A cancel shows at the next read.
-                    let _ = post_sse_message(
-                        &context.endpoint,
-                        &context.headers,
-                        server_request_reply(&message),
-                        context.timeout,
-                        cancel,
-                    )
-                    .await;
+        // An event that cannot be read ends the request, once the events
+        // before it are read: `push` gives those out first, and reports the
+        // event in the call after. So it is asked again until it has no more.
+        let mut bytes: &[u8] = &chunk;
+        loop {
+            let events = decoder.push(bytes)?;
+            bytes = &[];
+            if events.is_empty() {
+                break;
+            }
+            for event in events {
+                let Some(message) = sse_event_message(&event)? else {
+                    continue;
+                };
+                if is_server_request(&message) {
+                    if is_elicitation_create_request(&message) {
+                        // The handler is asked on the thread that sent the request.
+                        let (sender, receiver) = tokio::sync::oneshot::channel();
+                        elicitation_sender
+                            .send(SseElicitationEnvelope {
+                                request: message,
+                                response: sender,
+                            })
+                            .map_err(|_| "MCP SSE elicitation handler stopped".to_string())?;
+                        let answer = await_sse_elicitation_response(receiver, cancel).await?;
+                        // The server waits for the answer, so one that cannot
+                        // reach it ends the request.
+                        post_sse_message(
+                            &context.endpoint,
+                            &context.headers,
+                            answer,
+                            context.timeout,
+                            cancel,
+                        )
+                        .await?;
+                    } else {
+                        // Best effort: the request under way may be answered
+                        // all the same. A cancel shows at the next read.
+                        let _ = post_sse_message(
+                            &context.endpoint,
+                            &context.headers,
+                            server_request_reply(&message),
+                            context.timeout,
+                            cancel,
+                        )
+                        .await;
+                    }
+                } else if is_response_to(&message, context.id) {
+                    return parse_terminal_message(message, &context.method, context.id);
                 }
-            } else if is_response_to(&message, context.id) {
-                return parse_terminal_message(message, &context.method, context.id);
             }
         }
     }
@@ -2262,31 +2273,42 @@ fn read_sse_response(
                 "MCP SSE response exceeded maximum body size of {MAX_SSE_RESPONSE_BYTES} bytes"
             ));
         }
-        for event in decoder.push(&chunk[..read]).map_err(invalid)? {
-            let Some(message) = sse_event_message(&event).map_err(invalid)? else {
-                continue;
-            };
-            if is_server_request(&message) {
-                let reply = |answer: &Value| {
-                    post_sse_reply(
-                        client,
-                        &context.endpoint,
-                        reply_headers,
-                        answer,
-                        context.timeout,
-                    )
+        // An event that cannot be read ends the request, once the events
+        // before it are read: `push` gives those out first, and reports the
+        // event in the call after. So it is asked again until it has no more.
+        let mut bytes = &chunk[..read];
+        loop {
+            let events = decoder.push(bytes).map_err(invalid)?;
+            bytes = &[];
+            if events.is_empty() {
+                break;
+            }
+            for event in events {
+                let Some(message) = sse_event_message(&event).map_err(invalid)? else {
+                    continue;
                 };
-                if is_elicitation_create_request(&message) {
-                    // The server waits for the answer, so one that cannot
-                    // reach it ends the request.
-                    reply(&resolve_sse_elicitation(server_name, &message, None))?;
-                } else {
-                    // Best effort: the request under way may be answered
-                    // all the same.
-                    let _ = reply(&server_request_reply(&message));
+                if is_server_request(&message) {
+                    let reply = |answer: &Value| {
+                        post_sse_reply(
+                            client,
+                            &context.endpoint,
+                            reply_headers,
+                            answer,
+                            context.timeout,
+                        )
+                    };
+                    if is_elicitation_create_request(&message) {
+                        // The server waits for the answer, so one that cannot
+                        // reach it ends the request.
+                        reply(&resolve_sse_elicitation(server_name, &message, None))?;
+                    } else {
+                        // Best effort: the request under way may be answered
+                        // all the same.
+                        let _ = reply(&server_request_reply(&message));
+                    }
+                } else if is_response_to(&message, context.id) {
+                    return parse_terminal_message(message, method, context.id);
                 }
-            } else if is_response_to(&message, context.id) {
-                return parse_terminal_message(message, method, context.id);
             }
         }
     }
@@ -3994,6 +4016,81 @@ done
         }
     }
 
+    /// What one `tools/list` (read by the blocking reader) and one
+    /// `tools/call` (read by the async one) come to, each answered by an event
+    /// stream that carries `writes`, one write after the other.
+    fn both_stream_readers(writes: &[&[u8]]) -> [Result<Value, String>; 2] {
+        ["tools/list", "tools/call"].map(|method| {
+            let writes = writes.iter().map(|write| write.to_vec()).collect::<Vec<_>>();
+            let server = OneShotSseServer::start(move |stream| {
+                let _ = read_http_request(stream);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                );
+                for write in writes {
+                    let _ = stream.write_all(&write);
+                    let _ = stream.flush();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            let config = McpServerConfig {
+                name: "unreadable".to_string(),
+                transport: McpTransportKind::Http,
+                url: Some(server.url()),
+                startup_timeout_ms: Some(2_000),
+                tool_timeout_ms: Some(2_000),
+                ..Default::default()
+            };
+            let transport =
+                StreamableHttpTransport::new(&config, no_auth(&config)).expect("an HTTP transport");
+            if method == "tools/list" {
+                transport.list_tools(None)
+            } else {
+                transport.call_tool("t", json!({}))
+            }
+        })
+    }
+
+    #[test]
+    fn a_response_followed_by_an_unreadable_line_in_the_same_read_still_arrives() {
+        let response = br#"data: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        let write = [&response[..], b"\n\ndata: \xff\n\n"].concat();
+
+        for result in both_stream_readers(&[&write]) {
+            assert_eq!(result, Ok(json!({"ok": true})));
+        }
+    }
+
+    #[test]
+    fn an_unreadable_event_before_the_response_ends_the_request_wherever_the_reads_are_cut() {
+        let notification =
+            br#"data: {"jsonrpc":"2.0","method":"notifications/message","params":{}}"#;
+        let response = br#"data: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        let unreadable: &[u8] = b"data: \xff\n\n";
+        let notified = [&notification[..], b"\n\n"].concat();
+        let answered = [&response[..], b"\n\n"].concat();
+        let notified_then_unreadable = [&notified[..], unreadable].concat();
+        let everything = [&notified[..], unreadable, &answered[..]].concat();
+        let cases: [(&str, Vec<&[u8]>); 3] = [
+            ("all in one write", vec![&everything]),
+            (
+                "the response in a write of its own",
+                vec![&notified_then_unreadable, &answered],
+            ),
+            (
+                "each event in a write of its own",
+                vec![&notified, unreadable, &answered],
+            ),
+        ];
+
+        for (cut, writes) in cases {
+            for result in both_stream_readers(&writes) {
+                let error = result.expect_err(cut);
+                assert!(error.to_lowercase().contains("utf-8"), "{cut}: {error}");
+            }
+        }
+    }
+
     #[test]
     fn a_blocking_sse_read_ends_at_the_matching_response() {
         let (release, released) = mpsc::channel::<()>();
@@ -4956,6 +5053,28 @@ while IFS= read -r line; do :; done
             error,
             "MCP server 'misconfigured' has an invalid value for header 'Authorization'"
         );
+    }
+
+    #[test]
+    fn legacy_sse_skips_only_an_unreadable_event() {
+        // Each answer comes in the same write as an event that has a line
+        // that is not UTF-8. That event is skipped; the answer still arrives.
+        let server = LegacySseServer::start(LegacySseBehavior {
+            unreadable_before_answers: true,
+            ..LegacySseBehavior::default()
+        });
+        let transport =
+            legacy_sse(&legacy_sse_config("legacy", &server)).expect("open the event stream");
+
+        let initialized = transport
+            .initialize()
+            .expect("initialize over the event stream");
+        let tools = transport
+            .list_tools(None)
+            .expect("tools/list over the event stream");
+
+        assert_eq!(initialized["serverInfo"]["name"], "legacy");
+        assert_eq!(tools["tools"][0]["name"], "echo");
     }
 
     #[test]
@@ -6009,6 +6128,9 @@ while IFS= read -r line; do :; done
         /// with this method, as `ask-1`, and answer the call only once the
         /// client has answered it.
         asks_first: Option<&'static str>,
+        /// Send each answer in the same write as an event that has a line
+        /// that is not UTF-8, just before it.
+        unreadable_before_answers: bool,
     }
 
     impl Default for LegacySseBehavior {
@@ -6021,6 +6143,7 @@ while IFS= read -r line; do :; done
                 elicit: false,
                 elicit_unprompted: false,
                 asks_first: None,
+                unreadable_before_answers: false,
             }
         }
     }
@@ -6123,7 +6246,7 @@ while IFS= read -r line; do :; done
         let mut next = Some(opening);
         while let Some(event) = next {
             if stream
-                .write_all(event.as_bytes())
+                .write_all(&wire_bytes(&event))
                 .and_then(|()| stream.flush())
                 .is_err()
             {
@@ -6191,9 +6314,12 @@ while IFS= read -r line; do :; done
             "prompts/get" => fixture_prompt(&request.body),
             _ => json!({}),
         };
-        let _ = events.send(Some(legacy_event(
-            &json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        )));
+        let answer = legacy_event(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
+        let _ = events.send(Some(if behavior.unreadable_before_answers {
+            format!("event: message\ndata: {NOT_UTF8}\n\n{answer}")
+        } else {
+            answer
+        }));
         write_http_status(stream, 202);
     }
 
@@ -6270,6 +6396,22 @@ while IFS= read -r line; do :; done
 
     fn legacy_event(message: &Value) -> String {
         format!("event: message\ndata: {message}\n\n")
+    }
+
+    /// Stands, in an event the fixture sends, for a byte that is not UTF-8.
+    const NOT_UTF8: &str = "<not-utf-8>";
+
+    /// What goes on the wire for `event`: its bytes, with a `0xff` where
+    /// [`NOT_UTF8`] stands.
+    fn wire_bytes(event: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (index, part) in event.split(NOT_UTF8).enumerate() {
+            if index > 0 {
+                bytes.push(0xff);
+            }
+            bytes.extend_from_slice(part.as_bytes());
+        }
+        bytes
     }
 
     /// The prompts the HTTP fixtures offer.

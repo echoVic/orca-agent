@@ -5,6 +5,8 @@
 //! to streamable HTTP requests and the legacy SSE transport, reads it with
 //! [`SseDecoder`].
 
+use std::collections::VecDeque;
+
 /// One event of a stream.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct SseEvent {
@@ -17,9 +19,14 @@ pub(crate) struct SseEvent {
 }
 
 /// Cuts the bytes of a stream into events as they come in, however the reads
-/// that bring them break up lines and events. It limits no size: the caller
-/// bounds what it reads, and what is held for an event
+/// that bring them break up lines and events: what it gives out in all, and in
+/// which order, does not depend on where the reads end. It limits no size: the
+/// caller bounds what it reads, and what is held for an event
 /// ([`SseDecoder::buffered_len`]).
+///
+/// An event with a line that is not UTF-8 cannot be read. It is dropped whole,
+/// up to its blank line, and given out as an error in its place, after the
+/// events before it. The decoder reads on after it.
 #[derive(Debug, Default)]
 pub(crate) struct SseDecoder {
     /// The line being read, up to its end.
@@ -32,6 +39,13 @@ pub(crate) struct SseDecoder {
     event: Option<String>,
     id: Option<String>,
     data: Option<String>,
+    /// Why the event being read cannot be read, once one of its lines is not
+    /// UTF-8. The event is dropped when it ends.
+    unreadable: Option<String>,
+    /// What the bytes read so far have ended and was not given out yet, in
+    /// the order of the stream: each event, and each unreadable one as an
+    /// error.
+    ready: VecDeque<Result<SseEvent, String>>,
 }
 
 impl SseDecoder {
@@ -40,26 +54,22 @@ impl SseDecoder {
     }
 
     /// Takes the next bytes of the stream; returns the events they end, in
-    /// order. A line that is not UTF-8 is an error. The decoder is of no more
-    /// use then, and the events the bytes ended before that line are lost; a
-    /// caller that reads on starts again with a new decoder.
+    /// order, up to an event that cannot be read. That one is the error of the
+    /// call that follows, so that no event is lost to it. Then the decoder
+    /// goes on with what follows, and is good for more bytes.
+    ///
+    /// A call may leave more to give out, after an error, or after the
+    /// events before one. Ask again, with no bytes, until it returns no
+    /// events.
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, String> {
+        self.cut(bytes);
         let mut events = Vec::new();
-        let mut rest = bytes;
-        while let Some((&first, tail)) = rest.split_first() {
-            if std::mem::take(&mut self.after_cr) && first == b'\n' {
-                rest = tail;
-                continue;
-            }
-            match rest.iter().position(|&byte| byte == b'\n' || byte == b'\r') {
-                Some(end) => {
-                    self.line.extend_from_slice(&rest[..end]);
-                    self.after_cr = rest[end] == b'\r';
-                    rest = &rest[end + 1..];
-                    events.extend(self.end_line()?);
-                }
-                None => {
-                    self.line.extend_from_slice(rest);
+        while let Some(item) = self.ready.pop_front() {
+            match item {
+                Ok(event) => events.push(event),
+                Err(error) if events.is_empty() => return Err(error),
+                Err(error) => {
+                    self.ready.push_front(Err(error));
                     break;
                 }
             }
@@ -67,14 +77,21 @@ impl SseDecoder {
         Ok(events)
     }
 
-    /// The event the stream ended inside, without the blank line that ends it.
+    /// The event the stream ended inside, without the blank line that ends it,
+    /// or why it cannot be read. For a decoder that `push` has given out
+    /// everything of.
     pub(crate) fn finish(mut self) -> Result<Option<SseEvent>, String> {
+        debug_assert!(
+            self.ready.is_empty(),
+            "finish is for a decoder that has given out everything"
+        );
         // The last line may lack its end. It is read as any other, and being
         // no blank line, it ends no event.
         if !self.line.is_empty() {
-            self.end_line()?;
+            self.end_line();
         }
-        Ok(self.end_event())
+        self.end_event();
+        self.ready.pop_front().transpose()
     }
 
     /// How many bytes the decoder holds for the event it is in the middle of,
@@ -89,17 +106,53 @@ impl SseDecoder {
                 .sum::<usize>()
     }
 
-    /// Acts on the line just read: a blank line ends the event, a comment is
-    /// skipped, and a field sets what the event has.
-    fn end_line(&mut self) -> Result<Option<SseEvent>, String> {
-        let bytes = std::mem::take(&mut self.line);
-        let line = std::str::from_utf8(&bytes)
-            .map_err(|error| format!("an event stream line is not UTF-8: {error}"))?;
-        if line.is_empty() {
-            return Ok(self.end_event());
+    /// Cuts `bytes` into lines, which it acts on, one after the other.
+    fn cut(&mut self, bytes: &[u8]) {
+        let mut rest = bytes;
+        while let Some((&first, tail)) = rest.split_first() {
+            if std::mem::take(&mut self.after_cr) && first == b'\n' {
+                rest = tail;
+                continue;
+            }
+            match rest.iter().position(|&byte| byte == b'\n' || byte == b'\r') {
+                Some(end) => {
+                    self.line.extend_from_slice(&rest[..end]);
+                    self.after_cr = rest[end] == b'\r';
+                    rest = &rest[end + 1..];
+                    self.end_line();
+                }
+                None => {
+                    self.line.extend_from_slice(rest);
+                    break;
+                }
+            }
         }
-        if line.starts_with(':') {
-            return Ok(None);
+    }
+
+    /// Acts on the line just read: a blank line ends the event, a comment is
+    /// skipped, and a field sets what the event has. A line that is not UTF-8
+    /// makes the event unreadable: what it has is dropped, and so are its
+    /// other lines.
+    fn end_line(&mut self) {
+        let bytes = std::mem::take(&mut self.line);
+        let line = match std::str::from_utf8(&bytes) {
+            Ok(line) => line,
+            Err(error) => {
+                if self.unreadable.is_none() {
+                    self.unreadable = Some(format!("an event stream line is not UTF-8: {error}"));
+                }
+                self.event = None;
+                self.id = None;
+                self.data = None;
+                return;
+            }
+        };
+        if line.is_empty() {
+            self.end_event();
+            return;
+        }
+        if self.unreadable.is_some() || line.starts_with(':') {
+            return;
         }
         let (field, value) = line.split_once(':').unwrap_or((line, ""));
         let value = value.strip_prefix(' ').unwrap_or(value);
@@ -116,15 +169,19 @@ impl SseDecoder {
             // `retry`, and any field the standard does not name.
             _ => {}
         }
-        Ok(None)
     }
 
-    /// Ends the event being read, and returns it when it has data.
-    fn end_event(&mut self) -> Option<SseEvent> {
+    /// Ends the event being read: it is given out when it has data, or as an
+    /// error when it cannot be read.
+    fn end_event(&mut self) {
         let event = self.event.take();
         let id = self.id.take();
-        let data = self.data.take()?;
-        Some(SseEvent { event, id, data })
+        let data = self.data.take();
+        if let Some(error) = self.unreadable.take() {
+            self.ready.push_back(Err(error));
+        } else if let Some(data) = data {
+            self.ready.push_back(Ok(SseEvent { event, id, data }));
+        }
     }
 }
 
@@ -138,6 +195,27 @@ mod tests {
             data: text.to_string(),
             ..SseEvent::default()
         }
+    }
+
+    /// Everything a decoder gives out for `reads`, in the order of the
+    /// stream: each event, and each unreadable one as an `Err`. After each
+    /// read it asks again, with no bytes, until there is no more, as the
+    /// readers of a stream do.
+    fn read_all(reads: &[&[u8]]) -> Vec<Result<SseEvent, String>> {
+        let mut decoder = SseDecoder::new();
+        let mut given = Vec::new();
+        for read in reads {
+            let mut bytes = *read;
+            loop {
+                match decoder.push(bytes) {
+                    Ok(events) if events.is_empty() => break,
+                    Ok(events) => given.extend(events.into_iter().map(Ok)),
+                    Err(error) => given.push(Err(error)),
+                }
+                bytes = b"";
+            }
+        }
+        given
     }
 
     #[test]
@@ -220,5 +298,79 @@ mod tests {
 
         assert_eq!(decoder.push(b"data: x"), Ok(Vec::new()));
         assert_eq!(decoder.finish(), Ok(Some(data("x"))));
+    }
+
+    #[test]
+    fn an_event_before_an_unreadable_line_comes_out_and_the_error_follows() {
+        let mut decoder = SseDecoder::new();
+
+        // One read: an event, then one that has a line that is not UTF-8.
+        assert_eq!(
+            decoder.push(b"data: ok\n\ndata: \xff\n\n"),
+            Ok(vec![data("ok")])
+        );
+        let error = decoder
+            .push(b"")
+            .expect_err("the unreadable event is reported by the next call");
+        assert!(error.contains("not UTF-8"), "{error}");
+        assert_eq!(decoder.push(b""), Ok(Vec::new()));
+        assert_eq!(decoder.push(b"data: next\n\n"), Ok(vec![data("next")]));
+    }
+
+    #[test]
+    fn an_unreadable_event_is_dropped_whole_and_the_decoder_reads_on() {
+        let mut decoder = SseDecoder::new();
+
+        // `a`, then an event whose second line is not UTF-8 (its valid lines
+        // go with it), then `b`.
+        assert_eq!(
+            decoder.push(b"data: a\n\ndata: x\n\xff\ndata: y\n\ndata: b\n\n"),
+            Ok(vec![data("a")])
+        );
+        assert!(decoder.push(b"").is_err());
+        assert_eq!(decoder.push(b""), Ok(vec![data("b")]));
+        assert_eq!(decoder.push(b""), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_comment_that_is_not_utf_8_is_an_error_too() {
+        let mut decoder = SseDecoder::new();
+
+        assert!(decoder.push(b": \xff\n\ndata: x\n\n").is_err());
+        assert_eq!(decoder.push(b""), Ok(vec![data("x")]));
+    }
+
+    #[test]
+    fn the_events_do_not_depend_on_where_reads_are_cut() {
+        // Three line ends, a comment, a character of two bytes, and two
+        // events that have a line that is not UTF-8.
+        let stream: &[u8] = b"event: a\r\ndata: caf\xc3\xa9\r\n\r\n: keepalive\rdata: \xff\r\n\r\n\
+data: 2\ndata: 3\n\ndata: x\n\xc3\n\ndata: 4\r\r";
+        let whole = read_all(&[stream]);
+        let events: Vec<_> = whole
+            .iter()
+            .flatten()
+            .map(|event| event.data.as_str())
+            .collect();
+        assert_eq!(events, ["café", "2\n3", "4"]);
+        assert_eq!(whole.iter().filter(|item| item.is_err()).count(), 2);
+
+        for cut in 0..=stream.len() {
+            assert_eq!(
+                read_all(&[&stream[..cut], &stream[cut..]]),
+                whole,
+                "cut after {cut} bytes"
+            );
+        }
+        assert_eq!(read_all(&stream.chunks(1).collect::<Vec<_>>()), whole);
+    }
+
+    #[test]
+    fn finish_reports_an_unreadable_event_the_stream_ended_inside() {
+        let mut decoder = SseDecoder::new();
+
+        assert_eq!(decoder.push(b"data: x\n\xff\ndata: y\n"), Ok(Vec::new()));
+        let error = decoder.finish().expect_err("the event is not UTF-8");
+        assert!(error.contains("not UTF-8"), "{error}");
     }
 }
