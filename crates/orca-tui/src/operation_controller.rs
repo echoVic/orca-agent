@@ -329,7 +329,8 @@ impl TuiSurfaceTaskControl {
     }
 
     /// Keeps the MCP servers of the config from starting with the TUI until
-    /// first-run setup is done ([`crate::protocol::UserAction::SetupFinished`]):
+    /// first-run setup is done ([`crate::protocol::UserAction::SetupFinished`]),
+    /// and with them the conversation `--resume` or `--continue` names:
     /// nothing a workspace's config runs starts before the user has accepted
     /// the workspace.
     pub(crate) fn hold_mcp_prestart(&self) {

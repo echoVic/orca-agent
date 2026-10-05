@@ -230,7 +230,7 @@ fn run_tui_inner(
         state.setup_step = if needs_disclosure { 0 } else { 1 };
     }
 
-    let initial_prompt = if config.prompt.trim().is_empty() {
+    let mut initial_prompt = if config.prompt.trim().is_empty() {
         None
     } else {
         Some(config.prompt.clone())
@@ -283,15 +283,16 @@ fn run_tui_inner(
         }
     };
     // A prompt given on the command line waits for first-run setup like
-    // everything else the workspace runs: `finish_setup` submits it once the
-    // user has accepted the workspace.
-    let pending_initial_prompt = if !needs_setup
-        && typed_history_startup_eligible(&config.history_mode, &preloaded_transcript)
-    {
-        initial_prompt.clone()
-    } else {
-        None
-    };
+    // everything else the workspace runs. One given with a conversation
+    // resumed at launch, which itself waits for setup, is submitted once that
+    // conversation's history is loaded. Any other is submitted now, or once
+    // the user has accepted the workspace (`finish_setup`).
+    let pending_initial_prompt =
+        if typed_history_startup_eligible(&config.history_mode, &preloaded_transcript) {
+            initial_prompt.take()
+        } else {
+            None
+        };
     let renderer_interaction_acks =
         RendererInteractionAckOwner::new(agent_runtime.interaction_ack_receiver());
     let renderer_runtime_inbox = RendererRuntimeInboxOwner::new(pending_event_rx);
@@ -301,10 +302,7 @@ fn run_tui_inner(
     let mut textarea = if needs_setup && state.setup_step == 1 {
         make_setup_textarea(pending_terminal_session.theme())
     } else {
-        if !needs_setup
-            && let Some(prompt) = initial_prompt.clone()
-            && pending_initial_prompt.is_none()
-        {
+        if !needs_setup && let Some(prompt) = initial_prompt.clone() {
             state.push_message(ChatMessage::User(prompt.clone()));
             state.enter_running();
             let _ = action_tx.send(UserAction::Submit(prompt));

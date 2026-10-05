@@ -792,10 +792,16 @@ fn a_prompt_given_on_the_command_line_waits_for_the_workspace_review() {
         Duration::from_secs(20),
         "a prompt on the command line skipped the review of a new workspace",
     );
-    assert!(
-        !contains_rendered_text(&output, ASSISTANT_SENTINEL),
-        "the prompt ran before the workspace was accepted"
-    );
+    // A prompt sent at launch would have been answered by now.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        process.drain_output(&mut output);
+        assert!(
+            !contains_rendered_text(&output, ASSISTANT_SENTINEL),
+            "the prompt ran before the workspace was accepted"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 
     process.write(b"\r").expect("trust the workspace");
     receive_until(
@@ -835,6 +841,116 @@ fn leaving_the_workspace_review_never_runs_the_command_line_prompt() {
         !contains_rendered_text(&output, ASSISTANT_SENTINEL),
         "the prompt ran although the user left the review"
     );
+}
+
+#[test]
+fn a_conversation_resumed_on_the_command_line_waits_for_the_workspace_review() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let _recorded_in = record_a_conversation(home.path(), "pty resume seed");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process =
+        PtyProcess::spawn_resumed(home.path(), cwd.path(), "latest", "mock_history_echo")
+            .expect("spawn resumed TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "resuming a conversation skipped the review of a new workspace",
+    );
+    // A conversation resumed at launch would have loaded by now.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        process.drain_output(&mut output);
+        assert!(
+            !contains_rendered_text(&output, "Resumed saved conversation"),
+            "the conversation was resumed before the workspace was accepted"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    process.write(b"\r").expect("trust the workspace");
+    receive_until(
+        &process,
+        &mut output,
+        "Mock history users: pty resume seed | mock_history_echo",
+        Duration::from_secs(10),
+        "the resumed conversation did not get the prompt once the workspace was accepted",
+    );
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
+fn leaving_the_workspace_review_never_resumes_the_conversation() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let _recorded_in = record_a_conversation(home.path(), "pty resume seed");
+    let fixture = tempfile::tempdir().expect("MCP fixture directory");
+    let server = SlowMcpServer::configure(home.path(), fixture.path());
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process =
+        PtyProcess::spawn_resumed(home.path(), cwd.path(), "latest", "mock_history_echo")
+            .expect("spawn resumed TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "resuming a conversation skipped the review of a new workspace",
+    );
+    // The resumed conversation would have started its MCP server by now.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        assert_eq!(
+            server.started(),
+            Vec::<String>::new(),
+            "an MCP server started before the workspace was accepted"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    process.write(b"e").expect("leave the review");
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    process.drain_output(&mut output);
+
+    assert_eq!(status.code(), Some(0), "TUI exited with {status}");
+    assert!(
+        !contains_rendered_text(&output, "Mock history users"),
+        "the prompt ran although the user left the review"
+    );
+    assert_eq!(
+        server.started(),
+        Vec::<String>::new(),
+        "choosing Exit started an MCP server"
+    );
+}
+
+/// Records a conversation of one message, `prompt`, from a workspace of its
+/// own that the run accepts first, and returns that workspace.
+fn record_a_conversation(home: &std::path::Path, prompt: &str) -> tempfile::TempDir {
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process =
+        PtyProcess::spawn_with_prompt(home, cwd.path(), prompt).expect("spawn TUI in PTY");
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    receive_until(
+        &process,
+        &mut output,
+        ASSISTANT_SENTINEL,
+        Duration::from_secs(10),
+        "the conversation to resume did not complete",
+    );
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+    cwd
 }
 
 #[test]

@@ -199,6 +199,60 @@ fn prestart_mcp_servers(
     }
 }
 
+/// Opens the conversation `--resume` or `--continue` named, whose history
+/// the renderer shows (and then sends a prompt given with it), and announces
+/// its thread. When it cannot be opened, a prompt given with it still goes
+/// to a new conversation.
+fn resume_startup_conversation(
+    thread: &mut Option<RuntimeThreadHandle>,
+    host: &RuntimeHostHandle,
+    config: &Arc<Mutex<RunConfig>>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    control: &TuiSurfaceTaskControl,
+) {
+    let cfg = config.lock().unwrap().clone();
+    let selector = match &cfg.history_mode {
+        HistoryMode::Resume(selector)
+        | HistoryMode::ResumeAt { selector, .. }
+        | HistoryMode::Fork(selector) => selector,
+        HistoryMode::Record | HistoryMode::Disabled => unreachable!(),
+    };
+    let thread_was_missing = thread.is_none();
+    let result = RuntimeSurfaceHostHandle::load_saved_session(selector)
+        .map(|transcript| transcript.meta.title)
+        .map_err(|error| format!("failed to load saved session metadata: {error}"))
+        .and_then(|title| {
+            ensure_hosted_thread(thread, host, &cfg, preloaded, &title, event_tx, control)
+        })
+        .and_then(|_| {
+            synchronize_shared_config_from_surface(
+                thread.as_ref().expect("startup hosted thread"),
+                config,
+            )?;
+            emit_typed_history_snapshot(
+                thread.as_ref().expect("startup hosted thread"),
+                &cfg.history_mode,
+                None,
+                event_tx,
+            )
+        });
+    if let Err(error) = result {
+        if !cfg.prompt.trim().is_empty() {
+            emit_empty_history_snapshot(event_tx, "Unable to restore saved conversation.");
+        }
+        if !error.contains("typed TUI snapshot attachment unavailable") {
+            let _ = event_tx.send(TuiEvent::Error(format!(
+                "failed to restore typed conversation snapshot: {error}"
+            )));
+        }
+    }
+    if thread_was_missing && thread.is_some() {
+        let runtime_thread = thread.as_ref().expect("startup hosted thread");
+        announce_runtime_ready(runtime_thread, event_tx, control);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hosted_tui_controller_loop(
     config: Arc<Mutex<RunConfig>>,
@@ -241,56 +295,14 @@ pub(crate) fn hosted_tui_controller_loop(
     // Where `/mcp` saves and deletes logins. It is set before a thread
     // resumed at startup is announced below: `/mcp` can act from then on.
     control.set_mcp_credentials_path(config.lock().unwrap().mcp_credentials_path.clone());
-    let startup_history_mode = config.lock().unwrap().history_mode.clone();
-    if typed_history_startup_eligible(&startup_history_mode, &preloaded) {
-        let cfg = config.lock().unwrap().clone();
-        let selector = match &startup_history_mode {
-            HistoryMode::Resume(selector)
-            | HistoryMode::ResumeAt { selector, .. }
-            | HistoryMode::Fork(selector) => selector,
-            HistoryMode::Record | HistoryMode::Disabled => unreachable!(),
-        };
-        let thread_was_missing = thread.is_none();
-        let result = RuntimeSurfaceHostHandle::load_saved_session(selector)
-            .map(|transcript| transcript.meta.title)
-            .map_err(|error| format!("failed to load saved session metadata: {error}"))
-            .and_then(|title| {
-                ensure_hosted_thread(
-                    &mut thread,
-                    &host,
-                    &cfg,
-                    &preloaded,
-                    &title,
-                    &event_tx,
-                    &control,
-                )
-            })
-            .and_then(|_| {
-                synchronize_shared_config_from_surface(
-                    thread.as_ref().expect("startup hosted thread"),
-                    &config,
-                )?;
-                emit_typed_history_snapshot(
-                    thread.as_ref().expect("startup hosted thread"),
-                    &startup_history_mode,
-                    None,
-                    &event_tx,
-                )
-            });
-        if let Err(error) = result {
-            if !cfg.prompt.trim().is_empty() {
-                emit_empty_history_snapshot(&event_tx, "Unable to restore saved conversation.");
-            }
-            if !error.contains("typed TUI snapshot attachment unavailable") {
-                let _ = event_tx.send(TuiEvent::Error(format!(
-                    "failed to restore typed conversation snapshot: {error}"
-                )));
-            }
-        }
-        if thread_was_missing && thread.is_some() {
-            let runtime_thread = thread.as_ref().expect("startup hosted thread");
-            announce_runtime_ready(runtime_thread, &event_tx, &control);
-        }
+    // The conversation `--resume` or `--continue` names opens now, or, on a
+    // first run, once setup is done: like the MCP servers below, it waits
+    // for the user to accept the workspace.
+    let resume_at_launch =
+        typed_history_startup_eligible(&config.lock().unwrap().history_mode, &preloaded);
+    let mut resume_after_setup = resume_at_launch && control.mcp_prestart_held();
+    if resume_at_launch && !resume_after_setup {
+        resume_startup_conversation(&mut thread, &host, &config, &preloaded, &event_tx, &control);
     }
     // A new conversation's thread starts with its first message, but its MCP
     // servers connect now: `/mcp` and the MCP prompt commands use them
@@ -741,6 +753,16 @@ pub(crate) fn hosted_tui_controller_loop(
             | Ok(UserAction::RunMcpPrompt { .. }) => {}
             Ok(UserAction::SetupFinished) => {
                 if control.release_mcp_prestart() {
+                    if std::mem::take(&mut resume_after_setup) {
+                        resume_startup_conversation(
+                            &mut thread,
+                            &host,
+                            &config,
+                            &preloaded,
+                            &event_tx,
+                            &control,
+                        );
+                    }
                     prestart_mcp_servers(thread.as_ref(), &config, &control, &event_tx);
                 }
             }

@@ -28,9 +28,9 @@ See [Approval modes](approval-modes.md) and [Configuration](configuration.md).
 
 Nothing runs until you have answered (and, when no API key is set, entered
 one): a prompt given on the command line, as in `orca "fix the failing test"`,
-is sent once you accept, and the MCP servers a new conversation starts with
-wait too. Choosing `E` exits without running the prompt or starting any of
-them.
+is sent once you accept; a conversation named with `--continue` or `--resume`
+opens only then; and the MCP servers wait too. Choosing `E` exits without
+sending the prompt, opening the conversation, or starting any server.
 
 ## The screen
 
