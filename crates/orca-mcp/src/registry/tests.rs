@@ -1486,6 +1486,27 @@ fn registry_aggregates_mcp_resource_list_errors_without_losing_successes() {
         .list_resources(Some("broken"))
         .expect_err("single-server resource list should stay strict");
     assert_eq!(single_server_error, "resources/list timed out");
+
+    // Asked for by name, a server that cannot be listed fails a listing with
+    // errors too, as it does the one without: there is no other server for
+    // the listing to go on with.
+    assert_eq!(
+        registry
+            .list_resources_with_errors_or_cancel(Some("broken"), &|| false)
+            .expect_err("a server that cannot be listed fails the listing"),
+        McpRequestError::Failed("resources/list timed out".to_string())
+    );
+    assert_eq!(
+        registry
+            .list_resources_with_errors_or_cancel(Some("gone"), &|| false)
+            .expect_err("a server that is not connected fails the listing"),
+        McpRequestError::Failed("MCP server 'gone' is not connected".to_string())
+    );
+    let listing = registry
+        .list_resources_with_errors_or_cancel(Some("notes"), &|| false)
+        .expect("a server that can be listed");
+    assert_eq!(listing.resources.len(), 1);
+    assert!(listing.errors.is_empty(), "{:?}", listing.errors);
 }
 
 #[test]
@@ -1620,6 +1641,27 @@ fn registry_aggregates_mcp_resource_template_errors_without_losing_successes() {
         .list_resource_templates(Some("broken"))
         .expect_err("single-server resource template list should stay strict");
     assert_eq!(single_server_error, "resources/templates/list timed out");
+
+    // Asked for by name, a server that cannot be listed fails a listing with
+    // errors too, as it does the one without: there is no other server for
+    // the listing to go on with.
+    assert_eq!(
+        registry
+            .list_resource_templates_with_errors_or_cancel(Some("broken"), &|| false)
+            .expect_err("a server that cannot be listed fails the listing"),
+        McpRequestError::Failed("resources/templates/list timed out".to_string())
+    );
+    assert_eq!(
+        registry
+            .list_resource_templates_with_errors_or_cancel(Some("gone"), &|| false)
+            .expect_err("a server that is not connected fails the listing"),
+        McpRequestError::Failed("MCP server 'gone' is not connected".to_string())
+    );
+    let listing = registry
+        .list_resource_templates_with_errors_or_cancel(Some("docs"), &|| false)
+        .expect("a server that can be listed");
+    assert_eq!(listing.resource_templates.len(), 1);
+    assert!(listing.errors.is_empty(), "{:?}", listing.errors);
 }
 
 #[test]
@@ -2885,6 +2927,8 @@ fn a_prompt_or_resource_request_that_needs_login_marks_the_server() {
         "resources/read",
         "resources/list with errors",
         "resources/templates/list with errors",
+        "resources/list with errors, by name",
+        "resources/templates/list with errors, by name",
     ] {
         let server = OAuthTestServer::start(OAuthTestBehavior {
             accepted_tokens: vec!["at-stored".to_string()],
@@ -2903,14 +2947,22 @@ fn a_prompt_or_resource_request_that_needs_login_marks_the_server() {
             "resources/read" => registry.read_resource("docs", "memo://readme").map(drop),
             // These list what they can, with an error for each server
             // that failed.
-            "resources/list with errors" => Err(registry
-                .list_resources_with_errors(Some("docs"))
+            "resources/list with errors" => {
+                Err(registry.list_resources_with_errors(None).errors.join("\n"))
+            }
+            "resources/templates/list with errors" => Err(registry
+                .list_resource_templates_with_errors(None)
                 .errors
                 .join("\n")),
-            _ => Err(registry
-                .list_resource_templates_with_errors(Some("docs"))
-                .errors
-                .join("\n")),
+            // Asked for by name, the server that failed fails the listing.
+            "resources/list with errors, by name" => registry
+                .list_resources_with_errors_or_cancel(Some("docs"), &|| false)
+                .map(drop)
+                .map_err(|error| error.to_string()),
+            _ => registry
+                .list_resource_templates_with_errors_or_cancel(Some("docs"), &|| false)
+                .map(drop)
+                .map_err(|error| error.to_string()),
         }
         .expect_err("the server turns the token away");
 
@@ -4796,6 +4848,16 @@ fn a_resource_list_cut_short_says_so_where_its_errors_go() {
     // A listing with errors keeps what it read, and says why it stopped.
     let listing = registry.list_resources_with_errors(Some("paged"));
     assert_eq!(uris(&listing.resources), ["memo://1", "memo://2"]);
+    assert_eq!(listing.errors, ["paged: MCP server repeated a list cursor"]);
+    let listing = registry.list_resource_templates_with_errors(Some("paged"));
+    assert_eq!(
+        listing
+            .resource_templates
+            .iter()
+            .map(|template| template.uri_template.as_str())
+            .collect::<Vec<_>>(),
+        ["memo://{a}", "memo://{b}"]
+    );
     assert_eq!(listing.errors, ["paged: MCP server repeated a list cursor"]);
     assert_eq!(changes.load(Ordering::SeqCst), 0);
 

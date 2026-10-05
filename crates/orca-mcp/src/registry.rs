@@ -1651,31 +1651,32 @@ impl McpRegistry {
             })
     }
 
+    /// The resources of `server`, or of every server that has resources,
+    /// with an error for each server that could not be listed, and for each
+    /// list a server cut short, at its page limit or by naming a cursor it
+    /// had named before: what it gave until then is kept. Asked for by
+    /// name, a server that cannot be listed, or is not connected, fails the
+    /// call instead: there is no other server for it to go on with, and a
+    /// request for one server is as strict as [`Self::list_resources`].
     pub fn list_resources_with_errors_or_cancel(
         &self,
         server: Option<&str>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<McpResourceListing, McpRequestError> {
         let clients = match server {
-            Some(server) => match self.client(server) {
-                Some(client) => vec![(server.to_string(), client)],
-                None => {
-                    return Ok(McpResourceListing {
-                        resources: Vec::new(),
-                        errors: vec![format!("MCP server '{server}' is not connected")],
-                    });
-                }
-            },
+            Some(server) => vec![(
+                server.to_string(),
+                self.client(server).ok_or_else(|| {
+                    McpRequestError::Failed(format!("MCP server '{server}' is not connected"))
+                })?,
+            )],
             None => self.resource_clients(),
         };
 
+        let named = server.is_some();
         let mut listing = McpResourceListing {
             resources: Vec::new(),
-            errors: if server.is_none() {
-                self.errors()
-            } else {
-                Vec::new()
-            },
+            errors: if named { Vec::new() } else { self.errors() },
         };
         for (server, client) in clients {
             match self
@@ -1688,6 +1689,7 @@ impl McpRegistry {
                         .errors
                         .extend(warning.map(|warning| format!("{server}: {warning}")));
                 }
+                Err(error) if named => return Err(error),
                 Err(McpRequestError::Cancelled) => return Err(McpRequestError::Cancelled),
                 Err(McpRequestError::Failed(error)) => {
                     listing.errors.push(format!("{server}: {error}"));
@@ -1779,31 +1781,33 @@ impl McpRegistry {
             })
     }
 
+    /// The resource templates of `server`, or of every server that has
+    /// resources, with an error for each server that could not be listed,
+    /// and for each list a server cut short, at its page limit or by naming
+    /// a cursor it had named before: what it gave until then is kept. Asked
+    /// for by name, a server that cannot be listed, or is not connected,
+    /// fails the call instead: there is no other server for it to go on
+    /// with, and a request for one server is as strict as
+    /// [`Self::list_resource_templates`].
     pub fn list_resource_templates_with_errors_or_cancel(
         &self,
         server: Option<&str>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<McpResourceTemplateListing, McpRequestError> {
         let clients = match server {
-            Some(server) => match self.client(server) {
-                Some(client) => vec![(server.to_string(), client)],
-                None => {
-                    return Ok(McpResourceTemplateListing {
-                        resource_templates: Vec::new(),
-                        errors: vec![format!("MCP server '{server}' is not connected")],
-                    });
-                }
-            },
+            Some(server) => vec![(
+                server.to_string(),
+                self.client(server).ok_or_else(|| {
+                    McpRequestError::Failed(format!("MCP server '{server}' is not connected"))
+                })?,
+            )],
             None => self.resource_clients(),
         };
 
+        let named = server.is_some();
         let mut listing = McpResourceTemplateListing {
             resource_templates: Vec::new(),
-            errors: if server.is_none() {
-                self.errors()
-            } else {
-                Vec::new()
-            },
+            errors: if named { Vec::new() } else { self.errors() },
         };
         for (server, client) in clients {
             match self
@@ -1816,6 +1820,7 @@ impl McpRegistry {
                         .errors
                         .extend(warning.map(|warning| format!("{server}: {warning}")));
                 }
+                Err(error) if named => return Err(error),
                 Err(McpRequestError::Cancelled) => return Err(McpRequestError::Cancelled),
                 Err(McpRequestError::Failed(error)) => {
                     listing.errors.push(format!("{server}: {error}"));

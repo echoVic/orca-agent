@@ -144,6 +144,24 @@ stdio 服务器都会结束，仍在连接的也一样；`orca exec` 等待服�
 prompt 在发出第一条消息之前也能运行：它返回的内容就是那条消息，对话随之开始。
 参数规则和大小上限详见[终端界面](terminal-ui.md#mcp-prompt-命令)。
 
+## 资源
+
+声明了 `resources` 能力的服务器，可以让模型通过只读工具 `list_mcp_resources`、
+`list_mcp_resource_templates` 和 `read_mcp_resource` 查看它提供的内容。两个列表工具都接受
+可选的 `server` 参数，不论指定与否，返回的都是同一种 JSON 对象：
+`{"resources": [...], "errors": [...]}`，模板工具的键是 `resourceTemplates`。不指定 `server`
+时，工具覆盖所有声明了资源能力的服务器：启动失败或列表失败的服务器记在 `errors` 里，其余的
+照常列出。指定 `server` 时，该服务器没有连接，或者列表请求失败，这次调用会带着它的错误失败。
+
+服务器的列表按页读取，最多读 100 页。列表被截断时（页数超过 100，或者服务器给出一个它之前给过的
+游标），已经读到的条目保留，`errors` 里会有一行写明是哪个服务器、因为什么停下，模型因此不会把这份
+列表当成服务器的全部内容：
+
+~~~text
+<server>: MCP list stopped after 100 pages
+<server>: MCP server repeated a list cursor
+~~~
+
 ## 工具返回的图片
 
 只有 `deepseek-flash` 和使用它的 `auto` 能在 tool 消息中直接看到 MCP 工具返回的图片。`deepseek-v4-pro` 和自定义模型（即使声明了 `supports_images = true`）收到的是一句说明，告诉模型它看不到这些图片。仅接受 PNG、JPEG、GIF 和 WebP，解码后每张不超过 5 MiB；不符合的图片会被丢弃，并留下说明原因的文字。单个 MCP 响应连同图片最多 16 MiB，超过时这次调用会失败。

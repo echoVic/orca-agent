@@ -2031,55 +2031,28 @@ fn execute_list_mcp_resources(request: &ToolRequest, ctx: &ToolContext<'_>) -> T
     let server = args.get("server").and_then(Value::as_str);
     let should_cancel = || ctx.is_cancelled();
 
-    if server.is_none() {
-        let listing = if ctx.should_cancel.is_some() {
-            registry.list_resources_with_errors_or_cancel(None, &should_cancel)
-        } else {
-            Ok(registry.list_resources_with_errors(None))
-        };
-        let listing = match listing {
-            Ok(listing) => listing,
-            Err(McpRequestError::Cancelled) => {
-                return ToolResult::cancelled(request, MCP_TOOL_CALL_CANCELLED, None);
-            }
-            Err(McpRequestError::Failed(error)) => {
-                return ToolResult::failed(request, error, None);
-            }
-        };
-        let output = json!({
-            "resources": listing.resources,
-            "errors": listing.errors,
-        });
-        return match serde_json::to_string(&output) {
-            Ok(output) => ToolResult::completed(request, output, false),
-            Err(error) => ToolResult::failed(
-                request,
-                format!("failed to serialize MCP resources: {error}"),
-                None,
-            ),
-        };
-    }
-
-    let result = if ctx.should_cancel.is_some() {
-        registry.list_resources_or_cancel(server, &should_cancel)
-    } else {
-        registry
-            .list_resources(server)
-            .map_err(McpRequestError::Failed)
-    };
-    match result {
-        Ok(resources) => match serde_json::to_string(&resources) {
-            Ok(output) => ToolResult::completed(request, output, false),
-            Err(error) => ToolResult::failed(
-                request,
-                format!("failed to serialize MCP resources: {error}"),
-                None,
-            ),
-        },
+    // The model gets the errors beside the resources whether or not it names
+    // a server, so that a list a server cut short says so.
+    let listing = match registry.list_resources_with_errors_or_cancel(server, &should_cancel) {
+        Ok(listing) => listing,
         Err(McpRequestError::Cancelled) => {
-            ToolResult::cancelled(request, MCP_TOOL_CALL_CANCELLED, None)
+            return ToolResult::cancelled(request, MCP_TOOL_CALL_CANCELLED, None);
         }
-        Err(McpRequestError::Failed(error)) => ToolResult::failed(request, error, None),
+        Err(McpRequestError::Failed(error)) => {
+            return ToolResult::failed(request, error, None);
+        }
+    };
+    let output = json!({
+        "resources": listing.resources,
+        "errors": listing.errors,
+    });
+    match serde_json::to_string(&output) {
+        Ok(output) => ToolResult::completed(request, output, false),
+        Err(error) => ToolResult::failed(
+            request,
+            format!("failed to serialize MCP resources: {error}"),
+            None,
+        ),
     }
 }
 
@@ -2094,13 +2067,10 @@ fn execute_list_mcp_resource_templates(request: &ToolRequest, ctx: &ToolContext<
     let server = args.get("server").and_then(Value::as_str);
     let should_cancel = || ctx.is_cancelled();
 
-    if server.is_none() {
-        let listing = if ctx.should_cancel.is_some() {
-            registry.list_resource_templates_with_errors_or_cancel(None, &should_cancel)
-        } else {
-            Ok(registry.list_resource_templates_with_errors(None))
-        };
-        let listing = match listing {
+    // The model gets the errors beside the templates whether or not it names
+    // a server, so that a list a server cut short says so.
+    let listing =
+        match registry.list_resource_templates_with_errors_or_cancel(server, &should_cancel) {
             Ok(listing) => listing,
             Err(McpRequestError::Cancelled) => {
                 return ToolResult::cancelled(request, MCP_TOOL_CALL_CANCELLED, None);
@@ -2109,40 +2079,17 @@ fn execute_list_mcp_resource_templates(request: &ToolRequest, ctx: &ToolContext<
                 return ToolResult::failed(request, error, None);
             }
         };
-        let output = json!({
-            "resourceTemplates": listing.resource_templates,
-            "errors": listing.errors,
-        });
-        return match serde_json::to_string(&output) {
-            Ok(output) => ToolResult::completed(request, output, false),
-            Err(error) => ToolResult::failed(
-                request,
-                format!("failed to serialize MCP resource templates: {error}"),
-                None,
-            ),
-        };
-    }
-
-    let result = if ctx.should_cancel.is_some() {
-        registry.list_resource_templates_or_cancel(server, &should_cancel)
-    } else {
-        registry
-            .list_resource_templates(server)
-            .map_err(McpRequestError::Failed)
-    };
-    match result {
-        Ok(resource_templates) => match serde_json::to_string(&resource_templates) {
-            Ok(output) => ToolResult::completed(request, output, false),
-            Err(error) => ToolResult::failed(
-                request,
-                format!("failed to serialize MCP resource templates: {error}"),
-                None,
-            ),
-        },
-        Err(McpRequestError::Cancelled) => {
-            ToolResult::cancelled(request, MCP_TOOL_CALL_CANCELLED, None)
-        }
-        Err(McpRequestError::Failed(error)) => ToolResult::failed(request, error, None),
+    let output = json!({
+        "resourceTemplates": listing.resource_templates,
+        "errors": listing.errors,
+    });
+    match serde_json::to_string(&output) {
+        Ok(output) => ToolResult::completed(request, output, false),
+        Err(error) => ToolResult::failed(
+            request,
+            format!("failed to serialize MCP resource templates: {error}"),
+            None,
+        ),
     }
 }
 
@@ -2371,6 +2318,8 @@ pub fn tool_name_from_schema_name(name: &str) -> Option<ToolName> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_core::tool_types::ToolStatus;
+    use orca_mcp::transport::McpTransport;
 
     #[test]
     fn mcp_cancellation_mapping_requires_exact_error_and_observation() {
@@ -3092,6 +3041,198 @@ mod tests {
             .expect("required fields");
         assert!(required.contains(&Value::String("server".to_string())));
         assert!(required.contains(&Value::String("uri".to_string())));
+    }
+
+    /// How a server serves its lists in the tests below: a resource and a
+    /// resource template on every page.
+    #[derive(Clone, Copy)]
+    enum Lists {
+        /// One page, the last.
+        Complete,
+        /// Every page names the same next cursor.
+        RepeatedCursor,
+        /// Every page names a new next cursor, so the list has no end.
+        NewCursors,
+        /// Every request fails.
+        Failing,
+    }
+
+    impl Lists {
+        /// The cursor of the page after the one that starts at `cursor`.
+        fn next_cursor(self, cursor: Option<&str>) -> Result<Option<String>, String> {
+            match self {
+                Self::Complete => Ok(None),
+                Self::RepeatedCursor => Ok(Some("again".to_string())),
+                Self::NewCursors => {
+                    let page: usize = cursor.map_or(0, |cursor| {
+                        cursor.parse().expect("a cursor this server named")
+                    });
+                    Ok(Some((page + 1).to_string()))
+                }
+                Self::Failing => Err("the list timed out".to_string()),
+            }
+        }
+    }
+
+    impl McpTransport for Lists {
+        fn initialize(&self) -> Result<Value, String> {
+            Ok(json!({"capabilities": {"resources": {}}}))
+        }
+
+        fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
+            Ok(json!({"tools": []}))
+        }
+
+        fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+            Err("not asked for".to_string())
+        }
+
+        fn list_resources(&self, cursor: Option<&str>) -> Result<Value, String> {
+            Ok(json!({
+                "resources": [{"uri": "memo://orca/one", "name": "memo one"}],
+                "nextCursor": self.next_cursor(cursor)?,
+            }))
+        }
+
+        fn list_resource_templates(&self, cursor: Option<&str>) -> Result<Value, String> {
+            Ok(json!({
+                "resourceTemplates": [{"uriTemplate": "memo://orca/{id}", "name": "memo"}],
+                "nextCursor": self.next_cursor(cursor)?,
+            }))
+        }
+
+        fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+            Err("not asked for".to_string())
+        }
+    }
+
+    /// A registry of one server, `server`, that serves its lists as `lists`
+    /// has it.
+    fn registry_serving(server: &str, lists: Lists) -> McpRegistry {
+        McpRegistry::from_resource_transports_for_test([(
+            server.to_string(),
+            Box::new(lists) as Box<dyn McpTransport>,
+        )])
+    }
+
+    /// What the list tool `name` makes of `arguments` over `mcp`.
+    fn list_tool_result(mcp: &McpRegistry, name: ToolName, arguments: &str) -> ToolResult {
+        default_tool_registry().execute(
+            &request(name, arguments),
+            &ToolContext::new(Path::new(".")).with_mcp(mcp),
+        )
+    }
+
+    /// The JSON a list tool completed with.
+    fn completed_listing(result: &ToolResult) -> Value {
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        serde_json::from_str(result.output.as_deref().expect("tool output")).expect("listing JSON")
+    }
+
+    /// The list tool `name`, asked for a server that cuts its list short,
+    /// keeps what it read (under `items` in its output), and says in `errors`
+    /// which server stopped, and why.
+    fn assert_cut_short_list_tells_the_model(name: ToolName, items: &str) {
+        for (lists, pages_read, reason) in [
+            (
+                Lists::RepeatedCursor,
+                2,
+                "MCP server repeated a list cursor",
+            ),
+            (Lists::NewCursors, 100, "MCP list stopped after 100 pages"),
+        ] {
+            let mcp = registry_serving("paged", lists);
+
+            let result = list_tool_result(&mcp, name.clone(), r#"{"server":"paged"}"#);
+
+            let output = completed_listing(&result);
+            assert_eq!(
+                output[items].as_array().map(Vec::len),
+                Some(pages_read),
+                "what the server gave stays in the list: {output}"
+            );
+            let errors = output["errors"].as_array().expect("errors");
+            assert_eq!(errors.len(), 1, "{output}");
+            let note = errors[0].as_str().expect("a note");
+            assert!(note.contains("paged"), "the note names the server: {note}");
+            assert!(note.contains(reason), "the note says why: {note}");
+        }
+    }
+
+    #[test]
+    fn a_cut_short_resource_list_of_one_server_tells_the_model() {
+        assert_cut_short_list_tells_the_model(ToolName::ListMcpResources, "resources");
+    }
+
+    #[test]
+    fn a_cut_short_template_list_of_one_server_tells_the_model() {
+        assert_cut_short_list_tells_the_model(
+            ToolName::ListMcpResourceTemplates,
+            "resourceTemplates",
+        );
+    }
+
+    #[test]
+    fn the_list_of_one_server_has_the_shape_of_the_list_of_all_servers() {
+        let mcp = registry_serving("notes", Lists::Complete);
+
+        for (name, items) in [
+            (ToolName::ListMcpResources, "resources"),
+            (ToolName::ListMcpResourceTemplates, "resourceTemplates"),
+        ] {
+            let all = completed_listing(&list_tool_result(&mcp, name.clone(), "{}"));
+            let one = completed_listing(&list_tool_result(&mcp, name, r#"{"server":"notes"}"#));
+
+            assert_eq!(one["errors"], json!([]), "{one}");
+            assert_eq!(one[items].as_array().map(Vec::len), Some(1), "{one}");
+            assert_eq!(one, all);
+        }
+    }
+
+    #[test]
+    fn a_list_of_one_server_that_cannot_be_read_still_fails_the_call() {
+        let mcp = registry_serving("broken", Lists::Failing);
+
+        for name in [
+            ToolName::ListMcpResources,
+            ToolName::ListMcpResourceTemplates,
+        ] {
+            // Asked for by name, a server that cannot be listed fails the
+            // call with its error, and is not an entry in `errors`.
+            let failed = list_tool_result(&mcp, name.clone(), r#"{"server":"broken"}"#);
+            assert_eq!(failed.status, ToolStatus::Failed, "{name:?}");
+            assert_eq!(failed.error.as_deref(), Some("the list timed out"));
+
+            let missing = list_tool_result(&mcp, name, r#"{"server":"gone"}"#);
+            assert_eq!(missing.status, ToolStatus::Failed);
+            assert_eq!(
+                missing.error.as_deref(),
+                Some("MCP server 'gone' is not connected")
+            );
+        }
+    }
+
+    #[test]
+    fn a_cancelled_list_is_cancelled_with_or_without_a_server() {
+        let mcp = registry_serving("notes", Lists::Complete);
+        let cancelled = || true;
+
+        for name in [
+            ToolName::ListMcpResources,
+            ToolName::ListMcpResourceTemplates,
+        ] {
+            for arguments in ["{}", r#"{"server":"notes"}"#] {
+                let result = default_tool_registry().execute(
+                    &request(name.clone(), arguments),
+                    &ToolContext::new(Path::new("."))
+                        .with_mcp(&mcp)
+                        .with_cancel(&cancelled),
+                );
+
+                assert_eq!(result.status, ToolStatus::Cancelled, "{name:?} {arguments}");
+                assert_eq!(result.error.as_deref(), Some(MCP_TOOL_CALL_CANCELLED));
+            }
+        }
     }
 
     #[test]

@@ -179,6 +179,29 @@ before your first message: what it returns is that message, and starts the
 conversation. See
 [Terminal UI](terminal-ui.md#mcp-prompts) for the argument rules and limits.
 
+## Resources
+
+A server that declares the `resources` capability lets the model look at what
+it holds, through the read-only tools `list_mcp_resources`,
+`list_mcp_resource_templates`, and `read_mcp_resource`. The two list tools take
+an optional `server` name and answer with the same JSON object whether or not
+one is given: `{"resources": [...], "errors": [...]}`, with `resourceTemplates`
+in place of `resources` for templates. Without `server` they cover every server
+that declares resources: a server that failed to start or to list is named in
+`errors`, and the others are still listed. With `server`, a server that is not
+connected, or whose list request fails, fails the call with its error instead.
+
+A server's list is read a page at a time, up to 100 pages. A list that is cut
+short, because it has more pages than that or because the server names a
+cursor it has named before, keeps the entries read so far, and `errors` has a
+line for it that names the server and says why it stopped, so the model does
+not take the list for everything the server has:
+
+~~~text
+<server>: MCP list stopped after 100 pages
+<server>: MCP server repeated a list cursor
+~~~
+
 ## Images from tools
 
 `deepseek-flash` and `auto`, which uses it, are the only models that see the
