@@ -931,6 +931,33 @@ fn leaving_the_workspace_review_never_resumes_the_conversation() {
     );
 }
 
+#[test]
+fn a_conversation_that_cannot_be_resumed_leaves_the_prompt_to_a_new_one() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process = PtyProcess::spawn_resumed(
+        home.path(),
+        cwd.path(),
+        "00000000-0000-4000-8000-000000000000",
+        "mock_history_echo",
+    )
+    .expect("spawn resumed TUI in PTY");
+
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    receive_until(
+        &process,
+        &mut output,
+        "Mock history users: mock_history_echo",
+        Duration::from_secs(10),
+        "the prompt did not go to a new conversation when the named one could not be resumed",
+    );
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
 /// Records a conversation of one message, `prompt`, from a workspace of its
 /// own that the run accepts first, and returns that workspace.
 fn record_a_conversation(home: &std::path::Path, prompt: &str) -> tempfile::TempDir {

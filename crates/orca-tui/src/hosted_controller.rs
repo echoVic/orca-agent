@@ -238,6 +238,11 @@ fn resume_startup_conversation(
             )
         });
     if let Err(error) = result {
+        // What the user sends next starts a new conversation, instead of
+        // trying the one that could not be opened again.
+        if thread.is_none() {
+            config.lock().unwrap().history_mode = HistoryMode::Record;
+        }
         if !cfg.prompt.trim().is_empty() {
             emit_empty_history_snapshot(event_tx, "Unable to restore saved conversation.");
         }
