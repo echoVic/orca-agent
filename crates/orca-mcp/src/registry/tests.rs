@@ -885,10 +885,11 @@ done
 
 /// A stdio server whose starts after the first answer `initialize` only
 /// after `restart_seconds`, or never, when that is `None`: the server then
-/// exits. Its first start blocks in the first `tools/call` it gets and
-/// writes `started`, or exits there when `FIRST_CALL` is `crash` in its
-/// environment; later ones answer each call, writing their generation to
-/// `called` first.
+/// exits. It exits there too from the start numbered `EXIT_FROM` in its
+/// environment on, when that is set. Its first start blocks in the first
+/// `tools/call` it gets and writes `started`, or exits there when
+/// `FIRST_CALL` is `crash` in its environment; later ones answer each
+/// call, writing their generation to `called` first.
 #[cfg(unix)]
 fn restarting_server_config(
     dir: &std::path::Path,
@@ -912,7 +913,9 @@ printf '%s' "$generation" > "$GENERATION_FILE"
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
-      if [ "$generation" -gt 1 ]; then
+      if [ -n "$EXIT_FROM" ] && [ "$generation" -ge "$EXIT_FROM" ]; then
+        exit 1
+      elif [ "$generation" -gt 1 ]; then
         {restart}
       fi
       printf '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"slow","version":"1"}}}}}}\n'
@@ -1055,6 +1058,79 @@ fn a_cancel_stops_the_restart_that_follows_a_crashed_call() {
     assert!(called_file.exists());
 }
 
+/// What `call` returns when it is cancelled while it waits for the
+/// transport of `client`, which this holds throughout, as a restart that
+/// cannot be cancelled does. `call` runs on a thread of its own, with a
+/// `should_cancel` that this sets once the call has asked it twice, so
+/// that the call was waiting by then, and must return within 500 ms of
+/// that, the transport still held.
+fn cancelled_while_the_transport_is_held<T: Send>(
+    client: &McpClient,
+    call: impl FnOnce(&dyn Fn() -> bool) -> T + Send,
+) -> T {
+    let asked = AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
+    let should_cancel = || {
+        asked.fetch_add(1, Ordering::SeqCst);
+        cancelled.load(Ordering::SeqCst)
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let (asked_while_held, answered_while_held) = std::thread::scope(|scope| {
+        let transport = client.lock_transport().expect("its transport");
+        scope.spawn(move || {
+            let _ = sender.send(call(&should_cancel));
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while asked.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let asked_while_held = asked.load(Ordering::SeqCst);
+        cancelled.store(true, Ordering::SeqCst);
+        let answered = receiver.recv_timeout(Duration::from_millis(500));
+        drop(transport);
+        (asked_while_held, answered)
+    });
+    assert!(
+        asked_while_held >= 2,
+        "the call waited for the transport without looking for a cancel"
+    );
+    answered_while_held
+        .expect("the call returns within 500 ms of its cancel, with the transport still held")
+}
+
+/// A transport that counts the tool calls that reach it, and answers each
+/// with no content.
+struct CallCountingTransport {
+    calls: Arc<AtomicUsize>,
+}
+
+impl McpTransport for CallCountingTransport {
+    fn initialize(&self) -> Result<Value, String> {
+        Ok(serde_json::json!({}))
+    }
+
+    fn list_tools(&self, _cursor: Option<&str>) -> Result<Value, String> {
+        Ok(serde_json::json!({"tools": []}))
+    }
+
+    fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!({"content": [], "isError": false}))
+    }
+
+    fn list_resources(&self, _cursor: Option<&str>) -> Result<Value, String> {
+        Err("not asked for".to_string())
+    }
+
+    fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value, String> {
+        Err("not asked for".to_string())
+    }
+
+    fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+        Err("not asked for".to_string())
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_cancellable_call_waiting_for_the_transport_returns_when_cancelled() {
@@ -1065,33 +1141,75 @@ fn a_cancellable_call_waiting_for_the_transport_returns_when_cancelled() {
         .resolve_tool("mcp__slow__wait")
         .expect("slow tool ref");
     let client = registry.client("slow").expect("the server's client");
-    let cancelled = AtomicBool::new(false);
-    let (sender, receiver) = std::sync::mpsc::channel();
 
-    let answered_while_held = std::thread::scope(|scope| {
-        // Held as a restart that cannot be cancelled holds it, until the
-        // call has had its time to answer.
-        let transport = client.lock_transport().expect("its transport");
-        scope.spawn(|| {
-            let answer =
-                registry.call_tool_or_cancel(&tool_ref, Value::Object(Default::default()), &|| {
-                    cancelled.load(Ordering::SeqCst)
-                });
-            let _ = sender.send(answer);
-        });
-        std::thread::sleep(Duration::from_millis(100));
-        cancelled.store(true, Ordering::SeqCst);
-        let answered = receiver.recv_timeout(Duration::from_millis(500));
-        drop(transport);
-        answered
+    // A stdio server's call waits for the transport first to see whether
+    // it is closed.
+    let answer = cancelled_while_the_transport_is_held(&client, |should_cancel| {
+        registry.call_tool_or_cancel(&tool_ref, Value::Object(Default::default()), should_cancel)
     });
 
-    let answer = answered_while_held
-        .expect("the call returns within 500 ms of its cancel, with the transport still held");
     assert_eq!(answer.unwrap_err(), "MCP tool call cancelled");
     assert!(
         !started_file.exists(),
         "the cancelled call reached the server"
+    );
+}
+
+#[test]
+fn a_cancellable_call_to_a_remote_server_waiting_for_the_transport_returns_when_cancelled() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let client = client_with(
+        McpServerConfig {
+            name: "remote".to_string(),
+            transport: McpTransportKind::Http,
+            url: Some("http://127.0.0.1:9/mcp".to_string()),
+            ..Default::default()
+        },
+        CallCountingTransport {
+            calls: Arc::clone(&calls),
+        },
+    );
+
+    // A remote server's transport is never restarted before a request, so
+    // its call waits for the transport only to send itself.
+    let answer = cancelled_while_the_transport_is_held(&client, |should_cancel| {
+        client.call_tool("echo", serde_json::json!({}), None, Some(should_cancel))
+    });
+
+    assert_eq!(answer.unwrap_err(), "MCP tool call cancelled");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the cancelled call reached the server"
+    );
+}
+
+#[test]
+fn a_reconnect_waiting_for_the_transport_returns_when_cancelled() {
+    use crate::client::ReconnectFailure;
+
+    let client = client_with(
+        McpServerConfig {
+            name: "x".to_string(),
+            ..Default::default()
+        },
+        CallCountingTransport {
+            calls: Arc::default(),
+        },
+    );
+    let failed = client.lock_transport().expect("its transport").clone();
+
+    // A stdio server's reconnect waits for the transport before it stops
+    // the server.
+    let outcome = cancelled_while_the_transport_is_held(&client, |should_cancel| {
+        client.reconnect(&failed, None, should_cancel)
+    });
+
+    assert_eq!(outcome, Err(ReconnectFailure::Cancelled));
+    let current = client.lock_transport().expect("its transport").clone();
+    assert!(
+        Arc::ptr_eq(&current, &failed),
+        "the cancelled reconnect replaced the transport"
     );
 }
 
@@ -1118,6 +1236,41 @@ fn a_cancelled_calls_short_restart_that_fails_at_once_fails_the_server() {
     assert!(
         matches!(statuses[0].state, McpServerState::Failed { .. }),
         "{statuses:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_server_that_cannot_start_again_after_a_cut_short_restart_fails_the_next_call() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    // The start after the cancel takes longer than a cancelled call gives
+    // it, and the one after that exits at once.
+    let (mut config, started_file, _) = restarting_server_config(temp_dir.path(), Some(1));
+    config.env.insert("EXIT_FROM".to_string(), "3".to_string());
+    let registry = connected_registry(&[config], None);
+    let tool_ref = registry
+        .resolve_tool("mcp__slow__wait")
+        .expect("slow tool ref");
+    let cancelled =
+        registry.call_tool_or_cancel(&tool_ref, Value::Object(Default::default()), &|| {
+            started_file.exists()
+        });
+    assert_eq!(cancelled.unwrap_err(), "MCP tool call cancelled");
+    assert_eq!(
+        registry.server_statuses()[0].state,
+        McpServerState::Ready,
+        "a restart cut short after a cancel must not fail the server"
+    );
+
+    let error = registry
+        .call_tool(&tool_ref, Value::Object(Default::default()))
+        .expect_err("the server cannot start again");
+
+    assert_eq!(error, "MCP server closed stdout");
+    assert_eq!(
+        registry.server_statuses(),
+        [failed("slow", &error)],
+        "a server that cannot start again is failed with the reason"
     );
 }
 
