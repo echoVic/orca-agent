@@ -598,9 +598,8 @@ pub(crate) fn execute_workflow_draft_action_tool(
         "save" => {
             let workflow_dir = match input.scope.as_deref().unwrap_or("project") {
                 "project" => cwd.join(".orca").join("workflows"),
-                "user" => dirs::home_dir()
-                    .unwrap_or_else(|| cwd.to_path_buf())
-                    .join(".orca")
+                "user" => orca_core::home::orca_home()
+                    .unwrap_or_else(|| cwd.join(".orca"))
                     .join("workflows"),
                 other => {
                     return Ok(tool_types::ToolResult::invalid_input(
@@ -815,7 +814,7 @@ mod tests {
     use orca_core::event_sink::EventSink;
     use orca_core::model::ModelSelection;
     use orca_core::tool_types::{ToolName, ToolRequest, ToolStatus};
-    use orca_core::workflow_types::WorkflowOutput;
+    use orca_core::workflow_types::{WorkflowDraftActionOutput, WorkflowInput, WorkflowOutput};
 
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
     use crate::cost::CostTracker;
@@ -1074,6 +1073,72 @@ export const meta = {
             "expected startup failure details, got {result:?}"
         );
         assert!(background_workflows.is_empty());
+    }
+
+    #[test]
+    fn workflow_draft_action_save_writes_a_user_workflow_under_the_orca_home() {
+        // The redirect is a thread-local `ORCA_HOME` override: the user scope
+        // saves into the Orca home, wherever that is, not into `~/.orca`.
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let config = config();
+        let cwd = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new("session-draft-save-user-scope".to_string());
+        let session_dir = registry.workflow_session_dir(cwd.path()).unwrap();
+        let draft_store = WorkflowDraftStore::new(session_dir.join("workflow-drafts"));
+        let script = "export const meta = { name: 'security-audit', description: 'Audit', phases: ['scan'] };\nexport default await phase('scan', async () => agent('scan repo'));";
+        let draft = draft_store
+            .create_from_script(
+                registry.session_id(),
+                cwd.path(),
+                script,
+                config.workflows.max_concurrent_agents,
+            )
+            .unwrap();
+        let mut events = EventFactory::new("test-run".to_string());
+        let mut sink = EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl);
+        let mut background_workflows = Vec::<BackgroundWorkflowRun>::new();
+        let request = tool_request(
+            "save",
+            ToolName::WorkflowDraftAction,
+            serde_json::json!({ "draftId": draft.draft_id, "action": "save", "scope": "user" }),
+        );
+
+        let result = execute_workflow_draft_action_tool(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            true,
+            &registry,
+            &mut background_workflows,
+            unused_child_executor,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let saved = home.path().join("workflows").join("security-audit.js");
+        let output: WorkflowDraftActionOutput =
+            serde_json::from_str(result.output.as_deref().unwrap()).unwrap();
+        assert_eq!(output.saved_path, Some(saved.display().to_string()));
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), script);
+
+        // The loaders read the same directory, so a saved user workflow can be
+        // run by name.
+        let resolved = crate::workflow::script::resolve_workflow_script_to_path(
+            &WorkflowInput {
+                name: Some("security-audit".to_string()),
+                ..Default::default()
+            },
+            cwd.path(),
+            &cwd.path().join("persisted-script.js"),
+        )
+        .expect("the loader finds the saved user workflow");
+        assert_eq!(resolved.original_path, Some(saved));
     }
 
     #[test]
