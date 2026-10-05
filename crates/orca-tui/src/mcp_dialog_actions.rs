@@ -60,9 +60,9 @@ pub(crate) fn handle_mcp_dialog_key(
 /// newer one. The one exception is `l` on a login that waits for the
 /// browser, which cancels it; its worker still ends it, and frees the
 /// server. Once the browser is back with the code the login finishes, and
-/// `l` finds it running like any other action. Logging in and out uses the
-/// server's config entry, under whose name its login is saved, and only for
-/// a server that logs in with OAuth.
+/// `l` says so, and that it can no longer be cancelled. Logging in and out
+/// uses the server's config entry, under whose name its login is saved, and
+/// only for a server that logs in with OAuth.
 fn start_action(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
@@ -74,13 +74,26 @@ fn start_action(
     if matches!(action, McpServerAction::LogIn)
         && let Some(McpActionInFlight::LoggingIn { cancel, .. }) =
             state.mcp_actions_in_flight.get(&server.key)
-        && cancel.cancel()
     {
-        state.push_message(ChatMessage::System {
-            text: format!("login to MCP server {} cancelled", server.name),
-            expanded: false,
-        });
-        return;
+        // A login cancelled already is running until its worker ends it,
+        // as any other action is: that is answered below.
+        let notice = if cancel.cancel() {
+            Some(format!("login to MCP server {} cancelled", server.name))
+        } else if cancel.is_finishing() {
+            Some(format!(
+                "login to MCP server {} is finishing and can no longer be cancelled",
+                server.name
+            ))
+        } else {
+            None
+        };
+        if let Some(text) = notice {
+            state.push_message(ChatMessage::System {
+                text,
+                expanded: false,
+            });
+            return;
+        }
     }
     let request = if state.mcp_actions_in_flight.contains_key(&server.key) {
         Err(format!(
@@ -307,6 +320,44 @@ mod tests {
                 Some("an MCP action for local is already running")
             );
         }
+    }
+
+    /// Once the browser is back with its code the login finishes, and `l`
+    /// says so, rather than that an action is running.
+    #[test]
+    fn pressing_l_once_the_browser_is_back_says_the_login_is_finishing() {
+        let (mut state, action_rx) = open_panel(
+            vec![server("linear", McpServerStatusView::NeedsLogin)],
+            vec![remote("linear")],
+        );
+        state.mcp_actions_in_flight.insert(
+            "linear".to_string(),
+            McpActionInFlight::LoggingIn {
+                authorization_url: None,
+                cancel: McpLoginCancel::finishing_for_test(),
+            },
+        );
+
+        press_in_mcp_panel(&mut state, KeyCode::Char('l'));
+
+        assert!(action_rx.try_recv().is_err(), "`l` sent an action");
+        assert_eq!(
+            last_notice(&state),
+            Some("login to MCP server linear is finishing and can no longer be cancelled")
+        );
+        assert!(
+            !state.transcript.messages.iter().any(|message| matches!(
+                message,
+                ChatMessage::System { text, .. } if text.contains("already running")
+            )),
+            "{:?}",
+            state.transcript.messages
+        );
+        // The login goes on: `l` did not cancel it.
+        assert!(matches!(
+            state.mcp_actions_in_flight.get("linear"),
+            Some(McpActionInFlight::LoggingIn { cancel, .. }) if cancel.is_finishing()
+        ));
     }
 
     #[test]

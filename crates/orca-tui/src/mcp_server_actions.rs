@@ -754,8 +754,8 @@ mod tests {
     }
 
     /// Once the browser has come back with the code, the login finishes:
-    /// `/mcp` no longer offers to cancel it, and `l` then only says that an
-    /// action is running, never that a login which goes on was cancelled.
+    /// `/mcp` no longer offers to cancel it, and `l` then says that it is
+    /// finishing, never that a login which goes on was cancelled.
     #[test]
     fn a_login_past_the_browser_is_no_longer_offered_to_cancel() {
         use orca_mcp::oauth::test_server::{
@@ -810,7 +810,7 @@ mod tests {
         assert!(sent.try_recv().is_err(), "`l` sent an action");
         assert_eq!(
             last_notice(&state),
-            Some("an MCP action for linear is already running")
+            Some("login to MCP server linear is finishing and can no longer be cancelled")
         );
 
         gate.release();
@@ -831,8 +831,9 @@ mod tests {
             notices.contains(&"logged in to MCP server linear"),
             "{notices:?}"
         );
+        // The login went on, and nothing says it was cancelled.
         assert!(
-            !notices.iter().any(|notice| notice.contains("cancelled")),
+            !notices.contains(&"login to MCP server linear cancelled"),
             "{notices:?}"
         );
         assert!(state.mcp_actions_in_flight.is_empty());

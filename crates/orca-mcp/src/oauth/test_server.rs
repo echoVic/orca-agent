@@ -63,6 +63,11 @@ pub struct OAuthTestBehavior {
     /// Cancels the login when a request to the path comes in, before it is
     /// answered: as a user who cancels it while that step runs.
     pub cancel_on: Option<(String, super::McpLoginCancel)>,
+    /// Holds each request to the path until the gate is released, once it is
+    /// recorded and before it is answered: as a server that is slow to answer
+    /// that step. The server answers one request at a time, so it answers
+    /// no other meanwhile.
+    pub hold_path: Option<(String, TokenGate)>,
 }
 
 /// Holds requests until released, so that a test can act while one is in
@@ -313,6 +318,11 @@ fn serve(mut stream: TcpStream, state: &ServerState, base: &str) {
         && request.path == *path
     {
         cancel.cancel();
+    }
+    if let Some((path, gate)) = &state.behavior.hold_path
+        && request.path == *path
+    {
+        gate.wait();
     }
     let response = route(state, &request, base);
     let _ = stream.write_all(response.as_bytes());

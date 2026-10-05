@@ -30,6 +30,7 @@ use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -66,6 +67,9 @@ const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the callback checks for a connection, and, while it reads
 /// one, whether the login was cancelled.
 const CALLBACK_POLL: Duration = Duration::from_millis(20);
+/// How often a login that waits for a step to hear from a server checks
+/// whether it was cancelled.
+const LOGIN_STEP_POLL: Duration = Duration::from_millis(25);
 /// A token this close to expiring is refreshed before it is sent.
 const REFRESH_MARGIN_SECS: u64 = 60;
 
@@ -82,11 +86,11 @@ pub struct McpLoginOptions {
     pub open_browser: OpenBrowser,
     /// How long to wait for the browser to come back.
     pub callback_timeout: Duration,
-    /// Stops the login. It is checked as the login starts, after each step
-    /// before it opens the browser, and over and over while it waits for the
-    /// browser to come back: a login cancelled then stops at once, and frees
-    /// the callback's port. Once the browser is back with a code, the login
-    /// finishes, and no longer stops.
+    /// Stops the login. It is checked as the login starts, over and over
+    /// while a step before it opens the browser waits on a server, and over
+    /// and over while it waits for the browser to come back: a login
+    /// cancelled then stops at once, and frees the callback's port. Once the
+    /// browser is back with a code, the login finishes, and no longer stops.
     pub cancel: McpLoginCancel,
 }
 
@@ -133,6 +137,16 @@ impl McpLoginCancel {
         self.0.load(Ordering::Acquire) == Self::FINISHING
     }
 
+    /// The cancel of a login whose browser is back with its code, for tests
+    /// of what shows then: it is finishing, and a cancel stops nothing.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn finishing_for_test() -> Self {
+        let cancel = Self::default();
+        cancel.finish();
+        cancel
+    }
+
     /// Claims the code the browser came back with: from now on the login
     /// finishes. `false` when it was stopped first.
     fn finish(&self) -> bool {
@@ -171,15 +185,28 @@ pub fn login(server: &McpServerConfig, options: McpLoginOptions) -> Result<(), S
     let resource = Url::parse(server_url)
         .map_err(|error| format!("MCP server '{name}' has an invalid url: {error}"))?;
     let client = http_client(server, true)?;
+    let cancel = &options.cancel;
 
-    // Each step before the browser opens waits on a server, or takes a
-    // port; a cancel that came in meanwhile stops the login before the next.
-    let metadata_url = discover(&client, server, &resource)?;
-    stop_if_cancelled(&options.cancel, name)?;
-    let protected: ProtectedResource = get_json(&client, &metadata_url).map_err(|why| {
-        format!("failed to read the protected resource metadata of MCP server '{name}' from {metadata_url}: {why}")
+    // The steps before the browser opens that wait on a server run by
+    // `until_cancelled`: a cancel stops the login at once, not when the
+    // server answers, and no step starts once it has come.
+    let metadata_url = until_cancelled(cancel, name, {
+        let (client, server, resource, cancel) = (
+            client.clone(),
+            server.clone(),
+            resource.clone(),
+            cancel.clone(),
+        );
+        move || discover(&client, &server, &resource, &cancel)
     })?;
-    stop_if_cancelled(&options.cancel, name)?;
+    let protected: ProtectedResource = until_cancelled(cancel, name, {
+        let (client, name) = (client.clone(), name.clone());
+        move || {
+            get_json(&client, &metadata_url).map_err(|why| {
+                format!("failed to read the protected resource metadata of MCP server '{name}' from {metadata_url}: {why}")
+            })
+        }
+    })?;
     // The metadata must be for this server (RFC 9728 §3.3), so that a
     // server cannot have Orca log in to another resource for it.
     match protected.resource.as_deref() {
@@ -207,8 +234,16 @@ pub fn login(server: &McpServerConfig, options: McpLoginOptions) -> Result<(), S
             printable(issuer)
         )
     })?;
-    let endpoints = authorization_server(&client, server, issuer, &issuer_url)?;
-    stop_if_cancelled(&options.cancel, name)?;
+    let endpoints = until_cancelled(cancel, name, {
+        let (client, server, issuer, issuer_url, cancel) = (
+            client.clone(),
+            server.clone(),
+            issuer.to_string(),
+            issuer_url.clone(),
+            cancel.clone(),
+        );
+        move || authorization_server(&client, &server, &issuer, &issuer_url, &cancel)
+    })?;
     if endpoints
         .code_challenge_methods_supported
         .as_ref()
@@ -225,17 +260,21 @@ pub fn login(server: &McpServerConfig, options: McpLoginOptions) -> Result<(), S
         .ok_or_else(|| insecure("authorization endpoint"))?;
     oauth_url(&endpoints.token_endpoint).ok_or_else(|| insecure("token endpoint"))?;
 
+    // From here this thread holds the port, and frees it when the login ends,
+    // however it ends: a step left behind on a thread of its own holds none.
     let callback = Callback::listen(server)?;
-    stop_if_cancelled(&options.cancel, name)?;
     let redirect_uri = callback.redirect_uri.clone();
     let client_id = match &server.oauth_client_id {
         Some(client_id) => client_id.clone(),
-        None => register(
-            &client,
-            server,
-            endpoints.registration_endpoint.as_deref(),
-            &redirect_uri,
-        )?,
+        None => until_cancelled(cancel, name, {
+            let (client, server, endpoint, redirect_uri) = (
+                client.clone(),
+                server.clone(),
+                endpoints.registration_endpoint.clone(),
+                redirect_uri.clone(),
+            );
+            move || register(&client, &server, endpoint.as_deref(), &redirect_uri)
+        })?,
     };
     let verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let state = Uuid::new_v4().simple().to_string();
@@ -255,11 +294,11 @@ pub fn login(server: &McpServerConfig, options: McpLoginOptions) -> Result<(), S
     }
     authorization_url.query_pairs_mut().extend_pairs(&params);
     // Cancelled while it looked the server up: no browser opens.
-    stop_if_cancelled(&options.cancel, name)?;
+    stop_if_cancelled(cancel, name)?;
     // The url is also printed for the user to open by hand, so a browser
     // that does not open is no reason to stop waiting.
     let _ = (options.open_browser)(authorization_url.as_str());
-    let code = callback.wait_for_code(name, &state, options.callback_timeout, &options.cancel)?;
+    let code = callback.wait_for_code(name, &state, options.callback_timeout, cancel)?;
 
     let tokens = request_tokens(
         server,
@@ -300,6 +339,47 @@ fn stop_if_cancelled(cancel: &McpLoginCancel, name: &str) -> Result<(), String> 
 /// What a login of the MCP server named `name` that was stopped returns.
 fn cancelled(name: &str) -> String {
     format!("login to MCP server '{name}' cancelled")
+}
+
+/// Runs `step`, which waits on a server, on a thread of its own, and waits
+/// for its result [`LOGIN_STEP_POLL`] at a time. Once `cancel` has stopped
+/// the login of the MCP server named `name`, it returns at once, rather than
+/// when the server answers, and drops the result, a late one included. No
+/// step starts for a login stopped already.
+///
+/// Nothing waits for the thread, and it holds no port: it ends with its
+/// request, which the client's timeout bounds. A `step` of several requests
+/// checks `cancel` between them, so that one left behind ends with the
+/// request it was in. `step` owns whatever it uses.
+fn until_cancelled<T: Send + 'static>(
+    cancel: &McpLoginCancel,
+    name: &str,
+    step: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    stop_if_cancelled(cancel, name)?;
+    let (result_tx, result) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("orca-mcp-login-step".to_string())
+        .spawn(move || {
+            // A login stopped meanwhile takes no result.
+            let _ = result_tx.send(step());
+        })
+        .map_err(|error| {
+            format!("failed to start a step of the login for MCP server '{name}': {error}")
+        })?;
+    loop {
+        let waited = result.recv_timeout(LOGIN_STEP_POLL);
+        stop_if_cancelled(cancel, name)?;
+        match waited {
+            Ok(result) => return result,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(format!(
+                    "a step of the login for MCP server '{name}' stopped without a result"
+                ));
+            }
+        }
+    }
 }
 
 /// Replaces `credential`, the login in use, with a fresh one, and returns
@@ -442,7 +522,12 @@ fn request_error(error: &reqwest::Error) -> String {
 /// `initialize` POST with, or else a GET for an event stream, as a legacy
 /// SSE server wants. When the 401 names none, the metadata is at the
 /// well-known url on the server's origin.
-fn discover(client: &Client, server: &McpServerConfig, url: &Url) -> Result<Url, String> {
+fn discover(
+    client: &Client,
+    server: &McpServerConfig,
+    url: &Url,
+    cancel: &McpLoginCancel,
+) -> Result<Url, String> {
     let name = &server.name;
     let mut headers = configured_headers(server)?;
     headers.remove(AUTHORIZATION);
@@ -468,6 +553,7 @@ fn discover(client: &Client, server: &McpServerConfig, url: &Url) -> Result<Url,
         post.headers().clone()
     } else {
         drop(post);
+        stop_if_cancelled(cancel, name)?;
         let get = client
             .get(url.clone())
             .headers(headers)
@@ -527,9 +613,11 @@ fn authorization_server(
     server: &McpServerConfig,
     issuer: &str,
     issuer_url: &Url,
+    cancel: &McpLoginCancel,
 ) -> Result<AuthorizationServer, String> {
     let mut failures = Vec::new();
     for url in authorization_server_metadata_urls(issuer_url) {
+        stop_if_cancelled(cancel, &server.name)?;
         match get_json::<AuthorizationServer>(client, &url) {
             Ok(metadata) if metadata.issuer == issuer => return Ok(metadata),
             Ok(metadata) => {
@@ -1032,7 +1120,9 @@ mod tests {
     use orca_core::config::mcp_credentials::load_mcp_credential;
     use serde_json::json;
 
-    use super::test_server::{FIXTURE_WAIT, OAuthTestBehavior, OAuthTestServer, test_browser};
+    use super::test_server::{
+        FIXTURE_WAIT, OAuthTestBehavior, OAuthTestServer, TokenGate, test_browser,
+    };
     use super::*;
 
     fn options(credentials_path: &Path, open_browser: OpenBrowser) -> McpLoginOptions {
@@ -1487,7 +1577,7 @@ mod tests {
     /// then says it stopped nothing, and the login stores its tokens.
     #[test]
     fn a_login_whose_browser_came_back_is_past_cancelling() {
-        let gate = super::test_server::TokenGate::default();
+        let gate = TokenGate::default();
         let server = OAuthTestServer::start(OAuthTestBehavior {
             hold_token_requests: Some(gate.clone()),
             ..Default::default()
@@ -1566,6 +1656,267 @@ mod tests {
                 "{path}"
             );
             assert_eq!(server.trail(), trail[..made], "{path}");
+        }
+    }
+
+    /// Releases `gate` when dropped, so that a test that fails does not leave
+    /// the server holding a request until [`FIXTURE_WAIT`] runs out.
+    struct ReleaseOnDrop(TokenGate);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// A browser that says, on the channel it hands back, that it was asked
+    /// to open a url.
+    fn browser_that_reports_opening() -> (OpenBrowser, mpsc::Receiver<()>) {
+        let (opened_tx, opened) = mpsc::channel();
+        let browser: OpenBrowser = Box::new(move |_: &str| {
+            let _ = opened_tx.send(());
+            Ok(())
+        });
+        (browser, opened)
+    }
+
+    /// A cancel that comes while the server is slow to answer one of the
+    /// requests of the look-up stops the login at once, without waiting for
+    /// the answer: no more is asked of the servers, the callback's port, once
+    /// the login has it, is free, and no browser opens.
+    #[test]
+    fn a_login_cancelled_during_discovery_stops_at_once() {
+        let trail = [
+            "POST /mcp",
+            "GET /.well-known/oauth-protected-resource/mcp",
+            "GET /.well-known/oauth-authorization-server/tenant",
+            "POST /register",
+        ];
+        // The request the server holds, in each of the four steps.
+        for held in 0..trail.len() {
+            let path = trail[held].split_once(' ').expect("a method and a path").1;
+            let gate = TokenGate::default();
+            let server = OAuthTestServer::start(OAuthTestBehavior {
+                hold_path: Some((path.to_string(), gate.clone())),
+                ..Default::default()
+            });
+            // Declared after the server, so that it is dropped first, and the
+            // server stops once it has answered the request it holds.
+            let _release = ReleaseOnDrop(gate);
+            let home = tempfile::tempdir().expect("temp dir");
+            let port = free_port();
+            let mut config = server.config("docs");
+            config.oauth_callback_port = Some(port);
+            let cancel = McpLoginCancel::default();
+            let (browser, opened) = browser_that_reports_opening();
+            let (outcome_tx, outcome) = mpsc::channel();
+            std::thread::spawn({
+                let options = McpLoginOptions {
+                    cancel: cancel.clone(),
+                    ..options(&home.path().join("mcp-credentials.json"), browser)
+                };
+                move || {
+                    let _ = outcome_tx.send(login(&config, options));
+                }
+            });
+            // The login waits for the answer to the request the server holds.
+            assert!(
+                server.wait_for_request(path),
+                "{path}: {:?}",
+                server.trail()
+            );
+            assert!(
+                outcome.recv_timeout(Duration::from_millis(100)).is_err(),
+                "{path}: the login did not wait for the held request"
+            );
+
+            assert!(cancel.cancel(), "{path}");
+            let cancelled = Instant::now();
+            let outcome = outcome
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_else(|_| {
+                    panic!("{path}: the login stops within a second of its cancel")
+                });
+
+            assert!(cancelled.elapsed() < Duration::from_secs(1), "{path}");
+            assert_eq!(
+                outcome,
+                Err("login to MCP server 'docs' cancelled".to_string()),
+                "{path}"
+            );
+            // The login is over, with the server still holding its request,
+            // and nothing more asked of it; the port is free.
+            assert_eq!(server.trail(), trail[..=held], "{path}");
+            TcpListener::bind(("127.0.0.1", port)).expect("the callback port is free");
+            assert!(
+                opened.try_recv().is_err(),
+                "{path}: a cancelled login opened the browser"
+            );
+        }
+    }
+
+    /// A login registers once it has taken the callback's port. A cancel that
+    /// comes in the registration frees the port, and no browser opens.
+    #[test]
+    fn a_login_cancelled_after_the_callback_port_is_bound_frees_it() {
+        let cancel = McpLoginCancel::default();
+        let server = OAuthTestServer::start(OAuthTestBehavior {
+            cancel_on: Some(("/register".to_string(), cancel.clone())),
+            ..Default::default()
+        });
+        let home = tempfile::tempdir().expect("temp dir");
+        let port = free_port();
+        let mut config = server.config("docs");
+        config.oauth_callback_port = Some(port);
+        let (browser, opened) = browser_that_reports_opening();
+        let options = McpLoginOptions {
+            cancel,
+            ..options(&home.path().join("mcp-credentials.json"), browser)
+        };
+
+        assert_eq!(
+            login(&config, options),
+            Err("login to MCP server 'docs' cancelled".to_string())
+        );
+
+        // The registration names the port, so the login had taken it.
+        assert_eq!(
+            server.requests_to("/register")[0].json()["redirect_uris"][0],
+            format!("http://127.0.0.1:{port}/callback")
+        );
+        TcpListener::bind(("127.0.0.1", port)).expect("the callback port is free again");
+        assert!(
+            opened.try_recv().is_err(),
+            "a cancelled login opened the browser"
+        );
+    }
+
+    /// A step runs on a thread named for it, hands back what it ends with,
+    /// and does not start for a login cancelled already.
+    #[test]
+    fn a_login_step_runs_on_a_thread_of_its_own_and_hands_back_its_result() {
+        let cancel = McpLoginCancel::default();
+
+        assert_eq!(
+            until_cancelled(&cancel, "docs", || Ok(std::thread::current()
+                .name()
+                .map(str::to_string))),
+            Ok(Some("orca-mcp-login-step".to_string()))
+        );
+        assert_eq!(
+            until_cancelled(&cancel, "docs", || -> Result<(), String> {
+                Err("it answered 404".to_string())
+            }),
+            Err("it answered 404".to_string())
+        );
+
+        // No step starts for a login cancelled already: the step is dropped
+        // unrun, and what it held with it.
+        let (ran_tx, ran) = mpsc::channel();
+        cancel.cancel();
+        assert_eq!(
+            until_cancelled(&cancel, "docs", move || {
+                let _ = ran_tx.send(());
+                Ok(())
+            }),
+            Err("login to MCP server 'docs' cancelled".to_string())
+        );
+        assert_eq!(
+            ran.recv_timeout(FIXTURE_WAIT),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+    }
+
+    /// A cancel ends the wait for a step at once, however long the step takes,
+    /// and what the step comes to afterwards is dropped. The step ends by
+    /// itself, with nothing of the login to wait for.
+    #[test]
+    fn a_cancel_ends_the_wait_for_a_step_and_the_step_ends_by_itself() {
+        let cancel = McpLoginCancel::default();
+        let (started_tx, started) = mpsc::channel();
+        let (answer_tx, answer) = mpsc::channel::<()>();
+        let (ended_tx, ended) = mpsc::channel();
+        let (outcome_tx, outcome) = mpsc::channel();
+        std::thread::spawn({
+            let cancel = cancel.clone();
+            move || {
+                let outcome = until_cancelled(&cancel, "docs", move || {
+                    let _ = started_tx.send(());
+                    // The server's answer, which the test gives, or, should
+                    // it fail first, which dropping `answer_tx` gives.
+                    let _ = answer.recv_timeout(FIXTURE_WAIT);
+                    let _ = ended_tx.send(());
+                    Ok("a late answer")
+                });
+                let _ = outcome_tx.send(outcome);
+            }
+        });
+        started.recv_timeout(FIXTURE_WAIT).expect("the step starts");
+        assert!(
+            outcome.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the login did not wait for the step"
+        );
+
+        assert!(cancel.cancel());
+        let cancelled = Instant::now();
+        let outcome = outcome
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the login stops within a second of its cancel");
+
+        assert!(cancelled.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            outcome,
+            Err("login to MCP server 'docs' cancelled".to_string())
+        );
+        assert!(
+            ended.try_recv().is_err(),
+            "the step ended before its answer"
+        );
+        answer_tx.send(()).expect("the step waits for its answer");
+        ended
+            .recv_timeout(FIXTURE_WAIT)
+            .expect("the step ends once it is answered");
+    }
+
+    /// A step of more than one request that is cancelled in its first, as one
+    /// that has been left behind is, does not send the second: its thread
+    /// ends with the request it was in.
+    #[test]
+    fn a_step_cancelled_in_its_first_request_sends_no_second() {
+        type Step = fn(&Client, &McpServerConfig, &Url, &McpLoginCancel) -> Result<(), String>;
+        // The server has nothing at `/other`, so each step goes on to a
+        // second request if it can: `discover`, from its POST to a GET, and
+        // `authorization_server`, from the RFC 8414 metadata to the OpenID
+        // metadata.
+        let steps: [(&str, Step); 2] = [
+            ("/other", |client, config, url, cancel| {
+                discover(client, config, url, cancel).map(drop)
+            }),
+            (
+                "/.well-known/oauth-authorization-server/other",
+                |client, config, url, cancel| {
+                    authorization_server(client, config, url.as_str(), url, cancel).map(drop)
+                },
+            ),
+        ];
+        // (the request the cancel comes in, and the step that sends it)
+        for (first, step) in steps {
+            let cancel = McpLoginCancel::default();
+            let server = OAuthTestServer::start(OAuthTestBehavior {
+                cancel_on: Some((first.to_string(), cancel.clone())),
+                ..Default::default()
+            });
+            let mut config = server.config("docs");
+            config.url = Some(format!("{}/other", server.url()));
+            let url = Url::parse(config.url.as_deref().expect("a url")).expect("a valid url");
+            let client = http_client(&config, true).expect("an HTTP client");
+
+            assert_eq!(
+                step(&client, &config, &url, &cancel),
+                Err("login to MCP server 'docs' cancelled".to_string()),
+                "{first}"
+            );
+            assert_eq!(server.requests().len(), 1, "{first}: {:?}", server.trail());
         }
     }
 
