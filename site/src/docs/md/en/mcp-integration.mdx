@@ -193,14 +193,18 @@ connected, or whose list request fails, fails the call with its error instead.
 
 A server's list is read a page at a time, up to 100 pages. A list that is cut
 short, because it has more pages than that or because the server names a
-cursor it has named before, keeps the entries read so far, and `errors` has a
-line for it that names the server and says why it stopped, so the model does
-not take the list for everything the server has:
+cursor it has named before, keeps the entries read so far. `errors`, which
+comes last in the output, then has a line that names the server, says its list
+is incomplete, and says why it stopped, so the model does not take the list
+for everything the server has:
 
 ~~~text
-<server>: MCP list stopped after 100 pages
-<server>: MCP server repeated a list cursor
+incomplete resources/list result for '<server>': MCP list stopped after 100 pages
+incomplete resources/list result for '<server>': MCP server repeated a list cursor
 ~~~
+
+For templates the line says `resources/templates/list` where these say
+`resources/list`.
 
 ## Images from tools
 

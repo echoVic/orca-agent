@@ -560,6 +560,24 @@ fn incomplete_list(server_name: &str, method: &str, warning: &str) -> String {
     format!("incomplete {method} result for '{server_name}': {warning}")
 }
 
+/// Adds to `errors` what `warning`, if there is one, says of the list
+/// `server_name` gave only part of on its `method` result (see
+/// [`incomplete_list`]), unless `errors` say it already: the errors of a
+/// listing of every server begin with the servers' own, which hold the note
+/// an earlier listing made of the same list.
+fn note_incomplete_list(
+    errors: &mut Vec<String>,
+    server_name: &str,
+    method: &str,
+    warning: Option<String>,
+) {
+    let Some(warning) = warning else { return };
+    let note = incomplete_list(server_name, method, &warning);
+    if !errors.contains(&note) {
+        errors.push(note);
+    }
+}
+
 /// The prompts a server listed, under `server_name`. A prompt without a
 /// name, or with an argument without one, cannot be asked for, so it is
 /// left out, with a note in `errors`.
@@ -1652,11 +1670,13 @@ impl McpRegistry {
     }
 
     /// The resources of `server`, or of every server that has resources,
-    /// with an error for each server that could not be listed, and for each
-    /// list a server cut short, at its page limit or by naming a cursor it
-    /// had named before: what it gave until then is kept. Asked for by
-    /// name, a server that cannot be listed, or is not connected, fails the
-    /// call instead: there is no other server for it to go on with, and a
+    /// with an error for each server that could not be listed. A list a
+    /// server cut short, at its page limit or by naming a cursor it had
+    /// named before, keeps what the server gave until then, and the errors
+    /// say that it is incomplete, and why, in the words of the server's own
+    /// errors, once should they hold the note already. Asked for by name, a
+    /// server that cannot be listed, or is not connected, fails the call
+    /// instead: there is no other server for it to go on with, and a
     /// request for one server is as strict as [`Self::list_resources`].
     pub fn list_resources_with_errors_or_cancel(
         &self,
@@ -1685,9 +1705,7 @@ impl McpRegistry {
             {
                 Ok((listed, warning)) => {
                     listing.resources.extend(listed);
-                    listing
-                        .errors
-                        .extend(warning.map(|warning| format!("{server}: {warning}")));
+                    note_incomplete_list(&mut listing.errors, &server, "resources/list", warning);
                 }
                 Err(error) if named => return Err(error),
                 Err(McpRequestError::Cancelled) => return Err(McpRequestError::Cancelled),
@@ -1782,9 +1800,11 @@ impl McpRegistry {
     }
 
     /// The resource templates of `server`, or of every server that has
-    /// resources, with an error for each server that could not be listed,
-    /// and for each list a server cut short, at its page limit or by naming
-    /// a cursor it had named before: what it gave until then is kept. Asked
+    /// resources, with an error for each server that could not be listed. A
+    /// list a server cut short, at its page limit or by naming a cursor it
+    /// had named before, keeps what the server gave until then, and the
+    /// errors say that it is incomplete, and why, in the words of the
+    /// server's own errors, once should they hold the note already. Asked
     /// for by name, a server that cannot be listed, or is not connected,
     /// fails the call instead: there is no other server for it to go on
     /// with, and a request for one server is as strict as
@@ -1816,9 +1836,12 @@ impl McpRegistry {
             {
                 Ok((listed, warning)) => {
                     listing.resource_templates.extend(listed);
-                    listing
-                        .errors
-                        .extend(warning.map(|warning| format!("{server}: {warning}")));
+                    note_incomplete_list(
+                        &mut listing.errors,
+                        &server,
+                        "resources/templates/list",
+                        warning,
+                    );
                 }
                 Err(error) if named => return Err(error),
                 Err(McpRequestError::Cancelled) => return Err(McpRequestError::Cancelled),

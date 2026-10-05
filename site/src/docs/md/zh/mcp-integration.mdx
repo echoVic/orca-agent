@@ -154,13 +154,15 @@ prompt 在发出第一条消息之前也能运行：它返回的内容就是那�
 照常列出。指定 `server` 时，该服务器没有连接，或者列表请求失败，这次调用会带着它的错误失败。
 
 服务器的列表按页读取，最多读 100 页。列表被截断时（页数超过 100，或者服务器给出一个它之前给过的
-游标），已经读到的条目保留，`errors` 里会有一行写明是哪个服务器、因为什么停下，模型因此不会把这份
-列表当成服务器的全部内容：
+游标），已经读到的条目保留，输出里排在最后的 `errors` 会有一行，写明哪个服务器的列表不完整、
+因为什么停下，模型因此不会把这份列表当成服务器的全部内容：
 
 ~~~text
-<server>: MCP list stopped after 100 pages
-<server>: MCP server repeated a list cursor
+incomplete resources/list result for '<server>': MCP list stopped after 100 pages
+incomplete resources/list result for '<server>': MCP server repeated a list cursor
 ~~~
+
+模板列表的这一行里，`resources/list` 换成 `resources/templates/list`。
 
 ## 工具返回的图片
 

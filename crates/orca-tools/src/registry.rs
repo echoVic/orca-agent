@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use orca_core::approval_types::ActionKind;
@@ -2020,6 +2021,25 @@ enum BuiltinExecutor {
     AskUserQuestion,
 }
 
+/// What `list_mcp_resources` answers with. The fields are written in this
+/// order, the resources first: a `json!` object sorts its keys, which puts
+/// `errors` first, and the note on a list a server cut short is meant to be
+/// the last thing the output says. The resources are a `Value`, as they were
+/// in that object, so that each keeps its own keys.
+#[derive(Serialize)]
+struct ResourceList {
+    resources: Value,
+    errors: Vec<String>,
+}
+
+/// What `list_mcp_resource_templates` answers with, in the same order.
+#[derive(Serialize)]
+struct ResourceTemplateList {
+    #[serde(rename = "resourceTemplates")]
+    resource_templates: Value,
+    errors: Vec<String>,
+}
+
 fn execute_list_mcp_resources(request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
     let Some(registry) = ctx.mcp_registry else {
         return ToolResult::failed(request, "MCP registry is not initialized", None);
@@ -2042,11 +2062,13 @@ fn execute_list_mcp_resources(request: &ToolRequest, ctx: &ToolContext<'_>) -> T
             return ToolResult::failed(request, error, None);
         }
     };
-    let output = json!({
-        "resources": listing.resources,
-        "errors": listing.errors,
+    let output = serde_json::to_value(&listing.resources).and_then(|resources| {
+        serde_json::to_string(&ResourceList {
+            resources,
+            errors: listing.errors,
+        })
     });
-    match serde_json::to_string(&output) {
+    match output {
         Ok(output) => ToolResult::completed(request, output, false),
         Err(error) => ToolResult::failed(
             request,
@@ -2079,11 +2101,13 @@ fn execute_list_mcp_resource_templates(request: &ToolRequest, ctx: &ToolContext<
                 return ToolResult::failed(request, error, None);
             }
         };
-    let output = json!({
-        "resourceTemplates": listing.resource_templates,
-        "errors": listing.errors,
+    let output = serde_json::to_value(&listing.resource_templates).and_then(|resource_templates| {
+        serde_json::to_string(&ResourceTemplateList {
+            resource_templates,
+            errors: listing.errors,
+        })
     });
-    match serde_json::to_string(&output) {
+    match output {
         Ok(output) => ToolResult::completed(request, output, false),
         Err(error) => ToolResult::failed(
             request,
@@ -3129,10 +3153,12 @@ mod tests {
         serde_json::from_str(result.output.as_deref().expect("tool output")).expect("listing JSON")
     }
 
-    /// The list tool `name`, asked for a server that cuts its list short,
-    /// keeps what it read (under `items` in its output), and says in `errors`
-    /// which server stopped, and why.
-    fn assert_cut_short_list_tells_the_model(name: ToolName, items: &str) {
+    /// The output of the list tool `name`, over a server that cuts its list
+    /// short, keeps what was read (under `items`) and ends with `errors`,
+    /// which has the line the server's own errors have for a list cut short
+    /// on `method`: that the list is incomplete, whose, and why. The server
+    /// is asked for by name, and among every server, of which it is the one.
+    fn assert_cut_short_list_tells_the_model(name: ToolName, items: &str, method: &str) {
         for (lists, pages_read, reason) in [
             (
                 Lists::RepeatedCursor,
@@ -3143,25 +3169,38 @@ mod tests {
         ] {
             let mcp = registry_serving("paged", lists);
 
-            let result = list_tool_result(&mcp, name.clone(), r#"{"server":"paged"}"#);
+            for arguments in [r#"{"server":"paged"}"#, "{}"] {
+                let result = list_tool_result(&mcp, name.clone(), arguments);
 
-            let output = completed_listing(&result);
-            assert_eq!(
-                output[items].as_array().map(Vec::len),
-                Some(pages_read),
-                "what the server gave stays in the list: {output}"
-            );
-            let errors = output["errors"].as_array().expect("errors");
-            assert_eq!(errors.len(), 1, "{output}");
-            let note = errors[0].as_str().expect("a note");
-            assert!(note.contains("paged"), "the note names the server: {note}");
-            assert!(note.contains(reason), "the note says why: {note}");
+                let output = completed_listing(&result);
+                assert_eq!(
+                    output[items].as_array().map(Vec::len),
+                    Some(pages_read),
+                    "what the server gave stays in the list: {arguments} {output}"
+                );
+                assert_eq!(
+                    output["errors"],
+                    json!([format!("incomplete {method} result for 'paged': {reason}")]),
+                    "{arguments}"
+                );
+                let text = result.output.as_deref().expect("tool output");
+                let entries_at = text.find(&format!("\"{items}\":")).expect("the entries");
+                let errors_at = text.find("\"errors\":").expect("the errors");
+                assert!(
+                    entries_at < errors_at,
+                    "the errors come after the entries: {arguments} {text}"
+                );
+            }
         }
     }
 
     #[test]
     fn a_cut_short_resource_list_of_one_server_tells_the_model() {
-        assert_cut_short_list_tells_the_model(ToolName::ListMcpResources, "resources");
+        assert_cut_short_list_tells_the_model(
+            ToolName::ListMcpResources,
+            "resources",
+            "resources/list",
+        );
     }
 
     #[test]
@@ -3169,6 +3208,7 @@ mod tests {
         assert_cut_short_list_tells_the_model(
             ToolName::ListMcpResourceTemplates,
             "resourceTemplates",
+            "resources/templates/list",
         );
     }
 
@@ -3176,16 +3216,23 @@ mod tests {
     fn the_list_of_one_server_has_the_shape_of_the_list_of_all_servers() {
         let mcp = registry_serving("notes", Lists::Complete);
 
-        for (name, items) in [
-            (ToolName::ListMcpResources, "resources"),
-            (ToolName::ListMcpResourceTemplates, "resourceTemplates"),
+        // The entries come first and the errors last, and an entry keeps the
+        // keys it has always had.
+        for (name, expected) in [
+            (
+                ToolName::ListMcpResources,
+                r#"{"resources":[{"description":null,"name":"memo one","server":"notes","uri":"memo://orca/one"}],"errors":[]}"#,
+            ),
+            (
+                ToolName::ListMcpResourceTemplates,
+                r#"{"resourceTemplates":[{"description":null,"name":"memo","server":"notes","uriTemplate":"memo://orca/{id}"}],"errors":[]}"#,
+            ),
         ] {
-            let all = completed_listing(&list_tool_result(&mcp, name.clone(), "{}"));
-            let one = completed_listing(&list_tool_result(&mcp, name, r#"{"server":"notes"}"#));
+            let all = list_tool_result(&mcp, name.clone(), "{}");
+            let one = list_tool_result(&mcp, name, r#"{"server":"notes"}"#);
 
-            assert_eq!(one["errors"], json!([]), "{one}");
-            assert_eq!(one[items].as_array().map(Vec::len), Some(1), "{one}");
-            assert_eq!(one, all);
+            assert_eq!(one.output.as_deref(), Some(expected));
+            assert_eq!(all.output, one.output);
         }
     }
 

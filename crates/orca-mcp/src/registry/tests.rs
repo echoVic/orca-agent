@@ -4845,10 +4845,14 @@ fn a_resource_list_cut_short_says_so_where_its_errors_go() {
             .collect::<Vec<_>>()
     };
 
-    // A listing with errors keeps what it read, and says why it stopped.
+    // A listing with errors keeps what it read, and says that the list is
+    // incomplete, and why it stopped, as the server's errors do below.
     let listing = registry.list_resources_with_errors(Some("paged"));
     assert_eq!(uris(&listing.resources), ["memo://1", "memo://2"]);
-    assert_eq!(listing.errors, ["paged: MCP server repeated a list cursor"]);
+    assert_eq!(
+        listing.errors,
+        ["incomplete resources/list result for 'paged': MCP server repeated a list cursor"]
+    );
     let listing = registry.list_resource_templates_with_errors(Some("paged"));
     assert_eq!(
         listing
@@ -4858,7 +4862,12 @@ fn a_resource_list_cut_short_says_so_where_its_errors_go() {
             .collect::<Vec<_>>(),
         ["memo://{a}", "memo://{b}"]
     );
-    assert_eq!(listing.errors, ["paged: MCP server repeated a list cursor"]);
+    assert_eq!(
+        listing.errors,
+        [
+            "incomplete resources/templates/list result for 'paged': MCP server repeated a list cursor"
+        ]
+    );
     assert_eq!(changes.load(Ordering::SeqCst), 0);
 
     // One without errors of its own keeps what it read too, and the
@@ -4896,6 +4905,21 @@ fn a_resource_list_cut_short_says_so_where_its_errors_go() {
         .list_resources(Some("paged"))
         .expect("the resources read again");
     assert_eq!(registry.server_statuses()[0].errors.len(), 2);
+    assert_eq!(changes.load(Ordering::SeqCst), 2);
+
+    // A listing of every server begins with the servers' errors, which hold
+    // those notes now: the note on a list cut short is not made twice.
+    let notes = [
+        "incomplete resources/list result for 'paged': MCP server repeated a list cursor",
+        "incomplete resources/templates/list result for 'paged': MCP server repeated a list cursor",
+    ];
+    let listing = registry.list_resources_with_errors(None);
+    assert_eq!(uris(&listing.resources), ["memo://1", "memo://2"]);
+    assert_eq!(listing.errors, notes);
+    assert_eq!(
+        registry.list_resource_templates_with_errors(None).errors,
+        notes
+    );
     assert_eq!(changes.load(Ordering::SeqCst), 2);
 }
 
