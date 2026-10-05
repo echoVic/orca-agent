@@ -327,9 +327,7 @@ impl MentionCatalog {
 }
 
 fn skill_discovery_dirs_from_env() -> (Option<PathBuf>, Option<PathBuf>) {
-    let orca_home = std::env::var_os("ORCA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")));
+    let orca_home = orca_core::home::orca_home();
     let agents_home = dirs::home_dir().map(|home| home.join(".agents"));
     (orca_home, agents_home)
 }
@@ -438,10 +436,7 @@ fn discover_plugins(roots: &[PathBuf]) -> (Vec<DiscoveredPlugin>, Vec<String>) {
         .iter()
         .flat_map(|root| [root.join(".orca/plugins"), root.join(".codex/plugins")])
         .collect::<Vec<_>>();
-    if let Some(home) = std::env::var_os("ORCA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
-    {
+    if let Some(home) = orca_core::home::orca_home() {
         plugin_roots.push(home.join("plugins"));
     }
     let mut plugins = Vec::new();
@@ -1069,10 +1064,7 @@ fn plugin_manifest_allowed(path: &Path, cwd: &Path, workspace_roots: &[PathBuf])
         .into_iter()
         .flat_map(|root| [root.join(".orca/plugins"), root.join(".codex/plugins")])
         .collect::<Vec<_>>();
-    if let Some(home) = std::env::var_os("ORCA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
-    {
+    if let Some(home) = orca_core::home::orca_home() {
         plugin_roots.push(home.join("plugins"));
     }
     plugin_roots.into_iter().any(|root| {

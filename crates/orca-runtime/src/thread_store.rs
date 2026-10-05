@@ -12,9 +12,6 @@ mod storage_tests;
 mod types;
 mod writer;
 
-#[cfg(not(test))]
-pub(crate) const ORCA_HOME_ENV: &str = "ORCA_HOME";
-
 use orca_core::conversation::Conversation;
 
 pub use live_thread::LiveThread;

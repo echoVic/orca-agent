@@ -15,6 +15,7 @@ pub mod execution_broker;
 pub mod external_config;
 pub mod goal_runtime;
 pub mod goal_types;
+pub mod home;
 pub mod hook_types;
 pub mod mcp_types;
 pub mod model;

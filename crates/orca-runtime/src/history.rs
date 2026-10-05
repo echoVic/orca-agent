@@ -32,7 +32,7 @@ const SESSION_SCHEMA_VERSION: u32 = 1;
 /// isolated home). This is the v0.3.14 serialization behavior: the shared
 /// index stores are safe under serial execution, so tests that touch them
 /// hold this mutex for their whole body. Home resolution itself never takes
-/// this lock (see [`read_test_orca_home`] and [`with_test_orca_home`]), so a
+/// this lock (see [`orca_core::home::orca_home`] and [`with_test_orca_home`]), so a
 /// test holding it while waiting for its own host threads can never deadlock
 /// against them.
 #[cfg(test)]
@@ -50,16 +50,16 @@ pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
     recover_test_lock(&TEST_ENV_LOCK)
 }
 
-// Per-test `ORCA_HOME` overrides live in `orca_core::config::folder_trust`
-// (thread-local, never the environment) so that folder-trust and workflow
-// script resolution observe the same private home as sessions, goals, and
-// task sessions. Hosts spawned inside a test-home scope capture it
-// (`current_test_orca_home`) and install it on all their worker threads via
-// `set_host_orca_home`.
+// Per-test `ORCA_HOME` overrides live in `orca_core::home` (thread-local,
+// never the environment) so that config, folder-trust and workflow script
+// resolution observe the same private home as sessions, goals, and task
+// sessions: every one of them resolves through `orca_core::home::orca_home`.
+// Hosts spawned inside a test-home scope capture it (`current_test_orca_home`)
+// and install it on all their worker threads via `set_host_orca_home`.
 
 #[cfg(test)]
 pub(crate) fn current_test_orca_home() -> Option<std::path::PathBuf> {
-    orca_core::config::folder_trust::current_test_orca_home()
+    orca_core::home::current_test_orca_home()
 }
 
 /// Installs `home` as the `ORCA_HOME` override for the calling thread (a
@@ -67,7 +67,7 @@ pub(crate) fn current_test_orca_home() -> Option<std::path::PathBuf> {
 /// resolution.
 #[cfg(test)]
 pub(crate) fn set_host_orca_home(home: Option<std::path::PathBuf>) {
-    orca_core::config::folder_trust::install_host_orca_home(home);
+    orca_core::home::install_host_orca_home(home);
 }
 
 /// Runs `body` with `ORCA_HOME` resolving to `home` for the calling thread
@@ -82,9 +82,9 @@ pub(crate) fn with_test_orca_home<T>(
     body: impl FnOnce(&std::path::Path) -> T,
 ) -> T {
     let previous = current_test_orca_home();
-    orca_core::config::folder_trust::install_test_orca_home(Some(home.to_path_buf()));
+    orca_core::home::install_test_orca_home(Some(home.to_path_buf()));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(home)));
-    orca_core::config::folder_trust::install_test_orca_home(previous);
+    orca_core::home::install_test_orca_home(previous);
     match result {
         Ok(value) => value,
         Err(payload) => std::panic::resume_unwind(payload),
@@ -101,7 +101,7 @@ pub(crate) struct TestOrcaHomeGuard {
 #[cfg(test)]
 impl Drop for TestOrcaHomeGuard {
     fn drop(&mut self) {
-        orca_core::config::folder_trust::install_test_orca_home(self.previous.take());
+        orca_core::home::install_test_orca_home(self.previous.take());
     }
 }
 
@@ -114,36 +114,26 @@ impl Drop for TestOrcaHomeGuard {
 #[cfg(test)]
 pub(crate) fn redirect_test_orca_home(home: &std::path::Path) -> TestOrcaHomeGuard {
     let previous = current_test_orca_home();
-    orca_core::config::folder_trust::install_test_orca_home(Some(home.to_path_buf()));
+    orca_core::home::install_test_orca_home(Some(home.to_path_buf()));
     TestOrcaHomeGuard { previous }
-}
-
-/// Reads `ORCA_HOME` safely under test. The resolution order is: this
-/// thread's host-home override (installed on host worker threads), this
-/// thread's test-home override (inside a `with_test_orca_home` /
-/// `redirect_test_orca_home` scope), then the process-wide `ORCA_HOME`
-/// variable. No lock is taken: the variable is only ever set to the
-/// process-wide isolated home, so reads never observe a half-switched value.
-#[cfg(test)]
-pub(crate) fn read_test_orca_home() -> Option<std::ffi::OsString> {
-    orca_core::config::folder_trust::current_orca_home_override()
-        .map(Into::into)
-        .or_else(|| std::env::var_os("ORCA_HOME"))
 }
 
 /// One process-wide temporary `ORCA_HOME` for the whole lib test binary. The
 /// real user home may be in use by live `orca` processes, so every lib test
-/// resolves `ORCA_HOME` to this isolated directory instead. It is created
-/// once and never removed while the test process runs; this function does not
-/// touch the environment.
+/// resolves `ORCA_HOME` to this isolated directory instead. It is the same
+/// directory `orca_core::home::orca_home` falls back to when nothing names a
+/// home, created once and never removed while the test process runs; this
+/// function does not touch the environment.
+///
+/// Resolution itself is `orca_core::home::orca_home`: this thread's host-home
+/// override (installed on host worker threads), this thread's test-home
+/// override (inside a `with_test_orca_home` / `redirect_test_orca_home`
+/// scope), then the process-wide `ORCA_HOME` variable. No lock is taken: the
+/// variable is only ever set to the process-wide isolated home, so reads never
+/// observe a half-switched value.
 #[cfg(test)]
 pub(crate) fn isolated_test_orca_home_dir() -> &'static std::path::Path {
-    use std::sync::OnceLock;
-
-    static ORCA_HOME_TEST_HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
-    let home = ORCA_HOME_TEST_HOME
-        .get_or_init(|| tempfile::tempdir().expect("create process-wide test ORCA_HOME"));
-    home.path()
+    orca_core::home::process_temp_home()
 }
 
 /// Re-applies `ORCA_HOME` to the process-wide isolated home and returns it.

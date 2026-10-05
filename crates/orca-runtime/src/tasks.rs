@@ -7035,14 +7035,7 @@ fn read_json_bounded<T: for<'de> Deserialize<'de>>(
 }
 
 fn task_sessions_root() -> Option<PathBuf> {
-    #[cfg(test)]
-    let test_home = crate::history::read_test_orca_home();
-    #[cfg(not(test))]
-    let test_home = std::env::var_os("ORCA_HOME");
-    test_home
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
-        .map(|home| home.join("task-sessions"))
+    orca_core::home::orca_home().map(|home| home.join("task-sessions"))
 }
 
 fn legacy_project_task_sessions_root(cwd: &Path) -> PathBuf {

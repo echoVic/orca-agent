@@ -3,6 +3,12 @@ name = "orca-core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Test builds resolve the Orca home to a temporary directory instead of
+# `~/.orca` (see `home::orca_home`). Other crates turn it on through a
+# dev-dependency, so release builds never carry it.
+test-utils = ["dep:tempfile"]
+
 [dependencies]
 orca-platform = { path = "../orca-platform" }
 base64 = { workspace = true }
@@ -17,6 +23,7 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 dirs = { workspace = true }
 libc = { workspace = true }
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

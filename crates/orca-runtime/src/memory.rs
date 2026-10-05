@@ -559,15 +559,7 @@ fn auto_memory_provider_config(config: &RunConfig) -> ProviderConfig {
 }
 
 fn memory_root() -> Option<PathBuf> {
-    #[cfg(test)]
-    let configured_home = crate::history::read_test_orca_home();
-    #[cfg(not(test))]
-    let configured_home = std::env::var_os("ORCA_HOME");
-
-    configured_home
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
-        .map(|root| root.join("memory"))
+    orca_core::home::orca_home().map(|home| home.join("memory"))
 }
 
 fn project_memory_path(root: &Path, cwd: &Path) -> PathBuf {

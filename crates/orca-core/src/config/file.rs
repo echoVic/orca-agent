@@ -17,7 +17,7 @@ use crate::config::{
 use crate::model::ModelDefinition;
 use crate::subagent_config::SubagentConfig;
 
-pub const ORCA_HOME_ENV: &str = "ORCA_HOME";
+pub use crate::home::ORCA_HOME_ENV;
 pub const USER_CONFIG_FILE: &str = "config.toml";
 pub const AUTH_FILE: &str = "auth.json";
 
@@ -287,9 +287,7 @@ fn default_true() -> bool {
 /// This resolver is shared by runtime configuration, trust, diagnostics, and
 /// first-run setup.
 pub fn config_dir() -> Option<PathBuf> {
-    std::env::var_os(ORCA_HOME_ENV)
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".orca")))
+    crate::home::orca_home()
 }
 
 /// Return the user-owned TOML configuration path, if a home directory can be
@@ -653,7 +651,8 @@ fn persist_user_model_settings_to_dir(
 mod tests {
     use super::*;
 
-    static EFFECTIVE_CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Shared with the `home` tests: both change the process-wide `ORCA_HOME`.
+    use crate::home::ENV_LOCK as EFFECTIVE_CONFIG_ENV_LOCK;
 
     fn load_toml(path: &Path) -> FileConfig {
         let Ok(content) = fs::read_to_string(path) else {

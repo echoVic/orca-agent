@@ -3,7 +3,6 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
-const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const CACHE_SUBDIR: &str = "summary_cache";
 
 /// Content-addressed key for a summary request. Combining the previous summary
@@ -76,15 +75,13 @@ fn cache_dir() -> Option<PathBuf> {
         Some(ROOT.with(|root| root.path().join(CACHE_SUBDIR)))
     }
     #[cfg(not(test))]
-    std::env::var_os(ORCA_HOME_ENV)
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
-        .map(|home| home.join(CACHE_SUBDIR))
+    orca_core::home::orca_home().map(|home| home.join(CACHE_SUBDIR))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_core::home::ORCA_HOME_ENV;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());

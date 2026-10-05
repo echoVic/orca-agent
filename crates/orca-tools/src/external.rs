@@ -17,10 +17,7 @@ const MAX_EXTERNAL_TOOL_ENV_ARGS_BYTES: usize = 64 * 1024;
 // Security: only loads from ORCA_HOME/tools/ (user-controlled), never from
 // project-level directories, to prevent repo poisoning attacks.
 pub fn default_tools_dir() -> Option<PathBuf> {
-    std::env::var_os("ORCA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
-        .map(|home| home.join("tools"))
+    orca_core::home::orca_home().map(|home| home.join("tools"))
 }
 
 pub fn load_default_external_tools() -> Vec<ExternalToolConfig> {

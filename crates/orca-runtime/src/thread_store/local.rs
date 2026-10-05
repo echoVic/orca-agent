@@ -12,8 +12,6 @@ use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::tool_types::truncate_output;
 
 use super::LiveThread;
-#[cfg(not(test))]
-use super::ORCA_HOME_ENV;
 use super::assets;
 use super::pagination::{page_thread_items, page_thread_turns, page_vec};
 use super::projection::{
@@ -1014,17 +1012,7 @@ pub(crate) fn archive_dir() -> PathBuf {
 }
 
 pub(crate) fn orca_home() -> PathBuf {
-    // Under test, resolve through the thread-local per-test home override
-    // (host threads, then the calling test thread), falling back to the
-    // process-wide ORCA_HOME variable; the environment is never redirected.
-    #[cfg(test)]
-    let test_home = crate::history::read_test_orca_home();
-    #[cfg(not(test))]
-    let test_home = std::env::var_os(ORCA_HOME_ENV);
-    test_home
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
-        .unwrap_or_else(|| std::env::temp_dir().join("orca"))
+    orca_core::home::orca_home().unwrap_or_else(|| std::env::temp_dir().join("orca"))
 }
 
 impl ThreadStore for JsonlThreadStore {

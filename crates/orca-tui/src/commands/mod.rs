@@ -423,13 +423,8 @@ fn discover_saved_workflows(cwd: &Path) -> Vec<(String, &'static str)> {
             &mut workflows,
         );
     }
-    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-        collect_workflow_dir(
-            &home.join(".orca").join("workflows"),
-            "user",
-            &mut seen,
-            &mut workflows,
-        );
+    if let Some(home) = orca_core::home::orca_home() {
+        collect_workflow_dir(&home.join("workflows"), "user", &mut seen, &mut workflows);
     }
     workflows
 }
@@ -817,6 +812,26 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(command_names.contains(&"/workflow:<name>".to_string()));
         assert!(command_names.contains(&"/workflow:security-audit".to_string()));
+    }
+
+    #[test]
+    fn available_commands_include_user_saved_workflows_from_the_orca_home() {
+        let home = crate::test_support::isolate_orca_home();
+        let workflow_dir = home.path().join("workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        std::fs::write(
+            workflow_dir.join("nightly-review.js"),
+            "export default 'ok';",
+        )
+        .unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+
+        let command_names = available_commands(cwd.path(), &[])
+            .into_iter()
+            .map(|(command, _)| command)
+            .collect::<Vec<_>>();
+
+        assert!(command_names.contains(&"/workflow:nightly-review".to_string()));
     }
 
     #[test]

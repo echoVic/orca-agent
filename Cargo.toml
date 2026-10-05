@@ -76,6 +76,7 @@ clap = { workspace = true }
 
 [dev-dependencies]
 orca-approval = { path = "crates/orca-approval" }
+orca-core = { path = "crates/orca-core", features = ["test-utils"] }
 orca-mcp = { path = "crates/orca-mcp", features = ["test-utils"] }
 orca-platform = { path = "crates/orca-platform" }
 orca-provider = { path = "crates/orca-provider" }

@@ -64,9 +64,7 @@ pub fn execute_read(request: &ToolRequest, cwd: &Path) -> ToolResult {
 }
 
 pub fn discover_from_env(cwd: &Path) -> Result<Vec<Skill>, String> {
-    let orca_home = std::env::var_os("ORCA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")));
+    let orca_home = orca_core::home::orca_home();
     let agents_home = dirs::home_dir().map(|home| home.join(".agents"));
     discover(cwd, orca_home.as_deref(), agents_home.as_deref())
 }

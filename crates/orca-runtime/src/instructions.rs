@@ -5,8 +5,6 @@ use std::path::{Path, PathBuf};
 
 const INSTRUCTIONS_FILE: &str = "AGENTS.md";
 const RULES_DIR: &str = ".orca/rules";
-#[cfg(not(test))]
-const ORCA_HOME_ENV: &str = "ORCA_HOME";
 
 #[derive(Clone, Debug, Default)]
 pub struct ProjectInstructions {
@@ -56,7 +54,7 @@ pub fn load_for_cwd_or_default(cwd: &Path) -> ProjectInstructions {
 }
 
 pub fn load_for_cwd(cwd: &Path) -> io::Result<ProjectInstructions> {
-    let orca_home_path = orca_home();
+    let orca_home_path = orca_core::home::orca_home();
     load_for_cwd_with_home(cwd, orca_home_path.as_deref())
 }
 
@@ -99,16 +97,6 @@ fn load_for_cwd_with_home(
     }
 
     Ok(ProjectInstructions { sections })
-}
-
-fn orca_home() -> Option<PathBuf> {
-    #[cfg(test)]
-    let test_home = crate::history::read_test_orca_home();
-    #[cfg(not(test))]
-    let test_home = std::env::var_os(ORCA_HOME_ENV);
-    test_home
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
 }
 
 fn find_project_root(cwd: &Path) -> Option<PathBuf> {

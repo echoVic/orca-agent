@@ -330,9 +330,7 @@ fn checked_goal_file_path(output_dir: &Path, file_name: &str) -> io::Result<Path
 }
 
 fn orca_home() -> io::Result<PathBuf> {
-    let home = std::env::var_os("ORCA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
+    let home = orca_core::home::orca_home()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cannot determine ORCA_HOME"))?;
     absolute_path(&home)
 }

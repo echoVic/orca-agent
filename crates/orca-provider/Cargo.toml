@@ -18,3 +18,4 @@ dirs = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+orca-core = { path = "../orca-core", features = ["test-utils"] }

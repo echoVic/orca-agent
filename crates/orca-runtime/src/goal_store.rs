@@ -5497,21 +5497,7 @@ fn legacy_state(goal: &ThreadGoal) -> GoalState {
 }
 
 fn orca_home() -> PathBuf {
-    // Under test, resolve through the thread-local per-test home override
-    // (host threads, then the calling test thread), falling back to the
-    // process-wide ORCA_HOME variable; the environment is never redirected.
-    #[cfg(test)]
-    let test_home = crate::history::read_test_orca_home();
-    #[cfg(not(test))]
-    let test_home = std::env::var("ORCA_HOME")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
-    if let Some(value) = test_home {
-        return PathBuf::from(value);
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".orca")
+    orca_core::home::orca_home().unwrap_or_else(|| PathBuf::from(".orca"))
 }
 
 #[cfg(test)]

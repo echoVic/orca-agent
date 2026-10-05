@@ -1,11 +1,7 @@
 use crate::types::AppState;
 
 fn input_history_path() -> Option<std::path::PathBuf> {
-    // Unit tests must never read or pollute the real user history.
-    if cfg!(test) {
-        return None;
-    }
-    dirs::home_dir().map(|h| h.join(".orca").join("history.jsonl"))
+    orca_core::home::orca_home().map(|home| home.join("history.jsonl"))
 }
 
 fn current_project() -> String {
@@ -15,6 +11,11 @@ fn current_project() -> String {
 }
 
 pub(crate) fn load_input_history() -> Vec<String> {
+    // Tests build many `AppState`s in one process, and none may start out with
+    // the prompts another test recorded: test builds keep no history.
+    if cfg!(test) {
+        return Vec::new();
+    }
     let Some(path) = input_history_path() else {
         return Vec::new();
     };
@@ -60,6 +61,9 @@ pub(crate) fn load_input_history() -> Vec<String> {
 }
 
 fn append_input_history(prompt: &str) {
+    if cfg!(test) {
+        return;
+    }
     let Some(path) = input_history_path() else {
         return;
     };
@@ -179,5 +183,32 @@ mod tests {
         state.reset_history_navigation();
         assert!(state.history_cursor.is_none());
         assert!(state.draft_before_history.is_none());
+    }
+
+    #[test]
+    fn the_input_history_lives_under_the_orca_home() {
+        // The path follows the one resolver: when nothing names a home, a
+        // test build gets a process temp dir, never ~/.orca.
+        let _env = crate::test_support::lock_process_env();
+        let orca_home = orca_core::home::orca_home().expect("a test build always has a home");
+
+        let path = super::input_history_path().expect("the history has a file in test builds");
+
+        assert!(
+            path.starts_with(&orca_home),
+            "{} is not under {}",
+            path.display(),
+            orca_home.display()
+        );
+    }
+
+    #[test]
+    fn the_input_history_follows_an_explicit_orca_home() {
+        let home = crate::test_support::isolate_orca_home();
+
+        assert_eq!(
+            super::input_history_path(),
+            Some(home.path().join("history.jsonl"))
+        );
     }
 }

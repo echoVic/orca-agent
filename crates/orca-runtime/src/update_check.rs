@@ -10,7 +10,6 @@ use orca_platform::host::{HostPlatform, OperatingSystem};
 
 const RELEASES_URL: &str = "https://api.github.com/repos/echoVic/orca-agent/releases/latest";
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@blade-ai/orca/latest";
-const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const UPDATE_CACHE_FILE: &str = "update-cache.json";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -406,10 +405,7 @@ fn write_update_cache(cache: &UpdatePromptCache) -> Result<(), String> {
 }
 
 fn update_cache_path() -> Option<PathBuf> {
-    std::env::var_os(ORCA_HOME_ENV)
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
-        .map(|home| home.join(UPDATE_CACHE_FILE))
+    orca_core::home::orca_home().map(|home| home.join(UPDATE_CACHE_FILE))
 }
 
 #[cfg(test)]
