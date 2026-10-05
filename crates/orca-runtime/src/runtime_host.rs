@@ -182,6 +182,20 @@ fn inject_passthrough_finish_failure_once() {
     PASSTHROUGH_FINISH_FAILURES.store(1, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Takes one of the injected passthrough finish failures, when one is left.
+#[cfg(test)]
+fn take_passthrough_finish_failure() -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut remaining = PASSTHROUGH_FINISH_FAILURES.load(SeqCst);
+    while let Some(next) = remaining.checked_sub(1) {
+        match PASSTHROUGH_FINISH_FAILURES.compare_exchange_weak(remaining, next, SeqCst, SeqCst) {
+            Ok(_) => return true,
+            Err(current) => remaining = current,
+        }
+    }
+    false
+}
+
 pub trait HostedOperationWriter: io::Write + Send + 'static {
     fn finish_generation(&mut self, commit_terminal: bool) -> io::Result<()>;
 }
@@ -209,14 +223,7 @@ impl<W: io::Write> io::Write for PassthroughHostedOperationWriter<W> {
 impl<W: io::Write + Send + 'static> HostedOperationWriter for PassthroughHostedOperationWriter<W> {
     fn finish_generation(&mut self, _commit_terminal: bool) -> io::Result<()> {
         #[cfg(test)]
-        if PASSTHROUGH_FINISH_FAILURES
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok()
-        {
+        if take_passthrough_finish_failure() {
             return Err(io::Error::other(
                 "injected passthrough generation finish failure",
             ));
