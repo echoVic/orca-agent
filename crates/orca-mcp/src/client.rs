@@ -2020,17 +2020,22 @@ impl McpClient {
         elicitation_handler: Option<&dyn McpElicitationHandler>,
         should_cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<Value, String> {
-        self.request(|transport| match should_cancel {
-            Some(should_cancel) => transport.call_tool_with_elicitation_handler_or_cancel(
-                name,
-                arguments,
-                elicitation_handler,
-                should_cancel,
-            ),
-            None => {
-                transport.call_tool_with_elicitation_handler(name, arguments, elicitation_handler)
-            }
-        })
+        self.request_or_cancel(
+            should_cancel.unwrap_or(&|| false),
+            |transport| match should_cancel {
+                Some(should_cancel) => transport.call_tool_with_elicitation_handler_or_cancel(
+                    name,
+                    arguments,
+                    elicitation_handler,
+                    should_cancel,
+                ),
+                None => transport.call_tool_with_elicitation_handler(
+                    name,
+                    arguments,
+                    elicitation_handler,
+                ),
+            },
+        )
         .map_err(|error| error.to_string())
     }
 
@@ -2039,7 +2044,9 @@ impl McpClient {
         cursor: Option<&str>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, McpRequestError> {
-        self.request(|transport| transport.list_resources_or_cancel(cursor, should_cancel))
+        self.request_or_cancel(should_cancel, |transport| {
+            transport.list_resources_or_cancel(cursor, should_cancel)
+        })
     }
 
     fn list_resource_templates_or_cancel(
@@ -2047,7 +2054,9 @@ impl McpClient {
         cursor: Option<&str>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, McpRequestError> {
-        self.request(|transport| transport.list_resource_templates_or_cancel(cursor, should_cancel))
+        self.request_or_cancel(should_cancel, |transport| {
+            transport.list_resource_templates_or_cancel(cursor, should_cancel)
+        })
     }
 
     fn read_resource_or_cancel(
@@ -2055,7 +2064,9 @@ impl McpClient {
         uri: &str,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, McpRequestError> {
-        self.request(|transport| transport.read_resource_or_cancel(uri, should_cancel))
+        self.request_or_cancel(should_cancel, |transport| {
+            transport.read_resource_or_cancel(uri, should_cancel)
+        })
     }
 
     fn list_prompts(&self, cursor: Option<&str>) -> Result<Value, String> {
@@ -2081,7 +2092,21 @@ impl McpClient {
         &self,
         request: impl FnOnce(&dyn McpTransport) -> Result<Value, String>,
     ) -> Result<Value, McpRequestError> {
-        self.restart_closed_stdio_server()?;
+        self.request_or_cancel(&|| false, request)
+    }
+
+    /// [`Self::request`], for a request that `should_cancel` can stop: one
+    /// cancelled before it is sent, while its stdio server is started again
+    /// too, is never sent.
+    fn request_or_cancel(
+        &self,
+        should_cancel: &dyn Fn() -> bool,
+        request: impl FnOnce(&dyn McpTransport) -> Result<Value, String>,
+    ) -> Result<Value, McpRequestError> {
+        self.restart_closed_stdio_server(should_cancel)?;
+        if should_cancel() {
+            return Err(McpRequestError::Cancelled);
+        }
         let (result, failed) = {
             let transport = self.lock_transport().map_err(McpRequestError::Failed)?;
             let result = request(transport.as_ref());
@@ -2099,7 +2124,7 @@ impl McpClient {
                 let startup_timeout_cap_ms = (self.config.transport == McpTransportKind::Stdio
                     && error == MCP_TOOL_CALL_CANCELLED)
                     .then_some(CANCELLED_STDIO_RECONNECT_TIMEOUT_MS);
-                let reconnected = self.reconnect(&failed, startup_timeout_cap_ms);
+                let reconnected = self.reconnect(&failed, startup_timeout_cap_ms, &|| false);
                 if self.config.transport == McpTransportKind::Stdio
                     && startup_timeout_cap_ms.is_none()
                 {
@@ -2114,9 +2139,13 @@ impl McpClient {
 
     /// Starts a stdio server again, with its full startup timeout, when its
     /// transport is closed: a reconnect cut short after a cancelled call
-    /// left it so. One that cannot start leaves why in
+    /// left it so. A cancel stops the start, and leaves the server to the
+    /// next request. One that cannot start leaves why in
     /// [`Self::take_reconnect_failure`], and the request fails with it.
-    fn restart_closed_stdio_server(&self) -> Result<(), McpRequestError> {
+    fn restart_closed_stdio_server(
+        &self,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<(), McpRequestError> {
         if self.config.transport != McpTransportKind::Stdio {
             return Ok(());
         }
@@ -2127,10 +2156,17 @@ impl McpClient {
             }
             Arc::clone(&*transport)
         };
-        self.reconnect(&closed, None).map_err(|error| {
-            *self.lock_reconnect_failure() = Some(error.clone());
-            McpRequestError::from_message(error)
-        })
+        if should_cancel() {
+            return Err(McpRequestError::Cancelled);
+        }
+        match self.reconnect(&closed, None, should_cancel) {
+            Ok(()) => Ok(()),
+            Err(_) if should_cancel() => Err(McpRequestError::Cancelled),
+            Err(error) => {
+                *self.lock_reconnect_failure() = Some(error.clone());
+                Err(McpRequestError::from_message(error))
+            }
+        }
     }
 
     /// Connects the server again, with its startup timeout capped at
@@ -2147,6 +2183,7 @@ impl McpClient {
         &self,
         failed: &Arc<dyn McpTransport>,
         startup_timeout_cap_ms: Option<u64>,
+        should_cancel: &dyn Fn() -> bool,
     ) -> Result<(), String> {
         let mut config = self.config.clone();
         if let Some(cap_ms) = startup_timeout_cap_ms {
@@ -2159,12 +2196,12 @@ impl McpClient {
                 return Ok(());
             }
             current.terminate();
-            *current = self.connect(&config)?;
+            *current = self.connect(&config, should_cancel)?;
         } else {
             if !Arc::ptr_eq(&*self.lock_transport()?, failed) {
                 return Ok(());
             }
-            let transport = self.connect(&config)?;
+            let transport = self.connect(&config, should_cancel)?;
             let mut current = self.lock_transport()?;
             if Arc::ptr_eq(&current, failed) {
                 *current = transport;
@@ -2186,13 +2223,18 @@ impl McpClient {
     }
 
     /// A new transport to the server `config` describes, started under the
-    /// client's stop, once it has answered `initialize` and `tools/list`.
-    fn connect(&self, config: &McpServerConfig) -> Result<Arc<dyn McpTransport>, String> {
+    /// client's stop, once it has answered `initialize` and `tools/list`,
+    /// unless `should_cancel` stops it first.
+    fn connect(
+        &self,
+        config: &McpServerConfig,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Arc<dyn McpTransport>, String> {
         let transport = self.stop.start(&self.server_name, || {
             transport::connect_with_credentials(config, self.credentials_path.clone())
         })?;
-        transport.initialize()?;
-        let _ = transport.list_tools(None)?;
+        transport.initialize_or_cancel(should_cancel)?;
+        let _ = transport.list_tools_or_cancel(None, should_cancel)?;
         Ok(transport)
     }
 
@@ -3131,6 +3173,159 @@ done
 
         assert_eq!(answered.output, "answered by 3");
         assert_eq!(registry.server_statuses()[0].state, McpServerState::Ready);
+    }
+
+    /// A stdio server whose starts after the first answer `initialize` only
+    /// after `restart_seconds`, or never, when that is `None`: the server then
+    /// exits. Its first start blocks in the first `tools/call` it gets and
+    /// writes `started`; later ones answer each call, writing their
+    /// generation to `called` first.
+    #[cfg(unix)]
+    fn restarting_server_config(
+        dir: &std::path::Path,
+        restart_seconds: Option<u32>,
+    ) -> (McpServerConfig, PathBuf, PathBuf) {
+        let server = dir.join("restarting_mcp_server.sh");
+        let restart = match restart_seconds {
+            Some(seconds) => format!("sleep {seconds}"),
+            None => "exit 1".to_string(),
+        };
+        std::fs::write(
+            &server,
+            format!(
+                r#"#!/bin/sh
+generation=0
+if [ -f "$GENERATION_FILE" ]; then
+  IFS= read -r generation < "$GENERATION_FILE"
+fi
+generation=$((generation + 1))
+printf '%s' "$generation" > "$GENERATION_FILE"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      if [ "$generation" -gt 1 ]; then
+        {restart}
+      fi
+      printf '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"slow","version":"1"}}}}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"wait","description":"waits","inputSchema":{{"type":"object","properties":{{}},"required":[]}}}}]}}}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      if [ "$generation" -eq 1 ]; then
+        printf started > "$STARTED_FILE"
+        IFS= read -r ignored
+      else
+        printf '%s\n' "$generation" >> "$CALLED_FILE"
+        id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"answered by %s"}}],"isError":false}}}}\n' "$id" "$generation"
+      fi
+      ;;
+  esac
+done
+"#
+            ),
+        )
+        .expect("write MCP fixture");
+        let started_file = dir.join("started");
+        let called_file = dir.join("called");
+        let mut config = stdio_fixture_config("slow", &server);
+        config.env = HashMap::from([
+            (
+                "GENERATION_FILE".to_string(),
+                dir.join("generation").to_string_lossy().into_owned(),
+            ),
+            (
+                "STARTED_FILE".to_string(),
+                started_file.to_string_lossy().into_owned(),
+            ),
+            (
+                "CALLED_FILE".to_string(),
+                called_file.to_string_lossy().into_owned(),
+            ),
+        ]);
+        config.startup_timeout_ms = Some(10_000);
+        (config, started_file, called_file)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_call_cancelled_while_its_server_starts_again_is_never_sent() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (config, started_file, called_file) =
+            restarting_server_config(temp_dir.path(), Some(2));
+        let registry = connected_registry(&[config], None);
+        let tool_ref = registry
+            .resolve_tool("mcp__slow__wait")
+            .expect("slow tool ref");
+        // The cancel cuts short the start that follows, so the next call
+        // starts the server again first.
+        let cancelled =
+            registry.call_tool_or_cancel(&tool_ref, Value::Object(Default::default()), &|| {
+                started_file.exists()
+            });
+        assert_eq!(cancelled.unwrap_err(), "MCP tool call cancelled");
+
+        let sent = Instant::now();
+        let cancelled =
+            registry.call_tool_or_cancel(&tool_ref, Value::Object(Default::default()), &|| {
+                sent.elapsed() >= Duration::from_millis(200)
+            });
+
+        assert_eq!(cancelled.unwrap_err(), "MCP tool call cancelled");
+        assert!(
+            sent.elapsed() < Duration::from_millis(1_500),
+            "the cancel waited {:?} for the server to start",
+            sent.elapsed()
+        );
+        assert!(
+            !called_file.exists(),
+            "a call cancelled before it was sent reached the server"
+        );
+        assert_eq!(
+            registry.server_statuses()[0].state,
+            McpServerState::Ready,
+            "a start cut short by a cancel must not fail the server"
+        );
+
+        let answered = registry
+            .call_tool(&tool_ref, Value::Object(Default::default()))
+            .expect("the next call starts the server again and is answered");
+
+        assert_eq!(answered.output, "answered by 4");
+        assert_eq!(
+            std::fs::read_to_string(&called_file).expect("the calls the server got"),
+            "4\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_cannot_start_again_after_a_cancel_fails_the_next_call() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (config, started_file, _) = restarting_server_config(temp_dir.path(), None);
+        let registry = connected_registry(&[config], None);
+        let tool_ref = registry
+            .resolve_tool("mcp__slow__wait")
+            .expect("slow tool ref");
+        let cancelled =
+            registry.call_tool_or_cancel(&tool_ref, Value::Object(Default::default()), &|| {
+                started_file.exists()
+            });
+        assert_eq!(cancelled.unwrap_err(), "MCP tool call cancelled");
+        assert_eq!(registry.server_statuses()[0].state, McpServerState::Ready);
+
+        let error = registry
+            .call_tool(&tool_ref, Value::Object(Default::default()))
+            .expect_err("the server cannot start again");
+
+        assert_eq!(
+            registry.server_statuses()[0].state,
+            McpServerState::Failed { message: error },
+            "a server that cannot start again is failed with the reason"
+        );
     }
 
     #[cfg(unix)]
@@ -5296,7 +5491,7 @@ done
         let client = registry.client("x").expect("the server's client");
         let current = client.lock_transport().expect("its transport").clone();
         client
-            .reconnect(&current, None)
+            .reconnect(&current, None, &|| false)
             .expect("reconnect through the client");
         let after_the_client = overlapping_starts(temp_dir.path(), "x");
 
@@ -6097,7 +6292,7 @@ done
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
-                client.reconnect(&failed, None)
+                client.reconnect(&failed, None, &|| false)
             })
         });
         for reconnect in reconnects {

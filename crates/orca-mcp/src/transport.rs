@@ -110,9 +110,27 @@ pub trait McpTransport: Send + Sync {
         None
     }
     fn initialize(&self) -> Result<Value, String>;
+    /// [`Self::initialize`], for a start that `should_cancel` can stop.
+    fn initialize_or_cancel(&self, should_cancel: &dyn Fn() -> bool) -> Result<Value, String> {
+        if should_cancel() {
+            return Err("MCP tool call cancelled".to_string());
+        }
+        self.initialize()
+    }
     /// Sends `tools/list` for the page that starts at `cursor`, or for the
     /// first page.
     fn list_tools(&self, cursor: Option<&str>) -> Result<Value, String>;
+    /// [`Self::list_tools`], for a start that `should_cancel` can stop.
+    fn list_tools_or_cancel(
+        &self,
+        cursor: Option<&str>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        if should_cancel() {
+            return Err("MCP tool call cancelled".to_string());
+        }
+        self.list_tools(cursor)
+    }
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String>;
     fn call_tool_with_elicitation_handler(
         &self,
@@ -474,16 +492,11 @@ impl McpTransport for StdioTransport {
     }
 
     fn initialize(&self) -> Result<Value, String> {
-        let result = self.request_with_timeout(
-            "initialize",
-            initialize_params(),
-            self.startup_timeout,
-            None,
-            None,
-        )?;
-        negotiated_protocol_version(&self.server_name, &result)?;
-        self.notify("notifications/initialized", json!({}))?;
-        Ok(result)
+        self.handshake(None)
+    }
+
+    fn initialize_or_cancel(&self, should_cancel: &dyn Fn() -> bool) -> Result<Value, String> {
+        self.handshake(Some(should_cancel))
     }
 
     fn list_tools(&self, cursor: Option<&str>) -> Result<Value, String> {
@@ -493,6 +506,20 @@ impl McpTransport for StdioTransport {
             self.startup_timeout,
             None,
             None,
+        )
+    }
+
+    fn list_tools_or_cancel(
+        &self,
+        cursor: Option<&str>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        self.request_with_timeout(
+            "tools/list",
+            list_params(cursor),
+            self.startup_timeout,
+            None,
+            Some(should_cancel),
         )
     }
 
@@ -650,6 +677,21 @@ impl McpTransport for StdioTransport {
 }
 
 impl StdioTransport {
+    /// Sends `initialize` and then `notifications/initialized`. A cancel
+    /// stops the server.
+    fn handshake(&self, should_cancel: Option<&dyn Fn() -> bool>) -> Result<Value, String> {
+        let result = self.request_with_timeout(
+            "initialize",
+            initialize_params(),
+            self.startup_timeout,
+            None,
+            should_cancel,
+        )?;
+        negotiated_protocol_version(&self.server_name, &result)?;
+        self.notify("notifications/initialized", json!({}))?;
+        Ok(result)
+    }
+
     fn request_with_timeout(
         &self,
         method: &str,
