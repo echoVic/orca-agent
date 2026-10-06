@@ -7900,7 +7900,7 @@ mod tests {
     fn held_messages_leave_the_strip_to_the_runtimes_queue_once_it_has_them() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let mut state = test_state();
-        state.startup_turn_pending = true;
+        state.startup_turn = Some(crate::protocol::SubmitToken::new(1));
         state
             .held_submissions
             .push(crate::queued_input::HeldSubmission::FollowUp(queued(
@@ -7913,7 +7913,7 @@ mod tests {
         );
 
         // Released: the runtime's queue lists it, and the held list does not.
-        state.startup_turn_pending = false;
+        state.startup_turn = None;
         state.held_submissions.clear();
         state.enqueue_user_message(queued("held")).unwrap();
         let lines = queued_preview_lines(&state, 80, &theme);

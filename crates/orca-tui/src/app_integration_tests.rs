@@ -1526,6 +1526,7 @@ fn stale_bound_file_preparation_emits_submission_rejected() {
             prompt: prompt.to_string(),
             bindings,
             images: Vec::new(),
+            token: None,
         });
 
         let rejection =

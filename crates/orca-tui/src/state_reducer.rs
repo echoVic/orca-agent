@@ -915,7 +915,7 @@ impl AppState {
             | TuiEvent::MentionRuntimeReady(_)
             | TuiEvent::ClipboardImagePasteCompleted { .. } => {}
             // The renderer's runtime owner acts on these before they get here.
-            TuiEvent::OperationActive | TuiEvent::TurnNotStarted => {}
+            TuiEvent::OperationActive { .. } | TuiEvent::TurnNotStarted { .. } => {}
             TuiEvent::CompactionStarted => {
                 self.invalidate_recap();
                 self.set_status(AppStatus::Compacting);

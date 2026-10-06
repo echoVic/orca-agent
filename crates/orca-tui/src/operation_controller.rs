@@ -11,7 +11,9 @@ use crossbeam_channel::Sender;
 use orca_core::cancel::{OperationId, OperationIdAllocator};
 
 use crate::prestart_mcp::{McpServers, PrestartedMcp};
-use crate::protocol::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
+use crate::protocol::{
+    SubmitToken, TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse,
+};
 use crate::surface_projection::{SurfaceProjectionState, TuiStreamDeliveryWatermark};
 
 /// Presentation-side correlation for a typed runtime surface operation.
@@ -48,9 +50,9 @@ struct HostedOperationState {
 #[derive(Debug, Default)]
 struct HostedOperationInner {
     surface_active: Option<SurfaceActiveOperation>,
-    /// How many operations have become active so far: the number of times a
-    /// surface was installed.
-    surface_installs: u64,
+    /// The messages submitted to the controller that threads are handling
+    /// now (see [`TuiSurfaceTaskControl::handle_submit`]).
+    handling_submits: Vec<HandlingSubmit>,
     /// Interaction bindings for the live child currently shown in the
     /// conversation. This is separate from the parent's active operation so
     /// focusing a child never steals cancellation/background ownership.
@@ -76,6 +78,50 @@ struct HostedOperationInner {
     /// `mcp_credentials_path`.
     mcp_credentials_path: Option<PathBuf>,
     shutdown: bool,
+}
+
+/// A message submitted to the controller, as the thread handling it knows it.
+#[derive(Debug)]
+struct HandlingSubmit {
+    thread: std::thread::ThreadId,
+    token: Option<SubmitToken>,
+    /// Whether an operation has become active for it.
+    operation_active: bool,
+}
+
+/// Ends the handling of a submit that [`TuiSurfaceTaskControl::handle_submit`]
+/// began, when it goes out of scope.
+pub(crate) struct SubmitHandling<'a> {
+    control: &'a TuiSurfaceTaskControl,
+}
+
+impl SubmitHandling<'_> {
+    /// Whether an operation became active for the submit.
+    pub(crate) fn operation_became_active(&self) -> bool {
+        let thread = std::thread::current().id();
+        self.control
+            .lock_hosted()
+            .handling_submits
+            .iter()
+            .rev()
+            .find(|submit| submit.thread == thread)
+            .is_some_and(|submit| submit.operation_active)
+    }
+}
+
+impl Drop for SubmitHandling<'_> {
+    fn drop(&mut self) {
+        let thread = std::thread::current().id();
+        let mut hosted = self.control.lock_hosted();
+        // The thread's latest: a submit handled inside another ends first.
+        if let Some(index) = hosted
+            .handling_submits
+            .iter()
+            .rposition(|submit| submit.thread == thread)
+        {
+            hosted.handling_submits.remove(index);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -111,11 +157,32 @@ impl TuiSurfaceTaskControl {
         self.lock_hosted().interrupt_requested
     }
 
-    /// How many operations have become active so far. A message the
-    /// controller handled made one active when this number is greater after
-    /// than before.
-    pub(crate) fn surface_installs(&self) -> u64 {
-        self.lock_hosted().surface_installs
+    /// Notes that the calling thread is handling a message submitted to the
+    /// controller, until the returned guard goes out of scope. `token` is the
+    /// name the renderer gave the message, if it did. The operations this
+    /// thread makes active meanwhile are that message's: they carry the token
+    /// ([`Self::submit_token`]), and the guard says whether any became active.
+    /// The operations of every other thread, and of this one when it is not
+    /// handling a submit, are not.
+    pub(crate) fn handle_submit(&self, token: Option<SubmitToken>) -> SubmitHandling<'_> {
+        self.lock_hosted().handling_submits.push(HandlingSubmit {
+            thread: std::thread::current().id(),
+            token,
+            operation_active: false,
+        });
+        SubmitHandling { control: self }
+    }
+
+    /// The token of the message the calling thread is handling, if it is
+    /// handling one that has a token.
+    pub(crate) fn submit_token(&self) -> Option<SubmitToken> {
+        let thread = std::thread::current().id();
+        self.lock_hosted()
+            .handling_submits
+            .iter()
+            .rev()
+            .find(|submit| submit.thread == thread)
+            .and_then(|submit| submit.token)
     }
 
     pub(crate) fn interrupt_current(&self) -> io::Result<bool> {
@@ -883,7 +950,15 @@ impl TuiSurfaceTaskControl {
                 background_requested,
                 background_handoff_pending: false,
             });
-            hosted.surface_installs += 1;
+            let thread = std::thread::current().id();
+            if let Some(submit) = hosted
+                .handling_submits
+                .iter_mut()
+                .rev()
+                .find(|submit| submit.thread == thread)
+            {
+                submit.operation_active = true;
+            }
             hosted.surface_activation_armed = false;
             hosted.interrupt_requested = false;
             break background_requested;
@@ -1646,6 +1721,44 @@ mod tests {
         bytes[6] = 0x70 | (seed & 0x0f);
         bytes[8] = 0x80 | (seed & 0x3f);
         SurfaceOperationId::try_from_bytes(bytes).expect("surface operation id")
+    }
+
+    #[test]
+    fn a_submit_a_thread_is_handling_is_named_on_that_thread_until_it_is_done() {
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let token = crate::protocol::SubmitToken::new(3);
+        assert_eq!(control.submit_token(), None);
+
+        {
+            let handling = control.handle_submit(Some(token));
+            assert_eq!(control.submit_token(), Some(token));
+            assert!(!handling.operation_became_active());
+            // The operations of another thread are not this submit's.
+            let other = control.clone();
+            std::thread::spawn(move || assert_eq!(other.submit_token(), None))
+                .join()
+                .expect("the other thread");
+            assert_eq!(control.submit_token(), Some(token));
+        }
+
+        assert_eq!(control.submit_token(), None, "it is done");
+        // A submit that was given no token has none to carry.
+        let handling = control.handle_submit(None);
+        assert_eq!(control.submit_token(), None);
+        assert!(!handling.operation_became_active());
+        drop(handling);
+
+        // One handled inside another ends first, and leaves the other named.
+        let outer = control.handle_submit(Some(token));
+        let inner = control.handle_submit(Some(crate::protocol::SubmitToken::new(4)));
+        assert_eq!(
+            control.submit_token(),
+            Some(crate::protocol::SubmitToken::new(4))
+        );
+        drop(inner);
+        assert_eq!(control.submit_token(), Some(token));
+        drop(outer);
+        assert_eq!(control.submit_token(), None);
     }
 
     #[test]

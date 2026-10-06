@@ -959,6 +959,7 @@ fn reject_action(client: &TuiClient, action: UserAction, message: &str) {
             prompt,
             bindings,
             images,
+            ..
         }
         | UserAction::QueuePrompt {
             prompt,
@@ -1246,7 +1247,7 @@ pub(crate) fn run(
                         }
                         UserAction::Submit(text) =>
                             submit(&connection, &id, Submission::text(text), &mut prompt, &client),
-                        UserAction::SubmitWithMentions { prompt: text, bindings, images } =>
+                        UserAction::SubmitWithMentions { prompt: text, bindings, images, .. } =>
                             submit(&connection, &id, Submission { text, bindings, images, queued_id: None }, &mut prompt, &client),
                         action @ (UserAction::SetModel(_) | UserAction::Interrupt) => {
                             if control.is_some() {

@@ -580,10 +580,12 @@ fn enqueue_action(
 
 fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
     let message = "TUI command queue is full; command rejected".to_string();
-    let plain_submit = matches!(
-        action,
-        UserAction::Submit(_) | UserAction::SubmitWithMentions { .. }
-    );
+    // A plain submit, with the token it carried: the controller never gets it.
+    let plain_submit = match &action {
+        UserAction::Submit(_) => Some(None),
+        UserAction::SubmitWithMentions { token, .. } => Some(*token),
+        _ => None,
+    };
     match action {
         UserAction::Submit(prompt) => {
             let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
@@ -598,6 +600,7 @@ fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
             prompt,
             bindings,
             images,
+            ..
         }
         | UserAction::QueuePrompt {
             prompt,
@@ -661,9 +664,17 @@ fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
         }
     }
     // A message the controller never gets is one it did not start a turn for;
-    // said after the rejection, as the controller says it.
-    if plain_submit {
-        let _ = event_tx.try_send(TuiEvent::TurnNotStarted);
+    // said after the rejection, as the controller says it. The renderer holds
+    // what the user sends for the turn of a message with a token, and goes on
+    // only when it hears one way or the other, so this one is not left to a
+    // full queue: it waits a moment for room.
+    if let Some(token) = plain_submit {
+        let event = TuiEvent::TurnNotStarted { token };
+        if token.is_some() {
+            let _ = event_tx.send_timeout(event, Duration::from_millis(500));
+        } else {
+            let _ = event_tx.try_send(event);
+        }
     }
 }
 
@@ -1370,7 +1381,44 @@ mod tests {
         // for, and that is said after the rejection, not before it.
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(TuiEvent::TurnNotStarted)
+            Ok(TuiEvent::TurnNotStarted { token: None })
+        ));
+        dispatcher.shutdown().expect("shutdown dispatcher");
+    }
+
+    #[test]
+    fn an_overflowed_submit_with_a_token_says_no_turn_started_with_that_token() {
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (mut dispatcher, _command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
+        let token = crate::protocol::SubmitToken::new(5);
+
+        raw_tx
+            .send(UserAction::Submit("first".to_string()))
+            .unwrap();
+        raw_tx
+            .send(UserAction::Submit("second".to_string()))
+            .unwrap();
+        raw_tx
+            .send(UserAction::SubmitWithMentions {
+                prompt: "third".to_string(),
+                bindings: orca_runtime::mentions::MentionBindings::new("third"),
+                images: Vec::new(),
+                token: Some(token),
+            })
+            .unwrap();
+
+        // The controller will never get it: the renderer, which holds what the
+        // user sends for the turn of that submit, is told so, with its token.
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::SubmissionRejected { prompt, .. }) if prompt == "third"
+        ));
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::TurnNotStarted { token: Some(got) }) if got == token
         ));
         dispatcher.shutdown().expect("shutdown dispatcher");
     }

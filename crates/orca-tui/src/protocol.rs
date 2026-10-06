@@ -265,14 +265,20 @@ pub enum TuiEvent {
     /// The controller has an operation active: its surface is installed, so a
     /// follow-up queued from now on goes straight to the runtime's queue, behind
     /// it, and the queue shows it. Sent for each operation, ahead of the events
-    /// of its turn.
-    OperationActive,
+    /// of its turn. `token` is the one the submit that started it carried, if
+    /// it was one that carried a token: the operations of nothing else have it.
+    OperationActive {
+        token: Option<SubmitToken>,
+    },
     /// The controller finished handling a message submitted to it without an
     /// operation having become active for it: it was rejected, it failed, or
     /// the runtime queued it behind a turn that was already running. Sent
     /// after whatever it said of that (a rejection, an error), and for every
-    /// message submitted that did not start a turn.
-    TurnNotStarted,
+    /// message submitted that did not start a turn. `token` is the one the
+    /// message carried, if any.
+    TurnNotStarted {
+        token: Option<SubmitToken>,
+    },
     PromptQueueUpdated(orca_runtime::prompt_queue::PromptQueueSnapshot),
     /// The running turn accepted a `SubmitNow` follow-up; the model sees it
     /// before its next request.
@@ -609,6 +615,19 @@ impl From<SurfaceReadError> for TaskTranscriptError {
     }
 }
 
+/// A number the renderer gives a submit it must know the fate of, so that the
+/// events about it can be told from those about the commands and turns that
+/// came before it: a submit and the operation it starts are matched by this,
+/// not by the order the events come in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubmitToken(u64);
+
+impl SubmitToken {
+    pub(crate) fn new(number: u64) -> Self {
+        Self(number)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum UserAction {
     StartSideConversation {
@@ -653,6 +672,11 @@ pub enum UserAction {
         prompt: String,
         bindings: MentionBindings,
         images: Vec<ComposerImageAttachment>,
+        /// Names this submit to the renderer that sent it: the events that say
+        /// whether a turn started for it (`TuiEvent::OperationActive`,
+        /// `TuiEvent::TurnNotStarted`) carry it back, and those of any other
+        /// submit or operation do not.
+        token: Option<SubmitToken>,
     },
     QueuePrompt {
         prompt: String,

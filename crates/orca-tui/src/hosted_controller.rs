@@ -39,7 +39,9 @@ use crate::hosted_submission::{handle_hosted_queued_prompt, handle_hosted_submit
 use crate::hosted_workflow::{HostedWorkflowAction, handle_hosted_workflow_action};
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::prestart_mcp::start_prestart_mcp;
-use crate::protocol::{SessionAttachmentId, TaskTranscriptResult, TuiEvent, UserAction};
+use crate::protocol::{
+    SessionAttachmentId, SubmitToken, TaskTranscriptResult, TuiEvent, UserAction,
+};
 use crate::slash_command_actions::decode_settings_intent;
 use crate::submitted_turn::SubmittedTurn;
 use crate::surface_client;
@@ -205,9 +207,13 @@ fn prestart_mcp_servers(
 /// renderer holds what the user sends until the turn it started is active, and
 /// goes on with the next when that one will not be (`TuiEvent::TurnNotStarted`).
 /// A turn that is active has said so (`TuiEvent::OperationActive`) before its
-/// first event.
+/// first event. `token` is the name the renderer gave the message, if it did:
+/// both events carry it back, so that the renderer can tell this message's
+/// turn from the commands and turns that were ahead of it in the controller's
+/// line.
 #[allow(clippy::too_many_arguments)]
 fn handle_submitted_turn(
+    token: Option<SubmitToken>,
     submitted_turn: SubmittedTurn,
     config: &Arc<Mutex<RunConfig>>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
@@ -217,7 +223,7 @@ fn handle_submitted_turn(
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     host: &RuntimeHostHandle,
 ) {
-    let installs = control.surface_installs();
+    let handling = control.handle_submit(token);
     handle_hosted_submitted_turn(
         submitted_turn,
         config,
@@ -228,8 +234,8 @@ fn handle_submitted_turn(
         pending_workflow_notifications,
         host,
     );
-    if control.surface_installs() == installs {
-        let _ = event_tx.send(TuiEvent::TurnNotStarted);
+    if !handling.operation_became_active() {
+        let _ = event_tx.send(TuiEvent::TurnNotStarted { token });
     }
 }
 
@@ -667,6 +673,7 @@ pub(crate) fn hosted_tui_controller_loop(
                 );
             }
             Ok(UserAction::Submit(prompt)) => handle_submitted_turn(
+                None,
                 SubmittedTurn::user(prompt),
                 &hosted_config_for_active(side_parent.as_ref(), thread.as_ref(), &config),
                 &preloaded,
@@ -680,8 +687,10 @@ pub(crate) fn hosted_tui_controller_loop(
                 prompt,
                 bindings,
                 images,
+                token,
             }) => {
                 handle_submitted_turn(
+                    token,
                     SubmittedTurn::user_with_mentions(prompt, bindings, images),
                     &hosted_config_for_active(side_parent.as_ref(), thread.as_ref(), &config),
                     &preloaded,
@@ -1166,7 +1175,9 @@ mod tests {
     use crate::agent_runtime::TuiAgentRuntime;
     use crate::bridge;
     use crate::operation_controller::TuiSurfaceTaskControl;
-    use crate::protocol::{AttachedTuiEvent, TaskTranscriptResult, TuiEvent, UserAction};
+    use crate::protocol::{
+        AttachedTuiEvent, SubmitToken, TaskTranscriptResult, TuiEvent, UserAction,
+    };
 
     fn next_controller_event(event_rx: &mpsc::Receiver<TuiEvent>) -> TuiEvent {
         loop {
@@ -1445,30 +1456,60 @@ mod tests {
         events
     }
 
+    /// The events of a turn the controller ran for `action`, up to its end.
+    fn events_of_the_turn(
+        action_tx: &mpsc::Sender<UserAction>,
+        event_rx: &mpsc::Receiver<TuiEvent>,
+        action: UserAction,
+    ) -> Vec<TuiEvent> {
+        action_tx.send(action).expect("submit action");
+        let mut turn = Vec::new();
+        loop {
+            let event = next_controller_event(event_rx);
+            let done = matches!(event, TuiEvent::SessionCompleted { .. });
+            turn.push(event);
+            if done {
+                return turn;
+            }
+        }
+    }
+
+    fn submit_with_a_token(prompt: &str, token: Option<SubmitToken>) -> UserAction {
+        UserAction::SubmitWithMentions {
+            prompt: prompt.to_string(),
+            bindings: orca_runtime::mentions::MentionBindings::new(prompt),
+            images: Vec::new(),
+            token,
+        }
+    }
+
+    fn the_activations(events: &[TuiEvent]) -> Vec<Option<SubmitToken>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TuiEvent::OperationActive { token } => Some(*token),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn a_submit_that_starts_a_turn_makes_its_operation_active_before_the_turns_events() {
         let (_home, action_tx, event_rx, mut runtime) =
             spawn_controller_with_history(HistoryMode::Record);
 
-        action_tx
-            .send(UserAction::Submit("tidy the relay drain".to_string()))
-            .expect("submit action");
-        let mut turn = Vec::new();
-        loop {
-            let event = next_controller_event(&event_rx);
-            let done = matches!(event, TuiEvent::SessionCompleted { .. });
-            turn.push(event);
-            if done {
-                break;
-            }
-        }
+        let turn = events_of_the_turn(
+            &action_tx,
+            &event_rx,
+            UserAction::Submit("tidy the relay drain".to_string()),
+        );
         let after = events_until_the_controller_ends(&action_tx, &event_rx, &mut runtime);
 
         // The renderer queues a follow-up straight to the runtime from the
         // moment it hears of this, and none of the turn's events came before.
         let active = turn
             .iter()
-            .position(|event| matches!(event, TuiEvent::OperationActive))
+            .position(|event| matches!(event, TuiEvent::OperationActive { .. }))
             .expect("the operation was announced");
         let first_of_the_turn = turn
             .iter()
@@ -1487,44 +1528,95 @@ mod tests {
             !turn
                 .iter()
                 .chain(after.iter())
-                .any(|event| matches!(event, TuiEvent::TurnNotStarted)),
+                .any(|event| matches!(event, TuiEvent::TurnNotStarted { .. })),
             "{turn:?} then {after:?}"
         );
     }
 
     #[test]
-    fn a_submit_that_is_refused_says_that_no_turn_started() {
+    fn the_token_of_a_submit_comes_back_on_the_activation_of_its_own_operation_only() {
+        let (_home, action_tx, event_rx, mut runtime) =
+            spawn_controller_with_history(HistoryMode::Record);
+        let token = SubmitToken::new(7);
+
+        // A turn that was ahead of it in the controller's line, then the
+        // submit that has a token, then one that was behind it.
+        let mut events =
+            events_of_the_turn(&action_tx, &event_rx, submit_with_a_token("one", None));
+        events.extend(events_of_the_turn(
+            &action_tx,
+            &event_rx,
+            submit_with_a_token("two", Some(token)),
+        ));
+        events.extend(events_of_the_turn(
+            &action_tx,
+            &event_rx,
+            UserAction::Submit("three".to_string()),
+        ));
+        events.extend(events_until_the_controller_ends(
+            &action_tx,
+            &event_rx,
+            &mut runtime,
+        ));
+
+        // Each turn made an operation active, and only the second says whose
+        // it is.
+        assert_eq!(
+            the_activations(&events),
+            [None, Some(token), None],
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TuiEvent::TurnNotStarted { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_submit_that_is_refused_says_that_no_turn_started_with_its_token() {
         let (_home, action_tx, event_rx, mut runtime) =
             spawn_controller_with_history(HistoryMode::Record);
         let root = std::env::current_dir().expect("working directory");
         let prompt = "review @gone.txt";
-        let bindings = orca_runtime::mentions::MentionBindings::from_bindings(
-            prompt,
-            vec![orca_runtime::mentions::MentionBinding {
-                start: 7,
-                end: prompt.len(),
-                visible: "@gone.txt".to_string(),
-                target: orca_runtime::mentions::MentionTarget::File {
-                    root,
-                    path: "no-such-file-for-the-held-message-tests.txt".to_string(),
-                    kind: orca_runtime::mentions::MentionFileKind::File,
-                },
-            }],
-        );
-
-        action_tx
-            .send(UserAction::SubmitWithMentions {
+        let gone = |token| {
+            let bindings = orca_runtime::mentions::MentionBindings::from_bindings(
+                prompt,
+                vec![orca_runtime::mentions::MentionBinding {
+                    start: 7,
+                    end: prompt.len(),
+                    visible: "@gone.txt".to_string(),
+                    target: orca_runtime::mentions::MentionTarget::File {
+                        root: root.clone(),
+                        path: "no-such-file-for-the-held-message-tests.txt".to_string(),
+                        kind: orca_runtime::mentions::MentionFileKind::File,
+                    },
+                }],
+            );
+            UserAction::SubmitWithMentions {
                 prompt: prompt.to_string(),
                 bindings,
                 images: Vec::new(),
-            })
-            .expect("submit action");
-        // What the controller says of it, up to its saying that no turn
-        // started: a cancel sent at once could get ahead of the message.
+                token,
+            }
+        };
+        let token = SubmitToken::new(11);
+
+        // One that has no token, as a `$skill` typed before the history is,
+        // and one that has.
+        action_tx.send(gone(None)).expect("submit action");
+        action_tx.send(gone(Some(token))).expect("submit action");
+        // What the controller says of them, up to its saying that no turn
+        // started for the second: a cancel sent at once could get ahead of
+        // the messages.
         let mut events = Vec::new();
         loop {
             let event = next_controller_event(&event_rx);
-            let done = matches!(event, TuiEvent::TurnNotStarted);
+            let done = matches!(
+                &event,
+                TuiEvent::TurnNotStarted { token: Some(got) } if *got == token
+            );
             events.push(event);
             if done {
                 break;
@@ -1536,19 +1628,29 @@ mod tests {
             &mut runtime,
         ));
 
-        let rejected = events
+        // Each says, after its rejection, that no turn started, and with its
+        // own token.
+        let outcome: Vec<String> = events
             .iter()
-            .position(|event| matches!(event, TuiEvent::SubmissionRejected { .. }))
-            .expect("the message was refused");
-        let not_started = events
-            .iter()
-            .position(|event| matches!(event, TuiEvent::TurnNotStarted))
-            .expect("the controller said no turn started");
-        assert!(rejected < not_started, "{events:?}");
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, TuiEvent::OperationActive)),
+            .filter_map(|event| match event {
+                TuiEvent::SubmissionRejected { .. } => Some("rejected".to_string()),
+                TuiEvent::TurnNotStarted { token: None } => Some("no turn, no token".to_string()),
+                TuiEvent::TurnNotStarted { token: Some(got) } if *got == token => {
+                    Some("no turn, its token".to_string())
+                }
+                TuiEvent::TurnNotStarted { token } => Some(format!("no turn, {token:?}")),
+                TuiEvent::OperationActive { .. } => Some("ACTIVE".to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            outcome,
+            [
+                "rejected",
+                "no turn, no token",
+                "rejected",
+                "no turn, its token"
+            ],
             "{events:?}"
         );
     }

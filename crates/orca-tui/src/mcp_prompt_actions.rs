@@ -516,6 +516,7 @@ mod tests {
             prompt,
             bindings,
             images,
+            ..
         }) = action_rx.try_recv()
         else {
             panic!("the expansion was not sent");

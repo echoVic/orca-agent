@@ -1184,6 +1184,51 @@ fn a_message_held_for_the_resumed_history_stays_in_view_and_in_order_while_the_p
 }
 
 #[test]
+fn messages_held_behind_a_command_typed_before_the_history_still_follow_the_prompt() {
+    const SLOW_PROMPT: &str = "mock_stream_delay_ms 1500";
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let _recorded_in = record_a_conversation(home.path(), "pty resume seed");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process = PtyProcess::spawn_resumed(home.path(), cwd.path(), "latest", SLOW_PROMPT)
+        .expect("spawn resumed TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "resuming a conversation skipped the review of a new workspace",
+    );
+    // `/compact` is typed before the history can have loaded: it is ahead of
+    // the prompt in the controller's line, and the two messages after it.
+    process
+        .write(b"\r/compact\rA held\rmock_history_echo\r")
+        .expect("accept the workspace and type a command and two messages");
+
+    // The mock lists the user messages it was given: the prompt comes
+    // before the messages typed before it started.
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Mock history users: pty resume seed | mock_stream_delay_ms 1500 | A held | mock_history_echo",
+        "the messages did not run after the prompt",
+    );
+    // The command did run, ahead of the prompt: this is not the prompt
+    // running alone.
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "Compacted conversation context manually",
+        "the command typed before the history did not run",
+    );
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
 fn a_message_typed_before_a_conversation_that_cannot_be_resumed_is_not_held_for_good() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");

@@ -1198,7 +1198,6 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/running_actions.rs:handle_running_shortcut:user_action.route", 2],
   ["crates/orca-tui/src/runtime_event_actions.rs:handle_runtime_event:user_action.route", 1],
   ["crates/orca-tui/src/runtime_event_actions.rs:handle_runtime_event:workflow.continue", 2],
-  ["crates/orca-tui/src/renderer_runtime.rs:handle:user_action.route", 1],
   ["crates/orca-tui/src/session_picker_actions.rs:handle_session_picker_key:user_action.route", 3],
   ["crates/orca-tui/src/session_picker_actions.rs:activate_action:user_action.route", 2],
   ["crates/orca-tui/src/session_picker_actions.rs:dispatch_selected_resume:user_action.route", 1],

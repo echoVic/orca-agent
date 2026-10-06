@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::composer_images::{ComposerImageAttachment, ComposerImageState};
 use crate::composer_textarea::{expand_pending_pastes_with_bindings, retain_active_pending_pastes};
-use crate::protocol::UserAction;
+use crate::protocol::{SubmitToken, UserAction};
 #[cfg(test)]
 use crate::transcript_state::ChatMessage;
 use crate::types::AppState;
@@ -617,7 +617,21 @@ impl AppState {
     /// active yet (a message queued now would wait in the controller's own line,
     /// behind that whole turn, where nothing shows it).
     pub(crate) fn holds_submissions(&self) -> bool {
-        self.startup_history_pending || self.startup_turn_pending
+        self.startup_history_pending || self.startup_turn.is_some()
+    }
+
+    /// Whether the held messages wait for the turn of the submit named
+    /// `token`. A submit or operation that has no token, or a different one,
+    /// is not the one: the events about it come in the controller's own order,
+    /// which is not the order the renderer sent its messages in.
+    pub(crate) fn waits_for_turn_of(&self, token: Option<SubmitToken>) -> bool {
+        token.is_some() && self.startup_turn == token
+    }
+
+    /// A token not given to any submit before.
+    pub(crate) fn new_submit_token(&mut self) -> SubmitToken {
+        self.next_submit_token += 1;
+        SubmitToken::new(self.next_submit_token)
     }
 
     /// What the strip above the composer shows of the messages held back.

@@ -59,8 +59,8 @@ use crate::workspace_status::GitIdentity;
 
 use crate::interaction_state::PendingInteractionSubmission;
 use crate::protocol::{
-    PendingWorkflowNotification, SessionAttachmentId, TaskTranscriptRequest, TaskTranscriptResult,
-    TuiInteractionKey, UserAction,
+    PendingWorkflowNotification, SessionAttachmentId, SubmitToken, TaskTranscriptRequest,
+    TaskTranscriptResult, TuiInteractionKey, UserAction,
 };
 
 /// Local read-only state for the child transcript detail view. The runtime
@@ -605,11 +605,16 @@ pub struct AppState {
     pub(crate) startup_history_pending: bool,
     /// The history has loaded and the turn that was started after it, with the
     /// prompt given on the command line or with the first message held, is not
-    /// active yet. What the user sends is still held, until that turn's
-    /// operation is active (`TuiEvent::OperationActive`) and a message can be
-    /// queued behind it, or until it is known that it will not be
-    /// (`TuiEvent::TurnNotStarted`).
-    pub(crate) startup_turn_pending: bool,
+    /// active yet; the token is the name the submit that started it carries.
+    /// What the user sends is still held, until the operation of that submit is
+    /// active (`TuiEvent::OperationActive` with the token) and a message can
+    /// be queued behind it, or until it is known that it will not be
+    /// (`TuiEvent::TurnNotStarted` with the token). The events of any other
+    /// submit or operation, which come in the controller's own order, change
+    /// nothing.
+    pub(crate) startup_turn: Option<SubmitToken>,
+    /// How many tokens have been given to submits.
+    pub(crate) next_submit_token: u64,
     /// What the user sent while the hold lasted, in order.
     pub(crate) held_submissions: Vec<HeldSubmission>,
     pub setup_step: u8,
@@ -1025,7 +1030,8 @@ impl AppState {
             denied_approval_stops_turn: false,
             runtime_turn_id: None,
             startup_history_pending: false,
-            startup_turn_pending: false,
+            startup_turn: None,
+            next_submit_token: 0,
             held_submissions: Vec::new(),
             setup_step: 0,
             setup_selection: 0,
