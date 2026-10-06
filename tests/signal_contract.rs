@@ -286,6 +286,46 @@ fn sigint_while_a_turn_waits_for_mcp_servers_stops_them() {
     sigint_while_waiting_for_mcp_servers_stops_them("jsonl");
 }
 
+/// Sends `signal` to `child`, as `kill` does, but at once: two of these a
+/// millisecond apart arrive a millisecond apart.
+fn send(child: &Child, signal: libc::c_int) {
+    let pid = libc::pid_t::try_from(child.id()).expect("orca's pid");
+    assert_eq!(
+        unsafe { libc::kill(pid, signal) },
+        0,
+        "send signal {signal}"
+    );
+}
+
+/// A signal sent to a process group can reach `orca exec` twice, a
+/// millisecond or so apart: a wrapper script such as the npm launcher, in
+/// the same group, passes on what it got. The copy is the same signal: the
+/// run still stops its servers and commits its terminal record.
+#[test]
+fn sigterm_delivered_twice_while_mcp_servers_start_still_stops_them_and_commits_a_terminal() {
+    let fixture = Fixture::new();
+    let child = spawn_orca_with_a_slow_mcp_server(&fixture, "jsonl", 0);
+    let server_pid = wait_for_mcp_server_pid(&fixture, Duration::from_millis(1));
+
+    send(&child, libc::SIGTERM);
+    std::thread::sleep(Duration::from_millis(1));
+    send(&child, libc::SIGTERM);
+    let output = child.wait_with_output().expect("wait for orca");
+
+    let survived = mcp_server_survived(server_pid);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(143), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("received a second"),
+        "the copy cut the run short: {stderr}"
+    );
+    assert!(
+        !survived,
+        "SIGTERM delivered twice left the MCP server (pid {server_pid}) running after orca exited"
+    );
+    assert_cancelled_terminal("SIGTERM", &String::from_utf8_lossy(&output.stdout));
+}
+
 /// A signal as soon as the run has started its MCP servers, which can be
 /// before its signal handler was in effect when the handler was installed
 /// only after the run's thread started.

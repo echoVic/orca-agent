@@ -506,6 +506,13 @@
       "windows-test-portability"
     ],
     [
+      "signal-contract-exec-signal-libc",
+      "tests/signal_contract.rs",
+      "unix_libc_process",
+      3,
+      "windows-test-portability"
+    ],
+    [
       "tui-pty-contract-signal-libc",
       "tests/tui_pty_contract.rs",
       "unix_libc_process",
@@ -530,7 +537,7 @@
       "termination-signals-test-unix-libc",
       "crates/orca-runtime/src/termination_signals.rs",
       "unix_libc_process",
-      5,
+      7,
       "windows-test-portability"
     ],
     [

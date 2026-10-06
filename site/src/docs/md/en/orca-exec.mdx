@@ -73,8 +73,10 @@ and MCP servers, writes the run's terminal record, and exits with 130 for
 SIGINT or 143 for SIGTERM. In JSONL output the terminal record is the last
 event: session.completed with status cancelled.
 
-A second signal exits at once. If the cleanup takes longer than 10 seconds,
-orca exec exits without waiting for it. On Windows, Ctrl+C in the console is
+A second signal exits at once. A copy of the first that arrives with it
+(within half a second), as a closing terminal or a wrapper script sends,
+counts as the same signal. If the cleanup takes longer than 10 seconds, orca
+exec exits without waiting for it. On Windows, Ctrl+C in the console is
 handled the same way and exits with 130.
 
 ## Related commands

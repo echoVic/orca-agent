@@ -10,14 +10,15 @@
 //! caller reports it finished, or at a second signal, the process exits with
 //! the signal's conventional code, 128 plus its number, after a bounded last
 //! chance for the caller to put back what must not outlive it (the TUI's
-//! terminal modes).
+//! terminal modes). A copy of the first signal that comes with it, as a
+//! closing terminal or a wrapper script delivers, is not a second one.
 
 use std::future::poll_fn;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a signal-interrupted run may spend stopping task-owned commands
 /// and committing its terminal record before it is killed outright.
@@ -26,6 +27,11 @@ pub const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const INTERRUPT_GRACE_POLL: Duration = Duration::from_millis(25);
 /// How long a forced exit waits for the caller's `before_exit`.
 pub const BEFORE_EXIT_BOUND: Duration = Duration::from_millis(500);
+/// How long after the first signal another one is taken for a copy of the
+/// same delivery, and ignored: a terminal that closes, or a wrapper script
+/// that passes on what its process group got, delivers a signal twice, a
+/// millisecond or so apart.
+pub const DUPLICATE_DELIVERY_WINDOW: Duration = Duration::from_millis(500);
 
 /// A signal that asks the process to stop.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -82,10 +88,14 @@ pub struct TerminationSignalGuard {
 /// never comes, say) delays neither of the exits that bound it: if `finished`
 /// is still unset when [`INTERRUPT_GRACE_PERIOD`] has passed, the process
 /// exits with the signal's exit code, and a second signal, of any of them,
-/// exits at once with its own. Such a forced exit first calls `before_exit`,
-/// once, again on a thread of its own, and waits for it [`BEFORE_EXIT_BOUND`]
-/// at most; then it says why on stderr. Once `finished` is set, a signal is
-/// ignored, the thread ends, and `before_exit` never runs.
+/// exits at once with its own. A signal within [`DUPLICATE_DELIVERY_WINDOW`]
+/// of the first is not a second one but a copy of the same delivery, and is
+/// ignored: a terminal that closes, or a wrapper script that passes on what
+/// its process group got, delivers a signal twice, a millisecond or so apart.
+/// A forced exit first calls `before_exit`, once, again on a thread of its
+/// own, and waits for it [`BEFORE_EXIT_BOUND`] at most; then it says why on
+/// stderr. Once `finished` is set, a signal is ignored, the thread ends, and
+/// `before_exit` never runs.
 ///
 /// Windows handles only [`TerminationSignal::Interrupt`], as the console's
 /// Ctrl+C. Returns `None`, handling none of them, when the thread or its
@@ -118,6 +128,7 @@ pub fn handle_termination_signals(
                     signal = listeners.next() => signal,
                     _ = stop_rx => return,
                 };
+                let first_arrived = Instant::now();
                 if finished.load(Ordering::SeqCst) {
                     return;
                 }
@@ -126,7 +137,8 @@ pub fn handle_termination_signals(
                 let _ = std::thread::Builder::new()
                     .name("orca-signal-action".to_string())
                     .spawn(move || on_first_signal(first));
-                bound_the_cleanup(&mut listeners, first, &finished, before_exit).await;
+                bound_the_cleanup(&mut listeners, first, first_arrived, &finished, before_exit)
+                    .await;
             });
         })
         .ok()?;
@@ -134,14 +146,18 @@ pub fn handle_termination_signals(
     Some(TerminationSignalGuard { _stop: stop_tx })
 }
 
-/// Sees the grace period of `first` through: returns once `finished` is set,
-/// and ends the process when the period passes first, or at a second signal
-/// while the cleanup still runs. A second signal always exits immediately:
-/// the grace period exists to let cleanup stop task-owned commands, not to
-/// trap an impatient operator.
+/// Sees the grace period of `first`, which arrived at `first_arrived`,
+/// through: returns once `finished` is set, and ends the process when the
+/// period passes first, or at a second signal while the cleanup still runs.
+/// A second signal always exits immediately: the grace period exists to let
+/// cleanup stop task-owned commands, not to trap an impatient operator. One
+/// within [`DUPLICATE_DELIVERY_WINDOW`] of the first, though, is a copy of
+/// it, which no operator sent, and cutting the cleanup short for it would
+/// leave behind what the first one asked to stop.
 async fn bound_the_cleanup(
     listeners: &mut Listeners,
     first: TerminationSignal,
+    first_arrived: Instant,
     finished: &AtomicBool,
     before_exit: impl FnOnce() + Send + 'static,
 ) {
@@ -163,10 +179,12 @@ async fn bound_the_cleanup(
                 if finished.load(Ordering::SeqCst) {
                     return;
                 }
-                exit_with(second.exit_code(), before_exit, format_args!(
-                    "orca: received a second {}; exiting immediately",
-                    second.name()
-                ));
+                if first_arrived.elapsed() >= DUPLICATE_DELIVERY_WINDOW {
+                    exit_with(second.exit_code(), before_exit, format_args!(
+                        "orca: received a second {}; exiting immediately",
+                        second.name()
+                    ));
+                }
             }
             () = tokio::time::sleep(INTERRUPT_GRACE_POLL) => {
                 if finished.load(Ordering::SeqCst) {
@@ -281,7 +299,9 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use super::{TerminationSignal, handle_termination_signals};
+    use super::{
+        BEFORE_EXIT_BOUND, DUPLICATE_DELIVERY_WINDOW, TerminationSignal, handle_termination_signals,
+    };
 
     /// How long a child waits for the core to end it after the signal that
     /// should: well under the grace period, which an exit by then is not.
@@ -324,8 +344,88 @@ mod tests {
         String::from_utf8_lossy(&output.stderr).into_owned()
     }
 
+    /// Waits out the window in which another signal is a copy of the first,
+    /// so that the next one is a second signal.
+    fn wait_out_the_copies() {
+        std::thread::sleep(DUPLICATE_DELIVERY_WINDOW + Duration::from_millis(100));
+    }
+
+    /// The time on the monotonic clock, which every process on the system
+    /// reads alike.
+    fn monotonic_now() -> Duration {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
+            0,
+            "read the monotonic clock"
+        );
+        Duration::new(
+            u64::try_from(now.tv_sec).expect("seconds since boot"),
+            u32::try_from(now.tv_nsec).expect("nanoseconds"),
+        )
+    }
+
+    /// What a child says on stderr just before it raises the signal that
+    /// forces its exit, with the time on the monotonic clock.
+    const FORCING_AT: &str = "raising the second signal at ns ";
+
+    /// A copy of a signal comes with it: a terminal that closes, or a
+    /// wrapper script that passes on what its process group got, delivers
+    /// it twice, a millisecond or so apart. The copy, of that signal or of
+    /// another one handled, is the same delivery: it cuts nothing short.
+    #[test]
+    fn a_copy_that_comes_with_the_first_signal_is_the_same_delivery() {
+        let Some(child) =
+            in_a_process_of_its_own("a_copy_that_comes_with_the_first_signal_is_the_same_delivery")
+        else {
+            let finished = Arc::new(AtomicBool::new(false));
+            let (acting_tx, acting) = mpsc::channel();
+            let _signals = handle_termination_signals(
+                &[TerminationSignal::Interrupt, TerminationSignal::Terminate],
+                Arc::clone(&finished),
+                move |signal| {
+                    let _ = acting_tx.send(signal);
+                },
+                || {},
+            )
+            .expect("the signal handlers");
+            raise(libc::SIGTERM);
+            assert_eq!(
+                acting
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("the first signal's action ran"),
+                TerminationSignal::Terminate
+            );
+            std::thread::sleep(Duration::from_millis(1));
+            raise(libc::SIGTERM);
+            std::thread::sleep(Duration::from_millis(1));
+            raise(libc::SIGINT);
+            // A second signal would have ended the process by now; the
+            // cleanup goes on and finishes.
+            std::thread::sleep(Duration::from_millis(200));
+            finished.store(true, Ordering::SeqCst);
+            assert!(acting.try_recv().is_err(), "a copy acted again");
+            return;
+        };
+        assert!(
+            child.status.success() && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+            "a copy of the first signal cut the cleanup short ({}); stderr: {}",
+            child.status,
+            stderr(&child)
+        );
+        assert!(
+            !stderr(&child).contains("received a second"),
+            "{}",
+            stderr(&child)
+        );
+    }
+
     /// The first signal's action can block: exec's waits for the actor with
-    /// no timeout. A second signal must still end the process at once.
+    /// no timeout. A second signal, once it can no longer be a copy of the
+    /// first, must still end the process at once.
     #[test]
     fn a_second_signal_exits_at_once_while_the_first_ones_action_blocks() {
         let Some(child) = in_a_process_of_its_own(
@@ -348,6 +448,7 @@ mod tests {
             acting
                 .recv_timeout(Duration::from_secs(1))
                 .expect("the first signal's action started");
+            wait_out_the_copies();
             raise(libc::SIGINT);
             wait_to_be_ended();
         };
@@ -366,7 +467,8 @@ mod tests {
     }
 
     /// Raises SIGTERM twice, the second once the first one's action has
-    /// started, with `before_exit` for the exit the second one forces.
+    /// started and it can no longer be a copy of the first, with
+    /// `before_exit` for the exit the second one forces.
     fn force_an_exit_with(before_exit: impl FnOnce() + Send + 'static) -> ! {
         let (acting_tx, acting) = mpsc::channel();
         let _signals = handle_termination_signals(
@@ -382,6 +484,12 @@ mod tests {
         acting
             .recv_timeout(Duration::from_secs(1))
             .expect("the first signal's action ran");
+        wait_out_the_copies();
+        let _ = writeln!(
+            std::io::stderr(),
+            "{FORCING_AT}{}",
+            monotonic_now().as_nanos()
+        );
         raise(libc::SIGTERM);
         wait_to_be_ended();
     }
@@ -441,6 +549,7 @@ mod tests {
             acting
                 .recv_timeout(Duration::from_secs(1))
                 .expect("the first signal's action ran");
+            wait_out_the_copies();
             raise(libc::SIGTERM);
             // Longer than the grace period's poll and the exit's bound.
             std::thread::sleep(Duration::from_secs(1));
@@ -456,7 +565,8 @@ mod tests {
     }
 
     /// A `before_exit` that never returns (a terminal write that blocks, a
-    /// lock the renderer holds) cannot defeat the exit it comes before.
+    /// lock the renderer holds) cannot defeat the exit it comes before: the
+    /// exit waits for it BEFORE_EXIT_BOUND, and no longer.
     #[test]
     fn a_before_exit_that_never_returns_delays_the_exit_by_its_bound_only() {
         let Some(child) = in_a_process_of_its_own(
@@ -468,17 +578,29 @@ mod tests {
                 }
             });
         };
+        let exited_by = monotonic_now();
+        let stderr = stderr(&child);
         assert_eq!(
             child.status.code(),
             Some(TerminationSignal::Terminate.exit_code()),
-            "the exit waited for before_exit ({}); stderr: {}",
-            child.status,
-            stderr(&child)
+            "the exit waited for before_exit ({}); stderr: {stderr}",
+            child.status
         );
         assert!(
-            stderr(&child).contains("orca: received a second SIGTERM; exiting immediately"),
-            "{}",
-            stderr(&child)
+            stderr.contains("orca: received a second SIGTERM; exiting immediately"),
+            "{stderr}"
+        );
+        let forced_at = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix(FORCING_AT))
+            .and_then(|nanos| nanos.trim().parse::<u64>().ok())
+            .map(Duration::from_nanos)
+            .unwrap_or_else(|| panic!("the child did not say when it forced its exit: {stderr}"));
+        let waited = exited_by.saturating_sub(forced_at);
+        assert!(
+            waited >= BEFORE_EXIT_BOUND && waited < Duration::from_millis(1500),
+            "the exit came {waited:?} after the signal that forced it, not just past \
+             the {BEFORE_EXIT_BOUND:?} it waits for before_exit"
         );
     }
 }
