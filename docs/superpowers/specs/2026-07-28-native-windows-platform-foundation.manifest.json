@@ -513,6 +513,13 @@
       "windows-test-portability"
     ],
     [
+      "controller-signal-test-unix-libc",
+      "crates/orca-runtime/src/controller.rs",
+      "unix_libc_process",
+      2,
+      "windows-test-portability"
+    ],
+    [
       "runtime-permission-test-symlink",
       "crates/orca-runtime/src/runtime_permission.rs",
       "unix_std_api",

@@ -60,6 +60,12 @@ orca exec \
 
 自动化应使用进程退出状态和验证器输出作为门槛。Orca 不承诺一套额外稳定的数字退出码分类，因此脚本不应根据未公开的退出码名称推断结果。
 
+## 中止运行
+
+orca exec 一启动就接管 SIGINT 和 SIGTERM，在任何 MCP 服务器或任务命令启动之前就已生效。收到其中一个信号后，它停止任务命令和 MCP 服务器，写入本次运行的终止记录，然后退出：SIGINT 的退出码是 130，SIGTERM 是 143。JSONL 输出的最后一个事件就是终止记录，即 status 为 cancelled 的 session.completed。
+
+第二个信号会让它立即退出。收尾超过 10 秒时，它不再等待，直接退出。Windows 上，控制台的 Ctrl+C 按同样方式处理，退出码为 130。
+
 ## 相关页面
 
 - [恢复无头运行](orca-exec-resume.md)

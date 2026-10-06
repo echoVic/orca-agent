@@ -2782,6 +2782,9 @@ pub enum RuntimeThreadMutation {
     SetModel(Option<String>),
     AddPinnedContext(String),
     ReplaceSkillContext(Option<String>),
+    /// Records in the session how a run ended that ended before its turn
+    /// could record that itself, as one stopped by a signal while it starts.
+    RecordTerminal(orca_core::budget::OperationTerminal),
 }
 
 impl RuntimeThreadMutation {
@@ -2791,6 +2794,9 @@ impl RuntimeThreadMutation {
             Self::AddPinnedContext(content) => thread.session_mut().add_pinned_context(content),
             Self::ReplaceSkillContext(content) => {
                 thread.session_mut().replace_skill_context(content);
+            }
+            Self::RecordTerminal(terminal) => {
+                thread.session_mut().complete_with_terminal(&terminal)
             }
         }
     }

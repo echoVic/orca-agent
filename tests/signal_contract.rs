@@ -115,7 +115,6 @@ fn run_interrupted(signal: &str, expected_exit_code: i32) {
         .expect("send signal");
 
     let output = child.wait_with_output().expect("wait for orca");
-    let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert_eq!(
         output.status.code(),
@@ -123,22 +122,7 @@ fn run_interrupted(signal: &str, expected_exit_code: i32) {
         "{signal} should keep the conventional exit code; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-
-    let events: Vec<Value> = stdout
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
-    let terminal = events
-        .last()
-        .unwrap_or_else(|| panic!("{signal} produced no events: {stdout}"));
-    assert_eq!(
-        terminal["type"], "session.completed",
-        "{signal} must commit a terminal record; got: {terminal}"
-    );
-    assert_eq!(
-        terminal["payload"]["status"], "cancelled",
-        "{signal} must report the interrupted session as cancelled"
-    );
+    assert_cancelled_terminal(signal, &String::from_utf8_lossy(&output.stdout));
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while process_is_alive(tool_pid) && Instant::now() < deadline {
@@ -157,6 +141,26 @@ fn run_interrupted(signal: &str, expected_exit_code: i32) {
     );
 }
 
+/// The JSONL stream ends with the run's terminal record: `session.completed`,
+/// reporting the session as cancelled.
+fn assert_cancelled_terminal(signal: &str, stdout: &str) {
+    let events: Vec<Value> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let terminal = events
+        .last()
+        .unwrap_or_else(|| panic!("{signal} produced no events: {stdout}"));
+    assert_eq!(
+        terminal["type"], "session.completed",
+        "{signal} must commit a terminal record; got: {terminal}"
+    );
+    assert_eq!(
+        terminal["payload"]["status"], "cancelled",
+        "{signal} must report the interrupted session as cancelled"
+    );
+}
+
 #[test]
 fn sigint_cancels_the_running_command_and_commits_a_terminal() {
     run_interrupted("INT", 130);
@@ -170,15 +174,19 @@ fn sigterm_cancels_the_running_command_and_commits_a_terminal() {
 /// `orca exec` with a stdio MCP server, configured in `fixture`'s ORCA_HOME,
 /// that reads nothing for `SLEEP_SECONDS`: the run waits for it to connect.
 /// Text output waits before the turn; JSONL output waits inside it. The
-/// server writes its pid to `<cwd>/mcp.pid` only after two seconds, by which
-/// time `orca` has long installed its signal handler: a signal before that
-/// would end it as any process, without its cleanup.
-fn spawn_orca_with_a_slow_mcp_server(fixture: &Fixture, output_format: &str) -> Child {
+/// server writes its pid to `<cwd>/mcp.pid` after `pid_delay_seconds`. A
+/// signal sent once the pid is there lands in that wait after a delay of two
+/// seconds, and as early as the run starts its servers after none.
+fn spawn_orca_with_a_slow_mcp_server(
+    fixture: &Fixture,
+    output_format: &str,
+    pid_delay_seconds: u64,
+) -> Child {
     let script = fixture.cwd.path().join("slow-mcp.sh");
     fs::write(
         &script,
         format!(
-            "sleep 2\nprintf '%s\\n' \"$$\" > \"$1/mcp.pid\"\nsleep {SLEEP_SECONDS}\nwhile IFS= read -r line; do :; done\n"
+            "sleep {pid_delay_seconds}\nprintf '%s\\n' \"$$\" > \"$1/mcp.pid\"\nsleep {SLEEP_SECONDS}\nwhile IFS= read -r line; do :; done\n"
         ),
     )
     .expect("write the MCP server");
@@ -211,29 +219,24 @@ fn spawn_orca_with_a_slow_mcp_server(fixture: &Fixture, output_format: &str) -> 
         .expect("spawn orca")
 }
 
-fn sigint_while_waiting_for_mcp_servers_stops_them(output_format: &str) {
-    let fixture = Fixture::new();
-    let child = spawn_orca_with_a_slow_mcp_server(&fixture, output_format);
+/// The pid the MCP server wrote, looked for every `poll`.
+fn wait_for_mcp_server_pid(fixture: &Fixture, poll: Duration) -> i32 {
     let pid_file = fixture.cwd.path().join("mcp.pid");
     let deadline = Instant::now() + Duration::from_secs(30);
-    let server_pid = loop {
+    loop {
         if let Ok(text) = fs::read_to_string(&pid_file)
             && let Ok(pid) = text.trim().parse::<i32>()
         {
-            break pid;
+            return pid;
         }
         assert!(Instant::now() < deadline, "the MCP server never started");
-        std::thread::sleep(Duration::from_millis(50));
-    };
+        std::thread::sleep(poll);
+    }
+}
 
-    Command::new("kill")
-        .arg("-INT")
-        .arg(child.id().to_string())
-        .status()
-        .expect("send SIGINT");
-    let output = child.wait_with_output().expect("wait for orca");
-
-    // It was still connecting, and would have read nothing for a minute.
+/// Whether the MCP server is still running a second after `orca` exited; a
+/// survivor is killed, with its process group, before the test fails.
+fn mcp_server_survived(server_pid: i32) -> bool {
     let deadline = Instant::now() + Duration::from_secs(1);
     while process_is_alive(server_pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -244,6 +247,23 @@ fn sigint_while_waiting_for_mcp_servers_stops_them(output_format: &str) {
             .args(["-KILL", "--", &format!("-{server_pid}")])
             .status();
     }
+    survived
+}
+
+fn sigint_while_waiting_for_mcp_servers_stops_them(output_format: &str) {
+    let fixture = Fixture::new();
+    let child = spawn_orca_with_a_slow_mcp_server(&fixture, output_format, 2);
+    let server_pid = wait_for_mcp_server_pid(&fixture, Duration::from_millis(50));
+
+    Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .expect("send SIGINT");
+    let output = child.wait_with_output().expect("wait for orca");
+
+    // It was still connecting, and would have read nothing for a minute.
+    let survived = mcp_server_survived(server_pid);
     assert_eq!(
         output.status.code(),
         Some(130),
@@ -264,4 +284,34 @@ fn sigint_during_the_mcp_startup_wait_stops_the_servers() {
 #[test]
 fn sigint_while_a_turn_waits_for_mcp_servers_stops_them() {
     sigint_while_waiting_for_mcp_servers_stops_them("jsonl");
+}
+
+/// A signal as soon as the run has started its MCP servers, which can be
+/// before its signal handler was in effect when the handler was installed
+/// only after the run's thread started.
+#[test]
+fn sigterm_while_mcp_servers_start_stops_them_and_commits_a_terminal() {
+    let fixture = Fixture::new();
+    let child = spawn_orca_with_a_slow_mcp_server(&fixture, "jsonl", 0);
+    let server_pid = wait_for_mcp_server_pid(&fixture, Duration::from_millis(1));
+
+    Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .expect("send SIGTERM");
+    let output = child.wait_with_output().expect("wait for orca");
+
+    let survived = mcp_server_survived(server_pid);
+    assert_eq!(
+        output.status.code(),
+        Some(143),
+        "SIGTERM should keep the conventional exit code; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !survived,
+        "SIGTERM left the MCP server (pid {server_pid}) running after orca exited"
+    );
+    assert_cancelled_terminal("SIGTERM", &String::from_utf8_lossy(&output.stdout));
 }

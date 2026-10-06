@@ -365,6 +365,7 @@ pub mod subagent_execution;
 mod system_prompt;
 pub mod task_output;
 pub mod tasks;
+pub mod termination_signals;
 pub mod thread;
 pub mod thread_store;
 pub mod tool_execution;

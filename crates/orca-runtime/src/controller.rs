@@ -1,7 +1,7 @@
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex, MutexGuard, PoisonError,
     atomic::{AtomicBool, AtomicI32, Ordering},
     mpsc,
 };
@@ -44,7 +44,7 @@ use crate::runtime_conversation_bootstrap::AgentConversationContext;
 use crate::runtime_execution_policy::RuntimeExecutionPolicyHandle;
 use crate::runtime_host::{
     HeadlessInteractionCheckpoint, HeadlessOperationHandle, HeadlessSurfaceSession, RuntimeHost,
-    RuntimeHostError, RuntimeThreadHandle, RuntimeThreadStartRequest,
+    RuntimeHostError, RuntimeThreadHandle, RuntimeThreadMutation, RuntimeThreadStartRequest,
 };
 use crate::runtime_surface::{
     FailureClass as SurfaceFailureClass, OperationTerminal as SurfaceOperationTerminal,
@@ -55,6 +55,9 @@ use crate::runtime_surface::{RuntimeProviderResponseIngress, RuntimeWorkflowLife
 use crate::session::{InteractiveSession, InteractiveSessionRuntimeParts};
 use crate::tasks::{MainSessionTerminalUpdate, TaskRegistry};
 use crate::terminal_service::TerminalService;
+use crate::termination_signals::{
+    TerminationSignal, TerminationSignalGuard, handle_termination_signals,
+};
 #[cfg(test)]
 use crate::thread::RuntimeThread;
 use crate::tool_invocation::AgentToolPolicyContext;
@@ -63,11 +66,6 @@ use crate::workflow_execution::{BackgroundWorkflowRun, observe_background_workfl
 const HOSTED_EVENT_RELAY_CAPACITY: usize = 1;
 const HOSTED_EVENT_RELAY_POLL: Duration = Duration::from_millis(10);
 const DEFAULT_HEADLESS_INTERACTION_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a signal-interrupted headless run may spend stopping task-owned
-/// commands and committing its terminal record before it is killed outright.
-const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_secs(10);
-/// Poll interval used while waiting for an interrupted run to finish cleanup.
-const INTERRUPT_GRACE_POLL: Duration = Duration::from_millis(25);
 
 pub trait HeadlessInteractionHandler: Send + Sync + 'static {
     fn handle(
@@ -1356,7 +1354,8 @@ impl ThreadTurnToolMode {
     }
 }
 
-/// Termination signals a headless run reacts to.
+/// SIGINT/SIGTERM handling for one headless run, in effect before the runtime
+/// starts.
 ///
 /// The headless entry point used to keep the default disposition: SIGINT (Ctrl-C
 /// in a wrapper script) and SIGTERM (CI cancel, job timeout) killed the process
@@ -1364,146 +1363,143 @@ impl ThreadTurnToolMode {
 /// stream ended without a terminal record. The runtime already stops those
 /// commands and commits a terminal when an operation is interrupted — the path
 /// `task_stop`, budget deadlines and ordinary session end all use — so a signal
-/// now trips that cancellation instead of the default handler.
-enum TerminationSignals {
-    #[cfg(unix)]
-    Unix {
-        interrupt: tokio::signal::unix::Signal,
-        terminate: tokio::signal::unix::Signal,
-    },
-    #[cfg(not(unix))]
-    Console,
+/// now trips that cancellation instead of the default handler. The handler is
+/// in effect before the run starts anything: a signal that comes while the
+/// runtime starts, before there is a thread to interrupt, is recorded, and
+/// stops the run once the run hands over what stops it.
+struct TerminationSignalHandler {
+    interrupt: Arc<Mutex<RunInterrupt>>,
+    _signals: Option<TerminationSignalGuard>,
 }
 
-impl TerminationSignals {
-    fn install() -> Option<Self> {
-        #[cfg(unix)]
+/// Where a run stands with its signal handler.
+enum RunInterrupt {
+    /// No signal yet, and nothing handed over to stop the run.
+    Waiting,
+    /// What stops the run, called when a signal comes.
+    Attached(Box<dyn FnOnce() + Send>),
+    /// A signal came: what is handed over from now on is called at once.
+    Signalled,
+}
+
+impl TerminationSignalHandler {
+    /// Registers the handlers on a thread of its own and returns once they are in
+    /// effect, or once registering failed, leaving no handler.
+    ///
+    /// `interrupted` records the signal that arrived so the run reports the
+    /// conventional exit code, and `finished` is set once the terminal record and
+    /// the output are committed, which retires the grace period. A second signal
+    /// always exits immediately (see [`handle_termination_signals`]).
+    fn install(interrupted: Arc<AtomicI32>, finished: Arc<AtomicBool>) -> Self {
+        let interrupt = Arc::new(Mutex::new(RunInterrupt::Waiting));
+        let on_signal = {
+            let interrupt = Arc::clone(&interrupt);
+            move |signal: TerminationSignal| {
+                interrupted.store(signal.number(), Ordering::SeqCst);
+                let _ = writeln!(
+                    io::stderr(),
+                    "orca: received {}; stopping the running operation",
+                    signal.name()
+                );
+                let attached = std::mem::replace(
+                    &mut *lock_run_interrupt(&interrupt),
+                    RunInterrupt::Signalled,
+                );
+                if let RunInterrupt::Attached(stop) = attached {
+                    stop();
+                }
+            }
+        };
+        let signals = handle_termination_signals(
+            &[TerminationSignal::Interrupt, TerminationSignal::Terminate],
+            finished,
+            on_signal,
+        );
+        Self {
+            interrupt,
+            _signals: signals,
+        }
+    }
+
+    /// Hands over what stops the run: called at once if a signal already came,
+    /// else when one comes.
+    fn attach(&self, interrupt: Box<dyn FnOnce() + Send>) {
+        let mut state = lock_run_interrupt(&self.interrupt);
+        if matches!(*state, RunInterrupt::Signalled) {
+            drop(state);
+            interrupt();
+        } else {
+            *state = RunInterrupt::Attached(interrupt);
+        }
+    }
+}
+
+fn lock_run_interrupt(interrupt: &Mutex<RunInterrupt>) -> MutexGuard<'_, RunInterrupt> {
+    interrupt.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Stops the turn of a headless run for its signal handler, exactly once. The
+/// run checks for a signal before it sends its prompt, but one can still come
+/// between that check and the turn's start, when there is no turn to stop yet:
+/// the turn is then stopped as soon as it starts.
+struct TurnStop {
+    state: Mutex<TurnStopState>,
+}
+
+struct TurnStopState {
+    requested: bool,
+    started: bool,
+    /// Taken by the one call that stops the turn.
+    stop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl TurnStop {
+    fn new(stop: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            state: Mutex::new(TurnStopState {
+                requested: false,
+                started: false,
+                stop: Some(Box::new(stop)),
+            }),
+        }
+    }
+
+    /// The signal's side: stop the turn, now or once it starts.
+    fn request(&self) {
+        let mut state = self.lock();
+        state.requested = true;
+        Self::stop_when_due(state);
+    }
+
+    /// The run's side: its turn has started.
+    fn turn_started(&self) {
+        let mut state = self.lock();
+        state.started = true;
+        Self::stop_when_due(state);
+    }
+
+    fn stop_when_due(mut state: MutexGuard<'_, TurnStopState>) {
+        if state.requested
+            && state.started
+            && let Some(stop) = state.stop.take()
         {
-            use tokio::signal::unix::{SignalKind, signal};
-            let interrupt = signal(SignalKind::interrupt()).ok()?;
-            let terminate = signal(SignalKind::terminate()).ok()?;
-            Some(Self::Unix {
-                interrupt,
-                terminate,
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            Some(Self::Console)
+            drop(state);
+            stop();
         }
     }
 
-    /// Resolve with the number of the signal that asked this run to stop.
-    async fn next(&mut self) -> Option<i32> {
-        match self {
-            #[cfg(unix)]
-            Self::Unix {
-                interrupt,
-                terminate,
-            } => tokio::select! {
-                received = interrupt.recv() => received.map(|()| SIGINT),
-                received = terminate.recv() => received.map(|()| SIGTERM),
-            },
-            #[cfg(not(unix))]
-            Self::Console => tokio::signal::ctrl_c().await.ok().map(|()| SIGINT),
-        }
+    fn lock(&self) -> MutexGuard<'_, TurnStopState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// Signal numbers whose conventional exit codes are reported by the wrapper.
-const SIGINT: i32 = 2;
-#[cfg(unix)]
-const SIGTERM: i32 = 15;
-
-fn signal_exit_code(signal: i32) -> i32 {
-    128 + signal
-}
-
-fn signal_name(signal: i32) -> &'static str {
-    match signal {
-        SIGINT => "SIGINT",
-        #[cfg(unix)]
-        SIGTERM => "SIGTERM",
-        _ => "termination signal",
-    }
-}
-
-/// Exit code the wrapper expects when `interrupted` recorded a signal.
+/// Exit code the wrapper expects when `interrupted` recorded a signal: 128 plus
+/// its number.
 fn interrupted_exit_code(interrupted: &AtomicI32) -> Option<i32> {
     match interrupted.load(Ordering::SeqCst) {
         0 => None,
-        signal => Some(signal_exit_code(signal)),
+        signal => Some(128 + signal),
     }
-}
-
-/// Trip the runtime's cancellation path when the process is asked to stop.
-///
-/// `interrupted` records the signal that arrived so the run reports the
-/// conventional exit code, and `finished` is set once the terminal record and
-/// the output are committed, which retires the grace period. A second signal
-/// always exits immediately: the grace period exists to let cleanup stop
-/// task-owned commands, not to trap an impatient operator.
-fn install_termination_signal_handler(
-    thread: &RuntimeThreadHandle,
-    interrupted: Arc<AtomicI32>,
-    finished: Arc<AtomicBool>,
-) {
-    let thread = thread.clone();
-    let _ = std::thread::Builder::new()
-        .name("orca-signal".to_string())
-        .spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            runtime.block_on(async move {
-                let Some(mut signals) = TerminationSignals::install() else {
-                    return;
-                };
-                let Some(signal) = signals.next().await else {
-                    return;
-                };
-                interrupted.store(signal, Ordering::SeqCst);
-                eprintln!(
-                    "orca: received {}; stopping the running operation",
-                    signal_name(signal)
-                );
-                if let Err(error) = thread.interrupt_active() {
-                    eprintln!("orca: could not stop the running operation: {error}");
-                }
-                let grace = tokio::time::sleep(INTERRUPT_GRACE_PERIOD);
-                tokio::pin!(grace);
-                loop {
-                    tokio::select! {
-                        () = &mut grace => {
-                            if !finished.load(Ordering::SeqCst) {
-                                eprintln!(
-                                    "orca: cleanup did not finish within {}s; exiting",
-                                    INTERRUPT_GRACE_PERIOD.as_secs()
-                                );
-                                std::process::exit(signal_exit_code(signal));
-                            }
-                            return;
-                        }
-                        second = signals.next() => {
-                            let signal = second.unwrap_or(signal);
-                            eprintln!(
-                                "orca: received a second {}; exiting immediately",
-                                signal_name(signal)
-                            );
-                            std::process::exit(signal_exit_code(signal));
-                        }
-                        () = tokio::time::sleep(INTERRUPT_GRACE_POLL) => {
-                            if finished.load(Ordering::SeqCst) {
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
-        });
 }
 
 pub fn run(config: RunConfig) -> i32 {
@@ -1556,9 +1552,29 @@ pub fn run_to_writer_with_headless_transport<W: io::Write>(
 
 fn run_inner<W: io::Write>(
     config: RunConfig,
-    mut writer: W,
+    writer: W,
     _options: ControllerRunOptions,
     transport: Option<HeadlessInteractionTransport>,
+) -> io::Result<i32> {
+    let interrupted = Arc::new(AtomicI32::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
+    // In effect before the run starts any process or session: a signal from
+    // here on stops the run through its cleanup, not the default disposition.
+    let signals =
+        TerminationSignalHandler::install(Arc::clone(&interrupted), Arc::clone(&finished));
+    let exit_code = run_headless(config, writer, transport, &signals, &interrupted);
+    // Its terminal record and output are committed, or past committing: the
+    // grace period has nothing left to wait for, whichever way the run ended.
+    finished.store(true, Ordering::SeqCst);
+    exit_code
+}
+
+fn run_headless<W: io::Write>(
+    config: RunConfig,
+    mut writer: W,
+    transport: Option<HeadlessInteractionTransport>,
+    signals: &TerminationSignalHandler,
+    interrupted: &AtomicI32,
 ) -> io::Result<i32> {
     // The instruction is delivered byte-exact: trimming here silently rewrote every prompt
     // that ended with a newline (all Terminal-Bench instructions do). `orca exec` now rejects
@@ -1580,9 +1596,21 @@ fn run_inner<W: io::Write>(
     let thread = host
         .start_thread_with_request(start_request)
         .map_err(runtime_host_io_error)?;
-    let interrupted = Arc::new(AtomicI32::new(0));
-    let finished = Arc::new(AtomicBool::new(false));
-    install_termination_signal_handler(&thread, Arc::clone(&interrupted), Arc::clone(&finished));
+    let turn_stop = Arc::new(TurnStop::new({
+        let thread = thread.clone();
+        move || {
+            if let Err(error) = thread.interrupt_active() {
+                let _ = writeln!(
+                    io::stderr(),
+                    "orca: could not stop the running operation: {error}"
+                );
+            }
+        }
+    }));
+    signals.attach(Box::new({
+        let turn_stop = Arc::clone(&turn_stop);
+        move || turn_stop.request()
+    }));
     // Machine consumers of `--output-format jsonl` treat a non-empty stderr as
     // a failed run, so the warnings travel in `session.started.warnings` there
     // (the ACP surface surfaces the same list). Text mode keeps them on stderr.
@@ -1594,19 +1622,15 @@ fn run_inner<W: io::Write>(
         // once none is still connecting, before the turn, which would wait
         // for them anyway.
         let mcp_warnings =
-            thread.wait_for_mcp_startup_warnings(&|| interrupted_exit_code(&interrupted).is_some());
+            thread.wait_for_mcp_startup_warnings(&|| interrupted_exit_code(interrupted).is_some());
         for error in mcp_warnings.unwrap_or_default() {
             eprintln!("orca: warning: {error}");
         }
     }
-    if let Some(exit_code) = interrupted_exit_code(&interrupted) {
-        // The signal arrived before the turn was admitted: stop here instead of
-        // starting work the operator has already cancelled. The MCP servers
-        // stop first, those still connecting too: the signal thread holds
-        // the thread, and its registry, until the process exits.
-        thread.mcp_registry().close();
-        let _ = host.shutdown();
-        return Ok(exit_code);
+    if let Some(exit_code) = interrupted_exit_code(interrupted) {
+        // The signal came before the turn: stop here instead of starting
+        // work the operator has already cancelled.
+        return stop_before_the_turn(host, &thread, &config, writer, exit_code);
     }
     let mut headless = thread.attach_headless_surface(transport.is_some())?;
     let (relay_tx, relay_rx) = mpsc::sync_channel(HOSTED_EVENT_RELAY_CAPACITY);
@@ -1617,6 +1641,7 @@ fn run_inner<W: io::Write>(
             buffer: Vec::new(),
         },
     )?;
+    turn_stop.turn_started();
     let terminal = drain_headless_events(
         &operation,
         &mut headless,
@@ -1633,10 +1658,9 @@ fn run_inner<W: io::Write>(
     let status = headless_operation_status(&terminal);
     // A signal-requested cancellation reports the conventional signal code,
     // whatever status the interrupted operation happened to reach.
-    let exit_code = interrupted_exit_code(&interrupted)
+    let exit_code = interrupted_exit_code(interrupted)
         .unwrap_or_else(|| headless_operation_exit_code(&terminal));
     shutdown?;
-    finished.store(true, Ordering::SeqCst);
     if config.desktop_notifications {
         let _ = crate::notify::notify("Orca", &format!("Session {}", status.as_str()));
     }
@@ -1649,6 +1673,42 @@ fn run_inner<W: io::Write>(
             "To continue this session, run: orca exec resume {session_id}"
         )?;
     }
+    Ok(exit_code)
+}
+
+/// Ends a run that a signal stopped before its turn: the prompt is never sent.
+/// The run's MCP servers stop first, those still connecting too, then its
+/// thread closes, and the run is recorded as cancelled the way a cancelled
+/// turn is: in its session when that is recorded, and at the end of its
+/// output, after a `session.started` that opens the stream as usual.
+fn stop_before_the_turn<W: io::Write>(
+    host: RuntimeHost,
+    thread: &RuntimeThreadHandle,
+    config: &RunConfig,
+    mut writer: W,
+    exit_code: i32,
+) -> io::Result<i32> {
+    thread.mcp_registry().close();
+    let terminal = orca_core::budget::OperationTerminal::Cancelled {
+        reason: orca_core::budget::CancelReason::User,
+        checkpoint_id: None,
+    };
+    let _ = thread.mutate(RuntimeThreadMutation::RecordTerminal(terminal.clone()));
+    let _ = host.shutdown();
+    let cwd = match &config.cwd {
+        Some(cwd) => cwd.clone(),
+        None => std::env::current_dir()?,
+    };
+    let mut events = EventFactory::new(thread.thread_id().to_string());
+    let mut sink = EventSink::new(&mut writer, config.output_format);
+    sink.emit(events.session_started(
+        &cwd.display().to_string(),
+        config.approval_mode.as_str(),
+        config.provider.as_str(),
+        config.verifier.as_deref(),
+        thread.startup_warnings(),
+    ))?;
+    sink.emit(events.session_completed_terminal(&terminal, thread.session_id()))?;
     Ok(exit_code)
 }
 
@@ -2391,6 +2451,201 @@ mod tests {
             assert_eq!(event["seq"], sequence);
             assert_eq!(event["run_id"], events[0]["run_id"]);
         }
+    }
+
+    /// A test that raises a signal does so in a process of its own: a signal
+    /// reaches every handler in the process, so raised in the test process
+    /// it could stop another test's headless run, or be that run's second
+    /// signal and end the process. Returns whether this is that process, where
+    /// the test goes on; anywhere else it runs the test there, with an Orca
+    /// home of its own, and checks that it passed.
+    #[cfg(unix)]
+    fn in_a_process_of_its_own(test: &str) -> bool {
+        const CHILD_ENV: &str = "ORCA_TEST_SIGNAL_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            return true;
+        }
+        let home = tempfile::tempdir().expect("an Orca home for the child");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", &format!("controller::tests::{test}")])
+            .args(["--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .env("ORCA_HOME", home.path())
+            .output()
+            .expect("run the test in a process of its own");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{test} failed in a process of its own ({}): {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    /// Raises SIGTERM in this process, which ends it unless a handler is in
+    /// effect, and waits up to a second for `interrupted` to record it.
+    #[cfg(unix)]
+    fn raise_sigterm(interrupted: &AtomicI32) -> bool {
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0, "raise SIGTERM");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while interrupted.load(Ordering::SeqCst) != libc::SIGTERM {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_signal_handler_is_in_effect_once_install_returns() {
+        if !in_a_process_of_its_own("the_signal_handler_is_in_effect_once_install_returns") {
+            return;
+        }
+        let interrupted = Arc::new(AtomicI32::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let handler =
+            TerminationSignalHandler::install(Arc::clone(&interrupted), Arc::clone(&finished));
+
+        // Still running to check: the handler, not the default, took it.
+        let recorded = raise_sigterm(&interrupted);
+        // Before any assertion: the grace period must not end the process.
+        finished.store(true, Ordering::SeqCst);
+        drop(handler);
+
+        assert!(
+            recorded,
+            "the handler did not record SIGTERM within a second"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_before_attach_stops_the_run_when_it_is_attached() {
+        if !in_a_process_of_its_own("a_signal_before_attach_stops_the_run_when_it_is_attached") {
+            return;
+        }
+        let interrupted = Arc::new(AtomicI32::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let handler =
+            TerminationSignalHandler::install(Arc::clone(&interrupted), Arc::clone(&finished));
+        let recorded = raise_sigterm(&interrupted);
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        handler.attach(Box::new({
+            let stopped = Arc::clone(&stopped);
+            move || stopped.store(true, Ordering::SeqCst)
+        }));
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !stopped.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        finished.store(true, Ordering::SeqCst);
+        drop(handler);
+
+        assert!(
+            recorded,
+            "the handler did not record SIGTERM within a second"
+        );
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "what stops the run, attached after the signal, was not called"
+        );
+    }
+
+    #[test]
+    fn a_turn_stops_once_whether_the_signal_comes_before_it_starts_or_after() {
+        for signal_first in [true, false] {
+            let stops = Arc::new(AtomicUsize::new(0));
+            let turn_stop = TurnStop::new({
+                let stops = Arc::clone(&stops);
+                move || {
+                    stops.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            if signal_first {
+                turn_stop.request();
+                assert_eq!(stops.load(Ordering::SeqCst), 0, "no turn to stop yet");
+                turn_stop.turn_started();
+            } else {
+                turn_stop.turn_started();
+                assert_eq!(stops.load(Ordering::SeqCst), 0, "no signal yet");
+                turn_stop.request();
+            }
+            turn_stop.request();
+            turn_stop.turn_started();
+            assert_eq!(
+                stops.load(Ordering::SeqCst),
+                1,
+                "signal first: {signal_first}"
+            );
+        }
+    }
+
+    /// A signal that comes while the runtime starts is recorded before the
+    /// run's thread is up: the run never sends its prompt, and still ends
+    /// its stream and its session with a cancelled terminal record.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_signalled_before_its_thread_starts_never_sends_its_prompt() {
+        const PROMPT: &str = "a prompt the signal came before";
+        if !in_a_process_of_its_own(
+            "a_run_signalled_before_its_thread_starts_never_sends_its_prompt",
+        ) {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let interrupted = Arc::new(AtomicI32::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let handler =
+            TerminationSignalHandler::install(Arc::clone(&interrupted), Arc::clone(&finished));
+        let recorded = raise_sigterm(&interrupted);
+
+        let mut config = config(SubagentConfig::default());
+        config.prompt = PROMPT.to_string();
+        config.cwd = Some(workspace.path().to_path_buf());
+        config.output_format = OutputFormat::Jsonl;
+        config.history_mode = HistoryMode::Record;
+        let mut output = Vec::new();
+        let exit_code = run_headless(config, &mut output, None, &handler, &interrupted);
+        finished.store(true, Ordering::SeqCst);
+        drop(handler);
+
+        assert!(
+            recorded,
+            "the handler did not record SIGTERM within a second"
+        );
+        assert_eq!(exit_code.expect("the stopped run"), 143);
+        let events = String::from_utf8(output)
+            .expect("utf8 events")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json event"))
+            .collect::<Vec<_>>();
+        let kinds = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            ["session.started", "session.completed"],
+            "{events:?}"
+        );
+        assert_eq!(events[1]["payload"]["status"], "cancelled");
+        let session_id = events[1]["payload"]["session_id"]
+            .as_str()
+            .expect("the recorded session's id");
+        let transcript = crate::history::load_session(session_id).expect("the recorded session");
+        assert!(
+            !transcript.messages.iter().any(|message| matches!(
+                message,
+                Message::User { content, .. } if content.contains(PROMPT)
+            )),
+            "the prompt reached the session: {:?}",
+            transcript.messages
+        );
+        assert_eq!(transcript.completion_status.as_deref(), Some("cancelled"));
     }
 
     #[test]

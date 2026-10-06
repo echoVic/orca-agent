@@ -65,6 +65,18 @@ Use the process exit status and the verifier output as the automation gate.
 Orca does not publish a stable numeric taxonomy beyond that process result, so
 scripts should not infer semantics from undocumented exit-code labels.
 
+## Stopping a run
+
+orca exec handles SIGINT and SIGTERM from the moment it starts, before any MCP
+server or task command is running. On either signal it stops its task commands
+and MCP servers, writes the run's terminal record, and exits with 130 for
+SIGINT or 143 for SIGTERM. In JSONL output the terminal record is the last
+event: session.completed with status cancelled.
+
+A second signal exits at once. If the cleanup takes longer than 10 seconds,
+orca exec exits without waiting for it. On Windows, Ctrl+C in the console is
+handled the same way and exits with 130.
+
 ## Related commands
 
 - [Resume a headless run](orca-exec-resume.md)
