@@ -81,6 +81,7 @@ jobs:
         run: |
           python3 -m unittest discover -s terminal_bench -p 'test_*.py' -v
           node scripts/test-repository-hygiene.mjs
+          node --test tests/npm_launcher_contract.test.mjs
       - name: Run TUI library gate
         env:
           RUST_BACKTRACE: "1"
