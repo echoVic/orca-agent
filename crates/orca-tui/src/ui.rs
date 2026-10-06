@@ -1322,20 +1322,24 @@ fn mcp_details_column<'a>(labels: impl Iterator<Item = &'a str>, width: usize) -
 }
 
 fn queued_preview_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-    if state.panel_mode != PanelMode::Conversation
-        || !matches!(state.status, AppStatus::Idle | AppStatus::Running)
-        || width == 0
-    {
+    if state.panel_mode != PanelMode::Conversation || width == 0 {
         return Vec::new();
     }
     let width = width as usize;
     // What is held back for the conversation to start is not in the runtime's
-    // queue yet, and is listed on its own until it is.
+    // queue yet, and is listed on its own until it is, whatever runs before
+    // the conversation starts: a command typed before the history (a
+    // `/compact`), or an approval or a question, whose panel takes the
+    // composer's place. The strip has no keys of its own, and `main_layout`
+    // gives it only the rows that panel leaves.
     if let Some(held) = state.held_submissions_preview() {
         let header = format!(" Held until the conversation starts · {}", held.len);
         return preview_strip(header, theme.muted, held, width, theme);
     }
-    if !state.queued_follow_up_pending_or_in_flight() {
+    // The runtime's queue is listed with keys that act from the composer.
+    if !matches!(state.status, AppStatus::Idle | AppStatus::Running)
+        || !state.queued_follow_up_pending_or_in_flight()
+    {
         return Vec::new();
     }
     let Some(view) = state.queued_submission_view() else {
@@ -7921,6 +7925,79 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].to_string().contains("Queued 1"));
         assert!(lines[1].to_string().contains("held"));
+    }
+
+    /// Held messages stay on screen until the conversation starts, whatever
+    /// runs before it: a `/compact` typed before the history, or a turn that
+    /// waits for an approval or an answer in a panel that takes the
+    /// composer's place. The strip lists them above what holds the input.
+    #[test]
+    fn held_messages_stay_listed_while_a_command_or_a_prompt_runs_before_the_history() {
+        let compacting: fn(&mut AppState) = |state| state.status = AppStatus::Compacting;
+        let waiting_for_approval: fn(&mut AppState) = |state| {
+            state.status = AppStatus::WaitingApproval;
+            state.approval_dialog = Some(ApprovalDialog {
+                id: "1".into(),
+                interaction: None,
+                tool: "bash".into(),
+                target: Some("cargo test".into()),
+                permission_kind: None,
+                background_task_id: None,
+                selected: 0,
+                options: ApprovalDialog::options_for("bash", Some("cargo test")),
+                diff: None,
+                diff_scroll: 0,
+            });
+        };
+        let waiting_for_an_answer: fn(&mut AppState) = |state| {
+            state.status = AppStatus::WaitingUserInput;
+            state.user_input_dialog = Some(UserInputDialog::new(
+                crate::protocol::TuiUserInputQuestionnaire {
+                    questions: vec![crate::protocol::TuiUserInputQuestion {
+                        id: "question-1".to_string(),
+                        header: "Task".to_string(),
+                        question: "Which path?".to_string(),
+                        options: vec![crate::protocol::TuiUserInputOption {
+                            label: "Audit".to_string(),
+                            description: "Run existing checks".to_string(),
+                            preview: None,
+                        }],
+                        multi_select: false,
+                    }],
+                },
+            ));
+        };
+        for (running, enter) in [
+            ("a /compact", compacting),
+            ("an approval prompt", waiting_for_approval),
+            ("a question", waiting_for_an_answer),
+        ] {
+            let mut state = test_state();
+            state.startup_history_pending = true;
+            state
+                .held_submissions
+                .push(crate::queued_input::HeldSubmission::FollowUp(queued(
+                    "typed before the history",
+                )));
+            enter(&mut state);
+
+            let frame = frame_string(&mut state, 80, 24);
+            let rows = frame.lines().collect::<Vec<_>>();
+
+            let header = rows
+                .iter()
+                .position(|row| row.contains("Held until the conversation starts · 1"))
+                .unwrap_or_else(|| panic!("no held messages during {running}:\n{frame}"));
+            assert!(
+                rows[header + 1].contains("typed before the history"),
+                "during {running}:\n{frame}"
+            );
+            let input = state.viewport.input_area.expect("what holds the input");
+            assert!(
+                header + 2 <= usize::from(input.y),
+                "the strip runs into {input:?} during {running}:\n{frame}"
+            );
+        }
     }
 
     #[test]
