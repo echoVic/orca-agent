@@ -2055,6 +2055,11 @@ async fn read_sse_stream(
                 continue;
             }
         };
+        // A server that streams faster than the wait above never lets it run
+        // out: a cancel is looked for after each chunk too.
+        if cancel.load(Ordering::Acquire) {
+            return Err("MCP tool call cancelled".to_string());
+        }
         let Some(chunk) = chunk else {
             return parse_unterminated_sse_event(decoder, &context.method, context.id);
         };
@@ -4187,6 +4192,61 @@ done
                 .recv_timeout(Duration::from_secs(1))
                 .expect("server should observe cancellation peer close"),
             "cancelled SSE request remained connected after the call returned"
+        );
+    }
+
+    /// A server that streams progress faster than the reader's 25 ms wait
+    /// for a chunk never lets that wait run out, which is where the reader
+    /// looked for a cancel. It looks after each chunk too, so a cancel stops
+    /// the call mid-stream, well before the stream would end.
+    #[test]
+    fn a_cancel_stops_a_call_whose_event_stream_keeps_coming() {
+        const STREAM_FOR: Duration = Duration::from_secs(5);
+        const CANCEL_AFTER: Duration = Duration::from_millis(100);
+        let server = OneShotSseServer::start(|stream| {
+            let _ = read_http_request(stream);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            );
+            let progress = concat!(
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",",
+                "\"params\":{\"progressToken\":1,\"progress\":1}}\n\n",
+            );
+            // An event every 5 ms, until the stream ends or the client hangs up.
+            let ends = Instant::now() + STREAM_FOR;
+            while Instant::now() < ends
+                && stream
+                    .write_all(progress.as_bytes())
+                    .and_then(|()| stream.flush())
+                    .is_ok()
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let config = McpServerConfig {
+            name: "streaming".to_string(),
+            transport: McpTransportKind::Http,
+            url: Some(server.url()),
+            startup_timeout_ms: Some(10_000),
+            tool_timeout_ms: Some(10_000),
+            ..Default::default()
+        };
+        let transport =
+            StreamableHttpTransport::new(&config, no_auth(&config)).expect("an HTTP transport");
+        let started = Instant::now();
+
+        let error = transport
+            .call_tool_with_elicitation_handler_or_cancel("progress", json!({}), None, &|| {
+                started.elapsed() >= CANCEL_AFTER
+            })
+            .expect_err("the call is cancelled");
+        let returned_after = started.elapsed();
+
+        assert_eq!(error, "MCP tool call cancelled");
+        assert!(
+            returned_after < CANCEL_AFTER + Duration::from_millis(150),
+            "the call returned {returned_after:?} after it began, cancelled after \
+             {CANCEL_AFTER:?}, with a stream that lasts {STREAM_FOR:?}"
         );
     }
 
