@@ -586,7 +586,9 @@ fn comment_indent(lines: &str) -> &str {
 /// its own takes its comments with it: the comment lines directly above it,
 /// which a blank line ends, and the comment at the end of its line. The line
 /// goes whole, and every other comment stays where it was, with the entry it
-/// belongs to or, when it belongs to none, in the array.
+/// belongs to or, when it belongs to none, in the array. The last entry's line
+/// may end at the `]` instead of a line break: when a comment stays in front
+/// of it, the `]` goes on a line of its own after that comment.
 ///
 /// As `push_inline_entry` explains, `toml_edit` keeps the comment at the end
 /// of the line in the text that follows the entry's comma: in front of the
@@ -597,9 +599,11 @@ fn comment_indent(lines: &str) -> &str {
 /// the suffix of the entry before, which is the last now.
 ///
 /// Where the entry shares its line with another, or follows the `[`, no
-/// comment is its own. The entry that becomes the first or the last keeps the
-/// layout the array had at its start or its end, unless a comment is in the
-/// way.
+/// comment is its own, and the old handling of whitespace stays: the entry
+/// that becomes the first or the last keeps the layout the array had at its
+/// start or its end, unless a comment is in the way. That also holds for a
+/// last entry with the `]` glued to it when no comment stays in front of it:
+/// the array stays as written, the `]` still glued.
 fn remove_inline_entry(entries: &mut Array, index: usize) {
     let removed = entries.remove(index);
     let (prefix, suffix) = entry_layout(&removed);
@@ -608,9 +612,22 @@ fn remove_inline_entry(entries: &mut Array, index: usize) {
         None if entries.trailing_comma() => decor_text(Some(entries.trailing())),
         None => suffix.clone(),
     };
-    if let Some(above) = above_own_comments(&prefix)
-        && let Some((_, rest)) = after.split_once('\n')
-    {
+    let above = above_own_comments(&prefix);
+    let rest = match after.split_once('\n') {
+        Some((_, rest)) => Some(rest),
+        // No line break follows the last entry when the `]` is glued to it.
+        // What is in front of the entry's comments stays all the same if it
+        // holds a comment: the one at the end of the line of the entry before,
+        // or a note. Without one, there is nothing to keep, and the old
+        // handling below leaves the array as written.
+        None if entries.get(index).is_none()
+            && above.is_some_and(|above| !above.trim().is_empty()) =>
+        {
+            Some("")
+        }
+        None => None,
+    };
+    if let Some((above, rest)) = above.zip(rest) {
         let kept = format!("{above}{rest}");
         if let Some(next) = entries.get_mut(index) {
             next.decor_mut().set_prefix(kept);
@@ -1492,6 +1509,67 @@ mod tests {
                 after,
                 "removing {name} from:\n{before}"
             );
+        }
+    }
+
+    #[test]
+    fn removing_the_last_inline_entry_with_the_bracket_glued_to_it_keeps_what_is_before_it() {
+        // The `]` follows the last entry on its line, so no line break comes
+        // after it. What the entry before ends its line with, a note, and the
+        // comment on the `[` line are not the removed entry's.
+        let cases = [
+            (
+                "mcp_servers = [\n  <a>, # a\n  <b>]\n",
+                "b",
+                "mcp_servers = [\n  <a> # a\n]\n",
+            ),
+            (
+                "mcp_servers = [\n  <a>, # a\n  <b>,]\n",
+                "b",
+                "mcp_servers = [\n  <a>, # a\n]\n",
+            ),
+            // The entry's own comment goes with it.
+            (
+                "mcp_servers = [\n  <a>, # a\n  # about b\n  <b>]\n",
+                "b",
+                "mcp_servers = [\n  <a> # a\n]\n",
+            ),
+            (
+                "mcp_servers = [\n  <a>,\n  # a note\n\n  <b>]\n",
+                "b",
+                "mcp_servers = [\n  <a>\n  # a note\n\n]\n",
+            ),
+            (
+                "mcp_servers = [ # my servers\n  <a>]\n",
+                "a",
+                "mcp_servers = [ # my servers\n]\n",
+            ),
+            // With no comment in front of the entry there is nothing to keep:
+            // the `]` stays where it was.
+            (
+                "mcp_servers = [\n  <a>,\n  <b>]\n",
+                "b",
+                "mcp_servers = [\n  <a>]\n",
+            ),
+            (
+                "mcp_servers = [\n  <a>,\n  <b>,]\n",
+                "b",
+                "mcp_servers = [\n  <a>,]\n",
+            ),
+            ("mcp_servers = [\n  <a>]\n", "a", "mcp_servers = []\n"),
+        ];
+        for (before, name, after) in cases {
+            let (before, after) = (with_entries(before), with_entries(after));
+            let dir = config_dir_with(&before);
+
+            remove_user_mcp_server_in(dir.path(), name).unwrap();
+
+            assert_eq!(
+                config_text(dir.path()),
+                after,
+                "removing {name} from:\n{before}"
+            );
+            assert!(!listed_names(dir.path()).contains(&name.to_string()));
         }
     }
 
