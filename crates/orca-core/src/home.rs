@@ -9,9 +9,10 @@
 //! Test builds never touch the real `~/.orca`. When no override and no
 //! `ORCA_HOME` names a home, [`orca_home`] returns a temporary directory that
 //! is private to the process; these live in `<temp dir>/orca-test-homes`, so
-//! one `rm -rf` clears what test runs leave behind. A test build is this
-//! crate's own `cfg(test)`, or any build that enables the `test-utils`
-//! feature while cargo or nextest is running it (see
+//! one `rm -rf` clears what test runs leave behind, and each process that
+//! creates one there removes those last changed more than a day ago. A test
+//! build is this crate's own `cfg(test)`, or any build that enables the
+//! `test-utils` feature while cargo or nextest is running it (see
 //! `test_utils_default_home`). Other crates enable the feature through a
 //! dev-dependency, so release builds keep the `~/.orca` default.
 
@@ -135,7 +136,9 @@ fn adopt_process_temp_home() -> PathBuf {
 /// The temporary home every test build in this process falls back to. It is
 /// created on first use, inside `<temp dir>/orca-test-homes`, and this process
 /// never removes it: a detached child may still be writing to it when this one
-/// exits. This function does not touch the environment.
+/// exits. Instead, the first use in each process removes the homes there that
+/// were last changed more than a day ago (see `prune_stale_test_homes`).
+/// This function does not touch the environment.
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub fn process_temp_home() -> &'static std::path::Path {
@@ -144,10 +147,11 @@ pub fn process_temp_home() -> &'static std::path::Path {
     static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
     HOME.get_or_init(|| {
         let mut builder = tempfile::Builder::new();
-        builder.prefix("orca-test-home-");
+        builder.prefix(TEST_HOME_PREFIX);
         let group = std::env::temp_dir().join("orca-test-homes");
         std::fs::create_dir_all(&group)
             .and_then(|()| builder.tempdir_in(&group))
+            .inspect(|_| prune_stale_test_homes(&group))
             // Grouping is a convenience: on a temp dir shared between users
             // the group may belong to someone else, and the home must still
             // be created.
@@ -155,6 +159,55 @@ pub fn process_temp_home() -> &'static std::path::Path {
             .expect("create the process-wide test Orca home")
     })
     .path()
+}
+
+/// What each temporary home's name starts with.
+#[cfg(any(test, feature = "test-utils"))]
+const TEST_HOME_PREFIX: &str = "orca-test-home-";
+
+/// How long ago a temporary home must have last changed for another process
+/// to remove it: far longer than any test run, and than any child it leaves
+/// behind still writing there.
+#[cfg(any(test, feature = "test-utils"))]
+const STALE_TEST_HOME_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Removes from `group` the temporary homes that earlier test processes left
+/// there: each real directory named `orca-test-home-*` last changed more than
+/// [`STALE_TEST_HOME_AGE`] ago. Nothing else in `group` is touched, a link or
+/// a file of that name included, and no link is ever followed. Every error is
+/// ignored: what cannot be read or removed stays, and the tests go on.
+#[cfg(any(test, feature = "test-utils"))]
+fn prune_stale_test_homes(group: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(group) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(TEST_HOME_PREFIX))
+        {
+            continue;
+        }
+        // The entry's own metadata, as `symlink_metadata` gives it: a link is
+        // never followed, so it is never a directory here. Read from the
+        // directory listing, it costs no system call on Windows, where every
+        // test process lists the whole group.
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let stale = metadata.is_dir()
+            && metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age > STALE_TEST_HOME_AGE);
+        if stale {
+            // Removes a link inside the home, never what it names.
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Serializes the orca-core tests that change the process-wide `ORCA_HOME`.
@@ -341,5 +394,118 @@ mod tests {
         install_host_orca_home(None);
         assert_eq!(orca_home(), Some(PathBuf::from("/test")));
         assert_eq!(current_orca_home_override(), Some(PathBuf::from("/test")));
+    }
+
+    /// Sets when `directory` was last changed to `age` ago.
+    #[cfg(unix)]
+    fn last_changed(directory: &std::path::Path, age: std::time::Duration) {
+        std::fs::File::open(directory)
+            .and_then(|opened| opened.set_modified(std::time::SystemTime::now() - age))
+            .expect("set when the directory was last changed");
+    }
+
+    #[cfg(unix)]
+    const HOURS: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+    /// Only the test homes left more than a day ago go: a younger one stays,
+    /// and so does everything else, an old entry included, and whatever a
+    /// link names. A link is never followed, and never taken for a home,
+    /// however old it, or what it names, is.
+    #[cfg(unix)]
+    #[test]
+    fn pruning_removes_only_the_test_homes_left_more_than_a_day_ago() {
+        let group = tempfile::tempdir().expect("a scratch group");
+        let entry = |name: &str| group.path().join(name);
+        let stale = entry("orca-test-home-stale");
+        let recent = entry("orca-test-home-recent");
+        let fresh = entry("orca-test-home-fresh");
+        let unrelated = entry("unrelated-stale");
+        let file = entry("orca-test-home-file");
+        let target = entry("linked-stale");
+        let link = entry("orca-test-home-link");
+        for directory in [&stale, &recent, &fresh, &unrelated, &target] {
+            std::fs::create_dir(directory).expect("a directory");
+            std::fs::write(directory.join("content"), b"").expect("its content");
+        }
+        std::fs::write(&file, b"").expect("a file");
+        std::os::unix::fs::symlink(&target, &link).expect("a link");
+        for directory in [&stale, &unrelated, &target] {
+            last_changed(directory, 25 * HOURS);
+        }
+        last_changed(&recent, 23 * HOURS);
+        // The link's own time, not its target's: `touch -h` is the portable
+        // way to set it.
+        let touched = std::process::Command::new("touch")
+            .args(["-h", "-t", "200001010000"])
+            .arg(&link)
+            .status()
+            .expect("run touch");
+        assert!(touched.success(), "touch -h failed: {touched}");
+
+        prune_stale_test_homes(group.path());
+
+        assert!(!stale.exists(), "the stale test home is still there");
+        for kept in [&recent, &fresh, &unrelated, &target] {
+            assert!(
+                kept.join("content").exists(),
+                "{} lost its content",
+                kept.display()
+            );
+        }
+        assert!(file.exists(), "the file went");
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()),
+            "the link went"
+        );
+    }
+
+    /// The first home of a process prunes the group it is created in. The
+    /// test runs in a process of its own whose temp dir is a scratch one, so
+    /// that it never touches the real group.
+    #[cfg(unix)]
+    #[test]
+    fn the_first_home_of_a_process_prunes_the_stale_homes_beside_it() {
+        const CHILD_ENV: &str = "ORCA_TEST_HOME_PRUNING_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let _ = process_temp_home();
+            return;
+        }
+        let temp = tempfile::tempdir().expect("a scratch temp dir");
+        let group = temp.path().join("orca-test-homes");
+        let stale = group.join("orca-test-home-stale");
+        std::fs::create_dir_all(&stale).expect("a stale test home");
+        last_changed(&stale, 25 * HOURS);
+
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "home::tests::the_first_home_of_a_process_prunes_the_stale_homes_beside_it",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("TMPDIR", temp.path())
+            .output()
+            .expect("run the test in a process of its own");
+
+        assert!(
+            child.status.success() && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+            "the child failed ({}): {}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(!stale.exists(), "the stale test home is still there");
+        let homes = std::fs::read_dir(&group)
+            .expect("the group")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            homes.len() == 1
+                && homes[0]
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(TEST_HOME_PREFIX)),
+            "the group holds {homes:?}, not just the child's own home"
+        );
     }
 }
