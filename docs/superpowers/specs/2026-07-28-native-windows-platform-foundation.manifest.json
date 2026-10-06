@@ -516,7 +516,7 @@
       "tui-pty-contract-signal-libc",
       "tests/tui_pty_contract.rs",
       "unix_libc_process",
-      4,
+      6,
       "windows-test-portability"
     ],
     [

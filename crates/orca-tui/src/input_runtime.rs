@@ -95,7 +95,8 @@ impl From<ThemeName> for InputRuntimeOptions {
 /// either ends input, and with it the TUI.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct TerminationTakeover {
-    pub(crate) report_hangup: Box<dyn FnOnce() + Send>,
+    /// Reports a hangup; false when the report did not get through.
+    pub(crate) report_hangup: Box<dyn FnOnce() -> bool + Send>,
 }
 
 pub(crate) enum InputControl {
@@ -665,11 +666,14 @@ async fn drive_terminal<D: TerminalDriver>(
                     Ok(activity) => activity,
                     // The terminal hung up: reported the way SIGHUP is.
                     Err(error) if report_hangup.is_some() && terminal_hung_up(&error) => {
-                        if let Some(report_hangup) = report_hangup.take() {
-                            report_hangup();
+                        if report_hangup.take().is_some_and(|report| report()) {
+                            hung_up = true;
+                            break Ok(());
                         }
-                        hung_up = true;
-                        break Ok(());
+                        // The report did not get through: input ends, which
+                        // ends the TUI, as without the takeover.
+                        wait_for_main_teardown = true;
+                        break Err(error);
                     }
                     Err(error) => {
                         wait_for_main_teardown = true;
@@ -1000,9 +1004,7 @@ mod tests {
     fn takeover() -> (super::TerminationTakeover, mpsc::Receiver<()>) {
         let (reported_tx, reported) = mpsc::unbounded();
         let takeover = super::TerminationTakeover {
-            report_hangup: Box::new(move || {
-                let _ = reported_tx.send(());
-            }),
+            report_hangup: Box::new(move || reported_tx.send(()).is_ok()),
         };
         (takeover, reported)
     }
@@ -1513,6 +1515,58 @@ mod tests {
                     *calls.lock().expect("calls lock"),
                     ["alternate", "mouse", "paste", "keyboard", "read", "leave"]
                 );
+            });
+    }
+
+    /// Should the report not get through (the renderer's mailbox stayed
+    /// full, or the renderer is gone), input ends as it does without the
+    /// takeover, which ends the TUI: left open, it would keep a TUI with no
+    /// terminal running with nothing to end it.
+    #[cfg(unix)]
+    #[test]
+    fn a_hangup_that_cannot_be_reported_ends_input_as_before() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let driver = FakeDriver::new(Arc::clone(&calls), None, []).hanging_up();
+                let (startup_tx, startup_rx) = mpsc::bounded(1);
+                let (event_tx, event_rx) = mpsc::bounded(1);
+                let (control_tx, _control_rx) = mpsc::bounded(1);
+                let (stop_tx, stop_rx) = watch::channel(false);
+                let undelivered = super::TerminationTakeover {
+                    report_hangup: Box::new(|| false),
+                };
+
+                let task = tokio::spawn(drive_terminal(
+                    driver,
+                    ThemeName::Dark,
+                    TerminalColorLevel::TrueColor,
+                    startup_tx,
+                    event_tx,
+                    control_tx,
+                    stop_rx,
+                    Some(undelivered),
+                ));
+                let _ = wait_for_startup(&startup_rx).await;
+                for _ in 0..100 {
+                    if matches!(event_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    matches!(event_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+                    "input stayed open after a hangup it could not report"
+                );
+                stop_tx.send(true).expect("stop receiver alive");
+                let error = task
+                    .await
+                    .expect("driver task")
+                    .expect_err("input that ended says why");
+                assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
             });
     }
 

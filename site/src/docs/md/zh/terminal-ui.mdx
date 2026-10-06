@@ -249,6 +249,6 @@ Orca 请服务器填好这个 prompt，把返回的内容当作你的消息发�
 
 ## 退出
 
-没有轮次在运行时，连按两次 `Ctrl+C` 退出。退出时，Orca 会中断仍在运行的轮次，结束所有 stdio MCP 服务器，保存会话，恢复终端，然后打印这个会话的 `orca --resume <SESSION_ID>` 命令。
+没有轮次在运行时，连按两次 `Ctrl+C` 退出：Orca 结束所有 stdio MCP 服务器，保存会话，恢复终端，然后打印这个会话的 `orca --resume <SESSION_ID>` 命令。
 
-从外部发来的 SIGTERM、SIGHUP 和 SIGINT（来自 `kill`、关闭的终端窗口或任务调度器）也让 Orca 按同样方式退出，退出码为 128 加信号编号：SIGTERM 是 143，SIGHUP 是 129，SIGINT 是 130。收到 SIGHUP 时终端已经不在了，所以不再绘制，也不打印续接命令；终端关闭却没有发来 SIGHUP 时，按收到 SIGHUP 处理。第二个信号会让它立即退出；收尾超过 10 秒时，它也不再等待，恢复终端后直接退出。通过 `orca attach` 挂接到 daemon 会话的 TUI 只断开自己的连接，daemon 的会话照常进行，正在运行的轮次也一样。以上适用于 macOS 和 Linux。
+从外部发来的 SIGTERM、SIGHUP 和 SIGINT（来自 `kill`、关闭的终端窗口或任务调度器）随时都会让 Orca 按同样方式退出：信号先中断仍在运行的轮次。退出码为 128 加信号编号：SIGTERM 是 143，SIGHUP 是 129，SIGINT 是 130。收到 SIGHUP 时终端已经不在了，所以不再绘制，也不打印续接命令；终端关闭却没有发来 SIGHUP 时，按收到 SIGHUP 处理。第二个信号会让它立即退出；收尾超过 10 秒时，它也不再等待，恢复终端后直接退出。与第一个信号一起到达的副本（半秒之内），例如关闭的终端或包装脚本再发一次的那个，算作同一个信号。通过 `orca attach` 挂接到 daemon 会话的 TUI 只断开自己的连接，daemon 的会话照常进行，正在运行的轮次也一样。以上适用于 macOS 和 Linux。

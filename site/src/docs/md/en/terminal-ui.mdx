@@ -251,8 +251,7 @@ would have come back to, nothing is reconnected, and the conversation says
 `login to MCP server <name> cancelled`. Once your browser is back, `l` no
 longer cancels the login, and the conversation says
 `login to MCP server <name> is finishing and can no longer be cancelled`.
-`l` and `o` apply only to a server
-that logs in with OAuth; see
+`l` and `o` apply only to a server that logs in with OAuth; see
 [MCP integration](mcp-integration.md#remote-servers-and-login).
 
 A server's details show its full status, and then:
@@ -374,17 +373,19 @@ command line.
 
 ## Quitting
 
-`Ctrl+C` twice, while no turn runs, quits. Quitting interrupts a turn that is
-still running, stops every stdio MCP server, saves the conversation, puts the
-terminal back, and prints the `orca --resume <SESSION_ID>` command for the
-conversation.
+`Ctrl+C` twice, while no turn runs, quits: Orca stops every stdio MCP server,
+saves the conversation, puts the terminal back, and prints the
+`orca --resume <SESSION_ID>` command for the conversation.
 
 SIGTERM, SIGHUP, and SIGINT sent from outside (by `kill`, a terminal window
-closing, or a job runner) quit Orca the same way, and it exits with 128 plus
-the signal's number: 143 for SIGTERM, 129 for SIGHUP, 130 for SIGINT. After
-SIGHUP the terminal is gone, so nothing more is drawn and no resume command is
+closing, or a job runner) quit Orca the same way at any time: a signal first
+interrupts a turn that is still running. Orca then exits with 128 plus the
+signal's number: 143 for SIGTERM, 129 for SIGHUP, 130 for SIGINT. After SIGHUP
+the terminal is gone, so nothing more is drawn and no resume command is
 printed; a terminal that closes without sending SIGHUP counts as one. A second
 signal exits at once, and so does a quit that takes longer than 10 seconds,
-once the terminal is put back. A TUI attached to a daemon session with
+once the terminal is put back. A copy of the first signal that arrives with it
+(within half a second), as a closing terminal or a wrapper script sends,
+counts as the same signal. A TUI attached to a daemon session with
 `orca attach` only disconnects: the daemon's session goes on, a running turn
 too. This applies on macOS and Linux.

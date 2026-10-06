@@ -1089,6 +1089,66 @@ fn tui_sighup_with_the_terminal_gone_still_stops_mcp_servers() {
     assert_server_stops(&pid);
 }
 
+/// A signal sent to a process group can reach the TUI twice, a millisecond
+/// or so apart: a wrapper script such as the npm launcher, in the same group,
+/// passes on what it got, and a shell passes on its terminal's SIGHUP. The
+/// copy is the same signal, and must not cut the quit short.
+#[test]
+fn tui_sigterm_delivered_twice_still_stops_mcp_servers() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let fixture = tempfile::tempdir().expect("MCP fixture directory");
+    let server = SlowMcpServer::configure(home.path(), fixture.path());
+    let mut process =
+        PtyProcess::spawn_without_prompt(home.path(), cwd.path()).expect("spawn TUI in PTY");
+
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    let pid = server.wait_for_start();
+
+    process.drain_output(&mut output);
+    let signalled_at = output.len();
+    process.signal(libc::SIGTERM);
+    std::thread::sleep(Duration::from_millis(1));
+    process.signal(libc::SIGTERM);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    process.drain_output(&mut output);
+
+    assert_eq!(status.code(), Some(143), "TUI exited with {status}");
+    assert!(
+        !contains_rendered_text(&output[signalled_at..], "received a second"),
+        "the copy cut the quit short; output={}",
+        String::from_utf8_lossy(&output[signalled_at..])
+    );
+    assert_server_stops(&pid);
+}
+
+/// The same with the terminal gone, as when a window closes and the shell
+/// passes its SIGHUP on.
+#[test]
+fn tui_sighup_delivered_twice_with_the_terminal_gone_still_stops_mcp_servers() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let fixture = tempfile::tempdir().expect("MCP fixture directory");
+    let server = SlowMcpServer::configure(home.path(), fixture.path());
+    let mut process =
+        PtyProcess::spawn_without_prompt(home.path(), cwd.path()).expect("spawn TUI in PTY");
+
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    let pid = server.wait_for_start();
+
+    process.hang_up();
+    process.signal(libc::SIGHUP);
+    std::thread::sleep(Duration::from_millis(1));
+    process.signal(libc::SIGHUP);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+
+    assert_eq!(status.code(), Some(129), "TUI exited with {status}");
+    assert_server_stops(&pid);
+}
+
 /// A terminal can hang up with no SIGHUP to say so (it is not the TUI's
 /// controlling terminal, as here), and when one comes, the TUI may see its
 /// input end first. Either way it quits as on SIGHUP.
