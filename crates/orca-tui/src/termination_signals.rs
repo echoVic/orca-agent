@@ -81,21 +81,12 @@ pub(crate) fn hangup_takeover(event_tx: TuiEventSender) -> TerminationTakeover {
     }
 }
 
-/// The presentation profile the terminal session derives from the same
-/// environment (`PendingTerminalSession::start`).
-fn presentation_profile() -> TerminalPresentationProfile {
-    TerminalPresentationProfile::from_identity(&qwertty::caps::identity_from_env(
-        None,
-        qwertty::caps::std_env_source,
-    ))
-}
-
 /// What the TUI's teardown writes to stdout before it leaves the terminal
 /// session, for a forced exit to write instead: the window title put back as
 /// `TerminalPresentation::write_reset_title` does, then the cursor ratatui
 /// hid shown again.
 fn written_before_a_forced_exit() -> Vec<u8> {
-    let mut written = encode_title("Orca", presentation_profile());
+    let mut written = encode_title("Orca", TerminalPresentationProfile::from_env());
     written.extend_from_slice(b"\x1b[?25h");
     written
 }
@@ -121,15 +112,14 @@ fn put_the_terminal_back(on_stdout: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use crate::terminal_presentation::TerminalPresentation;
+    use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 
     /// A forced exit writes what the teardown would: the title the TUI set
     /// put back, then the cursor shown again.
     #[test]
     fn a_forced_exit_writes_the_title_and_the_cursor_the_teardown_puts_back() {
-        let profile = super::presentation_profile();
         let mut title = Vec::new();
-        TerminalPresentation::new(false, profile)
+        TerminalPresentation::new(false, TerminalPresentationProfile::from_env())
             .write_reset_title(&mut title)
             .expect("the teardown's title");
 

@@ -573,7 +573,7 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
       ],
       [
         "crates/orca-tui/src/terminal_session.rs",
-        /pub\(crate\)\s+struct\s+PendingTerminalSession[\s\S]*?pub\(crate\)\s+fn\s+start\s*\([\s\S]*?InputRuntime::start\([\s\S]*?Theme::resolve\([\s\S]*?input_runtime\.events\(\)\.clone\(\)[\s\S]*?input_runtime\.focus_events\(\)\.clone\(\)[\s\S]*?input_runtime\.controls\(\)\.clone\(\)[\s\S]*?TerminalPresentationProfile::from_identity\([\s\S]*?TerminalPresentation::new\([\s\S]*?CapabilityBackend::new\([\s\S]*?pub\(crate\)\s+fn\s+fail_after_agent_startup[\s\S]*?finish_startup_failure_with\([\s\S]*?pub\(crate\)\s+fn\s+activate\s*\([\s\S]*?InlineTerminal::new[\s\S]*?InlineTerminal::clear/,
+        /pub\(crate\)\s+struct\s+PendingTerminalSession[\s\S]*?pub\(crate\)\s+fn\s+start\s*\([\s\S]*?InputRuntime::start\([\s\S]*?Theme::resolve\([\s\S]*?input_runtime\.events\(\)\.clone\(\)[\s\S]*?input_runtime\.focus_events\(\)\.clone\(\)[\s\S]*?input_runtime\.controls\(\)\.clone\(\)[\s\S]*?TerminalPresentationProfile::from_env\(\)[\s\S]*?TerminalPresentation::new\([\s\S]*?CapabilityBackend::new\([\s\S]*?pub\(crate\)\s+fn\s+fail_after_agent_startup[\s\S]*?finish_startup_failure_with\([\s\S]*?pub\(crate\)\s+fn\s+activate\s*\([\s\S]*?InlineTerminal::new[\s\S]*?InlineTerminal::clear/,
       ],
     ]),
   ],

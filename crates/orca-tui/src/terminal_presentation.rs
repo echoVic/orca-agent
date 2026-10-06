@@ -19,6 +19,16 @@ pub(crate) struct TerminalPresentationProfile {
 }
 
 impl TerminalPresentationProfile {
+    /// The profile of the terminal this process runs in, as its environment
+    /// tells it: what the terminal session presents with, and what a forced
+    /// exit puts the window title back with (`termination_signals`).
+    pub(crate) fn from_env() -> Self {
+        Self::from_identity(&qwertty::caps::identity_from_env(
+            None,
+            qwertty::caps::std_env_source,
+        ))
+    }
+
     pub(crate) fn from_identity(identity: &TerminalIdentity) -> Self {
         let osc9_supported = matches!(
             identity.program,

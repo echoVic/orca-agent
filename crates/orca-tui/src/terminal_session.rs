@@ -82,9 +82,7 @@ impl PendingTerminalSession {
             focus_events: input_runtime.focus_events().clone(),
             controls: input_runtime.controls().clone(),
         };
-        let presentation_profile = TerminalPresentationProfile::from_identity(
-            &qwertty::caps::identity_from_env(None, qwertty::caps::std_env_source),
-        );
+        let presentation_profile = TerminalPresentationProfile::from_env();
         let presentation = TerminalPresentation::new(terminal_notifications, presentation_profile);
 
         // Retry transient stdout backpressure from resize redraw storms. The
