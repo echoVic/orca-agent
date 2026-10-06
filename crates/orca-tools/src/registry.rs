@@ -1056,7 +1056,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "scope": {
                         "type": "string",
                         "enum": ["project", "user"],
-                        "description": "Where to save reusable workflows. Project writes .orca/workflows; user writes ~/.orca/workflows."
+                        "description": "Where to save reusable workflows. Project writes .orca/workflows; user writes the workflows directory of the Orca home (~/.orca/workflows unless ORCA_HOME is set)."
                     },
                     "args": {
                         "type": "object",
@@ -2966,6 +2966,23 @@ mod tests {
             .expect("deadline description");
         assert!(deadline.contains("queueing"), "{deadline}");
         assert!(deadline.contains("never reset by a resume"), "{deadline}");
+    }
+
+    #[test]
+    fn workflow_draft_save_scope_names_the_orca_homes_workflows_directory() {
+        let registry = default_tool_registry();
+        let action = registry
+            .get("WorkflowDraftAction")
+            .expect("workflow draft action tool");
+        let scope = action.spec().input_schema["properties"]["scope"]["description"]
+            .as_str()
+            .expect("scope description");
+
+        // A user-scope save goes where the rest of the Orca home is, which
+        // ORCA_HOME moves.
+        assert!(scope.contains("Orca home"), "{scope}");
+        assert!(scope.contains("ORCA_HOME"), "{scope}");
+        assert!(scope.contains(".orca/workflows"), "{scope}");
     }
 
     #[test]
