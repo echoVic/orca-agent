@@ -520,39 +520,45 @@ mod tests {
     }
 
     /// Once the cleanup finished, nothing is cut short: a later signal
-    /// neither ends the process nor calls `before_exit`.
+    /// neither ends the process nor calls `before_exit`. The signal comes
+    /// just after `finished` is set, to find it set; but the grace period's
+    /// poll, which ends the watch once `finished` is set, now and then gets
+    /// there first, and then the signal finds no one. The child tries a few
+    /// times, each with a handler of its own.
     #[test]
     fn before_exit_never_runs_once_the_cleanup_finished() {
+        const TRIES: usize = 3;
         let Some(child) =
             in_a_process_of_its_own("before_exit_never_runs_once_the_cleanup_finished")
         else {
-            let finished = Arc::new(AtomicBool::new(false));
             let before_exit_ran = Arc::new(AtomicBool::new(false));
-            let (acting_tx, acting) = mpsc::channel();
-            let _signals = handle_termination_signals(
-                &[TerminationSignal::Terminate],
-                Arc::clone(&finished),
-                {
-                    let finished = Arc::clone(&finished);
+            for _ in 0..TRIES {
+                let finished = Arc::new(AtomicBool::new(false));
+                let (acting_tx, acting) = mpsc::channel();
+                let _signals = handle_termination_signals(
+                    &[TerminationSignal::Terminate],
+                    Arc::clone(&finished),
                     move |_| {
-                        finished.store(true, Ordering::SeqCst);
                         let _ = acting_tx.send(());
-                    }
-                },
-                {
-                    let before_exit_ran = Arc::clone(&before_exit_ran);
-                    move || before_exit_ran.store(true, Ordering::SeqCst)
-                },
-            )
-            .expect("the signal handlers");
-            raise(libc::SIGTERM);
-            acting
-                .recv_timeout(Duration::from_secs(1))
-                .expect("the first signal's action ran");
-            wait_out_the_copies();
-            raise(libc::SIGTERM);
-            // Longer than the grace period's poll and the exit's bound.
-            std::thread::sleep(Duration::from_secs(1));
+                    },
+                    {
+                        let before_exit_ran = Arc::clone(&before_exit_ran);
+                        move || before_exit_ran.store(true, Ordering::SeqCst)
+                    },
+                )
+                .expect("the signal handlers");
+                raise(libc::SIGTERM);
+                acting
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("the first signal's action ran");
+                wait_out_the_copies();
+                finished.store(true, Ordering::SeqCst);
+                raise(libc::SIGTERM);
+                // Longer than the grace period's poll: this watch is over.
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // Longer than a forced exit's wait for before_exit.
+            std::thread::sleep(BEFORE_EXIT_BOUND + Duration::from_millis(100));
             assert!(!before_exit_ran.load(Ordering::SeqCst));
             return;
         };
