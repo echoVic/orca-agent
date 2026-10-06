@@ -1414,6 +1414,7 @@ impl TerminationSignalHandler {
             &[TerminationSignal::Interrupt, TerminationSignal::Terminate],
             finished,
             on_signal,
+            || {},
         );
         Self {
             interrupt,

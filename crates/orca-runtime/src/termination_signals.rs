@@ -8,7 +8,9 @@
 //! run, the TUI quits as it does on its own), and the thread bounds the
 //! cleanup that follows: once [`INTERRUPT_GRACE_PERIOD`] passes before the
 //! caller reports it finished, or at a second signal, the process exits with
-//! the signal's conventional code, 128 plus its number.
+//! the signal's conventional code, 128 plus its number, after a bounded last
+//! chance for the caller to put back what must not outlive it (the TUI's
+//! terminal modes).
 
 use std::future::poll_fn;
 use std::io::{self, Write};
@@ -22,6 +24,8 @@ use std::time::Duration;
 pub const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_secs(10);
 /// Poll interval used while waiting for an interrupted run to finish cleanup.
 const INTERRUPT_GRACE_POLL: Duration = Duration::from_millis(25);
+/// How long a forced exit waits for the caller's `before_exit`.
+pub const BEFORE_EXIT_BOUND: Duration = Duration::from_millis(500);
 
 /// A signal that asks the process to stop.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -73,11 +77,15 @@ pub struct TerminationSignalGuard {
 /// once they are in effect: from then on none of them ends the process
 /// outright.
 ///
-/// The first one calls `on_first_signal` on that thread and starts the grace
-/// period. If `finished` is still unset when [`INTERRUPT_GRACE_PERIOD`] has
-/// passed, the process exits with the signal's exit code; a second signal,
-/// of any of them, exits at once with its own. Each exit says why on stderr.
-/// Once `finished` is set, a signal is ignored and the thread ends.
+/// The first one calls `on_first_signal` on another thread of its own and
+/// starts the grace period at once, so an action that blocks (on a reply that
+/// never comes, say) delays neither of the exits that bound it: if `finished`
+/// is still unset when [`INTERRUPT_GRACE_PERIOD`] has passed, the process
+/// exits with the signal's exit code, and a second signal, of any of them,
+/// exits at once with its own. Such a forced exit first calls `before_exit`,
+/// once, again on a thread of its own, and waits for it [`BEFORE_EXIT_BOUND`]
+/// at most; then it says why on stderr. Once `finished` is set, a signal is
+/// ignored, the thread ends, and `before_exit` never runs.
 ///
 /// Windows handles only [`TerminationSignal::Interrupt`], as the console's
 /// Ctrl+C. Returns `None`, handling none of them, when the thread or its
@@ -87,6 +95,7 @@ pub fn handle_termination_signals(
     signals: &[TerminationSignal],
     finished: Arc<AtomicBool>,
     on_first_signal: impl FnOnce(TerminationSignal) + Send + 'static,
+    before_exit: impl FnOnce() + Send + 'static,
 ) -> Option<TerminationSignalGuard> {
     let signals = signals.to_vec();
     let (registered_tx, registered_rx) = std::sync::mpsc::sync_channel(1);
@@ -112,12 +121,12 @@ pub fn handle_termination_signals(
                 if finished.load(Ordering::SeqCst) {
                     return;
                 }
-                // Whatever the caller's action does, the grace period and the
-                // second signal still bound the cleanup.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    on_first_signal(first)
-                }));
-                bound_the_cleanup(&mut listeners, first, &finished).await;
+                // Should its thread not start, the action does not run: the
+                // grace period still ends the process.
+                let _ = std::thread::Builder::new()
+                    .name("orca-signal-action".to_string())
+                    .spawn(move || on_first_signal(first));
+                bound_the_cleanup(&mut listeners, first, &finished, before_exit).await;
             });
         })
         .ok()?;
@@ -134,6 +143,7 @@ async fn bound_the_cleanup(
     listeners: &mut Listeners,
     first: TerminationSignal,
     finished: &AtomicBool,
+    before_exit: impl FnOnce() + Send + 'static,
 ) {
     let grace = tokio::time::sleep(INTERRUPT_GRACE_PERIOD);
     tokio::pin!(grace);
@@ -141,11 +151,10 @@ async fn bound_the_cleanup(
         tokio::select! {
             () = &mut grace => {
                 if !finished.load(Ordering::SeqCst) {
-                    say(format_args!(
+                    exit_with(first.exit_code(), before_exit, format_args!(
                         "orca: cleanup did not finish within {}s; exiting",
                         INTERRUPT_GRACE_PERIOD.as_secs()
                     ));
-                    std::process::exit(first.exit_code());
                 }
                 return;
             }
@@ -154,11 +163,10 @@ async fn bound_the_cleanup(
                 if finished.load(Ordering::SeqCst) {
                     return;
                 }
-                say(format_args!(
+                exit_with(second.exit_code(), before_exit, format_args!(
                     "orca: received a second {}; exiting immediately",
                     second.name()
                 ));
-                std::process::exit(second.exit_code());
             }
             () = tokio::time::sleep(INTERRUPT_GRACE_POLL) => {
                 if finished.load(Ordering::SeqCst) {
@@ -167,6 +175,31 @@ async fn bound_the_cleanup(
             }
         }
     }
+}
+
+/// Ends the process with `code` and says `why` on stderr, once `before_exit`
+/// has run, on a thread of its own, or [`BEFORE_EXIT_BOUND`] has passed: a
+/// `before_exit` that blocks, on a terminal write or a lock another thread
+/// holds, cannot keep the process alive. Should its thread not start, it does
+/// not run.
+fn exit_with(
+    code: i32,
+    before_exit: impl FnOnce() + Send + 'static,
+    why: std::fmt::Arguments<'_>,
+) -> ! {
+    let (done_tx, done) = std::sync::mpsc::channel::<()>();
+    let started = std::thread::Builder::new()
+        .name("orca-signal-exit".to_string())
+        .spawn(move || {
+            before_exit();
+            let _ = done_tx.send(());
+        });
+    if started.is_ok() {
+        // Returns early, too, when `before_exit` panics.
+        let _ = done.recv_timeout(BEFORE_EXIT_BOUND);
+    }
+    say(why);
+    std::process::exit(code);
 }
 
 /// Says `message` on stderr, dropping it if the write fails: after a SIGHUP
@@ -236,5 +269,216 @@ impl Listeners {
             return Poll::Ready(TerminationSignal::Interrupt);
         }
         Poll::Pending
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::io::Write as _;
+    use std::process::Output;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::{TerminationSignal, handle_termination_signals};
+
+    /// How long a child waits for the core to end it after the signal that
+    /// should: well under the grace period, which an exit by then is not.
+    const EXIT_DEADLINE: Duration = Duration::from_millis(2500);
+    /// The child's exit code when the core did not end it by EXIT_DEADLINE.
+    const NOT_ENDED: i32 = 99;
+
+    /// Each test raises signals that end its process, so it runs in a
+    /// process of its own: the test binary run again for just that test,
+    /// with an Orca home of its own. Returns that process's output, or
+    /// `None` in that process, where the test goes on.
+    fn in_a_process_of_its_own(test: &str) -> Option<Output> {
+        const CHILD_ENV: &str = "ORCA_TEST_SIGNAL_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            return None;
+        }
+        let home = tempfile::tempdir().expect("an Orca home for the child");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", &format!("termination_signals::tests::{test}")])
+            .args(["--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .env("ORCA_HOME", home.path())
+            .output()
+            .expect("run the test in a process of its own");
+        Some(output)
+    }
+
+    fn raise(signal: libc::c_int) {
+        assert_eq!(unsafe { libc::raise(signal) }, 0, "raise signal {signal}");
+    }
+
+    /// Waits for the core to end this process, which it does before
+    /// EXIT_DEADLINE when it works, and otherwise exits with NOT_ENDED.
+    fn wait_to_be_ended() -> ! {
+        std::thread::sleep(EXIT_DEADLINE);
+        std::process::exit(NOT_ENDED);
+    }
+
+    fn stderr(output: &Output) -> String {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// The first signal's action can block: exec's waits for the actor with
+    /// no timeout. A second signal must still end the process at once.
+    #[test]
+    fn a_second_signal_exits_at_once_while_the_first_ones_action_blocks() {
+        let Some(child) = in_a_process_of_its_own(
+            "a_second_signal_exits_at_once_while_the_first_ones_action_blocks",
+        ) else {
+            let (acting_tx, acting) = mpsc::channel();
+            let _signals = handle_termination_signals(
+                &[TerminationSignal::Interrupt, TerminationSignal::Terminate],
+                Arc::new(AtomicBool::new(false)),
+                move |_| {
+                    let _ = acting_tx.send(());
+                    loop {
+                        std::thread::park();
+                    }
+                },
+                || {},
+            )
+            .expect("the signal handlers");
+            raise(libc::SIGTERM);
+            acting
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the first signal's action started");
+            raise(libc::SIGINT);
+            wait_to_be_ended();
+        };
+        assert_eq!(
+            child.status.code(),
+            Some(TerminationSignal::Interrupt.exit_code()),
+            "the second signal did not end the process ({}); stderr: {}",
+            child.status,
+            stderr(&child)
+        );
+        assert!(
+            stderr(&child).contains("orca: received a second SIGINT; exiting immediately"),
+            "{}",
+            stderr(&child)
+        );
+    }
+
+    /// Raises SIGTERM twice, the second once the first one's action has
+    /// started, with `before_exit` for the exit the second one forces.
+    fn force_an_exit_with(before_exit: impl FnOnce() + Send + 'static) -> ! {
+        let (acting_tx, acting) = mpsc::channel();
+        let _signals = handle_termination_signals(
+            &[TerminationSignal::Terminate],
+            Arc::new(AtomicBool::new(false)),
+            move |_| {
+                let _ = acting_tx.send(());
+            },
+            before_exit,
+        )
+        .expect("the signal handlers");
+        raise(libc::SIGTERM);
+        acting
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the first signal's action ran");
+        raise(libc::SIGTERM);
+        wait_to_be_ended();
+    }
+
+    /// A forced exit gives the caller its chance first: the TUI puts the
+    /// terminal back before the line that says why.
+    #[test]
+    fn before_exit_runs_before_the_exit_line() {
+        const RAN: &str = "before_exit ran";
+        let Some(child) = in_a_process_of_its_own("before_exit_runs_before_the_exit_line") else {
+            force_an_exit_with(|| {
+                let _ = writeln!(std::io::stderr(), "{RAN}");
+            });
+        };
+        let stderr = stderr(&child);
+        assert_eq!(
+            child.status.code(),
+            Some(TerminationSignal::Terminate.exit_code()),
+            "the second signal did not end the process ({}); stderr: {stderr}",
+            child.status
+        );
+        let ran = stderr.find(RAN);
+        let exit_line = stderr.find("orca: received a second SIGTERM; exiting immediately");
+        assert!(
+            ran.is_some() && exit_line.is_some() && ran < exit_line,
+            "before_exit did not run before the exit line: {stderr}"
+        );
+    }
+
+    /// Once the cleanup finished, nothing is cut short: a later signal
+    /// neither ends the process nor calls `before_exit`.
+    #[test]
+    fn before_exit_never_runs_once_the_cleanup_finished() {
+        let Some(child) =
+            in_a_process_of_its_own("before_exit_never_runs_once_the_cleanup_finished")
+        else {
+            let finished = Arc::new(AtomicBool::new(false));
+            let before_exit_ran = Arc::new(AtomicBool::new(false));
+            let (acting_tx, acting) = mpsc::channel();
+            let _signals = handle_termination_signals(
+                &[TerminationSignal::Terminate],
+                Arc::clone(&finished),
+                {
+                    let finished = Arc::clone(&finished);
+                    move |_| {
+                        finished.store(true, Ordering::SeqCst);
+                        let _ = acting_tx.send(());
+                    }
+                },
+                {
+                    let before_exit_ran = Arc::clone(&before_exit_ran);
+                    move || before_exit_ran.store(true, Ordering::SeqCst)
+                },
+            )
+            .expect("the signal handlers");
+            raise(libc::SIGTERM);
+            acting
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the first signal's action ran");
+            raise(libc::SIGTERM);
+            // Longer than the grace period's poll and the exit's bound.
+            std::thread::sleep(Duration::from_secs(1));
+            assert!(!before_exit_ran.load(Ordering::SeqCst));
+            return;
+        };
+        assert!(
+            child.status.success() && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+            "a signal after the cleanup finished cut it short ({}); stderr: {}",
+            child.status,
+            stderr(&child)
+        );
+    }
+
+    /// A `before_exit` that never returns (a terminal write that blocks, a
+    /// lock the renderer holds) cannot defeat the exit it comes before.
+    #[test]
+    fn a_before_exit_that_never_returns_delays_the_exit_by_its_bound_only() {
+        let Some(child) = in_a_process_of_its_own(
+            "a_before_exit_that_never_returns_delays_the_exit_by_its_bound_only",
+        ) else {
+            force_an_exit_with(|| {
+                loop {
+                    std::thread::park();
+                }
+            });
+        };
+        assert_eq!(
+            child.status.code(),
+            Some(TerminationSignal::Terminate.exit_code()),
+            "the exit waited for before_exit ({}); stderr: {}",
+            child.status,
+            stderr(&child)
+        );
+        assert!(
+            stderr(&child).contains("orca: received a second SIGTERM; exiting immediately"),
+            "{}",
+            stderr(&child)
+        );
     }
 }

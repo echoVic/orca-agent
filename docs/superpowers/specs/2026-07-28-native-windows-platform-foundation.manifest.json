@@ -520,6 +520,13 @@
       "windows-test-portability"
     ],
     [
+      "termination-signals-test-unix-libc",
+      "crates/orca-runtime/src/termination_signals.rs",
+      "unix_libc_process",
+      5,
+      "windows-test-portability"
+    ],
+    [
       "runtime-permission-test-symlink",
       "crates/orca-runtime/src/runtime_permission.rs",
       "unix_std_api",
