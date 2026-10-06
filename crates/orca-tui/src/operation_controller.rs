@@ -48,6 +48,9 @@ struct HostedOperationState {
 #[derive(Debug, Default)]
 struct HostedOperationInner {
     surface_active: Option<SurfaceActiveOperation>,
+    /// How many operations have become active so far: the number of times a
+    /// surface was installed.
+    surface_installs: u64,
     /// Interaction bindings for the live child currently shown in the
     /// conversation. This is separate from the parent's active operation so
     /// focusing a child never steals cancellation/background ownership.
@@ -106,6 +109,13 @@ impl TuiSurfaceTaskControl {
     #[cfg(test)]
     pub(crate) fn has_pending_interrupt(&self) -> bool {
         self.lock_hosted().interrupt_requested
+    }
+
+    /// How many operations have become active so far. A message the
+    /// controller handled made one active when this number is greater after
+    /// than before.
+    pub(crate) fn surface_installs(&self) -> u64 {
+        self.lock_hosted().surface_installs
     }
 
     pub(crate) fn interrupt_current(&self) -> io::Result<bool> {
@@ -873,6 +883,7 @@ impl TuiSurfaceTaskControl {
                 background_requested,
                 background_handoff_pending: false,
             });
+            hosted.surface_installs += 1;
             hosted.surface_activation_armed = false;
             hosted.interrupt_requested = false;
             break background_requested;

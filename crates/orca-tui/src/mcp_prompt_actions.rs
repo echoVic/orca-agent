@@ -321,7 +321,17 @@ impl AppState {
         let action_tx = self.event_tx.clone();
         let bindings = MentionBindings::new(&text);
         if self.status == AppStatus::Idle {
-            return submit_user_message(self, &action_tx, text.clone(), text, bindings, images);
+            // An MCP prompt's text is literal: it has nothing of the composer's
+            // pastes in it.
+            return submit_user_message(
+                self,
+                &action_tx,
+                text.clone(),
+                text,
+                bindings,
+                images,
+                Vec::new(),
+            );
         }
         let message =
             QueuedUserMessage::from_composer_with_images(text, Vec::new(), bindings, images);
@@ -577,6 +587,24 @@ mod tests {
             state.input_history.last(),
             Some(&format!("/mcp__github__review_pr 123 {pasted}"))
         );
+    }
+
+    #[test]
+    fn a_prompt_that_expands_while_messages_are_held_is_held_with_none_of_the_composers_pastes() {
+        let (mut state, action_rx) = prompt_state();
+        state.startup_history_pending = true;
+        // What the user is typing has a paste in it, which is none of the
+        // prompt's: its text is the server's, as it is.
+        state.pending_pastes = vec![("[Pasted Content 1001 chars]".to_string(), "x".repeat(1001))];
+
+        state.update(expanded("Review pull request 123.", Vec::new()));
+
+        assert!(action_rx.try_recv().is_err(), "nothing is sent yet");
+        assert!(matches!(
+            state.held_submissions.as_slice(),
+            [crate::queued_input::HeldSubmission::Plain { prompt, pending_pastes, .. }]
+                if prompt == "Review pull request 123." && pending_pastes.is_empty()
+        ));
     }
 
     #[test]

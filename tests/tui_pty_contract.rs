@@ -1109,6 +1109,81 @@ fn a_message_typed_before_a_resume_that_fails_follows_the_prompt_in_the_new_conv
 }
 
 #[test]
+fn a_message_held_for_the_resumed_history_stays_in_view_and_in_order_while_the_prompt_runs() {
+    const SLOW_PROMPT: &str = "mock_stream_delay_ms 3000";
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let _recorded_in = record_a_conversation(home.path(), "pty resume seed");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process = PtyProcess::spawn_resumed(home.path(), cwd.path(), "latest", SLOW_PROMPT)
+        .expect("spawn resumed TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "resuming a conversation skipped the review of a new workspace",
+    );
+    // `A` is typed before the history can have loaded.
+    process
+        .write(b"\rA held\r")
+        .expect("accept the workspace and send a message");
+
+    // The prompt's turn runs for three seconds, from its line on screen to the
+    // end of its text. `A` has to be listed in the runtime's queue all the
+    // while it runs, not once it has ended: it waits for that turn, in view.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let screen = reconstruct_screen(&output);
+        let ended = screen.contains("Mock slow stream completed.");
+        if screen.contains("mock_stream_delay_ms 3000")
+            && !ended
+            && screen.contains("Queued 1")
+            && screen.contains("A held")
+        {
+            assert_eq!(
+                screen.matches("A held").count(),
+                1,
+                "A is on screen once; reconstructed screen=\n{screen}"
+            );
+            break;
+        }
+        assert!(
+            !ended,
+            "A was not queued while the prompt's turn ran; reconstructed screen=\n{screen}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the prompt's turn did not start; reconstructed screen=\n{screen}"
+        );
+        if let Some(chunk) = process.receive_output(Duration::from_millis(50)) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+
+    // `B` is typed during that turn, and a last message asks the mock for the
+    // user messages it was given, which is how the order they ran in shows.
+    process
+        .write(b"B typed\r")
+        .expect("send a message during the prompt's turn");
+    process
+        .write(b"mock_history_echo\r")
+        .expect("send the echo during the prompt's turn");
+
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Mock history users: pty resume seed | mock_stream_delay_ms 3000 | A held | B typed | mock_history_echo",
+        "the messages did not run in the order they were typed, after the prompt",
+    );
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
 fn a_message_typed_before_a_conversation_that_cannot_be_resumed_is_not_held_for_good() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");

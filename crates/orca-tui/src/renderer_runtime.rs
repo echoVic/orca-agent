@@ -11,7 +11,7 @@ use crate::bridge;
 use crate::composer_images::DeferredImageSubmit;
 use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{textarea_cursor_byte_index, textarea_text};
-use crate::idle_submit_actions::{handle_idle_submit, release_held_submissions};
+use crate::idle_submit_actions::{handle_idle_submit, release_held_submissions, start_held_turn};
 use crate::mention_search_manager::MentionSearchManager;
 use crate::protocol::{TuiEvent, UserAction};
 use crate::queued_input_actions::enqueue_composer_follow_up_to_runtime;
@@ -87,13 +87,27 @@ impl RendererRuntimeEventOwner {
                     theme,
                     presentation,
                 );
+                let waited_for_history = std::mem::take(&mut state.startup_history_pending);
                 if let Some(prompt) = self.pending_initial_prompt.take() {
                     state.push_message(ChatMessage::User(prompt.clone()));
                     state.enter_running();
                     let _ = action_tx.send(UserAction::Submit(prompt));
+                    // What the user sent meanwhile comes after the prompt: once
+                    // its turn's operation is active, not before, or it would
+                    // wait behind the whole turn in the controller's own line,
+                    // where nothing shows it (`TuiEvent::OperationActive`).
+                    state.startup_turn_pending |= waited_for_history;
+                } else if waited_for_history {
+                    start_held_turn(state, action_tx);
                 }
-                // What the user sent meanwhile comes after the prompt.
-                release_held_submissions(state, action_tx);
+            }
+            TuiEvent::OperationActive => release_held_submissions(state, action_tx),
+            TuiEvent::TurnNotStarted => {
+                // The turn the held messages waited for will not become active:
+                // the next one starts its own.
+                if state.startup_turn_pending {
+                    start_held_turn(state, action_tx);
+                }
             }
             TuiEvent::MentionSearchDirty { generation } => {
                 let text = textarea_text(textarea);
@@ -122,7 +136,9 @@ impl RendererRuntimeEventOwner {
                 );
                 // A new conversation that takes the place of the one resumed
                 // at launch has no history to wait for.
-                release_held_submissions(state, action_tx);
+                if std::mem::take(&mut state.startup_history_pending) {
+                    start_held_turn(state, action_tx);
+                }
             }
             TuiEvent::SettingsUpdated {
                 model,
@@ -293,6 +309,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crossbeam_channel as mpsc;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use orca_core::approval_types::ApprovalMode;
     use orca_core::config::{ReasoningEffort, RunConfig, ThemeName};
     use orca_runtime::prompt_queue::{
@@ -309,6 +326,8 @@ mod tests {
     use crate::mention_search_manager::MentionSearchManager;
     use crate::protocol::SessionAttachmentId;
     use crate::protocol::{AttachedTuiEvent, TuiEvent, UserAction};
+    use crate::queued_input::HeldSubmission;
+    use crate::queued_input_actions::handle_running_key;
     use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
     use crate::theme::Theme;
     use crate::transcript_state::ChatMessage;
@@ -807,7 +826,8 @@ mod tests {
             }
         }
 
-        /// The user types `text` in the composer and presses Enter.
+        /// The user types `text` in the composer and presses Enter, which
+        /// sends it while the conversation is idle.
         fn type_and_press_enter(&mut self, text: &str) {
             self.textarea = make_textarea_with_text(text, &self.vim_state, &self.theme);
             let shared = Arc::new(Mutex::new(self.config.clone()));
@@ -819,6 +839,26 @@ mod tests {
                 &mut self.config,
                 &shared,
                 &self.action_tx,
+            ));
+            assert_eq!(textarea_text(&self.textarea), "", "the composer is cleared");
+        }
+
+        /// The user types `text` in the composer and presses Enter, or Ctrl+Enter,
+        /// while a turn runs, which queues it behind that turn or sends it now.
+        fn type_and_press_while_running(&mut self, text: &str, modifiers: KeyModifiers) {
+            self.textarea = make_textarea_with_text(text, &self.vim_state, &self.theme);
+            let shared = Arc::new(Mutex::new(self.config.clone()));
+            let key = KeyEvent::new(KeyCode::Enter, modifiers);
+            assert!(handle_running_key(
+                &Event::Key(key),
+                &key,
+                &mut self.state,
+                &mut self.config,
+                &shared,
+                &self.action_tx,
+                &mut self.textarea,
+                &mut self.vim_state,
+                &self.theme,
             ));
             assert_eq!(textarea_text(&self.textarea), "", "the composer is cleared");
         }
@@ -854,6 +894,15 @@ mod tests {
                 })
                 .collect()
         }
+
+        /// What is held back, shown above the composer.
+        fn held(&self) -> Vec<&str> {
+            self.state
+                .held_submissions
+                .iter()
+                .map(HeldSubmission::visible_text)
+                .collect()
+        }
     }
 
     impl Drop for ResumingTui {
@@ -871,6 +920,21 @@ mod tests {
             plan: None,
             label: label.to_string(),
         }
+    }
+
+    /// What the controller says of a message it refused: the rejection, and
+    /// that no turn started.
+    fn refused(prompt: &str) -> [TuiEvent; 2] {
+        [
+            TuiEvent::SubmissionRejected {
+                queued_id: None,
+                prompt: prompt.to_string(),
+                bindings: Default::default(),
+                images: Vec::new(),
+                message: "could not start".to_string(),
+            },
+            TuiEvent::TurnNotStarted,
+        ]
     }
 
     /// The queue the runtime keeps once it has what `action` queued, and the
@@ -914,10 +978,10 @@ mod tests {
             tui.sent().is_empty(),
             "a message sent before the history is held"
         );
-        assert_eq!(
-            tui.user_messages(),
-            ["typed"],
-            "the held message stays on screen"
+        assert_eq!(tui.held(), ["typed"], "the held message stays on screen");
+        assert!(
+            tui.user_messages().is_empty(),
+            "the history is about to replace the conversation"
         );
         assert_eq!(
             tui.state.status,
@@ -930,15 +994,12 @@ mod tests {
             "Resumed saved conversation.",
         ));
 
-        // The prompt runs first; the held message waits behind its turn in the
-        // queue, as one typed while that turn runs does.
+        // The prompt starts its turn alone. A message queued now would wait in
+        // the controller's own line, behind that whole turn, where nothing
+        // shows it, so the message waits for the turn's operation to be active.
         let sent = tui.sent();
         assert!(
-            matches!(
-                sent.as_slice(),
-                [UserAction::Submit(prompt), UserAction::QueuePrompt { prompt: queued, .. }]
-                    if prompt == "cli" && queued == "typed"
-            ),
+            matches!(sent.as_slice(), [UserAction::Submit(prompt)] if prompt == "cli"),
             "{sent:?}"
         );
         assert!(matches!(
@@ -951,11 +1012,24 @@ mod tests {
         ));
         assert_eq!(tui.state.status, AppStatus::Running);
         assert!(!tui.state.startup_history_pending);
-        assert!(tui.state.held_submissions.is_empty());
+        assert!(tui.state.startup_turn_pending);
+        assert_eq!(tui.held(), ["typed"], "still on screen, and only once");
 
-        // The runtime has the message queued behind the prompt's turn, and the
-        // queue strip shows it there.
-        let (queue, turn_id) = queue_after(&sent[1]);
+        // The operation is active: the message queues behind it, in the
+        // runtime's queue, which shows it.
+        tui.receive(TuiEvent::OperationActive);
+        let sent = tui.sent();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [UserAction::QueuePrompt { prompt, .. }] if prompt == "typed"
+            ),
+            "{sent:?}"
+        );
+        assert!(tui.state.held_submissions.is_empty());
+        assert!(!tui.state.startup_turn_pending);
+
+        let (queue, turn_id) = queue_after(&sent[0]);
         tui.receive(TuiEvent::PromptQueueUpdated(queue));
         assert!(tui.state.queued_follow_up_pending_or_in_flight());
         assert_eq!(
@@ -992,14 +1066,9 @@ mod tests {
             None,
             "Unable to restore saved conversation.",
         ));
-
         let sent = tui.sent();
         assert!(
-            matches!(
-                sent.as_slice(),
-                [UserAction::Submit(prompt), UserAction::QueuePrompt { prompt: queued, .. }]
-                    if prompt == "cli" && queued == "typed"
-            ),
+            matches!(sent.as_slice(), [UserAction::Submit(prompt)] if prompt == "cli"),
             "{sent:?}"
         );
         assert!(matches!(
@@ -1009,9 +1078,20 @@ mod tests {
                 ChatMessage::User(prompt),
             ] if label == "Unable to restore saved conversation." && prompt == "cli"
         ));
-        assert!(!tui.state.startup_history_pending);
+        assert_eq!(tui.held(), ["typed"]);
 
-        let (queue, turn_id) = queue_after(&sent[1]);
+        tui.receive(TuiEvent::OperationActive);
+        let sent = tui.sent();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [UserAction::QueuePrompt { prompt, .. }] if prompt == "typed"
+            ),
+            "{sent:?}"
+        );
+        assert!(!tui.state.startup_history_pending && !tui.state.startup_turn_pending);
+
+        let (queue, turn_id) = queue_after(&sent[0]);
         tui.receive(TuiEvent::PromptQueueUpdated(queue));
         tui.receive(TuiEvent::RuntimeTurnStarted { turn_id });
         assert_eq!(tui.user_messages(), ["cli", "typed"]);
@@ -1024,7 +1104,7 @@ mod tests {
             Some("history"),
             "Resumed saved conversation.",
         ));
-        assert!(!tui.state.startup_history_pending);
+        assert!(!tui.state.holds_submissions(), "no turn waits to start");
 
         tui.type_and_press_enter("later");
 
@@ -1042,33 +1122,37 @@ mod tests {
         tui.type_and_press_enter("first");
         tui.type_and_press_enter("second");
         assert!(tui.sent().is_empty(), "the second one is held as well");
-        assert_eq!(tui.user_messages(), ["first", "second"]);
+        assert_eq!(tui.held(), ["first", "second"]);
 
         tui.receive(history_loaded(
             Some("history"),
             "Resumed saved conversation.",
         ));
 
+        // No prompt: the first message starts the turn, as a message sent
+        // between turns does, and the second waits for it to be active.
         let sent = tui.sent();
         assert!(
             matches!(
                 sent.as_slice(),
-                [
-                    UserAction::SubmitWithMentions { prompt: first, .. },
-                    UserAction::QueuePrompt { prompt: second, .. },
-                ] if first == "first" && second == "second"
+                [UserAction::SubmitWithMentions { prompt, .. }] if prompt == "first"
             ),
             "{sent:?}"
         );
-        assert!(matches!(
-            tui.state.transcript.messages.as_slice(),
-            [
-                ChatMessage::Assistant(_),
-                ChatMessage::System { .. },
-                ChatMessage::User(first),
-            ] if first == "first"
-        ));
+        assert_eq!(tui.user_messages(), ["first"]);
+        assert_eq!(tui.held(), ["second"]);
         assert_eq!(tui.state.status, AppStatus::Running);
+
+        tui.receive(TuiEvent::OperationActive);
+        let sent = tui.sent();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [UserAction::QueuePrompt { prompt, .. }] if prompt == "second"
+            ),
+            "{sent:?}"
+        );
+        assert!(!tui.state.holds_submissions());
     }
 
     #[test]
@@ -1087,7 +1171,7 @@ mod tests {
         ));
         assert!(tui.sent().is_empty());
         assert!(tui.state.startup_history_pending);
-        assert_eq!(tui.state.held_submissions.len(), 1);
+        assert_eq!(tui.held(), ["typed"]);
 
         tui.receive(attached(
             active,
@@ -1095,10 +1179,14 @@ mod tests {
         ));
         assert!(matches!(
             tui.sent().as_slice(),
-            [UserAction::Submit(prompt), UserAction::QueuePrompt { prompt: queued, .. }]
-                if prompt == "cli" && queued == "typed"
+            [UserAction::Submit(prompt)] if prompt == "cli"
         ));
-        assert!(!tui.state.startup_history_pending);
+        tui.receive(attached(active, TuiEvent::OperationActive));
+        assert!(matches!(
+            tui.sent().as_slice(),
+            [UserAction::QueuePrompt { prompt, .. }] if prompt == "typed"
+        ));
+        assert!(!tui.state.holds_submissions());
 
         // A conversation the user switches to later has its history too: the
         // messages are not sent into it again.
@@ -1107,6 +1195,7 @@ mod tests {
             history_loaded(Some("another"), "loaded another"),
         ));
         assert!(tui.sent().is_empty());
+        assert!(!tui.state.holds_submissions());
         assert!(matches!(
             tui.state.transcript.messages.as_slice(),
             [ChatMessage::Assistant(history), ChatMessage::System { .. }] if history == "another"
@@ -1114,9 +1203,10 @@ mod tests {
     }
 
     #[test]
-    fn a_new_conversation_that_takes_the_place_of_the_resume_releases_the_held_messages() {
+    fn a_new_conversation_that_takes_the_place_of_the_resume_starts_the_held_messages() {
         let mut tui = ResumingTui::waiting_for_history(None);
         tui.type_and_press_enter("typed");
+        tui.type_and_press_enter("then");
 
         // `/new` before the history: the session starts with a projection of
         // its own, which clears the screen, and is announced.
@@ -1142,13 +1232,210 @@ mod tests {
         assert!(tui.sent().is_empty());
         tui.receive(TuiEvent::NewSessionStarted);
 
-        // No history will come for it: what was held is sent to it, once.
+        // No history will come for it: the first message starts its turn,
+        // the next waits for that turn's operation to be active.
         assert!(!tui.state.startup_history_pending);
-        assert!(tui.state.held_submissions.is_empty());
         assert!(matches!(
             tui.sent().as_slice(),
             [UserAction::SubmitWithMentions { prompt, .. }] if prompt == "typed"
         ));
-        assert_eq!(tui.user_messages(), ["typed"]);
+        assert_eq!(tui.held(), ["then"]);
+        tui.receive(TuiEvent::OperationActive);
+        assert!(matches!(
+            tui.sent().as_slice(),
+            [UserAction::QueuePrompt { prompt, .. }] if prompt == "then"
+        ));
+        assert!(!tui.state.holds_submissions());
+    }
+
+    #[test]
+    fn what_is_sent_while_the_prompts_turn_starts_is_held_too() {
+        let mut tui = ResumingTui::waiting_for_history(Some("cli"));
+        tui.type_and_press_enter("before");
+        tui.receive(history_loaded(
+            Some("history"),
+            "Resumed saved conversation.",
+        ));
+        assert!(matches!(
+            tui.sent().as_slice(),
+            [UserAction::Submit(prompt)] if prompt == "cli"
+        ));
+        assert_eq!(tui.state.status, AppStatus::Running);
+
+        // The turn runs as far as the TUI knows, so Enter queues. Queued now,
+        // it would sit in the controller's line behind the whole turn, out of
+        // the queue's sight and behind whatever is sent once the turn is
+        // under way, so it is held with the one before it.
+        tui.type_and_press_while_running("A", KeyModifiers::NONE);
+        tui.type_and_press_while_running("B", KeyModifiers::CONTROL);
+        assert!(tui.sent().is_empty());
+        assert_eq!(tui.held(), ["before", "A", "B"]);
+
+        tui.receive(TuiEvent::OperationActive);
+        let sent = tui.sent();
+        let queued: Vec<&str> = sent
+            .iter()
+            .map(|action| match action {
+                UserAction::QueuePrompt { prompt, .. } => prompt.as_str(),
+                other => panic!("expected queued prompts, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(queued, ["before", "A", "B"], "in the order they were sent");
+
+        // From then on a message queues at once, as always.
+        tui.type_and_press_while_running("C", KeyModifiers::NONE);
+        assert!(matches!(
+            tui.sent().as_slice(),
+            [UserAction::QueuePrompt { prompt, .. }] if prompt == "C"
+        ));
+    }
+
+    #[test]
+    fn a_message_sent_on_the_running_path_before_the_history_loads_is_held() {
+        let mut tui = ResumingTui::waiting_for_history(Some("cli"));
+        // A command typed before the history, such as `$skill` or `/compact`,
+        // leaves the conversation running as far as the TUI knows.
+        tui.state.enter_running();
+
+        tui.type_and_press_while_running("A", KeyModifiers::NONE);
+
+        assert!(tui.sent().is_empty());
+        assert_eq!(tui.held(), ["A"]);
+        tui.receive(history_loaded(
+            Some("history"),
+            "Resumed saved conversation.",
+        ));
+        assert!(matches!(
+            tui.sent().as_slice(),
+            [UserAction::Submit(prompt)] if prompt == "cli"
+        ));
+        tui.receive(TuiEvent::OperationActive);
+        assert!(matches!(
+            tui.sent().as_slice(),
+            [UserAction::QueuePrompt { prompt, .. }] if prompt == "A"
+        ));
+    }
+
+    #[test]
+    fn a_start_that_does_not_happen_does_not_hold_the_rest_for_good() {
+        let mut tui = ResumingTui::waiting_for_history(Some("cli"));
+        tui.type_and_press_enter("A");
+        tui.type_and_press_enter("B");
+        tui.receive(history_loaded(
+            Some("history"),
+            "Resumed saved conversation.",
+        ));
+        assert!(matches!(
+            tui.sent().as_slice(),
+            [UserAction::Submit(prompt)] if prompt == "cli"
+        ));
+
+        // The prompt is refused before its operation is active: the first
+        // message held starts its turn instead, the other waits for that.
+        for event in refused("cli") {
+            tui.receive(event);
+        }
+        let sent = tui.sent();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [UserAction::SubmitWithMentions { prompt, .. }] if prompt == "A"
+            ),
+            "{sent:?}"
+        );
+        assert_eq!(tui.held(), ["B"]);
+        assert!(tui.state.startup_turn_pending);
+
+        // So is that one: the next message held starts its turn.
+        for event in refused("A") {
+            tui.receive(event);
+        }
+        let sent = tui.sent();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [UserAction::SubmitWithMentions { prompt, .. }] if prompt == "B"
+            ),
+            "{sent:?}"
+        );
+        assert!(tui.held().is_empty());
+        assert!(tui.state.startup_turn_pending);
+
+        // Nothing is left to wait for, and what comes next is not held.
+        for event in refused("B") {
+            tui.receive(event);
+        }
+        assert!(!tui.state.holds_submissions());
+        assert!(tui.sent().is_empty());
+        tui.type_and_press_enter("C");
+        assert!(matches!(
+            tui.sent().as_slice(),
+            [UserAction::SubmitWithMentions { prompt, .. }] if prompt == "C"
+        ));
+    }
+
+    #[test]
+    fn a_start_that_does_not_happen_and_one_that_does_release_the_rest_behind_the_latter() {
+        let mut tui = ResumingTui::waiting_for_history(Some("cli"));
+        tui.type_and_press_enter("A");
+        tui.type_and_press_enter("B");
+        tui.receive(history_loaded(
+            Some("history"),
+            "Resumed saved conversation.",
+        ));
+        let _ = tui.sent();
+
+        for event in refused("cli") {
+            tui.receive(event);
+        }
+        assert!(matches!(
+            tui.sent().as_slice(),
+            [UserAction::SubmitWithMentions { prompt, .. }] if prompt == "A"
+        ));
+
+        // A's turn is under way: B queues behind it.
+        tui.receive(TuiEvent::OperationActive);
+        assert!(matches!(
+            tui.sent().as_slice(),
+            [UserAction::QueuePrompt { prompt, .. }] if prompt == "B"
+        ));
+        assert!(!tui.state.holds_submissions());
+        // The turn's own events change nothing.
+        tui.receive(TuiEvent::TurnNotStarted);
+        assert!(tui.sent().is_empty());
+    }
+
+    #[test]
+    fn a_prompt_that_does_not_start_ends_the_hold_when_nothing_is_held() {
+        let mut tui = ResumingTui::waiting_for_history(Some("cli"));
+        tui.receive(history_loaded(
+            Some("history"),
+            "Resumed saved conversation.",
+        ));
+        assert!(tui.state.holds_submissions());
+        let _ = tui.sent();
+
+        // The runtime had the prompt queued behind a turn it was running.
+        tui.receive(TuiEvent::TurnNotStarted);
+
+        assert!(!tui.state.holds_submissions());
+        assert!(tui.sent().is_empty());
+    }
+
+    #[test]
+    fn what_says_no_turn_waits_to_start_or_become_active_changes_nothing() {
+        let mut tui = ResumingTui::waiting_for_history(None);
+        tui.receive(history_loaded(
+            Some("history"),
+            "Resumed saved conversation.",
+        ));
+        assert!(!tui.state.holds_submissions());
+
+        tui.receive(TuiEvent::OperationActive);
+        tui.receive(TuiEvent::TurnNotStarted);
+
+        assert!(tui.sent().is_empty());
+        assert!(!tui.state.holds_submissions());
+        assert!(tui.state.held_submissions.is_empty());
     }
 }

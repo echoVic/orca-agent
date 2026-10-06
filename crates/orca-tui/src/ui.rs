@@ -29,6 +29,7 @@ use crate::chrome::{GUTTER_CONTINUATION, GUTTER_WIDTH, TAIL_ROW};
 use crate::diagnostics::{DiagnosticContext, DiagnosticLevel, TuiDiagnostic};
 use crate::display_text::{compact_long_text, truncate_to_display_width};
 use crate::protocol::TaskTranscriptResult;
+use crate::queued_input::QueuedPreviewSnapshot;
 use crate::recap_view;
 use crate::selection::{TranscriptSelection, apply_style_to_line_range};
 use crate::session_picker::SessionPickerRow;
@@ -1323,16 +1324,24 @@ fn mcp_details_column<'a>(labels: impl Iterator<Item = &'a str>, width: usize) -
 fn queued_preview_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     if state.panel_mode != PanelMode::Conversation
         || !matches!(state.status, AppStatus::Idle | AppStatus::Running)
-        || !state.queued_follow_up_pending_or_in_flight()
         || width == 0
     {
+        return Vec::new();
+    }
+    let width = width as usize;
+    // What is held back for the conversation to start is not in the runtime's
+    // queue yet, and is listed on its own until it is.
+    if let Some(held) = state.held_submissions_preview() {
+        let header = format!(" Held until the conversation starts · {}", held.len);
+        return preview_strip(header, theme.muted, held, width, theme);
+    }
+    if !state.queued_follow_up_pending_or_in_flight() {
         return Vec::new();
     }
     let Some(view) = state.queued_submission_view() else {
         return Vec::new();
     };
     let snapshot = view.preview;
-    let width = width as usize;
     let header = view.error.as_ref().map_or_else(
         || {
             if snapshot.running {
@@ -1354,6 +1363,18 @@ fn queued_preview_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line
     } else {
         theme.muted
     };
+    preview_strip(header, header_color, snapshot, width, theme)
+}
+
+/// The rows above the composer that list queued messages: `header`, then the
+/// first and the second, or the first and the latest, of `snapshot`.
+fn preview_strip(
+    header: String,
+    header_color: Color,
+    snapshot: QueuedPreviewSnapshot,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         truncate_to_display_width(&header, width),
         Style::default().fg(header_color),
@@ -7842,6 +7863,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn held_messages_are_listed_above_the_composer_until_the_conversation_starts() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.startup_history_pending = true;
+        for text in ["first", "second", "third"] {
+            state
+                .held_submissions
+                .push(crate::queued_input::HeldSubmission::FollowUp(queued(text)));
+        }
+
+        let lines = queued_preview_lines(&state, 80, &theme)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines,
+            [
+                " Held until the conversation starts · 3",
+                " ↳ first",
+                " … 2 more · latest: third",
+            ]
+        );
+        // Not under the runtime's header: its keys act on its queue.
+        assert!(!lines.iter().any(|line| line.contains("Ctrl+Enter")));
+        // Running as far as the TUI knows, as it is once the prompt is sent.
+        state.enter_running();
+        assert_eq!(queued_preview_lines(&state, 80, &theme).len(), 3);
+    }
+
+    #[test]
+    fn held_messages_leave_the_strip_to_the_runtimes_queue_once_it_has_them() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.startup_turn_pending = true;
+        state
+            .held_submissions
+            .push(crate::queued_input::HeldSubmission::FollowUp(queued(
+                "held",
+            )));
+        assert!(
+            queued_preview_lines(&state, 80, &theme)[0]
+                .to_string()
+                .contains("Held until")
+        );
+
+        // Released: the runtime's queue lists it, and the held list does not.
+        state.startup_turn_pending = false;
+        state.held_submissions.clear();
+        state.enqueue_user_message(queued("held")).unwrap();
+        let lines = queued_preview_lines(&state, 80, &theme);
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].to_string().contains("Queued 1"));
+        assert!(lines[1].to_string().contains("held"));
+    }
+
+    #[test]
+    fn nothing_is_listed_when_nothing_is_held() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.startup_history_pending = true;
+
+        assert!(queued_preview_lines(&state, 80, &theme).is_empty());
     }
 
     #[test]

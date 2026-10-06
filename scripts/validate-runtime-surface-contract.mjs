@@ -1188,7 +1188,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/global_actions.rs:quit_on_termination_signal:user_action.route", 2],
   ["crates/orca-tui/src/idle_navigation_actions.rs:handle_idle_navigation_shortcut:user_action.route", 1],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:user_action.route", 1],
-  ["crates/orca-tui/src/idle_submit_actions.rs:submit_user_message:user_action.route", 1],
+  ["crates/orca-tui/src/idle_submit_actions.rs:send_user_message:user_action.route", 1],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:input_history.record", 1],
   ["crates/orca-tui/src/key_event_actions.rs:handle_key_event_preflight:settings.update", 1],
   ["crates/orca-tui/src/key_event_actions.rs:handle_key_event_preflight:user_action.route", 1],

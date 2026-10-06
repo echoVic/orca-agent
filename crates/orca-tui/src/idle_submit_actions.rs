@@ -15,12 +15,12 @@ use crate::composer_textarea::{
 };
 use crate::protocol::TuiUserInputResponse;
 use crate::protocol::{PendingTuiInput, TuiInteractionResponse, TuiMcpElicitationMode, UserAction};
-use crate::queued_input::QueuedUserMessage;
+use crate::queued_input::HeldSubmission;
 use crate::queued_input_actions::{FollowUp, dispatch_follow_up};
 use crate::slash_command_actions::{SlashOutcome, handle_composer_slash_command};
 use crate::theme::Theme;
 use crate::transcript_state::ChatMessage;
-use crate::types::{AppState, AppStatus, HeldSubmission};
+use crate::types::{AppState, AppStatus};
 use crate::vim::VimState;
 
 #[allow(clippy::too_many_arguments)]
@@ -179,7 +179,16 @@ pub(crate) fn handle_idle_submit(
         }
         let visible_text = visible_text.trim().to_string();
         let bindings = state.mention_bindings.clone();
-        submit_user_message(state, action_tx, visible_text, text, bindings, images);
+        let pending_pastes = state.pending_pastes.clone();
+        submit_user_message(
+            state,
+            action_tx,
+            visible_text,
+            text,
+            bindings,
+            images,
+            pending_pastes,
+        );
     }
     state.pending_pastes.clear();
     state.composer_images.clear_attachments();
@@ -229,12 +238,12 @@ pub(crate) fn submit_pending_user_input_response(
 /// Sends `prompt`, with its mention `bindings` and attached `images`, as the
 /// user's next message between turns; the conversation shows it as
 /// `visible_text` with the images. A paused queue starts again, since the
-/// user took over.
+/// user took over. `pending_pastes` are the composer's, which `prompt` has
+/// expanded.
 ///
-/// While the conversation resumed at launch has not loaded, it only shows
-/// the message, and keeps it for [`release_held_submissions`]: the history
-/// that is coming takes the place of what the conversation shows, and the
-/// prompt given on the command line is to run before it.
+/// While the messages the user sends are held (see
+/// [`AppState::holds_submissions`]) it only keeps this one, to send it
+/// after the turn the held ones wait for, in order.
 pub(crate) fn submit_user_message(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
@@ -242,20 +251,30 @@ pub(crate) fn submit_user_message(
     prompt: String,
     bindings: MentionBindings,
     images: Vec<ComposerImageAttachment>,
+    pending_pastes: Vec<(String, String)>,
 ) {
-    if state.startup_history_pending {
-        hold_submission(
-            state,
-            HeldSubmission {
-                visible_text,
-                prompt,
-                bindings,
-                images,
-                pending_pastes: state.pending_pastes.clone(),
-            },
-        );
+    if state.holds_submissions() {
+        state.held_submissions.push(HeldSubmission::Plain {
+            visible_text,
+            prompt,
+            bindings,
+            images,
+            pending_pastes,
+        });
         return;
     }
+    send_user_message(state, action_tx, visible_text, prompt, bindings, images);
+}
+
+/// What [`submit_user_message`] does when nothing is held back.
+fn send_user_message(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+    visible_text: String,
+    prompt: String,
+    bindings: MentionBindings,
+    images: Vec<ComposerImageAttachment>,
+) {
     state.push_user_message_with_images(visible_text, &images);
     state.enter_running();
     state.scroll_to_bottom();
@@ -268,64 +287,41 @@ pub(crate) fn submit_user_message(
     state.resume_queued_follow_up_autosend();
 }
 
-/// Shows `submission` as sent, and keeps it until the history has loaded. The
-/// status stays idle, so that the next message is held as well, not queued
-/// behind a turn that has not begun.
-fn hold_submission(state: &mut AppState, submission: HeldSubmission) {
-    state.push_user_message_with_images(submission.visible_text.clone(), &submission.images);
-    state.scroll_to_bottom();
-    state.held_submissions.push(submission);
-}
-
-/// The history of the conversation resumed at launch has loaded, or a new
-/// conversation has taken its place: sends what the user sent meanwhile, in
-/// order, as the composer sends a message. A message queues behind a turn that
-/// runs, the one the command-line prompt started, as one typed during a turn
-/// does; with no turn running, the first one starts its turn at once and the
-/// ones after it queue behind that.
-pub(crate) fn release_held_submissions(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>) {
-    state.startup_history_pending = false;
-    for held in std::mem::take(&mut state.held_submissions) {
-        if state.status == AppStatus::Idle {
-            let HeldSubmission {
-                visible_text,
-                prompt,
-                bindings,
-                images,
-                ..
-            } = held;
-            submit_user_message(state, action_tx, visible_text, prompt, bindings, images);
-        } else {
-            queue_held_submission(state, action_tx, held);
-        }
-    }
-}
-
-/// Queues `held` behind the turn that runs, the way a message typed during
-/// it is queued. What it asks the runtime for is what it would have asked for
-/// then: the composer's pastes are expanded for it.
-fn queue_held_submission(
-    state: &mut AppState,
-    action_tx: &mpsc::Sender<UserAction>,
-    held: HeldSubmission,
-) {
-    let HeldSubmission {
-        visible_text,
-        bindings,
-        images,
-        pending_pastes,
-        ..
-    } = held;
-    let Some(message) = QueuedUserMessage::from_composer_with_images(
-        visible_text,
-        pending_pastes,
-        bindings,
-        images,
-    ) else {
+/// Starts the turn of the first message held, as the composer starts the turn
+/// of a message it sends between turns, and holds the ones after it until that
+/// turn's operation is active: see [`release_held_submissions`]. With none
+/// held, there is no turn to wait for, and nothing is held any more.
+///
+/// The history of the conversation resumed at launch has loaded without a
+/// prompt given with it, a new conversation has taken its place, or the turn
+/// the held messages waited for did not start.
+pub(crate) fn start_held_turn(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>) {
+    if state.held_submissions.is_empty() {
+        state.startup_turn_pending = false;
         return;
-    };
-    if !dispatch_follow_up(state, action_tx, message, FollowUp::Queue) {
-        state.report_queued_input_error("follow-up action queue is unavailable".to_string());
+    }
+    let (visible_text, prompt, bindings, images) = state.held_submissions.remove(0).into_plain();
+    state.startup_turn_pending = true;
+    send_user_message(state, action_tx, visible_text, prompt, bindings, images);
+}
+
+/// The turn the held messages waited for is active: queues them behind it, in
+/// order, as the composer queues a message sent while a turn runs. The queue
+/// shows them from then on, and they run after it, ahead of what is sent
+/// later. Nothing is held any more.
+pub(crate) fn release_held_submissions(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>) {
+    if !std::mem::take(&mut state.startup_turn_pending) {
+        return;
+    }
+    for held in std::mem::take(&mut state.held_submissions) {
+        let text = held.visible_text().to_string();
+        let queued = held
+            .into_follow_up()
+            .is_some_and(|message| dispatch_follow_up(state, action_tx, message, FollowUp::Queue));
+        if !queued {
+            // The composer was cleared when it was sent: say what was lost.
+            state.report_queued_input_error(format!("could not queue \"{text}\""));
+        }
     }
 }
 
@@ -808,11 +804,16 @@ mod tests {
         ));
     }
 
-    /// What `HistoryLoaded` does to the conversation the held messages were
-    /// shown in.
-    fn history_replaces_the_conversation(state: &mut AppState) {
-        state.replace_messages(Vec::new());
-        state.set_status(AppStatus::Idle);
+    /// The history of the conversation resumed at launch arrives: the
+    /// reducer takes it in, and the renderer's runtime owner ends the hold
+    /// for it.
+    fn history_loads(state: &mut AppState) {
+        state.update(crate::protocol::TuiEvent::HistoryLoaded {
+            messages: Vec::new(),
+            plan: None,
+            label: "Resumed saved conversation.".to_string(),
+        });
+        state.startup_history_pending = false;
     }
 
     #[test]
@@ -844,14 +845,18 @@ mod tests {
 
         assert!(action_rx.try_recv().is_err(), "nothing is sent yet");
         assert!(state.composer_images.is_empty(), "the composer is cleared");
-        assert!(matches!(
-            state.transcript.messages.as_slice(),
-            [ChatMessage::User(text), ChatMessage::Image(image)]
-                if text == "inspect [Image #1]" && image.label == "[Image #1]"
-        ));
+        assert_eq!(
+            state
+                .held_submissions_preview()
+                .map(|preview| preview.first),
+            Some("inspect [Image #1]".to_string()),
+            "it is listed above the composer"
+        );
 
-        history_replaces_the_conversation(&mut state);
-        release_held_submissions(&mut state, &action_tx);
+        // No prompt came with the conversation: the message starts the turn,
+        // as it would have between turns.
+        history_loads(&mut state);
+        start_held_turn(&mut state, &action_tx);
 
         assert!(matches!(
             action_rx.try_recv(),
@@ -860,9 +865,14 @@ mod tests {
         ));
         assert!(matches!(
             state.transcript.messages.as_slice(),
-            [ChatMessage::User(text), ChatMessage::Image(image)]
-                if text == "inspect [Image #1]" && image.label == "[Image #1]"
+            [
+                ChatMessage::System { .. },
+                ChatMessage::User(text),
+                ChatMessage::Image(image),
+            ] if text == "inspect [Image #1]" && image.label == "[Image #1]"
         ));
+        assert!(state.held_submissions.is_empty());
+        assert!(state.startup_turn_pending, "its turn is not active yet");
     }
 
     #[test]
@@ -895,10 +905,10 @@ mod tests {
         ));
         assert!(state.pending_pastes.is_empty(), "the composer is cleared");
 
-        // A turn is running when the history has loaded: the message queues
-        // behind it, with the paste in it, as it would have when typed then.
-        history_replaces_the_conversation(&mut state);
-        state.enter_running();
+        // The turn the message waited for is active: it queues behind it, with
+        // the paste in it, as it would have when typed then.
+        history_loads(&mut state);
+        state.startup_turn_pending = true;
         release_held_submissions(&mut state, &action_tx);
 
         let Ok(UserAction::QueuePrompt { prompt, .. }) = action_rx.try_recv() else {
@@ -907,5 +917,76 @@ mod tests {
         assert!(prompt.contains(payload.trim()));
         assert!(!prompt.contains(placeholder));
         assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_message_held_while_a_turn_waits_is_queued_with_the_text_the_queue_would_send() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            orca_core::model::VISION_MODEL.to_string(),
+            "/tmp".to_string(),
+        );
+        state.startup_turn_pending = true;
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("inspect", &vim, &theme);
+        attach_test_image(&mut state, &mut textarea);
+
+        // Held as a plain message (the conversation is idle as far as the
+        // composer goes), queued as a follow-up: an image label is not part
+        // of what the runtime queue is given, as for any follow-up with one.
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+        ));
+        assert!(action_rx.try_recv().is_err());
+        release_held_submissions(&mut state, &action_tx);
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::QueuePrompt { prompt, images, .. })
+                if prompt == "inspect" && images.len() == 1
+        ));
+    }
+
+    #[test]
+    fn a_held_message_the_action_queue_cannot_take_is_named_not_lost_without_a_word() {
+        let (action_tx, action_rx) = mpsc::bounded(1);
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.startup_turn_pending = true;
+        state.held_submissions.push(HeldSubmission::Plain {
+            visible_text: "review the diff".to_string(),
+            prompt: "review the diff".to_string(),
+            bindings: MentionBindings::default(),
+            images: Vec::new(),
+            pending_pastes: Vec::new(),
+        });
+        action_tx
+            .try_send(UserAction::Interrupt)
+            .expect("fill the action queue");
+
+        release_held_submissions(&mut state, &action_tx);
+
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+        assert!(action_rx.try_recv().is_err(), "nothing else was sent");
+        assert_eq!(
+            state.queued_input_error(),
+            Some("could not queue \"review the diff\"")
+        );
+        assert!(!state.holds_submissions());
     }
 }

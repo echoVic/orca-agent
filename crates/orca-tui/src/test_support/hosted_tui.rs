@@ -343,6 +343,7 @@ impl Tui {
             text.to_string(),
             orca_runtime::mentions::MentionBindings::new(text),
             Vec::new(),
+            Vec::new(),
         );
     }
 

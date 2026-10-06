@@ -199,6 +199,40 @@ fn prestart_mcp_servers(
     }
 }
 
+/// Handles a message submitted to the controller, and says so when it ends
+/// with no operation having become active for it: it was rejected, it failed,
+/// or the runtime queued it behind a turn that was already running. The
+/// renderer holds what the user sends until the turn it started is active, and
+/// goes on with the next when that one will not be (`TuiEvent::TurnNotStarted`).
+/// A turn that is active has said so (`TuiEvent::OperationActive`) before its
+/// first event.
+#[allow(clippy::too_many_arguments)]
+fn handle_submitted_turn(
+    submitted_turn: SubmittedTurn,
+    config: &Arc<Mutex<RunConfig>>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    thread: &mut Option<RuntimeThreadHandle>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    control: &TuiSurfaceTaskControl,
+    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    host: &RuntimeHostHandle,
+) {
+    let installs = control.surface_installs();
+    handle_hosted_submitted_turn(
+        submitted_turn,
+        config,
+        preloaded,
+        thread,
+        event_tx,
+        control,
+        pending_workflow_notifications,
+        host,
+    );
+    if control.surface_installs() == installs {
+        let _ = event_tx.send(TuiEvent::TurnNotStarted);
+    }
+}
+
 /// Opens the conversation `--resume` or `--continue` named, whose history
 /// the renderer shows (and then sends a prompt given with it, and what the
 /// user sent meanwhile), and announces its thread. The history comes
@@ -632,7 +666,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     &pending_workflow_notifications,
                 );
             }
-            Ok(UserAction::Submit(prompt)) => handle_hosted_submitted_turn(
+            Ok(UserAction::Submit(prompt)) => handle_submitted_turn(
                 SubmittedTurn::user(prompt),
                 &hosted_config_for_active(side_parent.as_ref(), thread.as_ref(), &config),
                 &preloaded,
@@ -647,7 +681,7 @@ pub(crate) fn hosted_tui_controller_loop(
                 bindings,
                 images,
             }) => {
-                handle_hosted_submitted_turn(
+                handle_submitted_turn(
                     SubmittedTurn::user_with_mentions(prompt, bindings, images),
                     &hosted_config_for_active(side_parent.as_ref(), thread.as_ref(), &config),
                     &preloaded,
@@ -1391,6 +1425,132 @@ mod tests {
 
         action_tx.send(UserAction::Cancel).expect("cancel action");
         runtime.shutdown().expect("hosted controller shutdown");
+    }
+
+    /// Everything the controller said until it ended, in order.
+    fn events_until_the_controller_ends(
+        action_tx: &mpsc::Sender<UserAction>,
+        event_rx: &mpsc::Receiver<TuiEvent>,
+        runtime: &mut TuiAgentRuntime,
+    ) -> Vec<TuiEvent> {
+        action_tx.send(UserAction::Cancel).expect("cancel action");
+        runtime.shutdown().expect("hosted controller shutdown");
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.recv_timeout(Duration::from_millis(500)) {
+            match event {
+                TuiEvent::Attached(attached) => events.push(attached.event),
+                event => events.push(event),
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn a_submit_that_starts_a_turn_makes_its_operation_active_before_the_turns_events() {
+        let (_home, action_tx, event_rx, mut runtime) =
+            spawn_controller_with_history(HistoryMode::Record);
+
+        action_tx
+            .send(UserAction::Submit("tidy the relay drain".to_string()))
+            .expect("submit action");
+        let mut turn = Vec::new();
+        loop {
+            let event = next_controller_event(&event_rx);
+            let done = matches!(event, TuiEvent::SessionCompleted { .. });
+            turn.push(event);
+            if done {
+                break;
+            }
+        }
+        let after = events_until_the_controller_ends(&action_tx, &event_rx, &mut runtime);
+
+        // The renderer queues a follow-up straight to the runtime from the
+        // moment it hears of this, and none of the turn's events came before.
+        let active = turn
+            .iter()
+            .position(|event| matches!(event, TuiEvent::OperationActive))
+            .expect("the operation was announced");
+        let first_of_the_turn = turn
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    TuiEvent::TurnStarted { .. }
+                        | TuiEvent::MessageDelta(_)
+                        | TuiEvent::SessionCompleted { .. }
+                )
+            })
+            .expect("the turn's events");
+        assert!(active < first_of_the_turn, "{turn:?}");
+        // A turn that started is not one that did not.
+        assert!(
+            !turn
+                .iter()
+                .chain(after.iter())
+                .any(|event| matches!(event, TuiEvent::TurnNotStarted)),
+            "{turn:?} then {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_submit_that_is_refused_says_that_no_turn_started() {
+        let (_home, action_tx, event_rx, mut runtime) =
+            spawn_controller_with_history(HistoryMode::Record);
+        let root = std::env::current_dir().expect("working directory");
+        let prompt = "review @gone.txt";
+        let bindings = orca_runtime::mentions::MentionBindings::from_bindings(
+            prompt,
+            vec![orca_runtime::mentions::MentionBinding {
+                start: 7,
+                end: prompt.len(),
+                visible: "@gone.txt".to_string(),
+                target: orca_runtime::mentions::MentionTarget::File {
+                    root,
+                    path: "no-such-file-for-the-held-message-tests.txt".to_string(),
+                    kind: orca_runtime::mentions::MentionFileKind::File,
+                },
+            }],
+        );
+
+        action_tx
+            .send(UserAction::SubmitWithMentions {
+                prompt: prompt.to_string(),
+                bindings,
+                images: Vec::new(),
+            })
+            .expect("submit action");
+        // What the controller says of it, up to its saying that no turn
+        // started: a cancel sent at once could get ahead of the message.
+        let mut events = Vec::new();
+        loop {
+            let event = next_controller_event(&event_rx);
+            let done = matches!(event, TuiEvent::TurnNotStarted);
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        events.extend(events_until_the_controller_ends(
+            &action_tx,
+            &event_rx,
+            &mut runtime,
+        ));
+
+        let rejected = events
+            .iter()
+            .position(|event| matches!(event, TuiEvent::SubmissionRejected { .. }))
+            .expect("the message was refused");
+        let not_started = events
+            .iter()
+            .position(|event| matches!(event, TuiEvent::TurnNotStarted))
+            .expect("the controller said no turn started");
+        assert!(rejected < not_started, "{events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TuiEvent::OperationActive)),
+            "{events:?}"
+        );
     }
 
     #[test]

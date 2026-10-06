@@ -432,6 +432,85 @@ fn queued_composer_from_runtime(
     }
 }
 
+/// A message the user sent before the turn it would follow was under way,
+/// with what the submit path was given for it, kept until it can be sent: see
+/// [`AppState::holds_submissions`].
+pub(crate) enum HeldSubmission {
+    /// Sent from the composer while the conversation was idle, or by an MCP
+    /// prompt then: a plain submit, which starts a turn of its own.
+    Plain {
+        visible_text: String,
+        prompt: String,
+        bindings: MentionBindings,
+        images: Vec<ComposerImageAttachment>,
+        pending_pastes: Vec<(String, String)>,
+    },
+    /// Queued, or sent now, while a turn was running: a follow-up queued
+    /// behind it.
+    FollowUp(QueuedUserMessage),
+}
+
+impl HeldSubmission {
+    /// What the conversation shows for it.
+    pub(crate) fn visible_text(&self) -> &str {
+        match self {
+            Self::Plain { visible_text, .. } => visible_text,
+            Self::FollowUp(message) => message.visible_text(),
+        }
+    }
+
+    fn preview(&self) -> String {
+        compact_preview(self.visible_text())
+    }
+
+    /// It as the follow-up the composer queues behind a running turn. `None`
+    /// when there is nothing to send: no text, and no image label.
+    pub(crate) fn into_follow_up(self) -> Option<QueuedUserMessage> {
+        match self {
+            Self::Plain {
+                visible_text,
+                bindings,
+                images,
+                pending_pastes,
+                ..
+            } => QueuedUserMessage::from_composer_with_images(
+                visible_text,
+                pending_pastes,
+                bindings,
+                images,
+            ),
+            Self::FollowUp(message) => Some(message),
+        }
+    }
+
+    /// It as what the composer sends when no turn runs: the text the
+    /// conversation shows, the prompt, its mention bindings and its images.
+    pub(crate) fn into_plain(
+        self,
+    ) -> (
+        String,
+        String,
+        MentionBindings,
+        Vec<ComposerImageAttachment>,
+    ) {
+        match self {
+            Self::Plain {
+                visible_text,
+                prompt,
+                bindings,
+                images,
+                ..
+            } => (visible_text, prompt, bindings, images),
+            Self::FollowUp(message) => (
+                message.visible_text().to_string(),
+                message.submission_text().to_string(),
+                message.submission_bindings().clone(),
+                message.images().to_vec(),
+            ),
+        }
+    }
+}
+
 impl QueuedUserMessage {
     #[cfg(test)]
     pub(crate) fn from_composer(
@@ -485,7 +564,6 @@ impl QueuedUserMessage {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn visible_text(&self) -> &str {
         &self.visible_text
     }
@@ -532,6 +610,33 @@ impl QueuedUserMessage {
 }
 
 impl AppState {
+    /// Whether what the user sends is held back, shown above the composer
+    /// instead of sent: the conversation resumed at launch has not loaded yet
+    /// (its history is about to take the place of the conversation, and the
+    /// prompt given with it goes first), or the turn started after it is not
+    /// active yet (a message queued now would wait in the controller's own line,
+    /// behind that whole turn, where nothing shows it).
+    pub(crate) fn holds_submissions(&self) -> bool {
+        self.startup_history_pending || self.startup_turn_pending
+    }
+
+    /// What the strip above the composer shows of the messages held back.
+    pub(crate) fn held_submissions_preview(&self) -> Option<QueuedPreviewSnapshot> {
+        let len = self.held_submissions.len();
+        let preview = |index: usize| {
+            self.held_submissions
+                .get(index)
+                .map(HeldSubmission::preview)
+        };
+        Some(QueuedPreviewSnapshot {
+            len,
+            running: false,
+            first: preview(0)?,
+            second: (len == 2).then(|| preview(1)).flatten(),
+            latest: (len > 2).then(|| preview(len - 1)).flatten(),
+        })
+    }
+
     pub(crate) fn runtime_queue_revision(&self) -> orca_runtime::prompt_queue::QueueRevision {
         self.queued_submission.projection.revision
     }

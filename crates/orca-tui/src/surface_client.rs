@@ -2396,6 +2396,10 @@ fn drain_operation_with_boundary(
     event_tx: &mpsc::Sender<TuiEvent>,
     defer_compacted_until_terminal: bool,
 ) -> io::Result<TuiHostedOperationOutcome> {
+    // Every operation is drained right after its surface is installed, so
+    // this is the first thing the renderer hears of it: a message queued from
+    // here on goes straight to the runtime's queue.
+    let _ = event_tx.send(TuiEvent::OperationActive);
     let (wait_tx, wait_rx) = mpsc::bounded(1);
     let waiter_cancellation = OptionalProcessLocalCancel::new();
     let waiter_cancellation_for_thread = waiter_cancellation.clone();

@@ -262,6 +262,17 @@ pub enum TuiEvent {
     QueuedSubmissionStarted {
         id: u64,
     },
+    /// The controller has an operation active: its surface is installed, so a
+    /// follow-up queued from now on goes straight to the runtime's queue, behind
+    /// it, and the queue shows it. Sent for each operation, ahead of the events
+    /// of its turn.
+    OperationActive,
+    /// The controller finished handling a message submitted to it without an
+    /// operation having become active for it: it was rejected, it failed, or
+    /// the runtime queued it behind a turn that was already running. Sent
+    /// after whatever it said of that (a rejection, an error), and for every
+    /// message submitted that did not start a turn.
+    TurnNotStarted,
     PromptQueueUpdated(orca_runtime::prompt_queue::PromptQueueSnapshot),
     /// The running turn accepted a `SubmitNow` follow-up; the model sees it
     /// before its next request.

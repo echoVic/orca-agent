@@ -17,7 +17,7 @@ use crate::composer_textarea::{
 };
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::protocol::UserAction;
-use crate::queued_input::QueuedUserMessage;
+use crate::queued_input::{HeldSubmission, QueuedUserMessage};
 use crate::running_actions::handle_running_shortcut;
 use crate::shortcuts::{RunningShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::slash_command_actions::{SlashOutcome, handle_composer_slash_command};
@@ -111,12 +111,22 @@ pub(crate) enum FollowUp {
 /// Hands `message` to the dispatcher as a follow-up to the running turn:
 /// queued, or sent now. `false` when the action queue cannot take it, and
 /// then nothing is sent.
+///
+/// While the messages the user sends are held (see
+/// [`AppState::holds_submissions`]) it only keeps this one, behind the ones
+/// held before it, to be queued once the turn they wait for is active.
 pub(crate) fn dispatch_follow_up(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
     message: QueuedUserMessage,
     follow_up: FollowUp,
 ) -> bool {
+    if state.holds_submissions() {
+        state
+            .held_submissions
+            .push(HeldSubmission::FollowUp(message));
+        return true;
+    }
     let prompt = message.submission_text().to_string();
     let bindings = message.submission_bindings().clone();
     let images = message.images().to_vec();

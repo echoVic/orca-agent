@@ -580,6 +580,10 @@ fn enqueue_action(
 
 fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
     let message = "TUI command queue is full; command rejected".to_string();
+    let plain_submit = matches!(
+        action,
+        UserAction::Submit(_) | UserAction::SubmitWithMentions { .. }
+    );
     match action {
         UserAction::Submit(prompt) => {
             let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
@@ -655,6 +659,11 @@ fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
         _ => {
             let _ = event_tx.try_send(TuiEvent::Error(message));
         }
+    }
+    // A message the controller never gets is one it did not start a turn for;
+    // said after the rejection, as the controller says it.
+    if plain_submit {
+        let _ = event_tx.try_send(TuiEvent::TurnNotStarted);
     }
 }
 
@@ -1356,6 +1365,12 @@ mod tests {
                 prompt, message, ..
             })
                 if prompt == "third" && message.contains("queue is full")
+        ));
+        // A message the controller never gets is one it did not start a turn
+        // for, and that is said after the rejection, not before it.
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::TurnNotStarted)
         ));
         dispatcher.shutdown().expect("shutdown dispatcher");
     }
