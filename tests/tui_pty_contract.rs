@@ -2,8 +2,10 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -997,16 +999,7 @@ fn tui_quit_stops_an_mcp_server_that_is_still_starting() {
     let status = process.wait_for_exit(Duration::from_secs(5));
     process.close_io_and_join();
     assert_eq!(status.code(), Some(130), "TUI exited with {status}");
-
-    // It was still starting, and would have read nothing for 30 s.
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while process_is_alive(&pid) {
-        assert!(
-            Instant::now() < deadline,
-            "the MCP server {pid} outlived the TUI"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert_server_stops(&pid);
 }
 
 #[test]
@@ -1045,6 +1038,204 @@ fn tui_exit_from_first_run_setup_starts_no_mcp_server() {
         server.started(),
         Vec::<String>::new(),
         "choosing Exit started an MCP server"
+    );
+}
+
+#[test]
+fn tui_sigterm_quits_like_exit_and_stops_mcp_servers() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let fixture = tempfile::tempdir().expect("MCP fixture directory");
+    let server = SlowMcpServer::configure(home.path(), fixture.path());
+    let mut process =
+        PtyProcess::spawn_without_prompt(home.path(), cwd.path()).expect("spawn TUI in PTY");
+
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    let pid = server.wait_for_start();
+
+    process.drain_output(&mut output);
+    let signalled_at = output.len();
+    process.signal(libc::SIGTERM);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    process.drain_output(&mut output);
+
+    assert_eq!(status.code(), Some(143), "TUI exited with {status}");
+    assert_server_stops(&pid);
+    assert_restores_the_terminal(&output[signalled_at..]);
+}
+
+#[test]
+fn tui_sighup_with_the_terminal_gone_still_stops_mcp_servers() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let fixture = tempfile::tempdir().expect("MCP fixture directory");
+    let server = SlowMcpServer::configure(home.path(), fixture.path());
+    let mut process =
+        PtyProcess::spawn_without_prompt(home.path(), cwd.path()).expect("spawn TUI in PTY");
+
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    let pid = server.wait_for_start();
+
+    // The terminal goes first, as when its window closes: the TUI's reads
+    // end and its writes fail before the hangup arrives.
+    process.hang_up();
+    process.signal(libc::SIGHUP);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+
+    assert_eq!(status.code(), Some(129), "TUI exited with {status}");
+    assert_server_stops(&pid);
+}
+
+/// A terminal can hang up with no SIGHUP to say so (it is not the TUI's
+/// controlling terminal, as here), and when one comes, the TUI may see its
+/// input end first. Either way it quits as on SIGHUP.
+#[test]
+fn tui_whose_terminal_hangs_up_quits_as_on_sighup() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let fixture = tempfile::tempdir().expect("MCP fixture directory");
+    let server = SlowMcpServer::configure(home.path(), fixture.path());
+    let mut process =
+        PtyProcess::spawn_without_prompt(home.path(), cwd.path()).expect("spawn TUI in PTY");
+
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    let pid = server.wait_for_start();
+
+    process.hang_up();
+    let status = process.wait_for_exit(Duration::from_secs(5));
+
+    assert_eq!(status.code(), Some(129), "TUI exited with {status}");
+    assert_server_stops(&pid);
+}
+
+#[test]
+fn tui_sigterm_during_a_turn_interrupts_it() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process =
+        PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "mock_stream_delay_ms 10000")
+            .expect("spawn TUI in PTY");
+
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    receive_until(
+        &process,
+        &mut output,
+        "Running 0s",
+        Duration::from_secs(20),
+        "TUI did not render the active turn before the signal",
+    );
+    // The screen says so as soon as the message is sent: wait for the
+    // runtime to run the turn too.
+    let turn = wait_for_a_turn_record(home.path(), "\"type\":\"turn_started\"");
+    process.drain_output(&mut output);
+    let signalled_at = output.len();
+    process.signal(libc::SIGTERM);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    process.drain_output(&mut output);
+
+    assert_eq!(status.code(), Some(143), "TUI exited with {status}");
+    let record = std::fs::read_to_string(&turn).expect("the turn's record");
+    let terminal = record
+        .lines()
+        .find(|line| line.contains("\"type\":\"operation_terminal\""))
+        .unwrap_or_else(|| panic!("the turn ended without a terminal record: {record}"));
+    assert!(
+        terminal.contains("\"terminal\":{\"cancelled\""),
+        "the turn was not interrupted: {terminal}"
+    );
+    // The terminal is still there: the exit tells how to resume.
+    assert!(
+        contains_rendered_text(&output[signalled_at..], "orca --resume"),
+        "no resume hint after the signal; output={}",
+        String::from_utf8_lossy(&output[signalled_at..])
+    );
+}
+
+/// Waits for the record of a turn under `home` to hold `needle`, and
+/// returns its path.
+fn wait_for_a_turn_record(home: &std::path::Path, needle: &str) -> std::path::PathBuf {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let found = std::fs::read_dir(home.join("operations"))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| std::fs::read_to_string(path).is_ok_and(|record| record.contains(needle)));
+        if let Some(path) = found {
+            return path;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no turn record holds {needle} within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn tui_sigterm_during_the_workspace_review_exits_cleanly() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let fixture = tempfile::tempdir().expect("MCP fixture directory");
+    let server = SlowMcpServer::configure(home.path(), fixture.path());
+    let mut process =
+        PtyProcess::spawn_without_prompt(home.path(), cwd.path()).expect("spawn TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "TUI did not ask to review the new workspace",
+    );
+    process.drain_output(&mut output);
+    let signalled_at = output.len();
+    process.signal(libc::SIGTERM);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    process.drain_output(&mut output);
+
+    assert_eq!(status.code(), Some(143), "TUI exited with {status}");
+    assert_restores_the_terminal(&output[signalled_at..]);
+    assert_eq!(
+        server.started(),
+        Vec::<String>::new(),
+        "a signal during the workspace review started an MCP server"
+    );
+}
+
+/// Asserts that the MCP server `pid` is gone within a second of the TUI's
+/// exit: still starting, it would have read nothing for 30 s.
+fn assert_server_stops(pid: &str) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while process_is_alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the MCP server {pid} outlived the TUI"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Asserts that `output`, what the TUI wrote after a signal, puts the
+/// terminal back as an ordinary exit does: bracketed paste off, among the
+/// rest.
+fn assert_restores_the_terminal(output: &[u8]) {
+    const BRACKETED_PASTE_OFF: &[u8] = b"\x1b[?2004l";
+    assert!(
+        output
+            .windows(BRACKETED_PASTE_OFF.len())
+            .any(|window| window == BRACKETED_PASTE_OFF),
+        "the TUI did not restore the terminal; output={}",
+        String::from_utf8_lossy(output)
     );
 }
 
@@ -1278,6 +1469,8 @@ struct PtyProcess {
     writer: Option<File>,
     reader: Option<JoinHandle<()>>,
     output_rx: Receiver<Vec<u8>>,
+    /// Stops the reader, which then closes its end of the terminal.
+    stop_reading: Arc<AtomicBool>,
 }
 
 impl PtyProcess {
@@ -1365,18 +1558,27 @@ impl PtyProcess {
             .spawn()?;
 
         let (output_tx, output_rx) = mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            let mut buffer = [0_u8; 4096];
-            loop {
-                match terminal_reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(read) => {
-                        if output_tx.send(buffer[..read].to_vec()).is_err() {
-                            break;
-                        }
+        let stop_reading = Arc::new(AtomicBool::new(false));
+        let reader = std::thread::spawn({
+            let stop_reading = Arc::clone(&stop_reading);
+            move || {
+                let mut buffer = [0_u8; 4096];
+                // It waits for output a little at a time, so that `hang_up`
+                // can stop it while the TUI still runs.
+                while !stop_reading.load(Ordering::SeqCst) {
+                    if !readable(&terminal_reader, Duration::from_millis(25)) {
+                        continue;
                     }
-                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-                    Err(error) => panic!("read TUI PTY: {error}"),
+                    match terminal_reader.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            if output_tx.send(buffer[..read].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                        Err(error) => panic!("read TUI PTY: {error}"),
+                    }
                 }
             }
         });
@@ -1386,7 +1588,22 @@ impl PtyProcess {
             writer: Some(writer),
             reader: Some(reader),
             output_rx,
+            stop_reading,
         })
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.as_ref().expect("PTY child remains owned").id()
+    }
+
+    /// Sends `signal` to the TUI, as `kill` does.
+    fn signal(&self, signal: libc::c_int) {
+        let pid = libc::pid_t::try_from(self.pid()).expect("the TUI's pid");
+        assert_eq!(
+            unsafe { libc::kill(pid, signal) },
+            0,
+            "send signal {signal} to the TUI"
+        );
     }
 
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -1420,7 +1637,7 @@ impl PtyProcess {
             }
             assert!(
                 Instant::now() < deadline,
-                "TUI did not exit after idle Ctrl-C"
+                "TUI did not exit within {timeout:?}"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1434,6 +1651,18 @@ impl PtyProcess {
     }
 
     fn close_io_and_join(&mut self) {
+        self.writer.take();
+        if let Some(reader) = self.reader.take() {
+            reader.join().expect("join PTY reader");
+        }
+    }
+
+    /// Closes the terminal from this end while the TUI runs, as closing its
+    /// window does: stops reading it and closes every descriptor of the
+    /// PTY's master, so the TUI's reads end and its writes fail. What it
+    /// writes from then on is lost.
+    fn hang_up(&mut self) {
+        self.stop_reading.store(true, Ordering::SeqCst);
         self.writer.take();
         if let Some(reader) = self.reader.take() {
             reader.join().expect("join PTY reader");
@@ -1659,6 +1888,18 @@ fn open_pty(columns: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
     // close-on-exec duplicates and let the inheritable originals close; each
     // child still gets its own terminal, which spawning puts on fds 0-2.
     Ok((duplicate_fd(&master)?, duplicate_fd(&slave)?))
+}
+
+/// Whether `file` has something to read, or has reached its end, within
+/// `timeout`.
+fn readable(file: &File, timeout: Duration) -> bool {
+    let mut poll = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    unsafe { libc::poll(&mut poll, 1, timeout) > 0 }
 }
 
 fn duplicate_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {

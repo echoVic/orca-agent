@@ -6,7 +6,7 @@ use orca_core::config::ThemeName;
 use ratatui::backend::CrosstermBackend;
 
 use crate::capability_backend::CapabilityBackend;
-use crate::input_runtime::{InputControl, InputRuntime, InputRuntimeOptions};
+use crate::input_runtime::{InputControl, InputRuntime, InputRuntimeOptions, TerminationTakeover};
 use crate::presentation::{
     InlineTerminal, finish_terminal_presentation, initialize_terminal_presentation,
     with_terminal_presentation_cleanup,
@@ -59,11 +59,23 @@ pub(crate) struct PendingTerminalSession {
 }
 
 impl PendingTerminalSession {
-    pub(crate) fn start(theme: ThemeName, terminal_notifications: bool) -> io::Result<Self> {
-        let input_runtime = InputRuntime::start(InputRuntimeOptions {
-            theme,
-            focus_events: terminal_notifications,
-        })?;
+    /// `takeover` is the TUI's own handling of the end of the session (see
+    /// `termination_signals`): with it, input leaves SIGINT and SIGTERM to
+    /// it and reports a terminal that hung up, and the screen drops what it
+    /// would write to that terminal.
+    pub(crate) fn start(
+        theme: ThemeName,
+        terminal_notifications: bool,
+        takeover: Option<TerminationTakeover>,
+    ) -> io::Result<Self> {
+        let drops_writes_after_a_hangup = takeover.is_some();
+        let input_runtime = InputRuntime::start(
+            InputRuntimeOptions {
+                theme,
+                focus_events: terminal_notifications,
+            },
+            takeover,
+        )?;
         let theme = Theme::resolve(theme, input_runtime.profile());
         let input_receivers = TerminalInputReceivers {
             events: input_runtime.events().clone(),
@@ -77,10 +89,13 @@ impl PendingTerminalSession {
 
         // Retry transient stdout backpressure from resize redraw storms. The
         // CLI's stdio guard remains the primary nonblocking defense.
-        let backend = CapabilityBackend::new(
-            CrosstermBackend::new(RetryWriter::new(io::stdout())),
-            theme.color_level,
-        );
+        let writer = RetryWriter::new(io::stdout());
+        let writer = if drops_writes_after_a_hangup {
+            writer.dropping_writes_after_a_hangup()
+        } else {
+            writer
+        };
+        let backend = CapabilityBackend::new(CrosstermBackend::new(writer), theme.color_level);
 
         Ok(Self {
             theme,

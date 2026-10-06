@@ -108,6 +108,8 @@ mod terminal_capabilities;
 mod terminal_output;
 mod terminal_presentation;
 mod terminal_session;
+#[cfg(unix)]
+mod termination_signals;
 pub mod theme;
 mod transcript_hit;
 mod transcript_search;

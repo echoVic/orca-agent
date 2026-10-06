@@ -2,6 +2,8 @@ use crossbeam_channel as mpsc;
 use std::io;
 use std::time::{Duration, Instant};
 
+use orca_runtime::termination_signals::TerminationSignal;
+
 use crate::protocol::UserAction;
 use crate::shortcuts::GlobalShortcut;
 use crate::transcript_state::ChatMessage;
@@ -77,6 +79,35 @@ where
         }
     }
     Ok(GlobalShortcutFlow::Continue)
+}
+
+/// Quits as an ordinary exit does after `signal` (see `termination_signals`)
+/// and returns the exit code that reports it, 128 plus its number: a turn
+/// still running is interrupted first, as Ctrl+C does, unless it is the
+/// turn of a daemon's session this TUI is attached to, which goes on without
+/// it. After SIGHUP the terminal is gone.
+pub(crate) fn quit_on_termination_signal(
+    signal: TerminationSignal,
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+) -> i32 {
+    let turn_running = matches!(
+        state.status,
+        AppStatus::Running
+            | AppStatus::Compacting
+            | AppStatus::WaitingApproval
+            | AppStatus::WaitingUserInput
+    );
+    if turn_running && !state.attached_session {
+        let _ = action_tx.send(UserAction::Interrupt);
+        state.request_runtime_queue_pause();
+        state.suspend_queued_follow_up_autosend();
+    }
+    if signal == TerminationSignal::Hangup {
+        state.terminal_lost = true;
+    }
+    let _ = action_tx.send(UserAction::Cancel);
+    signal.exit_code()
 }
 
 #[cfg(test)]

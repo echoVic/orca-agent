@@ -10,6 +10,7 @@ use orca_runtime::history::SessionTranscript;
 
 use crate::bridge;
 use crate::frame_scheduler::IterationEvent;
+use crate::global_actions::quit_on_termination_signal;
 use crate::input_event_actions::BatchedInputEvent;
 use crate::protocol::{TuiEvent, UserAction};
 use crate::renderer_input_router::RendererInputRouter;
@@ -90,6 +91,9 @@ impl<'a, 'text> RendererIterationEventRouter<'a, 'text> {
                 self.state.exit_message = Some(reason);
                 Ok(Some(1))
             }
+            IterationEvent::Runtime(TuiEvent::TerminationSignal { signal }) => Ok(Some(
+                quit_on_termination_signal(signal, self.state, self.action_tx),
+            )),
             IterationEvent::Runtime(tui_event) => {
                 self.runtime.handle(
                     tui_event,
@@ -120,6 +124,7 @@ mod tests {
 
     use orca_core::config::ThemeName;
     use orca_runtime::history::SessionTranscript;
+    use orca_runtime::termination_signals::TerminationSignal;
 
     use super::RendererIterationEventRouter;
     use crate::bridge;
@@ -132,7 +137,7 @@ mod tests {
     use crate::test_support::test_run_config;
     use crate::theme::Theme;
     use crate::transcript_state::ChatMessage;
-    use crate::types::AppState;
+    use crate::types::{AppState, AppStatus};
     use crate::vim::VimState;
 
     struct Fixture {
@@ -256,6 +261,92 @@ mod tests {
         assert_eq!(
             fixture.state.exit_message.as_deref(),
             Some("ACP reconnect limit reached")
+        );
+    }
+
+    /// SIGTERM, SIGHUP or SIGINT quits as an ordinary exit does: a running
+    /// turn is interrupted first, and the exit code is 128 plus the signal.
+    #[test]
+    fn a_termination_signal_interrupts_the_turn_and_quits_with_its_code() {
+        let mut fixture = Fixture::new();
+        fixture.state.set_status(AppStatus::Running);
+
+        let exit = fixture
+            .route(
+                IterationEvent::Runtime(TuiEvent::TerminationSignal {
+                    signal: TerminationSignal::Terminate,
+                }),
+                Instant::now(),
+                || panic!("a signal does not clear the terminal"),
+            )
+            .expect("runtime event routing");
+
+        assert_eq!(exit, Some(143));
+        assert!(matches!(
+            fixture.action_rx.try_recv(),
+            Ok(UserAction::Interrupt)
+        ));
+        assert!(matches!(
+            fixture.action_rx.try_recv(),
+            Ok(UserAction::Cancel)
+        ));
+        assert!(!fixture.state.terminal_lost);
+    }
+
+    /// After SIGHUP the terminal is gone: nothing more is drawn on it, and
+    /// no resume hint is printed to it.
+    #[test]
+    fn a_hangup_quits_with_its_terminal_lost() {
+        let mut fixture = Fixture::new();
+
+        let exit = fixture
+            .route(
+                IterationEvent::Runtime(TuiEvent::TerminationSignal {
+                    signal: TerminationSignal::Hangup,
+                }),
+                Instant::now(),
+                || panic!("a signal does not clear the terminal"),
+            )
+            .expect("runtime event routing");
+
+        assert_eq!(exit, Some(129));
+        assert!(fixture.state.terminal_lost);
+        assert!(matches!(
+            fixture.action_rx.try_recv(),
+            Ok(UserAction::Cancel)
+        ));
+        assert!(
+            fixture.action_rx.try_recv().is_err(),
+            "nothing ran to interrupt"
+        );
+    }
+
+    /// The turn of a session attached with `orca attach` is the daemon's:
+    /// quitting only disconnects from it.
+    #[test]
+    fn an_attached_tui_quits_without_interrupting_the_daemons_turn() {
+        let mut fixture = Fixture::new();
+        fixture.state.attached_session = true;
+        fixture.state.set_status(AppStatus::Running);
+
+        let exit = fixture
+            .route(
+                IterationEvent::Runtime(TuiEvent::TerminationSignal {
+                    signal: TerminationSignal::Interrupt,
+                }),
+                Instant::now(),
+                || panic!("a signal does not clear the terminal"),
+            )
+            .expect("runtime event routing");
+
+        assert_eq!(exit, Some(130));
+        assert!(matches!(
+            fixture.action_rx.try_recv(),
+            Ok(UserAction::Cancel)
+        ));
+        assert!(
+            fixture.action_rx.try_recv().is_err(),
+            "the daemon's turn was interrupted"
         );
     }
 

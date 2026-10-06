@@ -42,18 +42,56 @@ pub(crate) fn clear_stdio_nonblocking() {}
 /// any time). Waits briefly between attempts to let the terminal drain.
 pub(crate) struct RetryWriter<W> {
     inner: W,
+    /// Set when the TUI handles a hangup itself (`termination_signals`):
+    /// once a write fails with EIO, as one does on a terminal whose other
+    /// end closed, that write and every later one are dropped. The renderer
+    /// then quits on the hangup, which its input reports too.
+    drops_writes_after_a_hangup: bool,
+    hung_up: bool,
 }
 
 impl<W> RetryWriter<W> {
     pub(crate) const fn new(inner: W) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            drops_writes_after_a_hangup: false,
+            hung_up: false,
+        }
     }
+
+    pub(crate) const fn dropping_writes_after_a_hangup(mut self) -> Self {
+        self.drops_writes_after_a_hangup = true;
+        self
+    }
+
+    /// Whether `error` says the terminal hung up, and writes from now on are
+    /// to be dropped.
+    fn hangs_up(&mut self, error: &io::Error) -> bool {
+        if self.drops_writes_after_a_hangup && is_eio(error) {
+            self.hung_up = true;
+        }
+        self.hung_up
+    }
+}
+
+#[cfg(unix)]
+fn is_eio(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EIO)
+}
+
+/// Only the unix TUI handles a hangup itself.
+#[cfg(not(unix))]
+fn is_eio(_error: &io::Error) -> bool {
+    false
 }
 
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
 
 impl<W: Write> Write for RetryWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.hung_up {
+            return Ok(buf.len());
+        }
         loop {
             match self.inner.write(buf) {
                 Err(e)
@@ -64,12 +102,16 @@ impl<W: Write> Write for RetryWriter<W> {
                 {
                     std::thread::sleep(RETRY_DELAY);
                 }
+                Err(e) if self.hangs_up(&e) => return Ok(buf.len()),
                 result => return result,
             }
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if self.hung_up {
+            return Ok(());
+        }
         loop {
             match self.inner.flush() {
                 Err(e)
@@ -80,6 +122,7 @@ impl<W: Write> Write for RetryWriter<W> {
                 {
                     std::thread::sleep(RETRY_DELAY);
                 }
+                Err(e) if self.hangs_up(&e) => return Ok(()),
                 result => return result,
             }
         }
@@ -153,6 +196,46 @@ mod tests {
         assert_eq!(
             writer.write(b"x").unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
+        );
+    }
+
+    /// A terminal that hung up fails every write with EIO. When the TUI
+    /// handles the hangup itself, the first such write marks it gone and
+    /// that write and every later one are dropped: a frame drawn before the
+    /// renderer quits on the hangup, or the cursor ratatui shows again when
+    /// its terminal is dropped, cannot fail the session (ratatui's drop would
+    /// panic, printing that failure to the same terminal).
+    #[cfg(unix)]
+    #[test]
+    fn writes_after_a_hangup_are_dropped_once_told_to() {
+        struct HungUpTerminal {
+            writes: usize,
+        }
+        impl Write for HungUpTerminal {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }
+        }
+
+        let mut writer = RetryWriter::new(HungUpTerminal { writes: 0 });
+        assert_eq!(
+            writer.write(b"x").unwrap_err().raw_os_error(),
+            Some(libc::EIO),
+            "untold, it fails as before"
+        );
+
+        let mut writer =
+            RetryWriter::new(HungUpTerminal { writes: 0 }).dropping_writes_after_a_hangup();
+        assert_eq!(writer.write(b"frame").unwrap(), 5);
+        assert_eq!(writer.write(b"cursor").unwrap(), 6);
+        writer.flush().unwrap();
+        assert_eq!(
+            writer.inner.writes, 1,
+            "nothing was written after the hangup"
         );
     }
 

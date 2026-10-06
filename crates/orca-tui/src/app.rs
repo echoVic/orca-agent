@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 #[cfg(test)]
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -137,18 +138,22 @@ pub(crate) fn run_tui_attached(
 }
 
 fn run_tui_backend(config: RunConfig, remote: Option<crate::acp_client::AttachOptions>) -> i32 {
+    // What is printed here may find the terminal gone, after a hangup: a
+    // failed write is ignored rather than ending the exit in a panic.
     match run_tui_inner(config, remote) {
         Ok(exit) => {
             if let Some(message) = exit.message.as_deref() {
-                eprintln!("orca: {message}");
+                let _ = writeln!(io::stderr(), "orca: {message}");
             }
-            if let Some(hint) = exit_resume_hint(exit.session_id.as_deref()) {
+            if !exit.terminal_lost
+                && let Some(hint) = exit_resume_hint(exit.session_id.as_deref())
+            {
                 let _ = io::stdout().lock().write_all(hint.as_bytes());
             }
             exit.code
         }
         Err(e) => {
-            eprintln!("TUI error: {e}");
+            let _ = writeln!(io::stderr(), "TUI error: {e}");
             1
         }
     }
@@ -158,8 +163,29 @@ fn run_tui_inner(
     mut config: RunConfig,
     remote: Option<crate::acp_client::AttachOptions>,
 ) -> io::Result<TuiExit> {
-    let pending_terminal_session =
-        PendingTerminalSession::start(config.theme, config.terminal_notifications)?;
+    let (event_tx, pending_event_rx) = tui_event_channel();
+    // Set once the TUI has cleaned up: a signal after that cuts nothing
+    // short.
+    let finished = Arc::new(AtomicBool::new(false));
+    // SIGINT, SIGTERM and SIGHUP quit like an ordinary exit from here on,
+    // before the terminal, the runtime or any MCP server starts; so does a
+    // terminal that hangs up (see `termination_signals`).
+    #[cfg(unix)]
+    let termination_signals = crate::termination_signals::install_tui_termination_signals(
+        event_tx.clone(),
+        Arc::clone(&finished),
+    );
+    #[cfg(unix)]
+    let termination_takeover = termination_signals
+        .as_ref()
+        .map(|_| crate::termination_signals::hangup_takeover(event_tx.clone()));
+    #[cfg(not(unix))]
+    let termination_takeover = None;
+    let pending_terminal_session = PendingTerminalSession::start(
+        config.theme,
+        config.terminal_notifications,
+        termination_takeover,
+    )?;
 
     const FRAME_INTERVAL: Duration = Duration::from_millis(16);
     const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
@@ -168,7 +194,6 @@ fn run_tui_inner(
     const MAX_SUPERVISED_TUI_TASKS: usize = 32;
 
     let workspace_root = syntax_workspace_root(&config);
-    let (event_tx, pending_event_rx) = tui_event_channel();
     let (action_tx, action_rx) = user_action_channel();
     let mention_search = MentionSearchManager::new_roots(
         mention_search_roots(&config, &workspace_root),
@@ -368,6 +393,7 @@ fn run_tui_inner(
         || renderer_runtime_inbox.shutdown(),
         || agent_runtime.shutdown(),
     )?;
+    finished.store(true, Ordering::SeqCst);
 
     Ok(TuiExit {
         code: exit_code,
@@ -376,6 +402,7 @@ fn run_tui_inner(
             &config.history_mode,
         ),
         message: state.exit_message.take(),
+        terminal_lost: state.terminal_lost,
     })
 }
 

@@ -417,6 +417,13 @@ pub enum TuiEvent {
     /// or gave up reconnecting. Nothing would answer input any more, so the
     /// TUI exits and prints why.
     BackendExited(String),
+    /// SIGINT, SIGTERM or SIGHUP asked the TUI to stop (unix; see
+    /// `termination_signals`), or its terminal hung up, which counts as the
+    /// SIGHUP that usually comes with it. The TUI quits as an ordinary exit
+    /// does, with the signal's exit code.
+    TerminationSignal {
+        signal: orca_runtime::termination_signals::TerminationSignal,
+    },
     CompactionStarted,
     SessionCompleted {
         status: String,

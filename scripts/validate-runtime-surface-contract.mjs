@@ -1183,6 +1183,9 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
     1,
   ],
   ["crates/orca-tui/src/global_actions.rs:handle_global_shortcut:user_action.route", 4],
+  // Quitting on SIGINT, SIGTERM or SIGHUP as an ordinary exit does: the
+  // interrupt of a turn still running, then the cancel the idle exit sends.
+  ["crates/orca-tui/src/global_actions.rs:quit_on_termination_signal:user_action.route", 2],
   ["crates/orca-tui/src/idle_navigation_actions.rs:handle_idle_navigation_shortcut:user_action.route", 1],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:user_action.route", 1],
   ["crates/orca-tui/src/idle_submit_actions.rs:submit_user_message:user_action.route", 1],

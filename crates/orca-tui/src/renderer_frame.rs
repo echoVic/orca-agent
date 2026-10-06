@@ -119,6 +119,10 @@ impl RendererFrameOwner {
         CopyClipboard: FnOnce(&str),
         WritePending: FnOnce(&mut Terminal<B>, &mut TerminalPresentation, AppStatus),
     {
+        // Gone with its hangup: nothing written to it would arrive.
+        if state.terminal_lost {
+            return Ok(());
+        }
         if let Some(text) = state.viewport.pending_clipboard_copy.take() {
             copy_clipboard(&text);
         }
@@ -375,6 +379,47 @@ mod tests {
                 .any(|cell| cell.symbol() != " ")
         );
         assert!(!owner.should_draw_for_test(draw_at + Duration::from_millis(16)));
+    }
+
+    /// After a hangup nothing reaches the terminal any more: no frame, no
+    /// title or notification, no clipboard sequence.
+    #[test]
+    fn a_lost_terminal_is_not_drawn_on() {
+        let started = Instant::now();
+        let mut owner = RendererFrameOwner::new(
+            started,
+            Duration::from_millis(16),
+            Duration::from_millis(80),
+        );
+        let mut state = state();
+        state.terminal_lost = true;
+        state.viewport.pending_clipboard_copy = Some("copy".to_string());
+        let mut presentation = presentation();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+
+        owner
+            .present_iteration(
+                &mut terminal,
+                &mut presentation,
+                &mut state,
+                &TextArea::default(),
+                &Theme::named(ThemeName::Dark),
+                Some(started + Duration::from_millis(16)),
+                |_text| panic!("a lost terminal gets no clipboard sequence"),
+                |_terminal, _presentation, _status| {
+                    panic!("a lost terminal gets no title or notification")
+                },
+            )
+            .expect("present nothing");
+
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.symbol() == " ")
+        );
     }
 
     #[test]

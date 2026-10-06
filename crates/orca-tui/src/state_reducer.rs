@@ -730,6 +730,12 @@ impl AppState {
             TuiEvent::BackendExited(reason) => {
                 self.exit_message = Some(reason);
             }
+            // The renderer quits on it before it gets here.
+            TuiEvent::TerminationSignal { signal } => {
+                if signal == orca_runtime::termination_signals::TerminationSignal::Hangup {
+                    self.terminal_lost = true;
+                }
+            }
             TuiEvent::Error(msg) => {
                 self.finish_assistant_stream();
                 self.clear_receiving_tool_progress();

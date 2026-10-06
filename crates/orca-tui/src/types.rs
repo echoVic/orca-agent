@@ -668,6 +668,9 @@ pub struct AppState {
     pub(crate) turn_diagnostic_seen: bool,
     /// Why the TUI exits on its own, printed once the terminal is restored.
     pub(crate) exit_message: Option<String>,
+    /// The terminal hung up: nothing more is drawn on it, and no resume hint
+    /// is printed to it.
+    pub(crate) terminal_lost: bool,
     pub tick: u64,
     pub(crate) edit_highlights: EditHighlightState,
     /// Current vim mode label for the status bar (e.g. `"NORMAL"`), kept in
@@ -1059,6 +1062,7 @@ impl AppState {
             suppress_background_main_session_output: false,
             turn_diagnostic_seen: false,
             exit_message: None,
+            terminal_lost: false,
             tick: 0,
             viewport: ViewportState::default(),
             edit_highlights: EditHighlightState::default(),

@@ -87,6 +87,17 @@ impl From<ThemeName> for InputRuntimeOptions {
     }
 }
 
+/// The TUI's own handling of the end of a session, which the input runtime
+/// defers to (unix; see `termination_signals`): SIGINT and SIGTERM are its
+/// signal handler's to act on, through the renderer, and a terminal that
+/// hung up is reported through `report_hangup` the way SIGHUP is, so that
+/// the renderer quits the same way whichever it learns of first. Without it,
+/// either ends input, and with it the TUI.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct TerminationTakeover {
+    pub(crate) report_hangup: Box<dyn FnOnce() + Send>,
+}
+
 pub(crate) enum InputControl {
     Suspend {
         acknowledge: tokio::sync::oneshot::Sender<()>,
@@ -145,7 +156,10 @@ pub(crate) struct InputRuntime {
 }
 
 impl InputRuntime {
-    pub(crate) fn start(options: InputRuntimeOptions) -> io::Result<Self> {
+    pub(crate) fn start(
+        options: InputRuntimeOptions,
+        takeover: Option<TerminationTakeover>,
+    ) -> io::Result<Self> {
         let owner_lease = TerminalOwnerLease::acquire()?;
         let owner_thread = thread::current().id();
 
@@ -166,6 +180,7 @@ impl InputRuntime {
                     control_tx,
                     stop_rx,
                     owner_thread,
+                    takeover,
                 )
             }) {
             Ok(join) => join,
@@ -260,6 +275,7 @@ impl Drop for InputRuntime {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn input_thread(
     options: InputRuntimeOptions,
     color_level: TerminalColorLevel,
@@ -268,6 +284,7 @@ fn input_thread(
     control_tx: mpsc::Sender<InputControl>,
     stop_rx: watch::Receiver<bool>,
     owner_thread: thread::ThreadId,
+    takeover: Option<TerminationTakeover>,
 ) -> io::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -292,6 +309,7 @@ fn input_thread(
             event_tx,
             control_tx,
             stop_rx,
+            takeover,
         )
         .await
     })
@@ -340,6 +358,21 @@ impl Drop for RestoreRegistration {
         if let Ok(mut slot) = ACTIVE_RESTORE_HANDLE.lock() {
             *slot = None;
         }
+    }
+}
+
+/// Puts back what the terminal session entered (raw mode, the alternate
+/// screen, mouse reporting, bracketed paste, focus events, keyboard
+/// enhancement) for an exit that cannot wait for its own teardown. Like the
+/// panic hook, it goes through the session's restore handle, which writes
+/// straight to the terminal; it waits for no lock, ignores every failure,
+/// and does nothing once the session has put the terminal back itself.
+#[cfg(unix)]
+pub(crate) fn restore_terminal_now() {
+    if let Ok(slot) = ACTIVE_RESTORE_HANDLE.try_lock()
+        && let Some(active) = slot.as_ref()
+    {
+        let _ = active.handle.restore();
     }
 }
 
@@ -514,6 +547,37 @@ fn terminal_signal_activity(signal: qwertty::TerminalSignal) -> TerminalActivity
     }
 }
 
+/// Whether `error`, from reading or leaving the terminal, says it hung up:
+/// its input ended, or a read or a write failed with EIO, as both do on a
+/// terminal whose other end closed (Linux reads with EIO, macOS with an end
+/// of input).
+#[cfg(unix)]
+fn terminal_hung_up(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::UnexpectedEof || error.raw_os_error() == Some(libc::EIO) {
+        return true;
+    }
+    let mut source = error
+        .get_ref()
+        .map(|inner| inner as &(dyn std::error::Error + 'static));
+    while let Some(current) = source {
+        if current
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error)
+            == Some(libc::EIO)
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
+/// Only the unix TUI takes the end of a session over.
+#[cfg(not(unix))]
+fn terminal_hung_up(_error: &io::Error) -> bool {
+    false
+}
+
 fn qwertty_error(error: qwertty::Error) -> io::Error {
     let kind = error
         .source()
@@ -522,6 +586,7 @@ fn qwertty_error(error: qwertty::Error) -> io::Error {
     io::Error::new(kind, error)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive_terminal<D: TerminalDriver>(
     mut driver: D,
     options: impl Into<InputRuntimeOptions>,
@@ -530,6 +595,7 @@ async fn drive_terminal<D: TerminalDriver>(
     event_tx: impl Into<InputEventSender>,
     control_tx: mpsc::Sender<InputControl>,
     mut stop_rx: watch::Receiver<bool>,
+    takeover: Option<TerminationTakeover>,
 ) -> io::Result<()> {
     let options = options.into();
     let background = if options.theme == ThemeName::Auto {
@@ -579,7 +645,10 @@ async fn drive_terminal<D: TerminalDriver>(
     let mut adapter = InputAdapter::default();
     let mut event_tx = Some(event_tx.into());
     let mut control_tx = Some(control_tx);
+    let taken_over = takeover.is_some();
+    let mut report_hangup = takeover.map(|takeover| takeover.report_hangup);
     let mut wait_for_main_teardown = false;
+    let mut hung_up = false;
     let mut suspended = false;
     let operation = loop {
         tokio::select! {
@@ -594,6 +663,14 @@ async fn drive_terminal<D: TerminalDriver>(
             activity = driver.next_activity() => {
                 let activity = match activity {
                     Ok(activity) => activity,
+                    // The terminal hung up: reported the way SIGHUP is.
+                    Err(error) if report_hangup.is_some() && terminal_hung_up(&error) => {
+                        if let Some(report_hangup) = report_hangup.take() {
+                            report_hangup();
+                        }
+                        hung_up = true;
+                        break Ok(());
+                    }
                     Err(error) => {
                         wait_for_main_teardown = true;
                         break Err(error);
@@ -670,6 +747,9 @@ async fn drive_terminal<D: TerminalDriver>(
                         }
                     }
                     TerminalActivity::Continue => {}
+                    // SIGINT or SIGTERM, which the TUI's own handler quits on
+                    // through the renderer: input that ended would race it.
+                    TerminalActivity::Terminate if taken_over => {}
                     TerminalActivity::Terminate => {
                         wait_for_main_teardown = true;
                         break Ok(());
@@ -680,12 +760,24 @@ async fn drive_terminal<D: TerminalDriver>(
         }
     };
 
+    if hung_up {
+        // Input stays open: ended, it would race the report, on which the
+        // renderer quits and then stops it.
+        wait_for_stop(&mut stop_rx).await;
+    }
     if wait_for_main_teardown {
         event_tx.take();
         control_tx.take();
         wait_for_stop(&mut stop_rx).await;
     }
-    finish_driver(driver, operation).await
+    let leave = driver.leave().await;
+    // With the end of the session taken over, a terminal that hung up has
+    // nothing left to put back: failing to is no failure of the session.
+    let leave = match leave {
+        Err(error) if taken_over && terminal_hung_up(&error) => Ok(()),
+        leave => leave,
+    };
+    operation.and(leave)
 }
 
 async fn wait_for_stop(stop_rx: &mut watch::Receiver<bool>) {
@@ -792,6 +884,9 @@ mod tests {
         background: Option<Rgb>,
         activities: VecDeque<TerminalActivity>,
         fail_at: Option<&'static str>,
+        /// Once its activities are read, its input ends, and leaving it
+        /// fails with EIO, as a terminal's does once its other end closed.
+        hung_up: bool,
     }
 
     impl FakeDriver {
@@ -805,6 +900,7 @@ mod tests {
                 background,
                 activities: events.into_iter().map(TerminalActivity::Event).collect(),
                 fail_at: None,
+                hung_up: false,
             }
         }
 
@@ -817,11 +913,18 @@ mod tests {
                 background: None,
                 activities: activities.into_iter().collect(),
                 fail_at: None,
+                hung_up: false,
             }
         }
 
         fn failing(mut self, operation: &'static str) -> Self {
             self.fail_at = Some(operation);
+            self
+        }
+
+        #[cfg(unix)]
+        fn hanging_up(mut self) -> Self {
+            self.hung_up = true;
             self
         }
 
@@ -865,6 +968,11 @@ mod tests {
             self.record("read")?;
             if let Some(activity) = self.activities.pop_front() {
                 Ok(activity)
+            } else if self.hung_up {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "terminal input closed",
+                ))
             } else {
                 std::future::pending().await
             }
@@ -879,8 +987,24 @@ mod tests {
         }
 
         async fn leave(self) -> io::Result<()> {
-            self.record("leave")
+            self.record("leave")?;
+            if self.hung_up {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            Ok(())
         }
+    }
+
+    /// What the TUI's own termination handling gives the input runtime,
+    /// counting the hangups it reports.
+    fn takeover() -> (super::TerminationTakeover, mpsc::Receiver<()>) {
+        let (reported_tx, reported) = mpsc::unbounded();
+        let takeover = super::TerminationTakeover {
+            report_hangup: Box::new(move || {
+                let _ = reported_tx.send(());
+            }),
+        };
+        (takeover, reported)
     }
 
     fn light_background() -> Option<Rgb> {
@@ -929,6 +1053,7 @@ mod tests {
                     event_tx,
                     control_tx,
                     stop_rx,
+                    None,
                 ));
                 let StartupMessage::Ready(profile) = wait_for_startup(&startup_rx).await else {
                     panic!("expected ready startup message");
@@ -975,6 +1100,7 @@ mod tests {
                     event_tx,
                     control_tx,
                     stop_rx,
+                    None,
                 ));
                 assert!(matches!(
                     wait_for_startup(&startup_rx).await,
@@ -1033,6 +1159,7 @@ mod tests {
                         event_tx,
                         control_tx,
                         stop_rx,
+                        None,
                     ));
                     let _ = wait_for_startup(&startup_rx).await;
                     stop_tx.send(true).expect("stop receiver alive");
@@ -1069,6 +1196,7 @@ mod tests {
                     event_tx,
                     control_tx,
                     stop_rx,
+                    None,
                 ));
                 let _ = wait_for_startup(&startup_rx).await;
                 for _ in 0..100 {
@@ -1122,6 +1250,7 @@ mod tests {
                     event_tx,
                     control_tx,
                     stop_rx,
+                    None,
                 ));
                 let _ = wait_for_startup(&startup_rx).await;
                 for _ in 0..100 {
@@ -1164,6 +1293,7 @@ mod tests {
                     event_tx,
                     control_tx,
                     stop_rx,
+                    None,
                 )
                 .await
                 .expect_err("mode failure should fail startup");
@@ -1208,6 +1338,7 @@ mod tests {
                     event_tx,
                     control_tx,
                     stop_rx,
+                    None,
                 ));
                 assert!(matches!(
                     wait_for_startup(&startup_rx).await,
@@ -1253,6 +1384,167 @@ mod tests {
             });
     }
 
+    /// With the TUI's own handler in charge of SIGINT and SIGTERM, qwertty's
+    /// report of them ends nothing here: the handler quits through the
+    /// renderer, which input that ended would race.
+    #[test]
+    fn taken_over_sigint_and_sigterm_leave_input_open() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let driver =
+                    FakeDriver::with_activities(Arc::clone(&calls), [TerminalActivity::Terminate]);
+                let (startup_tx, startup_rx) = mpsc::bounded(1);
+                let (event_tx, event_rx) = mpsc::bounded(1);
+                let (control_tx, control_rx) = mpsc::bounded(1);
+                let (stop_tx, stop_rx) = watch::channel(false);
+                let (takeover, hangups) = takeover();
+
+                let task = tokio::spawn(drive_terminal(
+                    driver,
+                    ThemeName::Dark,
+                    TerminalColorLevel::TrueColor,
+                    startup_tx,
+                    event_tx,
+                    control_tx,
+                    stop_rx,
+                    Some(takeover),
+                ));
+                let _ = wait_for_startup(&startup_rx).await;
+                // Reading again after the signal: it was passed over.
+                for _ in 0..100 {
+                    if calls
+                        .lock()
+                        .expect("calls lock")
+                        .iter()
+                        .filter(|call| **call == "read")
+                        .count()
+                        >= 2
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(matches!(
+                    event_rx.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                assert!(matches!(
+                    control_rx.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                stop_tx.send(true).expect("stop receiver alive");
+                task.await.expect("driver task").expect("clean stop");
+
+                assert!(hangups.try_recv().is_err());
+                assert_eq!(
+                    *calls.lock().expect("calls lock"),
+                    [
+                        "alternate",
+                        "mouse",
+                        "paste",
+                        "keyboard",
+                        "read",
+                        "read",
+                        "leave"
+                    ]
+                );
+            });
+    }
+
+    /// A terminal that hung up is reported, the way SIGHUP is, and input
+    /// stays open until the renderer, quitting on that report, stops it:
+    /// whichever comes first, the hangup or its signal, the TUI quits the
+    /// same way. Nothing is left to put back in that terminal, so leaving
+    /// it is no failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_that_hung_up_is_reported_with_input_left_open() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let driver = FakeDriver::new(Arc::clone(&calls), None, []).hanging_up();
+                let (startup_tx, startup_rx) = mpsc::bounded(1);
+                let (event_tx, event_rx) = mpsc::bounded(1);
+                let (control_tx, control_rx) = mpsc::bounded(1);
+                let (stop_tx, stop_rx) = watch::channel(false);
+                let (takeover, hangups) = takeover();
+
+                let task = tokio::spawn(drive_terminal(
+                    driver,
+                    ThemeName::Dark,
+                    TerminalColorLevel::TrueColor,
+                    startup_tx,
+                    event_tx,
+                    control_tx,
+                    stop_rx,
+                    Some(takeover),
+                ));
+                let _ = wait_for_startup(&startup_rx).await;
+                for _ in 0..100 {
+                    if hangups.try_recv().is_ok() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                    assert!(!task.is_finished(), "input ended without stopping");
+                }
+                assert!(calls.lock().expect("calls lock").contains(&"read"));
+                assert!(matches!(
+                    event_rx.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                assert!(matches!(
+                    control_rx.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                assert!(!task.is_finished(), "input ended without stopping");
+                stop_tx.send(true).expect("stop receiver alive");
+                task.await
+                    .expect("driver task")
+                    .expect("a terminal that hung up is no failure");
+
+                assert_eq!(
+                    *calls.lock().expect("calls lock"),
+                    ["alternate", "mouse", "paste", "keyboard", "read", "leave"]
+                );
+            });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hangup_is_an_end_of_input_or_an_eio_however_wrapped() {
+        #[derive(Debug)]
+        struct Wrapped(io::Error);
+        impl std::fmt::Display for Wrapped {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "write terminal: {}", self.0)
+            }
+        }
+        impl std::error::Error for Wrapped {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let eio = || io::Error::from_raw_os_error(libc::EIO);
+
+        assert!(super::terminal_hung_up(&io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "terminal input closed before another event was available",
+        )));
+        assert!(super::terminal_hung_up(&eio()));
+        assert!(super::terminal_hung_up(&io::Error::other(Wrapped(eio()))));
+        assert!(!super::terminal_hung_up(&io::Error::other("leave failed")));
+        assert!(!super::terminal_hung_up(&io::Error::other(Wrapped(
+            io::Error::from_raw_os_error(libc::EBADF)
+        ))));
+    }
+
     #[test]
     fn closed_startup_receiver_still_leaves() {
         tokio::runtime::Builder::new_current_thread()
@@ -1276,6 +1568,7 @@ mod tests {
                     event_tx,
                     control_tx,
                     stop_rx,
+                    None,
                 )
                 .await
                 .expect_err("closed startup receiver should stop the driver");

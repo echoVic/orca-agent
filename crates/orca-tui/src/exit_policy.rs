@@ -10,6 +10,8 @@ pub(crate) struct TuiExit {
     pub(crate) session_id: Option<String>,
     /// Why the TUI exited on its own, if it did.
     pub(crate) message: Option<String>,
+    /// Its terminal hung up: there is nowhere to print a resume hint.
+    pub(crate) terminal_lost: bool,
 }
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
