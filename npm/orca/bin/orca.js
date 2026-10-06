@@ -6,6 +6,8 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { signalDispositions } from "./signals.js";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
@@ -85,9 +87,8 @@ child.on("error", (error) => {
   process.exit(1);
 });
 
-const handledSignals = process.platform === "win32"
-  ? ["SIGINT", "SIGTERM"]
-  : ["SIGINT", "SIGTERM", "SIGHUP"];
+const dispositions = signalDispositions(process.platform);
+const handledSignals = Object.keys(dispositions);
 const forwardSignal = (signal) => {
   if (!child.killed) {
     child.kill(signal);
@@ -95,7 +96,7 @@ const forwardSignal = (signal) => {
 };
 
 for (const signal of handledSignals) {
-  process.on(signal, () => forwardSignal(signal));
+  process.on(signal, dispositions[signal] === "forward" ? () => forwardSignal(signal) : () => {});
 }
 
 const result = await new Promise((resolve) => {
