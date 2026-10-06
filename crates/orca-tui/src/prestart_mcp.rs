@@ -733,11 +733,84 @@ mod tests {
             wait_until_gone(&pids, Duration::from_secs(5));
         }
 
+        /// How the servers of `registry` stand, in config order.
+        fn server_states(registry: &McpRegistry) -> Vec<orca_mcp::McpServerState> {
+            registry
+                .server_statuses()
+                .into_iter()
+                .map(|status| status.state)
+                .collect()
+        }
+
+        /// What a start that failed leaves, once the TUI has been told that it
+        /// did: no thread, and the servers that started with the TUI still
+        /// its, connected, and each started once. Returns their process ids.
+        fn the_servers_stay_with_the_tui(
+            tui: &Tui,
+            prestarted: &McpRegistry,
+            fixture: &std::path::Path,
+        ) -> Vec<String> {
+            assert!(tui.control().runtime_thread().is_none());
+            assert!(
+                tui.control()
+                    .prestart_mcp_registry()
+                    .is_some_and(|registry| registry.is_same(prestarted)),
+                "the failed start took the servers"
+            );
+            assert_eq!(
+                server_states(prestarted),
+                [orca_mcp::McpServerState::Ready],
+                "the failed start stopped the servers"
+            );
+            let pids = launches(fixture);
+            assert_eq!(pids.len(), 1, "{pids:?}");
+            assert!(alive(&pids[0]), "the failed start stopped the server");
+            pids
+        }
+
+        /// The first message after a start that failed: it starts the
+        /// conversation's thread, which takes the servers that started with
+        /// the TUI as they are, with none started again.
+        fn the_first_message_takes_the_servers_over(
+            tui: &mut Tui,
+            prestarted: &McpRegistry,
+            fixture: &std::path::Path,
+            pids: &[String],
+        ) {
+            tui.send("hello");
+            tui.until_event("the first turn to end", |event| {
+                matches!(event, TuiEvent::SessionCompleted { .. })
+            });
+            let thread = tui
+                .control()
+                .runtime_thread()
+                .expect("the message started a thread");
+            assert!(thread.mcp_registry().is_same(prestarted));
+            tui.thread_catalog(thread_lists_docs_connected);
+            assert!(tui.control().prestart_mcp_registry().is_none());
+            assert_eq!(
+                server_states(&thread.mcp_registry()),
+                [orca_mcp::McpServerState::Ready]
+            );
+            assert_eq!(launches(fixture), pids, "the server started again");
+        }
+
         #[test]
         fn a_failed_thread_start_keeps_the_prestarted_servers_and_starts_each_once() {
             use crate::protocol::UserAction;
 
             let home = crate::test_support::isolate_orca_home();
+            let saved = a_saved_conversation(home.path());
+            // Another `orca` has that conversation open, and so holds it: a
+            // thread that resumes it cannot start.
+            let elsewhere = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let mut open = config(home.path(), Vec::new());
+            open.history_mode = orca_core::config::HistoryMode::Resume(saved.clone());
+            let open_thread = elsewhere
+                .handle()
+                .start_thread(open, "open elsewhere")
+                .expect("resume the saved conversation elsewhere");
+
             let fixture = tempfile::tempdir().unwrap();
             let mut tui = Tui::start(config(
                 home.path(),
@@ -749,55 +822,74 @@ mod tests {
                 .prestart_mcp_registry()
                 .expect("the servers that started");
 
-            // From the session picker, before any message, for a
-            // conversation that is not there: no thread starts.
+            // From the session picker, before any message: the saved
+            // conversation is read, and the thread that would resume it is
+            // asked to start with the servers lent to it, and fails.
             tui.state
                 .event_tx
-                .send(UserAction::ResumeSavedSession {
-                    session_id: "00000000-0000-4000-8000-000000000000".to_string(),
-                })
+                .send(UserAction::ResumeSavedSession { session_id: saved })
                 .expect("the controller runs");
-            tui.until_event("the resume to be turned down", |event| {
-                matches!(event, TuiEvent::OperationRejected(_))
+            tui.until_event("the thread to fail to start", |event| {
+                matches!(event, TuiEvent::OperationRejected(message)
+                    if message.starts_with("failed to switch saved conversation")
+                        && message.contains("AlreadyOwned"))
             });
 
-            // The servers are still the TUI's, still connected, and started
-            // once.
-            assert!(tui.control().runtime_thread().is_none());
-            assert!(
-                tui.control()
-                    .prestart_mcp_registry()
-                    .is_some_and(|registry| registry.is_same(&prestarted)),
-                "the failed start took the servers"
-            );
-            let pids = launches(fixture.path());
-            assert_eq!(pids.len(), 1, "{pids:?}");
-            assert!(alive(&pids[0]), "the failed start stopped the server");
+            let pids = the_servers_stay_with_the_tui(&tui, &prestarted, fixture.path());
+            the_first_message_takes_the_servers_over(&mut tui, &prestarted, fixture.path(), &pids);
+            tui.quit();
+            wait_until_gone(&pids, Duration::from_secs(5));
+            open_thread
+                .shutdown()
+                .expect("shut the open conversation down");
+            elsewhere.shutdown().expect("shut the runtime host down");
+        }
 
-            // The first message starts the conversation's thread, which
-            // takes them as they are.
-            tui.send("hello");
-            tui.until_event("the first turn to end", |event| {
-                matches!(event, TuiEvent::SessionCompleted { .. })
-            });
-            let thread = tui
+        /// The session id of a conversation an old `orca` saved in `home`
+        /// under an id that is no uuid. A thread resumes it, but it has no
+        /// typed surface for the TUI to read.
+        fn a_legacy_conversation(home: &std::path::Path) -> String {
+            let mut meta =
+                orca_runtime::history::create_meta(home, "mock", None, "an old conversation");
+            meta.session_id = "legacy-conversation".to_string();
+            let saved = meta.session_id.clone();
+            orca_runtime::history::SessionWriter::start_from_meta(meta)
+                .expect("save the legacy conversation");
+            saved
+        }
+
+        #[test]
+        fn a_failed_preflight_keeps_the_prestarted_servers_and_starts_each_once() {
+            use crate::protocol::UserAction;
+
+            let home = crate::test_support::isolate_orca_home();
+            let legacy = a_legacy_conversation(home.path());
+            let fixture = tempfile::tempdir().unwrap();
+            let mut tui = Tui::start(config(
+                home.path(),
+                vec![mcp_server("docs", fixture.path(), 0)],
+            ));
+            tui.until("the server to connect", |state| connected(state, "docs"));
+            let prestarted = tui
                 .control()
-                .runtime_thread()
-                .expect("the message started a thread");
-            assert!(thread.mcp_registry().is_same(&prestarted));
-            tui.thread_catalog(thread_lists_docs_connected);
-            assert!(tui.control().prestart_mcp_registry().is_none());
-            assert_eq!(
-                thread
-                    .mcp_registry()
-                    .server_statuses()
-                    .into_iter()
-                    .map(|status| (status.name, status.state))
-                    .collect::<Vec<_>>(),
-                [("docs".to_string(), orca_mcp::McpServerState::Ready)]
-            );
-            assert_eq!(launches(fixture.path()), pids, "the server started again");
-            drop(thread);
+                .prestart_mcp_registry()
+                .expect("the servers that started");
+
+            // From the session picker, before any message: the thread that
+            // resumes it starts, with the servers lent to it, but has no
+            // typed surface to project, so it is shut down and the start
+            // turned down.
+            tui.state
+                .event_tx
+                .send(UserAction::ResumeSavedSession { session_id: legacy })
+                .expect("the controller runs");
+            tui.until_event("the preflight to fail", |event| {
+                matches!(event, TuiEvent::OperationRejected(message)
+                    if message.starts_with("failed to project conversation before switch conversation"))
+            });
+
+            let pids = the_servers_stay_with_the_tui(&tui, &prestarted, fixture.path());
+            the_first_message_takes_the_servers_over(&mut tui, &prestarted, fixture.path(), &pids);
             tui.quit();
             wait_until_gone(&pids, Duration::from_secs(5));
         }
