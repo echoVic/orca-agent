@@ -1071,6 +1071,44 @@ fn messages_typed_before_the_resumed_history_loads_run_in_the_order_they_were_ty
 }
 
 #[test]
+fn a_message_typed_before_a_resume_that_fails_follows_the_prompt_in_the_new_conversation() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process = PtyProcess::spawn_resumed(
+        home.path(),
+        cwd.path(),
+        "00000000-0000-4000-8000-000000000000",
+        "first prompt",
+    )
+    .expect("spawn resumed TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "resuming a conversation skipped the review of a new workspace",
+    );
+    // The message asks the mock for the user messages it was given, which is
+    // how the order they ran in shows.
+    process
+        .write(b"\rmock_history_echo\r")
+        .expect("accept the workspace and send a message");
+
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Mock history users: first prompt | mock_history_echo",
+        "the message did not follow the prompt in the new conversation",
+    );
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
 fn a_message_typed_before_a_conversation_that_cannot_be_resumed_is_not_held_for_good() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");
