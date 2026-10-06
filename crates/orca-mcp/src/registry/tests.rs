@@ -1231,11 +1231,54 @@ fn a_cancelled_calls_short_restart_that_fails_at_once_fails_the_server() {
     assert_eq!(cancelled.unwrap_err(), "MCP tool call cancelled");
     // The short start that followed the cancel failed before its time was
     // up, as a full one would: the server is failed now, not at the next
-    // call.
-    let statuses = registry.server_statuses();
-    assert!(
-        matches!(statuses[0].state, McpServerState::Failed { .. }),
-        "{statuses:?}"
+    // call, and with why its start failed.
+    assert_eq!(
+        registry.server_statuses(),
+        [failed("slow", "MCP server closed stdout")]
+    );
+}
+
+/// The cap of a short restart bounds its start alone. One that first waits
+/// for the transport, which another request holds past the cap, and then
+/// finds a server that fails at once, was not cut short by its cap: its
+/// failure is recorded, so the server is failed now, not at the next call.
+#[cfg(unix)]
+#[test]
+fn a_short_restart_that_waited_past_its_cap_for_the_transport_records_a_fast_failure() {
+    use crate::client::{CANCELLED_STDIO_RECONNECT_TIMEOUT_MS, ReconnectFailure};
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    // Every start after the first exits at once.
+    let (config, _, _) = restarting_server_config(temp_dir.path(), None);
+    let registry = connected_registry(&[config], None);
+    let client = registry.client("slow").expect("the server's client");
+    let failed = client.lock_transport().expect("its transport").clone();
+
+    let outcome = std::thread::scope(|scope| {
+        let transport = client.lock_transport().expect("its transport");
+        let restart = scope.spawn(|| {
+            client.reconnect(&failed, Some(CANCELLED_STDIO_RECONNECT_TIMEOUT_MS), &|| {
+                false
+            })
+        });
+        std::thread::sleep(
+            Duration::from_millis(CANCELLED_STDIO_RECONNECT_TIMEOUT_MS)
+                + Duration::from_millis(200),
+        );
+        drop(transport);
+        restart.join().expect("the restart")
+    });
+
+    assert_eq!(
+        outcome,
+        Err(ReconnectFailure::Failed(
+            "MCP server closed stdout".to_string()
+        ))
+    );
+    client.note_reconnect(&outcome);
+    assert_eq!(
+        client.take_reconnect_failure().as_deref(),
+        Some("MCP server closed stdout")
     );
 }
 

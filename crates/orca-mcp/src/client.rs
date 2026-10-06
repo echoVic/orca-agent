@@ -308,21 +308,25 @@ impl McpClient {
     /// done: stopping the server it started would fail its requests.
     ///
     /// A reconnect that fails while `should_cancel` holds was cancelled. One
-    /// with a cap that fails once the cap has passed since it began was cut
-    /// short by it, and the server may still start with its full startup
-    /// timeout; one that fails sooner found a server that cannot start.
+    /// with a cap whose connect fails once the cap has passed since the
+    /// connect began was cut short by it, and the server may still start
+    /// with its full startup timeout; one that fails sooner, or before its
+    /// connect, found a server that cannot start. The cap bounds the connect
+    /// alone: a wait for the transport, which another request may hold past
+    /// the cap, says nothing of the server.
     pub(crate) fn reconnect(
         &self,
         failed: &Arc<dyn McpTransport>,
         startup_timeout_cap_ms: Option<u64>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Reconnected, ReconnectFailure> {
-        let began = Instant::now();
-        let failure = |error: String| {
+        // What `error` ended: the connect that began at `connect_began`, or,
+        // with none, a step before or after it.
+        let failure = |connect_began: Option<Instant>, error: String| {
             if should_cancel() {
                 ReconnectFailure::Cancelled
-            } else if startup_timeout_cap_ms
-                .is_some_and(|cap_ms| began.elapsed() >= Duration::from_millis(cap_ms))
+            } else if let (Some(cap_ms), Some(began)) = (startup_timeout_cap_ms, connect_began)
+                && began.elapsed() >= Duration::from_millis(cap_ms)
             {
                 ReconnectFailure::CapReached(error)
             } else {
@@ -337,18 +341,31 @@ impl McpClient {
         if config.transport == McpTransportKind::Stdio {
             let mut current = self
                 .lock_transport_or_cancel(should_cancel)
-                .map_err(|error| failure(error.to_string()))?;
+                .map_err(|error| failure(None, error.to_string()))?;
             if !Arc::ptr_eq(&current, failed) {
                 return Ok(Reconnected::AlreadyReplaced);
             }
             current.terminate();
-            *current = self.connect(&config, should_cancel).map_err(failure)?;
+            let began = Instant::now();
+            *current = self
+                .connect(&config, should_cancel)
+                .map_err(|error| failure(Some(began), error))?;
         } else {
-            if !Arc::ptr_eq(&*self.lock_transport().map_err(failure)?, failed) {
+            if !Arc::ptr_eq(
+                &*self
+                    .lock_transport()
+                    .map_err(|error| failure(None, error))?,
+                failed,
+            ) {
                 return Ok(Reconnected::AlreadyReplaced);
             }
-            let transport = self.connect(&config, should_cancel).map_err(failure)?;
-            let mut current = self.lock_transport().map_err(failure)?;
+            let began = Instant::now();
+            let transport = self
+                .connect(&config, should_cancel)
+                .map_err(|error| failure(Some(began), error))?;
+            let mut current = self
+                .lock_transport()
+                .map_err(|error| failure(None, error))?;
             if !Arc::ptr_eq(&current, failed) {
                 return Ok(Reconnected::AlreadyReplaced);
             }
@@ -433,7 +450,8 @@ impl McpClient {
 }
 
 const MCP_TOOL_CALL_CANCELLED: &str = "MCP tool call cancelled";
-const CANCELLED_STDIO_RECONNECT_TIMEOUT_MS: u64 = 500;
+/// The startup timeout cap of the restart that follows a cancelled stdio call.
+pub(crate) const CANCELLED_STDIO_RECONNECT_TIMEOUT_MS: u64 = 500;
 /// How often a wait for the transport tries it again, and looks for a
 /// cancel.
 const TRANSPORT_WAIT_STEP: Duration = Duration::from_millis(25);
