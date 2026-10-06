@@ -531,6 +531,20 @@ impl MentionPopupState {
     }
 }
 
+/// A message the user sent before the conversation resumed at launch had
+/// loaded, with what the submit path was given for it. It is kept until the
+/// history has loaded, and sent after it.
+pub(crate) struct HeldSubmission {
+    /// What the conversation shows for it.
+    pub(crate) visible_text: String,
+    /// What the runtime gets for it, with the pastes in it expanded.
+    pub(crate) prompt: String,
+    pub(crate) bindings: MentionBindings,
+    pub(crate) images: Vec<ComposerImageAttachment>,
+    /// The composer's pastes when it was sent, which a follow-up expands.
+    pub(crate) pending_pastes: Vec<(String, String)>,
+}
+
 pub struct AppState {
     pub(crate) conversation_target: ConversationTarget,
     pub(crate) transcript: TranscriptState,
@@ -598,6 +612,13 @@ pub struct AppState {
     /// The turn the runtime last started by itself, so its later tool rounds
     /// are not taken for a new turn.
     pub(crate) runtime_turn_id: Option<String>,
+    /// The conversation `--resume` or `--continue` named has not loaded: its
+    /// history, when it comes, takes the place of what the conversation
+    /// shows, and the prompt given with it is sent then. What the user sends
+    /// meanwhile is held in `held_submissions` until that is done.
+    pub(crate) startup_history_pending: bool,
+    /// What the user sent while `startup_history_pending`, in order.
+    pub(crate) held_submissions: Vec<HeldSubmission>,
     pub setup_step: u8,
     pub setup_selection: u8,
     /// Runtime-owned first-run disclosure state. The TUI may render and
@@ -1010,6 +1031,8 @@ impl AppState {
             continued_background_approvals: std::collections::HashSet::new(),
             denied_approval_stops_turn: false,
             runtime_turn_id: None,
+            startup_history_pending: false,
+            held_submissions: Vec::new(),
             setup_step: 0,
             setup_selection: 0,
             first_run: None,

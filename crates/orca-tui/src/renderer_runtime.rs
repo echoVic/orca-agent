@@ -11,7 +11,7 @@ use crate::bridge;
 use crate::composer_images::DeferredImageSubmit;
 use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{textarea_cursor_byte_index, textarea_text};
-use crate::idle_submit_actions::handle_idle_submit;
+use crate::idle_submit_actions::{handle_idle_submit, release_held_submissions};
 use crate::mention_search_manager::MentionSearchManager;
 use crate::protocol::{TuiEvent, UserAction};
 use crate::queued_input_actions::enqueue_composer_follow_up_to_runtime;
@@ -92,6 +92,8 @@ impl RendererRuntimeEventOwner {
                     state.enter_running();
                     let _ = action_tx.send(UserAction::Submit(prompt));
                 }
+                // What the user sent meanwhile comes after the prompt.
+                release_held_submissions(state, action_tx);
             }
             TuiEvent::MentionSearchDirty { generation } => {
                 let text = textarea_text(textarea);
@@ -118,6 +120,9 @@ impl RendererRuntimeEventOwner {
                     theme,
                     presentation,
                 );
+                // A new conversation that takes the place of the one resumed
+                // at launch has no history to wait for.
+                release_held_submissions(state, action_tx);
             }
             TuiEvent::SettingsUpdated {
                 model,
@@ -285,13 +290,22 @@ impl RendererRuntimeEventOwner {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use crossbeam_channel as mpsc;
     use orca_core::approval_types::ApprovalMode;
-    use orca_core::config::{ReasoningEffort, ThemeName};
+    use orca_core::config::{ReasoningEffort, RunConfig, ThemeName};
+    use orca_runtime::prompt_queue::{
+        ClientUserMessageId, PromptQueueInput, PromptQueueSnapshot, QueuedSubmission,
+        QueuedSubmissionId,
+    };
     use tui_textarea::TextArea;
 
     use super::RendererRuntimeEventOwner;
     use crate::bridge;
+    use crate::composer_images::ComposerImageState;
+    use crate::composer_textarea::{make_textarea_with_text, textarea_text};
+    use crate::idle_submit_actions::handle_idle_submit;
     use crate::mention_search_manager::MentionSearchManager;
     use crate::protocol::SessionAttachmentId;
     use crate::protocol::{AttachedTuiEvent, TuiEvent, UserAction};
@@ -742,5 +756,399 @@ mod tests {
         owner.shutdown();
         thread.shutdown().expect("thread shutdown");
         host.shutdown().expect("host shutdown");
+    }
+
+    /// A TUI waiting for the history of the conversation `--resume` named,
+    /// with `prompt` given on the command line, if any.
+    struct ResumingTui {
+        _root: tempfile::TempDir,
+        owner: RendererRuntimeEventOwner,
+        state: AppState,
+        config: RunConfig,
+        action_tx: mpsc::Sender<UserAction>,
+        action_rx: mpsc::Receiver<UserAction>,
+        pending: bridge::PendingWorkflowNotifications,
+        theme: Theme,
+        vim_state: VimState,
+        textarea: TextArea<'static>,
+        presentation: TerminalPresentation,
+    }
+
+    impl ResumingTui {
+        fn waiting_for_history(prompt: Option<&str>) -> Self {
+            let root = tempfile::tempdir().expect("temp root");
+            let (mention_event_tx, _mention_event_rx) = mpsc::unbounded();
+            let mention_search =
+                MentionSearchManager::new(root.path().to_path_buf(), mention_event_tx);
+            let owner = RendererRuntimeEventOwner::new(mention_search, prompt.map(str::to_string));
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let mut state = AppState::new(
+                action_tx.clone(),
+                "test".to_string(),
+                "mock".to_string(),
+                root.path().display().to_string(),
+            );
+            state.startup_history_pending = true;
+            let theme = Theme::named(ThemeName::Dark);
+            let vim_state = VimState::new(false);
+            let textarea = make_textarea_with_text("", &vim_state, &theme);
+            Self {
+                _root: root,
+                owner,
+                state,
+                config: crate::test_support::test_run_config(),
+                action_tx,
+                action_rx,
+                pending: bridge::PendingWorkflowNotifications::new(),
+                theme,
+                vim_state,
+                textarea,
+                presentation: presentation(),
+            }
+        }
+
+        /// The user types `text` in the composer and presses Enter.
+        fn type_and_press_enter(&mut self, text: &str) {
+            self.textarea = make_textarea_with_text(text, &self.vim_state, &self.theme);
+            let shared = Arc::new(Mutex::new(self.config.clone()));
+            assert!(handle_idle_submit(
+                &mut self.textarea,
+                &mut self.vim_state,
+                &self.theme,
+                &mut self.state,
+                &mut self.config,
+                &shared,
+                &self.action_tx,
+            ));
+            assert_eq!(textarea_text(&self.textarea), "", "the composer is cleared");
+        }
+
+        fn receive(&mut self, event: TuiEvent) {
+            self.owner.handle(
+                event,
+                &mut self.state,
+                &mut self.config,
+                &self.action_tx,
+                &self.pending,
+                &mut self.textarea,
+                &mut self.vim_state,
+                &self.theme,
+                &mut self.presentation,
+            );
+        }
+
+        /// What was sent to the runtime since the last call.
+        fn sent(&self) -> Vec<UserAction> {
+            self.action_rx.try_iter().collect()
+        }
+
+        /// What the conversation shows of the messages the user sent.
+        fn user_messages(&self) -> Vec<&str> {
+            self.state
+                .transcript
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    ChatMessage::User(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    impl Drop for ResumingTui {
+        fn drop(&mut self) {
+            self.owner.shutdown();
+        }
+    }
+
+    fn history_loaded(history: Option<&str>, label: &str) -> TuiEvent {
+        TuiEvent::HistoryLoaded {
+            messages: history
+                .map(|text| ChatMessage::Assistant(text.to_string()))
+                .into_iter()
+                .collect(),
+            plan: None,
+            label: label.to_string(),
+        }
+    }
+
+    /// The queue the runtime keeps once it has what `action` queued, and the
+    /// id of the turn it will start for it.
+    fn queue_after(action: &UserAction) -> (PromptQueueSnapshot, String) {
+        let UserAction::QueuePrompt {
+            prompt,
+            bindings,
+            images,
+        } = action
+        else {
+            panic!("expected a queued prompt, got {action:?}");
+        };
+        let item = QueuedSubmission {
+            id: QueuedSubmissionId::new(),
+            client_user_message_id: ClientUserMessageId::new(),
+            input: PromptQueueInput {
+                text: prompt.clone(),
+                mention_bindings: bindings.clone(),
+                images: ComposerImageState::image_inputs(images),
+            },
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let turn_id = item.client_user_message_id.turn_id().to_string();
+        (
+            PromptQueueSnapshot {
+                items: vec![item],
+                ..Default::default()
+            },
+            turn_id,
+        )
+    }
+
+    #[test]
+    fn held_submissions_follow_the_prompt_once_the_resumed_history_loads() {
+        let mut tui = ResumingTui::waiting_for_history(Some("cli"));
+
+        tui.type_and_press_enter("typed");
+        assert!(
+            tui.sent().is_empty(),
+            "a message sent before the history is held"
+        );
+        assert_eq!(
+            tui.user_messages(),
+            ["typed"],
+            "the held message stays on screen"
+        );
+        assert_eq!(
+            tui.state.status,
+            AppStatus::Idle,
+            "a held message starts no turn, so the next one is held as well"
+        );
+
+        tui.receive(history_loaded(
+            Some("history"),
+            "Resumed saved conversation.",
+        ));
+
+        // The prompt runs first; the held message waits behind its turn in the
+        // queue, as one typed while that turn runs does.
+        let sent = tui.sent();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [UserAction::Submit(prompt), UserAction::QueuePrompt { prompt: queued, .. }]
+                    if prompt == "cli" && queued == "typed"
+            ),
+            "{sent:?}"
+        );
+        assert!(matches!(
+            tui.state.transcript.messages.as_slice(),
+            [
+                ChatMessage::Assistant(history),
+                ChatMessage::System { text: label, .. },
+                ChatMessage::User(prompt),
+            ] if history == "history" && label == "Resumed saved conversation." && prompt == "cli"
+        ));
+        assert_eq!(tui.state.status, AppStatus::Running);
+        assert!(!tui.state.startup_history_pending);
+        assert!(tui.state.held_submissions.is_empty());
+
+        // The runtime has the message queued behind the prompt's turn, and the
+        // queue strip shows it there.
+        let (queue, turn_id) = queue_after(&sent[1]);
+        tui.receive(TuiEvent::PromptQueueUpdated(queue));
+        assert!(tui.state.queued_follow_up_pending_or_in_flight());
+        assert_eq!(
+            tui.state
+                .queued_submission_view()
+                .map(|view| view.preview.first),
+            Some("typed".to_string())
+        );
+
+        // The prompt's turn ends and the runtime starts the queued message's:
+        // it reads after the prompt, once.
+        tui.receive(TuiEvent::RuntimeTurnStarted { turn_id });
+        assert!(matches!(
+            tui.state.transcript.messages.as_slice(),
+            [
+                ChatMessage::Assistant(history),
+                ChatMessage::System { .. },
+                ChatMessage::User(prompt),
+                ChatMessage::User(typed),
+            ] if history == "history" && prompt == "cli" && typed == "typed"
+        ));
+    }
+
+    #[test]
+    fn held_submissions_follow_the_prompt_when_the_resume_fails() {
+        let mut tui = ResumingTui::waiting_for_history(Some("cli"));
+
+        tui.type_and_press_enter("typed");
+        assert!(tui.sent().is_empty());
+
+        // The conversation could not be opened: what comes is an empty
+        // history, and the prompt and the held message go to a new one.
+        tui.receive(history_loaded(
+            None,
+            "Unable to restore saved conversation.",
+        ));
+
+        let sent = tui.sent();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [UserAction::Submit(prompt), UserAction::QueuePrompt { prompt: queued, .. }]
+                    if prompt == "cli" && queued == "typed"
+            ),
+            "{sent:?}"
+        );
+        assert!(matches!(
+            tui.state.transcript.messages.as_slice(),
+            [
+                ChatMessage::System { text: label, .. },
+                ChatMessage::User(prompt),
+            ] if label == "Unable to restore saved conversation." && prompt == "cli"
+        ));
+        assert!(!tui.state.startup_history_pending);
+
+        let (queue, turn_id) = queue_after(&sent[1]);
+        tui.receive(TuiEvent::PromptQueueUpdated(queue));
+        tui.receive(TuiEvent::RuntimeTurnStarted { turn_id });
+        assert_eq!(tui.user_messages(), ["cli", "typed"]);
+    }
+
+    #[test]
+    fn a_message_sent_once_the_history_has_loaded_is_not_held() {
+        let mut tui = ResumingTui::waiting_for_history(None);
+        tui.receive(history_loaded(
+            Some("history"),
+            "Resumed saved conversation.",
+        ));
+        assert!(!tui.state.startup_history_pending);
+
+        tui.type_and_press_enter("later");
+
+        assert!(matches!(
+            tui.sent().as_slice(),
+            [UserAction::SubmitWithMentions { prompt, .. }] if prompt == "later"
+        ));
+        assert_eq!(tui.user_messages(), ["later"]);
+        assert!(tui.state.held_submissions.is_empty());
+    }
+
+    #[test]
+    fn without_a_prompt_the_first_held_message_starts_its_turn_and_the_next_queues_behind_it() {
+        let mut tui = ResumingTui::waiting_for_history(None);
+        tui.type_and_press_enter("first");
+        tui.type_and_press_enter("second");
+        assert!(tui.sent().is_empty(), "the second one is held as well");
+        assert_eq!(tui.user_messages(), ["first", "second"]);
+
+        tui.receive(history_loaded(
+            Some("history"),
+            "Resumed saved conversation.",
+        ));
+
+        let sent = tui.sent();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [
+                    UserAction::SubmitWithMentions { prompt: first, .. },
+                    UserAction::QueuePrompt { prompt: second, .. },
+                ] if first == "first" && second == "second"
+            ),
+            "{sent:?}"
+        );
+        assert!(matches!(
+            tui.state.transcript.messages.as_slice(),
+            [
+                ChatMessage::Assistant(_),
+                ChatMessage::System { .. },
+                ChatMessage::User(first),
+            ] if first == "first"
+        ));
+        assert_eq!(tui.state.status, AppStatus::Running);
+    }
+
+    #[test]
+    fn a_stale_history_releases_nothing_and_a_later_one_does_not_release_again() {
+        let mut tui = ResumingTui::waiting_for_history(Some("cli"));
+        let stale = SessionAttachmentId::new(1);
+        let active = stale.next();
+        tui.receive(attached(active, TuiEvent::SessionAttachmentActivated));
+        tui.type_and_press_enter("typed");
+
+        // The history of a conversation the TUI has left is not the one that
+        // is waited for.
+        tui.receive(attached(
+            stale,
+            history_loaded(Some("stale"), "stale history"),
+        ));
+        assert!(tui.sent().is_empty());
+        assert!(tui.state.startup_history_pending);
+        assert_eq!(tui.state.held_submissions.len(), 1);
+
+        tui.receive(attached(
+            active,
+            history_loaded(Some("hydrated"), "loaded history"),
+        ));
+        assert!(matches!(
+            tui.sent().as_slice(),
+            [UserAction::Submit(prompt), UserAction::QueuePrompt { prompt: queued, .. }]
+                if prompt == "cli" && queued == "typed"
+        ));
+        assert!(!tui.state.startup_history_pending);
+
+        // A conversation the user switches to later has its history too: the
+        // messages are not sent into it again.
+        tui.receive(attached(
+            active,
+            history_loaded(Some("another"), "loaded another"),
+        ));
+        assert!(tui.sent().is_empty());
+        assert!(matches!(
+            tui.state.transcript.messages.as_slice(),
+            [ChatMessage::Assistant(history), ChatMessage::System { .. }] if history == "another"
+        ));
+    }
+
+    #[test]
+    fn a_new_conversation_that_takes_the_place_of_the_resume_releases_the_held_messages() {
+        let mut tui = ResumingTui::waiting_for_history(None);
+        tui.type_and_press_enter("typed");
+
+        // `/new` before the history: the session starts with a projection of
+        // its own, which clears the screen, and is announced.
+        tui.receive(TuiEvent::SessionProjectionReset(Box::new(
+            crate::surface_projection::SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(1),
+                session_id: Some("session-2".to_string()),
+                title: "New conversation".to_string(),
+                usage_revision: 0,
+                usage: Default::default(),
+                context_revision: 0,
+                context_used_tokens: 0,
+                context_limit_tokens: 0,
+                workflow_tasks: Vec::new(),
+                current_goal: None,
+                foreground_operation_id: None,
+                recoverable_operation_id: None,
+                goal_presentation: None,
+                session_presentation: None,
+                mcp_catalog: Default::default(),
+            },
+        )));
+        assert!(tui.sent().is_empty());
+        tui.receive(TuiEvent::NewSessionStarted);
+
+        // No history will come for it: what was held is sent to it, once.
+        assert!(!tui.state.startup_history_pending);
+        assert!(tui.state.held_submissions.is_empty());
+        assert!(matches!(
+            tui.sent().as_slice(),
+            [UserAction::SubmitWithMentions { prompt, .. }] if prompt == "typed"
+        ));
+        assert_eq!(tui.user_messages(), ["typed"]);
     }
 }

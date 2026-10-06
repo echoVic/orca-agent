@@ -200,9 +200,10 @@ fn prestart_mcp_servers(
 }
 
 /// Opens the conversation `--resume` or `--continue` named, whose history
-/// the renderer shows (and then sends a prompt given with it), and announces
-/// its thread. When it cannot be opened, a prompt given with it still goes
-/// to a new conversation.
+/// the renderer shows (and then sends a prompt given with it, and what the
+/// user sent meanwhile), and announces its thread. The history comes
+/// whatever happens: when the conversation cannot be opened, it is empty, and
+/// what the renderer holds for it still goes to a new conversation.
 fn resume_startup_conversation(
     thread: &mut Option<RuntimeThreadHandle>,
     host: &RuntimeHostHandle,
@@ -243,9 +244,10 @@ fn resume_startup_conversation(
         if thread.is_none() {
             config.lock().unwrap().history_mode = HistoryMode::Record;
         }
-        if !cfg.prompt.trim().is_empty() {
-            emit_empty_history_snapshot(event_tx, "Unable to restore saved conversation.");
-        }
+        // The renderer holds the prompt given with the conversation, and what
+        // the user sent meanwhile, until its history comes. It comes empty,
+        // prompt or not, so that they go on to a new conversation.
+        emit_empty_history_snapshot(event_tx, "Unable to restore saved conversation.");
         if !error.contains("typed TUI snapshot attachment unavailable") {
             let _ = event_tx.send(TuiEvent::Error(format!(
                 "failed to restore typed conversation snapshot: {error}"
@@ -1355,6 +1357,36 @@ mod tests {
             next_controller_event(&event_rx),
             TuiEvent::Error(message)
                 if message == "cannot foreground task before a session exists"
+        ));
+
+        action_tx.send(UserAction::Cancel).expect("cancel action");
+        runtime.shutdown().expect("hosted controller shutdown");
+    }
+
+    #[test]
+    fn a_startup_resume_that_fails_still_ends_with_its_history_when_no_prompt_was_given() {
+        // The renderer holds what the user sends until the history of the
+        // conversation resumed at launch comes: it must come, empty, when the
+        // conversation cannot be opened, prompt or not.
+        let (_home, action_tx, event_rx, mut runtime) = spawn_controller_with_history(
+            HistoryMode::Resume("00000000-0000-4000-8000-000000000000".to_string()),
+        );
+
+        let (messages, label) = loop {
+            if let TuiEvent::HistoryLoaded {
+                messages, label, ..
+            } = next_controller_event(&event_rx)
+            {
+                break (messages, label);
+            }
+        };
+        assert!(messages.is_empty());
+        assert_eq!(label, "Unable to restore saved conversation.");
+        // The failure itself still shows after it, not under it.
+        assert!(matches!(
+            next_controller_event(&event_rx),
+            TuiEvent::Error(message)
+                if message.starts_with("failed to restore typed conversation snapshot")
         ));
 
         action_tx.send(UserAction::Cancel).expect("cancel action");

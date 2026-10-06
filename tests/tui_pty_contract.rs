@@ -960,6 +960,154 @@ fn a_conversation_that_cannot_be_resumed_leaves_the_prompt_to_a_new_one() {
     assert_eq!(status.code(), Some(130), "TUI exited with {status}");
 }
 
+#[test]
+fn a_message_typed_before_the_resumed_history_loads_runs_after_the_prompt() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let _recorded_in = record_a_conversation(home.path(), "pty resume seed");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process =
+        PtyProcess::spawn_resumed(home.path(), cwd.path(), "latest", "mock_history_echo")
+            .expect("spawn resumed TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "resuming a conversation skipped the review of a new workspace",
+    );
+    // Accepting the workspace starts the resume, and the message is typed
+    // with it, before the history can have loaded.
+    process
+        .write(b"\rheld message\r")
+        .expect("accept the workspace and send a message");
+
+    receive_until(
+        &process,
+        &mut output,
+        "Mock history users: pty resume seed | mock_history_echo",
+        Duration::from_secs(10),
+        "the prompt did not run right after the resumed conversation",
+    );
+    // Both turns are over once the sentinel is on screen a second time (the
+    // seed's answer is in the history), and the message is settled once its
+    // line in the conversation is the only place that shows it: while its turn
+    // runs, the queue strip shows it too.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let screen = loop {
+        let screen = reconstruct_screen(&output);
+        if screen.matches(ASSISTANT_SENTINEL).count() >= 2
+            && screen.matches("held message").count() == 1
+            && user_lines_showing(&screen, "held message") == 1
+        {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the held message is not on screen once, after the answer to the prompt; reconstructed screen=\n{screen}"
+        );
+        if let Some(chunk) = process.receive_output(Duration::from_millis(250)) {
+            output.extend_from_slice(&chunk);
+        }
+    };
+
+    assert!(
+        !screen.contains("pty resume seed | held message"),
+        "the held message ran before the prompt; reconstructed screen=\n{screen}"
+    );
+    // It reads after the answer to the prompt, as a message sent during that
+    // turn does, not above it.
+    let answer = screen
+        .find("Mock history users: pty resume seed | mock_history_echo")
+        .expect("the answer to the prompt");
+    let held = screen.find("held message").expect("the held message");
+    assert!(
+        answer < held,
+        "the held message is above the answer to the prompt; reconstructed screen=\n{screen}"
+    );
+
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
+fn messages_typed_before_the_resumed_history_loads_run_in_the_order_they_were_typed() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let _recorded_in = record_a_conversation(home.path(), "pty resume seed");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process =
+        PtyProcess::spawn_resumed(home.path(), cwd.path(), "latest", "mock_history_echo")
+            .expect("spawn resumed TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "resuming a conversation skipped the review of a new workspace",
+    );
+    // The second message asks the mock for the user messages it was given,
+    // which is how the order they ran in shows.
+    process
+        .write(b"\rfirst held\rmock_history_echo\r")
+        .expect("accept the workspace and send two messages");
+
+    // The prompt on the command line comes first, as it asks the same; the
+    // answer to the last message lists all of them.
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Mock history users: pty resume seed | mock_history_echo | first held | mock_history_echo",
+        "the messages did not run in the order they were typed, after the prompt",
+    );
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
+fn a_message_typed_before_a_conversation_that_cannot_be_resumed_is_not_held_for_good() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    // No prompt is given: the empty history that the failed resume sends is
+    // all that tells the TUI that the message it holds may go.
+    let mut process = PtyProcess::spawn_resumed_without_prompt(
+        home.path(),
+        cwd.path(),
+        "00000000-0000-4000-8000-000000000000",
+    )
+    .expect("spawn resumed TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "review this workspace security boundary",
+        Duration::from_secs(20),
+        "resuming a conversation skipped the review of a new workspace",
+    );
+    process
+        .write(b"\rmock_history_echo\r")
+        .expect("accept the workspace and send a message");
+
+    receive_until(
+        &process,
+        &mut output,
+        "Mock history users: mock_history_echo",
+        Duration::from_secs(10),
+        "the message went to no conversation when the named one could not be resumed",
+    );
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
 /// Records a conversation of one message, `prompt`, from a workspace of its
 /// own that the run accepts first, and returns that workspace.
 fn record_a_conversation(home: &std::path::Path, prompt: &str) -> tempfile::TempDir {
@@ -1394,6 +1542,33 @@ fn assert_screen_shows(process: &PtyProcess, output: &mut Vec<u8>, expected: &st
     }
 }
 
+/// Like `assert_screen_shows`, but `expected` has to be on the screen as it
+/// is, not in pieces somewhere in it: where text comes in an order is what is
+/// checked.
+fn assert_screen_has_text(
+    process: &PtyProcess,
+    output: &mut Vec<u8>,
+    expected: &str,
+    failure: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if reconstruct_screen(output).contains(expected) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "{failure}; reconstructed screen=\n{}",
+                reconstruct_screen(output)
+            );
+        }
+        if let Some(chunk) = process.receive_output(remaining.min(Duration::from_millis(250))) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+}
+
 fn assert_screen_shows_wrapped_token(
     process: &PtyProcess,
     output: &mut Vec<u8>,
@@ -1420,6 +1595,15 @@ fn assert_screen_shows_wrapped_token(
             output.extend_from_slice(&chunk);
         }
     }
+}
+
+/// How many of the lines of `screen` are a message the user sent that shows
+/// `text`: the conversation marks those with `›`.
+fn user_lines_showing(screen: &str, text: &str) -> usize {
+    screen
+        .lines()
+        .filter(|line| line.trim_start().starts_with('›') && line.contains(text))
+        .count()
 }
 
 fn screen_contains(output: &[u8], expected: &str) -> bool {
@@ -1562,6 +1746,18 @@ impl PtyProcess {
         prompt: &str,
     ) -> io::Result<Self> {
         Self::spawn_with_history(home, cwd, Some(selector), prompt)
+    }
+
+    /// `orca --resume selector` in `cwd` with no prompt.
+    fn spawn_resumed_without_prompt(
+        home: &std::path::Path,
+        cwd: &std::path::Path,
+        selector: &str,
+    ) -> io::Result<Self> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
+        command.args(["--provider", "mock", "--cwd"]).arg(cwd);
+        command.args(["--resume", selector]);
+        Self::spawn_command(command, home)
     }
 
     fn spawn_with_history(

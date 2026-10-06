@@ -311,13 +311,18 @@ fn run_tui_inner(
     // everything else the workspace runs. One given with a conversation
     // resumed at launch, which itself waits for setup, is submitted once that
     // conversation's history is loaded. Any other is submitted now, or once
-    // the user has accepted the workspace (`finish_setup`).
-    let pending_initial_prompt =
-        if typed_history_startup_eligible(&config.history_mode, &preloaded_transcript) {
-            initial_prompt.take()
-        } else {
-            None
-        };
+    // the user has accepted the workspace (`finish_setup`). What the user
+    // sends before that history is loaded waits for it too, prompt or not: it
+    // would run ahead of the prompt, and the history would take its place on
+    // the screen. A session attached to a daemon has no history to wait for.
+    let resume_at_launch =
+        typed_history_startup_eligible(&config.history_mode, &preloaded_transcript);
+    let pending_initial_prompt = if resume_at_launch {
+        initial_prompt.take()
+    } else {
+        None
+    };
+    state.startup_history_pending = resume_at_launch && local_runtime;
     let renderer_interaction_acks =
         RendererInteractionAckOwner::new(agent_runtime.interaction_ack_receiver());
     let renderer_runtime_inbox = RendererRuntimeInboxOwner::new(pending_event_rx);
