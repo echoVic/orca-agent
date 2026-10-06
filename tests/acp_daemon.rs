@@ -30,9 +30,15 @@ impl Process {
         }
     }
 
-    fn terminate(&mut self) {
+    /// Sends `signal` to the child, which must not have been waited for yet:
+    /// until then its PID cannot name another process.
+    fn signal(&self, signal: libc::c_int) {
         // SAFETY: PID belongs to this live, owned child; never read from a stale PID file.
-        assert_eq!(unsafe { libc::kill(self.0.id() as i32, libc::SIGTERM) }, 0);
+        assert_eq!(unsafe { libc::kill(self.0.id() as i32, signal) }, 0);
+    }
+
+    fn terminate(&mut self) {
+        self.signal(libc::SIGTERM);
         assert!(self.wait().success());
     }
 }
@@ -92,7 +98,12 @@ impl Fixture {
     }
 
     fn daemon(&self) -> Process {
-        let mut daemon = Process(self.daemon_command().spawn().expect("daemon process"));
+        self.started(self.daemon_command())
+    }
+
+    /// The daemon that `command` starts, once it accepts clients.
+    fn started(&self, mut command: Command) -> Process {
+        let mut daemon = Process(command.spawn().expect("daemon process"));
         let deadline = Instant::now() + TIMEOUT;
         loop {
             assert!(
@@ -604,4 +615,54 @@ fn model_read_file_uses_local_disk_and_ignores_observer_resource_responses() {
     drop(observer);
     drop(owner);
     daemon.terminate();
+}
+
+/// One Ctrl+C on a daemon in the foreground of a terminal comes twice
+/// through the npm launcher: the launcher shares the daemon's process group,
+/// so the terminal signals both, and it passes on what it got. The copy, a
+/// millisecond or so later, is the same stop request, not a second one: the
+/// daemon still sees its shutdown through, which ends the turn in flight
+/// with a terminal record, instead of cutting it short and leaving the turn
+/// to be recovered as after a crash.
+#[test]
+fn a_copy_of_the_stop_signal_does_not_cut_the_shutdown_short() {
+    let fixture = Fixture::new();
+    let mut command = fixture.daemon_command();
+    command.stderr(Stdio::piped());
+    let mut daemon = fixture.started(command);
+    let stderr = daemon.0.stderr.take().expect("daemon stderr");
+    let stderr = std::thread::spawn(move || std::io::read_to_string(stderr).unwrap_or_default());
+    let mut owner = fixture.bridge(false);
+    let session = owner.new_session(&fixture.cwd);
+    // A turn in flight gives the shutdown work to do when the copy comes.
+    owner.prompt(
+        3,
+        &session,
+        &format!(
+            "mock_stream_release_marker {}",
+            fixture.cwd.join("never-released").display()
+        ),
+    );
+    owner.until(|frame| {
+        frame["params"]["update"]["content"]["text"] == "Mock release-marker stream started."
+    });
+
+    daemon.signal(libc::SIGINT);
+    std::thread::sleep(Duration::from_millis(1));
+    assert!(
+        daemon.0.try_wait().expect("poll the daemon").is_none(),
+        "the daemon exited within a millisecond of the first signal"
+    );
+    daemon.signal(libc::SIGINT);
+    let status = daemon.wait();
+    let stderr = stderr.join().expect("daemon stderr reader");
+
+    assert!(
+        status.success(),
+        "the copy of the signal cut the shutdown short ({status}): {stderr}"
+    );
+    assert!(
+        !stderr.contains("stopped again before shutdown finished"),
+        "{stderr}"
+    );
 }

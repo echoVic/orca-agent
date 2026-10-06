@@ -89,7 +89,9 @@ Send SIGINT or SIGTERM to the foreground daemon for graceful shutdown. Runtime
 shutdown commits terminal state before client transport teardown. Shutdown has
 10 seconds: if it has not finished by then, or a second SIGINT or SIGTERM
 arrives, the daemon exits with an error saying so, and the next start recovers
-what the shutdown left unfinished, as after a crash. The daemon
+what the shutdown left unfinished, as after a crash. Any signal within half a
+second of the first counts as the same one: a wrapper that shares the daemon's
+process group, such as the npm launcher, delivers one Ctrl+C twice. The daemon
 removes only its own socket inode. A crash releases the OS lock and can leave a
 stale socket for the next start to validate. The lock PID is diagnostic only:
 the implementation does not signal processes based on stale PID-file content.

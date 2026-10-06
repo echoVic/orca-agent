@@ -40,7 +40,7 @@ mod unix {
     use std::os::unix::fs::{
         DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use orca_platform::fs::ExclusiveFileLock;
     use tokio::net::{UnixListener, UnixStream};
@@ -249,10 +249,10 @@ mod unix {
             let shared = super::super::shared::SharedSessions::default();
             let mut clients = JoinSet::new();
             eprintln!("orca: ACP daemon listening on {}", endpoint.path.display());
-            loop {
+            let stopped_at = loop {
                 tokio::select! {
-                    _ = term.recv() => break,
-                    _ = interrupt.recv() => break,
+                    _ = term.recv() => break Instant::now(),
+                    _ = interrupt.recv() => break Instant::now(),
                     Some(_) = clients.join_next(), if !clients.is_empty() => {}
                     accepted = endpoint.listener.accept() => {
                         let (stream, _) = accepted?;
@@ -274,21 +274,36 @@ mod unix {
                         });
                     }
                 }
-            }
+            };
             // Runtime commits shutdown terminals before transports disappear.
             // A signal is still an order to stop: a shutdown that has not
             // finished in time, or a second signal, ends the daemon anyway,
             // and what it left unfinished is recovered on the next start as
-            // after a crash.
-            let shutdown = tokio::task::spawn_blocking(move || host.shutdown());
-            let result = tokio::select! {
-                joined = shutdown => joined.map_err(io::Error::other)?.map_err(io::Error::other),
-                _ = tokio::time::sleep(SHUTDOWN_GRACE) => Err(io::Error::other(format!(
-                    "runtime shutdown did not finish within {}s",
-                    SHUTDOWN_GRACE.as_secs()
-                ))),
-                _ = term.recv() => Err(io::Error::other("stopped again before shutdown finished")),
-                _ = interrupt.recv() => Err(io::Error::other("stopped again before shutdown finished")),
+            // after a crash. A signal within DUPLICATE_DELIVERY_WINDOW of the
+            // first is a copy of it, not a second one, and is ignored: one
+            // Ctrl+C reaches a foreground daemon twice through the npm
+            // launcher, which shares its process group and passes the signal
+            // on, a millisecond or so apart.
+            let mut shutdown = tokio::task::spawn_blocking(move || host.shutdown());
+            let grace = tokio::time::sleep(SHUTDOWN_GRACE);
+            tokio::pin!(grace);
+            let result = loop {
+                tokio::select! {
+                    joined = &mut shutdown => {
+                        break joined.map_err(io::Error::other)?.map_err(io::Error::other);
+                    }
+                    () = &mut grace => {
+                        break Err(io::Error::other(format!(
+                            "runtime shutdown did not finish within {}s",
+                            SHUTDOWN_GRACE.as_secs()
+                        )));
+                    }
+                    _ = term.recv() => {}
+                    _ = interrupt.recv() => {}
+                }
+                if stopped_at.elapsed() >= crate::termination_signals::DUPLICATE_DELIVERY_WINDOW {
+                    break Err(io::Error::other("stopped again before shutdown finished"));
+                }
             };
             clients.abort_all();
             while clients.join_next().await.is_some() {}
