@@ -513,38 +513,115 @@ fn decor_text(text: Option<&RawString>) -> String {
 
 /// Append `entry` to an inline array. On one line it follows a comma and a
 /// space, as `Array::push` writes it. In an array with an entry to a line, it
-/// takes a line of its own, indented like the entry before it, and, when the
-/// array has no trailing comma, the whitespace before the `]`.
+/// takes a line of its own, indented like the entry before it: after that
+/// entry's comma and the comment at the end of its line, and in front of
+/// whatever is left before the `]`, such as comments that belong to no entry.
+/// In an empty array whose `]` is on a line of its own, it takes a line of its
+/// own too, indented like the first comment in the array, or by two spaces.
 ///
-/// Only whitespace is ever moved. `toml_edit` keeps a comment with the text
-/// that follows it, so one that trails an entry stays where it is, which can
-/// be after the entry that was added.
+/// `toml_edit` keeps the text after an entry's comma, up to the next entry,
+/// with that next entry. After the last entry it is the array's trailing text,
+/// or, when the array has no trailing comma, the last entry's suffix. The
+/// comment at the end of the entry's line is the first line of it, so the
+/// text is cut after that line: the line goes in front of the new entry, to
+/// stay on the line of the entry it comments on, and the rest follows it.
 fn push_inline_entry(entries: &mut Array, entry: InlineTable) {
     let mut entry = Value::from(entry);
     let (prefix, suffix) = entries.iter().last().map(entry_layout).unwrap_or_default();
-    let Some((_, indent)) = prefix
-        .rsplit_once('\n')
-        .filter(|(_, indent)| indent.trim().is_empty())
-    else {
+    let trailing_comma = entries.trailing_comma();
+    let tail = if trailing_comma || entries.is_empty() {
+        decor_text(Some(entries.trailing()))
+    } else {
+        suffix.clone()
+    };
+    let indent = if entries.is_empty() {
+        tail.split_once('\n')
+            .map(|(_, rest)| comment_indent(rest).to_string())
+    } else {
+        prefix
+            .rsplit_once('\n')
+            .filter(|(_, indent)| indent.trim().is_empty())
+            .map(|(_, indent)| indent.to_string())
+    };
+    let Some(indent) = indent else {
         return entries.push(entry);
     };
-    entry.decor_mut().set_prefix(format!("\n{indent}"));
-    if suffix.trim().is_empty() {
-        entry.decor_mut().set_suffix(suffix);
-        let last = entries.len() - 1;
-        if let Some(last) = entries.get_mut(last) {
+    let (new_prefix, new_tail) = match tail.split_once('\n') {
+        Some((first, rest)) => (format!("{first}\n{indent}"), format!("\n{rest}")),
+        None => (format!("\n{indent}"), tail),
+    };
+    // The tail goes in the array's trailing text when there is a comma after
+    // the new entry, and in the new entry's suffix when there is none. With
+    // a comma, the new entry also takes the whitespace between the last entry
+    // and its comma, if that is all it holds.
+    let (trailing, new_suffix) = if trailing_comma {
+        (new_tail, suffix.trim().is_empty().then_some(suffix))
+    } else {
+        (String::new(), Some(new_tail))
+    };
+    entry.decor_mut().set_prefix(new_prefix);
+    entries.set_trailing(trailing);
+    if let Some(new_suffix) = new_suffix {
+        entry.decor_mut().set_suffix(new_suffix);
+        if let Some(last) = entries.iter_mut().last() {
             last.decor_mut().set_suffix("");
         }
     }
     entries.push_formatted(entry);
 }
 
-/// Remove the entry at `index` from an inline array. The entry that becomes
-/// the first or the last keeps the layout the array had at its start or its
-/// end, unless a comment is in the way.
+/// The indentation of the first line of `lines` when it is a comment, and two
+/// spaces when it is not.
+fn comment_indent(lines: &str) -> &str {
+    let line = lines.lines().next().unwrap_or_default();
+    let comment = line.trim_start();
+    if comment.starts_with('#') {
+        &line[..line.len() - comment.len()]
+    } else {
+        "  "
+    }
+}
+
+/// Remove the entry at `index` from an inline array. An entry with a line of
+/// its own takes its comments with it: the comment lines directly above it,
+/// which a blank line ends, and the comment at the end of its line. The line
+/// goes whole, and every other comment stays where it was, with the entry it
+/// belongs to or, when it belongs to none, in the array.
+///
+/// As `push_inline_entry` explains, `toml_edit` keeps the comment at the end
+/// of the line in the text that follows the entry's comma: in front of the
+/// next entry, in the array's trailing text, or, when the array has no
+/// trailing comma, in the removed entry's own suffix. What stays of the text
+/// on either side of the entry is joined, and goes where the text after the
+/// entry was: in front of the next entry, in the array's trailing text, or in
+/// the suffix of the entry before, which is the last now.
+///
+/// Where the entry shares its line with another, or follows the `[`, no
+/// comment is its own. The entry that becomes the first or the last keeps the
+/// layout the array had at its start or its end, unless a comment is in the
+/// way.
 fn remove_inline_entry(entries: &mut Array, index: usize) {
     let removed = entries.remove(index);
     let (prefix, suffix) = entry_layout(&removed);
+    let after = match entries.get(index) {
+        Some(next) => decor_text(next.decor().prefix()),
+        None if entries.trailing_comma() => decor_text(Some(entries.trailing())),
+        None => suffix.clone(),
+    };
+    if let Some(above) = above_own_comments(&prefix)
+        && let Some((_, rest)) = after.split_once('\n')
+    {
+        let kept = format!("{above}{rest}");
+        if let Some(next) = entries.get_mut(index) {
+            next.decor_mut().set_prefix(kept);
+        } else if entries.is_empty() || entries.trailing_comma() {
+            entries.set_trailing(kept);
+        } else if let Some(last) = entries.iter_mut().last() {
+            let before = decor_text(last.decor().suffix());
+            last.decor_mut().set_suffix(before + &kept);
+        }
+        return;
+    }
     if index == 0 {
         if let Some(first) = entries.get_mut(0)
             && prefix.trim().is_empty()
@@ -559,6 +636,22 @@ fn remove_inline_entry(entries: &mut Array, index: usize) {
     {
         last.decor_mut().set_suffix(suffix);
     }
+}
+
+/// The text in front of an entry, `before`, up to the end of the line before
+/// the comment lines directly above the entry: those lines, and the entry's
+/// own indentation, are cut off. `None` when the entry is on the same line as
+/// what comes before it, so it has no line of its own. The first line of
+/// `before` is never cut off: it is the rest of the line of the entry before,
+/// and a comment there is that entry's.
+fn above_own_comments(before: &str) -> Option<&str> {
+    let (mut above, _indent) = before.rsplit_once('\n')?;
+    while let Some((higher, line)) = above.rsplit_once('\n')
+        && line.trim_start().starts_with('#')
+    {
+        above = higher;
+    }
+    Some(&before[..above.len() + 1])
 }
 
 fn not_an_array_error(path: &Path, field: &str) -> io::Error {
@@ -1051,6 +1144,484 @@ mod tests {
 
             assert_eq!(std::fs::read_to_string(&path).unwrap(), after, "{before}");
         }
+    }
+
+    /// A config directory holding `content`.
+    fn config_dir_with(content: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(USER_CONFIG_FILE), content).unwrap();
+        dir
+    }
+
+    fn config_text(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join(USER_CONFIG_FILE)).unwrap()
+    }
+
+    /// The index of the one line of `text` that holds `needle`. The tests on
+    /// comments say where a comment is relative to an entry, without pinning
+    /// how the entry is written, so they find the entry by its name.
+    fn line_with(text: &str, needle: &str) -> usize {
+        let found: Vec<usize> = text
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| line.contains(needle).then_some(index))
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "{needle:?} is not on exactly one line of:\n{text}"
+        );
+        found[0]
+    }
+
+    /// The index of the line that closes the array.
+    fn closing_bracket_line(text: &str) -> usize {
+        text.lines().position(|line| line.trim() == "]").unwrap()
+    }
+
+    /// Whether `line` holds one entry and nothing else: no comment, and no
+    /// other entry.
+    fn is_an_entry_alone(line: &str) -> bool {
+        let line = line.trim();
+        line.starts_with('{')
+            && line.trim_end_matches(',').ends_with('}')
+            && !line.contains('#')
+            && line.matches("name =").count() == 1
+    }
+
+    /// Two servers, each with a comment above it and one at the end of its
+    /// line, and a comment before the `]` that belongs to neither.
+    const COMMENTED_SERVERS: &str = concat!(
+        "mcp_servers = [\n",
+        "  # docs server\n",
+        "  { name = \"docs\", command = \"docs-mcp\" }, # stable\n",
+        "  # tracker server\n",
+        "  { name = \"tracker\", command = \"tracker-mcp\" }, # beta\n",
+        "  # end of servers\n",
+        "]\n",
+    );
+
+    #[test]
+    fn removing_an_inline_entry_takes_its_own_comments() {
+        let dir = config_dir_with(COMMENTED_SERVERS);
+
+        remove_user_mcp_server_in(dir.path(), "docs").unwrap();
+
+        let text = config_text(dir.path());
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(!text.contains("# docs server"), "{text}");
+        assert!(!text.contains("# stable"), "{text}");
+        // What is left keeps its place around the entry that stays.
+        let tracker = line_with(&text, "name = \"tracker\"");
+        assert_eq!(lines[tracker - 1].trim(), "# tracker server", "{text}");
+        assert!(lines[tracker].ends_with("# beta"), "{text}");
+        let closing = closing_bracket_line(&text);
+        assert_eq!(lines[closing - 1].trim(), "# end of servers", "{text}");
+        assert_eq!(listed_names(dir.path()), ["tracker"], "{text}");
+    }
+
+    #[test]
+    fn removing_the_last_inline_entry_keeps_the_closing_comment() {
+        let dir = config_dir_with(COMMENTED_SERVERS);
+
+        remove_user_mcp_server_in(dir.path(), "tracker").unwrap();
+
+        let text = config_text(dir.path());
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(!text.contains("# beta"), "{text}");
+        assert!(!text.contains("# tracker server"), "{text}");
+        let docs = line_with(&text, "name = \"docs\"");
+        assert_eq!(lines[docs - 1].trim(), "# docs server", "{text}");
+        assert!(lines[docs].ends_with("# stable"), "{text}");
+        let closing = closing_bracket_line(&text);
+        assert_eq!(lines[closing - 1].trim(), "# end of servers", "{text}");
+        assert_eq!(listed_names(dir.path()), ["docs"], "{text}");
+    }
+
+    #[test]
+    fn an_added_inline_entry_goes_after_the_last_entrys_comment() {
+        let dir = config_dir_with(COMMENTED_SERVERS);
+
+        add_user_mcp_server_in(dir.path(), &stdio_server("search", "search-mcp")).unwrap();
+
+        let text = config_text(dir.path());
+        let lines: Vec<&str> = text.lines().collect();
+        let tracker = line_with(&text, "name = \"tracker\"");
+        let search = line_with(&text, "name = \"search\"");
+        let end = line_with(&text, "# end of servers");
+        assert!(lines[tracker].ends_with("# beta"), "{text}");
+        assert!(is_an_entry_alone(lines[search]), "{text}");
+        assert!(tracker < search && search < end, "{text}");
+        assert_eq!(
+            listed_names(dir.path()),
+            ["docs", "tracker", "search"],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn adding_after_an_entry_without_a_trailing_comma_keeps_its_comment() {
+        let dir = config_dir_with(concat!(
+            "mcp_servers = [\n",
+            "  { name = \"docs\", command = \"docs-mcp\" },\n",
+            "  { name = \"tracker\", command = \"tracker-mcp\" } # beta\n",
+            "]\n",
+        ));
+
+        add_user_mcp_server_in(dir.path(), &stdio_server("search", "search-mcp")).unwrap();
+
+        let text = config_text(dir.path());
+        let lines: Vec<&str> = text.lines().collect();
+        let tracker = line_with(&text, "name = \"tracker\"");
+        let search = line_with(&text, "name = \"search\"");
+        // The comma comes before the comment, which stays on its entry's line.
+        assert!(lines[tracker].ends_with(", # beta"), "{text}");
+        assert!(is_an_entry_alone(lines[search]), "{text}");
+        assert!(tracker < search, "{text}");
+        assert_eq!(
+            listed_names(dir.path()),
+            ["docs", "tracker", "search"],
+            "{text}"
+        );
+    }
+
+    /// `text` with `<a>`, `<b>` and `<c>` written out as the entries of the
+    /// servers of those names.
+    fn with_entries(text: &str) -> String {
+        text.replace("<a>", r#"{ name = "a", command = "x" }"#)
+            .replace("<b>", r#"{ name = "b", command = "y" }"#)
+            .replace("<c>", r#"{ name = "c", command = "z" }"#)
+    }
+
+    #[test]
+    fn removing_an_inline_entry_leaves_every_comment_that_is_not_its_own() {
+        // The file before, the name removed, and the file after.
+        let cases = [
+            // A middle entry with a comment above it and one at the end of its
+            // line. The comment at the end of the line before, and a note a
+            // blank line away from the entry, stay.
+            (
+                concat!(
+                    "mcp_servers = [\n",
+                    "  <a>, # about a\n",
+                    "\n",
+                    "  # a note, set off by blank lines\n",
+                    "\n",
+                    "  # about b\n",
+                    "  <b>, # b\n",
+                    "  <c>,\n",
+                    "  # end\n",
+                    "]\n",
+                ),
+                "b",
+                concat!(
+                    "mcp_servers = [\n",
+                    "  <a>, # about a\n",
+                    "\n",
+                    "  # a note, set off by blank lines\n",
+                    "\n",
+                    "  <c>,\n",
+                    "  # end\n",
+                    "]\n",
+                ),
+            ),
+            // The first entry, with only a comment above it. The comment on
+            // the line of the `[` is the array's.
+            (
+                concat!(
+                    "mcp_servers = [ # my servers\n",
+                    "  # about a\n",
+                    "  <a>,\n",
+                    "  <b>, # b\n",
+                    "]\n",
+                ),
+                "a",
+                concat!("mcp_servers = [ # my servers\n", "  <b>, # b\n", "]\n"),
+            ),
+            // A middle entry with only a comment at the end of its line.
+            (
+                concat!(
+                    "mcp_servers = [\n",
+                    "  <a>, # a\n",
+                    "  <b>, # b\n",
+                    "  # about c\n",
+                    "  <c>,\n",
+                    "]\n",
+                ),
+                "b",
+                concat!(
+                    "mcp_servers = [\n",
+                    "  <a>, # a\n",
+                    "  # about c\n",
+                    "  <c>,\n",
+                    "]\n",
+                ),
+            ),
+            // A middle entry with no comment of its own, between two that
+            // have.
+            (
+                concat!(
+                    "mcp_servers = [\n",
+                    "  # about a\n",
+                    "  <a>, # a\n",
+                    "  <b>,\n",
+                    "  # about c\n",
+                    "  <c>, # c\n",
+                    "]\n",
+                ),
+                "b",
+                concat!(
+                    "mcp_servers = [\n",
+                    "  # about a\n",
+                    "  <a>, # a\n",
+                    "  # about c\n",
+                    "  <c>, # c\n",
+                    "]\n",
+                ),
+            ),
+            // The last entry of an array with no trailing comma: the one
+            // before it ends the array, with its comment, and keeps the
+            // comment that closes it.
+            (
+                concat!(
+                    "mcp_servers = [\n",
+                    "  <a>, # a\n",
+                    "  # about b\n",
+                    "  <b> # b\n",
+                    "  # end\n",
+                    "]\n",
+                ),
+                "b",
+                concat!("mcp_servers = [\n", "  <a> # a\n", "  # end\n", "]\n"),
+            ),
+            // The only entry: the comment that belongs to no entry stays.
+            (
+                concat!(
+                    "mcp_servers = [\n",
+                    "  # about a\n",
+                    "  <a>, # a\n",
+                    "  # end\n",
+                    "]\n",
+                ),
+                "a",
+                "mcp_servers = [\n  # end\n]\n",
+            ),
+            (
+                concat!(
+                    "mcp_servers = [\n",
+                    "  # about a\n",
+                    "  <a> # a\n",
+                    "  # end\n",
+                    "]\n",
+                ),
+                "a",
+                "mcp_servers = [\n  # end\n]\n",
+            ),
+            // The only entry, with nothing else: the array keeps its lines.
+            ("mcp_servers = [\n  <a>,\n]\n", "a", "mcp_servers = [\n]\n"),
+            ("mcp_servers = [\n  <a>\n]\n", "a", "mcp_servers = [\n]\n"),
+            // Every entry with the name goes, each with its own comments.
+            (
+                concat!(
+                    "mcp_servers = [\n",
+                    "  # first\n",
+                    "  <a>, # one\n",
+                    "  # second\n",
+                    "  <a>, # two\n",
+                    "  <b>,\n",
+                    "  # end\n",
+                    "]\n",
+                ),
+                "a",
+                "mcp_servers = [\n  <b>,\n  # end\n]\n",
+            ),
+        ];
+        for (before, name, after) in cases {
+            let (before, after) = (with_entries(before), with_entries(after));
+            let dir = config_dir_with(&before);
+
+            remove_user_mcp_server_in(dir.path(), name).unwrap();
+
+            let text = config_text(dir.path());
+            assert_eq!(text, after, "removing {name} from:\n{before}");
+            // What is left still loads, without the server.
+            assert!(!listed_names(dir.path()).contains(&name.to_string()));
+        }
+    }
+
+    #[test]
+    fn removing_an_inline_entry_that_shares_its_line_leaves_the_comments_around_it() {
+        // Two entries to a line are not the layout the comments are read in:
+        // a comment at the end of such a line is not either entry's, so it
+        // stays when one of them goes.
+        let cases = [
+            (
+                "mcp_servers = [\n  <a>, <b>,\n  <c>,\n]\n",
+                "a",
+                "mcp_servers = [\n  <b>,\n  <c>,\n]\n",
+            ),
+            (
+                "mcp_servers = [\n  <a>, <b>,\n  <c>,\n]\n",
+                "b",
+                "mcp_servers = [\n  <a>,\n  <c>,\n]\n",
+            ),
+            (
+                "mcp_servers = [\n  <a>, <b>,\n  <c>,\n]\n",
+                "c",
+                "mcp_servers = [\n  <a>, <b>,\n]\n",
+            ),
+            (
+                "mcp_servers = [\n  <a>, <b>, # both\n  <c>,\n]\n",
+                "a",
+                "mcp_servers = [\n  <b>, # both\n  <c>,\n]\n",
+            ),
+            (
+                "mcp_servers = [\n  <a>, <b>, # both\n  <c>,\n]\n",
+                "b",
+                "mcp_servers = [\n  <a>, # both\n  <c>,\n]\n",
+            ),
+        ];
+        for (before, name, after) in cases {
+            let (before, after) = (with_entries(before), with_entries(after));
+            let dir = config_dir_with(&before);
+
+            remove_user_mcp_server_in(dir.path(), name).unwrap();
+
+            assert_eq!(
+                config_text(dir.path()),
+                after,
+                "removing {name} from:\n{before}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_inline_entry_goes_after_the_comment_that_ends_the_last_entrys_line() {
+        const NEW: &str = r#"{ name = "new", transport = "stdio", command = "new-mcp" }"#;
+        // The file before, and after `new` is added. Removing `new` again
+        // must give back the file as it was.
+        let cases = [
+            // A trailing comma.
+            (
+                "mcp_servers = [\n  <a>, # about a\n  # closing\n]\n",
+                "mcp_servers = [\n  <a>, # about a\n  <new>,\n  # closing\n]\n",
+            ),
+            // No trailing comma: the comma goes in front of the comment, and
+            // the new entry, the last, has none.
+            (
+                "mcp_servers = [\n  <a> # about a\n]\n",
+                "mcp_servers = [\n  <a>, # about a\n  <new>\n]\n",
+            ),
+            (
+                "mcp_servers = [\n  <a> # about a\n  # closing\n]\n",
+                "mcp_servers = [\n  <a>, # about a\n  <new>\n  # closing\n]\n",
+            ),
+            // The new entry is indented like the last, whatever is above it.
+            (
+                "mcp_servers = [\n    # about a\n    <a>, # a\n]\n",
+                "mcp_servers = [\n    # about a\n    <a>, # a\n    <new>,\n]\n",
+            ),
+            // An empty array with a line of its own for the `]`: the new
+            // entry gets a line of its own too, indented like the first
+            // comment, or by two spaces. The comments stay at the end.
+            (
+                "mcp_servers = [\n  # <a>,\n]\n",
+                "mcp_servers = [\n  <new>\n  # <a>,\n]\n",
+            ),
+            (
+                "mcp_servers = [ # my servers\n    # <a>,\n]\n",
+                "mcp_servers = [ # my servers\n    <new>\n    # <a>,\n]\n",
+            ),
+            ("mcp_servers = [\n]\n", "mcp_servers = [\n  <new>\n]\n"),
+        ];
+        for (before, after) in cases {
+            let (before, after) = (with_entries(before), with_entries(after));
+            let dir = config_dir_with(&before);
+
+            add_user_mcp_server_in(dir.path(), &stdio_server("new", "new-mcp")).unwrap();
+            assert_eq!(
+                config_text(dir.path()),
+                after.replace("<new>", NEW),
+                "adding to:\n{before}"
+            );
+            assert_eq!(listed_names(dir.path()).last().unwrap(), "new");
+
+            remove_user_mcp_server_in(dir.path(), "new").unwrap();
+            assert_eq!(config_text(dir.path()), before);
+        }
+    }
+
+    #[test]
+    fn inline_entry_comments_stay_with_their_entries_in_a_file_with_crlf_line_ends() {
+        // `toml_edit` reads the `\r\n` into the text it keeps between the
+        // entries, and writes the file without the `\r`.
+        let crlf = COMMENTED_SERVERS.replace('\n', "\r\n");
+
+        let dir = config_dir_with(&crlf);
+        remove_user_mcp_server_in(dir.path(), "docs").unwrap();
+        let text = config_text(dir.path());
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(!text.contains("# docs server"), "{text:?}");
+        assert!(!text.contains("# stable"), "{text:?}");
+        let tracker = line_with(&text, "name = \"tracker\"");
+        assert_eq!(lines[tracker - 1].trim(), "# tracker server", "{text:?}");
+        assert!(lines[tracker].trim_end().ends_with("# beta"), "{text:?}");
+        assert_eq!(
+            lines[closing_bracket_line(&text) - 1].trim(),
+            "# end of servers",
+            "{text:?}"
+        );
+        assert_eq!(listed_names(dir.path()), ["tracker"], "{text:?}");
+
+        let dir = config_dir_with(&crlf);
+        add_user_mcp_server_in(dir.path(), &stdio_server("search", "search-mcp")).unwrap();
+        let text = config_text(dir.path());
+        let lines: Vec<&str> = text.lines().collect();
+        let tracker = line_with(&text, "name = \"tracker\"");
+        let search = line_with(&text, "name = \"search\"");
+        let end = line_with(&text, "# end of servers");
+        assert!(lines[tracker].trim_end().ends_with("# beta"), "{text:?}");
+        assert!(is_an_entry_alone(lines[search]), "{text:?}");
+        assert!(tracker < search && search < end, "{text:?}");
+        assert_eq!(
+            listed_names(dir.path()),
+            ["docs", "tracker", "search"],
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn an_allow_rule_is_saved_after_the_comment_that_ends_the_last_inline_rules_line() {
+        let dir = config_dir_with(concat!(
+            "[permissions]\n",
+            "rules = [\n",
+            "  # build tools\n",
+            "  { tool = \"bash\", pattern = \"cargo *\", decision = \"allow\" }, # cargo\n",
+            "  # end of rules\n",
+            "]\n",
+        ));
+
+        assert!(add_user_allow_rule_in(dir.path(), "mcp__github__create_issue").unwrap());
+
+        let text = config_text(dir.path());
+        let lines: Vec<&str> = text.lines().collect();
+        let bash = line_with(&text, "tool = \"bash\"");
+        let saved = line_with(&text, "mcp__github__create_issue");
+        let end = line_with(&text, "# end of rules");
+        assert!(lines[bash].ends_with("# cargo"), "{text}");
+        assert!(!lines[saved].contains('#'), "{text}");
+        assert!(bash < saved && saved < end, "{text}");
+        let config: crate::config::file::FileConfig = toml::from_str(&text).unwrap();
+        assert!(
+            config
+                .permissions
+                .rules
+                .contains(&PermissionRule::whole_tool(
+                    "mcp__github__create_issue",
+                    Decision::Allow
+                )),
+            "{text}"
+        );
     }
 
     #[test]
