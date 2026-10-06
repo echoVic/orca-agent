@@ -28,13 +28,19 @@ use orca_core::tool_images::tool_image;
 ///
 /// Its servers stop once the last clone is dropped, those still connecting
 /// too, or as soon as one holder closes it ([`McpRegistry::close`]).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct McpRegistry {
     shared: Arc<McpRegistryShared>,
 }
 
+impl Default for McpRegistry {
+    /// A registry with no server, which has started already.
+    fn default() -> Self {
+        Self::from_inner(McpRegistryInner::default())
+    }
+}
+
 /// What every clone of a registry shares.
-#[derive(Default)]
 struct McpRegistryShared {
     inner: RwLock<McpRegistryInner>,
     /// Who hears of each change. It has a lock of its own, so that a
@@ -150,6 +156,10 @@ struct McpRegistryInner {
     /// Whether the registry was closed ([`McpRegistry::close`]): its servers
     /// are stopped for good, and no connection is put in place any more.
     closed: bool,
+    /// How every server stood when the first startup ended, as
+    /// [`McpRegistry::startup_statuses`] tells ([`Self::note_startup_end`]).
+    /// `None` until then, and never changed after.
+    startup: Option<Vec<McpServerStatus>>,
 }
 
 #[derive(Clone)]
@@ -201,6 +211,25 @@ impl McpRegistryInner {
             .collect()
     }
 
+    /// Whether a server is [`McpServerState::Starting`].
+    fn is_starting(&self) -> bool {
+        self.servers
+            .iter()
+            .any(|server| server.state == McpServerState::Starting)
+    }
+
+    /// Keeps how every server stands as the registry's startup, the first
+    /// time none is starting: each has connected, failed or needs a login.
+    /// A registry with no server to start has that from the beginning. What
+    /// can end the startup calls this under the lock that made the change,
+    /// so what is kept is how the startup ended, whatever reconnect or login
+    /// follows.
+    fn note_startup_end(&mut self) {
+        if self.startup.is_none() && !self.is_starting() {
+            self.startup = Some(self.server_statuses());
+        }
+    }
+
     /// The prompts of every connected server, in config order.
     fn prompts(&self) -> Vec<McpPrompt> {
         self.servers
@@ -223,7 +252,9 @@ impl McpRegistryInner {
     /// Puts what a connection attempt came to in place of what the server
     /// at `index` had: its client, tools and prompts, or, when it failed,
     /// none and why. Returns the client it replaced, which stops its server
-    /// when dropped; drop it once the lock is released.
+    /// when dropped; drop it once the lock is released. Should that end the
+    /// first startup, how every server stands is kept as the startup
+    /// ([`Self::note_startup_end`]).
     fn apply_connection(
         &mut self,
         index: usize,
@@ -262,6 +293,7 @@ impl McpRegistryInner {
             }
         };
         self.index_tools();
+        self.note_startup_end();
         replaced
     }
 }
@@ -643,7 +675,9 @@ fn expand_prompt(result: GetPromptResult) -> McpPromptExpansion {
 }
 
 impl McpRegistry {
-    fn from_inner(inner: McpRegistryInner) -> Self {
+    fn from_inner(mut inner: McpRegistryInner) -> Self {
+        // With no server to start, the startup is over before it begins.
+        inner.note_startup_end();
         Self {
             shared: Arc::new(McpRegistryShared {
                 inner: RwLock::new(inner),
@@ -773,10 +807,19 @@ impl McpRegistry {
     /// Whether a server is [`McpServerState::Starting`]: still making its
     /// first connection, or a stdio server being reconnected.
     pub fn is_starting(&self) -> bool {
-        self.read()
-            .servers
-            .iter()
-            .any(|server| server.state == McpServerState::Starting)
+        self.read().is_starting()
+    }
+
+    /// How every server stood when the first startup ended, as
+    /// [`Self::server_statuses`] lists them: the first time none was
+    /// [`McpServerState::Starting`], each having connected, failed or needed
+    /// a login, or at once for a registry with no server to start. `None`
+    /// until then. It stays as it was taken: a server reconnected, logged in
+    /// or failing since changes nothing in it. So a registry handed to
+    /// another holder after its startup tells that holder how the startup
+    /// ended, not how the servers stand at the hand-over.
+    pub fn startup_statuses(&self) -> Option<Vec<McpServerStatus>> {
+        self.read().startup.clone()
     }
 
     /// Waits until no server is [`McpServerState::Starting`], each having
@@ -821,6 +864,8 @@ impl McpRegistry {
                 server.prompts_error = None;
             }
             inner.index_tools();
+            // None is starting any more: the startup is over, if it was not.
+            inner.note_startup_end();
             let stops = inner
                 .servers
                 .iter()
@@ -992,6 +1037,8 @@ impl McpRegistry {
             server.errors.clear();
         }
         inner.errors = errors;
+        // The copy's startup is how its servers stand now.
+        inner.startup = None;
         Self::from_inner(inner)
     }
 

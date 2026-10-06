@@ -3101,6 +3101,120 @@ fn startup_returns_before_servers_connect() {
 
 #[cfg(unix)]
 #[test]
+fn the_startup_statuses_come_once_the_first_startup_ends() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let config = listing_server_config("slow", temp_dir.path(), "[]");
+    delay_starts(temp_dir.path(), "slow", 1);
+    let registry = initialize_registry(&[config], None);
+
+    // The server is still connecting: startup has not ended.
+    assert!(registry.is_starting());
+    assert_eq!(registry.startup_statuses(), None);
+
+    assert!(registry.wait_for_startup(&|| false));
+    // Startup ended, and the statuses were kept in the same step that
+    // ended it: none is starting, so they are there.
+    assert_eq!(
+        registry.startup_statuses(),
+        Some(vec![status("slow", McpServerState::Ready)])
+    );
+}
+
+#[test]
+fn a_registry_with_no_server_to_start_has_started() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    assert_eq!(
+        initialize_registry(&[], None).startup_statuses(),
+        Some(Vec::new())
+    );
+    assert_eq!(McpRegistry::default().startup_statuses(), Some(Vec::new()));
+
+    let mut disabled = missing_server_config("off", temp_dir.path());
+    disabled.disabled = true;
+    let registry = initialize_registry(&[disabled], None);
+
+    assert!(!registry.is_starting());
+    assert_eq!(
+        registry.startup_statuses(),
+        Some(vec![status("off", McpServerState::Disabled)])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_startup_statuses_stay_as_startup_left_them_when_a_reconnect_fails() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    // Its first start serves, and the next one exits at once.
+    let (config, _, _) = restarting_server_config(temp_dir.path(), None);
+    let registry = connected_registry(&[config], None);
+    let at_startup = vec![status("slow", McpServerState::Ready)];
+    assert_eq!(registry.server_statuses(), at_startup);
+    assert_eq!(registry.startup_statuses(), Some(at_startup.clone()));
+
+    let error = registry
+        .reconnect_server("slow")
+        .expect_err("the server cannot start again");
+
+    assert_eq!(registry.server_statuses(), [failed("slow", &error)]);
+    assert_eq!(registry.startup_statuses(), Some(at_startup));
+}
+
+#[test]
+fn the_startup_statuses_stay_as_startup_left_them_when_a_login_follows() {
+    use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
+
+    let server = OAuthTestServer::start(OAuthTestBehavior {
+        accepted_tokens: vec!["at-stored".to_string()],
+        ..Default::default()
+    });
+    let home = tempfile::tempdir().expect("temp dir");
+    let credentials = home.path().join("mcp-credentials.json");
+    let registry = connected_registry(&[server.config("docs")], Some(credentials.clone()));
+    let at_startup = vec![McpServerStatus {
+        errors: vec![LOGIN_REQUIRED.to_string()],
+        ..status("docs", McpServerState::NeedsLogin)
+    }];
+    assert_eq!(registry.startup_statuses(), Some(at_startup.clone()));
+
+    // The user logs in, and the server is reconnected: it is ready.
+    store_login(&credentials, &server, "at-stored");
+    registry
+        .reconnect_server("docs")
+        .expect("reconnect after logging in");
+
+    assert_eq!(
+        registry.server_statuses(),
+        [status("docs", McpServerState::Ready)]
+    );
+    assert_eq!(registry.startup_statuses(), Some(at_startup));
+}
+
+#[cfg(unix)]
+#[test]
+fn closing_a_registry_ends_its_startup() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let config = listing_server_config("slow", temp_dir.path(), "[]");
+    delay_starts(temp_dir.path(), "slow", 30);
+    let registry = initialize_registry(&[config], None);
+    assert_eq!(registry.startup_statuses(), None);
+
+    registry.close();
+
+    // No server is starting, so the startup is over, as it ended.
+    assert!(!registry.is_starting());
+    assert_eq!(
+        registry.startup_statuses(),
+        Some(vec![status(
+            "slow",
+            McpServerState::Failed {
+                message: "MCP server 'slow' was stopped".to_string(),
+            },
+        )])
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn servers_connect_in_parallel() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let configs = ["one", "two"].map(|name| {

@@ -12,9 +12,18 @@ use orca_mcp::{McpChangeSubscription, McpRegistry, McpServerState};
 /// that started left out. A failure that does not name its server, as "MCP
 /// server closed stdout" does not, is prefixed with the server's name; the
 /// login a server needs names it in the `orca mcp login` it asks for.
+///
+/// The servers are read as they stood when their startup ended
+/// ([`McpRegistry::startup_statuses`]), however long ago, not as they stand:
+/// a reconnect that failed since was told to whoever asked for it, in the
+/// words of `/mcp`, and is no failure of startup. Called before the startup
+/// has ended, it reads them as they stand.
 pub fn mcp_startup_warnings(registry: &McpRegistry) -> Vec<String> {
     let mut warnings = registry.config_errors();
-    for server in registry.server_statuses() {
+    let statuses = registry
+        .startup_statuses()
+        .unwrap_or_else(|| registry.server_statuses());
+    for server in statuses {
         match server.state {
             McpServerState::Failed { message } => {
                 let named = message.contains(&format!("'{}'", server.name));
@@ -37,7 +46,10 @@ type WarningsReport = Box<dyn FnOnce(Vec<String>) + Send>;
 /// The warnings a session's MCP servers leave once their startup has ended
 /// ([`mcp_startup_warnings`]), taken once, when it ends: what happens to
 /// the servers since, such as a reconnect that fails, does not change them.
-/// So a surface that shows the thread again hears the same ones.
+/// So a surface that shows the thread again hears the same ones, and so
+/// does a thread lent servers that started before it, whose startup may
+/// have ended already: it hears how that ended, not how they stand when it
+/// is lent them.
 pub(crate) struct McpStartupWarnings {
     state: Mutex<StartupState>,
 }
@@ -142,7 +154,8 @@ impl McpStartupWarnings {
 
     /// The warnings, for a caller that has waited for `registry`'s startup
     /// to end: those taken when it ended, or, should a server have started
-    /// connecting again before they were, the registry's now.
+    /// connecting again before they were, those of its startup all the same
+    /// ([`mcp_startup_warnings`]).
     pub(crate) fn after_startup(&self, registry: &McpRegistry) -> Vec<String> {
         self.observe(registry);
         match &*self.lock() {
@@ -234,5 +247,67 @@ done
             ),
             "{warnings:?}"
         );
+    }
+
+    /// A stdio server that serves its first start, and exits at once from
+    /// every start after it, as one does that cannot start again.
+    fn server_that_cannot_start_again(name: &str, dir: &std::path::Path) -> McpServerConfig {
+        stdio_server(
+            name,
+            dir,
+            r#"#!/bin/sh
+if [ -e "$0.ran" ]; then
+  read -r line
+  exit 0
+fi
+: > "$0.ran"
+while IFS= read -r line; do
+  id=${line#*'"id":'}
+  id=${id%%,*}
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"docs","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"search","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )
+    }
+
+    #[test]
+    fn warnings_after_a_hand_off_leave_out_a_failure_already_reported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let registry = orca_mcp::initialize_registry(
+            &[server_that_cannot_start_again("docs", dir.path())],
+            None,
+        );
+        assert!(registry.wait_for_startup(&|| false));
+        assert_eq!(mcp_startup_warnings(&registry), Vec::<String>::new());
+
+        // A reconnect after startup fails. Whoever asked for it was told
+        // so, in the words of `/mcp`.
+        assert!(registry.reconnect_server("docs").is_err());
+        assert!(
+            matches!(
+                registry.server_statuses().as_slice(),
+                [docs] if matches!(docs.state, McpServerState::Failed { .. })
+            ),
+            "{:?}",
+            registry.server_statuses()
+        );
+
+        // The registry is handed to a thread, which watches it from then
+        // on: what its startup left was nothing.
+        let watch = McpStartupWarnings::watch(&registry);
+        let (reported, warnings) = std::sync::mpsc::channel();
+        watch.on_ended(&registry, move |warnings| {
+            let _ = reported.send(warnings);
+        });
+
+        assert_eq!(warnings.try_recv(), Ok(Vec::<String>::new()));
+        assert_eq!(watch.after_startup(&registry), Vec::<String>::new());
     }
 }

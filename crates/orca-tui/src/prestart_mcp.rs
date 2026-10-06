@@ -101,9 +101,10 @@ impl PrestartReport {
             .send(TuiEvent::McpCatalogPrestart(McpCatalogView::from_registry(
                 registry,
             )));
-        // Once none is starting, what their startup left is said, in the
-        // words of the thread that takes them, which says it again when it
-        // is ready: the conversation shows each warning once.
+        // Once none is starting, what their startup left is said. The
+        // thread that takes them says it again when it is ready, in the
+        // same words, as it reads the same startup: the conversation shows
+        // each warning once.
         if !*startup_reported && !registry.is_starting() {
             *startup_reported = true;
             for warning in orca_runtime::mcp_startup_warnings(registry) {
@@ -732,6 +733,75 @@ mod tests {
             wait_until_gone(&pids, Duration::from_secs(5));
         }
 
+        #[test]
+        fn a_failed_thread_start_keeps_the_prestarted_servers_and_starts_each_once() {
+            use crate::protocol::UserAction;
+
+            let home = crate::test_support::isolate_orca_home();
+            let fixture = tempfile::tempdir().unwrap();
+            let mut tui = Tui::start(config(
+                home.path(),
+                vec![mcp_server("docs", fixture.path(), 0)],
+            ));
+            tui.until("the server to connect", |state| connected(state, "docs"));
+            let prestarted = tui
+                .control()
+                .prestart_mcp_registry()
+                .expect("the servers that started");
+
+            // From the session picker, before any message, for a
+            // conversation that is not there: no thread starts.
+            tui.state
+                .event_tx
+                .send(UserAction::ResumeSavedSession {
+                    session_id: "00000000-0000-4000-8000-000000000000".to_string(),
+                })
+                .expect("the controller runs");
+            tui.until_event("the resume to be turned down", |event| {
+                matches!(event, TuiEvent::OperationRejected(_))
+            });
+
+            // The servers are still the TUI's, still connected, and started
+            // once.
+            assert!(tui.control().runtime_thread().is_none());
+            assert!(
+                tui.control()
+                    .prestart_mcp_registry()
+                    .is_some_and(|registry| registry.is_same(&prestarted)),
+                "the failed start took the servers"
+            );
+            let pids = launches(fixture.path());
+            assert_eq!(pids.len(), 1, "{pids:?}");
+            assert!(alive(&pids[0]), "the failed start stopped the server");
+
+            // The first message starts the conversation's thread, which
+            // takes them as they are.
+            tui.send("hello");
+            tui.until_event("the first turn to end", |event| {
+                matches!(event, TuiEvent::SessionCompleted { .. })
+            });
+            let thread = tui
+                .control()
+                .runtime_thread()
+                .expect("the message started a thread");
+            assert!(thread.mcp_registry().is_same(&prestarted));
+            tui.thread_catalog(thread_lists_docs_connected);
+            assert!(tui.control().prestart_mcp_registry().is_none());
+            assert_eq!(
+                thread
+                    .mcp_registry()
+                    .server_statuses()
+                    .into_iter()
+                    .map(|status| (status.name, status.state))
+                    .collect::<Vec<_>>(),
+                [("docs".to_string(), orca_mcp::McpServerState::Ready)]
+            );
+            assert_eq!(launches(fixture.path()), pids, "the server started again");
+            drop(thread);
+            tui.quit();
+            wait_until_gone(&pids, Duration::from_secs(5));
+        }
+
         /// The session id of a conversation an earlier `orca`, with no MCP
         /// server, saved in `home`.
         fn a_saved_conversation(home: &std::path::Path) -> String {
@@ -880,6 +950,57 @@ mod tests {
             );
             assert_eq!(tui.state.status, AppStatus::Idle);
             let pids = launches(fixture.path());
+            tui.quit();
+            wait_until_gone(&pids, Duration::from_secs(5));
+        }
+
+        #[test]
+        fn a_reconnect_that_failed_before_the_first_message_is_no_startup_warning() {
+            let home = crate::test_support::isolate_orca_home();
+            let fixture = tempfile::tempdir().unwrap();
+            let mut tui = Tui::start(config(
+                home.path(),
+                vec![mcp_server("docs", fixture.path(), 0)],
+            ));
+            tui.until("the server to connect", |state| connected(state, "docs"));
+
+            // `r` in `/mcp` while the server refuses to start again: the
+            // reconnect fails, and the conversation is told so, once.
+            std::fs::write(fixture.path().join("refuse"), "").expect("refuse the next start");
+            tui.command("/mcp");
+            tui.press('r');
+            assert!(tui.state.mcp_actions_in_flight.contains_key("docs"));
+            tui.until("the reconnect to end", |state| {
+                state.mcp_actions_in_flight.is_empty()
+            });
+            let failure_notices = |state: &crate::types::AppState| {
+                notices(state)
+                    .iter()
+                    .filter(|notice| notice.starts_with("MCP server docs: failed"))
+                    .count()
+            };
+            assert_eq!(failure_notices(&tui.state), 1, "{:?}", notices(&tui.state));
+
+            // The first message starts the thread, which takes the servers.
+            // Startup ended before the reconnect, with nothing to report, so
+            // the thread has no startup warning for them either.
+            let startup_warnings = std::cell::Cell::new(0);
+            tui.send("hello");
+            tui.until_event("the first turn to end", |event| {
+                if matches!(event, TuiEvent::StartupWarning(warning) if warning.contains("docs")) {
+                    startup_warnings.set(startup_warnings.get() + 1);
+                }
+                matches!(event, TuiEvent::SessionCompleted { .. })
+            });
+            assert_eq!(
+                startup_warnings.get(),
+                0,
+                "the failed reconnect was said again: {:?}",
+                notices(&tui.state)
+            );
+            assert_eq!(failure_notices(&tui.state), 1, "{:?}", notices(&tui.state));
+            let pids = launches(fixture.path());
+            assert_eq!(pids.len(), 2, "{pids:?}");
             tui.quit();
             wait_until_gone(&pids, Duration::from_secs(5));
         }
