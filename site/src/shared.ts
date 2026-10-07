@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.6";
+export const releaseVersion = "v0.5.7";
 
 export const releases = [
+  {
+    version: "v0.5.7",
+    date: "2026-10-07",
+    title: "Clean stops on signals, held messages on resume",
+    body: "orca exec and the TUI now stop cleanly on SIGINT, SIGTERM and SIGHUP: they stop MCP servers, record how the session ended and exit with 128 + the signal, and copies of one stop request count once. On Windows, Ctrl+C through the npm launcher reaches orca.exe. Messages typed before a resumed conversation loads are held and sent after the command-line prompt. Esc cancels MCP calls stuck behind a reconnect or a busy stream, stdio servers get ping answers while idle, a cut-short resource list says so, and orca mcp add and remove keep comments in inline arrays.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.7",
+  },
   {
     version: "v0.5.6",
     date: "2026-10-05",

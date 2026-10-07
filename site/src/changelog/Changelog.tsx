@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.7":
+        "orca exec and the TUI now stop cleanly on SIGINT, SIGTERM and SIGHUP: they stop running work and MCP servers, those still connecting too, record how the session ended and exit with 128 + the signal, and copies of one stop request that arrive within half a second count once. On Windows, Ctrl+C through the npm launcher now reaches orca.exe instead of terminating it. A message typed before a conversation resumed at launch has loaded is held and sent after the command-line prompt, in order. For MCP, Esc cancels a call waiting on a reconnecting server or a streamed call that keeps sending, stdio servers get answers to ping while idle, a cut-short resource list says so, a login can be cancelled before the browser opens, and a failure shows at once and only once. orca mcp add and remove keep each entry's comments in multi-line inline arrays, ORCA_HOME now also covers the input history and saved workflows, and on Windows files under a deeply nested ORCA_HOME are written past the 260-character path limit.",
       "v0.5.6":
         "MCP servers are now managed from the command line with orca mcp add, list, get, remove, login and logout, for local stdio servers and remote ones alike. Remote servers use streamable HTTP as the MCP spec defines it, fall back to legacy HTTP+SSE, and sign in with OAuth or a bearer token taken from the environment. Servers connect in the background, all at once, as soon as the TUI opens: before your first message /mcp already shows each server's status, tools and prompts and can reconnect, log in or log out, and a turn waits only for the servers still connecting. Each MCP prompt is a slash command, tools a server marks read-only no longer ask in suggest mode, and the approval panel can always allow a tool or a whole server. deepseek-flash now sees the images MCP tools return. In a folder you have not reviewed, the workspace review now always comes first, for orca \"prompt\", --continue and --resume alike, and a config.toml that cannot be read or parsed is reported with a warning instead of dropped in silence.",
       "v0.5.5":
@@ -688,6 +690,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.7":
+        "orca exec 和 TUI 收到 SIGINT、SIGTERM、SIGHUP 时现在都会正常收尾：停止正在运行的工作和 MCP 服务器（包括还在连接的），记下会话如何结束，并以 128 + 信号编号退出；半秒内重复送达的同一个停止请求只算一次。在 Windows 上，通过 npm 启动器按 Ctrl+C 不再直接终止 orca.exe。恢复会话的历史加载完之前输入的消息会先暂存，等命令行提示词发出后再按顺序发送。MCP 方面：Esc 可以取消排在重连后面的调用和持续输出的流式调用；stdio 服务器空闲时也会应答 ping；资源列表被截断时会说明；登录在浏览器打开之前也能取消；失败会立即显示，并且只报告一次。orca mcp add 和 remove 修改多行内联数组时，注释跟着各自的条目走；ORCA_HOME 现在也决定输入历史和保存的工作流放在哪里；在 Windows 上，ORCA_HOME 嵌套很深时，超过 260 个字符的路径也能正常写入。",
       "v0.5.6":
         "MCP 服务器现在可以在命令行管理：orca mcp add、list、get、remove、login 和 logout，本地 stdio 服务器和远程服务器都支持。远程服务器按 MCP 规范使用 streamable HTTP，必要时回退到旧版 HTTP+SSE，可以用 OAuth 登录，也可以用环境变量里的 bearer token。TUI 一打开，所有服务器就在后台同时连接：发出第一条消息之前，/mcp 就能显示每个服务器的状态、工具和 prompts，也能重新连接、登录和退出登录；一轮只等还在连接的服务器。每个 MCP prompt 都是一条斜杠命令；服务器标为只读的工具在 suggest 模式下不再询问；审批面板可以总是允许某个工具或整个服务器。deepseek-flash 现在能看到 MCP 工具返回的图片。在没有确认过的目录里，无论是 orca \"提示词\"、--continue 还是 --resume，都会先等你确认工作区；读不了或解析不了的 config.toml 会给出警告，不再悄悄忽略。",
       "v0.5.5":

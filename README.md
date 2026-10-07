@@ -245,6 +245,11 @@ More detail:
   status.
 - Cancelling a foreground turn also stops the subagent task tree it owns;
   unrelated detached work is left alone.
+- SIGINT, SIGTERM, and SIGHUP stop a run like an ordinary exit, in
+  `orca exec` from the moment it starts and in the TUI: running work and MCP
+  servers are stopped, the session records how it ended, and the exit code is
+  128 + the signal. Copies of one stop request that arrive together count
+  once.
 - Escape-driven cancellation commits one terminal child state and ignores late
   activity from the cancelled attempt, so a stopped subagent cannot flood the
   terminal while its parent returns to an interactive prompt.
