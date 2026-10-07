@@ -1976,7 +1976,13 @@ mod tests {
         assert_eq!(started.status, "running", "{started:?}");
 
         drop(service);
-        thread::sleep(Duration::from_millis(900));
+        // The command writes its marker half a second in, once its shell has
+        // started, which can take more than a second for PowerShell on a busy
+        // Windows runner. A command the shutdown killed never writes it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
         assert!(
             marker.exists(),
             "workspace-owned command was killed by service shutdown"
