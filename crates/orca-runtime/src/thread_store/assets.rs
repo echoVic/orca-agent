@@ -96,10 +96,13 @@ fn put_blob(root: &Path, asset: &ImageAsset, bytes: &[u8]) -> io::Result<()> {
     }
     // No-replace publication also supports nested transcript rewrites on
     // Windows, whose general atomic replacement helper holds a process lock.
-    let mut temporary = tempfile::NamedTempFile::new_in(root)?;
+    // tempfile publishes with `MoveFileExW`, which takes a long path only in
+    // its extended-length form.
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(orca_platform::fs::extended_length_path(root))?;
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
-    match temporary.persist_noclobber(&target) {
+    match temporary.persist_noclobber(orca_platform::fs::extended_length_path(&target)) {
         Ok(_) => {}
         Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
             read_blob(root, asset)?;

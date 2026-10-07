@@ -354,8 +354,14 @@ mod platform {
         Ok(())
     }
 
+    /// `MoveFileExW` and `ReplaceFileW` take a long path only in its
+    /// extended-length form.
     fn wide_path(path: &Path) -> Vec<u16> {
-        path.as_os_str().encode_wide().chain(Some(0)).collect()
+        crate::fs::extended_length_path(path)
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect()
     }
 
     fn retryable_replace_error(code: i32, destination_existed: bool) -> bool {

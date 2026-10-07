@@ -848,7 +848,9 @@ fn append_note_with_cancel_before_write(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut file = NamedTempFile::new_in(parent)
+    // tempfile publishes with `MoveFileExW`, which takes a long path only in
+    // its extended-length form.
+    let mut file = NamedTempFile::new_in(orca_platform::fs::extended_length_path(parent))
         .map_err(|error| format!("failed to stage memory file: {error}"))?;
     if cancel.is_cancelled() {
         return Ok(false);
@@ -861,7 +863,7 @@ fn append_note_with_cancel_before_write(
         return Ok(false);
     }
     let persisted = file
-        .persist(path)
+        .persist(orca_platform::fs::extended_length_path(path))
         .map_err(|error| format!("failed to publish memory file: {error}"))?;
     if cancel.is_cancelled() {
         drop(persisted);
