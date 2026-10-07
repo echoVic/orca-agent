@@ -4,13 +4,18 @@ import { spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-
-import { signalDispositions } from "./signals.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
+
+// Run through npm's `.bin` link with `node --preserve-symlinks-main`, as the
+// release smoke runs it, this module's own URL is the link's: a module beside
+// it is found from the real file's directory, not the link's.
+const { signalDispositions } = await import(
+  pathToFileURL(path.join(path.dirname(realpathSync(__filename)), "signals.js")).href
+);
 
 const TARGETS = {
   "darwin:arm64": {

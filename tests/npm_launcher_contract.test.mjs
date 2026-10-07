@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -27,13 +27,12 @@ test("on Windows the launcher leaves Ctrl+C to the binary and still passes SIGTE
   assert.deepEqual(signalDispositions("win32"), { SIGINT: "ignore", SIGTERM: "forward" });
 });
 
-test("the published package carries every module the launcher imports", () => {
-  const launcher = readFileSync(path.join(packageRoot, "bin", "orca.js"), "utf8");
+test("the published package carries every file of the launcher", () => {
   const files = JSON.parse(readFileSync(path.join(packageRoot, "package.json"), "utf8")).files;
-  const imported = [...launcher.matchAll(/from "\.\/([^"]+)"/g)].map(([, file]) => `bin/${file}`);
+  const launcherFiles = readdirSync(path.join(packageRoot, "bin")).map((file) => `bin/${file}`);
 
-  assert.ok(imported.length > 0, "the launcher imports no module of its own");
-  for (const file of imported) {
+  assert.ok(launcherFiles.includes("bin/signals.js"), "the launcher's signal module is gone");
+  for (const file of launcherFiles) {
     assert.ok(files.includes(file), `package.json "files" leaves out ${file}`);
   }
 });
@@ -101,6 +100,91 @@ test(
       assert.deepEqual({ code, signal }, { code: 130, signal: null });
     } finally {
       rmSync(installed, { recursive: true, force: true });
+    }
+  },
+);
+
+// The release smoke runs the launcher the way npm installs it: through the
+// `.bin` link, with `node --preserve-symlinks-main`, so the launcher's own URL
+// is the link's and not its real file's. A module beside the launcher must
+// still load, and the platform package must still be found.
+test(
+  "run through npm's .bin link with --preserve-symlinks-main, the launcher still starts the binary",
+  { skip: process.platform === "win32" },
+  async () => {
+    const platformPackages = {
+      "darwin:arm64": ["@blade-ai/orca-darwin-arm64", "aarch64-apple-darwin"],
+      "darwin:x64": ["@blade-ai/orca-darwin-x64", "x86_64-apple-darwin"],
+      "linux:arm64": ["@blade-ai/orca-linux-arm64", "aarch64-unknown-linux-gnu"],
+      "linux:x64": ["@blade-ai/orca-linux-x64", "x86_64-unknown-linux-gnu"],
+    };
+    const [platformPackage, triple] = platformPackages[`${process.platform}:${process.arch}`];
+    const project = mkdtempSync(path.join(os.tmpdir(), "orca-launcher-link-test-"));
+    try {
+      const modules = path.join(project, "node_modules");
+      const main = path.join(modules, "@blade-ai", "orca");
+      cpSync(path.join(packageRoot, "bin"), path.join(main, "bin"), { recursive: true });
+      cpSync(path.join(packageRoot, "package.json"), path.join(main, "package.json"));
+      const platform = path.join(modules, ...platformPackage.split("/"));
+      mkdirSync(platform, { recursive: true });
+      writeFileSync(
+        path.join(platform, "package.json"),
+        JSON.stringify({ name: platformPackage, version: "0.0.0" }),
+      );
+      const binary = path.join(platform, "vendor", triple, "bin", "orca");
+      mkdirSync(path.dirname(binary), { recursive: true });
+      writeFileSync(
+        binary,
+        [
+          "#!/bin/sh",
+          "trap 'echo got SIGINT; exit 130' INT",
+          "echo ready",
+          "i=0",
+          'while [ "$i" -lt 400 ]; do sleep 0.05; i=$((i + 1)); done',
+          "exit 99",
+          "",
+        ].join("\n"),
+      );
+      chmodSync(binary, 0o755);
+      const link = path.join(modules, ".bin", "orca");
+      mkdirSync(path.dirname(link), { recursive: true });
+      symlinkSync(path.join("..", "@blade-ai", "orca", "bin", "orca.js"), link);
+
+      const launcher = spawn(process.execPath, ["--preserve-symlinks-main", link], {
+        cwd: project,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      let errors = "";
+      launcher.stderr.on("data", (chunk) => {
+        errors += chunk;
+      });
+      const exited = new Promise((resolve) => launcher.on("close", (code, signal) => resolve({ code, signal })));
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`the binary never started: ${output}${errors}`)), 10_000);
+        launcher.on("exit", (code) => {
+          clearTimeout(timer);
+          reject(new Error(`the launcher exited with ${code} before the binary started: ${errors}`));
+        });
+        launcher.stdout.on("data", (chunk) => {
+          output += chunk;
+          if (output.includes("ready")) {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+      }).catch((error) => {
+        launcher.kill("SIGKILL");
+        throw error;
+      });
+
+      launcher.kill("SIGINT");
+      const { code, signal } = await exited;
+
+      assert.match(output, /got SIGINT/);
+      assert.deepEqual({ code, signal }, { code: 130, signal: null });
+    } finally {
+      rmSync(project, { recursive: true, force: true });
     }
   },
 );
