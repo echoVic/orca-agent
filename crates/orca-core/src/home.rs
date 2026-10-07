@@ -8,7 +8,7 @@
 //!
 //! Test builds never touch the real `~/.orca`. When no override and no
 //! `ORCA_HOME` names a home, [`orca_home`] returns a temporary directory that
-//! is private to the process; these live in `<temp dir>/orca-test-homes`, so
+//! is private to the process; these live in `<temp dir>/orca-th`, so
 //! one `rm -rf` clears what test runs leave behind, and each process that
 //! creates one there removes those last changed more than a day ago. A test
 //! build is this crate's own `cfg(test)`, or any build that enables the
@@ -134,7 +134,7 @@ fn adopt_process_temp_home() -> PathBuf {
 }
 
 /// The temporary home every test build in this process falls back to. It is
-/// created on first use, inside `<temp dir>/orca-test-homes`, and this process
+/// created on first use, inside `<temp dir>/orca-th`, and this process
 /// never removes it: a detached child may still be writing to it when this one
 /// exits. Instead, the first use in each process removes the homes there that
 /// were last changed more than a day ago (see `prune_stale_test_homes`).
@@ -148,7 +148,7 @@ pub fn process_temp_home() -> &'static std::path::Path {
     HOME.get_or_init(|| {
         let mut builder = tempfile::Builder::new();
         builder.prefix(TEST_HOME_PREFIX);
-        let group = std::env::temp_dir().join("orca-test-homes");
+        let group = std::env::temp_dir().join(TEST_HOME_GROUP);
         std::fs::create_dir_all(&group)
             .and_then(|()| builder.tempdir_in(&group))
             .inspect(|_| prune_stale_test_homes(&group))
@@ -161,9 +161,20 @@ pub fn process_temp_home() -> &'static std::path::Path {
     .path()
 }
 
+/// The directory, inside the temp dir, that holds every temporary home.
+///
+/// It and [`TEST_HOME_PREFIX`] are short on purpose. A session's image asset
+/// sits about 190 characters below the home it is written in, and on Windows
+/// tempfile publishes a file with `MoveFileExW`, which takes no
+/// extended-length path and fails past `MAX_PATH` (260): with the GitHub
+/// runner's 36-character temp dir, a longer group and prefix pushed the asset
+/// tests' paths over it.
+#[cfg(any(test, feature = "test-utils"))]
+const TEST_HOME_GROUP: &str = "orca-th";
+
 /// What each temporary home's name starts with.
 #[cfg(any(test, feature = "test-utils"))]
-const TEST_HOME_PREFIX: &str = "orca-test-home-";
+const TEST_HOME_PREFIX: &str = "h-";
 
 /// How long ago a temporary home must have last changed for another process
 /// to remove it: far longer than any test run, and than any child it leaves
@@ -172,7 +183,7 @@ const TEST_HOME_PREFIX: &str = "orca-test-home-";
 const STALE_TEST_HOME_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Removes from `group` the temporary homes that earlier test processes left
-/// there: each real directory named `orca-test-home-*` last changed more than
+/// there: each real directory named `h-*` last changed more than
 /// [`STALE_TEST_HOME_AGE`] ago. Nothing else in `group` is touched, a link or
 /// a file of that name included, and no link is ever followed. Every error is
 /// ignored: what cannot be read or removed stays, and the tests go on.
@@ -371,7 +382,7 @@ mod tests {
 
     #[test]
     fn orca_home_groups_the_process_temp_homes_in_one_directory() {
-        let group = std::env::temp_dir().join("orca-test-homes");
+        let group = std::env::temp_dir().join(TEST_HOME_GROUP);
 
         assert_eq!(
             process_temp_home().parent(),
@@ -379,6 +390,28 @@ mod tests {
             "{} is not inside {}",
             process_temp_home().display(),
             group.display()
+        );
+    }
+
+    /// The temporary home adds at most 17 characters to the temp dir's path:
+    /// `orca-th`, a separator, `h-` and tempfile's six random characters, and
+    /// a separator the temp dir may lack. On the GitHub Windows runner that
+    /// keeps the asset tests' longest path near 245 characters, under
+    /// `MAX_PATH` (see [`TEST_HOME_GROUP`]); a longer group or prefix broke
+    /// them.
+    #[test]
+    fn the_process_temp_home_keeps_its_path_short() {
+        let temp_dir = std::env::temp_dir();
+        let added = process_temp_home()
+            .as_os_str()
+            .len()
+            .saturating_sub(temp_dir.as_os_str().len());
+        let budget = 17;
+        assert!(
+            added <= budget,
+            "{} adds {added} characters to {}, more than {budget}",
+            process_temp_home().display(),
+            temp_dir.display()
         );
     }
 
@@ -416,13 +449,13 @@ mod tests {
     fn pruning_removes_only_the_test_homes_left_more_than_a_day_ago() {
         let group = tempfile::tempdir().expect("a scratch group");
         let entry = |name: &str| group.path().join(name);
-        let stale = entry("orca-test-home-stale");
-        let recent = entry("orca-test-home-recent");
-        let fresh = entry("orca-test-home-fresh");
+        let stale = entry(&format!("{TEST_HOME_PREFIX}stale"));
+        let recent = entry(&format!("{TEST_HOME_PREFIX}recent"));
+        let fresh = entry(&format!("{TEST_HOME_PREFIX}fresh"));
         let unrelated = entry("unrelated-stale");
-        let file = entry("orca-test-home-file");
+        let file = entry(&format!("{TEST_HOME_PREFIX}file"));
         let target = entry("linked-stale");
-        let link = entry("orca-test-home-link");
+        let link = entry(&format!("{TEST_HOME_PREFIX}link"));
         for directory in [&stale, &recent, &fresh, &unrelated, &target] {
             std::fs::create_dir(directory).expect("a directory");
             std::fs::write(directory.join("content"), b"").expect("its content");
@@ -471,8 +504,8 @@ mod tests {
             return;
         }
         let temp = tempfile::tempdir().expect("a scratch temp dir");
-        let group = temp.path().join("orca-test-homes");
-        let stale = group.join("orca-test-home-stale");
+        let group = temp.path().join(TEST_HOME_GROUP);
+        let stale = group.join(format!("{TEST_HOME_PREFIX}stale"));
         std::fs::create_dir_all(&stale).expect("a stale test home");
         last_changed(&stale, 25 * HOURS);
 
