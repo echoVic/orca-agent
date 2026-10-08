@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.8":
+        "A shell command that outlives its bash call no longer reads still running for good: its row shows how the command ended, with its exit code, timed out or stopped, as soon as it ends, also while Orca is idle and nothing reads it, and a resumed conversation shows the ends of commands that finished before Orca exited. Only the label changes, and shell commands stay out of the task dock. HTTPS certificates are now checked against the operating system's trust store instead of roots compiled into Orca, so a company proxy's CA installed in the system store works with no Orca setting; a minimal Linux system needs the ca-certificates package, and on Linux SSL_CERT_FILE and SSL_CERT_DIR point Orca at a CA bundle. HTTP requests look up IPv6 and IPv4 addresses and try IPv6 first. Configuration files may use TOML 1.1 syntax, which v0.5.7 cannot read. In the input box, moving or deleting by word keeps underscores inside the word, Up/Down keep the screen column and never stop inside a character, and newer emoji take two columns. Dependencies move to their current releases, among them ratatui 0.30, crossterm 0.29, reqwest 0.13, toml 1.1 and rusqlite 0.40 with SQLite 3.53.2, and the Skills & Plugins documentation page renders again.",
       "v0.5.7":
         "orca exec and the TUI now stop cleanly on SIGINT, SIGTERM and SIGHUP: they stop running work and MCP servers, those still connecting too, record how the session ended and exit with 128 + the signal, and copies of one stop request that arrive within half a second count once. On Windows, Ctrl+C through the npm launcher now reaches orca.exe instead of terminating it. A message typed before a conversation resumed at launch has loaded is held and sent after the command-line prompt, in order. For MCP, Esc cancels a call waiting on a reconnecting server or a streamed call that keeps sending, stdio servers get answers to ping while idle, a cut-short resource list says so, a login can be cancelled before the browser opens, and a failure shows at once and only once. orca mcp add and remove keep each entry's comments in multi-line inline arrays, ORCA_HOME now also covers the input history and saved workflows, and on Windows files under a deeply nested ORCA_HOME are written past the 260-character path limit.",
       "v0.5.6":
@@ -690,6 +692,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.8":
+        "bash 调用返回后仍在后台运行的命令，那一行不再一直显示 still running：命令一结束，就显示它怎样结束的，例如退出码、超时或被停止；Orca 空闲、没人读取它时也一样，恢复会话后，Orca 退出前已经结束的命令也会显示结果。只改标签，shell 命令不会出现在任务面板里。HTTPS 证书改用操作系统的证书库验证，不再用编译进 Orca 的根证书，公司代理的 CA 装进系统证书库即可使用；精简版 Linux 需要先安装 ca-certificates，在 Linux 上也可以用 SSL_CERT_FILE 和 SSL_CERT_DIR 指定 CA 证书包。HTTP 请求同时查询 IPv6 和 IPv4 地址，优先尝试 IPv6。配置文件可以使用 TOML 1.1 写法，v0.5.7 读不了这样的文件。输入框里按单词移动或删除时，下划线算单词的一部分；上下移动保持屏幕上的列，光标不会停在一个字符中间；较新的 emoji 占两列。依赖升级到当前版本，包括 ratatui 0.30、crossterm 0.29、reqwest 0.13、toml 1.1 和 rusqlite 0.40（SQLite 3.53.2）；文档里的 Skills & Plugins 页面也恢复正常。",
       "v0.5.7":
         "orca exec 和 TUI 收到 SIGINT、SIGTERM、SIGHUP 时现在都会正常收尾：停止正在运行的工作和 MCP 服务器（包括还在连接的），记下会话如何结束，并以 128 + 信号编号退出；半秒内重复送达的同一个停止请求只算一次。在 Windows 上，通过 npm 启动器按 Ctrl+C 不再直接终止 orca.exe。恢复会话的历史加载完之前输入的消息会先暂存，等命令行提示词发出后再按顺序发送。MCP 方面：Esc 可以取消排在重连后面的调用和持续输出的流式调用；stdio 服务器空闲时也会应答 ping；资源列表被截断时会说明；登录在浏览器打开之前也能取消；失败会立即显示，并且只报告一次。orca mcp add 和 remove 修改多行内联数组时，注释跟着各自的条目走；ORCA_HOME 现在也决定输入历史和保存的工作流放在哪里；在 Windows 上，ORCA_HOME 嵌套很深时，超过 260 个字符的路径也能正常写入。",
       "v0.5.6":

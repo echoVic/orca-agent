@@ -37,6 +37,11 @@ irm https://orcaagent.dev/install.ps1 | iex
 npm 包支持 macOS、Linux 和 Windows 的 ARM64 与 x64 平台。也可以从
 [GitHub Releases](https://github.com/echoVic/orca-agent/releases/latest) 下载预编译文件。
 
+Orca 用操作系统的证书库验证 HTTPS 证书，公司代理的 CA 装进系统证书库即可使用。精简版
+Linux（例如 slim 容器镜像）需要先安装 `ca-certificates`：系统里没有任何 CA 证书时，
+Orca 发不出任何网络请求，普通 HTTP 也不行。`SSL_CERT_FILE` 和 `SSL_CERT_DIR` 的用法见
+[配置说明](https://orcaagent.dev/docs/#configuration)。
+
 Windows 上会优先使用 PowerShell 7；即使它不在 `PATH` 中，Orca 也会检查标准
 安装目录。未安装 PowerShell 7 时，受限会话回退到 `cmd.exe`。Windows
 PowerShell 5.1 仅适用于不需要 AppContainer 隔离的显式配置。协议中的命令数组

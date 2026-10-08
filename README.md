@@ -38,6 +38,13 @@ From a project directory, provision its restricted sandbox capability with:
 The npm package supports macOS, Linux, and Windows on ARM64 and x64. Prebuilt
 archives are also available from [GitHub Releases](https://github.com/echoVic/orca-agent/releases/latest).
 
+Orca checks HTTPS certificates against the operating system's trust store, so a
+company proxy's CA works once it is installed there. A minimal Linux system, such
+as a slim container image, needs the `ca-certificates` package: with no CA
+certificates at all, Orca cannot make any network request, plain HTTP included.
+[Configuration](https://orcaagent.dev/docs/#configuration) covers `SSL_CERT_FILE`
+and `SSL_CERT_DIR`.
+
 On Windows, Orca prefers PowerShell 7 and detects its standard installation
 path even when it is absent from `PATH`. Restricted sessions fall back to
 `cmd.exe` when PowerShell 7 is unavailable. Windows PowerShell 5.1 remains an

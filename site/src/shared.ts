@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.7";
+export const releaseVersion = "v0.5.8";
 
 export const releases = [
+  {
+    version: "v0.5.8",
+    date: "2026-10-09",
+    title: "Shell rows that follow their command, system certificates",
+    body: "A shell command that outlives its bash call no longer reads still running for good: its row shows how the command ended (exit code, timed out, stopped) once it ends, also while Orca is idle, and a resumed conversation keeps it. HTTPS certificates are checked against the operating system's trust store, so a company CA installed there works with no Orca setting; minimal Linux needs ca-certificates. Configuration files may use TOML 1.1, moving by word keeps underscores inside the word, and Up/Down keep the screen column. Dependencies move to ratatui 0.30, crossterm 0.29, reqwest 0.13, toml 1.1 and rusqlite 0.40 with SQLite 3.53.2.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.8",
+  },
   {
     version: "v0.5.7",
     date: "2026-10-07",
