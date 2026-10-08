@@ -23,7 +23,7 @@ export default defineConfig({
   ],
   base: "/",
   build: {
-    rollupOptions: {
+    rolldownOptions: {
       input: {
         main: resolve(root, "index.html"),
         changelog: resolve(root, "changelog/index.html"),
