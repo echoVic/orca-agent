@@ -272,6 +272,7 @@ pub fn check_latest(current_version: &str) -> Result<Option<UpdateInfo>, String>
 
 fn check_latest_npm(current_version: &str) -> Result<Option<UpdateInfo>, String> {
     let response = orca_mcp::http::blocking_client()
+        .map_err(|error| format!("npm registry check failed: {error}"))?
         .get(NPM_REGISTRY_URL)
         .header("User-Agent", "orca-update-check")
         .timeout(std::time::Duration::from_secs(5))
@@ -297,6 +298,7 @@ fn check_latest_npm(current_version: &str) -> Result<Option<UpdateInfo>, String>
 
 fn check_latest_github(current_version: &str) -> Result<Option<UpdateInfo>, String> {
     let response = orca_mcp::http::blocking_client()
+        .map_err(|error| format!("failed to check latest release: {error}"))?
         .get(RELEASES_URL)
         .header("User-Agent", "orca-update-check")
         .timeout(std::time::Duration::from_secs(5))

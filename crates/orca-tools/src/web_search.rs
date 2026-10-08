@@ -234,9 +234,12 @@ fn search_client() -> Result<reqwest::Client, SearchError> {
     let builder = orca_mcp::http::client_builder().timeout(SEARCH_TIMEOUT);
     #[cfg(test)]
     let builder = builder.no_proxy();
-    builder
-        .build()
-        .map_err(|error| SearchError::Failed(format!("failed to build web search client: {error}")))
+    builder.build().map_err(|error| {
+        SearchError::Failed(format!(
+            "failed to build web search client: {}",
+            orca_mcp::http::build_error(&error)
+        ))
+    })
 }
 
 async fn await_or_cancel<T>(

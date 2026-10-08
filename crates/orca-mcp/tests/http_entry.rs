@@ -10,6 +10,6 @@ fn a_fresh_process_builds_clients_through_the_entry() {
     orca_mcp::http::blocking_client_builder()
         .build()
         .expect("blocking client");
-    let _ = orca_mcp::http::client();
-    let _ = orca_mcp::http::blocking_client();
+    orca_mcp::http::client().expect("async client from the entry");
+    orca_mcp::http::blocking_client().expect("blocking client from the entry");
 }

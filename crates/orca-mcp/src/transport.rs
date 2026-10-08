@@ -1277,7 +1277,12 @@ impl StreamableHttpTransport {
             auth,
             session: Mutex::new(HttpSession::default()),
             next_id: Mutex::new(1),
-            client: crate::http::blocking_client(),
+            client: crate::http::blocking_client().map_err(|error| {
+                format!(
+                    "MCP server '{}' could not start an HTTP client: {error}",
+                    config.name
+                )
+            })?,
             startup_timeout: timeout_from_ms(config.startup_timeout_ms),
             tool_timeout: timeout_from_ms(config.tool_timeout_ms),
         })
@@ -1686,8 +1691,13 @@ impl StreamableHttpTransport {
                     ))
                 })
                 .and_then(|runtime| {
+                    let client = crate::http::client().map_err(|error| {
+                        HttpRequestError::from(format!(
+                            "failed to start MCP SSE request client: {error}"
+                        ))
+                    })?;
                     runtime.block_on(request_sse_with_async_client(SseAsyncRequest {
-                        client: crate::http::client(),
+                        client,
                         context,
                         params,
                         cancel: worker_cancel,
@@ -2204,7 +2214,9 @@ async fn post_sse_message(
     timeout: Duration,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let response_future = crate::http::client()
+    let client = crate::http::client()
+        .map_err(|error| format!("failed to write MCP SSE response: {error}"))?;
+    let response_future = client
         .post(endpoint)
         .headers(headers.clone())
         .timeout(timeout)
@@ -4264,7 +4276,7 @@ done
             });
 
             let error = request_sse_with_client(
-                &crate::http::blocking_client(),
+                &crate::http::blocking_client().expect("an HTTP client"),
                 "oversized",
                 &SseRequestContext {
                     endpoint: server.url(),
@@ -4740,6 +4752,7 @@ done
         let server = StreamableHttpServer::start(StreamableHttpBehavior::default());
         for accept in ["*/*", "application/json", "text/event-stream"] {
             let status = crate::http::blocking_client()
+                .expect("an HTTP client")
                 .post(server.url())
                 .header("accept", accept)
                 .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))

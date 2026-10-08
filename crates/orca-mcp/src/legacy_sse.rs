@@ -64,6 +64,12 @@ impl LegacySseTransport {
         let base = Url::parse(&remote_url(config)?)
             .map_err(|error| format!("MCP server '{}' has an invalid url: {error}", config.name))?;
         let headers = configured_headers(config)?;
+        let client = crate::http::blocking_client().map_err(|error| {
+            format!(
+                "MCP server '{}' could not start an HTTP client: {error}",
+                config.name
+            )
+        })?;
         let startup_timeout = timeout_from_ms(config.startup_timeout_ms);
         let mut attempt = auth.begin()?;
         let (stream, reader, endpoint) = loop {
@@ -110,7 +116,7 @@ impl LegacySseTransport {
             endpoint,
             headers,
             auth,
-            client: crate::http::blocking_client(),
+            client,
             stream,
             next_id: AtomicU64::new(1),
             startup_timeout,
@@ -582,7 +588,15 @@ impl EventStreamReader {
     /// Reads the stream until it ends or the transport is dropped, and says
     /// why it stopped.
     async fn read(&mut self, stop: &mut oneshot::Receiver<()>) -> String {
-        let client = crate::http::client();
+        let client = match crate::http::client() {
+            Ok(client) => client,
+            Err(error) => {
+                return format!(
+                    "MCP server '{}' could not start an HTTP client for its SSE event stream: {error}",
+                    self.server_name
+                );
+            }
+        };
         let mut response = tokio::select! {
             response = self.open(&client) => match response {
                 Ok(response) => response,

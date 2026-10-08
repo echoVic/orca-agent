@@ -27,12 +27,19 @@ fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
 }
 
-static CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
+/// The blocking client, built on first use. A system that cannot build one
+/// (no CA certificates) keeps the reason, which every caller gets.
+static CLIENT: LazyLock<Result<BlockingClient, String>> = LazyLock::new(|| {
     orca_mcp::http::blocking_client_builder()
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build()
-        .expect("failed to build HTTP client")
+        .map_err(|error| {
+            format!(
+                "failed to build HTTP client: {}",
+                orca_mcp::http::build_error(&error)
+            )
+        })
 });
 
 pub(crate) fn streaming_client() -> Result<Client, String> {
@@ -40,21 +47,26 @@ pub(crate) fn streaming_client() -> Result<Client, String> {
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .hickory_dns(true)
         .build()
-        .map_err(|error| format!("failed to build streaming HTTP client: {error}"))
+        .map_err(|error| {
+            format!(
+                "failed to build streaming HTTP client: {}",
+                orca_mcp::http::build_error(&error)
+            )
+        })
 }
 
 pub(crate) fn streaming_idle_read_timeout() -> Duration {
     Duration::from_secs(STREAMING_IDLE_READ_TIMEOUT_SECS)
 }
 
-pub fn client() -> &'static BlockingClient {
-    &CLIENT
+pub fn client() -> Result<&'static BlockingClient, String> {
+    CLIENT.as_ref().map_err(Clone::clone)
 }
 
 pub fn execute_with_retry(
     build_request: impl Fn(&BlockingClient) -> BlockingRequestBuilder,
 ) -> Result<BlockingResponse, String> {
-    let client = client();
+    let client = client()?;
     let mut attempt: u32 = 0;
 
     loop {

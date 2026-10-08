@@ -473,8 +473,9 @@ fn http_client(server: &McpServerConfig, follow_redirects: bool) -> Result<Clien
         .build()
         .map_err(|error| {
             format!(
-                "failed to start an HTTP client for MCP server '{}': {error}",
-                server.name
+                "failed to start an HTTP client for MCP server '{}': {}",
+                server.name,
+                crate::http::build_error(&error)
             )
         })
 }

@@ -53,7 +53,7 @@ fn the_environment_proxy_is_used_and_no_proxy_hosts_are_reached_directly() {
         std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}"));
         std::env::set_var("NO_PROXY", "127.0.0.1");
     }
-    let client = orca_mcp::http::blocking_client();
+    let client = orca_mcp::http::blocking_client().expect("an HTTP client");
 
     let body = client
         .get("http://orca-proxy-probe.invalid/path")
