@@ -666,6 +666,9 @@ pub struct AppState {
     /// separate from the parent baseline so either attachment can refresh
     /// without resurrecting stale tasks from the other.
     pub(crate) focused_workflow_tasks: Vec<BackgroundTaskSummary>,
+    /// How the shell commands that outlived their calls ended; written into
+    /// the rows that still show them running.
+    pub(crate) command_ends: crate::command_ends::CommandEnds,
     pub recovery_prompt_visible: bool,
     pub recovery_prompt_selected: usize,
     pub panel_mode: PanelMode,
@@ -1067,6 +1070,7 @@ impl AppState {
             surface_workflow_tasks: SurfaceWorkflowTaskProjectionState::default(),
             background_workflow_tasks: Vec::new(),
             focused_workflow_tasks: Vec::new(),
+            command_ends: Default::default(),
             conversation_target: ConversationTarget::Main,
             recovery_prompt_visible: false,
             recovery_prompt_selected: 0,

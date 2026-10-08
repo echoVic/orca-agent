@@ -19,6 +19,7 @@ mod chrome;
 pub mod cli;
 mod clipboard;
 mod clipboard_image;
+mod command_ends;
 pub mod commands;
 mod composer_image_actions;
 mod composer_images;

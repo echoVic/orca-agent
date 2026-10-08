@@ -113,6 +113,7 @@ impl AppState {
                 self.invalidate_recap();
                 self.task_transcript = None;
                 self.agent_dock_selected_task_id = None;
+                self.command_ends.clear();
                 self.set_conversation_target(ConversationTarget::Main);
                 self.turn_diagnostic_seen = false;
                 self.announced_subagent_batches.clear();
@@ -183,6 +184,7 @@ impl AppState {
                 label,
             } => {
                 self.replace_messages(messages);
+                self.settle_restored_command_rows();
                 if let Some(plan) = plan {
                     self.restore_plan(Some(plan));
                 }
@@ -456,6 +458,9 @@ impl AppState {
                     return;
                 }
                 if is_panel_owned_tool_progress_name(&name) {
+                    // Not shown, but a read of a command's output, or a wait on it,
+                    // can say how a command that outlived its call ended.
+                    self.learn_command_ends_from_result(&name, &output);
                     return;
                 }
                 let message_index = if let Some(index) =
@@ -514,6 +519,8 @@ impl AppState {
                     });
                     index
                 };
+                self.learn_command_ends_from_result(&name, &output);
+                self.show_known_command_end(message_index);
                 if status == "completed" {
                     self.submit_edit_highlight_for_message(message_index);
                 }

@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 
+use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 use serde::Deserialize;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -19,8 +20,7 @@ pub(crate) struct TerminalOutputDisplay {
 /// `terminal_output_result` writes it.
 #[derive(Deserialize)]
 struct TerminalPayload {
-    #[serde(rename = "task_id")]
-    _task_id: String,
+    task_id: String,
     state: String,
     return_reason: String,
     output: String,
@@ -58,6 +58,177 @@ pub(crate) fn terminal_output_display(content: &str) -> Option<TerminalOutputDis
         output: payload.output,
         note: (!notes.is_empty()).then(|| notes.join(" · ")),
     })
+}
+
+/// How a shell command that outlived its call is known to have ended,
+/// least to most: a restored row nothing reports on, a task list's
+/// status, the command's own record (exit code and why it ended).
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum EndSource {
+    Unknown,
+    TaskList,
+    Record,
+}
+
+/// What a shell result says once its command has ended: the fields
+/// `terminal_output_display` reads, and where they came from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommandEnd {
+    pub(crate) source: EndSource,
+    state: String,
+    return_reason: String,
+    termination_reason: Option<String>,
+    exit_code: Option<i64>,
+}
+
+/// `return_reason` of a result rewritten from a task list's status.
+const TASK_LIST_REASON: &str = "task_list";
+/// `return_reason` of a restored result nothing reports on any more.
+const RESTORED_REASON: &str = "restored_unknown";
+
+/// The states the terminal service gives a command that is no longer
+/// running; `interrupted` is one that was running when Orca stopped.
+fn is_ended(state: &str) -> bool {
+    matches!(
+        state,
+        "completed" | "failed" | "stopped" | "cancelled" | "interrupted"
+    )
+}
+
+fn known_end(payload: &TerminalPayload) -> Option<EndSource> {
+    if payload.return_reason == RESTORED_REASON {
+        Some(EndSource::Unknown)
+    } else if !is_ended(&payload.state) {
+        None
+    } else if payload.return_reason == TASK_LIST_REASON {
+        Some(EndSource::TaskList)
+    } else {
+        Some(EndSource::Record)
+    }
+}
+
+/// The task a shell result reports on, and how its end is known: `None`
+/// while the result still has the command running.
+pub(crate) fn reported_task(content: &str) -> Option<(String, Option<EndSource>)> {
+    let payload: TerminalPayload = serde_json::from_str(content.trim()).ok()?;
+    let known = known_end(&payload);
+    Some((payload.task_id, known))
+}
+
+/// The ends a result reports: a `bash`, `task_send_input` or
+/// `task_read_output` result (all the same envelope), or each task a
+/// `task_wait` result lists. Commands still running are left out.
+pub(crate) fn reported_ends(content: &str) -> Vec<(String, CommandEnd)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content.trim()) else {
+        return Vec::new();
+    };
+    if let Some(tasks) = value.get("tasks").and_then(serde_json::Value::as_array) {
+        return tasks.iter().filter_map(waited_end).collect();
+    }
+    let Ok(payload) = serde_json::from_value::<TerminalPayload>(value) else {
+        return Vec::new();
+    };
+    let Some(source) = known_end(&payload) else {
+        return Vec::new();
+    };
+    vec![(
+        payload.task_id,
+        CommandEnd {
+            source,
+            state: payload.state,
+            return_reason: payload.return_reason,
+            termination_reason: payload.termination_reason,
+            exit_code: payload.exit_code,
+        },
+    )]
+}
+
+/// One task of a `task_wait` result. A shell task appears as the terminal
+/// service records it; other tasks have no `termination` and are skipped.
+fn waited_end(task: &serde_json::Value) -> Option<(String, CommandEnd)> {
+    #[derive(Deserialize)]
+    struct WaitedShell {
+        task_id: String,
+        status: String,
+        termination: String,
+        #[serde(default)]
+        exit_code: Option<i64>,
+        #[serde(default)]
+        deadline_reached: bool,
+    }
+    let task = WaitedShell::deserialize(task).ok()?;
+    if !is_ended(&task.status) {
+        return None;
+    }
+    let return_reason = if task.deadline_reached {
+        "deadline_exceeded"
+    } else {
+        "terminal_observed"
+    };
+    Some((
+        task.task_id,
+        CommandEnd {
+            source: EndSource::Record,
+            state: task.status,
+            return_reason: return_reason.to_string(),
+            termination_reason: Some(task.termination),
+            exit_code: task.exit_code,
+        },
+    ))
+}
+
+/// What a task list says about a shell task that has ended. It carries no
+/// exit code, so a failed command reads `failed` until its record says more.
+pub(crate) fn task_list_end(task: &BackgroundTaskSummary) -> Option<(String, CommandEnd)> {
+    if task.task_type != TaskType::Shell {
+        return None;
+    }
+    let (state, termination, exit_code) = match task.status {
+        TaskStatus::Completed => ("completed", "exited", Some(0)),
+        TaskStatus::Failed => ("failed", "failed", None),
+        TaskStatus::Stopped => ("stopped", "stopped", None),
+        TaskStatus::Cancelled => ("cancelled", "cancelled", None),
+        _ => return None,
+    };
+    Some((
+        task.id.clone(),
+        CommandEnd {
+            source: EndSource::TaskList,
+            state: state.to_string(),
+            return_reason: TASK_LIST_REASON.to_string(),
+            termination_reason: Some(termination.to_string()),
+            exit_code,
+        },
+    ))
+}
+
+/// A restored row's command that nothing reports on any more.
+pub(crate) fn unknown_end() -> CommandEnd {
+    CommandEnd {
+        source: EndSource::Unknown,
+        state: "unknown".to_string(),
+        return_reason: RESTORED_REASON.to_string(),
+        termination_reason: Some("state unknown".to_string()),
+        exit_code: None,
+    }
+}
+
+/// `content`, a shell result, saying how its command ended. The output and
+/// every other field stay as they were.
+pub(crate) fn with_end(content: &str, end: &CommandEnd) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(content.trim()).ok()?;
+    let fields = value.as_object_mut()?;
+    fields.insert("state".to_string(), end.state.clone().into());
+    fields.insert(
+        "return_reason".to_string(),
+        end.return_reason.clone().into(),
+    );
+    fields.insert(
+        "termination_reason".to_string(),
+        end.termination_reason.clone().into(),
+    );
+    fields.insert("exit_code".to_string(), end.exit_code.into());
+    serde_json::to_string(&value).ok()
 }
 
 /// What a terminal would have shown for `text`, as plain characters. Command
@@ -305,5 +476,91 @@ mod tests {
             None
         );
         assert_eq!(terminal_output_display(r#"["a", "b"]"#), None);
+    }
+
+    #[test]
+    fn writing_the_end_keeps_the_output_as_it_was() {
+        let output = format!(
+            "{}\x1b[31m红色\x1b[0m tab\there\r\nlast line without newline",
+            "构建日志 build log 0123456789\n".repeat(40_000)
+        );
+        let running = payload(serde_json::json!({
+            "state": "running", "return_reason": "yield_elapsed",
+            "termination_reason": null, "exit_code": null, "output": output,
+        }));
+        let (_, end) = task_list_end(
+            &serde_json::from_value(serde_json::json!({
+                "id": "task-1", "type": "shell", "status": "completed",
+                "description": "build", "createdAtMs": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let written = with_end(&running, &end).unwrap();
+        let before: serde_json::Value = serde_json::from_str(&running).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(after["output"], before["output"]);
+        assert_eq!(terminal_output_display(&written).unwrap().note, None);
+    }
+
+    #[test]
+    fn a_command_interrupted_by_a_restart_has_ended() {
+        // As the terminal service reports a task that was running when Orca
+        // stopped: its state is `interrupted`, in a result and in a wait.
+        let read = payload(serde_json::json!({
+            "state": "interrupted", "termination_reason": "interrupted", "exit_code": null,
+        }));
+        let wait = serde_json::json!({ "tasks": [
+            { "task_id": "task-1", "status": "interrupted", "termination": "interrupted", "exit_code": null },
+        ]})
+        .to_string();
+        for result in [read, wait] {
+            let ends = reported_ends(&result);
+            assert_eq!(ends.len(), 1, "{result}");
+            let running = payload(serde_json::json!({
+                "state": "running", "return_reason": "yield_elapsed",
+                "termination_reason": null, "exit_code": null,
+            }));
+            assert_eq!(
+                terminal_output_display(&with_end(&running, &ends[0].1).unwrap())
+                    .unwrap()
+                    .note
+                    .as_deref(),
+                Some("interrupted")
+            );
+        }
+    }
+
+    #[test]
+    fn ends_are_read_from_a_result_and_from_each_waited_task() {
+        let read = payload(serde_json::json!({ "exit_code": 7, "state": "failed" }));
+        let ends = reported_ends(&read);
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].0, "task-1");
+        assert_eq!(ends[0].1.source, EndSource::Record);
+        assert!(
+            reported_ends(&payload(serde_json::json!({
+                "state": "running", "termination_reason": null, "exit_code": null,
+            })))
+            .is_empty()
+        );
+        let wait = serde_json::json!({ "tasks": [
+            { "task_id": "a", "status": "running", "termination": "running", "exit_code": null },
+            { "task_id": "b", "status": "failed", "termination": "interrupted", "exit_code": null },
+            { "id": "agent-1", "type": "subagent", "status": "completed" },
+        ]})
+        .to_string();
+        let ends = reported_ends(&wait);
+        assert_eq!(
+            ends.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
+        assert_eq!(
+            terminal_output_display(&with_end(&read, &ends[0].1).unwrap())
+                .unwrap()
+                .note
+                .as_deref(),
+            Some("interrupted")
+        );
     }
 }

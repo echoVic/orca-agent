@@ -577,6 +577,7 @@ impl AppState {
                 self.tasks_dock_expanded = false;
             }
         }
+        self.learn_command_ends_from_tasks();
     }
 
     fn emit_subagent_terminal_notices(&mut self, previous: &[BackgroundTaskSummary]) {
@@ -637,6 +638,7 @@ impl AppState {
         self.background_workflow_tasks = tasks.clone();
         self.workflow_panel.replace_tasks(tasks);
         self.agent_workspace.reconcile(self.workflow_panel.tasks());
+        self.learn_command_ends_from_tasks();
     }
 
     #[cfg(test)]
