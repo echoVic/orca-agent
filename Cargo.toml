@@ -17,7 +17,7 @@ async-trait = "0.1"
 futures = { version = "0.3", default-features = false }
 agent-client-protocol = { version = "=0.10.4", features = ["unstable"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "form", "hickory-dns", "json", "query", "rustls-no-provider", "stream"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "fallible_uint"] }
 hickory-resolver = "0.26.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 toml = "1.1"

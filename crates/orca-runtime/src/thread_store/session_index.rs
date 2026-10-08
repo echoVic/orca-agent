@@ -935,6 +935,133 @@ mod tests {
         assert_eq!(indexed_count, 0);
     }
 
+    #[test]
+    fn a_v0_5_7_session_index_database_still_reads_and_writes() {
+        // Written by Orca 0.5.7 (rusqlite 0.32, SQLite 3.46) through
+        // `open_index` and `upsert_summary_with_connection`: two sessions, one
+        // with a Chinese title. The paths are opaque test keys, not files.
+        const FIXTURE: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sqlite-v0.5.7/sessions-index.sqlite3"
+        );
+        type Row = (String, String, String, bool, i64, i64, String);
+        fn rows(connection: &Connection) -> Vec<Row> {
+            connection
+                .prepare(
+                    "SELECT session_id, title, path, archived, created_at_ms, updated_at_ms, health
+                     FROM sessions ORDER BY created_at_ms",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        }
+        let english: Row = (
+            "fixture-session-english".to_string(),
+            "Fix the parser regression".to_string(),
+            "/orca-fixture/sessions/2026/01/02/fixture-session-english.jsonl".to_string(),
+            false,
+            1_767_323_045_000,
+            1_767_323_345_000,
+            "healthy".to_string(),
+        );
+        let chinese: Row = (
+            "fixture-session-chinese".to_string(),
+            "整理发布说明".to_string(),
+            "/orca-fixture/sessions/2026/01/03/fixture-session-chinese.jsonl".to_string(),
+            false,
+            1_767_413_106_000,
+            1_767_413_406_000,
+            "healthy".to_string(),
+        );
+
+        let home = tempfile::tempdir().unwrap();
+        fs::copy(FIXTURE, home.path().join(DATABASE_FILENAME)).unwrap();
+        let connection = open_index(home.path()).unwrap();
+
+        assert_eq!(rows(&connection), vec![english.clone(), chinese.clone()]);
+        let index_meta = connection
+            .prepare("SELECT key, value FROM index_meta ORDER BY key")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            index_meta,
+            vec![
+                ("backfill_complete".to_string(), "1".to_string()),
+                ("schema_version".to_string(), "4".to_string()),
+            ]
+        );
+        let cached: SessionSummary = serde_json::from_str(
+            &connection
+                .query_row(
+                    "SELECT summary_json FROM sessions WHERE session_id = ?1",
+                    [&chinese.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cached.title, "整理发布说明");
+        assert_eq!(cached.cwd, "/orca-fixture/project");
+        assert_eq!(cached.model.as_deref(), Some("fixture-model"));
+        assert_eq!(cached.path, Path::new(&chinese.2));
+        assert_eq!(cached.health, StoredSessionHealth::Healthy);
+
+        let mut meta = history::create_meta(
+            Path::new("/orca-fixture/project"),
+            "mock",
+            Some("fixture-model".to_string()),
+            "Review the upgraded index",
+        );
+        meta.session_id = "fixture-session-new".to_string();
+        meta.created_at = DateTime::parse_from_rfc3339("2026-01-04T05:06:07Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut added = summary_from_meta(
+            Path::new("/orca-fixture/sessions/2026/01/04/fixture-session-new.jsonl"),
+            meta,
+            false,
+        )
+        .unwrap();
+        added.updated_at = added.created_at + chrono::Duration::minutes(5);
+        upsert_summary_with_connection(&connection, &added).unwrap();
+        drop(connection);
+
+        let reopened = open_index(home.path()).unwrap();
+        assert_eq!(
+            rows(&reopened),
+            vec![
+                english,
+                chinese,
+                (
+                    "fixture-session-new".to_string(),
+                    "Review the upgraded index".to_string(),
+                    "/orca-fixture/sessions/2026/01/04/fixture-session-new.jsonl".to_string(),
+                    false,
+                    added.created_at.timestamp_millis(),
+                    added.updated_at.timestamp_millis(),
+                    "healthy".to_string(),
+                ),
+            ]
+        );
+    }
+
     fn write_legacy_session(home: &Path, index: usize) -> SessionSummary {
         let mut meta = history::create_meta(
             home,

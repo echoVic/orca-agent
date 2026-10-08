@@ -1278,4 +1278,158 @@ mod tests {
         assert!(OutputArchive::open(&root, "test-session").is_err());
         assert!(!outside.path().join("victim").exists());
     }
+
+    #[test]
+    fn a_v0_5_7_task_output_database_still_reads_and_writes() {
+        // Written by Orca 0.5.7 (rusqlite 0.32, SQLite 3.46) through
+        // `OutputArchive`: one finished shell whose output arrived as three
+        // chunks (offsets 0, 23 and 45), the middle one stderr with
+        // multi-byte text, and an automatic-output cursor at 23.
+        const FIXTURE: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sqlite-v0.5.7/task-output.sqlite3"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("output");
+        prepare_directory(&root).unwrap();
+        // The archive refuses a database that is not private to this user, so
+        // the fixture goes into a file created by the archive's own helper.
+        drop(private_file(&root.join(DATABASE)).unwrap());
+        fs::write(root.join(DATABASE), fs::read(FIXTURE).unwrap()).unwrap();
+
+        {
+            let mut archive = archive(&root, ArchiveLimits::default());
+            let shell = archive.shell("shell-fixture").unwrap();
+            assert_eq!(
+                (
+                    shell.task_id.as_str(),
+                    shell.state.as_str(),
+                    shell.exit_code,
+                    shell.cursor
+                ),
+                ("task-fixture", "exited", Some(3), 23)
+            );
+            assert!(shell.requested_pty && shell.effective_pty);
+
+            let whole = archive.read("task-fixture", 0, 99).unwrap();
+            assert_eq!(
+                whole.combined,
+                "building fixture crate\nwarning: 缺少文件\ndone\n"
+            );
+            assert_eq!(whole.stdout, "building fixture crate\ndone\n");
+            assert_eq!(whole.stderr, "warning: 缺少文件\n");
+            assert_eq!(
+                (whole.bytes_total, whole.bytes_read, whole.next_offset),
+                (50, 50, 50)
+            );
+            let from_cursor = archive.read("task-fixture", shell.cursor, 99).unwrap();
+            assert_eq!(from_cursor.combined, "warning: 缺少文件\ndone\n");
+            assert_eq!(
+                (
+                    from_cursor.stdout_prefix_bytes,
+                    from_cursor.stderr_prefix_bytes,
+                    from_cursor.next_offset
+                ),
+                (23, 0, 50)
+            );
+            let tail = archive.tail("task-fixture", 5).unwrap();
+            assert_eq!(tail.combined, "done\n");
+            assert_eq!(
+                (
+                    tail.omitted_prefix_bytes,
+                    tail.stdout_prefix_bytes,
+                    tail.stderr_prefix_bytes
+                ),
+                (45, 23, 22)
+            );
+
+            archive
+                .register("shell-new", "task-new", false, false)
+                .unwrap();
+            archive
+                .append(
+                    "task-new",
+                    TaskOutputStream::Stdout,
+                    "written after the upgrade\n",
+                )
+                .unwrap();
+            archive.finish("task-new", "exited", Some(0)).unwrap();
+        }
+
+        let archive = archive(&root, ArchiveLimits::default());
+        let old = archive.shell("shell-fixture").unwrap();
+        assert_eq!(
+            (old.state.as_str(), old.exit_code, old.cursor),
+            ("exited", Some(3), 23)
+        );
+        assert_eq!(
+            archive.read("task-fixture", 0, 99).unwrap().combined,
+            "building fixture crate\nwarning: 缺少文件\ndone\n"
+        );
+        let new = archive.shell("shell-new").unwrap();
+        assert_eq!(
+            (new.task_id.as_str(), new.state.as_str(), new.exit_code),
+            ("task-new", "exited", Some(0))
+        );
+        assert_eq!(
+            archive.read("task-new", 0, 99).unwrap().combined,
+            "written after the upgrade\n"
+        );
+        let (bytes, chunks): (usize, usize) = archive
+            .connection
+            .query_row("SELECT bytes, chunks FROM usage WHERE id = 1", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((bytes, chunks), (76, 4));
+    }
+
+    #[test]
+    fn unsigned_values_are_stored_as_integers_and_overflow_is_an_error() {
+        // rusqlite 0.38 made `u64` and `usize` opt-in; the `fallible_uint`
+        // feature keeps them what they were: an INTEGER up to `i64::MAX`, an
+        // error above it (never a wrapped or clamped value), and an error when
+        // a negative integer is read back.
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE offsets(label TEXT, value INTEGER)")
+            .unwrap();
+        let insert = "INSERT INTO offsets VALUES (?1, ?2)";
+        connection
+            .execute(insert, params!["u64", i64::MAX as u64])
+            .unwrap();
+        connection
+            .execute(insert, params!["usize", 7usize])
+            .unwrap();
+        for too_big in [i64::MAX as u64 + 1, u64::MAX] {
+            assert!(matches!(
+                connection.execute(insert, params!["too big", too_big]),
+                Err(rusqlite::Error::ToSqlConversionFailure(_))
+            ));
+        }
+        let stored: Vec<(String, String, i64)> = connection
+            .prepare("SELECT label, typeof(value), value FROM offsets ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            stored,
+            vec![
+                ("u64".to_string(), "integer".to_string(), i64::MAX),
+                ("usize".to_string(), "integer".to_string(), 7),
+            ]
+        );
+        let read: (u64, usize) = connection
+            .query_row("SELECT 9223372036854775807, 7", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(read, (i64::MAX as u64, 7));
+        assert!(matches!(
+            connection.query_row("SELECT -1", [], |row| row.get::<_, usize>(0)),
+            Err(rusqlite::Error::IntegralValueOutOfRange(0, -1))
+        ));
+    }
 }

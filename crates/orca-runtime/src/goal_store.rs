@@ -7074,4 +7074,71 @@ mod tests {
         assert!(error.to_string().contains("goal"));
         assert_eq!(store.transition_count(&goal.goal_id).unwrap(), before);
     }
+
+    #[test]
+    fn a_v0_5_7_goal_store_database_still_reads_and_writes() {
+        // Written by Orca 0.5.7 (rusqlite 0.32, SQLite 3.46) through
+        // `GoalStore`: one goal created and then paused by the user.
+        const FIXTURE: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sqlite-v0.5.7/goals.sqlite3"
+        );
+        let paused = GoalState::Paused {
+            reason: GoalPauseReason::User,
+            message: "paused for review".to_string(),
+        };
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(DATABASE_FILENAME);
+        let legacy = directory.path().join(LEGACY_FILENAME);
+        fs::copy(FIXTURE, &path).unwrap();
+
+        let store = GoalStore::open_with_legacy(&path, &legacy).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 4);
+        let goal = store.get_by_session("fixture-session").unwrap().unwrap();
+        assert_eq!(
+            goal.goal_id.as_str(),
+            "goal_01a11ab2-d609-7185-a80b-f0ab6ce013f4"
+        );
+        assert_eq!(
+            goal.objective,
+            "Write the release notes for the fixture project"
+        );
+        assert_eq!(goal.objective_revision, 1);
+        assert_eq!(goal.token_budget, Some(50_000));
+        assert_eq!(goal.state, paused);
+        assert_eq!(goal.usage, GoalUsage::default());
+        assert_eq!(goal.current_run, None);
+        assert_eq!(
+            goal.last_transition,
+            Some(GoalTransitionSummary {
+                previous_state: GoalState::Active,
+                next_state: paused,
+                reason_code: "user_paused".to_string(),
+            })
+        );
+        assert_eq!(store.transition_count(&goal.goal_id).unwrap(), 2);
+        assert_eq!(store.goal_count().unwrap(), 1);
+
+        let added = store
+            .create_goal(CreateGoalInput {
+                session_id: "fixture-session-new".to_string(),
+                objective: "Check the upgraded goal database".to_string(),
+                token_budget: None,
+                now: 1_800_000_000,
+            })
+            .unwrap();
+        drop(store);
+
+        let reopened = GoalStore::open_with_legacy(&path, &legacy).unwrap();
+        assert_eq!(reopened.schema_version().unwrap(), 4);
+        assert_eq!(reopened.goal_count().unwrap(), 2);
+        assert_eq!(
+            reopened.get_by_session("fixture-session").unwrap(),
+            Some(goal)
+        );
+        assert_eq!(
+            reopened.get_by_session("fixture-session-new").unwrap(),
+            Some(added)
+        );
+    }
 }

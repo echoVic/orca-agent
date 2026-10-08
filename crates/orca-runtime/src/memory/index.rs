@@ -248,3 +248,143 @@ fn index_path(root: &Path) -> PathBuf {
         .unwrap_or_else(|_| root.to_path_buf())
         .join(INDEX_FILENAME)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_v0_5_7_memory_index_database_still_reads_and_writes() {
+        // Written by Orca 0.5.7 (rusqlite 0.32, SQLite 3.46) through `rebuild`:
+        // two memories, one of them Chinese, under ledger fingerprint
+        // `fixture-ledger-fingerprint`.
+        const FIXTURE: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sqlite-v0.5.7/memory-index.sqlite3"
+        );
+        const CHINESE_TOKEN: &str = "发布前先运行完整的测试套件";
+        fn tokens(words: &[&str]) -> Vec<String> {
+            words.iter().map(|word| word.to_string()).collect()
+        }
+        let root = tempfile::tempdir().unwrap();
+        fs::copy(FIXTURE, root.path().join(INDEX_FILENAME)).unwrap();
+
+        // The fingerprint matches the stored one, so `search` answers from the
+        // old index instead of rebuilding it. The record handed in is a decoy:
+        // had the index been rebuilt from it, the stored keys could not come
+        // back.
+        let decoy = [IndexRecord {
+            key: "decoy",
+            search_text: "release",
+            recorded_at_ms: 0,
+        }];
+        let search_old = |words: &[&str]| {
+            search(
+                root.path(),
+                "fixture-ledger-fingerprint",
+                &decoy,
+                &tokens(words),
+            )
+            .unwrap()
+        };
+        assert_eq!(search_old(&["release"]), vec!["memory-release-checks"]);
+        assert_eq!(search_old(&[CHINESE_TOKEN]), vec!["memory-chinese-note"]);
+        let mut both = search_old(&["workspace", CHINESE_TOKEN]);
+        both.sort();
+        assert_eq!(both, vec!["memory-chinese-note", "memory-release-checks"]);
+        assert!(search_old(&["decoy"]).is_empty());
+
+        let stored = |connection: &Connection| {
+            connection
+                .prepare(
+                    "SELECT candidate_key, search_text, recorded_at_ms
+                     FROM memory_fts ORDER BY recorded_at_ms",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let old_rows = vec![
+            (
+                "memory-release-checks".to_string(),
+                "run the full workspace test suite before every release".to_string(),
+                1_700_000_000_000,
+            ),
+            (
+                "memory-chinese-note".to_string(),
+                CHINESE_TOKEN.to_string(),
+                1_700_000_100_000,
+            ),
+        ];
+        let connection = open_and_initialize(&index_path(root.path())).unwrap();
+        assert_eq!(stored(&connection), old_rows);
+        assert_eq!(
+            read_meta(&connection, "schema_version").unwrap().as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            read_meta(&connection, "ledger_fingerprint")
+                .unwrap()
+                .as_deref(),
+            Some("fixture-ledger-fingerprint")
+        );
+        drop(connection);
+
+        // A rebuild is how a new memory reaches the index: the two old records
+        // plus a new one, under a new fingerprint.
+        let records = [
+            IndexRecord {
+                key: "memory-release-checks",
+                search_text: &old_rows[0].1,
+                recorded_at_ms: old_rows[0].2,
+            },
+            IndexRecord {
+                key: "memory-chinese-note",
+                search_text: &old_rows[1].1,
+                recorded_at_ms: old_rows[1].2,
+            },
+            IndexRecord {
+                key: "memory-new",
+                search_text: "written after the upgrade",
+                recorded_at_ms: 1_800_000_000_000,
+            },
+        ];
+        rebuild(root.path(), "fixture-ledger-fingerprint-2", &records).unwrap();
+
+        let connection = open_and_initialize(&index_path(root.path())).unwrap();
+        let mut expected = old_rows.clone();
+        expected.push((
+            "memory-new".to_string(),
+            "written after the upgrade".to_string(),
+            1_800_000_000_000,
+        ));
+        assert_eq!(stored(&connection), expected);
+        assert_eq!(
+            read_meta(&connection, "ledger_fingerprint")
+                .unwrap()
+                .as_deref(),
+            Some("fixture-ledger-fingerprint-2")
+        );
+        drop(connection);
+        let search_new = |words: &[&str]| {
+            search(
+                root.path(),
+                "fixture-ledger-fingerprint-2",
+                &records,
+                &tokens(words),
+            )
+            .unwrap()
+        };
+        assert_eq!(search_new(&["release"]), vec!["memory-release-checks"]);
+        assert_eq!(search_new(&[CHINESE_TOKEN]), vec!["memory-chinese-note"]);
+        assert_eq!(search_new(&["upgrade"]), vec!["memory-new"]);
+    }
+}
