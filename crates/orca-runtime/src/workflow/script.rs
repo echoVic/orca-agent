@@ -1102,7 +1102,7 @@ fn missing_meta_field(field: &str) -> io::Error {
 fn sha256_hex(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input);
-    format!("{:x}", hasher.finalize())
+    orca_core::hex::lower(&hasher.finalize())
 }
 
 #[cfg(test)]
@@ -1111,6 +1111,7 @@ mod tests {
 
     use super::{
         contains_workflow_keyword, find_saved_workflow_with_config_dir, parse_workflow_meta,
+        sha256_hex,
     };
 
     #[test]
@@ -1251,6 +1252,14 @@ mod tests {
         assert!(
             message.contains(&project.path().display().to_string()),
             "error should name the workspace: {message}"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_is_the_lowercase_digest() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 }

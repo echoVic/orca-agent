@@ -644,7 +644,7 @@ pub(crate) fn storage_identity_for_path(path: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"orca-storage-identity-v1\n");
     hasher.update(path.to_string_lossy().as_bytes());
-    format!("storage-{:x}", hasher.finalize())
+    format!("storage-{}", orca_core::hex::lower(&hasher.finalize()))
 }
 
 pub fn search_sessions(query: &str, include_archived: bool) -> io::Result<Vec<SearchHit>> {
@@ -1709,5 +1709,15 @@ mod tests {
                 archived
             );
         });
+    }
+
+    #[test]
+    fn the_storage_identity_of_a_path_is_stable() {
+        // Selectors name a session by this identity, so it must not change
+        // from one release to the next.
+        assert_eq!(
+            storage_identity_for_path(Path::new("/orca/pin/workspace")),
+            "storage-791c488b9fb032cf020e1261bd3b0de10f6a36d201332f3b90f4cd8011c24a10"
+        );
     }
 }

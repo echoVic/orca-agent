@@ -506,7 +506,7 @@ fn source_fingerprint(path: &Path) -> Option<String> {
     hasher.update(metadata.len().to_le_bytes());
     hasher.update(modified.as_secs().to_le_bytes());
     hasher.update(modified.subsec_nanos().to_le_bytes());
-    Some(format!("{:x}", hasher.finalize()))
+    Some(orca_core::hex::lower(&hasher.finalize()))
 }
 
 pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<String>> {

@@ -11016,6 +11016,18 @@ mod tests {
     }
 
     #[test]
+    fn markdown_with_carets_and_tildes_renders_as_before() {
+        // Superscript, subscript and wiki links are syntax Orca does not
+        // enable, so their markers stay the text the model wrote.
+        let theme = Theme::named(ThemeName::Dark);
+        let lines = render_markdown("x^2^ and H~2~O, ~~gone~~, [[Wiki]]", 80, &theme);
+        assert_eq!(
+            rendered_text(&lines),
+            vec!["x^2^ and H~2~O, ~~gone~~, [[Wiki]]"]
+        );
+    }
+
+    #[test]
     fn inline_code_uses_the_selected_markdown_theme_color() {
         for name in [
             ThemeName::Dark,

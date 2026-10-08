@@ -79,7 +79,8 @@ fn read_blob(root: &Path, asset: &ImageAsset) -> io::Result<Vec<u8>> {
     }
     let mut bytes = Vec::new();
     file.take(asset.bytes + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 != asset.bytes || format!("{:x}", Sha256::digest(&bytes)) != asset.sha256
+    if bytes.len() as u64 != asset.bytes
+        || orca_core::hex::lower(&Sha256::digest(&bytes)) != asset.sha256
     {
         return Err(invalid("image asset digest mismatch"));
     }
@@ -179,7 +180,7 @@ pub(crate) fn externalize(path: &Path, mut record: Value) -> io::Result<Value> {
         }
         let asset = ImageAsset {
             pointer,
-            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            sha256: orca_core::hex::lower(&Sha256::digest(&bytes)),
             bytes: bytes.len() as u64,
         };
         put_blob(&directory(path), &asset, &bytes)?;

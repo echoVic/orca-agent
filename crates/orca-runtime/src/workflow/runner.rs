@@ -4422,7 +4422,7 @@ fn digest_value(value: &Value) -> String {
             .unwrap_or_else(|_| "null".to_string())
             .as_bytes(),
     );
-    format!("{:x}", hasher.finalize())
+    orca_core::hex::lower(&hasher.finalize())
 }
 
 fn task_type_name(task_type: TaskType) -> &'static str {

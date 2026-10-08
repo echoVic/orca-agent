@@ -300,7 +300,7 @@ fn analysis_key(query: &str, outline: Option<&str>, images: &[ImageInput]) -> St
         }
         digest.update([image.detail as u8]);
     }
-    format!("{:x}", digest.finalize())
+    orca_core::hex::lower(&digest.finalize())
 }
 
 fn strip_images(conversation: &mut Conversation) {

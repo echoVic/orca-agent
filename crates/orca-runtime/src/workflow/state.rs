@@ -805,7 +805,7 @@ pub fn input_hash(prompt: &str, opts: &Value) -> String {
             .unwrap_or_else(|_| "null".to_string())
             .as_bytes(),
     );
-    format!("{:x}", hasher.finalize())
+    orca_core::hex::lower(&hasher.finalize())
 }
 
 fn cache_key(call_path: &str, input_hash: &str) -> String {

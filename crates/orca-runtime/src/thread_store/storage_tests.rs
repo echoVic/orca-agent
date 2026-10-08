@@ -110,6 +110,31 @@ fn asset_codec_preserves_surface_payload_and_rejects_corruption() {
 }
 
 #[test]
+fn an_externalized_asset_records_the_sha256_of_its_bytes() {
+    // The SHA-256 of "abc", the digest a stored record names its blob by.
+    const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("digest.jsonl");
+    let original = serde_json::json!({
+        "images": [{
+            "type": "base64",
+            "media_type": "image/png",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"abc"),
+        }]
+    });
+    let stored = assets::externalize(&path, original.clone()).unwrap();
+    assert_eq!(stored["assets"][0]["sha256"], ABC_SHA256);
+    assert_eq!(stored["assets"][0]["bytes"], 3);
+    // The blob is filed under that digest, and reading it back passes the
+    // digest check.
+    assert_eq!(
+        fs::read(assets::directory(&path).join(ABC_SHA256)).unwrap(),
+        b"abc"
+    );
+    assert_eq!(assets::hydrate(&path, stored, true).unwrap(), original);
+}
+
+#[test]
 fn missing_asset_prevents_append_without_changing_transcript() {
     crate::history::with_redirected_orca_home("asset-missing", |home| {
         let mut writer = SessionWriter::start(home, "mock", None, "missing image").unwrap();

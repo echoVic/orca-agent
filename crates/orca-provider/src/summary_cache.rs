@@ -33,7 +33,7 @@ pub fn summary_key(
     }
     hasher.update(b"\ndelta:");
     hasher.update(delta_text.as_bytes());
-    format!("{:x}", hasher.finalize())
+    orca_core::hex::lower(&hasher.finalize())
 }
 
 pub fn lookup(key: &str) -> Option<String> {
@@ -126,6 +126,30 @@ mod tests {
             "delta body",
         );
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn summary_keys_are_stable() {
+        // Cached summaries are filed under these keys; a different digest
+        // would silently orphan every summary already on disk.
+        assert_eq!(
+            summary_key(
+                "provider=deepseek;model=aux;prompt=v1",
+                "delta",
+                Some("baseline"),
+                "delta body",
+            ),
+            "8e8e0bd22fa98c325e5aca4473143b3849c95c9bc1fdf77e8ccf4786d386f455"
+        );
+        assert_eq!(
+            summary_key(
+                "provider=deepseek;model=aux;prompt=v1",
+                "rebuild_baseline",
+                None,
+                "delta body",
+            ),
+            "fd51ab8c8854d7540999c6445d561f754229573b73d3a0c7e6a59529f2a408a8"
+        );
     }
 
     #[test]

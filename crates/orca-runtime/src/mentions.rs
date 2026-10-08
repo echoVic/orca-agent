@@ -583,7 +583,7 @@ impl MentionTarget {
                 "resource_template"
             }
         };
-        format!("{kind}:{:x}", hasher.finalize())
+        format!("{kind}:{}", orca_core::hex::lower(&hasher.finalize()))
     }
 }
 

@@ -141,5 +141,21 @@ fn hash_json<T: Serialize + ?Sized>(domain: &[u8], value: &T) -> serde_json::Res
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update(bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(orca_core::hex::lower(&hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hash_json;
+
+    #[test]
+    fn json_hashes_are_stable() {
+        // A recorded checkpoint is compared with a freshly computed digest; a
+        // different one would make every old checkpoint look like a changed
+        // prompt.
+        assert_eq!(
+            hash_json(b"orca-pin", &serde_json::json!({ "a": 1 })).unwrap(),
+            "5b5a63a4f0a8a47718b0896af14eb3b21d4a1d8bb42669f8d87f9a4d8e1a7cc9"
+        );
+    }
 }
