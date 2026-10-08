@@ -430,6 +430,8 @@ fn read_toml_value(path: &Path) -> Result<Option<Value>, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(config_read_warning(path, &error)),
     };
+    // The parser and the warning get the same text (see `toml_text`).
+    let content = super::toml_text::crlf_to_lf(&content);
     let mut value = toml::from_str(&content).map_err(|error| {
         format!(
             "config parse error in {}, ignoring it: {}",
@@ -1421,9 +1423,9 @@ rules = [{ tool = "bash", decision = "deny" }, { tool = "read_file", pattern = "
         );
         assert_eq!(session_start.tool, None);
         // The line break after the opening quotes is not part of the string;
-        // the one before the closing quotes is, whichever line ends the file
-        // has.
-        assert_eq!(session_start.command.trim_end(), "echo started");
+        // the one before the closing quotes is, as an LF in a file with CRLF
+        // line ends too.
+        assert_eq!(session_start.command, "echo started\n");
     }
 
     /// What `CONFIG_V0_5_7_INLINE_ARRAYS` says, as the config a load of it
@@ -1494,8 +1496,9 @@ rules = [{ tool = "bash", decision = "deny" }, { tool = "read_file", pattern = "
             // The file as a TOML value, merged with the other layers, then
             // read as the config.
             check(&load_layered_config_from_paths(&user_path, dir.path()));
+            // As `orca doctor` reads it, from the text itself.
             check(
-                &toml::from_str::<FileConfig>(&text)
+                &toml::from_str::<FileConfig>(&crate::config::toml_text::crlf_to_lf(&text))
                     .unwrap_or_else(|error| panic!("{error}\n{text:?}")),
             );
         }
@@ -1505,6 +1508,38 @@ rules = [{ tool = "bash", decision = "deny" }, { tool = "read_file", pattern = "
     fn a_config_in_the_v0_5_7_format_still_parses() {
         check_every_load_of(CONFIG_V0_5_7, check_the_v0_5_7_config);
         check_every_load_of(CONFIG_V0_5_7_INLINE_ARRAYS, check_the_v0_5_7_inline_arrays);
+    }
+
+    /// The line breaks inside a multi-line string read as LF in a config
+    /// saved with CRLF line ends, as they did with toml 0.8. With CRs in them
+    /// a hook's command would reach the shell with the CRs.
+    #[test]
+    fn the_multi_line_strings_of_a_crlf_config_read_with_lf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(USER_CONFIG_FILE);
+        let lf = concat!(
+            "literal = '''\n",
+            "one\n",
+            "two\n",
+            "'''\n",
+            "basic = \"\"\"\n",
+            "one\n",
+            "two\"\"\"\n",
+            // A line-ending backslash takes the line break and the blanks
+            // after it; the next line break stays.
+            "folded = \"\"\"one \\\n",
+            "    two\n",
+            "three\"\"\"\n",
+        );
+        for text in [lf.to_string(), lf.replace('\n', "\r\n")] {
+            fs::write(&path, &text).unwrap();
+
+            let value = read_toml_value(&path).unwrap().unwrap();
+
+            assert_eq!(value["literal"].as_str(), Some("one\ntwo\n"), "{text:?}");
+            assert_eq!(value["basic"].as_str(), Some("one\ntwo"), "{text:?}");
+            assert_eq!(value["folded"].as_str(), Some("one two\nthree"), "{text:?}");
+        }
     }
 
     #[test]
@@ -2429,6 +2464,31 @@ workflowKeywordTriggerEnabled = true
         assert!(!warning.contains("abc-SECRET"), "{warning}");
         // No file is nothing to warn about.
         assert_eq!(read_toml_value(&dir.path().join("absent.toml")), Ok(None));
+    }
+
+    /// A config saved with CRLF line ends is reported at the line and column
+    /// that one saved with LF is, past line breaks inside a multi-line string
+    /// too.
+    #[test]
+    fn a_crlf_config_with_a_syntax_error_is_reported_at_the_same_line_and_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(USER_CONFIG_FILE);
+        let lf = "note = '''\nfirst\nsecond\n'''\nmodel = \"m\"\napi_key = \"abc-SECRET\n";
+        for text in [lf.to_string(), lf.replace('\n', "\r\n")] {
+            fs::write(&path, &text).unwrap();
+
+            let warning = read_toml_value(&path).unwrap_err();
+
+            assert_eq!(
+                warning,
+                format!(
+                    "config parse error in {}, ignoring it: TOML syntax error at line 6, column 22: invalid basic string, expected `\"`",
+                    path.display()
+                ),
+                "{text:?}"
+            );
+            assert!(!warning.contains("abc-SECRET"), "{warning}");
+        }
     }
 
     /// A config file that cannot be read is left out with a warning, never

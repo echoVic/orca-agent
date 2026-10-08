@@ -17,6 +17,7 @@ pub mod error_text;
 pub mod file;
 pub mod folder_trust;
 pub mod mcp_credentials;
+pub mod toml_text;
 pub mod user_edit;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

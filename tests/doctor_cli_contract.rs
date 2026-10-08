@@ -132,6 +132,47 @@ fn doctor_reports_config_file_credentials_without_echoing_them() {
 }
 
 #[test]
+fn doctor_reads_a_config_saved_with_crlf_line_ends() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    let secret = "sk-test-crlf-config-secret";
+    // As a Windows editor saves it: CRLF line ends, also inside a multi-line
+    // string.
+    let config = format!(
+        "# my config\napi_key = {secret:?}\n\n[[hooks]]\nevent = \"post_tool_use\"\ncommand = '''\necho done\n'''\n"
+    )
+    .replace('\n', "\r\n");
+    fs::write(home.join("config.toml"), config).unwrap();
+
+    let output = run_doctor(&home, &cwd, &["--format", "json"]);
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains(secret), "doctor must not print an API key");
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    let check = |id: &str| {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == id)
+            .unwrap_or_else(|| panic!("no {id} check in {stdout}"))
+            .clone()
+    };
+    assert_eq!(check("config")["status"], "pass", "{stdout}");
+    assert!(
+        check("config")["detail"]
+            .as_str()
+            .unwrap()
+            .ends_with("(valid)"),
+        "{stdout}"
+    );
+    assert_eq!(check("credentials")["status"], "pass", "{stdout}");
+}
+
+#[test]
 fn doctor_reports_malformed_config_without_starting_the_tui() {
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");

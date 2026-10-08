@@ -9,6 +9,7 @@ use toml_edit::{
 use crate::approval_rules::{PermissionRules, canonical_rule_tool};
 use crate::config::error_text::{data_error_text, syntax_error_text};
 use crate::config::file::USER_CONFIG_FILE;
+use crate::config::toml_text::crlf_to_lf;
 use crate::mcp_types::{McpServerConfig, McpTransportKind, canonical_mcp_name};
 
 /// Parse the user-owned config file under `dir`, hand the document to `edit`
@@ -235,6 +236,8 @@ pub fn list_user_mcp_servers_in(dir: &Path) -> io::Result<UserMcpServers> {
     let Some(content) = read_config_text(&listed.path)? else {
         return Ok(listed);
     };
+    // The parser and the message get the same text (see `toml_text`).
+    let content = crlf_to_lf(&content);
     let mut config: toml::Table = toml::from_str(&content).map_err(|error| {
         unparsable_config_error(
             &listed.path,
@@ -365,6 +368,8 @@ pub fn user_permission_rules_in(dir: &Path) -> io::Result<PermissionRules> {
     let Some(content) = read_config_text(&path)? else {
         return Ok(PermissionRules::default());
     };
+    // The parser and the message get the same text (see `toml_text`).
+    let content = crlf_to_lf(&content);
     let unreadable = |what: String| {
         io::Error::other(format!(
             "{}: cannot read the config: {what}",
@@ -2095,28 +2100,72 @@ mod tests {
             "command = \"x\"\n",
             "env = { TOKEN = \"abc-SECRET }\n",
         );
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(USER_CONFIG_FILE);
-        std::fs::write(&path, content).unwrap();
+        // Saved with LF line ends or with CRLF ones, as Windows editors do:
+        // the same line and column.
+        for content in [content.to_string(), content.replace('\n', "\r\n")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(USER_CONFIG_FILE);
+            std::fs::write(&path, &content).unwrap();
 
-        // Reading it, and every way of editing it, say the same.
-        let errors = [
-            list_user_mcp_servers_in(dir.path()).unwrap_err(),
-            add_user_mcp_server_in(dir.path(), &stdio_server("b", "y")).unwrap_err(),
-            remove_user_mcp_server_in(dir.path(), "a").unwrap_err(),
-            add_user_allow_rule_in(dir.path(), "bash").unwrap_err(),
-        ];
-        for error in errors {
+            // Reading it, and every way of editing it, say the same.
+            let errors = [
+                list_user_mcp_servers_in(dir.path()).unwrap_err(),
+                add_user_mcp_server_in(dir.path(), &stdio_server("b", "y")).unwrap_err(),
+                remove_user_mcp_server_in(dir.path(), "a").unwrap_err(),
+                add_user_allow_rule_in(dir.path(), "bash").unwrap_err(),
+            ];
+            for error in errors {
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "{}: existing config cannot be parsed; fix or remove it before persisting settings (TOML syntax error at line 7, column 30: unclosed inline table, expected `}}`)",
+                        path.display()
+                    ),
+                    "{content:?}"
+                );
+            }
+            // And the file is as it was.
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        }
+    }
+
+    /// The line breaks inside a multi-line string read as LF in a config
+    /// saved with CRLF line ends, as they did with toml 0.8, in what `orca
+    /// mcp list` shows and in the permission rules.
+    #[test]
+    fn the_multi_line_strings_of_a_crlf_config_read_with_lf_in_servers_and_rules() {
+        let lf = concat!(
+            "[[mcp_servers]]\n",
+            "name = \"docs\"\n",
+            "command = \"npx\"\n",
+            "args = [\"-y\", '''one\n",
+            "two''']\n",
+            "env = { NOTE = \"\"\"\n",
+            "first\n",
+            "second\"\"\" }\n",
+            "\n",
+            "[[permissions.rules]]\n",
+            "tool = \"bash\"\n",
+            "pattern = \"\"\"\n",
+            "cargo *\n",
+            "rm\"\"\"\n",
+            "decision = \"deny\"\n",
+        );
+        for content in [lf.to_string(), lf.replace('\n', "\r\n")] {
+            let dir = config_dir_with(&content);
+
+            let servers = list_user_mcp_servers_in(dir.path()).unwrap().servers;
+            let rules = user_permission_rules_in(dir.path()).unwrap().rules;
+
+            assert_eq!(servers.len(), 1, "{content:?}");
+            assert_eq!(servers[0].args, ["-y", "one\ntwo"], "{content:?}");
+            assert_eq!(servers[0].env["NOTE"], "first\nsecond", "{content:?}");
             assert_eq!(
-                error.to_string(),
-                format!(
-                    "{}: existing config cannot be parsed; fix or remove it before persisting settings (TOML syntax error at line 7, column 30: unclosed inline table, expected `}}`)",
-                    path.display()
-                )
+                rules,
+                [PermissionRule::new("bash", "cargo *\nrm", Decision::Deny)],
+                "{content:?}"
             );
         }
-        // And the file is as it was.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
     }
 
     #[test]

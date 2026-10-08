@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use orca_core::capability::{EnforcementState, SandboxEnforcementDecision};
 use orca_core::config::file::{self, ConfigOverrides, FileConfig};
 use orca_core::config::folder_trust::{self, TrustLevel};
+use orca_core::config::toml_text::crlf_to_lf;
 use orca_platform::host::HostPlatform;
 use serde::Serialize;
 
@@ -197,7 +198,7 @@ fn check_config(cwd: &Path) -> DiagnosticCheck {
     let source = path.to_string_lossy();
     if path.exists() {
         match fs::read_to_string(&path).and_then(|content| {
-            toml::from_str::<FileConfig>(&content)
+            toml::from_str::<FileConfig>(&crlf_to_lf(&content))
                 .map(|_| ())
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
         }) {
@@ -259,7 +260,7 @@ fn check_credentials(config_is_usable: bool) -> DiagnosticCheck {
     if config_is_usable
         && let Some(path) = file::user_config_path()
         && let Ok(content) = fs::read_to_string(&path)
-        && let Ok(config) = toml::from_str::<FileConfig>(&content)
+        && let Ok(config) = toml::from_str::<FileConfig>(&crlf_to_lf(&content))
         && config.api_key.is_some_and(|value| !value.trim().is_empty())
     {
         return pass_check("credentials", format!("configured via {}", path.display()));

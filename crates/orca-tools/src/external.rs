@@ -5,6 +5,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use orca_core::config::error_text::{data_error_text, syntax_error_text};
+use orca_core::config::toml_text::crlf_to_lf;
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{
     ToolOutputTruncation, ToolRequest, ToolResult, truncate_output_with_policy,
@@ -62,11 +63,13 @@ pub fn load_external_tools_dir(dir: &Path) -> Vec<ExternalToolConfig> {
 fn read_external_tool(path: &Path, content: &str) -> Result<ExternalToolConfig, String> {
     let failed =
         |what: String| format!("failed to parse external tool '{}': {what}", path.display());
+    // The parser and the message get the same text (see `toml_text`).
+    let content = crlf_to_lf(content);
     // Parsed to a table first, so that a value of the wrong type is named
     // by its key (see `data_error_text`).
     let table = content
         .parse::<toml::Table>()
-        .map_err(|error| failed(syntax_error_text(error.message(), error.span(), content)))?;
+        .map_err(|error| failed(syntax_error_text(error.message(), error.span(), &content)))?;
     let tool = toml::Value::Table(table)
         .try_into::<ExternalToolConfig>()
         .map_err(|error| failed(data_error_text(&error)))?;
@@ -419,6 +422,49 @@ schema = { env = { type = "string", description = "environment" } }
                 "{content}"
             );
             assert!(!warning.contains(value), "{content}: {warning}");
+        }
+    }
+
+    /// A tool file saved with CRLF line ends reads as one saved with LF: the
+    /// line breaks inside a multi-line string are LF, as they were with
+    /// toml 0.8 (a command reaches the shell as written, without CRs), and a
+    /// syntax error is at the same line and column.
+    #[test]
+    fn an_external_tool_file_with_crlf_line_ends_reads_like_one_with_lf() {
+        let path = Path::new("/home/me/.orca/tools/deploy.toml");
+        let lf = concat!(
+            "name = \"deploy\"\n",
+            "description = \"\"\"\n",
+            "Deploys the branch\n",
+            "to staging\"\"\"\n",
+            "action_kind = \"write\"\n",
+            "command = '''\n",
+            "set -e\n",
+            "./scripts/deploy.sh\n",
+            "'''\n",
+        );
+        for content in [lf.to_string(), lf.replace('\n', "\r\n")] {
+            let tool = read_external_tool(path, &content).expect("loads");
+
+            assert_eq!(
+                tool.description, "Deploys the branch\nto staging",
+                "{content:?}"
+            );
+            assert_eq!(tool.command, "set -e\n./scripts/deploy.sh\n", "{content:?}");
+        }
+
+        let broken = "name = \"lookup\"\ndescription = \"looks up\"\naction_kind = \"read\"\ncommand = \"abc-SECRET\n";
+        for content in [broken.to_string(), broken.replace('\n', "\r\n")] {
+            let warning = read_external_tool(path, &content).unwrap_err();
+
+            assert_eq!(
+                warning,
+                format!(
+                    "failed to parse external tool '{}': TOML syntax error at line 4, column 22: invalid basic string, expected `\"`",
+                    path.display()
+                ),
+                "{content:?}"
+            );
         }
     }
 

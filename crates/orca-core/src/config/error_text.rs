@@ -128,12 +128,18 @@ fn code_name<'a>(message: &'a str, start: &str) -> Option<&'a str> {
 }
 
 /// The line and the column, both counted from 1, of byte `offset` in
-/// `source`. The column counts characters.
+/// `source`. The column counts characters. A position between the CR and the
+/// LF of a line end is the end of that line, where a text with LF line ends
+/// puts it: the CR is not counted.
 fn line_and_column(source: &str, offset: usize) -> (usize, usize) {
-    let offset = (0..=offset.min(source.len()))
+    let mut offset = (0..=offset.min(source.len()))
         .rev()
         .find(|&offset| source.is_char_boundary(offset))
         .unwrap_or(0);
+    let bytes = source.as_bytes();
+    if offset > 0 && bytes[offset - 1] == b'\r' && bytes.get(offset) == Some(&b'\n') {
+        offset -= 1;
+    }
     let before = &source[..offset];
     let line = before.matches('\n').count() + 1;
     let column = before
@@ -470,5 +476,19 @@ mod tests {
         assert_eq!(line_and_column(source, source.len() + 40), (3, 5));
         assert_eq!(line_and_column(source, at("é") + 1), (2, 2));
         assert_eq!(line_and_column("", 0), (1, 1));
+    }
+
+    #[test]
+    fn a_position_between_the_cr_and_the_lf_of_a_line_end_is_the_end_of_the_line() {
+        let crlf = "a = 1\r\nb = 2\r\n";
+
+        // On the CR, between it and the LF, and on the next line.
+        assert_eq!(line_and_column(crlf, 5), (1, 6));
+        assert_eq!(line_and_column(crlf, 6), (1, 6));
+        assert_eq!(line_and_column(crlf, 7), (2, 1));
+        // The same line end with an LF only.
+        assert_eq!(line_and_column("a = 1\nb = 2\n", 5), (1, 6));
+        // A CR that no LF follows is a character of its line.
+        assert_eq!(line_and_column("a = 1\rb", 6), (1, 7));
     }
 }
