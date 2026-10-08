@@ -446,6 +446,10 @@ impl AppState {
                 kind,
             } => {
                 if self.suppress_background_main_session_output {
+                    // Nothing of a backgrounded session is shown, but how its
+                    // commands ended is still learned: a reattach settles the
+                    // rows of the conversation from it.
+                    self.learn_command_ends_from_result(&name, &output);
                     return;
                 }
                 if name == "update_plan" {

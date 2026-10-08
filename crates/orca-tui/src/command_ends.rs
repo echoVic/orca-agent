@@ -301,6 +301,20 @@ mod tests {
         .expect("task summary")
     }
 
+    /// The main session, running in the background: a task list that has it
+    /// makes the reducer drop the output of the session.
+    fn backgrounded_main_session() -> BackgroundTaskSummary {
+        serde_json::from_value(json!({
+            "id": "task-main",
+            "type": "main_session",
+            "status": "running",
+            "isBackgrounded": true,
+            "description": "long answer",
+            "createdAtMs": 1,
+        }))
+        .expect("task summary")
+    }
+
     fn restored(id: &str, tool: &str, output: String) -> ChatMessage {
         ChatMessage::ToolCall {
             id: id.to_string(),
@@ -519,6 +533,50 @@ mod tests {
         );
         assert_eq!(note(&state, "call-1").as_deref(), Some("still running"));
         assert_eq!(note(&state, "call-2").as_deref(), Some("state unknown"));
+    }
+
+    #[test]
+    fn commands_seen_while_the_main_session_is_backgrounded_are_known_after_a_reattach() {
+        let mut state = state();
+        state.update(TuiEvent::WorkflowTasksUpdated(vec![
+            backgrounded_main_session(),
+        ]));
+        assert!(
+            state.suppress_background_main_session_output,
+            "the reducer drops the output of a backgrounded session"
+        );
+        let rows = state.transcript.messages.len();
+
+        // The session starts two commands that outlive their calls, and reads
+        // how the first one ended.
+        tool(&mut state, "call-1", "bash", running("task-1"));
+        tool(&mut state, "call-2", "bash", running("task-2"));
+        tool(
+            &mut state,
+            "call-3",
+            "task_read_output",
+            ended("task-1", "completed", 0),
+        );
+        assert_eq!(
+            state.transcript.messages.len(),
+            rows,
+            "nothing of it is shown while it is backgrounded"
+        );
+
+        // Attaching to the session brings its conversation back from history.
+        state.update(TuiEvent::BackgroundTaskOutputAttached {
+            task_id: "task-main".to_string(),
+        });
+        assert!(!state.suppress_background_main_session_output);
+        restore(
+            &mut state,
+            vec![
+                restored("call-1", "bash", running("task-1")),
+                restored("call-2", "bash", running("task-2")),
+            ],
+        );
+        assert_eq!(note(&state, "call-1"), None);
+        assert_eq!(note(&state, "call-2").as_deref(), Some("still running"));
     }
 
     /// The note of the latest bash row; `None` before there is one.
