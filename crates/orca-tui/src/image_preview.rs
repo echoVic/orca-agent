@@ -832,7 +832,9 @@ mod tests {
     /// A terminal below true color has its cell colors reduced on the way out
     /// (`CapabilityBackend`). A Kitty placeholder cell is an image reference,
     /// not text, so it must reach the terminal exactly as the image widget
-    /// wrote it, or the terminal cannot tell which image to show.
+    /// wrote it, or the terminal cannot tell which image to show. In
+    /// Monochrome, which NO_COLOR selects and under which crossterm writes no
+    /// colors, the image id travels in the symbol instead of the cell color.
     #[test]
     fn kitty_placeholders_reach_a_reduced_color_terminal_unchanged() {
         use crate::capability_backend::CapabilityBackend;
@@ -871,7 +873,18 @@ mod tests {
             for (index, cell) in rendered.content().iter().enumerate() {
                 if cell.symbol().contains('\u{10eeee}') {
                     placeholders += 1;
-                    assert_eq!(&drawn.content()[index], cell, "{level:?} cell {index}");
+                    let mut expected = cell.clone();
+                    if level == TerminalColorLevel::Monochrome {
+                        let Color::Rgb(red, green, blue) = cell.fg else {
+                            panic!("{level:?} cell {index} has image id {:?}", cell.fg);
+                        };
+                        expected.set_symbol(&format!(
+                            "\x1b[38;2;{red};{green};{blue}m{}\x1b[39m",
+                            cell.symbol()
+                        ));
+                        expected.fg = Color::Reset;
+                    }
+                    assert_eq!(drawn.content()[index], expected, "{level:?} cell {index}");
                 }
             }
             assert!(placeholders > 0, "{level:?}");

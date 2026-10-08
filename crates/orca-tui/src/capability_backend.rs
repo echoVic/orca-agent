@@ -6,6 +6,7 @@ use std::ops::Range;
 use ratatui::backend::{Backend, ClearType, WindowSize};
 use ratatui::buffer::{Cell, CellWidth};
 use ratatui::layout::{Position, Size};
+use ratatui::style::Color;
 
 use crate::terminal_capabilities::TerminalColorLevel;
 
@@ -13,6 +14,9 @@ use crate::terminal_capabilities::TerminalColorLevel;
 /// an image covers. Such a cell's foreground color is the image id rather than
 /// a color to show, so it has to reach the terminal unchanged.
 const KITTY_IMAGE_PLACEHOLDER: char = '\u{10EEEE}';
+
+/// Sets the foreground back to the terminal's default.
+const DEFAULT_FOREGROUND: &str = "\x1b[39m";
 
 pub(crate) struct CapabilityBackend<B> {
     inner: B,
@@ -30,6 +34,27 @@ impl<B> CapabilityBackend<B> {
 
     pub(crate) fn inner_mut(&mut self) -> &mut B {
         &mut self.inner
+    }
+
+    /// Gives a Kitty placeholder cell back the image id its colors were
+    /// adapted away from. NO_COLOR, which is what selects Monochrome, also
+    /// stops crossterm from writing any color, so there the id goes into the
+    /// symbol as an escape sequence of its own and the cell keeps no color.
+    fn keep_image_id(&self, cell: &mut Cell, image_id: Color) {
+        let foreground = match (self.color_level, image_id) {
+            (TerminalColorLevel::Monochrome, Color::Rgb(red, green, blue)) => {
+                format!("\x1b[38;2;{red};{green};{blue}m")
+            }
+            (TerminalColorLevel::Monochrome, Color::Indexed(index)) => {
+                format!("\x1b[38;5;{index}m")
+            }
+            _ => {
+                cell.fg = image_id;
+                return;
+            }
+        };
+        let symbol = format!("{foreground}{}{DEFAULT_FOREGROUND}", cell.symbol());
+        cell.set_symbol(&symbol);
     }
 }
 
@@ -55,7 +80,7 @@ impl<B: Backend> Backend for CapabilityBackend<B> {
                     .then_some(cell.fg);
                 cell.set_style(self.color_level.adapt_style(cell.style()));
                 if let Some(image_id) = image_id {
-                    cell.fg = image_id;
+                    self.keep_image_id(&mut cell, image_id);
                 }
                 (x, y, cell)
             })
@@ -160,6 +185,7 @@ fn draw_covered_columns_first<C: Borrow<Cell>>(updates: &mut [(u16, u16, C)]) {
 mod tests {
     use std::cell::RefCell;
     use std::io;
+    use std::num::NonZeroU16;
     use std::ops::Range;
 
     use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
@@ -435,6 +461,30 @@ mod tests {
             assert_eq!(drawn.2.diff_option, CellDiffOption::Skip);
             assert!(cell_colors_fit(level, &drawn.2));
         }
+    }
+
+    /// NO_COLOR, which is what selects Monochrome, also stops crossterm from
+    /// writing any color, so a Kitty placeholder's image id travels in the
+    /// symbol: set before the placeholder and back to the default after it.
+    #[test]
+    fn capability_backend_writes_kitty_image_ids_into_the_symbol_in_monochrome() {
+        let mut source = Cell::default();
+        source.set_symbol("\u{10EEEE}\u{0305}\u{0305}");
+        source.set_fg(Color::Rgb(1, 72, 32));
+        source.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
+
+        let mut backend =
+            CapabilityBackend::new(RecordingBackend::default(), TerminalColorLevel::Monochrome);
+        backend.draw(std::iter::once((3, 4, &source))).unwrap();
+
+        let (x, y, drawn) = &backend.inner().drawn[0];
+        assert_eq!((*x, *y), (3, 4));
+        assert_eq!(
+            drawn.symbol(),
+            "\x1b[38;2;1;72;32m\u{10EEEE}\u{0305}\u{0305}\x1b[39m"
+        );
+        assert_eq!(drawn.fg, Color::Reset);
+        assert_eq!(drawn.diff_option, source.diff_option);
     }
 
     #[test]
