@@ -1,8 +1,8 @@
 use crossbeam_channel as mpsc;
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use orca_core::config::RunConfig;
+use ratatui_textarea::TextArea;
 use std::sync::{Arc, Mutex};
-use tui_textarea::TextArea;
 
 use crate::commands;
 use crate::composer_image_actions::handle_composer_image_preview_key;

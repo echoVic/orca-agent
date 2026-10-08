@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crossbeam_channel as mpsc;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
 use orca_runtime::history::SessionTranscript;
@@ -224,7 +224,7 @@ mod tests {
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use ratatui::layout::Rect;
-    use tui_textarea::{Input, Key, TextArea};
+    use ratatui_textarea::{Input, Key, TextArea};
 
     use orca_core::approval_types::ApprovalMode;
     use orca_core::config::{RunConfig, ThemeName, VimInsertEscapeSequence};

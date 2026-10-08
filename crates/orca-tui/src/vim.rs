@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use orca_core::config::VimInsertEscapeSequence;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Block;
-use tui_textarea::{CursorMove, Input, Key, TextArea};
+use ratatui_textarea::{CursorMove, DataCursor, Input, Key, TextArea};
 
 use crate::theme::Theme;
 use crate::vim_command::{
@@ -800,7 +800,7 @@ fn delete_chars(textarea: &mut TextArea<'_>, count: usize) -> Option<String> {
 }
 
 fn delete_to_end(textarea: &mut TextArea<'_>) -> Option<String> {
-    let (row, col) = textarea.cursor();
+    let DataCursor(row, col) = textarea.cursor();
     let suffix = textarea.lines()[row].chars().skip(col).collect::<String>();
     let deleted = if !suffix.is_empty() {
         suffix

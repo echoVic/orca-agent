@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use crate::frame_scheduler::{
     FrameScheduler, IterationEvent, IterationOutcome, run_event_loop_iteration,
@@ -72,7 +72,10 @@ impl RendererFrameOwner {
         &mut self,
         terminal: &mut Terminal<B>,
         presentation: &mut TerminalPresentation,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         resume_terminal_render(terminal, &mut self.scheduler, presentation)
     }
 
@@ -116,6 +119,7 @@ impl RendererFrameOwner {
     ) -> io::Result<()>
     where
         B: Backend,
+        B::Error: std::error::Error + Send + Sync + 'static,
         CopyClipboard: FnOnce(&str),
         WritePending: FnOnce(&mut Terminal<B>, &mut TerminalPresentation, AppStatus),
     {
@@ -128,7 +132,9 @@ impl RendererFrameOwner {
         }
         write_pending(terminal, presentation, state.status);
         if let Some(draw_at) = draw_at {
-            terminal.draw(|frame| ui::render(frame, state, textarea, theme))?;
+            terminal
+                .draw(|frame| ui::render(frame, state, textarea, theme))
+                .map_err(io::Error::other)?;
             self.scheduler.did_draw(draw_at);
         }
         Ok(())
@@ -150,7 +156,7 @@ mod tests {
     use orca_core::config::ThemeName;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use tui_textarea::TextArea;
+    use ratatui_textarea::TextArea;
 
     use super::RendererFrameOwner;
     use crate::protocol::{TuiEvent, UserAction};

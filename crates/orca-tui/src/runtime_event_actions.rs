@@ -1,6 +1,6 @@
 use crossbeam_channel as mpsc;
 
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use crate::action_dispatcher::InteractionResponseAck;
 use crate::bridge;
@@ -251,13 +251,13 @@ mod tests {
     use orca_core::cancel::OperationIdAllocator;
     use orca_core::config::{ThemeName, VimInsertEscapeSequence};
     use orca_runtime::mentions::{MentionBinding, MentionBindings, MentionFileKind, MentionTarget};
+    use ratatui_textarea::CursorMove;
     use std::path::PathBuf;
     use std::time::Instant;
-    use tui_textarea::CursorMove;
 
-    fn vim_insert_input(character: char) -> tui_textarea::Input {
-        tui_textarea::Input {
-            key: tui_textarea::Key::Char(character),
+    fn vim_insert_input(character: char) -> ratatui_textarea::Input {
+        ratatui_textarea::Input {
+            key: ratatui_textarea::Key::Char(character),
             ctrl: false,
             alt: false,
             shift: false,
@@ -1246,8 +1246,8 @@ mod tests {
         assert_eq!(state.status, AppStatus::WaitingUserInput);
         assert!(!vim.has_pending_command_for_test());
         vim.handle(
-            tui_textarea::Input {
-                key: tui_textarea::Key::Char('i'),
+            ratatui_textarea::Input {
+                key: ratatui_textarea::Key::Char('i'),
                 ctrl: false,
                 alt: false,
                 shift: false,

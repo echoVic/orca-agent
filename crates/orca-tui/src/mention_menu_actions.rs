@@ -1,5 +1,5 @@
 use crossterm::event::{Event, KeyCode, KeyEvent};
-use tui_textarea::{Input, TextArea};
+use ratatui_textarea::{Input, TextArea};
 
 use orca_runtime::mentions;
 

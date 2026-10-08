@@ -50,7 +50,7 @@ fn exit_session_id_prefers_the_current_picker_selection() {
         );
     });
 }
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use crate::approval_actions::resolve_approval_option;
 use crate::commands;
@@ -77,9 +77,9 @@ use orca_core::config::{
 };
 use tempfile::tempdir;
 
-fn vim_insert_input(character: char) -> tui_textarea::Input {
-    tui_textarea::Input {
-        key: tui_textarea::Key::Char(character),
+fn vim_insert_input(character: char) -> ratatui_textarea::Input {
+    ratatui_textarea::Input {
+        key: ratatui_textarea::Key::Char(character),
         ctrl: false,
         alt: false,
         shift: false,

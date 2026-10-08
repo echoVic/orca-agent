@@ -1,5 +1,5 @@
 use crossbeam_channel::Receiver;
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use crate::action_dispatcher::InteractionResponseAck;
 use crate::runtime_event_actions::handle_interaction_response_ack;
@@ -35,7 +35,7 @@ impl RendererInteractionAckOwner {
 #[cfg(test)]
 mod tests {
     use crossbeam_channel as mpsc;
-    use tui_textarea::TextArea;
+    use ratatui_textarea::TextArea;
 
     use orca_core::cancel::OperationIdAllocator;
     use orca_core::config::ThemeName;

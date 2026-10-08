@@ -1,7 +1,7 @@
 use crossbeam_channel as mpsc;
 
 use crossterm::event::Event;
-use tui_textarea::{Input, TextArea};
+use ratatui_textarea::{Input, TextArea};
 
 use crate::protocol::UserAction;
 use crate::shortcuts::IdleShortcut;

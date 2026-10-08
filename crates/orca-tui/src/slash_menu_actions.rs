@@ -2,7 +2,7 @@ use crossbeam_channel as mpsc;
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{Event, KeyCode, KeyEvent};
-use tui_textarea::{Input, TextArea};
+use ratatui_textarea::{Input, TextArea};
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{ReasoningEffort, RunConfig};

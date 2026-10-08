@@ -3,7 +3,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{Event, KeyCode, KeyEvent};
-use tui_textarea::{Input, TextArea};
+use ratatui_textarea::{Input, TextArea};
 
 use orca_core::config::RunConfig;
 use orca_core::config::folder_trust::{self, TrustLevel};
@@ -168,6 +168,9 @@ pub(crate) fn handle_setup_key(
             KeyCode::Esc => {
                 return Ok(SetupFlow::Exit(0));
             }
+            // Shift+Tab means nothing in the key field; the editor would
+            // insert indentation for it.
+            KeyCode::BackTab => {}
             _ => {
                 textarea.input(Input::from(ev.clone()));
             }
@@ -468,5 +471,39 @@ mod tests {
         assert!(matches!(flow, SetupFlow::Continue));
         assert_eq!(state.status, AppStatus::Idle);
         assert!(textarea.is_empty());
+    }
+
+    /// The input layer reports Shift+Tab as `BackTab` with Shift held. The
+    /// API key field has no use for it, so it must not type anything there.
+    #[test]
+    fn shift_tab_leaves_the_api_key_field_unchanged() {
+        let mut state = welcome_state();
+        state.setup_step = 1;
+        let mut config = crate::test_support::test_run_config();
+        let shared = Arc::new(Mutex::new(crate::test_support::test_run_config()));
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let vim = VimState::new(false);
+        let mut textarea = make_setup_textarea(&theme);
+        textarea.insert_str("sk-abc");
+
+        let key = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        let flow = handle_setup_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &vim,
+            &theme,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(flow, SetupFlow::Continue));
+        assert_eq!(state.setup_step, 1);
+        assert_eq!(textarea.lines(), ["sk-abc"]);
     }
 }

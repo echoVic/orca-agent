@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crossbeam_channel as mpsc;
 use orca_core::config::{HistoryMode, RunConfig};
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use crate::attachment_routing::accept_attached_tui_event;
 use crate::bridge;
@@ -304,7 +304,7 @@ mod tests {
         ClientUserMessageId, PromptQueueInput, PromptQueueSnapshot, QueuedSubmission,
         QueuedSubmissionId,
     };
-    use tui_textarea::TextArea;
+    use ratatui_textarea::TextArea;
 
     use super::RendererRuntimeEventOwner;
     use crate::bridge;

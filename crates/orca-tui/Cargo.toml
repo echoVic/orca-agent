@@ -17,10 +17,10 @@ orca-file-search = { path = "../orca-file-search" }
 base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-ratatui = { workspace = true, features = ["scrolling-regions", "unstable-rendered-line-info"] }
+ratatui = { workspace = true, features = ["crossterm_0_29", "scrolling-regions", "unstable-rendered-line-info"] }
 ratatui-image = { workspace = true }
 crossterm = { workspace = true }
-tui-textarea = { workspace = true }
+ratatui-textarea = { workspace = true }
 qwertty = { workspace = true }
 image = { workspace = true }
 shlex = { workspace = true }

@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use crossbeam_channel as mpsc;
 use crossterm::event::{Event, MouseButton, MouseEventKind};
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
 
@@ -87,7 +87,7 @@ mod focus_tests {
 #[cfg(test)]
 mod search_paste_tests {
     use crossterm::event::Event;
-    use tui_textarea::TextArea;
+    use ratatui_textarea::TextArea;
 
     use super::handle_paste_event;
     use crate::composer_textarea::textarea_text;
@@ -124,7 +124,7 @@ mod search_paste_tests {
 #[cfg(test)]
 mod image_path_paste_tests {
     use crossterm::event::Event;
-    use tui_textarea::TextArea;
+    use ratatui_textarea::TextArea;
 
     use super::handle_paste_event;
     use crate::clipboard_image::ImagePasteRequest;
@@ -169,7 +169,7 @@ mod image_path_paste_tests {
 mod running_paste_tests {
     use crossterm::event::Event;
     use orca_core::config::ThemeName;
-    use tui_textarea::TextArea;
+    use ratatui_textarea::TextArea;
 
     use super::handle_paste_event;
     use crate::composer_textarea::textarea_text;
@@ -635,7 +635,7 @@ pub(crate) fn handle_mouse_event(
                     crate::ui::composer_click_target(textarea, area, mouse.column, mouse.row)
             {
                 textarea.cancel_selection();
-                textarea.move_cursor(tui_textarea::CursorMove::Jump(row, col));
+                textarea.move_cursor(ratatui_textarea::CursorMove::Jump(row, col));
                 let text = crate::composer_textarea::textarea_text(textarea);
                 let cursor = crate::composer_textarea::textarea_cursor_byte_index(textarea);
                 if let Some(image) = state
@@ -812,7 +812,7 @@ pub(crate) fn handle_mouse_event(
                     if let Some((row, col)) =
                         crate::ui::composer_click_target(textarea, area, column, row)
                     {
-                        textarea.move_cursor(tui_textarea::CursorMove::Jump(row, col));
+                        textarea.move_cursor(ratatui_textarea::CursorMove::Jump(row, col));
                     }
                 }
                 return MouseFlow::Handled;
@@ -900,7 +900,7 @@ mod tests {
     };
     use ratatui::layout::Rect;
     use ratatui::text::Line;
-    use tui_textarea::TextArea;
+    use ratatui_textarea::TextArea;
 
     use super::{
         BatchedInputEvent, MouseFlow, coalesce_input_events, handle_resize_event,

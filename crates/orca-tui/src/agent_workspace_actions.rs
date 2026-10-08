@@ -435,7 +435,7 @@ mod tests {
     /// the ones on screen.
     fn render_once(state: &mut AppState) {
         let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
-        let textarea = tui_textarea::TextArea::default();
+        let textarea = ratatui_textarea::TextArea::default();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
             .expect("test backend");
         terminal
@@ -453,7 +453,7 @@ mod tests {
     }
 
     fn click(state: &mut AppState, (column, row): (u16, u16)) -> MouseFlow {
-        let mut textarea = tui_textarea::TextArea::default();
+        let mut textarea = ratatui_textarea::TextArea::default();
         crate::input_event_actions::handle_mouse_event(
             &crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
                 kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -498,7 +498,7 @@ mod tests {
 
     fn render_sized(state: &mut AppState, width: u16, height: u16) {
         let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
-        let textarea = tui_textarea::TextArea::default();
+        let textarea = ratatui_textarea::TextArea::default();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
                 .expect("test backend");

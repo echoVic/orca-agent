@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel as mpsc;
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
 use orca_runtime::history::SessionTranscript;
@@ -102,6 +102,7 @@ impl<'a, 'text> RendererLoopOwner<'a, 'text> {
     ) -> io::Result<i32>
     where
         B: Backend,
+        B::Error: std::error::Error + Send + Sync + 'static,
         ClearTerminal: FnMut(&mut Terminal<B>) -> io::Result<()>,
         CopyClipboard: FnMut(&str),
         WritePending: FnMut(&mut Terminal<B>, &mut TerminalPresentation, AppStatus),
@@ -198,7 +199,7 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use tui_textarea::TextArea;
+    use ratatui_textarea::TextArea;
 
     use orca_core::config::ThemeName;
     use orca_runtime::history::SessionTranscript;

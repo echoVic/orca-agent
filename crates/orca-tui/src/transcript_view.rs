@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ratatui::layout::Alignment;
+use ratatui::layout::HorizontalAlignment;
 use ratatui::style::Color;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, StyledGrapheme};
@@ -45,11 +45,11 @@ struct CompactWrappedLine {
     /// line as written and only shift their screen columns by it.
     continuation_indent: u16,
     style_runs: Vec<StyleRun>,
-    alignment: Option<Alignment>,
+    alignment: Option<HorizontalAlignment>,
 }
 
 impl CompactWrappedLine {
-    fn new(alignment: Option<Alignment>) -> Self {
+    fn new(alignment: Option<HorizontalAlignment>) -> Self {
         Self {
             text: String::new(),
             row_boundaries: vec![0],
@@ -333,7 +333,10 @@ fn symbol_is_whitespace(symbol: &str) -> bool {
 /// lines, and when the hang would take more than half the width, where
 /// squeezing the text into a sliver reads worse than not hanging it.
 fn hanging_indent(line: &Line<'_>, width: u16) -> u16 {
-    if matches!(line.alignment, Some(Alignment::Center | Alignment::Right)) {
+    if matches!(
+        line.alignment,
+        Some(HorizontalAlignment::Center | HorizontalAlignment::Right)
+    ) {
         return 0;
     }
     // Only the prefix matters, and a prefix of 64 graphemes is already past
@@ -1753,7 +1756,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use ratatui::buffer::Buffer;
-    use ratatui::layout::{Alignment, Rect};
+    use ratatui::layout::{HorizontalAlignment, Rect};
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Paragraph, Widget, Wrap};
@@ -1868,7 +1871,7 @@ mod tests {
             ),
             Span::styled("tail-tail-tail", Style::default().fg(Color::Blue)),
         ])
-        .alignment(Alignment::Center);
+        .alignment(HorizontalAlignment::Center);
         let width = 9;
         let paragraph = Paragraph::new(line.clone()).wrap(Wrap { trim: false });
         let height = paragraph.line_count(width) as u16;
@@ -2544,7 +2547,7 @@ mod tests {
         let line = Line::from("          ten spaces then text".to_string());
         assert_eq!(hanging_indent(&line, 20), 10);
         assert_eq!(hanging_indent(&line, 19), 0);
-        let centred = Line::from(" ●  centred".to_string()).alignment(Alignment::Center);
+        let centred = Line::from(" ●  centred".to_string()).alignment(HorizontalAlignment::Center);
         assert_eq!(hanging_indent(&centred, 80), 0);
     }
 
@@ -3886,5 +3889,39 @@ mod tests {
             cache.last_prepare_visited()
         );
         assert!(cache.reflow_pending_for_test());
+    }
+
+    /// Every row the transcript draws for messages full of emoji sequences,
+    /// flags, CJK and ambiguous-width characters fits the width. Messages
+    /// come out of `build_lines_for_messages` unwrapped; the rows on screen
+    /// are the ones the transcript's own wrapper makes from them.
+    #[test]
+    fn messages_with_emoji_sequences_and_cjk_stay_within_the_width() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let text = "构建完成 👩‍💻 🇨🇳 ™ ½ — 修改了 `foo_bar.rs`，共 12 处：👍🏽 ✔️ ⚠️ ".repeat(3);
+        let (mut lines, mut rows) = (0, 0);
+        for width in [20, 41, 80] {
+            for message in [
+                ChatMessage::Assistant(text.clone()),
+                ChatMessage::User(text.clone()),
+            ] {
+                for line in build_lines_for_messages(
+                    std::slice::from_ref(&message),
+                    &theme,
+                    width,
+                    0,
+                    false,
+                ) {
+                    lines += 1;
+                    let wrapped = super::wrap_line_hanging(&line, width as u16);
+                    for row in wrapped.materialize_rows(0, wrapped.row_count()) {
+                        rows += 1;
+                        assert!(row.width() <= width, "width {width}: {row:?}");
+                    }
+                }
+            }
+        }
+        // The text is far wider than every width, so it must have wrapped.
+        assert!(rows > lines, "{rows} rows from {lines} lines");
     }
 }

@@ -1,6 +1,6 @@
 use crossbeam_channel as mpsc;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use crate::clipboard_image::ImagePasteRequest;
 use crate::composer_textarea::{textarea_cursor_byte_index, textarea_text};
@@ -223,7 +223,7 @@ mod tests {
             )
             .unwrap();
         let mut textarea = TextArea::from([insertion.as_str()]);
-        textarea.move_cursor(tui_textarea::CursorMove::Jump(
+        textarea.move_cursor(ratatui_textarea::CursorMove::Jump(
             0,
             insertion.trim_end().chars().count() as u16,
         ));

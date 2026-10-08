@@ -1,4 +1,4 @@
-use tui_textarea::{Input, Key};
+use ratatui_textarea::{Input, Key};
 
 pub(crate) const MAX_VIM_COUNT: usize = 9_999;
 

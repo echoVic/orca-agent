@@ -3,7 +3,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{Event, KeyCode, KeyEvent};
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
 use orca_runtime::history::SessionTranscript;

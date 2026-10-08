@@ -1,6 +1,5 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::io;
 use std::ops::Range;
 
 use ratatui::backend::{Backend, ClearType, WindowSize};
@@ -8,6 +7,11 @@ use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Size};
 
 use crate::terminal_capabilities::TerminalColorLevel;
+
+/// The character Kitty's unicode-placeholder image protocol puts in every cell
+/// an image covers. Such a cell's foreground color is the image id rather than
+/// a color to show, so it has to reach the terminal unchanged.
+const KITTY_IMAGE_PLACEHOLDER: char = '\u{10EEEE}';
 
 pub(crate) struct CapabilityBackend<B> {
     inner: B,
@@ -29,7 +33,9 @@ impl<B> CapabilityBackend<B> {
 }
 
 impl<B: Backend> Backend for CapabilityBackend<B> {
-    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    type Error = B::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
@@ -40,7 +46,14 @@ impl<B: Backend> Backend for CapabilityBackend<B> {
         let adapted = content
             .map(|(x, y, cell)| {
                 let mut cell = cell.clone();
+                let image_id = cell
+                    .symbol()
+                    .contains(KITTY_IMAGE_PLACEHOLDER)
+                    .then_some(cell.fg);
                 cell.set_style(self.color_level.adapt_style(cell.style()));
+                if let Some(image_id) = image_id {
+                    cell.fg = image_id;
+                }
                 (x, y, cell)
             })
             .collect::<Vec<_>>();
@@ -48,61 +61,65 @@ impl<B: Backend> Backend for CapabilityBackend<B> {
             .draw(adapted.iter().map(|(x, y, cell)| (*x, *y, cell)))
     }
 
-    fn append_lines(&mut self, line_count: u16) -> io::Result<()> {
+    fn append_lines(&mut self, line_count: u16) -> Result<(), Self::Error> {
         self.inner.append_lines(line_count)
     }
 
-    fn hide_cursor(&mut self) -> io::Result<()> {
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
         self.inner.hide_cursor()
     }
 
-    fn show_cursor(&mut self) -> io::Result<()> {
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
         self.inner.show_cursor()
     }
 
-    fn get_cursor_position(&mut self) -> io::Result<Position> {
+    fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
         self.inner.get_cursor_position()
     }
 
-    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> Result<(), Self::Error> {
         self.inner.set_cursor_position(position)
     }
 
     #[allow(deprecated)]
-    fn get_cursor(&mut self) -> io::Result<(u16, u16)> {
+    fn get_cursor(&mut self) -> Result<(u16, u16), Self::Error> {
         self.inner.get_cursor()
     }
 
     #[allow(deprecated)]
-    fn set_cursor(&mut self, x: u16, y: u16) -> io::Result<()> {
+    fn set_cursor(&mut self, x: u16, y: u16) -> Result<(), Self::Error> {
         self.inner.set_cursor(x, y)
     }
 
-    fn clear(&mut self) -> io::Result<()> {
+    fn clear(&mut self) -> Result<(), Self::Error> {
         self.inner.clear()
     }
 
-    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+    fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
         self.inner.clear_region(clear_type)
     }
 
-    fn size(&self) -> io::Result<Size> {
+    fn size(&self) -> Result<Size, Self::Error> {
         self.inner.size()
     }
 
-    fn window_size(&mut self) -> io::Result<WindowSize> {
+    fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
         self.inner.window_size()
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&mut self) -> Result<(), Self::Error> {
         self.inner.flush()
     }
 
-    fn scroll_region_up(&mut self, region: Range<u16>, line_count: u16) -> io::Result<()> {
+    fn scroll_region_up(&mut self, region: Range<u16>, line_count: u16) -> Result<(), Self::Error> {
         self.inner.scroll_region_up(region, line_count)
     }
 
-    fn scroll_region_down(&mut self, region: Range<u16>, line_count: u16) -> io::Result<()> {
+    fn scroll_region_down(
+        &mut self,
+        region: Range<u16>,
+        line_count: u16,
+    ) -> Result<(), Self::Error> {
         self.inner.scroll_region_down(region, line_count)
     }
 }
@@ -114,7 +131,7 @@ mod tests {
     use std::ops::Range;
 
     use ratatui::backend::{Backend, ClearType, WindowSize};
-    use ratatui::buffer::Cell;
+    use ratatui::buffer::{Cell, CellDiffOption};
     use ratatui::layout::{Position, Size};
     use ratatui::style::{Color, Modifier, Style};
 
@@ -165,6 +182,8 @@ mod tests {
     }
 
     impl Backend for RecordingBackend {
+        type Error = io::Error;
+
         fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
         where
             I: Iterator<Item = (u16, u16, &'a Cell)>,
@@ -268,6 +287,8 @@ mod tests {
     }
 
     impl Backend for FailingBackend {
+        type Error = io::Error;
+
         fn draw<'a, I>(&mut self, _content: I) -> io::Result<()>
         where
             I: Iterator<Item = (u16, u16, &'a Cell)>,
@@ -362,7 +383,7 @@ mod tests {
                 .underline_color(Color::Rgb(0, 255, 0))
                 .add_modifier(Modifier::BOLD),
         );
-        source.set_skip(true);
+        source.set_diff_option(CellDiffOption::Skip);
 
         for level in [
             TerminalColorLevel::Ansi256,
@@ -377,7 +398,7 @@ mod tests {
             assert_eq!((drawn.0, drawn.1), (3, 4));
             assert_eq!(drawn.2.symbol(), "界");
             assert_eq!(drawn.2.modifier, Modifier::BOLD);
-            assert!(drawn.2.skip);
+            assert_eq!(drawn.2.diff_option, CellDiffOption::Skip);
             assert!(cell_colors_fit(level, &drawn.2));
         }
     }
@@ -393,7 +414,7 @@ mod tests {
                 .underline_color(Color::Rgb(4, 5, 6))
                 .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         );
-        source.set_skip(true);
+        source.set_diff_option(CellDiffOption::Skip);
 
         let mut backend =
             CapabilityBackend::new(RecordingBackend::default(), TerminalColorLevel::TrueColor);

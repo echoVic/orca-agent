@@ -77,8 +77,8 @@ pub(crate) fn handle_transcript_search_key(key: KeyEvent, state: &mut AppState) 
 mod tests {
     use super::*;
     use crossterm::event::{Event, KeyModifiers};
+    use ratatui_textarea::TextArea;
     use std::sync::{Arc, Mutex};
-    use tui_textarea::TextArea;
 
     use crate::protocol::{TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
     use crate::selection::{SelectionPos, TranscriptSelection};

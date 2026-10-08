@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crossbeam_channel as mpsc;
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
 use orca_runtime::history::SessionTranscript;
@@ -120,7 +120,7 @@ mod tests {
 
     use crossbeam_channel as mpsc;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use tui_textarea::TextArea;
+    use ratatui_textarea::TextArea;
 
     use orca_core::config::ThemeName;
     use orca_runtime::history::SessionTranscript;

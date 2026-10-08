@@ -30,10 +30,10 @@ ignore = "0.4"
 regex = "1"
 nucleo = { git = "https://github.com/helix-editor/nucleo.git", rev = "8c16d47cdfa9607d3e44df5f81c635c6f43c65ee" }
 crossbeam-channel = "0.5"
-crossterm = "0.28"
-ratatui = "0.29"
-ratatui-image = { version = "=9.0.0", default-features = false, features = ["crossterm"] }
-tui-textarea = "0.7"
+crossterm = "0.29"
+ratatui = "0.30.2"
+ratatui-image = { version = "=11.1.0", default-features = false, features = ["crossterm"] }
+ratatui-textarea = "0.9.3"
 qwertty = { version = "=0.1.6", features = ["tokio"] }
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 shlex = "2"
@@ -41,7 +41,7 @@ url = "2"
 supports-color = "3.0.2"
 pulldown-cmark = { version = "0.13", default-features = false }
 unicode-segmentation = "1.13.3"
-unicode-width = "0.2.0"
+unicode-width = "0.2.2"
 zstd = "0.14"
 similar = "3.1.1"
 tempfile = "3.27.0"

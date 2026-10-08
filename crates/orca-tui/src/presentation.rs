@@ -16,14 +16,30 @@ use crate::stdio_guard::RetryWriter;
 pub(crate) type InlineTerminal =
     Terminal<CapabilityBackend<CrosstermBackend<RetryWriter<std::io::Stdout>>>>;
 
+/// Clears the whole screen and makes the next draw repaint every cell, which
+/// is what `Terminal::clear` did for a fullscreen terminal before ratatui 0.30.
+///
+/// Since 0.30 `Terminal::clear` first asks the terminal where the cursor is,
+/// so that it can put the cursor back. The answer comes in on the terminal
+/// input, which the TUI reads itself, so crossterm never sees it and the call
+/// fails after a two-second wait. A resize to the current size clears the
+/// same way without asking, and the next draw places the cursor.
+pub(crate) fn clear_terminal<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    let area = terminal.size()?.into();
+    terminal.resize(area)
+}
+
 pub(crate) fn resume_terminal_render<B: Backend>(
     terminal: &mut Terminal<B>,
     scheduler: &mut FrameScheduler,
     presentation: &mut TerminalPresentation,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     complete_presentation_resume(
         terminal,
-        Terminal::clear,
+        |terminal| clear_terminal(terminal).map_err(io::Error::other),
         |_| presentation.invalidate_title(),
         |_| scheduler.mark_dirty(),
     )
@@ -78,13 +94,111 @@ pub(crate) fn with_terminal_presentation_cleanup<T, R>(
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::convert::Infallible;
     use std::io;
+    use std::ops::Range;
     use std::rc::Rc;
 
+    use ratatui::Terminal;
+    use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
+    use ratatui::buffer::Cell;
+    use ratatui::layout::{Position, Size};
+    use ratatui::widgets::Paragraph;
+
     use super::{
-        complete_presentation_resume, finish_terminal_presentation,
+        clear_terminal, complete_presentation_resume, finish_terminal_presentation,
         initialize_terminal_presentation, with_terminal_presentation_cleanup,
     };
+
+    /// A terminal whose cursor position cannot be read, like the TUI's own:
+    /// the answer to crossterm's query arrives on the input the TUI reads.
+    struct CursorBlindBackend(TestBackend);
+
+    fn infallible<T>(result: Result<T, Infallible>) -> io::Result<T> {
+        result.map_err(|never| match never {})
+    }
+
+    impl Backend for CursorBlindBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            infallible(self.0.draw(content))
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            infallible(self.0.hide_cursor())
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            infallible(self.0.show_cursor())
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            Err(io::Error::other(
+                "The cursor position could not be read within a normal duration",
+            ))
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            infallible(self.0.set_cursor_position(position))
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            infallible(self.0.clear())
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+            infallible(self.0.clear_region(clear_type))
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            infallible(self.0.size())
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            infallible(self.0.window_size())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            infallible(self.0.flush())
+        }
+
+        fn scroll_region_up(&mut self, region: Range<u16>, line_count: u16) -> io::Result<()> {
+            infallible(self.0.scroll_region_up(region, line_count))
+        }
+
+        fn scroll_region_down(&mut self, region: Range<u16>, line_count: u16) -> io::Result<()> {
+            infallible(self.0.scroll_region_down(region, line_count))
+        }
+    }
+
+    #[test]
+    fn clearing_the_terminal_never_asks_where_the_cursor_is() {
+        let draw = |terminal: &mut Terminal<CursorBlindBackend>| {
+            terminal
+                .draw(|frame| frame.render_widget(Paragraph::new("orca"), frame.area()))
+                .map(|_| ())
+                .unwrap();
+        };
+        let mut terminal = Terminal::new(CursorBlindBackend(TestBackend::new(6, 2))).unwrap();
+        draw(&mut terminal);
+
+        clear_terminal(&mut terminal).expect("clearing must not need the cursor position");
+        terminal
+            .backend()
+            .0
+            .assert_buffer_lines(["      ", "      "]);
+
+        // The same frame again is painted in full, not skipped as unchanged.
+        draw(&mut terminal);
+        terminal
+            .backend()
+            .0
+            .assert_buffer_lines(["orca  ", "      "]);
+    }
 
     #[test]
     fn terminal_title_writes_before_initial_draw() {

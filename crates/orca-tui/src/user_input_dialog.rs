@@ -1,6 +1,6 @@
 use crossbeam_channel as mpsc;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use crate::idle_submit_actions::submit_pending_user_input_response;
 use crate::protocol::{

@@ -1,15 +1,15 @@
 use chrono::{DateTime, Utc};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, HorizontalAlignment, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap,
 };
+use ratatui_textarea::{DataCursor, TextArea};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use tui_textarea::TextArea;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -2261,7 +2261,7 @@ fn render_empty_tasks_notice(frame: &mut Frame, area: Rect, theme: &Theme, title
     let block = crate::chrome::panel_block(theme, title, theme.border);
     frame.render_widget(
         Paragraph::new(content)
-            .alignment(Alignment::Center)
+            .alignment(HorizontalAlignment::Center)
             .block(block),
         popup,
     );
@@ -4712,7 +4712,7 @@ fn render_search_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         .chars()
         .count()
         .min(u16::MAX as usize) as u16;
-    textarea.move_cursor(tui_textarea::CursorMove::Jump(0, cursor_column));
+    textarea.move_cursor(ratatui_textarea::CursorMove::Jump(0, cursor_column));
     render_textarea_surface(
         frame,
         Rect::new(area.x + prefix_width, area.y, query_width, 1),
@@ -4798,7 +4798,7 @@ struct TextareaVisualLayout {
     #[cfg_attr(not(test), allow(dead_code))]
     cursor_display_col: usize,
     cursor_cell_width: usize,
-    alignment: Alignment,
+    alignment: HorizontalAlignment,
     rows: Vec<TextareaVisualRow>,
 }
 
@@ -4870,7 +4870,7 @@ fn textarea_visual_layout_with_selection(
         };
     }
 
-    let (cursor_row, cursor_col) = textarea.cursor();
+    let DataCursor(cursor_row, cursor_col) = textarea.cursor();
     let selection = textarea.selection_range();
     let mut visual_lines = Vec::new();
     let mut visual_rows = Vec::new();
@@ -5090,7 +5090,7 @@ fn textarea_visible_start(layout: &TextareaVisualLayout, visible_height: usize) 
 #[cfg_attr(not(test), allow(dead_code))]
 fn visible_textarea_cursor(layout: &TextareaVisualLayout, inner: Rect) -> Option<Position> {
     if inner.is_empty()
-        || layout.alignment != Alignment::Left
+        || layout.alignment != HorizontalAlignment::Left
         || layout.cursor_visual_row >= layout.lines.len()
         || layout
             .cursor_display_col
@@ -6859,7 +6859,7 @@ pub(crate) fn composer_click_target(
     let clicked = (start + (row - inner.y) as usize).min(layout.rows.len() - 1);
     let target = (column - inner.x) as usize;
     if clicked == layout.cursor_visual_row && target == layout.cursor_display_col {
-        let (cursor_row, cursor_col) = textarea.cursor();
+        let DataCursor(cursor_row, cursor_col) = textarea.cursor();
         return Some((
             cursor_row.min(u16::MAX as usize) as u16,
             cursor_col.min(u16::MAX as usize) as u16,
@@ -7688,26 +7688,33 @@ mod tests {
         }
     }
 
+    /// `TestBackend` cannot fail, so its results pass through unchanged.
+    fn infallible<T>(result: Result<T, std::convert::Infallible>) -> std::io::Result<T> {
+        result.map_err(|never| match never {})
+    }
+
     impl Backend for RecordingBackend {
+        type Error = std::io::Error;
+
         fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
         where
             I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
         {
-            self.inner.draw(content)
+            infallible(self.inner.draw(content))
         }
 
         fn hide_cursor(&mut self) -> std::io::Result<()> {
             self.events.lock().unwrap().push(CursorEvent::Hide);
-            self.inner.hide_cursor()
+            infallible(self.inner.hide_cursor())
         }
 
         fn show_cursor(&mut self) -> std::io::Result<()> {
             self.events.lock().unwrap().push(CursorEvent::Show);
-            self.inner.show_cursor()
+            infallible(self.inner.show_cursor())
         }
 
         fn get_cursor_position(&mut self) -> std::io::Result<Position> {
-            self.inner.get_cursor_position()
+            infallible(self.inner.get_cursor_position())
         }
 
         fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
@@ -7716,35 +7723,35 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(CursorEvent::Move(position));
-            self.inner.set_cursor_position(position)
+            infallible(self.inner.set_cursor_position(position))
         }
 
         fn clear(&mut self) -> std::io::Result<()> {
-            self.inner.clear()
+            infallible(self.inner.clear())
         }
 
         fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
-            self.inner.clear_region(clear_type)
+            infallible(self.inner.clear_region(clear_type))
         }
 
         fn append_lines(&mut self, line_count: u16) -> std::io::Result<()> {
-            self.inner.append_lines(line_count)
+            infallible(self.inner.append_lines(line_count))
         }
 
         fn size(&self) -> std::io::Result<ratatui::layout::Size> {
-            self.inner.size()
+            infallible(self.inner.size())
         }
 
         fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
-            self.inner.window_size()
+            infallible(self.inner.window_size())
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            self.inner.flush()
+            infallible(self.inner.flush())
         }
 
         fn scroll_region_up(&mut self, region: Range<u16>, line_count: u16) -> std::io::Result<()> {
-            self.inner.scroll_region_up(region, line_count)
+            infallible(self.inner.scroll_region_up(region, line_count))
         }
 
         fn scroll_region_down(
@@ -7752,7 +7759,7 @@ mod tests {
             region: Range<u16>,
             line_count: u16,
         ) -> std::io::Result<()> {
-            self.inner.scroll_region_down(region, line_count)
+            infallible(self.inner.scroll_region_down(region, line_count))
         }
     }
 
@@ -15550,7 +15557,7 @@ mod tests {
     #[test]
     fn composer_cursor_layout_tracks_ascii_and_cjk_display_columns() {
         let mut textarea = TextArea::from(["ab界c"]);
-        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 3));
+        textarea.move_cursor(ratatui_textarea::CursorMove::Jump(0, 3));
 
         let layout = textarea_visual_layout(&textarea, 20);
 
@@ -15562,7 +15569,7 @@ mod tests {
     #[test]
     fn composer_cursor_layout_tracks_combining_and_emoji_widths() {
         let mut textarea = TextArea::from(["e\u{301}🙂x"]);
-        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 3));
+        textarea.move_cursor(ratatui_textarea::CursorMove::Jump(0, 3));
 
         let layout = textarea_visual_layout(&textarea, 20);
 
@@ -15577,7 +15584,7 @@ mod tests {
         for grapheme in ["👍🏽", "👨‍👩‍👧‍👦", "1️⃣"] {
             let text = format!("a{grapheme}b");
             let mut textarea = TextArea::from([text.as_str()]);
-            textarea.move_cursor(tui_textarea::CursorMove::Jump(
+            textarea.move_cursor(ratatui_textarea::CursorMove::Jump(
                 0,
                 (1 + grapheme.chars().count()) as u16,
             ));
@@ -15598,7 +15605,7 @@ mod tests {
     fn composer_internal_grapheme_cursor_uses_rendered_lead_column() {
         for grapheme in ["e\u{301}", "👍🏽", "1️⃣"] {
             let mut textarea = TextArea::from([grapheme]);
-            textarea.move_cursor(tui_textarea::CursorMove::Forward);
+            textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
 
             let layout = textarea_visual_layout(&textarea, 20);
 
@@ -15613,7 +15620,7 @@ mod tests {
         for (text, width, cursor_grapheme) in [("e\u{301}x", 2, "e\u{301}"), ("👍🏽x", 3, "👍🏽")]
         {
             let mut textarea = TextArea::from([text]);
-            textarea.move_cursor(tui_textarea::CursorMove::Forward);
+            textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
 
             let layout = textarea_visual_layout(&textarea, width);
             let area = Rect::new(0, 0, width as u16, 1);
@@ -15643,7 +15650,7 @@ mod tests {
     fn composer_internal_grapheme_exact_width_uses_rendered_lead_cell() {
         for (grapheme, width) in [("e\u{301}", 1), ("👍🏽", 2), ("1️⃣", 2)] {
             let mut textarea = TextArea::from([grapheme]);
-            textarea.move_cursor(tui_textarea::CursorMove::Forward);
+            textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
 
             let layout = textarea_visual_layout(&textarea, width);
             let inner = Rect::new(7, 9, width as u16, 1);
@@ -15669,7 +15676,7 @@ mod tests {
         for grapheme in ["e\u{301}", "👍🏽", "1️⃣"] {
             let width = 4;
             let mut textarea = TextArea::from([grapheme]);
-            textarea.move_cursor(tui_textarea::CursorMove::Forward);
+            textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
             let layout = textarea_visual_layout(&textarea, width);
             // `composer_click_target` always carves the prompt/rule chrome out of
             // `area`; pad the outer rect so the resulting inner rect keeps the
@@ -15691,7 +15698,7 @@ mod tests {
         for grapheme in ["👍🏽", "👨‍👩‍👧‍👦", "1️⃣"] {
             let text = grapheme.repeat(2);
             let mut textarea = TextArea::from([text.as_str()]);
-            textarea.move_cursor(tui_textarea::CursorMove::Jump(
+            textarea.move_cursor(ratatui_textarea::CursorMove::Jump(
                 0,
                 grapheme.chars().count() as u16,
             ));
@@ -15712,7 +15719,7 @@ mod tests {
     fn composer_grapheme_exact_width_end_uses_styled_synthetic_row() {
         for grapheme in ["👍🏽", "👨‍👩‍👧‍👦", "1️⃣"] {
             let mut textarea = TextArea::from([grapheme]);
-            textarea.move_cursor(tui_textarea::CursorMove::End);
+            textarea.move_cursor(ratatui_textarea::CursorMove::End);
 
             let layout = textarea_visual_layout(&textarea, UnicodeWidthStr::width(grapheme));
 
@@ -15733,7 +15740,7 @@ mod tests {
     fn composer_combining_only_grapheme_keeps_cursor_and_click_target() {
         let text = "\u{301}";
         let mut textarea = TextArea::from([text]);
-        textarea.move_cursor(tui_textarea::CursorMove::End);
+        textarea.move_cursor(ratatui_textarea::CursorMove::End);
 
         let layout = textarea_visual_layout(&textarea, 4);
 
@@ -15757,7 +15764,7 @@ mod tests {
     fn composer_combining_only_grapheme_survives_buffer_render_with_cursor() {
         let text = "\u{301}";
         let mut textarea = TextArea::from([text]);
-        textarea.move_cursor(tui_textarea::CursorMove::End);
+        textarea.move_cursor(ratatui_textarea::CursorMove::End);
         let layout = textarea_visual_layout(&textarea, 4);
         let area = Rect::new(0, 0, 4, 1);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -15779,7 +15786,7 @@ mod tests {
         let mut textarea = TextArea::from([text]);
 
         let start_layout = textarea_visual_layout(&textarea, 4);
-        textarea.move_cursor(tui_textarea::CursorMove::Forward);
+        textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
         let after_mark_layout = textarea_visual_layout(&textarea, 4);
 
         assert_eq!(start_layout.lines[0].to_string(), text);
@@ -15898,8 +15905,8 @@ mod tests {
             let mut textarea =
                 crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
             textarea.insert_str(grapheme);
-            textarea.move_cursor(tui_textarea::CursorMove::Head);
-            textarea.move_cursor(tui_textarea::CursorMove::Forward);
+            textarea.move_cursor(ratatui_textarea::CursorMove::Head);
+            textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
 
@@ -15970,7 +15977,7 @@ mod tests {
     fn exact_width_synthetic_row_completed_draw_uses_next_row_first_cell() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let mut textarea = TextArea::from(["界"]);
-        textarea.move_cursor(tui_textarea::CursorMove::End);
+        textarea.move_cursor(ratatui_textarea::CursorMove::End);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(2, 2)).unwrap();
 
@@ -16529,7 +16536,7 @@ mod tests {
     fn composer_combining_trailing_mark_keeps_cursor_and_click_target() {
         let text = "a \u{301}";
         let mut textarea = TextArea::from([text]);
-        textarea.move_cursor(tui_textarea::CursorMove::End);
+        textarea.move_cursor(ratatui_textarea::CursorMove::End);
 
         let layout = textarea_visual_layout(&textarea, 10);
 
@@ -16572,7 +16579,7 @@ mod tests {
     #[test]
     fn composer_cursor_at_word_wrap_boundary_uses_next_visual_row() {
         let mut textarea = TextArea::from(["alpha bravo"]);
-        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 6));
+        textarea.move_cursor(ratatui_textarea::CursorMove::Jump(0, 6));
 
         let layout = textarea_visual_layout(&textarea, 6);
 
@@ -16583,7 +16590,7 @@ mod tests {
     #[test]
     fn exact_width_line_end_creates_a_synthetic_cursor_row() {
         let mut textarea = TextArea::from(["abcdef"]);
-        textarea.move_cursor(tui_textarea::CursorMove::End);
+        textarea.move_cursor(ratatui_textarea::CursorMove::End);
 
         let layout = textarea_visual_layout(&textarea, 6);
 
@@ -16598,7 +16605,7 @@ mod tests {
     #[test]
     fn zero_width_layout_does_not_create_a_synthetic_cursor_row() {
         let mut textarea = TextArea::from(["abcdef"]);
-        textarea.move_cursor(tui_textarea::CursorMove::End);
+        textarea.move_cursor(ratatui_textarea::CursorMove::End);
 
         let layout = textarea_visual_layout(&textarea, 0);
 
@@ -16608,7 +16615,7 @@ mod tests {
     #[test]
     fn hard_wrapped_token_cursor_uses_display_width_within_chunk() {
         let mut textarea = TextArea::from(["界界界"]);
-        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 2));
+        textarea.move_cursor(ratatui_textarea::CursorMove::Jump(0, 2));
 
         let layout = textarea_visual_layout(&textarea, 4);
 
@@ -16620,8 +16627,8 @@ mod tests {
     fn visible_composer_cursor_includes_origin_border_and_scroll() {
         let mut textarea = TextArea::from(["one", "two", "three", "four"]);
         textarea.set_block(Block::default().borders(Borders::ALL));
-        textarea.move_cursor(tui_textarea::CursorMove::Bottom);
-        textarea.move_cursor(tui_textarea::CursorMove::End);
+        textarea.move_cursor(ratatui_textarea::CursorMove::Bottom);
+        textarea.move_cursor(ratatui_textarea::CursorMove::End);
         let area = Rect::new(10, 5, 12, 4);
         let inner = textarea.block().unwrap().inner(area);
         let layout = textarea_visual_layout(&textarea, inner.width as usize);
@@ -16652,9 +16659,9 @@ mod tests {
         let secret = "密钥abc";
         let mut textarea = crate::composer_textarea::make_setup_textarea(&theme);
         textarea.insert_str(secret);
-        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 1));
+        textarea.move_cursor(ratatui_textarea::CursorMove::Jump(0, 1));
         textarea.start_selection();
-        textarea.move_cursor(tui_textarea::CursorMove::End);
+        textarea.move_cursor(ratatui_textarea::CursorMove::End);
 
         let layout = textarea_visual_layout(&textarea, 2);
 
@@ -16688,9 +16695,9 @@ mod tests {
         let theme = monochrome_theme();
         let mut textarea = TextArea::from(["abc"]);
         textarea.set_cursor_style(Style::default());
-        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 0));
+        textarea.move_cursor(ratatui_textarea::CursorMove::Jump(0, 0));
         textarea.start_selection();
-        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 2));
+        textarea.move_cursor(ratatui_textarea::CursorMove::Jump(0, 2));
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(6, 1)).expect("test backend");
 
@@ -16779,7 +16786,7 @@ mod tests {
         );
 
         let mut exact = TextArea::from(["abcdef"]);
-        exact.move_cursor(tui_textarea::CursorMove::End);
+        exact.move_cursor(ratatui_textarea::CursorMove::End);
         assert_eq!(
             composer_click_target(&exact, area, inner.x, inner.y + 1),
             Some((0, 6))
@@ -16793,7 +16800,7 @@ mod tests {
         assert_eq!(visible_textarea_cursor(&layout, Rect::ZERO), None);
 
         let mut centered = TextArea::default();
-        centered.set_alignment(ratatui::layout::Alignment::Center);
+        centered.set_alignment(ratatui::layout::HorizontalAlignment::Center);
         let layout = textarea_visual_layout(&centered, 10);
         assert_eq!(
             visible_textarea_cursor(&layout, Rect::new(3, 4, 10, 1)),
@@ -16823,7 +16830,7 @@ mod tests {
     #[test]
     fn hardware_cursor_includes_nonzero_origin_without_block() {
         let mut textarea = TextArea::from(["abc"]);
-        textarea.move_cursor(tui_textarea::CursorMove::End);
+        textarea.move_cursor(ratatui_textarea::CursorMove::End);
         let layout = textarea_visual_layout(&textarea, 10);
 
         assert_eq!(layout.lines[0].to_string(), "abc ");
@@ -16858,7 +16865,7 @@ mod tests {
             textarea.insert_char(ch);
         }
         for _ in 0.."bravo".chars().count() {
-            textarea.move_cursor(tui_textarea::CursorMove::Back);
+            textarea.move_cursor(ratatui_textarea::CursorMove::Back);
         }
 
         let layout = textarea_visual_layout(&textarea, 6);

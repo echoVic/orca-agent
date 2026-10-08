@@ -1,4 +1,4 @@
-use tui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 
 use crate::theme::Theme;
 use crate::vim::VimState;
@@ -67,7 +67,7 @@ pub(crate) fn textarea_text(textarea: &TextArea) -> String {
 }
 
 pub(crate) fn textarea_cursor_byte_index(textarea: &TextArea) -> usize {
-    let (row, column) = textarea.cursor();
+    let DataCursor(row, column) = textarea.cursor();
     let mut cursor = 0usize;
     for (index, line) in textarea.lines().iter().enumerate() {
         if index == row {

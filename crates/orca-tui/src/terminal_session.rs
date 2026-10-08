@@ -8,7 +8,7 @@ use ratatui::backend::CrosstermBackend;
 use crate::capability_backend::CapabilityBackend;
 use crate::input_runtime::{InputControl, InputRuntime, InputRuntimeOptions, TerminationTakeover};
 use crate::presentation::{
-    InlineTerminal, finish_terminal_presentation, initialize_terminal_presentation,
+    InlineTerminal, clear_terminal, finish_terminal_presentation, initialize_terminal_presentation,
     with_terminal_presentation_cleanup,
 };
 use crate::renderer_input_wake::RendererInputWakeOwner;
@@ -125,7 +125,7 @@ impl PendingTerminalSession {
             presentation,
             input_runtime,
             InlineTerminal::new,
-            InlineTerminal::clear,
+            clear_terminal,
         )?;
         Ok(ActivatedTerminalSession {
             theme,

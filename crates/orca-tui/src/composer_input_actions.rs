@@ -1,5 +1,5 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use tui_textarea::{Input, TextArea};
+use ratatui_textarea::{Input, TextArea};
 
 use orca_core::config::RunConfig;
 use orca_runtime::mentions;
@@ -460,6 +460,28 @@ mod tests {
     }
 
     #[test]
+    fn word_deletion_keeps_an_identifier_with_underscores_together() {
+        for (text, left) in [
+            ("cargo test foo_bar", "cargo test "),
+            ("提交 foo_bar", "提交 "),
+        ] {
+            let (mut state, config, theme, mut vim, mut textarea) =
+                editor_fixture(text, text.len(), false);
+            let ctrl_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+            assert!(handle_composer_editor_shortcut(
+                &Event::Key(ctrl_w),
+                &ctrl_w,
+                &mut state,
+                &config,
+                &mut textarea,
+                &mut vim,
+                &theme,
+            ));
+            assert_eq!(textarea_text(&textarea), left, "{text:?}");
+        }
+    }
+
+    #[test]
     fn vim_insert_escape_is_owned_by_editor_even_when_draft_is_empty() {
         let (mut state, config, theme, mut vim, mut textarea) = editor_fixture("", 0, true);
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -621,10 +643,10 @@ mod tests {
         let theme = Theme::named(ThemeName::Dark);
         let mut expected_vim = VimState::new(true);
         let mut expected = make_textarea_with_text("abcd", &expected_vim, &theme);
-        expected.move_cursor(tui_textarea::CursorMove::Head);
+        expected.move_cursor(ratatui_textarea::CursorMove::Head);
         let mut vim = VimState::new(true);
         let mut textarea = make_textarea_with_text("abcd", &vim, &theme);
-        textarea.move_cursor(tui_textarea::CursorMove::Head);
+        textarea.move_cursor(ratatui_textarea::CursorMove::Head);
 
         for code in [KeyCode::Tab, KeyCode::Char('x')] {
             let key = KeyEvent::new(code, KeyModifiers::NONE);

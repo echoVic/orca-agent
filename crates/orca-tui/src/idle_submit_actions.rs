@@ -1,7 +1,7 @@
 use crossbeam_channel as mpsc;
 use std::sync::{Arc, Mutex};
 
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
 use orca_runtime::mentions::MentionBindings;

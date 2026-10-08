@@ -11,7 +11,7 @@ use crate::theme::Theme;
 use crate::types::AppState;
 use crate::vim::{PendingInsertEscapeFlow, VimState};
 use orca_core::config::RunConfig;
-use tui_textarea::{Input, TextArea};
+use ratatui_textarea::{Input, TextArea};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PendingInsertEscapeRouting {

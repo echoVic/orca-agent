@@ -3,9 +3,7 @@
 
 use std::io;
 
-use ratatui::Terminal;
-
-use crate::presentation::InlineTerminal;
+use crate::presentation::{InlineTerminal, clear_terminal};
 
 pub(crate) fn clear_terminal_scrollback_with<T>(
     target: &mut T,
@@ -48,6 +46,6 @@ pub(crate) fn clear_terminal_scrollback(terminal: &mut InlineTerminal) -> io::Re
                 .execute(Clear(ClearType::Purge))?;
             Ok(())
         },
-        Terminal::clear,
+        clear_terminal,
     )
 }

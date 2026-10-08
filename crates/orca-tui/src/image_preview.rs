@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::{Resize, StatefulImage};
+use ratatui_image::{FontSize, Resize, StatefulImage};
 use unicode_width::UnicodeWidthStr;
 
 use crate::composer_images::TuiImage;
@@ -158,7 +158,7 @@ impl ImageRenderState {
             NativeImageProtocol::None => None,
             protocol => {
                 #[allow(deprecated)]
-                let mut picker = Picker::from_fontsize(profile.cell_size);
+                let mut picker = Picker::from_fontsize(FontSize::from(profile.cell_size));
                 picker.set_protocol_type(match protocol {
                     NativeImageProtocol::Kitty => ProtocolType::Kitty,
                     NativeImageProtocol::Iterm2 => ProtocolType::Iterm2,
@@ -213,7 +213,7 @@ impl ImageRenderState {
             return false;
         };
         let resize = Resize::Fit(Some(ratatui_image::FilterType::Lanczos3));
-        let fitted = protocol.size_for(resize.clone(), area);
+        let fitted = protocol.size_for(resize.clone(), area.as_size());
         let target = Rect::new(
             area.x + area.width.saturating_sub(fitted.width) / 2,
             area.y + area.height.saturating_sub(fitted.height) / 2,
@@ -829,6 +829,55 @@ mod tests {
         );
     }
 
+    /// A terminal below true color has its cell colors reduced on the way out
+    /// (`CapabilityBackend`). A Kitty placeholder cell is an image reference,
+    /// not text, so it must reach the terminal exactly as the image widget
+    /// wrote it, or the terminal cannot tell which image to show.
+    #[test]
+    fn kitty_placeholders_reach_a_reduced_color_terminal_unchanged() {
+        use crate::capability_backend::CapabilityBackend;
+        use crate::terminal_capabilities::TerminalColorLevel;
+
+        for level in [
+            TerminalColorLevel::Ansi256,
+            TerminalColorLevel::Ansi16,
+            TerminalColorLevel::Monochrome,
+        ] {
+            let mut renderer = ImageRenderState::new(ImageRenderProfile {
+                protocol: NativeImageProtocol::Kitty,
+                cell_size: (10, 20),
+            });
+            let backend = CapabilityBackend::new(ratatui::backend::TestBackend::new(40, 20), level);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+            let rendered = terminal
+                .draw(|frame| {
+                    assert!(renderer.paint_native(
+                        frame,
+                        &image(),
+                        Rect::new(2, 2, 20, 10),
+                        ImageRenderSurface::Viewer,
+                        100,
+                        0,
+                        0,
+                    ));
+                })
+                .unwrap()
+                .buffer
+                .clone();
+
+            let drawn = terminal.backend().inner().buffer();
+            let mut placeholders = 0;
+            for (index, cell) in rendered.content().iter().enumerate() {
+                if cell.symbol().contains('\u{10eeee}') {
+                    placeholders += 1;
+                    assert_eq!(&drawn.content()[index], cell, "{level:?} cell {index}");
+                }
+            }
+            assert!(placeholders > 0, "{level:?}");
+        }
+    }
+
     #[test]
     fn thumbnail_contains_metadata_and_colored_pixels() {
         let lines = thumbnail_lines(
@@ -871,7 +920,7 @@ mod tests {
         ));
         state.push_message(crate::transcript_state::ChatMessage::Image(image()));
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
-        let textarea = tui_textarea::TextArea::default();
+        let textarea = ratatui_textarea::TextArea::default();
         let backend = ratatui::backend::TestBackend::new(80, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
 
@@ -891,7 +940,7 @@ mod tests {
             crate::input_event_actions::handle_mouse_event(
                 &event,
                 &mut state,
-                &mut tui_textarea::TextArea::default(),
+                &mut ratatui_textarea::TextArea::default(),
                 std::time::Instant::now(),
             ),
             crate::input_event_actions::MouseFlow::Handled

@@ -1441,7 +1441,7 @@ mod tests {
 
     struct Renderer {
         state: crate::types::AppState,
-        textarea: tui_textarea::TextArea<'static>,
+        textarea: ratatui_textarea::TextArea<'static>,
         vim: crate::vim::VimState,
         theme: crate::theme::Theme,
         actions: Sender<UserAction>,
@@ -1459,7 +1459,7 @@ mod tests {
                     "mock".into(),
                     "/tmp".into(),
                 ),
-                textarea: tui_textarea::TextArea::default(),
+                textarea: ratatui_textarea::TextArea::default(),
                 vim: crate::vim::VimState::new(false),
                 theme: crate::theme::Theme::named(orca_core::config::ThemeName::Dark),
                 actions,

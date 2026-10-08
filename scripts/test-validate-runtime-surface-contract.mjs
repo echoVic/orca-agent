@@ -1882,7 +1882,7 @@ expectFailure(
     ],
     [
       "terminal draw",
-      /terminal\.draw\(/,
+      /terminal\s*\.draw\(/,
       "terminal.removed_draw(",
       /\.draw\(/,
       /renderer_frame source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_frame\.rs/,
@@ -2225,8 +2225,8 @@ expectFailure(
     ],
     [
       "startup clear",
-      /InlineTerminal::clear,/,
-      "InlineTerminal::removed_clear,",
+      /InlineTerminal::new,\s*clear_terminal,/,
+      "InlineTerminal::new, removed_clear_terminal,",
       /clear_calls/,
     ],
   ]) {
