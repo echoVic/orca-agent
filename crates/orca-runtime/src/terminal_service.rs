@@ -2209,8 +2209,11 @@ mod tests {
         } else {
             "sleep 60"
         };
+        // Long enough that process startup cannot consume it (PowerShell on a
+        // Windows runner can take longer than half a second to start), so the
+        // call still returns with the command running.
         let deadline = ExecutionDeadline {
-            after: Duration::from_millis(500),
+            after: Duration::from_millis(1_500),
             source: "caller timeout_ms",
         };
         let started = start(
