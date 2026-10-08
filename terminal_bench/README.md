@@ -75,6 +75,24 @@ Terminal-Bench containers use various base images with different glibc versions.
 The release binary (`x86_64-unknown-linux-gnu`) requires glibc 2.39+, which many
 task containers lack. The static musl binary works universally.
 
+## CA certificates in the task container
+
+Orca checks TLS certificates against the operating system's trust store and, since
+its move to reqwest 0.13, has no root certificates compiled in. The adapter copies
+the static binary into each task container and runs it there, so the trust store
+that matters is the container's, not the host's.
+
+- A task image without a CA bundle (no `ca-certificates` package) leaves Orca unable
+  to build any HTTP client, so every turn fails with
+  `No CA certificates were loaded from the system`. Plain `http://` endpoints fail
+  too: no client is built, so nothing is sent.
+- A task that edits the container's CA store can also break Orca's own connection to
+  the model API, because Orca reads the store again for every request to the model.
+
+The adapter does not install or ship a CA bundle today, and how it should is still
+open: install `ca-certificates` in the container, or ship a CA bundle beside the
+binary (on Linux, Orca reads one from `SSL_CERT_FILE`).
+
 ## Filtering Tasks
 
 ```bash

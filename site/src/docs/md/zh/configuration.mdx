@@ -109,8 +109,8 @@ export ORCA_API_KEY="sk-..."
 
 Orca 用操作系统的证书库验证 HTTPS 证书：macOS 用钥匙串，Windows 用系统证书存储，Linux 用系统的 CA 证书包。
 
-- 公司的代理或网关用自己的 CA 时，把这张 CA 装进系统证书库就行，Orca 不需要额外设置。
-- 精简版的 Linux（比如最小化的容器镜像）要先安装 `ca-certificates`，否则 HTTPS 请求会因为找不到根证书而失败。
+- 公司的代理或网关用自己的 CA 时，把这张 CA 装进系统证书库就行，Orca 不需要额外设置。在 Linux 上，如果没有 root 权限，可以用环境变量 `SSL_CERT_FILE` 和 `SSL_CERT_DIR` 让 Orca 改读你指定的 CA 证书包或证书目录，不再读取系统位置，所以指定的证书包或目录要包含你用到的所有根证书，不能只放公司的那一张。
+- 精简版的 Linux（比如最小化的容器镜像）要先安装 `ca-certificates`，否则 Orca 根本创建不了 HTTP 客户端，所有请求都会失败，纯 HTTP 也不例外：本地的 `http://` MCP 服务器，或以 `http://` 开头的 `base_url`。
 - `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 环境变量照常生效。
 
 ## 目录信任

@@ -117,8 +117,8 @@ TOML settings to catch it before a task run.
 
 Orca checks HTTPS certificates against the operating system's trust store: the keychain on macOS, the system certificate store on Windows, and the system CA bundle on Linux.
 
-- If your company's proxy or gateway uses its own CA, install that CA in the system trust store. Orca needs no setting of its own.
-- On a minimal Linux system, such as a slim container image, install `ca-certificates` first. Otherwise HTTPS requests fail because no root certificates are found.
+- If your company's proxy or gateway uses its own CA, install that CA in the system trust store. Orca needs no setting of its own. On Linux, if you lack root access, the `SSL_CERT_FILE` and `SSL_CERT_DIR` environment variables point Orca at a CA bundle or a directory of certificates instead of the system locations, so what they point at must hold every root you need, not only your company's CA.
+- On a minimal Linux system, such as a slim container image, install `ca-certificates` first. Otherwise Orca cannot create its HTTP client at all, so every request fails, plain HTTP included: a local `http://` MCP server, or a `base_url` that starts with `http://`.
 - The `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` environment variables work as before.
 
 ## Folder trust
