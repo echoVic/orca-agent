@@ -82,16 +82,22 @@ its move to reqwest 0.13, has no root certificates compiled in. The adapter copi
 the static binary into each task container and runs it there, so the trust store
 that matters is the container's, not the host's.
 
-- A task image without a CA bundle (no `ca-certificates` package) leaves Orca unable
-  to build any HTTP client, so every turn fails with
-  `No CA certificates were loaded from the system`. Plain `http://` endpoints fail
-  too: no client is built, so nothing is sent.
+- A task image without a CA bundle (no `ca-certificates` package) would leave Orca
+  unable to build any HTTP client, so every turn would fail with
+  `No CA certificates were loaded from the system`. Plain `http://` endpoints would
+  fail too: no client is built, so nothing is sent.
 - A task that edits the container's CA store can also break Orca's own connection to
   the model API, because Orca reads the store again for every request to the model.
 
-The adapter does not install or ship a CA bundle today, and how it should is still
-open: install `ca-certificates` in the container, or ship a CA bundle beside the
-binary (on Linux, Orca reads one from `SSL_CERT_FILE`).
+So the adapter ships a CA bundle with the binary: during setup it copies the bundle of
+Harbor's own Python environment (`certifi`) to `/usr/local/share/orca/cacert.pem` in
+the container. When Orca starts, the bundle is used only if the container has no CA
+bundle of its own (none of the bundle files Orca looks for on Linux, such as
+`/etc/ssl/certs/ca-certificates.crt`, exists and is non-empty) and `SSL_CERT_FILE` is
+not already set; then the adapter sets `SSL_CERT_FILE` to it. Commands the agent runs
+inherit that variable, so in such a container they trust the same bundle. A container
+that has a trust store keeps using it unchanged. If Harbor's environment has no
+`certifi`, or the copy fails, setup goes on without the bundle.
 
 ## Filtering Tasks
 

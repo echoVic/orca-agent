@@ -2,13 +2,14 @@ import asyncio
 import json
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 def _install_harbor_stubs() -> None:
@@ -76,7 +77,8 @@ class OrcaInstalledAgentTests(unittest.TestCase):
             text=True,
         )
 
-    def test_install_copies_the_binary_before_the_optional_packages(self) -> None:
+    @patch("terminal_bench.orca_agent._host_ca_bundle", return_value=None)
+    def test_install_copies_the_binary_before_the_optional_packages(self, _) -> None:
         agent = orca_agent.OrcaInstalledAgent()
         agent.exec_as_root = AsyncMock(
             return_value=SimpleNamespace(stdout="", stderr="", return_code=0)
@@ -106,7 +108,8 @@ class OrcaInstalledAgentTests(unittest.TestCase):
             )
         self.assertGreater(orca_agent.DEFAULT_SETUP_TIMEOUT_SEC, 360)
 
-    def test_install_honours_an_explicit_setup_budget(self) -> None:
+    @patch("terminal_bench.orca_agent._host_ca_bundle", return_value=None)
+    def test_install_honours_an_explicit_setup_budget(self, _) -> None:
         agent = orca_agent.OrcaInstalledAgent(override_setup_timeout_sec=1500)
         agent.exec_as_root = AsyncMock(
             return_value=SimpleNamespace(stdout="", stderr="", return_code=0)
@@ -118,6 +121,110 @@ class OrcaInstalledAgentTests(unittest.TestCase):
             [call.kwargs["timeout_sec"] for call in agent.exec_as_root.await_args_list],
             [1500, 1500],
         )
+
+    @patch("terminal_bench.orca_agent._host_ca_bundle", return_value="/host/cacert.pem")
+    def test_install_ships_a_ca_bundle_once_the_binary_is_in_place(self, _) -> None:
+        steps = []
+        agent = orca_agent.OrcaInstalledAgent()
+
+        async def exec_as_root(environment, command, timeout_sec):
+            steps.append(("exec", command))
+            return SimpleNamespace(stdout="", stderr="", return_code=0)
+
+        async def upload_file(source, target):
+            steps.append(("upload", source, target))
+
+        agent.exec_as_root = exec_as_root
+        asyncio.run(agent.install(SimpleNamespace(upload_file=upload_file)))
+
+        self.assertEqual([step[0] for step in steps], ["exec", "upload", "exec"])
+        self.assertIn("cp /mnt/orca-bin/orca /usr/local/bin/orca", steps[0][1])
+        self.assertIn(f"mkdir -p {orca_agent.CA_BUNDLE_DIR}", steps[0][1])
+        self.assertEqual(
+            steps[1], ("upload", "/host/cacert.pem", orca_agent.CA_BUNDLE_IN_CONTAINER)
+        )
+
+    @patch("terminal_bench.orca_agent._host_ca_bundle", return_value="/host/cacert.pem")
+    def test_install_goes_on_when_the_ca_bundle_cannot_be_copied(self, _) -> None:
+        agent = orca_agent.OrcaInstalledAgent()
+        agent.logger = SimpleNamespace(warning=Mock())
+        agent.exec_as_root = AsyncMock(
+            return_value=SimpleNamespace(stdout="", stderr="", return_code=0)
+        )
+        environment = SimpleNamespace(
+            upload_file=AsyncMock(side_effect=RuntimeError("no space left"))
+        )
+
+        asyncio.run(agent.install(environment))
+
+        self.assertEqual(agent.exec_as_root.await_count, 2)
+        agent.logger.warning.assert_called_once()
+
+    @patch("terminal_bench.orca_agent._host_ca_bundle", return_value=None)
+    def test_install_without_a_ca_bundle_copies_none(self, _) -> None:
+        agent = orca_agent.OrcaInstalledAgent()
+        agent.exec_as_root = AsyncMock(
+            return_value=SimpleNamespace(stdout="", stderr="", return_code=0)
+        )
+        environment = SimpleNamespace(upload_file=AsyncMock())
+
+        asyncio.run(agent.install(environment))
+
+        environment.upload_file.assert_not_awaited()
+        self.assertEqual(agent.exec_as_root.await_count, 2)
+
+    def test_the_ca_bundle_is_used_only_where_the_container_has_none(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "orca" / "cacert.pem"
+            system = Path(directory) / "etc" / "ca-certificates.crt"
+            snippet = orca_agent._ca_bundle_fallback(
+                str(bundle), (str(Path(directory) / "missing.pem"), str(system))
+            )
+
+            def cert_file(preset: str | None = None) -> str:
+                env = {"PATH": os.environ["PATH"]}
+                if preset is not None:
+                    env["SSL_CERT_FILE"] = preset
+                return subprocess.run(
+                    ["sh", "-c", snippet + 'printf %s "${SSL_CERT_FILE:-}"'],
+                    capture_output=True,
+                    check=True,
+                    env=env,
+                    text=True,
+                ).stdout
+
+            # No bundle was copied: nothing to point at.
+            self.assertEqual(cert_file(), "")
+            bundle.parent.mkdir()
+            bundle.write_text("bundle")
+            # The container has no CA bundle of its own.
+            self.assertEqual(cert_file(), str(bundle))
+            # A variable the task environment already sets is left alone.
+            self.assertEqual(cert_file("/task/ca.pem"), "/task/ca.pem")
+            # An empty system bundle does not count; a non-empty one does.
+            system.parent.mkdir()
+            system.write_text("")
+            self.assertEqual(cert_file(), str(bundle))
+            system.write_text("system")
+            self.assertEqual(cert_file(), "")
+
+    def test_run_checks_for_the_ca_bundle_before_starting_orca(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = orca_agent.OrcaInstalledAgent()
+            agent.logs_dir = Path(directory)
+            environment = SimpleNamespace(
+                exec=AsyncMock(
+                    return_value=SimpleNamespace(stdout="", stderr="", return_code=0)
+                ),
+                download_file=AsyncMock(side_effect=FileNotFoundError("absent")),
+            )
+
+            asyncio.run(agent.run("finish the task", environment, orca_agent.AgentContext()))
+
+            command = environment.exec.await_args.kwargs["command"]
+            fallback = orca_agent._ca_bundle_fallback()
+            self.assertIn(fallback, command)
+            self.assertLess(command.index(fallback), command.index("orca exec"))
 
     def test_run_persists_trajectory_without_extending_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

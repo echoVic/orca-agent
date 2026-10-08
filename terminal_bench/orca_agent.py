@@ -48,6 +48,25 @@ PROVIDER_ENV = (
 #: Usage counters reported in `execution_metadata.json` for post-mortems.
 USAGE_FIELDS = ("turns", "output_tokens", "input_tokens", "cache_tokens", "cost_usd_micros")
 
+#: Where the adapter puts a CA bundle in the task container. Orca checks TLS
+#: certificates against the system trust store and has none compiled in, so on
+#: an image without one it cannot build an HTTP client at all.
+CA_BUNDLE_DIR = "/usr/local/share/orca"
+CA_BUNDLE_IN_CONTAINER = f"{CA_BUNDLE_DIR}/cacert.pem"
+
+#: The CA bundle files Orca looks for on Linux (the list `openssl-probe` checks
+#: for rustls-native-certs). The adapter's bundle is used only when none exists.
+SYSTEM_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/tls/cacert.pem",
+    "/etc/ssl/cert.pem",
+    "/opt/etc/ssl/certs/ca-certificates.crt",
+    "/etc/ssl/certs/cacert.pem",
+)
+
 #: Budget for the install step. Harbor's agent-setup timeout defaults to a fixed
 #: 360 s, which an `apt-get update` on a slow image used to exhaust before Orca
 #: ever started (issue #60); the adapter asks Harbor for more and overrides the
@@ -64,6 +83,35 @@ def _load_api_key() -> str:
         if key := data.get("DEEPSEEK_API_KEY"):
             return key
     return os.environ.get("ORCA_API_KEY", "")
+
+
+def _host_ca_bundle() -> str | None:
+    """The CA bundle shipped into the container: certifi's, when Harbor has it."""
+    try:
+        import certifi
+    except ImportError:
+        return None
+    path = certifi.where()
+    return path if os.path.isfile(path) else None
+
+
+def _ca_bundle_fallback(
+    bundle: str = CA_BUNDLE_IN_CONTAINER,
+    system_bundles: tuple[str, ...] = SYSTEM_CA_BUNDLES,
+) -> str:
+    """Shell that points Orca at `bundle` when the container has no CA bundle.
+
+    The variable is exported only then: a task's own commands inherit it, and a
+    container that has a trust store keeps using it unchanged.
+    """
+    has_system_bundle = " || ".join(
+        f"[ -s {shlex.quote(path)} ]" for path in system_bundles
+    )
+    quoted = shlex.quote(bundle)
+    return (
+        f'if [ -z "${{SSL_CERT_FILE:-}}" ] && [ -s {quoted} ]'
+        f" && ! {{ {has_system_bundle}; }}; then export SSL_CERT_FILE={quoted}; fi; "
+    )
 
 
 def _usage_summary(events: list[dict]) -> dict:
@@ -155,9 +203,20 @@ class OrcaInstalledAgent(BaseInstalledAgent):
             command=(
                 "cp /mnt/orca-bin/orca /usr/local/bin/orca"
                 " && chmod +x /usr/local/bin/orca"
+                f" && {{ mkdir -p {CA_BUNDLE_DIR} || true; }}"
             ),
             timeout_sec=self._install_exec_timeout_sec,
         )
+        # A CA bundle rides along for images that have none (see
+        # `_ca_bundle_fallback`). Without it Orca can still run wherever the image
+        # has a trust store, so a missing or failed copy never fails the setup.
+        if bundle := _host_ca_bundle():
+            try:
+                await environment.upload_file(bundle, CA_BUNDLE_IN_CONTAINER)
+            except Exception as error:  # noqa: BLE001 - the bundle is a fallback
+                self.logger.warning(
+                    "orca-adapter: CA bundle not copied, continuing: %s", error
+                )
         # `git` and `ripgrep` are conveniences, not prerequisites: Orca's own
         # tools do not need them and the agent can install whatever a task
         # requires through its own shell tool, whose budget is far larger than
@@ -214,6 +273,7 @@ class OrcaInstalledAgent(BaseInstalledAgent):
         # command lines; keeping its text out of the Orca argv prevents a
         # cleanup command from matching and killing this session (issue #114).
         cmd = (
+            f"{_ca_bundle_fallback()}"
             f"printf '%s' {shlex.quote(instruction)} | orca exec"
             f" --mode full-auto"
             f" --output-format jsonl"
