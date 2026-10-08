@@ -14,15 +14,121 @@ function fail(message) {
   throw new Error(`http client boundary: ${message}`);
 }
 
-// A `use` declaration at the start of a line. It names an item without
-// calling it, so the call patterns look at the source without it.
-const importDeclaration = /^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?use[ \t]+[^;]+;/gm;
+// A `use` declaration, with the visibility it may start with. Only one that
+// starts an item is a declaration: see `startsItem`.
+const declaration = /(?:\bpub(?:\s*\([^)]*\))?\s+)?\buse\s+([^;]+);/g;
 
 function trackedRustSources() {
   return execFileSync("git", ["ls-files", "crates", "-z"], { cwd: repoRoot })
     .toString()
     .split("\0")
     .filter((file) => file.endsWith(".rs"));
+}
+
+const identifierCharacter = /[\p{L}\p{N}_]/u;
+// A raw string literal up to its opening quote, with its `#`s: `r#"`, `br"`.
+const rawStringStart = /(?:br|cr|r)(#*)"/y;
+// A character literal, as against the tick of a lifetime or a label.
+const characterLiteral = /'(?:\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\}|[^\r\n])|[^\\'\r\n])'/uy;
+
+// The opening of the raw string literal that starts at `at`, if one does:
+// the match of `r#"`, `br"` and the like, and the `#`s in it.
+function rawStringAt(source, at) {
+  if (!"rbc".includes(source[at]) || identifierCharacter.test(source[at - 1] ?? "")) {
+    return null;
+  }
+  rawStringStart.lastIndex = at;
+  return rawStringStart.exec(source);
+}
+
+// `source` as the compiler reads code: comments (`//`, `///`, `//!` and
+// `/* … */`, which nest) are blanked out, and so are the insides of string
+// and character literals, with every line break kept. A word in a comment, or
+// text in a string, is then never taken for a `use` or a call, and a `//` in
+// a string never starts a comment. Throws when a block comment or a literal
+// never ends: what follows would be skipped unseen, and Rust that compiles
+// has none.
+export function codeOnly(source) {
+  const pieces = [];
+  let copied = 0; // source[0, copied) is in `pieces`
+  let at = 0;
+  const blankOut = (end) => {
+    pieces.push(source.slice(copied, at), source.slice(at, end).replace(/[^\r\n]/g, " "));
+    copied = end;
+    at = end;
+  };
+  while (at < source.length) {
+    const character = source[at];
+    if (character === "/" && source[at + 1] === "/") {
+      const lineEnd = source.indexOf("\n", at);
+      blankOut(lineEnd === -1 ? source.length : lineEnd);
+    } else if (character === "/" && source[at + 1] === "*") {
+      let depth = 1;
+      let end = at + 2;
+      while (depth > 0 && end < source.length) {
+        if (source.startsWith("/*", end)) {
+          depth += 1;
+          end += 2;
+        } else if (source.startsWith("*/", end)) {
+          depth -= 1;
+          end += 2;
+        } else {
+          end += 1;
+        }
+      }
+      if (depth > 0) {
+        throw new Error("a block comment never ends");
+      }
+      blankOut(end);
+    } else if (character === '"') {
+      let end = at + 1;
+      while (end < source.length && source[end] !== '"') {
+        end += source[end] === "\\" ? 2 : 1;
+      }
+      if (end >= source.length) {
+        throw new Error("a string literal never ends");
+      }
+      blankOut(end + 1);
+    } else if (rawStringAt(source, at)) {
+      const [opening, hashes] = rawStringAt(source, at);
+      const closing = `"${hashes}`;
+      const close = source.indexOf(closing, at + opening.length);
+      if (close === -1) {
+        throw new Error("a raw string literal never ends");
+      }
+      blankOut(close + closing.length);
+    } else if (character === "'") {
+      characterLiteral.lastIndex = at;
+      const literal = characterLiteral.exec(source);
+      if (literal) {
+        blankOut(at + literal[0].length);
+      } else {
+        at += 1; // the tick of a lifetime or a label
+      }
+    } else {
+      at += 1;
+    }
+  }
+  pieces.push(source.slice(copied));
+  return pieces.join("");
+}
+
+// Whether an item starts at `index` of `code`: it is the first thing in the
+// file, or follows `;`, `{`, `}` or the `]` that ends an attribute.
+function startsItem(code, index) {
+  let before = index - 1;
+  while (before >= 0 && /\s/.test(code[before])) {
+    before -= 1;
+  }
+  return before < 0 || ";{}]".includes(code[before]);
+}
+
+// `code` without its `use` declarations. A declaration names an item without
+// calling it, so the call patterns look at the code without them.
+function withoutImports(code) {
+  return code.replace(declaration, (match, _tree, index) =>
+    startsItem(code, index) ? match.replace(/[^\r\n]/g, " ") : match,
+  );
 }
 
 // What a `use` brings in, one leaf per name:
@@ -91,15 +197,18 @@ function useLeaves(tree) {
 // `use reqwest::Client;`, `use reqwest::blocking::{Client as BlockingClient, …};`,
 // `use reqwest::blocking;`, `use reqwest as http;`, `use reqwest::blocking::*;`,
 // `type Http = reqwest::Client;`, …
-function reqwestNames(source) {
+function reqwestNames(code) {
   const names = {
     crate: new Set(["reqwest"]),
     blocking: new Set(),
     clientTypes: new Set(),
     getFunctions: new Set(),
   };
-  for (const [, tree] of source.matchAll(/\buse\s+([^;]+);/g)) {
-    for (const { path: leaf, alias } of useLeaves(tree)) {
+  for (const match of code.matchAll(declaration)) {
+    if (!startsItem(code, match.index)) {
+      continue;
+    }
+    for (const { path: leaf, alias } of useLeaves(match[1])) {
       if (leaf[0] !== "reqwest") {
         continue;
       }
@@ -125,12 +234,12 @@ function reqwestNames(source) {
       }
     }
   }
-  for (const [, name] of source.matchAll(
+  for (const [, name] of code.matchAll(
     /\btype\s+(\w+)\s*=\s*(?:::)?reqwest::(?:blocking::)?(?:Client|ClientBuilder)\s*;/g,
   )) {
     names.clientTypes.add(name);
   }
-  for (const [, name] of source.matchAll(/\bextern\s+crate\s+reqwest\s+as\s+(\w+)\s*;/g)) {
+  for (const [, name] of code.matchAll(/\bextern\s+crate\s+reqwest\s+as\s+(\w+)\s*;/g)) {
     names.crate.add(name);
   }
   return names;
@@ -140,8 +249,8 @@ function reqwestNames(source) {
 // `Client::builder()`, `Client::default()` and the same of `ClientBuilder`,
 // and `get(url)`, which builds a client of its own; for reqwest and for
 // reqwest::blocking, qualified or through the names the file gave them.
-function directClientPatterns(source) {
-  const { crate, blocking, clientTypes, getFunctions } = reqwestNames(source);
+function directClientPatterns(code) {
+  const { crate, blocking, clientTypes, getFunctions } = reqwestNames(code);
   const any = (set) => [...set].join("|");
   const build = "(?:new|builder|default)";
   const patterns = [
@@ -174,8 +283,14 @@ export function validateHttpClientBoundary({ sourceOverrides = new Map() } = {})
     if (!source.includes("reqwest")) {
       continue;
     }
-    const calls = source.replace(importDeclaration, "");
-    if (directClientPatterns(source).some((pattern) => pattern.test(calls))) {
+    let code;
+    try {
+      code = codeOnly(source);
+    } catch (error) {
+      fail(`cannot read ${relativePath}: ${error.message}`);
+    }
+    const calls = withoutImports(code);
+    if (directClientPatterns(code).some((pattern) => pattern.test(calls))) {
       fail(`direct reqwest client in ${relativePath}; build it with orca_mcp::http`);
     }
   }
