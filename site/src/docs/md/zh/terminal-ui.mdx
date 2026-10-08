@@ -108,7 +108,7 @@
 
 ## 后台任务与任务 dock
 
-后台运行的轮次、agent 和长时间运行的命令，会显示在对话下方的任务 dock 里：
+后台运行的轮次和 agent 会显示在对话下方的任务 dock 里：
 
 ~~~text
  ◆ Tasks · 1 active · 1 needs approval
@@ -119,6 +119,8 @@
 - `/tasks` 显示或隐藏 dock，`Esc` 关闭。
 - 放到后台的轮次会停在第一个需要你答复的工具调用上。在 dock 里按 `Enter`（输入框需为空）或点击那一行，就能打开这个审批。如果按你当前的审批模式这个工具本来不用问，轮次会自己继续，并给出提示。
 - 你空闲时后台 agent 完成了，Orca 会带着它们的结果继续对话。
+
+`bash` 调用返回时仍在运行的 shell 命令会转到后台继续跑，但不显示在 dock 里。对话里它那一行先显示 `still running`，命令结束后改为显示结束方式，你空闲时也一样：正常退出（退出码 0）不加标签，否则显示 `exit N`、`timed out`、`stopped`、`cancelled`，拿不到退出码时显示 `failed`。恢复会话后，如果 Orca 退出时命令还在运行，那一行显示 `state unknown`。
 
 `/agents` 打开 Agent Workspace，列出所有任务及其状态。选中一个后按 `Enter`：
 

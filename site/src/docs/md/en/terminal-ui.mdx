@@ -141,8 +141,7 @@ Entering full-auto asks for confirmation first. See
 
 ## Background work and the tasks dock
 
-Background turns, agents, and long-running commands appear in the tasks dock
-under the conversation:
+Background turns and agents appear in the tasks dock under the conversation:
 
 ~~~text
  ◆ Tasks · 1 active · 1 needs approval
@@ -157,6 +156,13 @@ under the conversation:
   without asking, the turn continues by itself and says so.
 - When background agents finish while you are idle, Orca continues the
   conversation with their results.
+
+A shell command that is still running when its `bash` call returns keeps
+running in the background, but not in the dock. Its row in the conversation
+says `still running` until the command ends, and then how it ended, also while
+you are idle: nothing after exit 0, otherwise `exit N`, `timed out`, `stopped`,
+`cancelled`, or `failed` when no exit code is known. After a resume, a row
+whose command was still running when Orca exited says `state unknown`.
 
 `/agents` opens the Agent Workspace, which lists every task with its status.
 Select one and press `Enter`:
