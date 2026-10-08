@@ -85,6 +85,7 @@ main {
   justify-content: space-between;
   gap: 24px;
   background: color-mix(in oklch, var(--bg) 80%, transparent);
+  /* Keep -webkit-backdrop-filter before backdrop-filter: Lightning CSS (Vite 8's minifier) keeps only the prefixed one if the standard property comes first, silently dropping the header blur in Chrome and Firefox. */
   -webkit-backdrop-filter: blur(16px);
   backdrop-filter: blur(16px);
   border-bottom: 1px solid var(--border-soft);
