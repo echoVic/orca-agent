@@ -1,9 +1,10 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
+use std::borrow::Borrow;
 use std::ops::Range;
 
 use ratatui::backend::{Backend, ClearType, WindowSize};
-use ratatui::buffer::Cell;
+use ratatui::buffer::{Cell, CellWidth};
 use ratatui::layout::{Position, Size};
 
 use crate::terminal_capabilities::TerminalColorLevel;
@@ -40,10 +41,12 @@ impl<B: Backend> Backend for CapabilityBackend<B> {
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
         if self.color_level == TerminalColorLevel::TrueColor {
-            return self.inner.draw(content);
+            let mut updates = content.collect::<Vec<_>>();
+            draw_covered_columns_first(&mut updates);
+            return self.inner.draw(updates.into_iter());
         }
 
-        let adapted = content
+        let mut adapted = content
             .map(|(x, y, cell)| {
                 let mut cell = cell.clone();
                 let image_id = cell
@@ -57,6 +60,7 @@ impl<B: Backend> Backend for CapabilityBackend<B> {
                 (x, y, cell)
             })
             .collect::<Vec<_>>();
+        draw_covered_columns_first(&mut adapted);
         self.inner
             .draw(adapted.iter().map(|(x, y, cell)| (*x, *y, cell)))
     }
@@ -124,16 +128,46 @@ impl<B: Backend> Backend for CapabilityBackend<B> {
     }
 }
 
+/// Moves the writes to the columns a wide cell covers ahead of that cell.
+///
+/// ratatui-core 0.1.2 follows an emoji carrying U+FE0F, such as ⚠️, with a
+/// write to the column the emoji covers, and the crossterm backend prints that
+/// write without moving the cursor, as if the emoji had advanced it by one
+/// column. Terminals that draw the emoji in two columns, Ghostty among them,
+/// advance it by two, so that write and the rest of the row land one column
+/// to the right. Written first, the covered column is cleared on terminals
+/// that draw the emoji in one column and drawn over on the others, and the
+/// emoji gets its own cursor move. ratatui fixes its diff the same way in
+/// ratatui/ratatui#2686, which no release has yet.
+fn draw_covered_columns_first<C: Borrow<Cell>>(updates: &mut [(u16, u16, C)]) {
+    let mut index = 0;
+    while index < updates.len() {
+        let (x, y, cell) = &updates[index];
+        let (x, y) = (*x, *y);
+        let covered = updates[index + 1..]
+            .iter()
+            .zip(1..cell.borrow().cell_width())
+            .take_while(|((next_x, next_y, _), offset)| {
+                *next_y == y && next_x.checked_sub(x) == Some(*offset)
+            })
+            .count();
+        updates[index..=index + covered].rotate_left(1);
+        index += covered + 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::io;
     use std::ops::Range;
 
-    use ratatui::backend::{Backend, ClearType, WindowSize};
-    use ratatui::buffer::{Cell, CellDiffOption};
-    use ratatui::layout::{Position, Size};
+    use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
+    use ratatui::buffer::{Buffer, Cell, CellDiffOption};
+    use ratatui::layout::{Position, Rect, Size};
     use ratatui::style::{Color, Modifier, Style};
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
 
     use super::CapabilityBackend;
     use crate::terminal_capabilities::TerminalColorLevel;
@@ -516,5 +550,122 @@ mod tests {
         assert_injected_error(backend.flush());
         assert_injected_error(backend.scroll_region_up(3..9, 2));
         assert_injected_error(backend.scroll_region_down(4..12, 3));
+    }
+
+    /// What a terminal shows, row by row. `None` is a column covered by the
+    /// wide grapheme to its left.
+    type Screen = Vec<Vec<Option<String>>>;
+
+    /// How many columns a terminal gives `grapheme`. Terminals disagree on one
+    /// carrying U+FE0F: most, Ghostty among them, give it two, some one.
+    fn columns(grapheme: &str, vs16_columns: usize) -> usize {
+        if grapheme.contains('\u{FE0F}') {
+            vs16_columns
+        } else {
+            grapheme.width()
+        }
+    }
+
+    /// Replays crossterm output the way a terminal does: `ESC [ row ; col H`
+    /// moves the cursor, other escape sequences change no cells, and each
+    /// grapheme is written at the cursor, which then moves past it. Writing
+    /// over either half of a wide grapheme blanks the other half.
+    fn replay(screen: &mut Screen, bytes: &[u8], vs16_columns: usize) {
+        let mut rest = std::str::from_utf8(bytes).expect("crossterm writes UTF-8");
+        let (mut x, mut y) = (0, 0);
+        while !rest.is_empty() {
+            if let Some(sequence) = rest.strip_prefix("\u{1b}[") {
+                let end = sequence
+                    .find(|c: char| ('@'..='~').contains(&c))
+                    .expect("complete escape sequence");
+                if sequence[end..].starts_with('H') {
+                    let (row, col) = sequence[..end].split_once(';').expect("row;col");
+                    y = row.parse::<usize>().unwrap() - 1;
+                    x = col.parse::<usize>().unwrap() - 1;
+                }
+                rest = &sequence[end + 1..];
+                continue;
+            }
+            let text_end = rest.find('\u{1b}').unwrap_or(rest.len());
+            for grapheme in rest[..text_end].graphemes(true) {
+                let width = columns(grapheme, vs16_columns);
+                let row = &mut screen[y];
+                let end = (x + width).min(row.len());
+                for column in x..end {
+                    if row[column].is_none() && column > 0 && column - 1 < x {
+                        row[column - 1] = Some(" ".to_string());
+                    }
+                    if row[column].is_some()
+                        && column + 1 >= end
+                        && let Some(covered @ None) = row.get_mut(column + 1)
+                    {
+                        *covered = Some(" ".to_string());
+                    }
+                }
+                if x < end {
+                    row[x] = Some(grapheme.to_string());
+                    row[x + 1..end].fill(None);
+                }
+                x += width;
+            }
+            rest = &rest[text_end..];
+        }
+    }
+
+    /// The screen a terminal should show for `buffer`.
+    fn shown(buffer: &Buffer, vs16_columns: usize) -> Screen {
+        let area = buffer.area;
+        (area.top()..area.bottom())
+            .map(|y| {
+                let mut row = Vec::new();
+                while row.len() < usize::from(area.width) {
+                    let symbol = buffer[(row.len() as u16, y)].symbol();
+                    let width = columns(symbol, vs16_columns).max(1);
+                    row.push(Some(symbol.to_string()));
+                    row.extend(std::iter::repeat_n(None, width - 1));
+                }
+                row.truncate(usize::from(area.width));
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn capability_backend_keeps_a_row_aligned_after_a_vs16_emoji() {
+        let area = Rect::new(0, 0, 10, 1);
+        let rows = [
+            ("aaaaaaaaaa", "\u{2764}\u{FE0F}bc"),
+            ("│ abcdef │", "│ ok \u{26A0}\u{FE0F}Y │"),
+            ("aaaaaaaaaa", "\u{2764}\u{FE0F}漢😀b"),
+            ("漢字漢字漢", "a\u{2764}\u{FE0F}b"),
+        ];
+
+        for level in [TerminalColorLevel::TrueColor, TerminalColorLevel::Ansi16] {
+            for vs16_columns in [2, 1] {
+                for (before, after) in rows {
+                    let blank = Buffer::empty(area);
+                    let mut previous = Buffer::empty(area);
+                    previous.set_string(0, 0, before, Style::default());
+                    let mut next = Buffer::empty(area);
+                    next.set_string(0, 0, after, Style::default());
+
+                    let mut bytes = Vec::new();
+                    {
+                        let mut backend =
+                            CapabilityBackend::new(CrosstermBackend::new(&mut bytes), level);
+                        backend.draw(blank.diff(&previous).into_iter()).unwrap();
+                        backend.draw(previous.diff(&next).into_iter()).unwrap();
+                    }
+
+                    let mut screen = vec![vec![Some(" ".to_string()); 10]];
+                    replay(&mut screen, &bytes, vs16_columns);
+                    assert_eq!(
+                        screen,
+                        shown(&next, vs16_columns),
+                        "{level:?}, VS16 in {vs16_columns} columns: {before:?} -> {after:?}"
+                    );
+                }
+            }
+        }
     }
 }
