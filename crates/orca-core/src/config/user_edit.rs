@@ -1218,6 +1218,95 @@ mod tests {
         "]\n",
     );
 
+    /// Adding servers and a rule to a config, and reading it back with the
+    /// TOML library of the release before this one (toml 0.8), as an older
+    /// Orca on the same machine does. Fields with escapes in them, in every
+    /// shape a server holds them: an array, inline tables, and strings.
+    #[test]
+    fn an_edited_config_reads_back_with_toml_0_8() {
+        use crate::approval_rules::PermissionRule;
+        use crate::approval_types::Decision;
+
+        let stdio = McpServerConfig {
+            command: Some("search-mcp".to_string()),
+            args: vec![
+                "--root".to_string(),
+                "C:\\Users\\dev\\项目 \"x\"".to_string(),
+                "tab\there".to_string(),
+            ],
+            env: HashMap::from([("API_KEY".to_string(), "k'\"\\\u{1b}[0m中".to_string())]),
+            ..stdio_server("search", "search-mcp")
+        };
+        let http = McpServerConfig {
+            name: "tracker2".to_string(),
+            transport: McpTransportKind::Http,
+            url: Some("https://t.example/mcp?q=\"x\"&p=a\\b".to_string()),
+            headers: HashMap::from([("X-Team".to_string(), "a\nb".to_string())]),
+            bearer_token_env_var: Some("TOKEN".to_string()),
+            oauth_client_id: Some("orca-cli".to_string()),
+            oauth_callback_port: Some(51_000),
+            ..McpServerConfig::default()
+        };
+        // The config of the comment tests, which has its servers in an inline
+        // array; a config with them in tables; and no config at all.
+        let table_servers = concat!(
+            "# my config\n",
+            "model = \"deepseek-flash\"\n",
+            "\n",
+            "[[mcp_servers]]\n",
+            "name = \"docs\"\n",
+            "command = \"docs-mcp\"\n",
+        );
+        for (before, mut names) in [
+            (COMMENTED_SERVERS, vec!["docs", "tracker"]),
+            (table_servers, vec!["docs"]),
+            ("", vec![]),
+        ] {
+            let dir = config_dir_with(before);
+
+            add_user_mcp_server_in(dir.path(), &stdio).unwrap();
+            add_user_mcp_server_in(dir.path(), &http).unwrap();
+            assert!(add_user_allow_rule_in(dir.path(), "mcp__search__query").unwrap());
+
+            names.extend(["search", "tracker2"]);
+            let text = config_text(dir.path());
+            // The release before this one parses the file, and reads the
+            // servers and the rule in it as this one does.
+            toml_v08::from_str::<toml_v08::Table>(&text)
+                .unwrap_or_else(|error| panic!("{error}\n{text}"));
+            let by_toml_0_8: crate::config::file::FileConfig = toml_v08::from_str(&text).unwrap();
+            let listed = list_user_mcp_servers_in(dir.path()).unwrap();
+            assert_eq!(listed.invalid, [], "{text}");
+            assert_eq!(listed_names(dir.path()), names, "{text}");
+            assert_eq!(
+                serde_json::to_value(&by_toml_0_8.mcp_servers).unwrap(),
+                serde_json::to_value(&listed.servers).unwrap(),
+                "{text}"
+            );
+            let rule = PermissionRule::whole_tool("mcp__search__query", Decision::Allow);
+            assert_eq!(
+                by_toml_0_8.permissions.rules,
+                std::slice::from_ref(&rule),
+                "{text}"
+            );
+            assert_eq!(
+                user_permission_rules_in(dir.path()).unwrap().rules,
+                std::slice::from_ref(&rule),
+                "{text}"
+            );
+
+            // What the escapes say is what was added.
+            let [.., search, tracker] = listed.servers.as_slice() else {
+                panic!("{text}");
+            };
+            assert_eq!(search.args, stdio.args, "{text}");
+            assert_eq!(search.env, stdio.env, "{text}");
+            assert_eq!(tracker.url, http.url, "{text}");
+            assert_eq!(tracker.headers, http.headers, "{text}");
+            assert_eq!(tracker.oauth_callback_port, Some(51_000), "{text}");
+        }
+    }
+
     #[test]
     fn removing_an_inline_entry_takes_its_own_comments() {
         let dir = config_dir_with(COMMENTED_SERVERS);
@@ -2021,7 +2110,7 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 format!(
-                    "{}: existing config cannot be parsed; fix or remove it before persisting settings (TOML syntax error at line 7, column 30: invalid basic string)",
+                    "{}: existing config cannot be parsed; fix or remove it before persisting settings (TOML syntax error at line 7, column 30: unclosed inline table, expected `}}`)",
                     path.display()
                 )
             );

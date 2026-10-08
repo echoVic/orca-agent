@@ -320,6 +320,119 @@ mod tests {
         assert!(!is_trusted_with_config_dir(&child, home.path()));
     }
 
+    /// The trust file v0.5.7 wrote with `save_path`, as the TOML library of
+    /// that release laid it out: folders with spaces and Chinese characters
+    /// in their names, Windows paths with backslashes (a key written as a
+    /// literal string), and a path with both kinds of quote in it (a key
+    /// written with escapes). A user's file stays in this form until the next
+    /// decision rewrites it, so a newer library has to read it as it is.
+    const TRUST_FILE_V0_5_7: &str = r#"[folders."/Users/dev/projects/my app"]
+level = "trusted"
+
+[folders."/Users/dev/项目"]
+level = "trusted"
+
+[folders."/Users/dev/项目/测试 目录"]
+level = "untrusted"
+
+[folders."/srv/it's \"quoted\""]
+level = "trusted"
+
+[folders.'C:\Users\dev\My Project']
+level = "trusted"
+
+[folders.'\\?\C:\Users\dev\工作 区']
+level = "untrusted"
+"#;
+
+    /// Every decision of `TRUST_FILE_V0_5_7`.
+    const TRUST_DECISIONS_V0_5_7: [(&str, TrustLevel); 6] = [
+        ("/Users/dev/projects/my app", TrustLevel::Trusted),
+        ("/Users/dev/项目", TrustLevel::Trusted),
+        ("/Users/dev/项目/测试 目录", TrustLevel::Untrusted),
+        (r#"/srv/it's "quoted""#, TrustLevel::Trusted),
+        (r"C:\Users\dev\My Project", TrustLevel::Trusted),
+        (r"\\?\C:\Users\dev\工作 区", TrustLevel::Untrusted),
+    ];
+
+    #[test]
+    fn a_trust_file_in_the_v0_5_7_format_still_loads() {
+        let home = tempfile::tempdir().unwrap();
+        let path = trust_file_path_in(home.path());
+        fs::write(&path, TRUST_FILE_V0_5_7).unwrap();
+
+        let store = load_path(&path);
+
+        // A file that does not parse loads as an empty store, which trusts
+        // nothing: the count says that apart from a file that parses.
+        assert_eq!(
+            store.folders.len(),
+            TRUST_DECISIONS_V0_5_7.len(),
+            "{:?}",
+            store.folders
+        );
+        for (folder, level) in TRUST_DECISIONS_V0_5_7 {
+            assert_eq!(
+                store.folders.get(folder).map(|entry| entry.level),
+                Some(level),
+                "{folder}"
+            );
+        }
+    }
+
+    /// The decisions of `TRUST_FILE_V0_5_7` and of folders whose names need
+    /// an escape: a tab, a line break, the escape and delete characters, a
+    /// trailing backslash, and both kinds of quote beside an emoji.
+    fn decisions_to_save() -> Vec<(String, TrustLevel)> {
+        let awkward = [
+            "/srv/tab\there",
+            "/srv/new\nline",
+            "/srv/escape\u{1b}[0m",
+            "/srv/delete\u{7f}",
+            "/srv/ends-with-a-backslash\\",
+            "/srv/crab \u{1f980} with 'single' and \"double\" quotes",
+        ];
+        TRUST_DECISIONS_V0_5_7
+            .into_iter()
+            .chain(
+                awkward
+                    .into_iter()
+                    .map(|folder| (folder, TrustLevel::Untrusted)),
+            )
+            .map(|(folder, level)| (folder.to_string(), level))
+            .collect()
+    }
+
+    fn decisions_of(store: &TrustFile) -> Vec<(String, TrustLevel)> {
+        store
+            .folders
+            .iter()
+            .map(|(folder, entry)| (folder.clone(), entry.level))
+            .collect()
+    }
+
+    #[test]
+    fn a_saved_trust_file_reads_back_with_toml_0_8() {
+        let home = tempfile::tempdir().unwrap();
+        let path = trust_file_path_in(home.path());
+        let mut saved = TrustFile::default();
+        for (folder, level) in decisions_to_save() {
+            saved.folders.insert(folder, TrustEntry { level });
+        }
+
+        save_path(&path, &saved).unwrap();
+
+        // A release that still has toml 0.8 reads the file this one writes:
+        // as TOML, and as the store it loads, which holds nothing when the
+        // file does not parse.
+        let text = fs::read_to_string(&path).unwrap();
+        toml_v08::from_str::<toml_v08::Table>(&text)
+            .unwrap_or_else(|error| panic!("{error}\n{text}"));
+        let by_toml_0_8: TrustFile = toml_v08::from_str(&text).unwrap();
+        assert_eq!(decisions_of(&by_toml_0_8), decisions_of(&saved));
+        assert_eq!(decisions_of(&load_path(&path)), decisions_of(&saved));
+    }
+
     #[test]
     fn malformed_trust_store_fails_closed() {
         let home = tempfile::tempdir().unwrap();

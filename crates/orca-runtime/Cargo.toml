@@ -38,5 +38,8 @@ futures = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+# toml 0.8 is the TOML library of the releases up to v0.5.7. An older Orca on the same
+# machine reads the files this one writes, so the `with_toml_0_8` tests parse them with it.
+toml_v08 = { package = "toml", version = "0.8" }
 orca-core = { path = "../orca-core", features = ["test-utils"] }
 orca-mcp = { path = "../orca-mcp", features = ["test-utils"] }

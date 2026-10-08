@@ -243,3 +243,164 @@ fn canonicalize_allow_missing(path: &Path) -> io::Result<PathBuf> {
     }
     Ok(canonical)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diagnostics::DiagnosticCwd;
+
+    /// The state `inspect_first_run_in` returns for `workspace`, as far as
+    /// `acknowledge_first_run_in` reads it. The workspace need not exist.
+    fn first_run_state(
+        config_dir: &Path,
+        workspace: &str,
+        security_policy_digest: &str,
+    ) -> FirstRunState {
+        FirstRunState {
+            schema_version: ONBOARDING_SCHEMA_VERSION,
+            workspace: PathBuf::from(workspace),
+            config_dir: config_dir.to_path_buf(),
+            auth_path: config_dir.join(AUTH_FILE),
+            acknowledgement_path: config_dir.join(ACKNOWLEDGEMENT_FILE),
+            security_policy_digest: security_policy_digest.to_string(),
+            acknowledged: false,
+            workspace_trusted: false,
+            diagnostics: DiagnosticReport {
+                schema_version: 1,
+                package: "orca",
+                website: "",
+                version: String::new(),
+                platform: String::new(),
+                cwd: DiagnosticCwd {
+                    requested: workspace.to_string(),
+                    canonical: None,
+                },
+                checks: Vec::new(),
+            },
+        }
+    }
+
+    /// The acknowledgement file v0.5.7 wrote with `acknowledge_first_run_in`,
+    /// as the TOML library of that release laid it out: workspaces with
+    /// spaces and Chinese characters in their names, and a Windows path with
+    /// backslashes (written as a literal string). A user's file stays in
+    /// this form until the next acknowledgement rewrites it, so a newer
+    /// library has to read it as it is.
+    const ACKNOWLEDGEMENT_FILE_V0_5_7: &str = r#"schema_version = 1
+
+[[acknowledgements]]
+workspace = "/Users/dev/projects/my app"
+security_policy_digest = "aa1e03b9d98286428b5fd1e3ccf3b999a20fa8dedf7ed8b7310f3e211417e51a"
+acknowledged_at = "2026-10-08T04:21:38.905745Z"
+
+[[acknowledgements]]
+workspace = "/Users/dev/项目/测试 目录"
+security_policy_digest = "cbe0df110917259d1814dffef075983390aa87f1745004833c54c789054a60c7"
+acknowledged_at = "2026-10-08T04:21:38.920209Z"
+
+[[acknowledgements]]
+workspace = '\\?\C:\Users\dev\工作 区'
+security_policy_digest = "bc99adfdecebc9bbbcce3dd81dd97feaf8afcddbe92b79b7c96c2bb7fd090fbc"
+acknowledged_at = "2026-10-08T04:21:38.934146Z"
+"#;
+
+    /// Every acknowledgement of `ACKNOWLEDGEMENT_FILE_V0_5_7`: the workspace,
+    /// the security-policy digest, and the time.
+    const ACKNOWLEDGEMENTS_V0_5_7: [(&str, &str, &str); 3] = [
+        (
+            "/Users/dev/projects/my app",
+            "aa1e03b9d98286428b5fd1e3ccf3b999a20fa8dedf7ed8b7310f3e211417e51a",
+            "2026-10-08T04:21:38.905745Z",
+        ),
+        (
+            "/Users/dev/项目/测试 目录",
+            "cbe0df110917259d1814dffef075983390aa87f1745004833c54c789054a60c7",
+            "2026-10-08T04:21:38.920209Z",
+        ),
+        (
+            r"\\?\C:\Users\dev\工作 区",
+            "bc99adfdecebc9bbbcce3dd81dd97feaf8afcddbe92b79b7c96c2bb7fd090fbc",
+            "2026-10-08T04:21:38.934146Z",
+        ),
+    ];
+
+    #[test]
+    fn an_acknowledgement_file_in_the_v0_5_7_format_still_loads() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(ACKNOWLEDGEMENT_FILE);
+        fs::write(&path, ACKNOWLEDGEMENT_FILE_V0_5_7).unwrap();
+
+        let store = read_store(&path);
+
+        // A file that does not load is an empty store, which has
+        // acknowledged nothing: the count says that apart from a file that
+        // does.
+        assert_eq!(store.schema_version, ONBOARDING_SCHEMA_VERSION);
+        assert_eq!(
+            store.acknowledgements.len(),
+            ACKNOWLEDGEMENTS_V0_5_7.len(),
+            "{store:?}"
+        );
+        for (entry, (workspace, digest, at)) in
+            store.acknowledgements.iter().zip(ACKNOWLEDGEMENTS_V0_5_7)
+        {
+            assert_eq!(entry.workspace, Path::new(workspace));
+            assert_eq!(entry.security_policy_digest, digest);
+            assert_eq!(entry.acknowledged_at, at.parse::<DateTime<Utc>>().unwrap());
+        }
+    }
+
+    #[test]
+    fn a_saved_acknowledgement_file_reads_back_with_toml_0_8() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(ACKNOWLEDGEMENT_FILE);
+        // The workspaces of v0.5.7's file, and one whose name needs escapes:
+        // a tab, a line break, the escape character, an emoji, both kinds of
+        // quote and a trailing backslash.
+        let mut saved: Vec<(String, String)> = ACKNOWLEDGEMENTS_V0_5_7
+            .iter()
+            .map(|(workspace, digest, _)| (workspace.to_string(), digest.to_string()))
+            .collect();
+        saved.push((
+            "/srv/tab\there/new\nline/escape\u{1b}[0m \u{1f980} 'single' \"double\"\\".to_string(),
+            "ee".repeat(32),
+        ));
+        for (workspace, digest) in &saved {
+            acknowledge_first_run_in(&first_run_state(home.path(), workspace, digest)).unwrap();
+        }
+
+        // A release that still has toml 0.8 reads the file this one writes:
+        // as TOML, and as the store it loads, which holds nothing when the
+        // file does not parse.
+        let text = fs::read_to_string(&path).unwrap();
+        toml_v08::from_str::<toml_v08::Table>(&text)
+            .unwrap_or_else(|error| panic!("{error}\n{text}"));
+        let by_toml_0_8: AcknowledgementStore = toml_v08::from_str(&text).unwrap();
+        let by_this_release = read_store(&path);
+
+        let read_back = |store: &AcknowledgementStore| -> Vec<(String, String)> {
+            store
+                .acknowledgements
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.workspace.to_str().unwrap().to_string(),
+                        entry.security_policy_digest.clone(),
+                    )
+                })
+                .collect()
+        };
+        for store in [&by_toml_0_8, &by_this_release] {
+            assert_eq!(store.schema_version, ONBOARDING_SCHEMA_VERSION);
+            assert_eq!(read_back(store), saved);
+        }
+        let times = |store: &AcknowledgementStore| -> Vec<DateTime<Utc>> {
+            store
+                .acknowledgements
+                .iter()
+                .map(|entry| entry.acknowledged_at)
+                .collect()
+        };
+        assert_eq!(times(&by_toml_0_8), times(&by_this_release));
+    }
+}

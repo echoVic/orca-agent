@@ -1066,6 +1066,447 @@ command = "echo done"
         assert_eq!(config.hooks[0].tool.as_deref(), Some("bash"));
     }
 
+    /// A user config as v0.5.7 reads it, with a setting of nearly every kind:
+    /// strings with escapes, literal and multi-line strings, digit
+    /// separators, inline tables, quoted and dotted keys, arrays of tables
+    /// (`[[mcp_servers]]`, `[[hooks]]`), an inline array of rules, comments,
+    /// and Chinese text. A file in this form has to keep loading as the TOML
+    /// library changes.
+    const CONFIG_V0_5_7: &str = r#"# Orca configuration -- 配置文件
+model = "deepseek-v4-pro"
+base_url = "https://api.deepseek.com"
+mode = "auto-edit"
+reasoning_effort = "high"
+theme = "solarized"
+vim_mode = true
+vim_insert_escape = "jk"
+update_check = false
+desktop_notifications = true
+terminal_notifications = false
+auto_memory = true
+
+[budget]
+max_turns = 20
+max_tool_calls = 80
+max_cost_usd_micros = 2_000_000 # digit separators
+max_wall_time_ms = 1800000
+
+[model_runtime]
+context_window = 128000
+auto_compact_token_limit = 96000
+soft_compact_token_limit = 64000
+max_output_tokens = 200000
+
+[models."deepseek-v4.1-flash-expires-on-0910"]
+supports_images = true
+
+[subagents]
+delegation = "explicit"
+max_depth = 3
+max_running = 8
+max_queued = 64
+max_live_tasks = 128
+max_investigation_turns = 5
+max_investigation_tool_calls = 7
+
+[tools]
+max_read_parallel = 5
+output_truncation = { mode = "tokens", limit = 512 }
+shell_timeout_secs = 900
+
+[workflows]
+enabled = true
+max_concurrent_agents = 7
+max_agents_per_run = 99
+max_agent_retries = 1
+max_agent_tokens = 12345
+workflowKeywordTriggerEnabled = false
+
+[workflows.teams.backend]
+max_agent_retries = 0
+max_agent_tokens = 100
+allowed_tools = ["read_file", "grep"]
+
+[permissions]
+rules = [
+  { tool = "bash", pattern = "cargo *", decision = "allow" }, # build tools
+  { tool = "write_file", pattern = "/etc/**", decision = "deny" },
+]
+
+[permission_profiles.docs]
+extends = ":read-only"
+
+[permission_profiles.docs.filesystem]
+glob_scan_max_depth = 2
+"/tmp/orca-docs/**/*.md" = "read"
+"/tmp/orca-extra/**" = "write"
+
+[permission_profiles.docs.filesystem.":workspace_roots"]
+docs = "write"
+secrets = "deny"
+
+[permission_profiles.docs.network]
+enabled = true
+
+[permission_profiles.docs.network.domains]
+"api.example.com" = "allow"
+"blocked.example.com" = "deny"
+
+[permission_profiles.docs.network.unix_sockets]
+"/tmp/orca-browser.sock" = "allow"
+
+[[mcp_servers]]
+name = "repository"
+transport = "stdio"
+command = "node"
+args = ["/absolute/path/to/server.mjs", "--root", 'C:\Users\dev\项目']
+startup_timeout_ms = 10000
+tool_timeout_ms = 30000
+env = { API_KEY = "k", "X-Mixed.Key" = "v" }
+
+[mcp_servers.capabilities]
+read = true
+write = false
+metadata_write = false
+network = false
+shell = false
+agent = false
+
+[[mcp_servers]]
+name = "tracker"
+transport = "http"
+url = "https://tracker.example.test/mcp"
+oauth_client_id = "orca-cli"
+oauth_callback_port = 51000
+bearer_token_env_var = "TRACKER_TOKEN"
+headers.X-Team = "a"
+enabled_tools = ["list_issues", "create_issue"]
+disabled_tools = ["create_issue"]
+
+[[hooks]]
+event = "post_tool_use"
+tool = "bash"
+command = "echo \"完成\" && printf '%s\\n' done"
+
+[[hooks]]
+event = "session_start"
+command = '''
+echo started
+'''
+"#;
+
+    /// The servers, hooks and rules of a config that writes them as inline
+    /// arrays, as `orca mcp add` and the "always allow" choice keep them in a
+    /// file that already has one. A document names `mcp_servers` once, so
+    /// this is a second config beside `CONFIG_V0_5_7`.
+    const CONFIG_V0_5_7_INLINE_ARRAYS: &str = r#"# the servers
+mcp_servers = [
+  # docs server
+  { name = "docs", command = "npx", args = ["-y", "docs-mcp"], env = { API_KEY = "k" }, startup_timeout_ms = 5000, disabled = true }, # stable
+  { name = "remote", transport = "http", url = "https://mcp.example/mcp", headers = { "X-Team" = "a" }, bearer_token_env_var = "TOKEN", enabled_tools = ["search"] },
+  { name = "files", command = "node", capabilities = { read = true, write = true, metadata_write = false, network = false, shell = false, agent = false } },
+  # end of servers
+]
+hooks = [{ event = "pre_tool_use", tool = "bash", command = "echo pre" }]
+
+[permissions]
+rules = [{ tool = "bash", decision = "deny" }, { tool = "read_file", pattern = "/srv/*", decision = "allow" }]
+"#;
+
+    /// What `CONFIG_V0_5_7` says, as the config a load of it returned.
+    fn check_the_v0_5_7_config(config: &FileConfig) {
+        use crate::approval_rules::PermissionRule;
+        use crate::approval_types::Decision;
+        use crate::capability::CapabilitySet;
+        use crate::config::{PermissionProfileFileAccess, PermissionProfileNetworkAccess};
+
+        assert_eq!(config.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(config.base_url.as_deref(), Some("https://api.deepseek.com"));
+        assert_eq!(
+            config.mode,
+            Some(crate::approval_types::ApprovalMode::AutoEdit)
+        );
+        assert_eq!(config.reasoning_effort, ReasoningEffort::High);
+        assert_eq!(config.theme, ThemeName::Solarized);
+        assert!(config.vim_mode);
+        assert_eq!(
+            config
+                .vim_insert_escape
+                .as_ref()
+                .map(crate::config::VimInsertEscapeSequence::as_str),
+            Some("jk")
+        );
+        assert!(!config.update_check);
+        assert!(config.desktop_notifications);
+        assert!(!config.terminal_notifications);
+        assert!(config.auto_memory);
+        assert_eq!(
+            config.budget,
+            BudgetConfig {
+                max_turns: Some(20),
+                max_tool_calls: Some(80),
+                max_cost_usd_micros: Some(2_000_000),
+                max_wall_time_ms: Some(1_800_000),
+            }
+        );
+        assert_eq!(
+            config.model_runtime,
+            ModelRuntimeConfig {
+                context_window: Some(128_000),
+                auto_compact_token_limit: Some(96_000),
+                soft_compact_token_limit: Some(64_000),
+                max_output_tokens: Some(200_000),
+            }
+        );
+        assert_eq!(
+            config
+                .models
+                .get("deepseek-v4.1-flash-expires-on-0910")
+                .and_then(|model| model.supports_images),
+            Some(true)
+        );
+        assert_eq!(
+            config.subagents.delegation,
+            crate::subagent_config::DelegationPolicy::Explicit
+        );
+        assert_eq!(config.subagents.max_depth, 3);
+        assert_eq!(config.subagents.max_running(), 8);
+        assert_eq!(config.subagents.max_queued(), 64);
+        assert_eq!(config.subagents.max_live_tasks(), 128);
+        assert_eq!(config.subagents.max_investigation_turns, 5);
+        assert_eq!(config.subagents.max_investigation_tool_calls, 7);
+        assert_eq!(config.tools.max_read_parallel, 5);
+        assert_eq!(
+            config.tools.output_truncation,
+            crate::tool_types::ToolOutputTruncation::tokens(512)
+        );
+        assert_eq!(config.tools.shell_timeout_secs, 900);
+
+        let workflows = config.workflows.resolved();
+        assert!(workflows.enabled);
+        assert_eq!(workflows.max_concurrent_agents, 7);
+        assert_eq!(workflows.max_agents_per_run, 99);
+        assert_eq!(workflows.max_agent_retries, 1);
+        assert_eq!(workflows.max_agent_tokens, Some(12_345));
+        assert!(!workflows.keyword_trigger_enabled);
+        let backend = workflows.teams.get("backend").expect("backend team");
+        assert_eq!(backend.max_agent_retries, Some(0));
+        assert_eq!(backend.max_agent_tokens, Some(100));
+        assert_eq!(
+            backend.allowed_tools.as_deref(),
+            Some(["read_file".to_string(), "grep".to_string()].as_slice())
+        );
+
+        assert_eq!(
+            config.permissions.rules,
+            [
+                PermissionRule::new("bash", "cargo *", Decision::Allow),
+                PermissionRule::new("write_file", "/etc/**", Decision::Deny),
+            ]
+        );
+
+        assert_eq!(config.permission_profiles.len(), 1);
+        let docs = &config.permission_profiles["docs"];
+        assert_eq!(docs.extends.as_deref(), Some(":read-only"));
+        assert_eq!(docs.filesystem.glob_scan_max_depth(), Some(2));
+        for (path, access) in [
+            ("/tmp/orca-docs/**/*.md", PermissionProfileFileAccess::Read),
+            // A trailing `/**` names the subtree root.
+            ("/tmp/orca-extra", PermissionProfileFileAccess::Write),
+            (":workspace_roots/docs", PermissionProfileFileAccess::Write),
+            (
+                ":workspace_roots/secrets",
+                PermissionProfileFileAccess::Deny,
+            ),
+        ] {
+            assert_eq!(
+                docs.filesystem.get(Path::new(path)),
+                Some(&access),
+                "{path}"
+            );
+        }
+        assert_eq!(docs.filesystem.entries().count(), 4);
+        assert_eq!(docs.network.enabled, Some(true));
+        assert_eq!(
+            docs.network.domains.get("api.example.com"),
+            Some(&PermissionProfileNetworkAccess::Allow)
+        );
+        assert_eq!(
+            docs.network.domains.get("blocked.example.com"),
+            Some(&PermissionProfileNetworkAccess::Deny)
+        );
+        assert_eq!(
+            docs.network.unix_sockets.entries().collect::<Vec<_>>(),
+            [(
+                Path::new("/tmp/orca-browser.sock"),
+                &PermissionProfileNetworkAccess::Allow
+            )]
+        );
+
+        let [repository, tracker] = config.mcp_servers.as_slice() else {
+            panic!("two servers expected: {:?}", config.mcp_servers);
+        };
+        assert_eq!(repository.name, "repository");
+        assert_eq!(
+            repository.transport,
+            crate::mcp_types::McpTransportKind::Stdio
+        );
+        assert_eq!(repository.command.as_deref(), Some("node"));
+        assert_eq!(
+            repository.args,
+            [
+                "/absolute/path/to/server.mjs",
+                "--root",
+                r"C:\Users\dev\项目"
+            ]
+        );
+        assert_eq!(repository.startup_timeout_ms, Some(10_000));
+        assert_eq!(repository.tool_timeout_ms, Some(30_000));
+        assert_eq!(
+            repository.env,
+            HashMap::from([
+                ("API_KEY".to_string(), "k".to_string()),
+                ("X-Mixed.Key".to_string(), "v".to_string()),
+            ])
+        );
+        assert_eq!(
+            repository.capabilities,
+            CapabilitySet {
+                read: true,
+                write: false,
+                metadata_write: false,
+                network: false,
+                shell: false,
+                agent: false,
+            }
+        );
+        assert_eq!(tracker.name, "tracker");
+        assert_eq!(tracker.transport, crate::mcp_types::McpTransportKind::Http);
+        assert_eq!(
+            tracker.url.as_deref(),
+            Some("https://tracker.example.test/mcp")
+        );
+        assert_eq!(tracker.oauth_client_id.as_deref(), Some("orca-cli"));
+        assert_eq!(tracker.oauth_callback_port, Some(51_000));
+        assert_eq!(
+            tracker.bearer_token_env_var.as_deref(),
+            Some("TRACKER_TOKEN")
+        );
+        assert_eq!(tracker.headers.get("X-Team").map(String::as_str), Some("a"));
+        assert_eq!(
+            tracker.enabled_tools.as_deref(),
+            Some(["list_issues".to_string(), "create_issue".to_string()].as_slice())
+        );
+        assert_eq!(
+            tracker.disabled_tools.as_deref(),
+            Some(["create_issue".to_string()].as_slice())
+        );
+        assert_eq!(tracker.capabilities, CapabilitySet::default());
+
+        let [post_tool_use, session_start] = config.hooks.as_slice() else {
+            panic!("two hooks expected: {:?}", config.hooks);
+        };
+        assert_eq!(
+            post_tool_use.event,
+            crate::hook_types::HookEvent::PostToolUse
+        );
+        assert_eq!(post_tool_use.tool.as_deref(), Some("bash"));
+        assert_eq!(
+            post_tool_use.command,
+            r#"echo "完成" && printf '%s\n' done"#
+        );
+        assert_eq!(
+            session_start.event,
+            crate::hook_types::HookEvent::SessionStart
+        );
+        assert_eq!(session_start.tool, None);
+        // The line break after the opening quotes is not part of the string;
+        // the one before the closing quotes is, whichever line ends the file
+        // has.
+        assert_eq!(session_start.command.trim_end(), "echo started");
+    }
+
+    /// What `CONFIG_V0_5_7_INLINE_ARRAYS` says, as the config a load of it
+    /// returned.
+    fn check_the_v0_5_7_inline_arrays(config: &FileConfig) {
+        use crate::approval_rules::PermissionRule;
+        use crate::approval_types::Decision;
+        use crate::capability::CapabilitySet;
+
+        let [docs, remote, files] = config.mcp_servers.as_slice() else {
+            panic!("three servers expected: {:?}", config.mcp_servers);
+        };
+        assert_eq!(docs.name, "docs");
+        assert_eq!(docs.command.as_deref(), Some("npx"));
+        assert_eq!(docs.args, ["-y", "docs-mcp"]);
+        assert_eq!(docs.env.get("API_KEY").map(String::as_str), Some("k"));
+        assert_eq!(docs.startup_timeout_ms, Some(5000));
+        assert!(docs.disabled);
+        assert_eq!(remote.name, "remote");
+        assert_eq!(remote.transport, crate::mcp_types::McpTransportKind::Http);
+        assert_eq!(remote.url.as_deref(), Some("https://mcp.example/mcp"));
+        assert_eq!(remote.headers.get("X-Team").map(String::as_str), Some("a"));
+        assert_eq!(remote.bearer_token_env_var.as_deref(), Some("TOKEN"));
+        assert_eq!(
+            remote.enabled_tools.as_deref(),
+            Some(["search".to_string()].as_slice())
+        );
+        assert_eq!(files.name, "files");
+        assert_eq!(
+            files.capabilities,
+            CapabilitySet {
+                read: true,
+                write: true,
+                metadata_write: false,
+                network: false,
+                shell: false,
+                agent: false,
+            }
+        );
+
+        let [hook] = config.hooks.as_slice() else {
+            panic!("one hook expected: {:?}", config.hooks);
+        };
+        assert_eq!(hook.event, crate::hook_types::HookEvent::PreToolUse);
+        assert_eq!(hook.tool.as_deref(), Some("bash"));
+        assert_eq!(hook.command, "echo pre");
+
+        assert_eq!(
+            config.permissions.rules,
+            [
+                PermissionRule::whole_tool("bash", Decision::Deny),
+                PermissionRule::new("read_file", "/srv/*", Decision::Allow),
+            ]
+        );
+    }
+
+    /// `text` written as the user config, and loaded the way a session loads
+    /// it and the way `orca doctor` reads it, as it is and as Windows editors
+    /// save it, with a byte order mark and CRLF line ends. `check` says what
+    /// the config has to hold.
+    fn check_every_load_of(text: &str, check: fn(&FileConfig)) {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join(USER_CONFIG_FILE);
+        let windows_text = format!("\u{feff}{}", text.replace('\n', "\r\n"));
+        for text in [text.to_string(), windows_text] {
+            fs::write(&user_path, &text).unwrap();
+
+            // The file as a TOML value, merged with the other layers, then
+            // read as the config.
+            check(&load_layered_config_from_paths(&user_path, dir.path()));
+            check(
+                &toml::from_str::<FileConfig>(&text)
+                    .unwrap_or_else(|error| panic!("{error}\n{text:?}")),
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_in_the_v0_5_7_format_still_parses() {
+        check_every_load_of(CONFIG_V0_5_7, check_the_v0_5_7_config);
+        check_every_load_of(CONFIG_V0_5_7_INLINE_ARRAYS, check_the_v0_5_7_inline_arrays);
+    }
+
     #[test]
     fn parse_subagent_config() {
         let toml = r#"
@@ -1981,7 +2422,7 @@ workflowKeywordTriggerEnabled = true
         assert_eq!(
             warning,
             format!(
-                "config parse error in {}, ignoring it: TOML syntax error at line 2, column 22: invalid basic string",
+                "config parse error in {}, ignoring it: TOML syntax error at line 2, column 22: invalid basic string, expected `\"`",
                 path.display()
             )
         );

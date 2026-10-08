@@ -388,7 +388,7 @@ schema = { env = { type = "string", description = "environment" } }
         let cases = [
             (
                 format!("{head}action_kind = \"read\"\ncommand = \"abc-SECRET\n"),
-                "TOML syntax error at line 4, column 22: invalid basic string",
+                "TOML syntax error at line 4, column 22: invalid basic string, expected `\"`",
                 "abc-SECRET",
             ),
             (

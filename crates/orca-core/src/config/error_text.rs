@@ -18,11 +18,11 @@
 
 use std::ops::Range;
 
-/// A TOML syntax error, as where and what: `TOML syntax error at line 4,
-/// column 30: invalid basic string`. `message` and `span` are the error's
-/// own, and `source` is the text that was parsed. The parser's messages are
-/// fixed text (and key names, for a duplicate key); the line it stopped at is
-/// not quoted.
+/// A TOML syntax error, as where and what: `TOML syntax error at line 1,
+/// column 8: string values must be quoted, expected literal string`.
+/// `message` and `span` are the error's own, and `source` is the text that
+/// was parsed. The parser's messages are fixed text (and key names, for a
+/// duplicate key); the line it stopped at is not quoted.
 pub fn syntax_error_text(message: &str, span: Option<Range<usize>>, source: &str) -> String {
     let message = message
         .lines()
@@ -30,6 +30,7 @@ pub fn syntax_error_text(message: &str, span: Option<Range<usize>>, source: &str
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("; ");
+    let message = duplicate_key_message(&message, span.as_ref(), source).unwrap_or(message);
     match span {
         Some(span) => {
             let (line, column) = line_and_column(source, span.start);
@@ -37,6 +38,24 @@ pub fn syntax_error_text(message: &str, span: Option<Range<usize>>, source: &str
         }
         None => format!("TOML syntax error: {message}"),
     }
+}
+
+/// The message of a duplicate-key error with the key named, ``duplicate key
+/// `name` ``. The parser says only `duplicate key` and spans the key, where
+/// the one before it said ``duplicate key `name` in document root``. A key
+/// name is not a value, and the old message named it, so it is put back from
+/// the span. `None` for any other message, and for a span that holds no key
+/// text.
+fn duplicate_key_message(
+    message: &str,
+    span: Option<&Range<usize>>,
+    source: &str,
+) -> Option<String> {
+    if message != "duplicate key" {
+        return None;
+    }
+    let key = source.get(span?.clone())?;
+    (!key.is_empty() && !key.contains(['`', '\n', '\r'])).then(|| format!("duplicate key `{key}`"))
 }
 
 /// A TOML value that does not load as the type it is read as, as where and
@@ -342,8 +361,9 @@ mod tests {
 
         assert_eq!(
             text,
-            "TOML syntax error at line 2, column 30: invalid basic string"
+            "TOML syntax error at line 2, column 30: unclosed inline table, expected `}`"
         );
+        assert!(!text.contains("abc-SECRET"), "{text}");
     }
 
     #[test]
@@ -355,9 +375,19 @@ mod tests {
 
         assert_eq!(
             text,
-            "TOML syntax error at line 1, column 8: invalid string; expected `\"`, `'`"
+            "TOML syntax error at line 1, column 8: string values must be quoted, expected literal string"
         );
         assert!(!text.contains("abc-SECRET"), "{text}");
+        // The parser says its message in one line, but a message of several
+        // is one still: the lines are joined, and empty ones are dropped.
+        assert_eq!(
+            syntax_error_text(
+                "invalid string\n  expected `\"`, `'`\n\n",
+                Some(7..17),
+                source
+            ),
+            "TOML syntax error at line 1, column 8: invalid string; expected `\"`, `'`"
+        );
     }
 
     #[test]
@@ -369,9 +399,52 @@ mod tests {
 
         assert_eq!(
             text,
-            "TOML syntax error at line 2, column 1: duplicate key `name` in document root"
+            "TOML syntax error at line 2, column 1: duplicate key `name`"
         );
         assert!(!text.contains("abc-SECRET"), "{text}");
+
+        // In a table, in a dotted key, and as a table: the key is the one
+        // that repeats.
+        for (source, reported) in [
+            (
+                "[t]\na = 1\na = \"abc-SECRET\"\n",
+                "line 3, column 1: duplicate key `a`",
+            ),
+            (
+                "a.b = 1\na.b = \"abc-SECRET\"\n",
+                "line 2, column 3: duplicate key `b`",
+            ),
+            ("[t]\n[t]\n", "line 2, column 2: duplicate key `t`"),
+        ] {
+            let error = toml::from_str::<toml::Table>(source).unwrap_err();
+
+            let text = syntax_error_text(error.message(), error.span(), source);
+
+            assert_eq!(text, format!("TOML syntax error at {reported}"));
+            assert!(!text.contains("abc-SECRET"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_duplicate_key_that_the_span_does_not_show_is_not_named() {
+        // No position, a position outside the text, and one with no key in it.
+        assert_eq!(
+            syntax_error_text("duplicate key", None, "a = 1\n"),
+            "TOML syntax error: duplicate key"
+        );
+        assert_eq!(
+            syntax_error_text("duplicate key", Some(40..41), "a = 1\n"),
+            "TOML syntax error at line 2, column 1: duplicate key"
+        );
+        assert_eq!(
+            syntax_error_text("duplicate key", Some(1..1), "a = 1\n"),
+            "TOML syntax error at line 1, column 2: duplicate key"
+        );
+        // A message that says more than that is the parser's own.
+        assert_eq!(
+            syntax_error_text("duplicate key `a` in document root", Some(0..1), "a = 1\n"),
+            "TOML syntax error at line 1, column 1: duplicate key `a` in document root"
+        );
     }
 
     #[test]

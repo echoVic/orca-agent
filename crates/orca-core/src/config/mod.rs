@@ -1148,7 +1148,7 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("vim_insert_escape = "))
             .expect("vim insert escape line");
-        let parsed: toml::Value = vim_insert_escape_line.parse().unwrap();
+        let parsed: toml::Table = vim_insert_escape_line.parse().unwrap();
         assert_eq!(
             parsed
                 .get("vim_insert_escape")
