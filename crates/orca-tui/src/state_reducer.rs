@@ -551,6 +551,7 @@ impl AppState {
                     return;
                 }
                 let mut tasks = self.workflow_tasks().to_vec();
+                tasks.extend_from_slice(self.command_tasks());
                 if let Some(existing) = tasks.iter_mut().find(|existing| existing.id == task.id) {
                     *existing = task;
                 } else {

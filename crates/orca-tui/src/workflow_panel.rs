@@ -16,6 +16,10 @@ use crate::types::{AppState, AppStatus, ApprovalDialog, PanelMode};
 pub(crate) struct WorkflowPanelState {
     selected: usize,
     tasks: Vec<BackgroundTaskSummary>,
+    /// The shell tasks of the task list. The panel does not show them: they
+    /// only say how commands that outlived their calls ended, which their
+    /// rows in the conversation show.
+    command_tasks: Vec<BackgroundTaskSummary>,
     expanded_task_ids: BTreeSet<String>,
 }
 
@@ -54,6 +58,10 @@ impl WorkflowPanelState {
         &self.tasks
     }
 
+    pub(crate) fn command_tasks(&self) -> &[BackgroundTaskSummary] {
+        &self.command_tasks
+    }
+
     pub(crate) fn selected(&self) -> usize {
         self.selected
     }
@@ -82,6 +90,10 @@ impl WorkflowPanelState {
 
     fn replace_tasks(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         let selected_task_id = self.selected_task().map(|task| task.id.clone());
+        let (command_tasks, tasks) = tasks
+            .into_iter()
+            .partition(|task| task.task_type == TaskType::Shell);
+        self.command_tasks = command_tasks;
         self.tasks = sort_workflow_tasks_for_panel(tasks);
         let task_ids = self
             .tasks
@@ -125,6 +137,7 @@ impl WorkflowPanelState {
 
     pub(crate) fn reset_for_session(&mut self) {
         self.tasks = Vec::new();
+        self.command_tasks = Vec::new();
         self.selected = 0;
         self.expanded_task_ids.clear();
     }
@@ -394,6 +407,11 @@ impl AppState {
 
     pub(crate) fn workflow_tasks(&self) -> &[BackgroundTaskSummary] {
         self.workflow_panel.tasks()
+    }
+
+    /// The shell tasks of the task list, which `workflow_tasks` leaves out.
+    pub(crate) fn command_tasks(&self) -> &[BackgroundTaskSummary] {
+        self.workflow_panel.command_tasks()
     }
 
     pub(crate) fn workflow_selected_index(&self) -> usize {

@@ -77,7 +77,7 @@ impl AppState {
     /// Learns which shell tasks the task list shows ended.
     pub(crate) fn learn_command_ends_from_tasks(&mut self) {
         let ends: Vec<_> = self
-            .workflow_tasks()
+            .command_tasks()
             .iter()
             .filter_map(task_list_end)
             .collect();
@@ -126,7 +126,7 @@ impl AppState {
             self.command_ends.learn(&task_id, &end);
         }
         let listed: Vec<_> = self
-            .workflow_tasks()
+            .command_tasks()
             .iter()
             .filter_map(task_list_end)
             .collect();
@@ -134,7 +134,7 @@ impl AppState {
             self.command_ends.learn(&task_id, &end);
         }
         let in_task_list: HashSet<String> = self
-            .workflow_tasks()
+            .command_tasks()
             .iter()
             .map(|task| task.id.clone())
             .collect();
@@ -200,6 +200,7 @@ mod tests {
     use serde_json::json;
 
     use crate::protocol::TuiEvent;
+    use crate::surface_projection::SurfaceProjectionState;
     use crate::terminal_output::terminal_output_display;
     use crate::transcript_state::ChatMessage;
     use crate::types::AppState;
@@ -299,6 +300,41 @@ mod tests {
             "createdAtMs": 1,
         }))
         .expect("task summary")
+    }
+
+    /// A shell task as the runtime publishes the end of a command that
+    /// outlived its call: `error` says how a failed one ended.
+    fn ended_shell_task(id: &str, status: &str, error: Option<&str>) -> BackgroundTaskSummary {
+        serde_json::from_value(json!({
+            "id": id,
+            "type": "shell",
+            "status": status,
+            "description": "du -sh .",
+            "createdAtMs": 1,
+            "error": error,
+        }))
+        .expect("task summary")
+    }
+
+    /// The projection of a surface with `tasks`.
+    fn projection(tasks: Vec<BackgroundTaskSummary>) -> SurfaceProjectionState {
+        SurfaceProjectionState {
+            cursor: crate::surface_projection::test_surface_cursor(3),
+            session_id: Some("restored-session".to_string()),
+            title: "restored".to_string(),
+            usage_revision: 0,
+            usage: Default::default(),
+            context_revision: 0,
+            context_used_tokens: 0,
+            context_limit_tokens: 0,
+            workflow_tasks: tasks,
+            current_goal: None,
+            foreground_operation_id: None,
+            recoverable_operation_id: None,
+            goal_presentation: None,
+            session_presentation: None,
+            mcp_catalog: Default::default(),
+        }
     }
 
     /// The main session, running in the background: a task list that has it
@@ -579,6 +615,57 @@ mod tests {
         assert_eq!(note(&state, "call-2").as_deref(), Some("still running"));
     }
 
+    #[test]
+    fn shell_tasks_say_how_their_commands_ended_and_stay_out_of_the_task_panel() {
+        let mut state = state();
+        tool(&mut state, "call-1", "bash", running("task-1"));
+        tool(&mut state, "call-2", "bash", running("task-2"));
+        let workflow: BackgroundTaskSummary = serde_json::from_value(json!({
+            "id": "workflow-1",
+            "type": "workflow",
+            "status": "running",
+            "description": "review",
+            "createdAtMs": 1,
+        }))
+        .expect("task summary");
+        state.update(TuiEvent::WorkflowTasksUpdated(vec![
+            ended_shell_task("task-1", "failed", Some("exit code 3")),
+            workflow,
+            ended_shell_task("task-2", "failed", Some("timed out")),
+        ]));
+        assert_eq!(note(&state, "call-1").as_deref(), Some("exit 3"));
+        assert_eq!(note(&state, "call-2").as_deref(), Some("timed out"));
+        let ids = |tasks: &[BackgroundTaskSummary]| {
+            tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(state.workflow_tasks()), ["workflow-1"]);
+        assert_eq!(ids(state.command_tasks()), ["task-1", "task-2"]);
+    }
+
+    #[test]
+    fn a_restored_row_shows_how_its_command_ended_in_either_restore_order() {
+        let ended = || vec![ended_shell_task("task-1", "failed", Some("exit code 3"))];
+        let rows = || vec![restored("call-1", "bash", running("task-1"))];
+
+        // A resumed conversation: its history first, then the surface.
+        let mut resumed = state();
+        restore(&mut resumed, rows());
+        resumed.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            ended(),
+        ))));
+        assert_eq!(note(&resumed, "call-1").as_deref(), Some("exit 3"));
+
+        // A new hosted session: the surface, the session, then its history.
+        let mut started = state();
+        started.update(TuiEvent::SessionProjectionReset(Box::new(projection(
+            ended(),
+        ))));
+        started.update(TuiEvent::NewSessionStarted);
+        restore(&mut started, rows());
+        assert_eq!(note(&started, "call-1").as_deref(), Some("exit 3"));
+        assert!(started.workflow_tasks().is_empty());
+    }
+
     /// The note of the latest bash row; `None` before there is one.
     #[cfg(unix)]
     fn latest_bash_note(state: &AppState) -> Option<Option<String>> {
@@ -617,13 +704,11 @@ mod tests {
             })
     }
 
-    /// What the user wants: the row follows its command's end with nothing
-    /// else going on. It cannot yet: the runtime's surface has a shell task
-    /// type but reports no shell task, so an idle TUI is not told that a
-    /// command ended. After the turn, no task list and no event arrives.
+    /// The row follows its command's end with nothing else going on: the
+    /// runtime publishes the end on the surface as the command's shell task,
+    /// which the idle TUI's poll brings in.
     #[cfg(unix)]
     #[test]
-    #[ignore = "the runtime never reports shell tasks to the TUI, so an idle TUI is not told when a command ends"]
     fn a_bash_row_shows_how_its_command_ended_after_outliving_the_call() {
         use crate::test_support::hosted_tui::{Tui, config};
 
@@ -637,6 +722,26 @@ mod tests {
         });
         tui.until("the row to show its command ended", |state| {
             latest_bash_note(state) == Some(None)
+        });
+        tui.quit();
+    }
+
+    /// The same for a command that fails: the row shows its exit code.
+    #[cfg(unix)]
+    #[test]
+    fn a_bash_row_shows_the_exit_code_of_a_command_that_outlived_the_call() {
+        use crate::test_support::hosted_tui::{Tui, config};
+
+        let home = crate::test_support::isolate_orca_home();
+        let mut config = config(home.path(), Vec::new());
+        config.approval_mode = orca_core::approval_types::ApprovalMode::FullAuto;
+        let mut tui = Tui::start(config);
+        tui.send("bash_wait 200 :: sleep 1; exit 3");
+        tui.until("the call to return while its command runs", |state| {
+            latest_bash_note(state) == Some(Some("still running".to_string()))
+        });
+        tui.until("the row to show the command's exit code", |state| {
+            latest_bash_note(state) == Some(Some("exit 3".to_string()))
         });
         tui.quit();
     }

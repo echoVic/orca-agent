@@ -9,6 +9,7 @@ use super::{
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::task_view::ShellEndDetail;
 use crate::tasks::{
     LegacyActiveTaskAdoptionReceipt, LegacyActiveTaskAdoptionRecord,
     LegacyTerminalTaskReconciliationReceipt,
@@ -6776,6 +6777,83 @@ fn actor_control_workflow_start_facts_authorized(
         && generation_is_started
 }
 
+/// A shell command that outlived its call has ended. The actor publishes
+/// it as a new Shell task created running, as the call left it, and settled
+/// in the same batch, with nothing else. A bare actor permit creates no
+/// other task, so every field is checked: no link to an operation, task,
+/// workflow, subagent or interaction, no usage or result, and an error only
+/// as the end writes it on a failed command.
+fn actor_control_shell_task_settled_authorized(
+    state: &SurfaceReducerState,
+    batch: &SurfaceCommitBatch,
+) -> bool {
+    let [created, settled] = batch.events.as_slice() else {
+        return false;
+    };
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Task(super::TaskPatch::Upserted {
+            expected_revision: None,
+            task,
+        }),
+    ) = (&created.scope, &created.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Task(super::TaskPatch::StatusChanged {
+            task_id,
+            expected_revision,
+            next_revision,
+            status,
+            completed_at,
+            result,
+            error,
+        }),
+    ) = (&settled.scope, &settled.event)
+    else {
+        return false;
+    };
+    let error_matches_status = match status {
+        super::SurfaceTaskStatus::Failed => error
+            .as_ref()
+            .is_none_or(|error| ShellEndDetail::parse(error.as_str()).is_some()),
+        super::SurfaceTaskStatus::Completed
+        | super::SurfaceTaskStatus::Stopped
+        | super::SurfaceTaskStatus::Cancelled => error.is_none(),
+        _ => false,
+    };
+    task.task_type == super::SurfaceTaskType::Shell
+        && task.revision.get() == 1
+        && task.status == super::SurfaceTaskStatus::Running
+        && !task.backgrounded
+        && task.started_at.is_some()
+        && task.completed_at.is_none()
+        && task.parent_operation.is_none()
+        && task.parent_task_id.is_none()
+        && task.background_fence.is_none()
+        && task.workflow_run_id.is_none()
+        && task.subagent_id.is_none()
+        && task.pending_interaction_id.is_none()
+        && task.usage.is_none()
+        && task.result.is_none()
+        && task.error.is_none()
+        && task.retry_count == 0
+        && !task.output_truncated
+        && *task_id == task.task_id
+        && expected_revision.get() == 1
+        && next_revision.get() == 2
+        && completed_at.is_some()
+        && result.is_none()
+        && error_matches_status
+        && !state
+            .snapshot()
+            .tasks
+            .iter()
+            .any(|existing| existing.task_id == task.task_id)
+}
+
 fn operation_fence_is_known(
     snapshot: &super::SurfaceSnapshot,
     fence: &super::SurfaceOperationFence,
@@ -6987,6 +7065,7 @@ fn permit_authorizes(
                         ))
                     || actor_control_subagent_activity_authorized(state, batch)
                     || actor_control_workflow_start_facts_authorized(state, batch)
+                    || actor_control_shell_task_settled_authorized(state, batch)
                     || actor_control_workflow_launch_authorized(batch)
                     || actor_control_main_session_transfer_authorized(batch)
                     || actor_control_admission_pair_authorized(batch)
@@ -14189,6 +14268,501 @@ mod tests {
                 Err(SurfaceCommitError::StalePublisherPermit)
             ));
         }
+    }
+
+    /// A command that outlived its call, published as the actor does when
+    /// it ends: its task created running, then settled as `status`.
+    fn shell_task_settled_events(
+        task_id: &str,
+        status: super::super::SurfaceTaskStatus,
+        error: Option<&str>,
+    ) -> Vec<(SurfaceScope, super::super::SurfaceEvent)> {
+        let task_id = super::super::SurfaceTaskId::try_new(task_id).unwrap();
+        vec![
+            (
+                SurfaceScope::Thread,
+                super::super::SurfaceEvent::Task(super::super::TaskPatch::Upserted {
+                    expected_revision: None,
+                    task: super::super::SurfaceTask {
+                        task_id: task_id.clone(),
+                        revision: super::super::TaskRevision::try_new(1).unwrap(),
+                        task_type: super::super::SurfaceTaskType::Shell,
+                        status: super::super::SurfaceTaskStatus::Running,
+                        backgrounded: false,
+                        description: super::super::DisplayText::new("sleep 1; exit 3"),
+                        created_at: super::super::UnixMillis::new(10),
+                        started_at: Some(super::super::UnixMillis::new(10)),
+                        completed_at: None,
+                        parent_operation: None,
+                        parent_task_id: None,
+                        background_fence: None,
+                        workflow_run_id: None,
+                        subagent_id: None,
+                        pending_interaction_id: None,
+                        usage: None,
+                        result: None,
+                        error: None,
+                        retry_count: 0,
+                        output_truncated: false,
+                    },
+                }),
+            ),
+            (
+                SurfaceScope::Thread,
+                super::super::SurfaceEvent::Task(super::super::TaskPatch::StatusChanged {
+                    task_id,
+                    expected_revision: super::super::TaskRevision::try_new(1).unwrap(),
+                    next_revision: super::super::TaskRevision::try_new(2).unwrap(),
+                    status,
+                    completed_at: Some(super::super::UnixMillis::new(20)),
+                    result: None,
+                    error: error.map(super::super::DisplayText::new),
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn actor_permit_publishes_a_settled_shell_task_only_in_its_exact_shape() {
+        use super::super::SurfaceTaskStatus::{Cancelled, Completed, Failed, Running, Stopped};
+        use super::super::{SurfaceEvent, SurfaceTask, TaskPatch, TaskRevision, UnixMillis};
+
+        /// A change to the batch the actor publishes.
+        type Change<T> = fn(&mut T);
+
+        fn created(events: &mut [(SurfaceScope, SurfaceEvent)]) -> &mut SurfaceTask {
+            let SurfaceEvent::Task(TaskPatch::Upserted { task, .. }) = &mut events[0].1 else {
+                unreachable!()
+            };
+            task
+        }
+        fn settled(events: &mut [(SurfaceScope, SurfaceEvent)]) -> &mut TaskPatch {
+            let SurfaceEvent::Task(patch) = &mut events[1].1 else {
+                unreachable!()
+            };
+            patch
+        }
+
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let permit = SurfacePublisherPermit::ActorControl {
+            permit_id: super::super::SurfacePublisherPermitId::new([4; 32]),
+            thread_id: thread_id(),
+            owner_epoch: ThreadOwnerEpoch::new(1),
+        };
+        let authorizes = |state: &SurfaceReducerState, events| {
+            permit_authorizes(
+                state,
+                std::slice::from_ref(&permit),
+                &permit,
+                &test_batch_with_events(state, events),
+                ThreadOwnerEpoch::new(1),
+            )
+        };
+        for (status, error) in [
+            (Completed, None),
+            (Failed, Some("exit code 3")),
+            (Failed, Some("exit code -1")),
+            (Failed, Some("timed out")),
+            (Failed, None),
+            (Stopped, None),
+            (Cancelled, None),
+        ] {
+            assert!(
+                authorizes(
+                    &state,
+                    shell_task_settled_events("task-shell", status, error)
+                ),
+                "{status:?} {error:?}"
+            );
+        }
+
+        let exact = || shell_task_settled_events("task-shell", Failed, Some("exit code 3"));
+        let mut rejected = Vec::new();
+        rejected.push(("the creation alone", exact()[..1].to_vec()));
+        rejected.push(("the two swapped", exact().into_iter().rev().collect()));
+        let mut extra = exact();
+        extra.push((
+            SurfaceScope::Thread,
+            SurfaceEvent::Session(super::super::SessionPatch::RuntimeFault {
+                class: super::super::FailureClass::Persistence,
+                message: super::super::DisplayText::new("rides along"),
+                causative_generation: None,
+            }),
+        ));
+        rejected.push(("an extra event", extra));
+        for task_type in [
+            super::super::SurfaceTaskType::MainSession,
+            super::super::SurfaceTaskType::Workflow,
+            super::super::SurfaceTaskType::Subagent,
+            super::super::SurfaceTaskType::Monitor,
+        ] {
+            let mut events = exact();
+            created(&mut events).task_type = task_type;
+            rejected.push(("another task type", events));
+        }
+        let mut events = exact();
+        created(&mut events).revision = TaskRevision::try_new(2).unwrap();
+        let TaskPatch::StatusChanged {
+            expected_revision,
+            next_revision,
+            ..
+        } = settled(&mut events)
+        else {
+            unreachable!()
+        };
+        *expected_revision = TaskRevision::try_new(2).unwrap();
+        *next_revision = TaskRevision::try_new(3).unwrap();
+        rejected.push(("created at revision 2", events));
+        let settlements: Vec<(&str, Change<TaskPatch>)> = vec![
+            ("settled at revision 3", |patch| {
+                let TaskPatch::StatusChanged { next_revision, .. } = patch else {
+                    unreachable!()
+                };
+                *next_revision = TaskRevision::try_new(3).unwrap();
+            }),
+            ("another task settled", |patch| {
+                let TaskPatch::StatusChanged { task_id, .. } = patch else {
+                    unreachable!()
+                };
+                *task_id = super::super::SurfaceTaskId::try_new("task-other").unwrap();
+            }),
+            ("settled queued", |patch| {
+                let TaskPatch::StatusChanged { status, error, .. } = patch else {
+                    unreachable!()
+                };
+                *status = super::super::SurfaceTaskStatus::Queued;
+                *error = None;
+            }),
+            ("settled running", |patch| {
+                let TaskPatch::StatusChanged { status, error, .. } = patch else {
+                    unreachable!()
+                };
+                *status = Running;
+                *error = None;
+            }),
+            ("settled without an end time", |patch| {
+                let TaskPatch::StatusChanged { completed_at, .. } = patch else {
+                    unreachable!()
+                };
+                *completed_at = None;
+            }),
+            ("settled with a result", |patch| {
+                let TaskPatch::StatusChanged { result, .. } = patch else {
+                    unreachable!()
+                };
+                *result = Some(super::super::DisplayText::new("done"));
+            }),
+            ("failed with an error the end does not write", |patch| {
+                let TaskPatch::StatusChanged { error, .. } = patch else {
+                    unreachable!()
+                };
+                *error = Some(super::super::DisplayText::new("failed"));
+            }),
+            ("failed with an exit code written another way", |patch| {
+                let TaskPatch::StatusChanged { error, .. } = patch else {
+                    unreachable!()
+                };
+                *error = Some(super::super::DisplayText::new("exit code 03"));
+            }),
+            ("completed with an error", |patch| {
+                let TaskPatch::StatusChanged { status, error, .. } = patch else {
+                    unreachable!()
+                };
+                *status = Completed;
+                *error = Some(super::super::DisplayText::new("exit code 0"));
+            }),
+            ("stopped with an error", |patch| {
+                let TaskPatch::StatusChanged { status, error, .. } = patch else {
+                    unreachable!()
+                };
+                *status = Stopped;
+                *error = Some(super::super::DisplayText::new("timed out"));
+            }),
+            ("cancelled with an error", |patch| {
+                let TaskPatch::StatusChanged { status, error, .. } = patch else {
+                    unreachable!()
+                };
+                *status = Cancelled;
+                *error = Some(super::super::DisplayText::new("exit code 1"));
+            }),
+        ];
+        for (case, change) in settlements {
+            let mut events = exact();
+            change(settled(&mut events));
+            rejected.push((case, events));
+        }
+        let operation_fence = test_operation_fence(150);
+        for scope in [
+            SurfaceScope::Operation {
+                operation_id: operation_fence.operation_id.clone(),
+            },
+            SurfaceScope::Generation {
+                fence: operation_fence.clone(),
+            },
+        ] {
+            for index in 0..2 {
+                let mut events = exact();
+                events[index].0 = scope.clone();
+                rejected.push(("an event outside the thread scope", events));
+            }
+        }
+        let creations: Vec<(&str, Change<SurfaceTask>)> = vec![
+            ("created queued", |task| {
+                task.status = super::super::SurfaceTaskStatus::Queued
+            }),
+            ("created backgrounded", |task| task.backgrounded = true),
+            ("created without a start", |task| task.started_at = None),
+            ("created ended", |task| {
+                task.completed_at = Some(UnixMillis::new(20))
+            }),
+            ("created under an operation", |task| {
+                task.parent_operation = Some(test_operation_fence(151).operation_id)
+            }),
+            ("created under a task", |task| {
+                task.parent_task_id =
+                    Some(super::super::SurfaceTaskId::try_new("task-parent").unwrap())
+            }),
+            ("created with a background fence", |task| {
+                task.background_fence = Some(super::super::SurfaceBackgroundFence {
+                    operation_fence: test_operation_fence(152),
+                    background_owner_token: super::super::SurfaceBackgroundOwnerToken::new(
+                        [153; 32],
+                    ),
+                })
+            }),
+            ("created for a workflow run", |task| {
+                task.workflow_run_id =
+                    Some(super::super::SurfaceWorkflowRunId::try_new("run-1").unwrap())
+            }),
+            ("created for a subagent", |task| {
+                task.subagent_id =
+                    Some(super::super::SurfaceSubagentId::try_new("agent-1").unwrap())
+            }),
+            ("created awaiting an interaction", |task| {
+                task.pending_interaction_id = Some(
+                    super::super::SurfaceInteractionId::try_from_bytes(uuid_v7_bytes(154)).unwrap(),
+                )
+            }),
+            ("created with usage", |task| task.usage = Some(zero_usage())),
+            ("created with a result", |task| {
+                task.result = Some(super::super::DisplayText::new("done"))
+            }),
+            ("created with an error", |task| {
+                task.error = Some(super::super::DisplayText::new("exit code 3"))
+            }),
+            ("created retried", |task| task.retry_count = 1),
+            ("created with truncated output", |task| {
+                task.output_truncated = true
+            }),
+        ];
+        for (case, change) in creations {
+            let mut events = exact();
+            change(created(&mut events));
+            rejected.push((case, events));
+        }
+        for (case, events) in rejected {
+            assert!(!authorizes(&state, events), "{case}");
+        }
+
+        // The exact shape commits, and a task that exists is not created again.
+        let dir = tempfile::tempdir().unwrap();
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owned_lease(TestLedger::default(), state, owner)
+                .unwrap();
+        let batch = test_batch_with_events(coordinator.state(), exact());
+        coordinator.commit_actor_batch(&batch).unwrap();
+        let task = &coordinator.state().snapshot().tasks[0];
+        assert_eq!(task.task_type, super::super::SurfaceTaskType::Shell);
+        assert_eq!(task.revision.get(), 2);
+        assert_eq!(task.status, Failed);
+        assert_eq!(task.completed_at, Some(UnixMillis::new(20)));
+        assert_eq!(
+            task.error.as_ref().map(super::super::DisplayText::as_str),
+            Some("exit code 3")
+        );
+        assert!(!authorizes(coordinator.state(), exact()));
+        let again = test_batch_with_events(coordinator.state(), exact());
+        assert_eq!(
+            coordinator.commit_actor_batch(&again),
+            Err(SurfaceCommitError::StalePublisherPermit)
+        );
+    }
+
+    #[test]
+    fn prepared_shell_task_settlement_recovers_as_an_actor_batch() {
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let settled = test_batch_with_events(
+            &state,
+            shell_task_settled_events(
+                "task-prepared-shell",
+                super::super::SurfaceTaskStatus::Failed,
+                Some("timed out"),
+            ),
+        );
+        let mut workflow = settled.clone();
+        let mut events = workflow.events.as_slice().to_vec();
+        let super::super::SurfaceEvent::Task(super::super::TaskPatch::Upserted { task, .. }) =
+            &mut events[0].event
+        else {
+            unreachable!();
+        };
+        task.task_type = super::super::SurfaceTaskType::Workflow;
+        replace_batch_events(&mut workflow, events);
+        let dir = tempfile::tempdir().unwrap();
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owned_lease(TestLedger::default(), state, owner)
+                .unwrap();
+
+        assert!(matches!(
+            coordinator.issue_exact_recovered_authority(&settled),
+            Ok(RecoveredBatchAuthority::Single(
+                SurfacePublisherPermit::ActorControl { .. }
+            ))
+        ));
+        assert!(matches!(
+            coordinator.issue_exact_recovered_authority(&workflow),
+            Err(SurfaceCommitError::StalePublisherPermit)
+        ));
+    }
+
+    /// The stored form of a settled shell task, as Orca writes it to a
+    /// session and as v0.5.7, whose stored forms and digests are the same,
+    /// reads it back.
+    #[test]
+    fn a_settled_shell_task_keeps_its_stored_form() {
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let batch = test_batch_with_events(
+            &state,
+            shell_task_settled_events(
+                "task-stored-shell",
+                super::super::SurfaceTaskStatus::Failed,
+                Some("exit code 3"),
+            ),
+        );
+        let stored = serde_json::to_value(
+            super::super::StoredSurfaceCommitBatchV1::from_live(&batch).unwrap(),
+        )
+        .unwrap();
+        let read: super::super::StoredSurfaceCommitBatchV1 =
+            serde_json::from_value(stored.clone()).unwrap();
+        assert!(read.into_live().unwrap() == batch);
+        assert_eq!(
+            stored,
+            serde_json::json!({
+                "batch_digest": [106, 159, 2, 168, 60, 163, 145, 134, 211, 37, 88, 25, 202, 54, 207, 94, 90, 186, 137, 141, 23, 80, 245, 106, 208, 213, 93, 108, 186, 101, 51, 159],
+                "commit_class": {
+                    "Recorded": {
+                        "commit_id": "5b5b5b5b-5b5b-7b5b-9b5b-5b5b5b5b5b5b",
+                        "durable_revision": 2,
+                        "thread_owner_epoch": 1,
+                    },
+                },
+                "cursor_after": {
+                    "incarnation": "05050505-0505-7505-8505-050505050505",
+                    "next_seq": 2,
+                    "source_revision": {
+                        "Recorded": {
+                            "durable_revision": 2,
+                        },
+                    },
+                    "thread_id": "01010101-0101-0101-0101-010101010101",
+                },
+                "cursor_before": {
+                    "incarnation": "05050505-0505-7505-8505-050505050505",
+                    "next_seq": 0,
+                    "source_revision": {
+                        "Recorded": {
+                            "durable_revision": 1,
+                        },
+                    },
+                    "thread_id": "01010101-0101-0101-0101-010101010101",
+                },
+                "event_count": 2,
+                "events": [
+                    {
+                        "commit_class": {
+                            "Recorded": {
+                                "commit_id": "5b5b5b5b-5b5b-7b5b-9b5b-5b5b5b5b5b5b",
+                                "durable_revision": 2,
+                                "thread_owner_epoch": 1,
+                            },
+                        },
+                        "event": {
+                            "Task": {
+                                "Upserted": {
+                                    "expected_revision": null,
+                                    "task": {
+                                        "background_fence": null,
+                                        "backgrounded": false,
+                                        "completed_at": null,
+                                        "created_at": 10,
+                                        "description": "sleep 1; exit 3",
+                                        "error": null,
+                                        "output_truncated": false,
+                                        "parent_operation": null,
+                                        "parent_task_id": null,
+                                        "pending_interaction_id": null,
+                                        "result": null,
+                                        "retry_count": 0,
+                                        "revision": 1,
+                                        "started_at": 10,
+                                        "status": "Running",
+                                        "subagent_id": null,
+                                        "task_id": "task-stored-shell",
+                                        "task_type": "Shell",
+                                        "usage": null,
+                                        "workflow_run_id": null,
+                                    },
+                                },
+                            },
+                        },
+                        "event_id": "64646464-6464-7464-a464-646464646464",
+                        "ordinal": 0,
+                        "scope": "Thread",
+                    },
+                    {
+                        "commit_class": {
+                            "Recorded": {
+                                "commit_id": "5b5b5b5b-5b5b-7b5b-9b5b-5b5b5b5b5b5b",
+                                "durable_revision": 2,
+                                "thread_owner_epoch": 1,
+                            },
+                        },
+                        "event": {
+                            "Task": {
+                                "StatusChanged": {
+                                    "completed_at": 20,
+                                    "error": "exit code 3",
+                                    "expected_revision": 1,
+                                    "next_revision": 2,
+                                    "result": null,
+                                    "status": "Failed",
+                                    "task_id": "task-stored-shell",
+                                },
+                            },
+                        },
+                        "event_id": "65656565-6565-7565-a565-656565656565",
+                        "ordinal": 1,
+                        "scope": "Thread",
+                    },
+                ],
+                "version": 1,
+            })
+        );
     }
 
     #[test]

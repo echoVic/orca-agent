@@ -374,8 +374,14 @@ impl<'a> RuntimeToolRouter<'a> {
                     let thread_store = extension_stores
                         .map(|stores| stores.thread_store())
                         .unwrap_or(&self.runtime.thread_extensions);
+                    // Taken before `get_or_init`, which holds the store's lock
+                    // while it starts the service.
+                    let end_sink = thread_store.get::<crate::terminal_service::ShellTaskEndSink>();
                     thread_store.get_or_init(|| {
-                        crate::terminal_service::TerminalService::new(task_registry.clone())
+                        crate::terminal_service::TerminalService::with_end_sink(
+                            task_registry.clone(),
+                            end_sink.as_deref().cloned(),
+                        )
                     })
                 });
                 // Whether this session already lets git writes run without

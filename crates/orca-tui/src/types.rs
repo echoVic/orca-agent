@@ -1315,7 +1315,14 @@ impl AppState {
             .assert_matches_projection(projection);
         debug_assert_eq!(
             self.workflow_tasks(),
-            sort_workflow_tasks_for_panel(projection.workflow_tasks.clone())
+            sort_workflow_tasks_for_panel(
+                projection
+                    .workflow_tasks
+                    .iter()
+                    .filter(|task| task.task_type != orca_core::task_types::TaskType::Shell)
+                    .cloned()
+                    .collect()
+            )
         );
         self.surface_goal.assert_matches_projection(projection);
         self.surface_operation.assert_matches_projection(projection);

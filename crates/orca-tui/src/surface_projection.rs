@@ -2752,6 +2752,129 @@ mod tests {
     }
 
     #[test]
+    fn a_settled_shell_task_tells_the_row_of_its_command_how_it_ended() {
+        let snapshot = goal_projection_snapshot();
+        let mut projection = TuiSurfaceProjection::from_surface_snapshot(&snapshot);
+        let task_id = SurfaceTaskId::try_new("task-shell-1").unwrap();
+        // How the runtime publishes the end of a command that outlived its
+        // call: its task created running and settled, in one batch.
+        let mut batch = task_projection_batch(
+            &projection,
+            41,
+            SurfaceTask {
+                task_id: task_id.clone(),
+                revision: TaskRevision::try_new(1).unwrap(),
+                task_type: SurfaceTaskType::Shell,
+                status: SurfaceTaskStatus::Running,
+                backgrounded: false,
+                description: DisplayText::new("sleep 1; exit 3"),
+                created_at: UnixMillis::new(1_000),
+                started_at: Some(UnixMillis::new(1_000)),
+                completed_at: None,
+                parent_operation: None,
+                parent_task_id: None,
+                background_fence: None,
+                workflow_run_id: None,
+                subagent_id: None,
+                pending_interaction_id: None,
+                usage: None,
+                result: None,
+                error: None,
+                retry_count: 0,
+                output_truncated: false,
+            },
+        );
+        let mut events = batch.events.as_slice().to_vec();
+        events.push(SurfaceEventEnvelope {
+            ordinal: 1,
+            event_id: SurfaceEventId::try_from_bytes(uuid_v7_bytes(43)).unwrap(),
+            commit_class: batch.commit_class.clone(),
+            scope: SurfaceScope::Thread,
+            event: SurfaceEvent::Task(TaskPatch::StatusChanged {
+                task_id,
+                expected_revision: TaskRevision::try_new(1).unwrap(),
+                next_revision: TaskRevision::try_new(2).unwrap(),
+                status: SurfaceTaskStatus::Failed,
+                completed_at: Some(UnixMillis::new(2_000)),
+                result: None,
+                error: Some(DisplayText::new("exit code 3")),
+            }),
+        });
+        batch.event_count = 2;
+        batch.cursor_after.next_seq = SequenceNumber::new(batch.cursor_before.next_seq.get() + 2);
+        batch.events = NonEmptyVec::try_new(events).unwrap();
+        batch.batch_digest = canonical_batch_digest(&batch);
+
+        let events = projection.project_typed_batch(&batch).unwrap();
+        let [TuiEvent::SurfaceProjectionSynced(synced)] = events.as_slice() else {
+            panic!("the batch must end in one projection: {events:?}");
+        };
+        let summary = synced
+            .workflow_tasks
+            .iter()
+            .find(|summary| summary.id == "task-shell-1")
+            .expect("the shell task");
+        assert_eq!(summary.task_type, TaskType::Shell);
+        assert_eq!(summary.status, TaskStatus::Failed);
+        assert_eq!(summary.error.as_deref(), Some("exit code 3"));
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = crate::types::AppState::new(
+            tx,
+            "0.0.0-test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.update(TuiEvent::ToolRequested {
+            id: "call-1".to_string(),
+            name: "bash".to_string(),
+            target: None,
+        });
+        state.update(TuiEvent::ToolCompleted {
+            id: "call-1".to_string(),
+            name: "bash".to_string(),
+            status: "completed".to_string(),
+            output: serde_json::json!({
+                "task_id": "task-shell-1",
+                "state": "running",
+                "return_reason": "yield_elapsed",
+                "output": "",
+            })
+            .to_string(),
+            diff: None,
+            kind: None,
+        });
+        state.update(events.into_iter().next().unwrap());
+        let row = state
+            .transcript
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                crate::transcript_state::ChatMessage::ToolCall { id, output, .. }
+                    if id == "call-1" =>
+                {
+                    output.clone()
+                }
+                _ => None,
+            })
+            .expect("the row");
+        assert_eq!(
+            crate::terminal_output::terminal_output_display(&row)
+                .unwrap()
+                .note
+                .as_deref(),
+            Some("exit 3")
+        );
+        assert!(
+            state
+                .workflow_tasks()
+                .iter()
+                .all(|task| task.id != "task-shell-1"),
+            "the task panel does not list it"
+        );
+    }
+
+    #[test]
     fn workflow_task_projection_preserves_parent_identity_and_revision() {
         let mut snapshot = goal_projection_snapshot();
         let parent_id = SurfaceTaskId::try_new("task-parent").unwrap();

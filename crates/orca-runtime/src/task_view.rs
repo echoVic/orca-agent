@@ -283,6 +283,40 @@ impl TaskTiming {
     }
 }
 
+/// How a failed shell command ended, beyond its status. When a command
+/// outlives its call, the runtime publishes its end as a shell task and
+/// writes this as the task's `error`; a client reads it back to show what
+/// the command's own record would.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellEndDetail {
+    /// The command exited with this code.
+    ExitCode(i32),
+    /// Its execution deadline stopped the command.
+    TimedOut,
+}
+
+impl ShellEndDetail {
+    /// Reads what [`fmt::Display`](std::fmt::Display) writes, `exit code N`
+    /// or `timed out`, and nothing else: any other error text is `None`.
+    pub fn parse(text: &str) -> Option<Self> {
+        if text == "timed out" {
+            return Some(Self::TimedOut);
+        }
+        let detail = Self::ExitCode(text.strip_prefix("exit code ")?.parse().ok()?);
+        // `+3` and `03` parse as well; only the written form reads back.
+        (detail.to_string() == text).then_some(detail)
+    }
+}
+
+impl std::fmt::Display for ShellEndDetail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExitCode(code) => write!(formatter, "exit code {code}"),
+            Self::TimedOut => formatter.write_str("timed out"),
+        }
+    }
+}
+
 /// A page of an agent result, with the offset to continue from.
 #[derive(Clone, Debug)]
 pub struct AgentResultPage {
@@ -678,6 +712,38 @@ mod tests {
             json["exit_code"].is_null(),
             "a command that has not exited has no exit code: {json}"
         );
+    }
+
+    #[test]
+    fn a_shell_end_detail_reads_back_exactly_what_it_writes() {
+        assert_eq!(ShellEndDetail::ExitCode(3).to_string(), "exit code 3");
+        assert_eq!(ShellEndDetail::TimedOut.to_string(), "timed out");
+        for detail in [
+            ShellEndDetail::ExitCode(3),
+            ShellEndDetail::ExitCode(-1),
+            ShellEndDetail::ExitCode(i32::MAX),
+            ShellEndDetail::ExitCode(i32::MIN),
+            ShellEndDetail::TimedOut,
+        ] {
+            assert_eq!(ShellEndDetail::parse(&detail.to_string()), Some(detail));
+        }
+        for other in [
+            "",
+            "failed",
+            "exit code",
+            "exit code ",
+            "exit code 3 ",
+            " exit code 3",
+            "exit code +3",
+            "exit code 03",
+            "exit code 2147483648",
+            "Exit code 3",
+            "exit 3",
+            "timed out.",
+            "Timed out",
+        ] {
+            assert_eq!(ShellEndDetail::parse(other), None, "{other:?}");
+        }
     }
 
     #[test]

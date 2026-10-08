@@ -114,6 +114,8 @@ mod thread_actor_goal;
 mod thread_actor_interaction;
 #[path = "runtime_actor/thread_actor_operation.rs"]
 mod thread_actor_operation;
+#[path = "runtime_actor/thread_actor_shell_tasks.rs"]
+mod thread_actor_shell_tasks;
 #[path = "runtime_actor/thread_actor_task_workflow.rs"]
 mod thread_actor_task_workflow;
 #[path = "runtime_actor/thread_state.rs"]
@@ -125,6 +127,7 @@ use crate::thread_store::{
 };
 use crate::workflow::runner::{WorkflowLaunchRequest, WorkflowRunner};
 use crate::workflow_execution::BackgroundWorkflowRun;
+use thread_actor_shell_tasks::ShellTaskEnds;
 use thread_state::{RuntimeUsageLedger, ThreadActorState, retain_recovered_background_approvals};
 
 const SIDE_CONVERSATION_BOUNDARY: &str = r#"Side conversation boundary.
@@ -8709,6 +8712,11 @@ fn reconcile_main_session_task_mirrors_on_start(
 ) {
     let task_registry = thread.session().task_registry();
     for task in &snapshot.tasks {
+        // A command's task has no provider outcome to clear: only main
+        // sessions have one, and each clear is a write.
+        if task.task_type == surface::SurfaceTaskType::Shell {
+            continue;
+        }
         reconcile_main_session_task_mirror(&task_registry, task);
         if matches!(
             task.status,
@@ -12028,6 +12036,8 @@ struct ThreadActor {
     recap_cancellations: HashMap<crate::recap::RecapRequestId, CancelToken>,
     recap_workers: HashMap<crate::recap::RecapRequestId, thread::JoinHandle<()>>,
     recap_inflight_keys: HashMap<String, crate::recap::RecapRequestId>,
+    /// How commands that outlived their calls ended, for the typed surface.
+    shell_task_ends: ShellTaskEnds,
 }
 
 struct ResidentSurfaceSlot(Option<ResidentSurfaceState>);
@@ -16574,6 +16584,14 @@ impl ThreadActor {
         {
             eprintln!("orca: failed to persist recovered prompt queue: {error}");
         }
+        // The thread's terminal services leave how commands that outlived
+        // their calls ended here, for the actor to show on the typed surface.
+        // A thread without one has nowhere to show them, and gets no sink.
+        let (shell_task_end_sink, shell_task_end_inbox) =
+            crate::terminal_service::ShellTaskEndSink::channel();
+        if resident_surface.is_some() {
+            thread.thread_extensions().insert(shell_task_end_sink);
+        }
         let (state, usage_ledger) = ThreadActorState::new(thread);
         let mut background_controller = ResidentBackgroundController::new(background_capacity);
         retain_recovered_background_approvals(
@@ -16605,6 +16623,7 @@ impl ThreadActor {
             recap_cancellations: HashMap::new(),
             recap_workers: HashMap::new(),
             recap_inflight_keys: HashMap::new(),
+            shell_task_ends: ShellTaskEnds::new(shell_task_end_inbox),
         }
     }
 
@@ -17605,11 +17624,15 @@ impl ThreadActor {
                     .0
                     .as_ref()
                     .is_some_and(|surface| surface.commit.has_terminal_waiters());
+                let shell_task_ends_open = !self.shell_task_ends.is_closed();
                 tokio::select! {
                     biased;
                     _ = subagent_relay_poll.tick() => {
                         self.drain_subagent_relays_while_idle();
                         self.drain_detached_permission_requests(None);
+                        if self.operation_recovery.pending_manual_compaction.is_none() {
+                            self.publish_shell_task_ends();
+                        }
                         rearm_subagent_relay_poll(&mut subagent_relay_poll);
                     }
                     _ = wait_for_surface_transition_retry(surface_retry_at) => {
@@ -17636,6 +17659,16 @@ impl ThreadActor {
                             && self.operation_recovery.pending_manual_compaction.is_none()
                         {
                             let _ = self.publish_mcp_catalog();
+                        }
+                    }
+                    wake = self.shell_task_ends.wake(), if shell_task_ends_open => {
+                        if wake.is_some() {
+                            self.shell_task_ends.take_left();
+                            // As for the catalog; the poll publishes them once
+                            // the compaction's batch is in.
+                            if self.operation_recovery.pending_manual_compaction.is_none() {
+                                self.publish_shell_task_ends();
+                            }
                         }
                     }
                     completion = self.goal_controller.completion_receiver().recv(), if goal_blocking_in_flight => {
@@ -17891,6 +17924,7 @@ impl ThreadActor {
                 .0
                 .as_ref()
                 .is_some_and(|surface| surface.commit.has_terminal_waiters());
+            let shell_task_ends_open = !self.shell_task_ends.is_closed();
             tokio::select! {
                 biased;
                 _ = wait_for_surface_transition_retry(surface_retry_at) => {
@@ -17904,6 +17938,9 @@ impl ThreadActor {
                 _ = subagent_relay_poll.tick() => {
                     self.drain_subagent_relays_for_active(&mut active);
                     self.drain_detached_permission_requests(Some(&active));
+                    if active.surface_manual_compaction_prepared.is_none() {
+                        self.publish_shell_task_ends();
+                    }
                     rearm_subagent_relay_poll(&mut subagent_relay_poll);
                     self.active = Some(active);
                 }
@@ -17922,6 +17959,17 @@ impl ThreadActor {
                         && active.surface_manual_compaction_prepared.is_none()
                     {
                         let _ = self.publish_mcp_catalog();
+                    }
+                    self.active = Some(active);
+                }
+                wake = self.shell_task_ends.wake(), if shell_task_ends_open => {
+                    if wake.is_some() {
+                        self.shell_task_ends.take_left();
+                        // As for the catalog; the poll publishes them once the
+                        // compaction's batch is in.
+                        if active.surface_manual_compaction_prepared.is_none() {
+                            self.publish_shell_task_ends();
+                        }
                     }
                     self.active = Some(active);
                 }
@@ -40020,6 +40068,217 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    /// The surface's Shell tasks, as a fresh attachment reads them.
+    fn surface_shell_tasks(surface: &surface::RuntimeSurfaceHandle) -> Vec<surface::SurfaceTask> {
+        fresh_surface_attachment_with_capabilities(
+            surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot
+        .tasks
+        .iter()
+        .filter(|task| task.task_type == surface::SurfaceTaskType::Shell)
+        .cloned()
+        .collect()
+    }
+
+    #[test]
+    fn a_command_that_outlives_its_call_settles_its_shell_task_which_a_reopen_keeps() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .start_thread(config.clone(), "command outlives its call")
+            .expect("start recorded runtime thread");
+        let thread_id = thread.thread_id().to_string();
+        thread
+            .start_turn(
+                HostedTurnRequest::new("bash_wait 200 :: sleep 1; exit 3"),
+                io::sink(),
+            )
+            .expect("start the turn")
+            .wait();
+
+        // Nothing reads or waits on the command; it ends on its own.
+        let surface = thread.surface();
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let task = loop {
+            if let [task] = surface_shell_tasks(&surface).as_slice()
+                && task.status != surface::SurfaceTaskStatus::Running
+            {
+                break task.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the command's end never reached the surface"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(task.status, surface::SurfaceTaskStatus::Failed);
+        assert_eq!(
+            task.error.as_ref().map(surface::DisplayText::as_str),
+            Some("exit code 3")
+        );
+        assert_eq!(task.revision.get(), 2);
+        assert_eq!(task.description.as_str(), "sleep 1; exit 3");
+        assert!(task.started_at.is_some() && task.completed_at.is_some());
+        assert!(task.completed_at >= task.started_at);
+        assert!(!task.backgrounded && task.parent_operation.is_none());
+        assert!(
+            thread.task_registry().get(task.task_id.as_str()).is_some(),
+            "the task id is the registry's"
+        );
+        thread.shutdown().expect("shutdown thread");
+        host.shutdown().expect("shutdown host");
+
+        let reopened_host = RuntimeHost::start().expect("start reopen host");
+        let reopened = reopened_host
+            .start_thread(
+                RunConfig {
+                    history_mode: HistoryMode::Resume(thread_id),
+                    ..config
+                },
+                "reopen the command's task",
+            )
+            .expect("reopen the thread");
+        let reopened_tasks = surface_shell_tasks(&reopened.surface());
+        assert_eq!(reopened_tasks.len(), 1);
+        assert!(reopened_tasks[0] == task, "a reopen changes the task");
+        reopened.shutdown().expect("shutdown reopened thread");
+        reopened_host.shutdown().expect("shutdown reopen host");
+    }
+
+    #[test]
+    fn an_end_that_fails_to_commit_is_retried_and_given_up_on_without_holding_the_rest() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .start_thread(config, "command ends that fail to commit")
+            .expect("start recorded runtime thread");
+        let surface = thread.surface();
+        let run = |command: &str| {
+            thread
+                .start_turn(
+                    HostedTurnRequest::new(format!("bash_wait 100 :: {command}")),
+                    io::sink(),
+                )
+                .expect("start the turn")
+                .wait();
+        };
+        let shows = |command: &str| {
+            surface_shell_tasks(&surface)
+                .iter()
+                .any(|task| task.description.as_str() == command)
+        };
+        let wait_until_shown = |command: &str| {
+            let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+            while !shows(command) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{command} never reached the surface"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let tag = uuid::Uuid::new_v4();
+
+        // A commit that fails is tried again on the next poll.
+        let retried = format!("sleep 0.3; exit 3 # retried {tag}");
+        thread_actor_shell_tasks::inject_shell_task_end_commit_failures(&retried, 2);
+        run(&retried);
+        wait_until_shown(&retried);
+
+        // One that keeps failing is given up on, and the ends behind it are
+        // not held back.
+        let dropped = format!("sleep 0.3; exit 4 # dropped {tag}");
+        thread_actor_shell_tasks::inject_shell_task_end_commit_failures(
+            &dropped,
+            thread_actor_shell_tasks::SHELL_TASK_END_COMMIT_ATTEMPTS,
+        );
+        run(&dropped);
+        let after = format!("sleep 0.3; exit 5 # after {tag}");
+        run(&after);
+        wait_until_shown(&after);
+        assert!(!shows(&dropped));
+        thread.shutdown().expect("shutdown thread");
+        host.shutdown().expect("shutdown host");
+    }
+
+    #[test]
+    fn a_command_that_ends_inside_its_call_publishes_no_shell_task() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .start_thread(config, "command ends inside its call")
+            .expect("start recorded runtime thread");
+        thread
+            .start_turn(HostedTurnRequest::new("bash exit 3"), io::sink())
+            .expect("start the turn")
+            .wait();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(surface_shell_tasks(&thread.surface()).is_empty());
+        thread.shutdown().expect("shutdown thread");
+        host.shutdown().expect("shutdown host");
+    }
+
+    #[test]
+    fn opening_a_thread_writes_nothing_for_a_command_task() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        let host = RuntimeHost::start().expect("start runtime host");
+        let started = host
+            .start_thread(config.clone(), "command task mirror")
+            .expect("start recorded runtime thread");
+        let mut snapshot = (*fresh_surface_attachment(&started.surface())
+            .baseline
+            .snapshot)
+            .clone();
+        started.shutdown().expect("shutdown thread");
+        host.shutdown().expect("shutdown host");
+        snapshot.tasks.push(surface::SurfaceTask {
+            task_id: surface::SurfaceTaskId::try_new("task-ended-command").unwrap(),
+            revision: surface::TaskRevision::try_new(2).unwrap(),
+            task_type: surface::SurfaceTaskType::Shell,
+            status: surface::SurfaceTaskStatus::Failed,
+            backgrounded: false,
+            description: surface::DisplayText::new("sleep 1; exit 3"),
+            created_at: surface::UnixMillis::new(1),
+            started_at: Some(surface::UnixMillis::new(1)),
+            completed_at: Some(surface::UnixMillis::new(2)),
+            parent_operation: None,
+            parent_task_id: None,
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: None,
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: Some(surface::DisplayText::new("exit code 3")),
+            retry_count: 0,
+            output_truncated: false,
+        });
+        let thread = RuntimeThread::start(&config, "command task mirror").expect("thread");
+        let registry = thread.session().task_registry();
+        TaskRegistry::inject_typed_provider_outcome_write_failures(registry.session_id(), 1);
+
+        reconcile_main_session_task_mirrors_on_start(&thread, &snapshot);
+
+        // Only main sessions have provider outcomes; the command's task has
+        // none to clear, so its reconcile writes nothing.
+        assert!(
+            registry
+                .clear_typed_provider_outcome("task-unrelated")
+                .is_err(),
+            "the reconcile wrote the provider outcomes for a command's task"
+        );
     }
 
     #[test]

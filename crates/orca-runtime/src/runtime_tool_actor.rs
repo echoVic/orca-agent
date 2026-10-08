@@ -205,8 +205,16 @@ impl RuntimeToolActorContext {
         .then(|| task_registry)
         .flatten()
         .map(|task_registry| {
+            // Taken before `get_or_init`, which holds the store's lock while
+            // it starts the service.
+            let end_sink = self
+                .thread_extensions
+                .get::<crate::terminal_service::ShellTaskEndSink>();
             self.thread_extensions.get_or_init(|| {
-                crate::terminal_service::TerminalService::new(task_registry.clone())
+                crate::terminal_service::TerminalService::with_end_sink(
+                    task_registry.clone(),
+                    end_sink.as_deref().cloned(),
+                )
             })
         });
         let invocation = RuntimeNormalToolInvocation::snapshot(

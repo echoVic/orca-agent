@@ -3554,6 +3554,98 @@ fn task_revision_must_be_exact_and_contiguous() {
     }
 }
 
+/// How the runtime publishes a command that outlived its call once it ends:
+/// its Shell task created running and settled, in one Thread batch.
+fn shell_task_settled(
+    status: SurfaceTaskStatus,
+    error: Option<&str>,
+) -> Vec<(SurfaceScope, SurfaceEvent)> {
+    let mut created = task(SurfaceTaskStatus::Running, 1);
+    created.task_id = SurfaceTaskId::try_new("shell-task").unwrap();
+    created.task_type = SurfaceTaskType::Shell;
+    created.description = DisplayText::new("sleep 1; exit 3");
+    vec![
+        (
+            SurfaceScope::Thread,
+            SurfaceEvent::Task(TaskPatch::Upserted {
+                expected_revision: None,
+                task: created,
+            }),
+        ),
+        (
+            SurfaceScope::Thread,
+            SurfaceEvent::Task(TaskPatch::StatusChanged {
+                task_id: SurfaceTaskId::try_new("shell-task").unwrap(),
+                expected_revision: TaskRevision::try_new(1).unwrap(),
+                next_revision: TaskRevision::try_new(2).unwrap(),
+                status,
+                completed_at: Some(UnixMillis::new(20)),
+                result: None,
+                error: error.map(DisplayText::new),
+            }),
+        ),
+    ]
+}
+
+#[test]
+fn a_shell_task_is_created_and_settled_in_one_batch_live_and_rematerialized() {
+    let initial = state();
+    for (seed, status, error) in [
+        (5_950, SurfaceTaskStatus::Failed, Some("exit code 3")),
+        (5_951, SurfaceTaskStatus::Completed, None),
+        (5_952, SurfaceTaskStatus::Stopped, None),
+    ] {
+        let settled = batch(&initial, seed, shell_task_settled(status, error));
+        for mode in [
+            SurfaceReduceMode::Live,
+            SurfaceReduceMode::Rematerialization,
+        ] {
+            let state = applied(reduce_batch(mode, &initial, &settled));
+            let [task] = state.snapshot().tasks.as_slice() else {
+                panic!("one task: {:?}", state.snapshot().tasks.len());
+            };
+            assert_eq!(task.task_type, SurfaceTaskType::Shell);
+            assert_eq!(task.status, status);
+            assert_eq!(task.revision.get(), 2);
+            assert_eq!(task.completed_at, Some(UnixMillis::new(20)));
+            assert_eq!(task.error, error.map(DisplayText::new));
+            assert!(matches!(
+                reduce_batch(SurfaceReduceMode::Rematerialization, &state, &settled),
+                SurfaceReduceResult::AlreadyApplied { cursor, .. } if cursor == settled.cursor_after
+            ));
+        }
+    }
+}
+
+#[test]
+fn a_running_shell_task_cannot_be_running_again() {
+    let mut snapshot = snapshot();
+    let mut running = task(SurfaceTaskStatus::Running, 1);
+    running.task_type = SurfaceTaskType::Shell;
+    snapshot.tasks.push(running);
+    let state = SurfaceReducerState::new(snapshot);
+    let again = batch(
+        &state,
+        5_953,
+        vec![(
+            SurfaceScope::Thread,
+            SurfaceEvent::Task(TaskPatch::StatusChanged {
+                task_id: SurfaceTaskId::try_new("manifest-task").unwrap(),
+                expected_revision: TaskRevision::try_new(1).unwrap(),
+                next_revision: TaskRevision::try_new(2).unwrap(),
+                status: SurfaceTaskStatus::Running,
+                completed_at: None,
+                result: None,
+                error: None,
+            }),
+        )],
+    );
+    rejected(
+        reduce_batch(SurfaceReduceMode::Live, &state, &again),
+        SurfaceReducerErrorCode::IllegalTransition,
+    );
+}
+
 #[test]
 fn manifest_contains_every_required_reducer_inventory() {
     for key in [

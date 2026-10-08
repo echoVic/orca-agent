@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
+use orca_runtime::task_view::ShellEndDetail;
 use serde::Deserialize;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -177,15 +178,21 @@ fn waited_end(task: &serde_json::Value) -> Option<(String, CommandEnd)> {
     ))
 }
 
-/// What a task list says about a shell task that has ended. It carries no
-/// exit code, so a failed command reads `failed` until its record says more.
+/// What a task list says about a shell task that has ended. The runtime
+/// writes how a failed command ended, its exit code or its deadline, as the
+/// task's error; without either it reads `failed` until its record says
+/// more.
 pub(crate) fn task_list_end(task: &BackgroundTaskSummary) -> Option<(String, CommandEnd)> {
     if task.task_type != TaskType::Shell {
         return None;
     }
     let (state, termination, exit_code) = match task.status {
         TaskStatus::Completed => ("completed", "exited", Some(0)),
-        TaskStatus::Failed => ("failed", "failed", None),
+        TaskStatus::Failed => match task.error.as_deref().and_then(ShellEndDetail::parse) {
+            Some(ShellEndDetail::ExitCode(code)) => ("failed", "exited", Some(i64::from(code))),
+            Some(ShellEndDetail::TimedOut) => ("failed", "timed_out", None),
+            None => ("failed", "failed", None),
+        },
         TaskStatus::Stopped => ("stopped", "stopped", None),
         TaskStatus::Cancelled => ("cancelled", "cancelled", None),
         _ => return None,
@@ -501,6 +508,36 @@ mod tests {
         let after: serde_json::Value = serde_json::from_str(&written).unwrap();
         assert_eq!(after["output"], before["output"]);
         assert_eq!(terminal_output_display(&written).unwrap().note, None);
+    }
+
+    #[test]
+    fn a_task_list_reads_how_a_failed_command_ended_from_its_error() {
+        let running = payload(serde_json::json!({
+            "state": "running", "return_reason": "yield_elapsed",
+            "termination_reason": null, "exit_code": null,
+        }));
+        let note = |status: &str, error: Option<&str>| {
+            let (_, end) = task_list_end(
+                &serde_json::from_value(serde_json::json!({
+                    "id": "task-1", "type": "shell", "status": status,
+                    "description": "build", "createdAtMs": 1, "error": error,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(end.source, EndSource::TaskList);
+            terminal_output_display(&with_end(&running, &end).unwrap())
+                .unwrap()
+                .note
+        };
+        assert_eq!(note("failed", Some("exit code 3")), Some("exit 3".into()));
+        assert_eq!(note("failed", Some("exit code -9")), Some("exit -9".into()));
+        assert_eq!(note("failed", Some("timed out")), Some("timed out".into()));
+        assert_eq!(note("failed", None), Some("failed".into()));
+        assert_eq!(note("failed", Some("disk full")), Some("failed".into()));
+        assert_eq!(note("failed", Some("exit code 03")), Some("failed".into()));
+        assert_eq!(note("completed", None), None);
+        assert_eq!(note("stopped", None), Some("stopped".into()));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,11 @@ const COMPLETION_QUEUE_CAPACITY: usize = 64;
 const COMPLETION_OUTPUT_MAX_BYTES: usize = 8 * 1024;
 const COMPLETED_SESSION_RETENTION: Duration = Duration::from_secs(10 * 60);
 const MAX_COMPLETED_SESSIONS: usize = 256;
+/// Command ends the supervisor holds for the thread actor at most; past it
+/// the oldest is dropped, as with the model's notifications.
+const SHELL_TASK_END_CAPACITY: usize = 256;
+/// The longest description a command's task gets, in characters.
+const SHELL_TASK_DESCRIPTION_MAX_CHARS: usize = 120;
 
 pub(crate) struct TerminalService {
     sender: SyncSender<TerminalCommand>,
@@ -37,10 +42,17 @@ struct TerminalServiceState {
     manager: RuntimeShellSessionManager,
     sessions: HashMap<String, TerminalSessionState>,
     completions: VecDeque<TerminalCompletion>,
+    /// Where the ends of commands that outlived their calls go, for the
+    /// thread's typed surface. Without one they are not reported.
+    end_sink: Option<ShellTaskEndSink>,
 }
 
 struct TerminalSessionState {
     task_id: String,
+    /// What the command's task shows of it; see `shell_task_description`.
+    description: String,
+    /// When the command started, in Unix milliseconds.
+    started_at_ms: i64,
     cursor: usize,
     /// Absolute instant the managed process must not outlive.
     deadline: Option<(Instant, &'static str)>,
@@ -52,6 +64,8 @@ struct TerminalSessionState {
     background_notifiable: bool,
     completion_observed: bool,
     completion_queued: bool,
+    /// Whether the command's end went to the end sink.
+    end_reported: bool,
     completed_at: Option<Instant>,
     network_proxy: Option<RuntimeNetworkProxy>,
     network_block_receiver: Option<Receiver<RuntimeNetworkBlockRequest>>,
@@ -220,12 +234,105 @@ impl TerminalCompletion {
     }
 }
 
+/// How a command that outlived its call ended, as the supervisor recorded
+/// it. The thread actor publishes it on the typed surface as the command's
+/// task.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ShellTaskEnd {
+    pub(crate) task_id: String,
+    pub(crate) description: String,
+    pub(crate) started_at_ms: i64,
+    pub(crate) ended_at_ms: i64,
+    pub(crate) status: TaskStatus,
+    pub(crate) exit_code: Option<i32>,
+    /// Whether its execution deadline stopped the command.
+    pub(crate) deadline_reached: bool,
+}
+
+/// Where a terminal supervisor leaves the ends of commands that outlived
+/// their calls, for the thread actor to publish. Leaving one never waits:
+/// the actor may itself be waiting on a tool call that waits on the
+/// supervisor. The thread keeps one in its extensions; each terminal
+/// service of the thread gets a clone.
+#[derive(Clone)]
+pub(crate) struct ShellTaskEndSink {
+    ends: Arc<Mutex<VecDeque<ShellTaskEnd>>>,
+    wake: tokio::sync::mpsc::Sender<()>,
+}
+
+/// The thread actor's side of a [`ShellTaskEndSink`].
+pub(crate) struct ShellTaskEndInbox {
+    ends: Arc<Mutex<VecDeque<ShellTaskEnd>>>,
+    wake: tokio::sync::mpsc::Receiver<()>,
+}
+
+impl ShellTaskEndSink {
+    pub(crate) fn channel() -> (Self, ShellTaskEndInbox) {
+        let ends = Arc::new(Mutex::new(VecDeque::new()));
+        // One pending wake covers any number of ends: the actor takes them
+        // all after each wake.
+        let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(1);
+        (
+            Self {
+                ends: Arc::clone(&ends),
+                wake: wake_tx,
+            },
+            ShellTaskEndInbox {
+                ends,
+                wake: wake_rx,
+            },
+        )
+    }
+
+    fn leave(&self, end: ShellTaskEnd) {
+        {
+            let mut ends = self.ends.lock().unwrap_or_else(PoisonError::into_inner);
+            if ends.len() >= SHELL_TASK_END_CAPACITY {
+                ends.pop_front();
+            }
+            ends.push_back(end);
+        }
+        let _ = self.wake.try_send(());
+    }
+}
+
+impl ShellTaskEndInbox {
+    /// Waits until an end is left; `None` once no sink is left to leave one.
+    pub(crate) async fn wake(&mut self) -> Option<()> {
+        self.wake.recv().await
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.wake.is_closed()
+    }
+
+    /// The ends left so far, oldest first. Take them after the wake, so an
+    /// end left meanwhile wakes the actor again instead of waiting unseen.
+    pub(crate) fn take(&self) -> Vec<ShellTaskEnd> {
+        self.ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(..)
+            .collect()
+    }
+}
+
 impl TerminalService {
+    #[cfg(test)]
     pub(crate) fn new(task_registry: TaskRegistry) -> Self {
+        Self::with_end_sink(task_registry, None)
+    }
+
+    /// A terminal service whose supervisor leaves the ends of commands that
+    /// outlive their calls in `end_sink`.
+    pub(crate) fn with_end_sink(
+        task_registry: TaskRegistry,
+        end_sink: Option<ShellTaskEndSink>,
+    ) -> Self {
         let (sender, receiver) = mpsc::sync_channel(TERMINAL_COMMAND_CAPACITY);
         let supervisor = thread::Builder::new()
             .name("orca-terminal-supervisor".to_string())
-            .spawn(move || run_terminal_supervisor(task_registry, receiver))
+            .spawn(move || run_terminal_supervisor(task_registry, end_sink, receiver))
             .expect("terminal supervisor thread must start");
         Self {
             sender,
@@ -273,12 +380,19 @@ impl TerminalService {
             should_cancel,
             on_output,
         )?;
+        self.mark_background_if_still_running(&handle.id, &output);
+        Ok(output)
+    }
+
+    /// A command still running when its call yields, and not waiting on a
+    /// network decision, goes on in the background: how it ends is reported
+    /// when it does.
+    fn mark_background_if_still_running(&self, session_id: &str, output: &TerminalServiceOutput) {
         if output.status == "running" && output.network_block.is_none() {
             let _ = self.send(TerminalCommand::MarkBackground {
-                session_id: handle.id,
+                session_id: session_id.to_string(),
             });
         }
-        Ok(output)
     }
 
     /// Resolves a model-facing `task_id` to its terminal session id.
@@ -408,6 +522,8 @@ impl TerminalService {
         receive_response(receiver, "terminal network permission")?
     }
 
+    /// Goes on observing a command `exec` returned on for a network
+    /// decision, for at most `yield_time`, as `exec` would have.
     pub(crate) fn continue_session(
         &self,
         session_id: &str,
@@ -416,14 +532,16 @@ impl TerminalService {
         should_cancel: impl Fn() -> bool,
         on_output: &mut dyn FnMut(&str),
     ) -> io::Result<TerminalServiceOutput> {
-        self.poll_until_with_output(
+        let output = self.poll_until_with_output(
             session_id,
             yield_time,
             max_output_bytes,
             false,
             should_cancel,
             on_output,
-        )
+        )?;
+        self.mark_background_if_still_running(session_id, &output);
+        Ok(output)
     }
 
     pub(crate) fn drain_completions(&self) -> Vec<TerminalCompletion> {
@@ -560,12 +678,12 @@ fn receive_response<T>(receiver: Receiver<T>, operation: &str) -> io::Result<T> 
     })
 }
 
-fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<TerminalCommand>) {
-    let mut state = TerminalServiceState {
-        manager: RuntimeShellSessionManager::new(task_registry),
-        sessions: HashMap::new(),
-        completions: VecDeque::new(),
-    };
+fn run_terminal_supervisor(
+    task_registry: TaskRegistry,
+    end_sink: Option<ShellTaskEndSink>,
+    receiver: Receiver<TerminalCommand>,
+) {
+    let mut state = TerminalServiceState::new(task_registry, end_sink);
     loop {
         match receiver.recv_timeout(POLL_INTERVAL) {
             Ok(TerminalCommand::Start {
@@ -578,6 +696,7 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
                 deadline_after,
                 response,
             }) => {
+                let description = shell_task_description(&command.description);
                 let result = state.manager.spawn_with_metadata_roots_and_lifetime(
                     *command,
                     metadata_writable_directories,
@@ -598,6 +717,7 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
                     }
                     let mut session = TerminalSessionState::from_handle(
                         handle,
+                        description,
                         network_proxy,
                         network_block_receiver,
                     );
@@ -683,6 +803,15 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
 }
 
 impl TerminalServiceState {
+    fn new(task_registry: TaskRegistry, end_sink: Option<ShellTaskEndSink>) -> Self {
+        Self {
+            manager: RuntimeShellSessionManager::new(task_registry),
+            sessions: HashMap::new(),
+            completions: VecDeque::new(),
+            end_sink,
+        }
+    }
+
     fn write(&mut self, session_id: &str, chars: &str) -> io::Result<()> {
         let session = self.sessions.get(session_id).ok_or_else(|| {
             io::Error::new(
@@ -931,6 +1060,7 @@ impl TerminalServiceState {
             session.background_notifiable = true;
         }
         self.queue_completion(session_id);
+        self.report_end(session_id);
     }
 
     fn record_terminal(&mut self, output: &ShellSessionOutput) {
@@ -959,6 +1089,41 @@ impl TerminalServiceState {
             session.network_proxy.take();
         }
         self.queue_completion(&output.id);
+        self.report_end(&output.id);
+    }
+
+    /// Leaves the end of a command that outlived its call in the end sink,
+    /// once. A command can end before its call marks it background, so this
+    /// runs at both. Unlike the model's notification it does not wait on
+    /// whether anyone read the end: the typed surface keeps it for good.
+    fn report_end(&mut self, session_id: &str) {
+        let Some(end_sink) = self.end_sink.as_ref() else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        let Some(terminal) = session.terminal else {
+            return;
+        };
+        if !session.background_notifiable || session.end_reported {
+            return;
+        }
+        session.end_reported = true;
+        // The end may have been recorded a moment before the call yielded.
+        let ended_ago = session
+            .completed_at
+            .map_or(Duration::ZERO, |at| at.elapsed());
+        end_sink.leave(ShellTaskEnd {
+            task_id: session.task_id.clone(),
+            description: session.description.clone(),
+            started_at_ms: session.started_at_ms,
+            ended_at_ms: unix_now_ms()
+                .saturating_sub(i64::try_from(ended_ago.as_millis()).unwrap_or(i64::MAX)),
+            status: terminal.status,
+            exit_code: terminal.exit_code,
+            deadline_reached: terminal.deadline_reached,
+        });
     }
 
     fn queue_completion(&mut self, session_id: &str) {
@@ -1057,11 +1222,14 @@ pub(crate) fn merge_terminal_output(
 impl TerminalSessionState {
     fn from_handle(
         handle: &ShellSessionHandle,
+        description: String,
         network_proxy: Option<RuntimeNetworkProxy>,
         network_block_receiver: Option<Receiver<RuntimeNetworkBlockRequest>>,
     ) -> Self {
         Self {
             task_id: handle.task_id.clone(),
+            description,
+            started_at_ms: unix_now_ms(),
             cursor: 0,
             deadline: None,
             deadline_after: None,
@@ -1071,6 +1239,7 @@ impl TerminalSessionState {
             background_notifiable: false,
             completion_observed: false,
             completion_queued: false,
+            end_reported: false,
             completed_at: None,
             network_proxy,
             network_block_receiver,
@@ -1252,6 +1421,24 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+/// What a command's task shows of it: its first line that is not blank,
+/// without control characters, cut to `SHELL_TASK_DESCRIPTION_MAX_CHARS`.
+fn shell_task_description(command: &str) -> String {
+    command
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(SHELL_TASK_DESCRIPTION_MAX_CHARS)
+        .collect()
+}
+
+fn unix_now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
 fn task_status_label(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::Completed => "completed",
@@ -1363,6 +1550,31 @@ mod tests {
                 true,
                 should_cancel,
             )
+        }
+    }
+
+    impl TerminalSessionState {
+        /// A session as `Start` leaves it, running in a pipe.
+        fn started_for_test(task_id: &str, description: &str, started_at_ms: i64) -> Self {
+            Self {
+                task_id: task_id.to_string(),
+                description: description.to_string(),
+                started_at_ms,
+                cursor: 0,
+                deadline: None,
+                deadline_after: None,
+                requested_terminal: ShellTerminalMode::pipe(),
+                effective_terminal: ShellTerminalMode::pipe(),
+                terminal: None,
+                background_notifiable: false,
+                completion_observed: false,
+                completion_queued: false,
+                end_reported: false,
+                completed_at: None,
+                network_proxy: None,
+                network_block_receiver: None,
+                pending_network_block: None,
+            }
         }
     }
 
@@ -1838,6 +2050,353 @@ mod tests {
         thread::sleep(POLL_INTERVAL * 3);
         assert_eq!(service.drain_completions().len(), 1);
         assert!(service.drain_completions().is_empty());
+    }
+
+    fn service_with_end_sink(cwd: &Path) -> (TerminalService, TaskRegistry, ShellTaskEndInbox) {
+        let registry = TaskRegistry::new_persistent(
+            format!("terminal-test-{}", uuid::Uuid::new_v4()),
+            cwd.join("tasks"),
+        )
+        .expect("isolated task registry");
+        let (sink, inbox) = ShellTaskEndSink::channel();
+        (
+            TerminalService::with_end_sink(registry.clone(), Some(sink)),
+            registry,
+            inbox,
+        )
+    }
+
+    /// The ends the supervisor left, once there are `count` of them.
+    fn wait_for_ends(inbox: &ShellTaskEndInbox, count: usize) -> Vec<ShellTaskEnd> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut ends = Vec::new();
+        loop {
+            ends.extend(inbox.take());
+            if ends.len() >= count {
+                return ends;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} of {count} command ends were reported: {ends:?}",
+                ends.len()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_command_task_shows_the_first_line_of_its_command() {
+        assert_eq!(
+            shell_task_description("\n  cargo test\t--all  \nsecond line"),
+            "cargo test--all"
+        );
+        assert_eq!(
+            shell_task_description("printf '\x1b[31mred'"),
+            "printf '[31mred'"
+        );
+        let long = "x".repeat(SHELL_TASK_DESCRIPTION_MAX_CHARS + 10);
+        assert_eq!(
+            shell_task_description(&long).chars().count(),
+            SHELL_TASK_DESCRIPTION_MAX_CHARS
+        );
+        assert_eq!(shell_task_description(" \n\t"), "");
+    }
+
+    #[test]
+    fn a_command_that_outlives_its_call_reports_its_end_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, _, mut inbox) = service_with_end_sink(temp.path());
+        let overlay = TurnPermissionOverlay::default();
+        let started = start(
+            &service,
+            request(
+                "sleep 0.2; exit 3",
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_millis(10),
+            8 * 1024,
+            || false,
+        )
+        .expect("start background command");
+        assert_eq!(started.status, "running", "{started:?}");
+
+        let ends = wait_for_ends(&inbox, 1);
+        assert_eq!(ends.len(), 1, "{ends:?}");
+        let end = &ends[0];
+        assert_eq!(end.task_id, started.task_id);
+        assert_eq!(end.description, "sleep 0.2; exit 3");
+        assert_eq!(end.status, TaskStatus::Failed);
+        assert_eq!(end.exit_code, Some(3));
+        assert!(!end.deadline_reached);
+        assert!(end.started_at_ms <= end.ended_at_ms, "{end:?}");
+        assert!(inbox.wake.try_recv().is_ok(), "an end wakes the actor");
+        // The model is told as it was.
+        let completions = service.drain_completions();
+        assert_eq!(completions.len(), 1, "{completions:?}");
+        assert_eq!(completions[0].exit_code, Some(3));
+
+        // Neither reading the command nor marking it background again
+        // reports its end a second time.
+        service
+            .read_output(&started.task_id, 8 * 1024)
+            .expect("read")
+            .expect("known task");
+        service
+            .send(TerminalCommand::MarkBackground {
+                session_id: started.session_id.clone(),
+            })
+            .expect("mark background");
+        thread::sleep(POLL_INTERVAL * 4);
+        assert!(inbox.take().is_empty());
+    }
+
+    #[test]
+    fn a_command_that_ends_inside_its_call_reports_nothing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, _, inbox) = service_with_end_sink(temp.path());
+        let overlay = TurnPermissionOverlay::default();
+        let output = start(
+            &service,
+            request("exit 3", temp.path(), &overlay, ShellTerminalMode::pipe()),
+            Duration::from_secs(5),
+            8 * 1024,
+            || false,
+        )
+        .expect("exec");
+        assert_eq!(output.status, "failed", "{output:?}");
+
+        thread::sleep(POLL_INTERVAL * 4);
+        assert!(inbox.take().is_empty());
+        assert!(service.drain_completions().is_empty());
+    }
+
+    #[test]
+    fn a_stopped_command_reports_stopped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, _, inbox) = service_with_end_sink(temp.path());
+        let overlay = TurnPermissionOverlay::default();
+        let started = start(
+            &service,
+            request(
+                host_long_running_command(),
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_millis(50),
+            8 * 1024,
+            || false,
+        )
+        .expect("start long command");
+        assert_eq!(started.status, "running", "{started:?}");
+        assert!(service.stop_task(&started.task_id).expect("stop task"));
+
+        let ends = wait_for_ends(&inbox, 1);
+        assert_eq!(ends[0].task_id, started.task_id);
+        assert_eq!(ends[0].status, TaskStatus::Stopped);
+        assert!(!ends[0].deadline_reached);
+    }
+
+    #[test]
+    fn a_command_its_deadline_stopped_reports_the_deadline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, _, inbox) = service_with_end_sink(temp.path());
+        let overlay = TurnPermissionOverlay::default();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 60"
+        } else {
+            "sleep 60"
+        };
+        let deadline = ExecutionDeadline {
+            after: Duration::from_millis(500),
+            source: "caller timeout_ms",
+        };
+        let started = start(
+            &service,
+            request_with_deadline(command, temp.path(), &overlay, Some(deadline)),
+            Duration::ZERO,
+            8 * 1024,
+            || false,
+        )
+        .expect("started");
+        assert_eq!(started.status, "running", "{started:?}");
+
+        let ends = wait_for_ends(&inbox, 1);
+        assert_eq!(ends[0].task_id, started.task_id);
+        assert_eq!(ends[0].status, TaskStatus::Failed);
+        assert!(ends[0].deadline_reached, "{:?}", ends[0]);
+    }
+
+    #[test]
+    fn an_end_recorded_before_its_call_yields_is_reported_when_it_does() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = TaskRegistry::new_persistent(
+            format!("terminal-test-{}", uuid::Uuid::new_v4()),
+            temp.path().join("tasks"),
+        )
+        .expect("isolated task registry");
+        let (sink, inbox) = ShellTaskEndSink::channel();
+        let mut state = TerminalServiceState::new(registry, Some(sink));
+        state.sessions.insert(
+            "shell-1".to_string(),
+            TerminalSessionState::started_for_test("task-1", "make test", 1_000),
+        );
+        // The command ends after the call's last poll, before the call marks
+        // it background: the supervisor reaps between any two commands.
+        state.record_terminal(&ShellSessionOutput {
+            id: "shell-1".to_string(),
+            task_id: "task-1".to_string(),
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            status: TaskStatus::Completed,
+            termination: ShellSessionTermination::Exited,
+            requested_terminal: ShellTerminalMode::pipe(),
+            effective_terminal: ShellTerminalMode::pipe(),
+        });
+        assert!(
+            inbox.take().is_empty(),
+            "the call may still observe the end itself"
+        );
+
+        state.mark_background("shell-1");
+        let ends = inbox.take();
+        assert_eq!(ends.len(), 1, "{ends:?}");
+        assert_eq!(ends[0].task_id, "task-1");
+        assert_eq!(ends[0].description, "make test");
+        assert_eq!(ends[0].started_at_ms, 1_000);
+        assert_eq!(ends[0].status, TaskStatus::Completed);
+        assert_eq!(ends[0].exit_code, Some(0));
+        state.mark_background("shell-1");
+        assert!(inbox.take().is_empty(), "an end is reported once");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_command_still_running_after_a_network_decision_reports_its_end() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let upstream = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
+        let upstream_port = upstream.local_addr().expect("upstream address").port();
+        let server = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+
+            let (mut stream, _) = upstream.accept().expect("accept resumed request");
+            let mut reader =
+                std::io::BufReader::new(stream.try_clone().expect("clone upstream stream"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).expect("read request") != 0 {
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                line.clear();
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\nresumed")
+                .expect("write upstream response");
+        });
+        let mut overlay = TurnPermissionOverlay::default();
+        overlay.merge_network_permissions(&crate::protocol::RequestPermissionProfile {
+            file_system: None,
+            network: Some(crate::protocol::RequestNetworkPermissions {
+                enabled: Some(true),
+                domains: std::collections::HashMap::from([(
+                    "api.example.com".to_string(),
+                    PermissionProfileNetworkAccess::Allow,
+                )]),
+            }),
+        });
+        let (service, _, inbox) = service_with_end_sink(temp.path());
+        let blocked = start(
+            &service,
+            request(
+                &format!(
+                    "curl --max-time 5 --proxy \"$HTTP_PROXY\" -sS http://127.0.0.1:{upstream_port}/; sleep 0.3; exit 4"
+                ),
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_secs(5),
+            8 * 1024,
+            || false,
+        )
+        .expect("exec through policy proxy");
+        assert_eq!(blocked.status, "running", "{blocked:?}");
+        assert!(blocked.network_block.is_some(), "{blocked:?}");
+        service
+            .resolve_network_permission(&blocked.session_id, RuntimeNetworkBlockDecision::Allow)
+            .expect("allow blocked connection");
+
+        // The call goes on after the decision and yields before the command
+        // ends, as `exec` does when there is no decision to make.
+        let continued = service
+            .continue_session(
+                &blocked.session_id,
+                Duration::from_millis(50),
+                8 * 1024,
+                || false,
+                &mut |_chunk: &str| {},
+            )
+            .expect("continue the command");
+        assert_eq!(continued.status, "running", "{continued:?}");
+
+        let ends = wait_for_ends(&inbox, 1);
+        assert_eq!(ends[0].task_id, blocked.task_id);
+        assert_eq!(ends[0].exit_code, Some(4));
+        let completions = service.drain_completions();
+        assert_eq!(
+            completions.len(),
+            1,
+            "the model is told too: {completions:?}"
+        );
+        server.join().expect("upstream server");
+    }
+
+    #[test]
+    fn an_end_sink_leaves_the_model_notification_as_it_was() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let overlay = TurnPermissionOverlay::default();
+        let (without_sink, _) = service(temp.path());
+        let (with_sink, _, _inbox) = service_with_end_sink(temp.path());
+        let mut notifications = Vec::new();
+        for service in [&without_sink, &with_sink] {
+            let started = start(
+                service,
+                request(
+                    "sleep 0.1; printf done; exit 3",
+                    temp.path(),
+                    &overlay,
+                    ShellTerminalMode::pipe(),
+                ),
+                Duration::from_millis(10),
+                8 * 1024,
+                || false,
+            )
+            .expect("start background command");
+            assert_eq!(started.status, "running", "{started:?}");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let completions = loop {
+                let completions = service.drain_completions();
+                if !completions.is_empty() {
+                    break completions;
+                }
+                assert!(Instant::now() < deadline, "no completion was queued");
+                thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(completions.len(), 1, "{completions:?}");
+            let TerminalCompletion {
+                status,
+                output,
+                exit_code,
+                truncated,
+                ..
+            } = completions[0].clone();
+            notifications.push((status, output, exit_code, truncated));
+        }
+        assert_eq!(notifications[0], notifications[1]);
+        assert_eq!(notifications[0].2, Some(3));
     }
 
     #[test]
