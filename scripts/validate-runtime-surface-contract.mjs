@@ -1433,8 +1433,9 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/ui.rs:append_assistant_markdown:line.spans.insert", 1],
   ["crates/orca-tui/src/ui.rs:append_diff_lines:line.spans.insert", 1],
   ["crates/orca-tui/src/command_ends.rs:learn:self.known.insert", 1],
+  ["crates/orca-tui/src/command_ends.rs:saw_running:self.seen_running.insert", 1],
   ["crates/orca-tui/src/command_ends.rs:clear:self.known.clear", 1],
-  ["crates/orca-tui/src/command_ends.rs:settle_restored_command_rows:self.command_ends.clear", 1],
+  ["crates/orca-tui/src/command_ends.rs:clear:self.seen_running.clear", 1],
   ["crates/orca-tui/src/state_reducer.rs:update:self.command_ends.clear", 1],
   ["crates/orca-tui/src/terminal_output.rs:with_end:fields.insert", 4],
 ]);

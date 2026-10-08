@@ -666,8 +666,9 @@ pub struct AppState {
     /// separate from the parent baseline so either attachment can refresh
     /// without resurrecting stale tasks from the other.
     pub(crate) focused_workflow_tasks: Vec<BackgroundTaskSummary>,
-    /// How the shell commands that outlived their calls ended; written into
-    /// the rows that still show them running.
+    /// How the shell commands that outlived their calls ended, and which of
+    /// them this Orca saw running; the ends are written into the rows that
+    /// still show them running.
     pub(crate) command_ends: crate::command_ends::CommandEnds,
     pub recovery_prompt_visible: bool,
     pub recovery_prompt_selected: usize,

@@ -2,6 +2,10 @@
 //! result its call returned; when the command was still running then, what
 //! is learned later — a read of its output, a wait on it, the task list —
 //! is kept here by task id and written into every row of that task.
+//!
+//! A conversation restored from history is settled the same way. A row whose
+//! command this Orca did not see running, and that nothing reports on, shows
+//! `state unknown`: the command ran in an earlier Orca.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,10 +15,14 @@ use crate::terminal_output::{
 use crate::transcript_state::ChatMessage;
 use crate::types::AppState;
 
-/// The most telling end known for each task.
+/// What is known about the commands that outlived their calls: the most
+/// telling end for each task, and the tasks this Orca saw running.
 #[derive(Debug, Default)]
 pub(crate) struct CommandEnds {
     known: HashMap<String, CommandEnd>,
+    /// Tasks a live result showed running. A restored row of any other task
+    /// belongs to a command of an earlier Orca.
+    seen_running: HashSet<String>,
 }
 
 impl CommandEnds {
@@ -31,8 +39,14 @@ impl CommandEnds {
         true
     }
 
+    /// Remembers that a live result showed the command of `task_id` running.
+    fn saw_running(&mut self, task_id: &str) {
+        self.seen_running.insert(task_id.to_string());
+    }
+
     pub(crate) fn clear(&mut self) {
         self.known.clear();
+        self.seen_running.clear();
     }
 }
 
@@ -45,10 +59,15 @@ fn reports_on_commands(tool: &str) -> bool {
 }
 
 impl AppState {
-    /// Learns what the result of `tool` says about how commands ended.
+    /// Learns what the result of `tool` says about how commands ended, and
+    /// which command it shows running. Only results arriving live come here:
+    /// the rows of a restored conversation are settled apart.
     pub(crate) fn learn_command_ends_from_result(&mut self, tool: &str, output: &str) {
         if !reports_on_commands(tool) {
             return;
+        }
+        if let Some((task_id, None)) = reported_task(output) {
+            self.command_ends.saw_running(&task_id);
         }
         for (task_id, end) in reported_ends(output) {
             self.learn_command_end(&task_id, &end);
@@ -81,12 +100,14 @@ impl AppState {
         }
     }
 
-    /// Settles a restored transcript: what later results in it say, then
-    /// what the task list says. A row still running whose task the list does
-    /// not have shows `state unknown`: its command ran in an earlier Orca,
-    /// and nothing says how it ended.
+    /// Settles a restored transcript: what is already known, what later
+    /// results in it say, then what the task list says. A row still running
+    /// shows `state unknown` when the task list does not have its task and
+    /// it is the row of a command this Orca did not see running: the command
+    /// ran in an earlier Orca, and nothing says how it ended. The row of a
+    /// command this Orca saw running, as when a conversation shown before is
+    /// attached again, keeps showing it running.
     pub(crate) fn settle_restored_command_rows(&mut self) {
-        self.command_ends.clear();
         let reported: Vec<_> = self
             .transcript
             .messages
@@ -121,6 +142,7 @@ impl AppState {
             self.show_known_command_end(index);
             if let Some((task_id, None)) = self.command_row_task(index)
                 && !in_task_list.contains(&task_id)
+                && !self.command_ends.seen_running.contains(&task_id)
             {
                 let end = unknown_end();
                 self.command_ends.learn(&task_id, &end);
@@ -442,6 +464,61 @@ mod tests {
             "completed",
         )]));
         assert_eq!(note(&state, "call-1"), None);
+    }
+
+    #[test]
+    fn a_reattached_row_of_a_command_this_orca_saw_running_keeps_still_running() {
+        let mut state = state();
+        tool(&mut state, "call-1", "bash", running("task-1"));
+        restore(
+            &mut state,
+            vec![restored("call-1", "bash", running("task-1"))],
+        );
+        assert_eq!(note(&state, "call-1").as_deref(), Some("still running"));
+    }
+
+    #[test]
+    fn a_reattached_row_shows_an_end_learned_before_the_reattach() {
+        let mut state = state();
+        tool(&mut state, "call-1", "bash", running("task-1"));
+        tool(
+            &mut state,
+            "call-2",
+            "task_read_output",
+            ended("task-1", "failed", 4),
+        );
+        restore(
+            &mut state,
+            vec![restored("call-1", "bash", running("task-1"))],
+        );
+        assert_eq!(note(&state, "call-1").as_deref(), Some("exit 4"));
+    }
+
+    #[test]
+    fn a_new_session_forgets_what_it_saw_running() {
+        let mut state = state();
+        tool(&mut state, "call-1", "bash", running("task-1"));
+        state.update(TuiEvent::NewSessionStarted);
+        restore(
+            &mut state,
+            vec![restored("call-1", "bash", running("task-1"))],
+        );
+        assert_eq!(note(&state, "call-1").as_deref(), Some("state unknown"));
+    }
+
+    #[test]
+    fn only_the_commands_this_orca_saw_running_are_kept_running_on_a_reattach() {
+        let mut state = state();
+        tool(&mut state, "call-1", "bash", running("task-1"));
+        restore(
+            &mut state,
+            vec![
+                restored("call-1", "bash", running("task-1")),
+                restored("call-2", "bash", running("task-2")),
+            ],
+        );
+        assert_eq!(note(&state, "call-1").as_deref(), Some("still running"));
+        assert_eq!(note(&state, "call-2").as_deref(), Some("state unknown"));
     }
 
     /// The note of the latest bash row; `None` before there is one.
