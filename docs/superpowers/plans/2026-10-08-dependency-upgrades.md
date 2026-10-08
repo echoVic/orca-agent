@@ -1528,6 +1528,24 @@
   有差异就说明原因，属于回归的修掉。
 - [ ] **Step 7：提交。** `chore(deps): move the site to vite 8, TypeScript 7 and React 19.3`
 
+### Task 9（2026-10-09 追加）：命令自己结束时也更新那一行
+
+用户决定修好 Task 1 留下的空闲情况，对应规格第 1 节第 8 条。先做了只读的设计调研，比较了三种做法：
+- 调用返回时就发布任务：持久化后会留下 running 行；
+- 新增一种事件：v0.5.7 会把会话隔离；
+- TUI 直接读任务表：绕过了 typed surface。
+
+最后选了"只在命令结束时发布"。
+
+- **提交：** 0244c89a（runtime 和 TUI 两部分一起，单拆哪一半都不完整），45cfd0f0（评审的 7 个小问题）。
+- **runtime：**
+  - `terminal_service.rs`：`ShellTaskEnd`、`ShellTaskEndSink` 和 `report_end`；`continue_session` 也会标记后台命令。
+  - 新文件 `runtime_actor/thread_actor_shell_tasks.rs`：actor 的 select 分支，以及重试和放弃。
+  - `commit.rs`：精确形状的提交权限。
+  - `runtime_host.rs`：启动时对 main session 镜像的对账跳过 Shell 任务。
+- **TUI：** `workflow_panel.rs` 把 Shell 任务分到 `command_tasks`，`command_ends.rs` 和 `terminal_output.rs` 从这里读取结束状态。
+- **验收：** 原来 ignore 的 `a_bash_row_shows_how_its_command_ended_after_outliving_the_call` 已经打开并通过，另外新增了一个 `exit 3` 的版本。Ghostty 实测确认了三点：空闲时那一行从 `still running` 变成 `exit 2`；恢复会话后状态仍在；v0.5.7 能打开同一个会话。
+
 ## 收尾（控制会话）
 
 - [ ] **全量验证。** 在这台 Mac 上跑：
