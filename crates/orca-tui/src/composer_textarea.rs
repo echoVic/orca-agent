@@ -1,4 +1,5 @@
-use ratatui_textarea::{CursorMove, DataCursor, TextArea};
+use ratatui_textarea::{CursorMove, DataCursor, Input, Key, TextArea};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme::Theme;
 use crate::vim::VimState;
@@ -80,6 +81,116 @@ pub(crate) fn textarea_cursor_byte_index(textarea: &TextArea) -> usize {
         cursor += line.len() + 1;
     }
     cursor
+}
+
+/// `TextArea::input` for the composer. Left, Right, Up and Down, and their
+/// Ctrl+B, Ctrl+F, Ctrl+P and Ctrl+N forms, with or without Shift, move
+/// through `move_composer_cursor`.
+pub(crate) fn composer_input(textarea: &mut TextArea, input: Input) -> bool {
+    let movement = match (input.key, input.ctrl, input.alt) {
+        (Key::Right, false, false) | (Key::Char('f'), true, false) => CursorMove::Forward,
+        (Key::Left, false, false) | (Key::Char('b'), true, false) => CursorMove::Back,
+        (Key::Up, false, false) | (Key::Char('p'), true, false) => CursorMove::Up,
+        (Key::Down, false, false) | (Key::Char('n'), true, false) => CursorMove::Down,
+        _ => return textarea.input(input),
+    };
+    move_composer_cursor(textarea, movement, Some(input.shift));
+    false
+}
+
+/// Moves the composer's cursor so it never stops in front of a character
+/// that takes no screen column, such as the variation selector in ⚠️, the
+/// jamo of a Hangul syllable written in parts or a zero-width space.
+/// ratatui-textarea moves by screen column and can stop there, and what is
+/// typed next then lands inside a character.
+/// - Left and right step one character and cross a line break only at a
+///   line's true end or start, as tui-textarea 0.7 did.
+/// - Up and down keep the screen column, but a cursor that lands inside a
+///   character goes on to that character's end.
+/// - Other moves are the textarea's own.
+///
+/// `shift` is a key press's Shift, which starts or keeps a selection while
+/// its absence drops one. vim passes `None`, keeping the selection as it is.
+pub(crate) fn move_composer_cursor(
+    textarea: &mut TextArea,
+    movement: CursorMove,
+    shift: Option<bool>,
+) {
+    let before = textarea.cursor();
+    let (row, col) = match movement {
+        CursorMove::Forward | CursorMove::Back => {
+            let Some(target) = one_character_on(textarea.lines(), before, movement) else {
+                return;
+            };
+            match shift {
+                Some(true) if !textarea.is_selecting() => textarea.start_selection(),
+                Some(false) => textarea.cancel_selection(),
+                _ => {}
+            }
+            target
+        }
+        CursorMove::Up | CursorMove::Down => {
+            match shift {
+                Some(shift) => {
+                    let key = if movement == CursorMove::Up {
+                        Key::Up
+                    } else {
+                        Key::Down
+                    };
+                    textarea.input(Input {
+                        key,
+                        shift,
+                        ..Input::default()
+                    });
+                }
+                None => textarea.move_cursor(movement),
+            }
+            let DataCursor(row, col) = textarea.cursor();
+            let end = out_of_character(&textarea.lines()[row], col);
+            if textarea.cursor() == before || end == col {
+                return;
+            }
+            (row, end)
+        }
+        other => return textarea.move_cursor(other),
+    };
+    match (u16::try_from(row), u16::try_from(col)) {
+        (Ok(row), Ok(col)) => textarea.move_cursor(CursorMove::Jump(row, col)),
+        // `Jump` stops at u16; on a line that long the textarea's own move has to do.
+        _ if movement != CursorMove::Up && movement != CursorMove::Down => {
+            textarea.move_cursor(movement)
+        }
+        _ => {}
+    }
+}
+
+/// Where tui-textarea 0.7 put the cursor one character left or right of
+/// `cursor`, or `None` at the very start or end of the text.
+fn one_character_on(
+    lines: &[String],
+    DataCursor(row, col): DataCursor,
+    movement: CursorMove,
+) -> Option<(usize, usize)> {
+    match movement {
+        CursorMove::Forward if col < lines[row].chars().count() => Some((row, col + 1)),
+        CursorMove::Forward if row + 1 < lines.len() => Some((row + 1, 0)),
+        CursorMove::Back if col > 0 => Some((row, col - 1)),
+        CursorMove::Back if row > 0 => Some((row - 1, lines[row - 1].chars().count())),
+        _ => None,
+    }
+}
+
+/// `col`, or the end of the character (grapheme cluster) `col` falls inside.
+fn out_of_character(line: &str, col: usize) -> usize {
+    let mut start = 0;
+    for grapheme in line.graphemes(true) {
+        let end = start + grapheme.chars().count();
+        if col < end {
+            return if col > start { end } else { col };
+        }
+        start = end;
+    }
+    col
 }
 
 pub(crate) fn insert_pasted_text(textarea: &mut TextArea, pasted: &str) -> bool {

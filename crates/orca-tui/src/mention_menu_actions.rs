@@ -5,7 +5,7 @@ use orca_runtime::mentions;
 
 use crate::composer_input_actions::delete_atomic_skill_token;
 use crate::composer_textarea::{
-    make_textarea_with_text_at_cursor, textarea_cursor_byte_index, textarea_text,
+    composer_input, make_textarea_with_text_at_cursor, textarea_cursor_byte_index, textarea_text,
 };
 use crate::theme::Theme;
 use crate::types::AppState;
@@ -110,7 +110,7 @@ pub(crate) fn handle_mention_menu_key(
             true
         }
         _ => {
-            textarea.input(Input::from(ev.clone()));
+            composer_input(textarea, Input::from(ev.clone()));
             true
         }
     }

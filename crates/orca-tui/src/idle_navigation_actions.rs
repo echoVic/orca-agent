@@ -3,6 +3,7 @@ use crossbeam_channel as mpsc;
 use crossterm::event::Event;
 use ratatui_textarea::{Input, TextArea};
 
+use crate::composer_textarea::composer_input;
 use crate::protocol::UserAction;
 use crate::shortcuts::IdleShortcut;
 use crate::types::AppState;
@@ -17,14 +18,14 @@ pub(crate) fn handle_idle_navigation_shortcut(
     match shortcut {
         IdleShortcut::ScrollUp => {
             if textarea.lines().len() > 1 {
-                textarea.input(Input::from(ev.clone()));
+                composer_input(textarea, Input::from(ev.clone()));
             } else {
                 state.scroll_up(1);
             }
         }
         IdleShortcut::ScrollDown => {
             if textarea.lines().len() > 1 {
-                textarea.input(Input::from(ev.clone()));
+                composer_input(textarea, Input::from(ev.clone()));
             } else {
                 state.scroll_down(1);
             }

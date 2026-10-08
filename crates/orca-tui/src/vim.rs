@@ -5,6 +5,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Block;
 use ratatui_textarea::{CursorMove, DataCursor, Input, Key, TextArea};
 
+use crate::composer_textarea::{composer_input, move_composer_cursor};
 use crate::theme::Theme;
 use crate::vim_command::{
     VimCommand, VimCommandParser, VimCommandResolution, VimMotion, VimRegisterSelector,
@@ -215,7 +216,7 @@ impl VimState {
         now: Instant,
     ) -> bool {
         if !self.enabled {
-            return textarea.input(input);
+            return composer_input(textarea, input);
         }
 
         let changed = match self.mode {
@@ -307,7 +308,7 @@ impl VimState {
             });
             return true;
         }
-        textarea.input(input)
+        composer_input(textarea, input)
     }
 
     fn handle_command(&mut self, input: Input, textarea: &mut TextArea<'_>) -> bool {
@@ -359,7 +360,7 @@ impl VimState {
                 ..
             } => {
                 textarea.cancel_selection();
-                textarea.move_cursor(CursorMove::Forward);
+                move_composer_cursor(textarea, CursorMove::Forward, None);
                 self.mode = VimMode::Insert;
                 true
             }
@@ -787,7 +788,7 @@ fn delete_chars(textarea: &mut TextArea<'_>, count: usize) -> Option<String> {
     textarea.start_selection();
     for _ in 0..count {
         let before = textarea.cursor();
-        textarea.move_cursor(CursorMove::Forward);
+        move_composer_cursor(textarea, CursorMove::Forward, None);
         if textarea.cursor() == before {
             break;
         }
@@ -888,11 +889,7 @@ fn move_cursor(textarea: &mut TextArea<'_>, movement: CursorMove, visual: bool) 
     if visual && textarea.selection_range().is_none() {
         textarea.start_selection();
     }
-    if visual {
-        textarea.move_cursor(movement);
-    } else {
-        textarea.move_cursor(movement);
-    }
+    move_composer_cursor(textarea, movement, None);
     true
 }
 

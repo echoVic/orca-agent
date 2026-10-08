@@ -8,7 +8,9 @@ use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{ReasoningEffort, RunConfig};
 
 use crate::commands;
-use crate::composer_textarea::{make_textarea, make_textarea_with_text, textarea_text};
+use crate::composer_textarea::{
+    composer_input, make_textarea, make_textarea_with_text, textarea_text,
+};
 use crate::full_access_confirmation_actions::request_settings_change;
 use crate::protocol::UserAction;
 use crate::slash_command_actions::encode_settings_intent;
@@ -202,7 +204,7 @@ pub(crate) fn handle_slash_menu_key(
             true
         }
         _ => {
-            textarea.input(Input::from(ev.clone()));
+            composer_input(textarea, Input::from(ev.clone()));
             update_slash_menu(textarea, state, config);
             true
         }

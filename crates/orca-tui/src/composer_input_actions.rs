@@ -5,7 +5,7 @@ use orca_core::config::RunConfig;
 use orca_runtime::mentions;
 
 use crate::composer_textarea::{
-    make_textarea, make_textarea_with_text, make_textarea_with_text_at_cursor,
+    composer_input, make_textarea, make_textarea_with_text, make_textarea_with_text_at_cursor,
     textarea_cursor_byte_index, textarea_text,
 };
 use crate::shortcuts::{EditorShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
@@ -133,7 +133,7 @@ pub(crate) fn recall_previous_history(
     theme: &Theme,
 ) {
     if key.code == KeyCode::Up && textarea.lines().len() > 1 {
-        textarea.input(Input::from(ev.clone()));
+        composer_input(textarea, Input::from(ev.clone()));
     } else if textarea.is_empty()
         && let Some(cleared) = state.cleared_draft.take()
     {
@@ -163,7 +163,7 @@ pub(crate) fn recall_next_history(
     theme: &Theme,
 ) {
     if key.code == KeyCode::Down && textarea.lines().len() > 1 {
-        textarea.input(Input::from(ev.clone()));
+        composer_input(textarea, Input::from(ev.clone()));
     } else if let Some(history) = state.history_next() {
         state.atomic_skill_tokens.clear();
         state.composer_images.clear_attachments();
@@ -217,12 +217,12 @@ pub(crate) fn apply_composer_key_input(
                 make_textarea_with_text_at_cursor(&edit.text, edit.cursor, vim_state, theme);
             true
         } else {
-            textarea.input(Input::from(normalized_event.clone()))
+            composer_input(textarea, Input::from(normalized_event.clone()))
         }
     } else if vim_state.enabled {
         vim_state.handle(Input::from(normalized_event.clone()), textarea, theme)
     } else {
-        textarea.input(Input::from(normalized_event))
+        composer_input(textarea, Input::from(normalized_event))
     };
     sync_vim_mode_label(state, vim_state);
     if changed {
@@ -479,6 +479,205 @@ mod tests {
             ));
             assert_eq!(textarea_text(&textarea), left, "{text:?}");
         }
+    }
+
+    type EditorFixture = (AppState, RunConfig, Theme, VimState, TextArea<'static>);
+
+    /// Sends one key the way the idle and running key paths do: an editor
+    /// shortcut first, otherwise straight to the composer (or vim).
+    fn press(fixture: &mut EditorFixture, code: KeyCode, modifiers: KeyModifiers) {
+        let (state, config, theme, vim, textarea) = fixture;
+        let key = KeyEvent::new(code, modifiers);
+        let event = Event::Key(key);
+        if !handle_composer_editor_shortcut(&event, &key, state, config, textarea, vim, theme) {
+            apply_composer_key_input(&event, &key, state, config, textarea, vim, theme);
+        }
+    }
+
+    fn press_all(fixture: &mut EditorFixture, keys: &[(KeyCode, KeyModifiers)]) {
+        for &(code, modifiers) in keys {
+            press(fixture, code, modifiers);
+        }
+    }
+
+    const PLAIN: KeyModifiers = KeyModifiers::NONE;
+    const CTRL: KeyModifiers = KeyModifiers::CONTROL;
+
+    /// Runs `keys` on `text` with the cursor at byte `cursor`, then types X.
+    /// Returns where the keys left the cursor and the text after the X.
+    fn cursor_then_typed(
+        text: &str,
+        cursor: usize,
+        vim: bool,
+        keys: &[(KeyCode, KeyModifiers)],
+    ) -> ((usize, usize), String) {
+        let mut fixture = editor_fixture(text, cursor, vim);
+        press_all(&mut fixture, keys);
+        let landed = fixture.4.cursor();
+        if vim {
+            press(&mut fixture, KeyCode::Char('i'), PLAIN);
+        }
+        press(&mut fixture, KeyCode::Char('X'), PLAIN);
+        ((landed.0, landed.1), textarea_text(&fixture.4))
+    }
+
+    /// Every case whose cursor or typed text differs from the expectation.
+    fn mismatches(
+        cases: impl IntoIterator<Item = (String, ((usize, usize), String), ((usize, usize), String))>,
+    ) -> Vec<String> {
+        cases
+            .into_iter()
+            .filter(|(_, actual, expected)| actual != expected)
+            .map(|(case, actual, expected)| format!("{case}: got {actual:?}, want {expected:?}"))
+            .collect()
+    }
+
+    /// A line ending in characters that take no screen column: a variation
+    /// selector (⚠️, ❤️), Hangul jamo (한 written as three code points), a
+    /// zero-width space. The number is the line's length in characters.
+    const LINES_ENDING_IN_ZERO_WIDTH: [(&str, usize); 4] = [
+        ("ok \u{26a0}\u{fe0f}", 5),
+        ("thanks \u{2764}\u{fe0f}", 9),
+        ("\u{1112}\u{1161}\u{11ab}", 3),
+        ("abc\u{200b}", 4),
+    ];
+
+    #[test]
+    fn right_steps_over_a_zero_width_character_at_the_end_of_a_line() {
+        let wrong = mismatches(
+            LINES_ENDING_IN_ZERO_WIDTH
+                .into_iter()
+                .flat_map(|(text, len)| {
+                    [
+                        ("Right", KeyCode::Right, PLAIN),
+                        ("Ctrl+F", KeyCode::Char('f'), CTRL),
+                    ]
+                    .map(|(name, code, modifiers)| {
+                        (
+                            format!("{text:?} Left, {name}"),
+                            cursor_then_typed(
+                                text,
+                                text.len(),
+                                false,
+                                &[(KeyCode::Left, PLAIN), (code, modifiers)],
+                            ),
+                            ((0, len), format!("{text}X")),
+                        )
+                    })
+                }),
+        );
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn vim_l_steps_over_a_zero_width_character_at_the_end_of_a_line() {
+        let keys = [
+            (KeyCode::Esc, PLAIN),
+            (KeyCode::Char('h'), PLAIN),
+            (KeyCode::Char('l'), PLAIN),
+        ];
+        let wrong = mismatches(LINES_ENDING_IN_ZERO_WIDTH.into_iter().map(|(text, len)| {
+            (
+                format!("{text:?} vim h, l"),
+                cursor_then_typed(text, text.len(), true, &keys),
+                ((0, len), format!("{text}X")),
+            )
+        }));
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn right_leaves_a_line_only_from_its_true_end() {
+        let text = "ok \u{26a0}\u{fe0f}\nnext";
+        let line_end = "ok \u{26a0}\u{fe0f}".len();
+        let wrong = mismatches([
+            (
+                "Left, Right before the variation selector".to_string(),
+                cursor_then_typed(
+                    text,
+                    line_end,
+                    false,
+                    &[(KeyCode::Left, PLAIN), (KeyCode::Right, PLAIN)],
+                ),
+                ((0, 5), "ok \u{26a0}\u{fe0f}X\nnext".to_string()),
+            ),
+            (
+                "Right at the true end".to_string(),
+                cursor_then_typed(text, line_end, false, &[(KeyCode::Right, PLAIN)]),
+                ((1, 0), "ok \u{26a0}\u{fe0f}\nXnext".to_string()),
+            ),
+        ]);
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn left_from_a_line_start_lands_after_the_whole_line_above() {
+        let wrong = mismatches(LINES_ENDING_IN_ZERO_WIDTH.into_iter().map(|(text, len)| {
+            (
+                format!("{text:?} then a line, Left from its start"),
+                cursor_then_typed(
+                    &format!("{text}\nnext"),
+                    text.len() + 1,
+                    false,
+                    &[(KeyCode::Left, PLAIN)],
+                ),
+                ((0, len), format!("{text}X\nnext")),
+            )
+        }));
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn up_and_down_never_leave_the_cursor_inside_a_character() {
+        // Down from the end of `abcdefgh` onto `ok ⚠️`, and Up from the end of
+        // `abcd` onto 한 written as three code points.
+        let down_text = "abcdefgh\nok \u{26a0}\u{fe0f}";
+        let down = ((1, 5), format!("{down_text}X"));
+        let up_text = "\u{1112}\u{1161}\u{11ab}\nabcd";
+        let up = ((0, 3), "\u{1112}\u{1161}\u{11ab}X\nabcd".to_string());
+        let mut cases = Vec::new();
+        for (name, keys) in [
+            ("Down", vec![(KeyCode::Down, PLAIN)]),
+            ("Ctrl+N", vec![(KeyCode::Char('n'), CTRL)]),
+        ] {
+            cases.push((
+                name.to_string(),
+                cursor_then_typed(down_text, 8, false, &keys),
+                down.clone(),
+            ));
+        }
+        cases.push((
+            "vim j".to_string(),
+            cursor_then_typed(
+                down_text,
+                8,
+                true,
+                &[(KeyCode::Esc, PLAIN), (KeyCode::Char('j'), PLAIN)],
+            ),
+            down,
+        ));
+        for (name, keys) in [
+            ("Up", vec![(KeyCode::Up, PLAIN)]),
+            ("Ctrl+P", vec![(KeyCode::Char('p'), CTRL)]),
+        ] {
+            cases.push((
+                name.to_string(),
+                cursor_then_typed(up_text, up_text.len(), false, &keys),
+                up.clone(),
+            ));
+        }
+        cases.push((
+            "vim k".to_string(),
+            cursor_then_typed(
+                up_text,
+                up_text.len(),
+                true,
+                &[(KeyCode::Esc, PLAIN), (KeyCode::Char('k'), PLAIN)],
+            ),
+            up,
+        ));
+        let wrong = mismatches(cases);
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     #[test]
