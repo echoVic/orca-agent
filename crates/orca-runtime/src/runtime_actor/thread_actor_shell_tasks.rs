@@ -1,8 +1,10 @@
-// Mechanical ThreadActor method boundary; state ownership lives in runtime_actor controllers.
+// How commands that outlived their calls ended, on their way from the terminal
+// supervisors to the typed surface: this file owns the ends the actor holds
+// (ShellTaskEnds) and the ThreadActor methods that publish them.
 use super::*;
 
 use crate::task_view::ShellEndDetail;
-use crate::terminal_service::{ShellTaskEnd, ShellTaskEndInbox};
+use crate::terminal_service::{SHELL_TASK_END_CAPACITY, ShellTaskEnd, ShellTaskEndInbox};
 
 /// Polls on which one end may fail to commit before it is dropped.
 pub(super) const SHELL_TASK_END_COMMIT_ATTEMPTS: u8 = 20;
@@ -21,8 +23,15 @@ pub(super) fn inject_shell_task_end_commit_failures(description: &str, count: u8
         .insert(description.to_string(), count);
 }
 
+/// Whether a test made this commit of the end of the command `description`
+/// fail; never outside tests.
+#[cfg(not(test))]
+fn shell_task_end_commit_fails(_description: &str) -> bool {
+    false
+}
+
 #[cfg(test)]
-fn take_shell_task_end_commit_failure(description: &str) -> bool {
+fn shell_task_end_commit_fails(description: &str) -> bool {
     let mut failures = SHELL_TASK_END_COMMIT_FAILURES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -70,15 +79,22 @@ impl ShellTaskEnds {
     /// Takes what the supervisors left, to publish once the surface may
     /// commit.
     pub(super) fn take_left(&mut self) {
-        self.pending.extend(
-            self.inbox
-                .take()
-                .into_iter()
-                .map(|end| PendingShellTaskEnd {
-                    end,
-                    failed_commits: 0,
-                }),
-        );
+        let left = self.inbox.take();
+        self.keep(left);
+    }
+
+    /// Keeps `ends` to publish, at most `SHELL_TASK_END_CAPACITY` of them:
+    /// past it the oldest is dropped, as the supervisor drops them.
+    fn keep(&mut self, ends: Vec<ShellTaskEnd>) {
+        for end in ends {
+            if self.pending.len() >= SHELL_TASK_END_CAPACITY {
+                self.pending.pop_front();
+            }
+            self.pending.push_back(PendingShellTaskEnd {
+                end,
+                failed_commits: 0,
+            });
+        }
     }
 }
 
@@ -113,12 +129,8 @@ impl ThreadActor {
                 self.shell_task_ends.pending.pop_front();
                 continue;
             };
-            #[cfg(test)]
-            let injected_failure = take_shell_task_end_commit_failure(&pending.end.description);
-            #[cfg(not(test))]
-            let injected_failure = false;
             let batch = self.surface_event_batch_with_commit_id(events, None);
-            let committed = if injected_failure {
+            let committed = if shell_task_end_commit_fails(&pending.end.description) {
                 Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
             } else {
                 self.commit_surface_actor_batch_with_retry(&batch)
@@ -127,7 +139,9 @@ impl ThreadActor {
                 Ok(()) => {
                     self.shell_task_ends.pending.pop_front();
                 }
-                Err(error) => {
+                // The commit helper reports every failure as the runtime being
+                // unavailable, so there is no cause to name.
+                Err(_) => {
                     let pending = self
                         .shell_task_ends
                         .pending
@@ -136,8 +150,8 @@ impl ThreadActor {
                     pending.failed_commits = pending.failed_commits.saturating_add(1);
                     if pending.failed_commits >= SHELL_TASK_END_COMMIT_ATTEMPTS {
                         eprintln!(
-                            "orca: gave up showing how command task {} ended: {error:?}",
-                            pending.end.task_id
+                            "orca: dropped how command task {} ended: its commit failed {} times",
+                            pending.end.task_id, pending.failed_commits
                         );
                         self.shell_task_ends.pending.pop_front();
                     }
@@ -232,4 +246,48 @@ fn shell_task_settled_events(
             }),
         ),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ended(index: usize) -> ShellTaskEnd {
+        ShellTaskEnd {
+            task_id: format!("task-{index}"),
+            description: "true".to_string(),
+            started_at_ms: 1,
+            ended_at_ms: 2,
+            status: TaskStatus::Completed,
+            exit_code: Some(0),
+            deadline_reached: false,
+        }
+    }
+
+    #[test]
+    fn the_actor_keeps_the_newest_ends_up_to_the_supervisors_capacity() {
+        let (_sink, inbox) = crate::terminal_service::ShellTaskEndSink::channel();
+        let mut ends = ShellTaskEnds::new(inbox);
+        let overflow = 44;
+        ends.keep((0..200).map(ended).collect());
+        ends.keep(
+            (200..SHELL_TASK_END_CAPACITY + overflow)
+                .map(ended)
+                .collect(),
+        );
+
+        assert_eq!(ends.pending.len(), SHELL_TASK_END_CAPACITY);
+        assert_eq!(
+            ends.pending
+                .front()
+                .map(|pending| pending.end.task_id.as_str()),
+            Some(format!("task-{overflow}").as_str())
+        );
+        assert_eq!(
+            ends.pending
+                .back()
+                .map(|pending| pending.end.task_id.as_str()),
+            Some(format!("task-{}", SHELL_TASK_END_CAPACITY + overflow - 1).as_str())
+        );
+    }
 }

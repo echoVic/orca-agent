@@ -95,7 +95,7 @@ impl AppState {
                 // reuse the existing background_workflow_tasks so the parent dock
                 // state is never overwritten with a previous child's projection.
                 if task_id.is_some() && self.conversation_target.task_id().is_none() {
-                    self.background_workflow_tasks = self.workflow_panel.tasks().to_vec();
+                    self.background_workflow_tasks = self.workflow_panel.task_list();
                 }
                 self.focused_workflow_tasks.clear();
                 self.set_conversation_target(match task_id {
@@ -550,8 +550,7 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
-                let mut tasks = self.workflow_tasks().to_vec();
-                tasks.extend_from_slice(self.command_tasks());
+                let mut tasks = self.workflow_panel.task_list();
                 if let Some(existing) = tasks.iter_mut().find(|existing| existing.id == task.id) {
                     *existing = task;
                 } else {

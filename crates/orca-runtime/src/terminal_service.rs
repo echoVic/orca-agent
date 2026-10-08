@@ -27,9 +27,9 @@ const COMPLETION_QUEUE_CAPACITY: usize = 64;
 const COMPLETION_OUTPUT_MAX_BYTES: usize = 8 * 1024;
 const COMPLETED_SESSION_RETENTION: Duration = Duration::from_secs(10 * 60);
 const MAX_COMPLETED_SESSIONS: usize = 256;
-/// Command ends the supervisor holds for the thread actor at most; past it
-/// the oldest is dropped, as with the model's notifications.
-const SHELL_TASK_END_CAPACITY: usize = 256;
+/// Command ends the supervisor, and then the thread actor, hold at most;
+/// past it the oldest is dropped, as with the model's notifications.
+pub(crate) const SHELL_TASK_END_CAPACITY: usize = 256;
 /// The longest description a command's task gets, in characters.
 const SHELL_TASK_DESCRIPTION_MAX_CHARS: usize = 120;
 

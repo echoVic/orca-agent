@@ -62,6 +62,16 @@ impl WorkflowPanelState {
         &self.command_tasks
     }
 
+    /// Every task of the list: the panel's, then the shell tasks it leaves
+    /// out.
+    pub(crate) fn task_list(&self) -> Vec<BackgroundTaskSummary> {
+        self.tasks
+            .iter()
+            .chain(&self.command_tasks)
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn selected(&self) -> usize {
         self.selected
     }

@@ -205,6 +205,7 @@ impl RuntimeToolActorContext {
         .then(|| task_registry)
         .flatten()
         .map(|task_registry| {
+            // This store is the context's own and never holds a sink: this finds none.
             // Taken before `get_or_init`, which holds the store's lock while
             // it starts the service.
             let end_sink = self

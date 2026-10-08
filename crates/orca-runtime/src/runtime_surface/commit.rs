@@ -6790,11 +6790,36 @@ fn actor_control_shell_task_settled_authorized(
     let [created, settled] = batch.events.as_slice() else {
         return false;
     };
+    // Every field is named, so a field added to the task or the patch has to
+    // be decided on here before the actor permit may set it.
     let (
         SurfaceScope::Thread,
         super::SurfaceEvent::Task(super::TaskPatch::Upserted {
             expected_revision: None,
-            task,
+            task:
+                super::SurfaceTask {
+                    task_id,
+                    revision,
+                    task_type,
+                    status: created_status,
+                    backgrounded,
+                    // What a task row shows; any text and time will do.
+                    description: _,
+                    created_at: _,
+                    started_at,
+                    completed_at: created_completed_at,
+                    parent_operation,
+                    parent_task_id,
+                    background_fence,
+                    workflow_run_id,
+                    subagent_id,
+                    pending_interaction_id,
+                    usage,
+                    result: created_result,
+                    error: created_error,
+                    retry_count,
+                    output_truncated,
+                },
         }),
     ) = (&created.scope, &created.event)
     else {
@@ -6803,7 +6828,7 @@ fn actor_control_shell_task_settled_authorized(
     let (
         SurfaceScope::Thread,
         super::SurfaceEvent::Task(super::TaskPatch::StatusChanged {
-            task_id,
+            task_id: settled_task_id,
             expected_revision,
             next_revision,
             status,
@@ -6824,24 +6849,24 @@ fn actor_control_shell_task_settled_authorized(
         | super::SurfaceTaskStatus::Cancelled => error.is_none(),
         _ => false,
     };
-    task.task_type == super::SurfaceTaskType::Shell
-        && task.revision.get() == 1
-        && task.status == super::SurfaceTaskStatus::Running
-        && !task.backgrounded
-        && task.started_at.is_some()
-        && task.completed_at.is_none()
-        && task.parent_operation.is_none()
-        && task.parent_task_id.is_none()
-        && task.background_fence.is_none()
-        && task.workflow_run_id.is_none()
-        && task.subagent_id.is_none()
-        && task.pending_interaction_id.is_none()
-        && task.usage.is_none()
-        && task.result.is_none()
-        && task.error.is_none()
-        && task.retry_count == 0
-        && !task.output_truncated
-        && *task_id == task.task_id
+    *task_type == super::SurfaceTaskType::Shell
+        && revision.get() == 1
+        && *created_status == super::SurfaceTaskStatus::Running
+        && !backgrounded
+        && started_at.is_some()
+        && created_completed_at.is_none()
+        && parent_operation.is_none()
+        && parent_task_id.is_none()
+        && background_fence.is_none()
+        && workflow_run_id.is_none()
+        && subagent_id.is_none()
+        && pending_interaction_id.is_none()
+        && usage.is_none()
+        && created_result.is_none()
+        && created_error.is_none()
+        && *retry_count == 0
+        && !output_truncated
+        && settled_task_id == task_id
         && expected_revision.get() == 1
         && next_revision.get() == 2
         && completed_at.is_some()
@@ -6851,7 +6876,7 @@ fn actor_control_shell_task_settled_authorized(
             .snapshot()
             .tasks
             .iter()
-            .any(|existing| existing.task_id == task.task_id)
+            .any(|existing| existing.task_id == *task_id)
 }
 
 fn operation_fence_is_known(

@@ -6688,6 +6688,76 @@ fn sibling_child_focus_switch_preserves_parent_workflow_tasks() {
     );
 }
 
+/// Entering a child keeps the parent's shell tasks in the background list, as
+/// a task list update with Main in view stores them: the child's projection
+/// merges over that list, and the parent's shell tasks stay command tasks.
+#[test]
+fn entering_a_child_keeps_the_parent_shell_tasks_in_the_background_list() {
+    let mut state = state();
+    let parent = workflow_task_summary("parent-a", "Parent task A");
+    let mut shell = workflow_task_summary("parent-shell", "sleep 1; exit 3");
+    shell.task_type = TaskType::Shell;
+    shell.status = TaskStatus::Failed;
+    shell.error = Some("exit code 3".to_string());
+    state.apply_workflow_tasks_for_test(vec![parent, shell]);
+
+    state.update(TuiEvent::ChildFocusChanged {
+        task_id: Some("child-a".into()),
+    });
+    assert!(
+        state
+            .background_workflow_tasks
+            .iter()
+            .any(|task| task.id == "parent-shell"),
+        "the background list lost the parent's shell task: {:?}",
+        state
+            .background_workflow_tasks
+            .iter()
+            .map(|task| &task.id)
+            .collect::<Vec<_>>()
+    );
+
+    let mut child = workflow_task_summary("child-a-task", "child work");
+    child.task_type = TaskType::Subagent;
+    state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+        SurfaceProjectionState {
+            cursor: crate::surface_projection::test_surface_cursor(2),
+            session_id: Some("child-session".to_string()),
+            title: "Child session".to_string(),
+            usage_revision: 1,
+            usage: UsageTotals::default(),
+            context_revision: 1,
+            context_used_tokens: 0,
+            context_limit_tokens: 128_000,
+            workflow_tasks: vec![child],
+            current_goal: None,
+            foreground_operation_id: None,
+            recoverable_operation_id: None,
+            goal_presentation: None,
+            session_presentation: None,
+            mcp_catalog: Default::default(),
+        },
+    )));
+    assert!(
+        state
+            .command_tasks()
+            .iter()
+            .any(|task| task.id == "parent-shell")
+    );
+    assert!(
+        state
+            .workflow_tasks()
+            .iter()
+            .all(|task| task.id != "parent-shell")
+    );
+    assert!(
+        state
+            .workflow_tasks()
+            .iter()
+            .any(|task| task.id == "child-a-task")
+    );
+}
+
 /// End-to-end: main → child-a → main → child-b, verifying conversation_target at
 /// every hop and that a session reset clears the target back to Main.
 #[test]
