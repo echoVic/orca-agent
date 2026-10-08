@@ -231,7 +231,7 @@ async fn search_exa_at_or_cancel_async(
 }
 
 fn search_client() -> Result<reqwest::Client, SearchError> {
-    let builder = reqwest::Client::builder().timeout(SEARCH_TIMEOUT);
+    let builder = orca_mcp::http::client_builder().timeout(SEARCH_TIMEOUT);
     #[cfg(test)]
     let builder = builder.no_proxy();
     builder

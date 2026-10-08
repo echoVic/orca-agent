@@ -28,7 +28,7 @@ fn is_retryable_status(status: u16) -> bool {
 }
 
 static CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
-    BlockingClient::builder()
+    orca_mcp::http::blocking_client_builder()
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build()
@@ -36,7 +36,7 @@ static CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
 });
 
 pub(crate) fn streaming_client() -> Result<Client, String> {
-    Client::builder()
+    orca_mcp::http::client_builder()
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .hickory_dns(true)
         .build()

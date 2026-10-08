@@ -71,6 +71,8 @@ jobs:
           node scripts/validate-runtime-surface-contract.mjs
           node scripts/test-validate-execution-broker-boundary.mjs
           node scripts/validate-execution-broker-boundary.mjs
+          node scripts/test-validate-http-client-boundary.mjs
+          node scripts/validate-http-client-boundary.mjs
       - name: Mark the start of the test steps
         run: touch "$RUNNER_TEMP/orca-home-marker"
       - name: Validate dependency graph and Rust inventory

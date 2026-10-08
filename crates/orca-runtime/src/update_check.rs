@@ -271,7 +271,7 @@ pub fn check_latest(current_version: &str) -> Result<Option<UpdateInfo>, String>
 }
 
 fn check_latest_npm(current_version: &str) -> Result<Option<UpdateInfo>, String> {
-    let response = reqwest::blocking::Client::new()
+    let response = orca_mcp::http::blocking_client()
         .get(NPM_REGISTRY_URL)
         .header("User-Agent", "orca-update-check")
         .timeout(std::time::Duration::from_secs(5))
@@ -296,7 +296,7 @@ fn check_latest_npm(current_version: &str) -> Result<Option<UpdateInfo>, String>
 }
 
 fn check_latest_github(current_version: &str) -> Result<Option<UpdateInfo>, String> {
-    let response = reqwest::blocking::Client::new()
+    let response = orca_mcp::http::blocking_client()
         .get(RELEASES_URL)
         .header("User-Agent", "orca-update-check")
         .timeout(std::time::Duration::from_secs(5))

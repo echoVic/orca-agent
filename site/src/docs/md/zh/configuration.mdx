@@ -105,6 +105,14 @@ export ORCA_API_KEY="sk-..."
 无效的 `ORCA_MODE` 或推理努力级别会导致生效配置无法解析。修改环境变量或 TOML 后，
 在执行任务前运行 `orca doctor`。
 
+## 网络与证书
+
+Orca 用操作系统的证书库验证 HTTPS 证书：macOS 用钥匙串，Windows 用系统证书存储，Linux 用系统的 CA 证书包。
+
+- 公司的代理或网关用自己的 CA 时，把这张 CA 装进系统证书库就行，Orca 不需要额外设置。
+- 精简版的 Linux（比如最小化的容器镜像）要先安装 `ca-certificates`，否则 HTTPS 请求会因为找不到根证书而失败。
+- `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 环境变量照常生效。
+
 ## 目录信任
 
 新工作区默认是不受信任的。信任决定工作区是否能加载项目配置，以及是否能使用完整的

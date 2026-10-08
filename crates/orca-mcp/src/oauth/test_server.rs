@@ -276,7 +276,7 @@ pub fn test_browser() -> (OpenBrowser, mpsc::Receiver<String>) {
     let browser = move |url: &str| {
         let url = url.to_string();
         std::thread::spawn(move || {
-            let Ok(client) = reqwest::blocking::Client::builder()
+            let Ok(client) = crate::http::blocking_client_builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(FIXTURE_WAIT)
                 .build()

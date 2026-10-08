@@ -113,6 +113,14 @@ An invalid `ORCA_MODE` or reasoning-effort value prevents effective
 configuration from resolving. Run `orca doctor` after changing environment or
 TOML settings to catch it before a task run.
 
+## Network and certificates
+
+Orca checks HTTPS certificates against the operating system's trust store: the keychain on macOS, the system certificate store on Windows, and the system CA bundle on Linux.
+
+- If your company's proxy or gateway uses its own CA, install that CA in the system trust store. Orca needs no setting of its own.
+- On a minimal Linux system, such as a slim container image, install `ca-certificates` first. Otherwise HTTPS requests fail because no root certificates are found.
+- The `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` environment variables work as before.
+
 ## Folder trust
 
 New workspaces are treated as untrusted. Trust controls whether a workspace

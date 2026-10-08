@@ -3,6 +3,7 @@
 mod auth;
 pub mod client;
 mod connection_stop;
+pub mod http;
 mod legacy_sse;
 pub mod oauth;
 mod registry;

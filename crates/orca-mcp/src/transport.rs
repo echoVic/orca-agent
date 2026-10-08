@@ -1277,7 +1277,7 @@ impl StreamableHttpTransport {
             auth,
             session: Mutex::new(HttpSession::default()),
             next_id: Mutex::new(1),
-            client: reqwest::blocking::Client::new(),
+            client: crate::http::blocking_client(),
             startup_timeout: timeout_from_ms(config.startup_timeout_ms),
             tool_timeout: timeout_from_ms(config.tool_timeout_ms),
         })
@@ -1687,7 +1687,7 @@ impl StreamableHttpTransport {
                 })
                 .and_then(|runtime| {
                     runtime.block_on(request_sse_with_async_client(SseAsyncRequest {
-                        client: reqwest::Client::new(),
+                        client: crate::http::client(),
                         context,
                         params,
                         cancel: worker_cancel,
@@ -2204,7 +2204,7 @@ async fn post_sse_message(
     timeout: Duration,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let response_future = reqwest::Client::new()
+    let response_future = crate::http::client()
         .post(endpoint)
         .headers(headers.clone())
         .timeout(timeout)
@@ -4264,7 +4264,7 @@ done
             });
 
             let error = request_sse_with_client(
-                &reqwest::blocking::Client::new(),
+                &crate::http::blocking_client(),
                 "oversized",
                 &SseRequestContext {
                     endpoint: server.url(),
@@ -4739,7 +4739,7 @@ done
     fn http_requests_accept_json_and_event_streams() {
         let server = StreamableHttpServer::start(StreamableHttpBehavior::default());
         for accept in ["*/*", "application/json", "text/event-stream"] {
-            let status = reqwest::blocking::Client::new()
+            let status = crate::http::blocking_client()
                 .post(server.url())
                 .header("accept", accept)
                 .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))

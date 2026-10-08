@@ -8,6 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use hickory_resolver::TokioResolver;
+use hickory_resolver::config::LookupIpStrategy;
 use orca_core::config::PermissionProfileNetworkAccess;
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -304,8 +305,14 @@ async fn run_proxy_supervisor(
             return Err(error);
         }
     };
-    let resolver = match TokioResolver::builder_tokio() {
-        Ok(builder) => Arc::new(builder.build()),
+    let resolver = match TokioResolver::builder_tokio().and_then(|mut builder| {
+        // hickory 0.26 looks IPv6 up first by default. This proxy connects
+        // one address at a time, so it keeps the order it always had: IPv4
+        // first, IPv6 only for a host with no IPv4 address.
+        builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
+        builder.build()
+    }) {
+        Ok(resolver) => Arc::new(resolver),
         Err(error) => {
             let error = io::Error::other(format!("failed to initialize DNS resolver: {error}"));
             let _ = startup_sender.send(Err(clone_io_error(&error)));

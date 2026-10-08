@@ -537,7 +537,7 @@ mod tests {
                 )
                 .expect("write partial stream");
         });
-        let response = reqwest::Client::new()
+        let response = orca_mcp::http::client()
             .get(format!("http://{address}/stream"))
             .send()
             .await
@@ -708,7 +708,7 @@ mod tests {
             stream.flush().expect("flush stalled SSE headers");
             std::thread::sleep(Duration::from_millis(100));
         });
-        let response = reqwest::Client::new()
+        let response = orca_mcp::http::client()
             .get(format!("http://{address}/stream"))
             .send()
             .await

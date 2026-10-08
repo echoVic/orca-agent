@@ -110,7 +110,7 @@ impl LegacySseTransport {
             endpoint,
             headers,
             auth,
-            client: reqwest::blocking::Client::new(),
+            client: crate::http::blocking_client(),
             stream,
             next_id: AtomicU64::new(1),
             startup_timeout,
@@ -582,7 +582,7 @@ impl EventStreamReader {
     /// Reads the stream until it ends or the transport is dropped, and says
     /// why it stopped.
     async fn read(&mut self, stop: &mut oneshot::Receiver<()>) -> String {
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let mut response = tokio::select! {
             response = self.open(&client) => match response {
                 Ok(response) => response,

@@ -467,7 +467,7 @@ fn http_client(server: &McpServerConfig, follow_redirects: bool) -> Result<Clien
     } else {
         reqwest::redirect::Policy::none()
     };
-    Client::builder()
+    crate::http::blocking_client_builder()
         .timeout(timeout_from_ms(server.startup_timeout_ms))
         .redirect(redirects)
         .build()
@@ -1285,7 +1285,7 @@ mod tests {
                 .map(|(_, value)| value.into_owned())
                 .unwrap_or_default();
             std::thread::spawn(move || {
-                let Ok(client) = Client::builder()
+                let Ok(client) = crate::http::blocking_client_builder()
                     .redirect(reqwest::redirect::Policy::none())
                     .timeout(FIXTURE_WAIT)
                     .build()
@@ -1338,7 +1338,7 @@ mod tests {
         let browser = move |url: &str| {
             let url = url.to_string();
             std::thread::spawn(move || {
-                let Ok(client) = Client::builder()
+                let Ok(client) = crate::http::blocking_client_builder()
                     .redirect(reqwest::redirect::Policy::none())
                     .timeout(FIXTURE_WAIT)
                     .build()
