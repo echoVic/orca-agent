@@ -186,6 +186,9 @@ fn run_tui_inner(
         config.terminal_notifications,
         termination_takeover,
     )?;
+    // The runtime reports some failures on stderr. While the screen is up,
+    // such a line becomes a notice instead of being drawn over the frame.
+    let mut stderr_capture = crate::stderr_capture::StderrCapture::start(event_tx.clone());
 
     const FRAME_INTERVAL: Duration = Duration::from_millis(16);
     const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
@@ -387,6 +390,9 @@ fn run_tui_inner(
                             presentation.write_pending(terminal.backend_mut().inner_mut(), status);
                     },
                 )?;
+                // The screen goes next: what the runtime reports from here
+                // on, its shutdown included, reaches the terminal.
+                stderr_capture.stop();
                 Ok(exit_code)
             },
         ),

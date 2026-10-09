@@ -343,9 +343,8 @@ impl TuiSurfaceTaskControl {
         let Some(surface) = surface else {
             return Ok(None);
         };
-        surface
-            .client
-            .prompt_queue(action)
+        let result = surface.client.prompt_queue(action.clone());
+        crate::queued_input::settled_queue_action(&action, result)
             .map(Some)
             .map_err(|error| io::Error::other(error.to_string()))
     }

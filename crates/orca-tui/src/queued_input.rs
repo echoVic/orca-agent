@@ -834,6 +834,35 @@ impl AppState {
     }
 }
 
+/// What a runtime queue action came to. A start that finds the queue paused
+/// again, at a newer revision, was sent before an interrupt: the user's next
+/// message restarts the queue, and that start can land after the message's
+/// own turn was interrupted. The user has taken over since, so the paused
+/// queue is the answer, not an error.
+pub(crate) fn settled_queue_action(
+    action: &orca_runtime::prompt_queue::PromptQueueAction,
+    result: Result<
+        orca_runtime::prompt_queue::PromptQueueSnapshot,
+        orca_runtime::prompt_queue::PromptQueueMutationError,
+    >,
+) -> Result<
+    orca_runtime::prompt_queue::PromptQueueSnapshot,
+    orca_runtime::prompt_queue::PromptQueueMutationError,
+> {
+    match result {
+        Err(orca_runtime::prompt_queue::PromptQueueMutationError::RevisionConflict { current })
+            if current.paused
+                && matches!(
+                    action,
+                    orca_runtime::prompt_queue::PromptQueueAction::Start { .. }
+                ) =>
+        {
+            Ok(current)
+        }
+        result => result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -1391,5 +1420,47 @@ mod tests {
             message: "other rejection".to_string(),
         });
         assert!(state.queued_submission_in_flight());
+    }
+
+    #[test]
+    fn a_start_refused_by_a_newer_pause_settles_on_the_paused_queue() {
+        use orca_runtime::prompt_queue::{
+            PromptQueueAction, PromptQueueMutationError, PromptQueueSnapshot, PromptQueueState,
+            QueueRevision,
+        };
+
+        let mut runtime = PromptQueueState::from_snapshot(PromptQueueSnapshot::default());
+        let paused = runtime
+            .apply(
+                PromptQueueAction::Pause {
+                    expected_revision: QueueRevision::ZERO,
+                },
+                1,
+            )
+            .unwrap();
+        // The interrupt during the next message's turn pauses it again.
+        let repaused = runtime
+            .apply(
+                PromptQueueAction::Pause {
+                    expected_revision: paused.revision,
+                },
+                2,
+            )
+            .unwrap();
+        let stale_start = PromptQueueAction::Start {
+            expected_revision: paused.revision,
+        };
+
+        let settled = settled_queue_action(&stale_start, runtime.apply(stale_start.clone(), 3));
+        assert_eq!(settled.unwrap(), repaused);
+
+        // Any other refusal stays one.
+        let stale_pause = PromptQueueAction::Pause {
+            expected_revision: paused.revision,
+        };
+        assert!(matches!(
+            settled_queue_action(&stale_pause, runtime.apply(stale_pause.clone(), 4)),
+            Err(PromptQueueMutationError::RevisionConflict { .. })
+        ));
     }
 }

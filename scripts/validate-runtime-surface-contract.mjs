@@ -1259,6 +1259,13 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/hosted_child.rs:return_to_parent:child_focus.event_bridge.stop", 1],
   ["crates/orca-tui/src/attachment_routing.rs:switch_attachment_deferred:routing.deferred_parent_events.clear", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:pending_terminal_session.activate", 1],
+  // The stderr capture's own lifecycle and buffers, not runtime mutations.
+  ["crates/orca-tui/src/app.rs:run_tui_inner:stderr_capture.stop", 1],
+  ["crates/orca-tui/src/stderr_capture.rs:stop:capture.stop", 1],
+  ["crates/orca-tui/src/stderr_capture.rs:drop:self.stop", 1],
+  ["crates/orca-tui/src/stderr_capture.rs:forward_lines:line.clear", 1],
+  ["crates/orca-tui/src/stderr_capture.rs:forward_lines:shown.clear", 1],
+  ["crates/orca-tui/src/stderr_capture.rs:forward_lines:shown.insert", 1],
   ["crates/orca-tui/src/renderer_loop.rs:run:frame.resume", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:renderer_runtime.shutdown", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:renderer_runtime_inbox.shutdown", 1],

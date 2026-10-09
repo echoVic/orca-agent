@@ -1165,9 +1165,14 @@ impl ThreadActor {
         task_registry: &crate::tasks::TaskRegistry,
         event: SubagentActivityEvent,
     ) -> io::Result<()> {
+        // A generation that is ending admits no new child, but a child it
+        // already started still reports, up to how it ended: refused, it
+        // would stay running after the operation, and a cancelled turn would
+        // fail on its refused end.
         if let (Some(active), Some(fence)) = (active, fence)
             && (active.surface_operation.as_ref() != Some(fence)
-                || Self::surface_interaction_admission_closed(active))
+                || (Self::surface_interaction_admission_closed(active)
+                    && matches!(event.payload, SubagentActivityPayload::Started { .. })))
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,

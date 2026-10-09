@@ -738,9 +738,11 @@ pub(crate) fn hosted_tui_controller_loop(
                     .as_ref()
                     .ok_or_else(|| "prompt queue requires an active session".to_string())
                     .and_then(|thread| {
-                        thread
-                            .prompt_queue(action)
-                            .map_err(|error| error.to_string())
+                        crate::queued_input::settled_queue_action(
+                            &action,
+                            thread.prompt_queue(action.clone()),
+                        )
+                        .map_err(|error| error.to_string())
                     });
                 match result {
                     Ok(snapshot) => {

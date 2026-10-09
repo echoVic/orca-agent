@@ -342,8 +342,47 @@ fn check_sandbox(cwd: &Path) -> DiagnosticCheck {
 }
 
 #[cfg(not(windows))]
-fn check_sandbox(_cwd: &Path) -> DiagnosticCheck {
-    sandbox_check_from_decision(orca_tools::sandbox::enforcement_decision())
+fn check_sandbox(cwd: &Path) -> DiagnosticCheck {
+    sandbox_check(cwd, orca_tools::sandbox::enforcement_decision())
+}
+
+/// A backend that enforces is not enough: the shell of a session started in
+/// `cwd`, with the configured approval mode, has to be one the launch runs.
+/// The check asks the shell's own readiness, which asks the launch's
+/// question of that shell's policy (issue #118).
+#[cfg(not(windows))]
+fn sandbox_check(cwd: &Path, decision: SandboxEnforcementDecision) -> DiagnosticCheck {
+    if decision.state == EnforcementState::Enforced
+        && let crate::shell_readiness::ShellReadiness::Blocked {
+            detail,
+            remediation,
+        } = default_shell_readiness(cwd, &decision)
+    {
+        return fail_check(
+            "sandbox",
+            format!("{} is available, but {detail}", decision.backend),
+            Some(&remediation),
+        );
+    }
+    sandbox_check_from_decision(decision)
+}
+
+#[cfg(not(windows))]
+fn default_shell_readiness(
+    cwd: &Path,
+    decision: &SandboxEnforcementDecision,
+) -> crate::shell_readiness::ShellReadiness {
+    let mut config = orca_core::config::RunConfig {
+        cwd: Some(cwd.to_path_buf()),
+        ..orca_core::config::RunConfig::default()
+    };
+    if let Ok(effective) = file::load_effective_config(cwd, ConfigOverrides::default())
+        && let Some(mode) = effective.mode
+    {
+        config.approval_mode = mode;
+    }
+    config.tools.shell_enforcement_decision = Some(decision.clone());
+    crate::shell_readiness::ShellReadiness::for_config(&config)
 }
 
 #[cfg(not(windows))]
@@ -446,6 +485,78 @@ mod tests {
                 .remediation
                 .as_deref()
                 .is_some_and(|message| message.contains("/trust does not change that boundary"))
+        );
+    }
+
+    #[cfg(not(windows))]
+    fn landlock_only_decision() -> SandboxEnforcementDecision {
+        SandboxEnforcementDecision::new(
+            EnforcementState::Enforced,
+            "landlock+seccomp",
+            vec![orca_core::capability::SandboxProbeEvidence {
+                backend: "bwrap".to_string(),
+                executable: Some("/usr/bin/bwrap".into()),
+                status: orca_core::capability::SandboxProbeStatus::ProbeDenied,
+                exit_code: Some(1),
+                signal: None,
+                stderr: Some(
+                    "bwrap: Can't mount proc on /newroot/proc: Operation not permitted".to_string(),
+                ),
+                io_error: None,
+            }],
+        )
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn an_untrusted_folder_passes_with_a_backend_that_enforces_its_policy() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir(cwd.path().join(".git")).unwrap();
+
+        let check = sandbox_check(cwd.path(), landlock_only_decision());
+
+        assert_eq!(check.status, DiagnosticStatus::Pass, "{}", check.detail);
+        assert!(
+            check.detail.contains("landlock+seccomp"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_landlock_only_host_fails_for_a_trusted_workspace_whose_policy_needs_bubblewrap() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir(cwd.path().join(".git")).unwrap();
+        folder_trust::set_trust_with_config_dir(cwd.path(), home.path(), TrustLevel::Trusted)
+            .unwrap();
+
+        let check = sandbox_check(cwd.path(), landlock_only_decision());
+
+        assert_eq!(check.status, DiagnosticStatus::Fail);
+        assert!(
+            check
+                .detail
+                .starts_with("landlock+seccomp is available, but this shell policy"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("Can't mount proc"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .is_some_and(|remedy| remedy.contains("bubblewrap")),
+            "{:?}",
+            check.remediation
         );
     }
 

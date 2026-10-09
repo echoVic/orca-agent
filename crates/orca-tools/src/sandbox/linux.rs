@@ -35,6 +35,8 @@ const BWRAP_BACKEND: &str = "bwrap";
 const LANDLOCK_BACKEND: &str = "landlock";
 const SECCOMP_BACKEND: &str = "seccomp";
 const LINUX_BACKEND_SET: &str = "bwrap+landlock+seccomp";
+/// The backend `probe_enforcement` selects when bubblewrap cannot run.
+const LANDLOCK_SECCOMP_BACKEND: &str = "landlock+seccomp";
 
 /// Resolved, canonicalized sandbox request shared by both backends.
 pub(crate) struct LinuxSandboxRequest {
@@ -142,7 +144,7 @@ fn fallback_enforcement_decision(
         EnforcementState::Unavailable
     };
     let backend = if state == EnforcementState::Enforced {
-        "landlock+seccomp"
+        LANDLOCK_SECCOMP_BACKEND
     } else {
         LINUX_BACKEND_SET
     };
@@ -220,13 +222,8 @@ fn result_probe_evidence(
 /// Build a `Command` that runs `request.command` under the strongest available
 /// Linux sandbox backend.
 pub(crate) fn sandbox_command(request: LinuxSandboxRequest) -> Command {
-    if request
-        .policy
-        .denied_roots
-        .iter()
-        .any(|root| !root.exists())
-    {
-        return fail_closed_command("one or more sandbox deny paths do not exist");
+    if let Some(refusal) = policy_refusal(enforcement_decision(&request.policy.cwd), &request) {
+        return fail_closed_command(&refusal.detail);
     }
     if bwrap_enforced_available(&request.policy.cwd) {
         let Some(bwrap) = bwrap_path(&request.policy.cwd) else {
@@ -235,45 +232,116 @@ pub(crate) fn sandbox_command(request: LinuxSandboxRequest) -> Command {
         return bwrap_command(bwrap, &request);
     }
 
-    // No bwrap: try the in-process Landlock + seccomp backend. Policies that
-    // require namespace mounts (nested read-only or denied paths) are rejected
-    // by landlock_command below. Any backend failure is fail-closed: a
-    // non-dangerous request must never become a plain host shell.
+    // No bwrap: try the in-process Landlock + seccomp backend, which
+    // `policy_refusal` has found able to express the policy. Any backend
+    // failure is fail-closed: a non-dangerous request must never become a
+    // plain host shell.
     match landlock_command(&request) {
         Ok(command) => command,
-        Err(_) => fail_closed_command("no compatible Linux sandbox backend is available"),
+        Err(error) => fail_closed_command(&format!(
+            "no compatible Linux sandbox backend is available: {error}"
+        )),
     }
 }
 
+/// Why a command under `request` would be refused although `decision` found
+/// a backend that enforces: a deny path is missing, or the policy needs more
+/// than Landlock and seccomp can express while bubblewrap cannot run. The
+/// launch and the readiness checks (`orca doctor`, the shell's availability)
+/// ask this one question, so a sandbox reported ready is one the launch uses
+/// (issue #118). A decision that enforces nothing is reported on its own.
+pub(crate) fn policy_refusal(
+    decision: &SandboxEnforcementDecision,
+    request: &LinuxSandboxRequest,
+) -> Option<super::SandboxPolicyRefusal> {
+    if request
+        .policy
+        .denied_roots
+        .iter()
+        .any(|root| !root.exists())
+    {
+        return Some(super::SandboxPolicyRefusal {
+            detail: "one or more sandbox deny paths do not exist".to_string(),
+            remediation: "create the missing deny paths or remove them from the permission \
+                          profile"
+                .to_string(),
+        });
+    }
+    // Only the Landlock fallback is held to what Landlock can express. An
+    // enforced decision from anything else (bubblewrap, or one a caller
+    // supplies, such as the test fixtures' "test-sandbox") is not refused here.
+    if decision.state != EnforcementState::Enforced || decision.backend != LANDLOCK_SECCOMP_BACKEND
+    {
+        return None;
+    }
+    let reason = bwrap_only_policy_reason(request)?;
+    let bwrap = decision
+        .probes
+        .iter()
+        .find(|probe| probe.backend == BWRAP_BACKEND)
+        .map(super::format_probe_evidence)
+        .unwrap_or_else(|| "bwrap was not probed".to_string());
+    Some(super::SandboxPolicyRefusal {
+        detail: format!(
+            "this shell policy {reason}; Landlock cannot enforce that, and bubblewrap cannot \
+             run here: {bwrap}"
+        ),
+        remediation: "let bubblewrap create its namespaces on this host (a container may have to \
+                      allow user namespaces and mounting /proc), or select a trusted-host \
+                      permission profile for a workspace you trust; /trust does not change the \
+                      sandbox"
+            .to_string(),
+    })
+}
+
 fn policy_requires_bwrap(request: &LinuxSandboxRequest) -> bool {
+    bwrap_only_policy_reason(request).is_some()
+}
+
+/// What in the policy only bubblewrap's mount namespace can enforce, or
+/// `None`. Landlock grants access and cannot take any back below a grant, so
+/// it can neither keep a path read-only inside a writable root nor hide one
+/// inside a readable root.
+fn bwrap_only_policy_reason(request: &LinuxSandboxRequest) -> Option<String> {
     let policy = &request.policy;
     if !policy.network_access && !policy.allowed_unix_socket_roots.is_empty() {
-        return true;
+        return Some(format!(
+            "allows Unix sockets under {} without network access",
+            display_paths(policy.allowed_unix_socket_roots.iter())
+        ));
     }
-    let writable_overlap = effective_read_only_roots(policy)
-        .iter()
-        .filter(|root| root.exists())
-        .any(|read_only| {
-            policy
-                .writable_roots
-                .iter()
-                .chain(&policy.metadata_writable_roots)
-                .any(|writable| paths_overlap(read_only, writable))
-        });
-    if writable_overlap {
-        return true;
-    }
-
     let denied = policy
         .denied_roots
         .iter()
         .filter(|path| path.exists())
         .collect::<Vec<_>>();
-    if denied.is_empty() {
-        return false;
+    // Checked before the walk below: readiness asks this for every turn.
+    if !denied.is_empty() && policy.read_scope == LinuxReadScope::Global {
+        return Some(format!(
+            "hides {} from a global read",
+            display_paths(denied.into_iter())
+        ));
     }
-    if policy.read_scope == LinuxReadScope::Global {
-        return true;
+
+    let read_only_inside_writable = effective_read_only_roots(policy)
+        .into_iter()
+        .filter(|root| root.exists())
+        .filter(|read_only| {
+            policy
+                .writable_roots
+                .iter()
+                .chain(&policy.metadata_writable_roots)
+                .any(|writable| paths_overlap(read_only, writable))
+        })
+        .collect::<Vec<_>>();
+    if !read_only_inside_writable.is_empty() {
+        return Some(format!(
+            "keeps {} read-only inside a writable root",
+            display_paths(read_only_inside_writable.iter())
+        ));
+    }
+    if denied.is_empty() {
+        return None;
     }
 
     let mut accessible = vec![policy.cwd.as_path()];
@@ -286,9 +354,32 @@ fn policy_requires_bwrap(request: &LinuxSandboxRequest) -> bool {
             .iter()
             .map(PathBuf::as_path),
     );
-    denied
+    let hidden_inside = denied
+        .into_iter()
+        .filter(|denied| accessible.iter().any(|root| paths_overlap(denied, root)))
+        .collect::<Vec<_>>();
+    (!hidden_inside.is_empty()).then(|| {
+        format!(
+            "hides {} inside a readable root",
+            display_paths(hidden_inside.into_iter())
+        )
+    })
+}
+
+/// A few paths for a message; the rest are counted.
+fn display_paths<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> String {
+    const SHOWN: usize = 3;
+    let paths = paths.collect::<Vec<_>>();
+    let mut shown = paths
         .iter()
-        .any(|denied| accessible.iter().any(|root| paths_overlap(denied, root)))
+        .take(SHOWN)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if paths.len() > SHOWN {
+        shown.push_str(&format!(" and {} more", paths.len() - SHOWN));
+    }
+    shown
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
@@ -393,8 +484,8 @@ fn plain_command(command: &str, cwd: &std::path::Path) -> Command {
 }
 
 /// A command that always fails without running anything, used for fail-closed
-/// strict mode when no sandbox backend is available.
-fn fail_closed_command(reason: &'static str) -> Command {
+/// strict mode when no sandbox backend can enforce the policy.
+fn fail_closed_command(reason: &str) -> Command {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg("echo \"orca: refusing to run: $ORCA_SANDBOX_ERROR\" >&2; exit 126")
@@ -979,5 +1070,132 @@ mod tests {
         };
 
         assert!(policy_requires_bwrap(&request));
+    }
+
+    fn landlock_only_decision() -> SandboxEnforcementDecision {
+        let mut bwrap = probe(BWRAP_BACKEND, SandboxProbeStatus::ProbeDenied);
+        bwrap.exit_code = Some(1);
+        bwrap.stderr =
+            Some("bwrap: Can't mount proc on /newroot/proc: Operation not permitted".to_string());
+        fallback_enforcement_decision(
+            bwrap,
+            probe(LANDLOCK_BACKEND, SandboxProbeStatus::Available),
+            probe(SECCOMP_BACKEND, SandboxProbeStatus::Available),
+        )
+    }
+
+    fn workspace_request(workspace: &Path) -> LinuxSandboxRequest {
+        LinuxSandboxRequest {
+            command: "true".to_string(),
+            policy: LinuxSandboxPolicy {
+                cwd: workspace.to_path_buf(),
+                read_scope: LinuxReadScope::Restricted,
+                readable_roots: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                writable_roots: vec![workspace.to_path_buf()],
+                metadata_protection_roots: vec![workspace.to_path_buf()],
+                metadata_writable_roots: Vec::new(),
+                read_only_roots: Vec::new(),
+                denied_roots: Vec::new(),
+                network_access: false,
+            },
+            strict: true,
+        }
+    }
+
+    #[test]
+    fn a_landlock_only_host_refuses_a_policy_that_needs_bwrap_and_says_why() {
+        let workspace = tempfile::tempdir().unwrap();
+        let git = workspace.path().join(".git");
+        std::fs::create_dir(&git).unwrap();
+        let mut request = workspace_request(workspace.path());
+        request.policy.read_only_roots = vec![git.clone()];
+
+        let refusal = policy_refusal(&landlock_only_decision(), &request)
+            .expect("Landlock cannot keep .git read-only inside the workspace")
+            .detail;
+
+        assert!(refusal.contains(&git.display().to_string()), "{refusal}");
+        assert!(refusal.contains("bubblewrap"), "{refusal}");
+        assert!(refusal.contains("Can't mount proc"), "{refusal}");
+    }
+
+    #[test]
+    fn a_landlock_only_host_refuses_a_path_hidden_from_a_global_read() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let secrets = home.path().join(".ssh");
+        std::fs::create_dir(&secrets).unwrap();
+        let mut request = workspace_request(workspace.path());
+        request.policy.read_scope = LinuxReadScope::Global;
+        request.policy.denied_roots = vec![secrets.clone()];
+
+        let refusal = policy_refusal(&landlock_only_decision(), &request)
+            .expect("Landlock cannot hide a path from a global read")
+            .detail;
+
+        assert!(
+            refusal.contains(&secrets.display().to_string()),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_landlock_only_host_accepts_a_policy_landlock_can_enforce() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            policy_refusal(
+                &landlock_only_decision(),
+                &workspace_request(workspace.path())
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_landlock_fallback_is_held_to_what_landlock_can_enforce() {
+        // Tests and embedders can hand the shell their own enforced decision
+        // (the TUI and runtime fixtures use "test-sandbox"); it says nothing
+        // about Landlock, so it must not be refused for Landlock's limits.
+        let workspace = tempfile::tempdir().unwrap();
+        let git = workspace.path().join(".git");
+        std::fs::create_dir(&git).unwrap();
+        let mut request = workspace_request(workspace.path());
+        request.policy.read_only_roots = vec![git];
+        let decision =
+            SandboxEnforcementDecision::new(EnforcementState::Enforced, "test-sandbox", Vec::new());
+
+        assert_eq!(policy_refusal(&decision, &request), None);
+    }
+
+    #[test]
+    fn bubblewrap_enforces_a_policy_landlock_cannot() {
+        let workspace = tempfile::tempdir().unwrap();
+        let git = workspace.path().join(".git");
+        std::fs::create_dir(&git).unwrap();
+        let mut request = workspace_request(workspace.path());
+        request.policy.read_only_roots = vec![git];
+        let decision = SandboxEnforcementDecision::new(
+            EnforcementState::Enforced,
+            BWRAP_BACKEND,
+            vec![probe(BWRAP_BACKEND, SandboxProbeStatus::Available)],
+        );
+
+        assert_eq!(policy_refusal(&decision, &request), None);
+    }
+
+    #[test]
+    fn a_missing_deny_path_is_refused_whatever_the_backend() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut request = workspace_request(workspace.path());
+        request.policy.denied_roots = vec![workspace.path().join("not-there")];
+        let decision = SandboxEnforcementDecision::new(
+            EnforcementState::Enforced,
+            BWRAP_BACKEND,
+            vec![probe(BWRAP_BACKEND, SandboxProbeStatus::Available)],
+        );
+
+        assert!(policy_refusal(&decision, &request).is_some());
     }
 }

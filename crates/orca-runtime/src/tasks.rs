@@ -5380,8 +5380,15 @@ impl TaskRegistry {
             .map_err(|_| "task registry lock poisoned".to_string())?;
         let mut signalled = Vec::with_capacity(targets.len());
         for (_, task_id) in targets.drain(..) {
-            self.mark_stop_requested(&task_id)?;
-            signalled.push(task_id);
+            match self.mark_stop_requested(&task_id) {
+                Ok(()) => signalled.push(task_id),
+                // It ended after this mirror was read; nothing is left to stop.
+                Err(_)
+                    if self
+                        .get(&task_id)
+                        .is_some_and(|task| is_terminal(task.status)) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(signalled)
     }
@@ -5460,19 +5467,35 @@ impl TaskRegistry {
     {
         let mut capacity_changed = false;
         let result = if let Some(persistence) = &self.persistence {
-            let (result, record) = persistence
-                .mutate_current_task(id, |record| {
-                    let before = CapacityFacts::of(record);
-                    let (result, changed) = mutate(record).map_err(TaskLeaseError::Persistence)?;
-                    if changed {
-                        record.publication_revision = record.publication_revision.saturating_add(1);
+            let mutation = persistence.mutate_current_task(id, |record| {
+                let before = CapacityFacts::of(record);
+                let (result, changed) = mutate(record).map_err(TaskLeaseError::Persistence)?;
+                if changed {
+                    record.publication_revision = record.publication_revision.saturating_add(1);
+                }
+                if before.affects_scope(&CapacityFacts::of(record)) {
+                    capacity_changed = true;
+                }
+                Ok(result)
+            });
+            let (result, record) = match mutation {
+                Ok(mutated) => mutated,
+                Err(error) => {
+                    // The durable record can be ahead of this mirror: another
+                    // registry of the session, such as a detached worker's,
+                    // may have finished the task. Mirror the record that
+                    // refused the change, so the caller can tell a task that
+                    // already ended from a real failure.
+                    if let Ok(Some(current)) = persistence.load_record_by_id(
+                        id,
+                        self.recover_persisted_active_tasks,
+                        &self.session_id,
+                    ) {
+                        let _ = self.install_persisted_task(id, current);
                     }
-                    if before.affects_scope(&CapacityFacts::of(record)) {
-                        capacity_changed = true;
-                    }
-                    Ok(result)
-                })
-                .map_err(|error| error.to_string())?;
+                    return Err(error.to_string());
+                }
+            };
             self.install_persisted_task(id, record)
                 .map_err(|error| error.to_string())?;
             Ok(result)
@@ -9477,6 +9500,76 @@ mod tests {
             persisted.get(&detached.id).unwrap().status,
             TaskStatus::Running
         );
+    }
+
+    #[test]
+    fn a_rejected_stop_leaves_the_owner_seeing_the_task_another_instance_finished() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("tasks");
+        let owner =
+            TaskRegistry::new_persistent("shared-session".to_string(), root_path.clone()).unwrap();
+        let root = owner.create_main_session("foreground turn".to_string());
+        owner.mark_running(&root.id).unwrap();
+        let child = owner.create_subagent_with_parent(
+            "worker child".to_string(),
+            None,
+            Some(root.id.clone()),
+        );
+        owner.mark_running(&child.id).unwrap();
+        let worker =
+            TaskRegistry::new_persistent_attached("shared-session".to_string(), root_path).unwrap();
+        worker.complete(&child.id, "done".to_string()).unwrap();
+        assert_eq!(owner.get(&child.id).unwrap().status, TaskStatus::Running);
+
+        let error = owner
+            .request_stop(&child.id)
+            .expect_err("a finished task cannot be asked to stop");
+
+        assert!(error.contains("Completed"), "{error}");
+        assert_eq!(
+            owner.get(&child.id).unwrap().status,
+            TaskStatus::Completed,
+            "the owner still shows the state the durable record rejected"
+        );
+    }
+
+    #[test]
+    fn signalling_a_stop_tree_skips_a_task_another_instance_finished() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("tasks");
+        let owner =
+            TaskRegistry::new_persistent("shared-session".to_string(), root_path.clone()).unwrap();
+        let root = owner.create_main_session("foreground turn".to_string());
+        owner.mark_running(&root.id).unwrap();
+        let finished = owner.create_subagent_with_parent(
+            "finished child".to_string(),
+            None,
+            Some(root.id.clone()),
+        );
+        owner.mark_running(&finished.id).unwrap();
+        let running = owner.create_subagent_with_parent(
+            "running child".to_string(),
+            None,
+            Some(root.id.clone()),
+        );
+        owner.mark_running(&running.id).unwrap();
+        let worker =
+            TaskRegistry::new_persistent_attached("shared-session".to_string(), root_path).unwrap();
+        worker.complete(&finished.id, "done".to_string()).unwrap();
+
+        let signalled = owner
+            .signal_stop_tree(&root.id)
+            .expect("a child that already finished is not a failure");
+
+        assert!(!signalled.contains(&finished.id));
+        assert!(signalled.contains(&running.id));
+        assert!(signalled.contains(&root.id));
+        assert_eq!(
+            owner.get(&finished.id).unwrap().status,
+            TaskStatus::Completed
+        );
+        assert_eq!(owner.get(&running.id).unwrap().status, TaskStatus::Stopping);
+        assert_eq!(owner.get(&root.id).unwrap().status, TaskStatus::Stopping);
     }
 
     #[test]
