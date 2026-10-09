@@ -1,0 +1,146 @@
+[
+  {
+    "clientRequests": [],
+    "notifications": [
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "content": [
+              {
+                "content": {
+                  "text": "Plan updated (3 item(s)).\n  [x] Inspect references\n  [>] Implement task plan support\n  [ ] Verify behavior",
+                  "type": "text"
+                },
+                "type": "content"
+              }
+            ],
+            "sessionUpdate": "tool_call_update",
+            "status": "completed",
+            "toolCallId": "mock-tool-1"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "content": {
+              "text": "Mock completed after tool execution.",
+              "type": "text"
+            },
+            "sessionUpdate": "agent_message_chunk"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "content": {
+              "text": "Mock reasoning.",
+              "type": "text"
+            },
+            "sessionUpdate": "agent_thought_chunk"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "content": {
+              "text": "Mock runtime is preserving the DeepSeek reasoning channel.",
+              "type": "text"
+            },
+            "sessionUpdate": "agent_thought_chunk"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "kind": "read",
+            "rawInput": {
+              "explanation": "Inspect references",
+              "plan": [
+                {
+                  "status": "completed",
+                  "step": "Inspect references"
+                },
+                {
+                  "status": "in_progress",
+                  "step": "Implement task plan support"
+                },
+                {
+                  "status": "pending",
+                  "step": "Verify behavior"
+                }
+              ]
+            },
+            "sessionUpdate": "tool_call",
+            "title": "update_plan: 3 items",
+            "toolCallId": "mock-tool-1"
+          }
+        }
+      }
+    ],
+    "responses": [
+      {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "result": {
+          "agentCapabilities": {
+            "auth": {},
+            "loadSession": true,
+            "mcpCapabilities": {
+              "http": false,
+              "sse": true
+            },
+            "promptCapabilities": {
+              "audio": false,
+              "embeddedContext": false,
+              "image": false
+            },
+            "sessionCapabilities": {
+              "additionalDirectories": {},
+              "list": {}
+            }
+          },
+          "agentInfo": {
+            "name": "orca",
+            "title": "Orca",
+            "version": "test"
+          },
+          "authMethods": [],
+          "protocolVersion": 1
+        }
+      },
+      {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "sessionId": "<uuid>"
+        }
+      },
+      {
+        "id": 3,
+        "jsonrpc": "2.0",
+        "result": {
+          "stopReason": "end_turn"
+        }
+      }
+    ]
+  }
+]

@@ -1,0 +1,210 @@
+[
+  {
+    "clientRequests": [],
+    "notifications": [],
+    "responses": [
+      {
+        "error": {
+          "code": -32602,
+          "data": "invalid type: string \"not-an-object\", expected struct InitializeRequest",
+          "message": "Invalid params"
+        },
+        "id": 1,
+        "jsonrpc": "2.0"
+      },
+      {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "agentCapabilities": {
+            "auth": {},
+            "loadSession": true,
+            "mcpCapabilities": {
+              "http": false,
+              "sse": true
+            },
+            "promptCapabilities": {
+              "audio": false,
+              "embeddedContext": false,
+              "image": false
+            },
+            "sessionCapabilities": {
+              "additionalDirectories": {},
+              "list": {}
+            }
+          },
+          "agentInfo": {
+            "name": "orca",
+            "title": "Orca",
+            "version": "test"
+          },
+          "authMethods": [],
+          "protocolVersion": 1
+        }
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "invalid type: string \"not-an-object\", expected struct AuthenticateRequest",
+          "message": "Invalid params"
+        },
+        "id": 3,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "invalid type: integer `42`, expected a string",
+          "message": "Invalid params"
+        },
+        "id": 4,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "invalid type: string \"not-an-object\", expected struct NewSessionRequest",
+          "message": "Invalid params"
+        },
+        "id": 5,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "invalid type: integer `42`, expected path string",
+          "message": "Invalid params"
+        },
+        "id": 6,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "invalid type: string \"not-an-object\", expected struct LoadSessionRequest",
+          "message": "Invalid params"
+        },
+        "id": 7,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "invalid type: integer `42`, expected a string",
+          "message": "Invalid params"
+        },
+        "id": 8,
+        "jsonrpc": "2.0"
+      },
+      {
+        "id": 9,
+        "jsonrpc": "2.0",
+        "result": {
+          "sessionId": "<uuid>"
+        }
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "invalid ACP prompt: invalid type: string \"not-an-object\", expected struct PromptRequest",
+          "message": "Invalid params"
+        },
+        "id": 10,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "invalid ACP prompt: missing field `prompt`",
+          "message": "Invalid params"
+        },
+        "id": 11,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "missing field `sessionId`",
+          "message": "Invalid params"
+        },
+        "id": 12,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "invalid type: integer `42`, expected a string",
+          "message": "Invalid params"
+        },
+        "id": 13,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "data did not match any variant of untagged enum SessionConfigOptionValue",
+          "message": "Invalid params"
+        },
+        "id": 14,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "missing field `sessionId`",
+          "message": "Invalid params"
+        },
+        "id": 15,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "invalid type: integer `5`, expected a string",
+          "message": "Invalid params"
+        },
+        "id": 16,
+        "jsonrpc": "2.0",
+        "result": null
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "invalid session list cursor",
+          "message": "Invalid params"
+        },
+        "id": 17,
+        "jsonrpc": "2.0",
+        "result": null
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "additional directory filtering is unsupported",
+          "message": "Invalid params"
+        },
+        "id": 18,
+        "jsonrpc": "2.0",
+        "result": null
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "invalid type: string \"not-an-object\", expected struct AcpPromptQueueParams",
+          "message": "Invalid params"
+        },
+        "id": 19,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "queue mutation params.expectedRevision is required",
+          "message": "Invalid params"
+        },
+        "id": 20,
+        "jsonrpc": "2.0"
+      }
+    ]
+  }
+]

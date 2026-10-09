@@ -1,0 +1,97 @@
+[
+  {
+    "clientRequests": [
+      {
+        "id": 0,
+        "jsonrpc": "2.0",
+        "method": "session/request_permission",
+        "params": {
+          "options": [
+            {
+              "kind": "allow_once",
+              "name": "Allow once",
+              "optionId": "allow_once"
+            },
+            {
+              "kind": "reject_once",
+              "name": "Reject once",
+              "optionId": "reject_once"
+            }
+          ],
+          "sessionId": "<uuid>",
+          "toolCall": {
+            "title": "run exact standard tool",
+            "toolCallId": "standard-interaction-tool"
+          }
+        }
+      }
+    ],
+    "notifications": [
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "kind": "execute",
+            "rawInput": {
+              "args": [
+                "hello"
+              ],
+              "command": "printf"
+            },
+            "sessionUpdate": "tool_call",
+            "title": "bash: printf",
+            "toolCallId": "standard-interaction-tool"
+          }
+        }
+      }
+    ],
+    "responses": [
+      {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "result": {
+          "agentCapabilities": {
+            "auth": {},
+            "loadSession": true,
+            "mcpCapabilities": {
+              "http": false,
+              "sse": true
+            },
+            "promptCapabilities": {
+              "audio": false,
+              "embeddedContext": false,
+              "image": false
+            },
+            "sessionCapabilities": {
+              "additionalDirectories": {},
+              "list": {}
+            }
+          },
+          "agentInfo": {
+            "name": "orca",
+            "title": "Orca",
+            "version": "test"
+          },
+          "authMethods": [],
+          "protocolVersion": 1
+        }
+      },
+      {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "sessionId": "<uuid>"
+        }
+      },
+      {
+        "id": 3,
+        "jsonrpc": "2.0",
+        "result": {
+          "stopReason": "end_turn"
+        }
+      }
+    ]
+  }
+]

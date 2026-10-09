@@ -1,0 +1,923 @@
+[
+  {
+    "clientRequests": [],
+    "notifications": [
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "configOptions": [
+              {
+                "currentValue": "auto",
+                "id": "model",
+                "name": "Model",
+                "options": [
+                  {
+                    "name": "auto",
+                    "value": "auto"
+                  },
+                  {
+                    "name": "deepseek-flash",
+                    "value": "deepseek-flash"
+                  },
+                  {
+                    "name": "deepseek-v4-pro",
+                    "value": "deepseek-v4-pro"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "full-auto",
+                "id": "mode",
+                "name": "Approval mode",
+                "options": [
+                  {
+                    "name": "plan",
+                    "value": "plan"
+                  },
+                  {
+                    "name": "suggest",
+                    "value": "suggest"
+                  },
+                  {
+                    "name": "auto-edit",
+                    "value": "auto-edit"
+                  },
+                  {
+                    "name": "full-auto",
+                    "value": "full-auto"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "max",
+                "id": "reasoning",
+                "name": "Reasoning effort",
+                "options": [
+                  {
+                    "name": "low",
+                    "value": "low"
+                  },
+                  {
+                    "name": "high",
+                    "value": "high"
+                  },
+                  {
+                    "name": "max",
+                    "value": "max"
+                  }
+                ],
+                "type": "select"
+              }
+            ],
+            "sessionUpdate": "config_option_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "configOptions": [
+              {
+                "currentValue": "deepseek-v4-pro",
+                "id": "model",
+                "name": "Model",
+                "options": [
+                  {
+                    "name": "auto",
+                    "value": "auto"
+                  },
+                  {
+                    "name": "deepseek-flash",
+                    "value": "deepseek-flash"
+                  },
+                  {
+                    "name": "deepseek-v4-pro",
+                    "value": "deepseek-v4-pro"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "full-auto",
+                "id": "mode",
+                "name": "Approval mode",
+                "options": [
+                  {
+                    "name": "plan",
+                    "value": "plan"
+                  },
+                  {
+                    "name": "suggest",
+                    "value": "suggest"
+                  },
+                  {
+                    "name": "auto-edit",
+                    "value": "auto-edit"
+                  },
+                  {
+                    "name": "full-auto",
+                    "value": "full-auto"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "max",
+                "id": "reasoning",
+                "name": "Reasoning effort",
+                "options": [
+                  {
+                    "name": "low",
+                    "value": "low"
+                  },
+                  {
+                    "name": "high",
+                    "value": "high"
+                  },
+                  {
+                    "name": "max",
+                    "value": "max"
+                  }
+                ],
+                "type": "select"
+              }
+            ],
+            "sessionUpdate": "config_option_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "configOptions": [
+              {
+                "currentValue": "deepseek-v4-pro",
+                "id": "model",
+                "name": "Model",
+                "options": [
+                  {
+                    "name": "auto",
+                    "value": "auto"
+                  },
+                  {
+                    "name": "deepseek-flash",
+                    "value": "deepseek-flash"
+                  },
+                  {
+                    "name": "deepseek-v4-pro",
+                    "value": "deepseek-v4-pro"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "plan",
+                "id": "mode",
+                "name": "Approval mode",
+                "options": [
+                  {
+                    "name": "plan",
+                    "value": "plan"
+                  },
+                  {
+                    "name": "suggest",
+                    "value": "suggest"
+                  },
+                  {
+                    "name": "auto-edit",
+                    "value": "auto-edit"
+                  },
+                  {
+                    "name": "full-auto",
+                    "value": "full-auto"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "high",
+                "id": "reasoning",
+                "name": "Reasoning effort",
+                "options": [
+                  {
+                    "name": "low",
+                    "value": "low"
+                  },
+                  {
+                    "name": "high",
+                    "value": "high"
+                  },
+                  {
+                    "name": "max",
+                    "value": "max"
+                  }
+                ],
+                "type": "select"
+              }
+            ],
+            "sessionUpdate": "config_option_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "configOptions": [
+              {
+                "currentValue": "deepseek-v4-pro",
+                "id": "model",
+                "name": "Model",
+                "options": [
+                  {
+                    "name": "auto",
+                    "value": "auto"
+                  },
+                  {
+                    "name": "deepseek-flash",
+                    "value": "deepseek-flash"
+                  },
+                  {
+                    "name": "deepseek-v4-pro",
+                    "value": "deepseek-v4-pro"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "plan",
+                "id": "mode",
+                "name": "Approval mode",
+                "options": [
+                  {
+                    "name": "plan",
+                    "value": "plan"
+                  },
+                  {
+                    "name": "suggest",
+                    "value": "suggest"
+                  },
+                  {
+                    "name": "auto-edit",
+                    "value": "auto-edit"
+                  },
+                  {
+                    "name": "full-auto",
+                    "value": "full-auto"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "max",
+                "id": "reasoning",
+                "name": "Reasoning effort",
+                "options": [
+                  {
+                    "name": "low",
+                    "value": "low"
+                  },
+                  {
+                    "name": "high",
+                    "value": "high"
+                  },
+                  {
+                    "name": "max",
+                    "value": "max"
+                  }
+                ],
+                "type": "select"
+              }
+            ],
+            "sessionUpdate": "config_option_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "cost": {
+              "amount": 0.0,
+              "currency": "USD"
+            },
+            "sessionUpdate": "usage_update",
+            "size": 768928,
+            "used": 0
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "cost": {
+              "amount": 0.0,
+              "currency": "USD"
+            },
+            "sessionUpdate": "usage_update",
+            "size": 800000,
+            "used": 0
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "currentModeId": "full-auto",
+            "sessionUpdate": "current_mode_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "currentModeId": "full-auto",
+            "sessionUpdate": "current_mode_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "currentModeId": "plan",
+            "sessionUpdate": "current_mode_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "currentModeId": "plan",
+            "sessionUpdate": "current_mode_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "entries": [],
+            "sessionUpdate": "plan"
+          }
+        }
+      }
+    ],
+    "responses": [
+      {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "result": {
+          "_meta": {
+            "orca.dev/projection": {
+              "version": 1
+            }
+          },
+          "agentCapabilities": {
+            "auth": {},
+            "loadSession": true,
+            "mcpCapabilities": {
+              "http": false,
+              "sse": true
+            },
+            "promptCapabilities": {
+              "audio": false,
+              "embeddedContext": false,
+              "image": false
+            },
+            "sessionCapabilities": {
+              "list": {}
+            }
+          },
+          "agentInfo": {
+            "name": "orca",
+            "title": "Orca",
+            "version": "test"
+          },
+          "authMethods": [],
+          "protocolVersion": 1
+        }
+      },
+      {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "configOptions": [
+            {
+              "currentValue": "auto",
+              "id": "model",
+              "name": "Model",
+              "options": [
+                {
+                  "name": "auto",
+                  "value": "auto"
+                },
+                {
+                  "name": "deepseek-flash",
+                  "value": "deepseek-flash"
+                },
+                {
+                  "name": "deepseek-v4-pro",
+                  "value": "deepseek-v4-pro"
+                }
+              ],
+              "type": "select"
+            },
+            {
+              "currentValue": "full-auto",
+              "id": "mode",
+              "name": "Approval mode",
+              "options": [
+                {
+                  "name": "plan",
+                  "value": "plan"
+                },
+                {
+                  "name": "suggest",
+                  "value": "suggest"
+                },
+                {
+                  "name": "auto-edit",
+                  "value": "auto-edit"
+                },
+                {
+                  "name": "full-auto",
+                  "value": "full-auto"
+                }
+              ],
+              "type": "select"
+            },
+            {
+              "currentValue": "max",
+              "id": "reasoning",
+              "name": "Reasoning effort",
+              "options": [
+                {
+                  "name": "low",
+                  "value": "low"
+                },
+                {
+                  "name": "high",
+                  "value": "high"
+                },
+                {
+                  "name": "max",
+                  "value": "max"
+                }
+              ],
+              "type": "select"
+            }
+          ],
+          "models": {
+            "availableModels": [
+              {
+                "modelId": "auto",
+                "name": "auto"
+              },
+              {
+                "modelId": "deepseek-flash",
+                "name": "deepseek-flash"
+              },
+              {
+                "modelId": "deepseek-v4-pro",
+                "name": "deepseek-v4-pro"
+              }
+            ],
+            "currentModelId": "auto"
+          },
+          "modes": {
+            "availableModes": [
+              {
+                "id": "plan",
+                "name": "plan"
+              },
+              {
+                "id": "suggest",
+                "name": "suggest"
+              },
+              {
+                "id": "auto-edit",
+                "name": "auto-edit"
+              },
+              {
+                "id": "full-auto",
+                "name": "full-auto"
+              }
+            ],
+            "currentModeId": "full-auto"
+          },
+          "sessionId": "<uuid>"
+        }
+      },
+      {
+        "id": 3,
+        "jsonrpc": "2.0",
+        "result": {}
+      },
+      {
+        "id": 4,
+        "jsonrpc": "2.0",
+        "result": {}
+      },
+      {
+        "id": 5,
+        "jsonrpc": "2.0",
+        "result": {
+          "configOptions": [
+            {
+              "currentValue": "deepseek-v4-pro",
+              "id": "model",
+              "name": "Model",
+              "options": [
+                {
+                  "name": "auto",
+                  "value": "auto"
+                },
+                {
+                  "name": "deepseek-flash",
+                  "value": "deepseek-flash"
+                },
+                {
+                  "name": "deepseek-v4-pro",
+                  "value": "deepseek-v4-pro"
+                }
+              ],
+              "type": "select"
+            },
+            {
+              "currentValue": "plan",
+              "id": "mode",
+              "name": "Approval mode",
+              "options": [
+                {
+                  "name": "plan",
+                  "value": "plan"
+                },
+                {
+                  "name": "suggest",
+                  "value": "suggest"
+                },
+                {
+                  "name": "auto-edit",
+                  "value": "auto-edit"
+                },
+                {
+                  "name": "full-auto",
+                  "value": "full-auto"
+                }
+              ],
+              "type": "select"
+            },
+            {
+              "currentValue": "high",
+              "id": "reasoning",
+              "name": "Reasoning effort",
+              "options": [
+                {
+                  "name": "low",
+                  "value": "low"
+                },
+                {
+                  "name": "high",
+                  "value": "high"
+                },
+                {
+                  "name": "max",
+                  "value": "max"
+                }
+              ],
+              "type": "select"
+            }
+          ]
+        }
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "model must not have leading or trailing whitespace",
+          "message": "Invalid params"
+        },
+        "id": 6,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "model must not have leading or trailing whitespace",
+          "message": "Invalid params"
+        },
+        "id": 7,
+        "jsonrpc": "2.0"
+      },
+      {
+        "id": 8,
+        "jsonrpc": "2.0",
+        "result": {
+          "sessions": [
+            {
+              "cwd": "<cwd>",
+              "sessionId": "<uuid>",
+              "title": "ACP session"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "clientRequests": [],
+    "notifications": [
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "configOptions": [
+              {
+                "currentValue": "deepseek-v4-pro",
+                "id": "model",
+                "name": "Model",
+                "options": [
+                  {
+                    "name": "auto",
+                    "value": "auto"
+                  },
+                  {
+                    "name": "deepseek-flash",
+                    "value": "deepseek-flash"
+                  },
+                  {
+                    "name": "deepseek-v4-pro",
+                    "value": "deepseek-v4-pro"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "plan",
+                "id": "mode",
+                "name": "Approval mode",
+                "options": [
+                  {
+                    "name": "plan",
+                    "value": "plan"
+                  },
+                  {
+                    "name": "suggest",
+                    "value": "suggest"
+                  },
+                  {
+                    "name": "auto-edit",
+                    "value": "auto-edit"
+                  },
+                  {
+                    "name": "full-auto",
+                    "value": "full-auto"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "high",
+                "id": "reasoning",
+                "name": "Reasoning effort",
+                "options": [
+                  {
+                    "name": "low",
+                    "value": "low"
+                  },
+                  {
+                    "name": "high",
+                    "value": "high"
+                  },
+                  {
+                    "name": "max",
+                    "value": "max"
+                  }
+                ],
+                "type": "select"
+              }
+            ],
+            "sessionUpdate": "config_option_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "cost": {
+              "amount": 0.0,
+              "currency": "USD"
+            },
+            "sessionUpdate": "usage_update",
+            "size": 800000,
+            "used": 0
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "currentModeId": "plan",
+            "sessionUpdate": "current_mode_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "entries": [],
+            "sessionUpdate": "plan"
+          }
+        }
+      }
+    ],
+    "responses": [
+      {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "result": {
+          "_meta": {
+            "orca.dev/projection": {
+              "version": 1
+            }
+          },
+          "agentCapabilities": {
+            "auth": {},
+            "loadSession": true,
+            "mcpCapabilities": {
+              "http": false,
+              "sse": true
+            },
+            "promptCapabilities": {
+              "audio": false,
+              "embeddedContext": false,
+              "image": false
+            },
+            "sessionCapabilities": {
+              "list": {}
+            }
+          },
+          "agentInfo": {
+            "name": "orca",
+            "title": "Orca",
+            "version": "test"
+          },
+          "authMethods": [],
+          "protocolVersion": 1
+        }
+      },
+      {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "configOptions": [
+            {
+              "currentValue": "deepseek-v4-pro",
+              "id": "model",
+              "name": "Model",
+              "options": [
+                {
+                  "name": "auto",
+                  "value": "auto"
+                },
+                {
+                  "name": "deepseek-flash",
+                  "value": "deepseek-flash"
+                },
+                {
+                  "name": "deepseek-v4-pro",
+                  "value": "deepseek-v4-pro"
+                }
+              ],
+              "type": "select"
+            },
+            {
+              "currentValue": "plan",
+              "id": "mode",
+              "name": "Approval mode",
+              "options": [
+                {
+                  "name": "plan",
+                  "value": "plan"
+                },
+                {
+                  "name": "suggest",
+                  "value": "suggest"
+                },
+                {
+                  "name": "auto-edit",
+                  "value": "auto-edit"
+                },
+                {
+                  "name": "full-auto",
+                  "value": "full-auto"
+                }
+              ],
+              "type": "select"
+            },
+            {
+              "currentValue": "high",
+              "id": "reasoning",
+              "name": "Reasoning effort",
+              "options": [
+                {
+                  "name": "low",
+                  "value": "low"
+                },
+                {
+                  "name": "high",
+                  "value": "high"
+                },
+                {
+                  "name": "max",
+                  "value": "max"
+                }
+              ],
+              "type": "select"
+            }
+          ],
+          "models": {
+            "availableModels": [
+              {
+                "modelId": "auto",
+                "name": "auto"
+              },
+              {
+                "modelId": "deepseek-flash",
+                "name": "deepseek-flash"
+              },
+              {
+                "modelId": "deepseek-v4-pro",
+                "name": "deepseek-v4-pro"
+              }
+            ],
+            "currentModelId": "deepseek-v4-pro"
+          },
+          "modes": {
+            "availableModes": [
+              {
+                "id": "plan",
+                "name": "plan"
+              },
+              {
+                "id": "suggest",
+                "name": "suggest"
+              },
+              {
+                "id": "auto-edit",
+                "name": "auto-edit"
+              },
+              {
+                "id": "full-auto",
+                "name": "full-auto"
+              }
+            ],
+            "currentModeId": "plan"
+          }
+        }
+      }
+    ]
+  }
+]

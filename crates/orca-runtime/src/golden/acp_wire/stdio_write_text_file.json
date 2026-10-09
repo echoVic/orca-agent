@@ -1,0 +1,102 @@
+[
+  {
+    "clientRequests": [
+      {
+        "id": -1,
+        "jsonrpc": "2.0",
+        "method": "fs/write_text_file",
+        "params": {
+          "content": "written by Orca\n",
+          "path": "<tmp>/orca-acp-output.txt",
+          "sessionId": "<uuid>"
+        }
+      }
+    ],
+    "notifications": [
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "content": [
+              {
+                "content": {
+                  "text": "wrote through ACP client",
+                  "type": "text"
+                },
+                "type": "content"
+              }
+            ],
+            "sessionUpdate": "tool_call_update",
+            "status": "completed",
+            "toolCallId": "write-capability-1"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "kind": "edit",
+            "rawInput": {
+              "content": "written by Orca\n",
+              "path": "<tmp>/orca-acp-output.txt"
+            },
+            "sessionUpdate": "tool_call",
+            "title": "write_file: <tmp>/orca-acp-output.txt",
+            "toolCallId": "write-capability-1"
+          }
+        }
+      }
+    ],
+    "responses": [
+      {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "result": {
+          "agentCapabilities": {
+            "auth": {},
+            "loadSession": true,
+            "mcpCapabilities": {
+              "http": false,
+              "sse": true
+            },
+            "promptCapabilities": {
+              "audio": false,
+              "embeddedContext": false,
+              "image": false
+            },
+            "sessionCapabilities": {
+              "additionalDirectories": {},
+              "list": {}
+            }
+          },
+          "agentInfo": {
+            "name": "orca",
+            "title": "Orca",
+            "version": "test"
+          },
+          "authMethods": [],
+          "protocolVersion": 1
+        }
+      },
+      {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "sessionId": "<uuid>"
+        }
+      },
+      {
+        "id": 3,
+        "jsonrpc": "2.0",
+        "result": {
+          "stopReason": "end_turn"
+        }
+      }
+    ]
+  }
+]

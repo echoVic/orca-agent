@@ -1,0 +1,144 @@
+[
+  {
+    "clientRequests": [
+      {
+        "id": -1,
+        "jsonrpc": "2.0",
+        "method": "terminal/create",
+        "params": {
+          "args": [
+            "hello"
+          ],
+          "command": "printf",
+          "cwd": "<tmp>/orca-acp-workspace",
+          "outputByteLimit": 4096,
+          "sessionId": "<uuid>"
+        }
+      },
+      {
+        "id": -2,
+        "jsonrpc": "2.0",
+        "method": "terminal/output",
+        "params": {
+          "sessionId": "<uuid>",
+          "terminalId": "terminal-1"
+        }
+      },
+      {
+        "id": -3,
+        "jsonrpc": "2.0",
+        "method": "terminal/wait_for_exit",
+        "params": {
+          "sessionId": "<uuid>",
+          "terminalId": "terminal-1"
+        }
+      },
+      {
+        "id": -4,
+        "jsonrpc": "2.0",
+        "method": "terminal/kill",
+        "params": {
+          "sessionId": "<uuid>",
+          "terminalId": "terminal-1"
+        }
+      },
+      {
+        "id": -5,
+        "jsonrpc": "2.0",
+        "method": "terminal/release",
+        "params": {
+          "sessionId": "<uuid>",
+          "terminalId": "terminal-1"
+        }
+      }
+    ],
+    "notifications": [
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "content": [
+              {
+                "content": {
+                  "text": "observed terminal through ACP client",
+                  "type": "text"
+                },
+                "type": "content"
+              }
+            ],
+            "sessionUpdate": "tool_call_update",
+            "status": "completed",
+            "toolCallId": "terminal-observe-1"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "kind": "execute",
+            "rawInput": {
+              "args": [
+                "hello"
+              ],
+              "command": "printf"
+            },
+            "sessionUpdate": "tool_call",
+            "title": "bash: printf",
+            "toolCallId": "terminal-observe-1"
+          }
+        }
+      }
+    ],
+    "responses": [
+      {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "result": {
+          "agentCapabilities": {
+            "auth": {},
+            "loadSession": true,
+            "mcpCapabilities": {
+              "http": false,
+              "sse": true
+            },
+            "promptCapabilities": {
+              "audio": false,
+              "embeddedContext": false,
+              "image": false
+            },
+            "sessionCapabilities": {
+              "additionalDirectories": {},
+              "list": {}
+            }
+          },
+          "agentInfo": {
+            "name": "orca",
+            "title": "Orca",
+            "version": "test"
+          },
+          "authMethods": [],
+          "protocolVersion": 1
+        }
+      },
+      {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "sessionId": "<uuid>"
+        }
+      },
+      {
+        "id": 3,
+        "jsonrpc": "2.0",
+        "result": {
+          "stopReason": "end_turn"
+        }
+      }
+    ]
+  }
+]

@@ -1,0 +1,164 @@
+[
+  {
+    "clientRequests": [],
+    "notifications": [
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "content": {
+              "text": "typed update",
+              "type": "text"
+            },
+            "sessionUpdate": "agent_message_chunk"
+          }
+        }
+      }
+    ],
+    "responses": [
+      {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "result": {
+          "agentCapabilities": {
+            "auth": {},
+            "loadSession": true,
+            "mcpCapabilities": {
+              "http": false,
+              "sse": true
+            },
+            "promptCapabilities": {
+              "audio": false,
+              "embeddedContext": false,
+              "image": false
+            },
+            "sessionCapabilities": {
+              "additionalDirectories": {},
+              "list": {}
+            }
+          },
+          "agentInfo": {
+            "name": "orca",
+            "title": "Orca",
+            "version": "test"
+          },
+          "authMethods": [],
+          "protocolVersion": 1
+        }
+      },
+      {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {}
+      },
+      {
+        "id": 3,
+        "jsonrpc": "2.0",
+        "result": {
+          "sessionId": "<uuid>"
+        }
+      },
+      {
+        "id": 4,
+        "jsonrpc": "2.0",
+        "result": {
+          "sessions": [
+            {
+              "cwd": "<cwd>",
+              "sessionId": "<uuid>",
+              "title": "ACP session"
+            }
+          ]
+        }
+      },
+      {
+        "id": "prompt-1",
+        "jsonrpc": "2.0",
+        "result": {
+          "stopReason": "end_turn"
+        }
+      },
+      {
+        "error": {
+          "code": -32601,
+          "data": "unsupported ACP method 'orca.dev/unknown'",
+          "message": "Method not found"
+        },
+        "id": 5,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32600,
+          "data": "ACP session is already initialized",
+          "message": "Invalid request"
+        },
+        "id": 11,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32601,
+          "message": "Method not found"
+        },
+        "id": 6,
+        "jsonrpc": "2.0"
+      },
+      {
+        "error": {
+          "code": -32602,
+          "data": "ACP session is already loaded",
+          "message": "Invalid params"
+        },
+        "id": 7,
+        "jsonrpc": "2.0"
+      },
+      {
+        "id": 8,
+        "jsonrpc": "2.0",
+        "result": {
+          "dispatch": null,
+          "items": [],
+          "paused": false,
+          "revision": 0
+        }
+      },
+      {
+        "id": 9,
+        "jsonrpc": "2.0",
+        "result": {
+          "dispatch": null,
+          "items": [],
+          "paused": true,
+          "revision": 1
+        }
+      },
+      {
+        "id": 10,
+        "jsonrpc": "2.0",
+        "result": {
+          "dispatch": null,
+          "items": [
+            {
+              "client_user_message_id": "<uuid>",
+              "created_at_unix_ms": "<unix-ms>",
+              "id": "<uuid>",
+              "input": {
+                "mention_bindings": {
+                  "bindings": [],
+                  "text": "queued later"
+                },
+                "text": "queued later"
+              },
+              "updated_at_unix_ms": "<unix-ms>"
+            }
+          ],
+          "paused": true,
+          "revision": 2
+        }
+      }
+    ]
+  }
+]

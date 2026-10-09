@@ -1,0 +1,524 @@
+[
+  {
+    "clientRequests": [
+      {
+        "id": 0,
+        "jsonrpc": "2.0",
+        "method": "session/request_permission",
+        "params": {
+          "options": [
+            {
+              "kind": "allow_once",
+              "name": "Allow for this turn",
+              "optionId": "allow_once"
+            },
+            {
+              "kind": "allow_once",
+              "name": "Allow for this turn and require tool review",
+              "optionId": "allow_once_strict"
+            },
+            {
+              "kind": "allow_always",
+              "name": "Allow for this session",
+              "optionId": "allow_always"
+            },
+            {
+              "kind": "allow_always",
+              "name": "Allow for this session and require tool review",
+              "optionId": "allow_always_strict"
+            },
+            {
+              "kind": "reject_once",
+              "name": "Deny for this turn",
+              "optionId": "reject_once"
+            }
+          ],
+          "sessionId": "<uuid>",
+          "toolCall": {
+            "rawInput": {
+              "context": {
+                "origin": "SpecialTool",
+                "owner": {
+                  "Foreground": {
+                    "tool_call_id": "mock-tool-1",
+                    "turn_id": "turn_<uuid>"
+                  }
+                }
+              },
+              "permissions": {
+                "file_system": {
+                  "read": null,
+                  "write": [
+                    "<cwd>/extra"
+                  ]
+                },
+                "network": null
+              }
+            },
+            "title": "mock provider needs a temporary write root",
+            "toolCallId": "mock-tool-1"
+          }
+        }
+      }
+    ],
+    "notifications": [
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "configOptions": [
+              {
+                "currentValue": "auto",
+                "id": "model",
+                "name": "Model",
+                "options": [
+                  {
+                    "name": "auto",
+                    "value": "auto"
+                  },
+                  {
+                    "name": "deepseek-flash",
+                    "value": "deepseek-flash"
+                  },
+                  {
+                    "name": "deepseek-v4-pro",
+                    "value": "deepseek-v4-pro"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "full-auto",
+                "id": "mode",
+                "name": "Approval mode",
+                "options": [
+                  {
+                    "name": "plan",
+                    "value": "plan"
+                  },
+                  {
+                    "name": "suggest",
+                    "value": "suggest"
+                  },
+                  {
+                    "name": "auto-edit",
+                    "value": "auto-edit"
+                  },
+                  {
+                    "name": "full-auto",
+                    "value": "full-auto"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "max",
+                "id": "reasoning",
+                "name": "Reasoning effort",
+                "options": [
+                  {
+                    "name": "low",
+                    "value": "low"
+                  },
+                  {
+                    "name": "high",
+                    "value": "high"
+                  },
+                  {
+                    "name": "max",
+                    "value": "max"
+                  }
+                ],
+                "type": "select"
+              }
+            ],
+            "sessionUpdate": "config_option_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "configOptions": [
+              {
+                "currentValue": "auto",
+                "id": "model",
+                "name": "Model",
+                "options": [
+                  {
+                    "name": "auto",
+                    "value": "auto"
+                  },
+                  {
+                    "name": "deepseek-flash",
+                    "value": "deepseek-flash"
+                  },
+                  {
+                    "name": "deepseek-v4-pro",
+                    "value": "deepseek-v4-pro"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "suggest",
+                "id": "mode",
+                "name": "Approval mode",
+                "options": [
+                  {
+                    "name": "plan",
+                    "value": "plan"
+                  },
+                  {
+                    "name": "suggest",
+                    "value": "suggest"
+                  },
+                  {
+                    "name": "auto-edit",
+                    "value": "auto-edit"
+                  },
+                  {
+                    "name": "full-auto",
+                    "value": "full-auto"
+                  }
+                ],
+                "type": "select"
+              },
+              {
+                "currentValue": "max",
+                "id": "reasoning",
+                "name": "Reasoning effort",
+                "options": [
+                  {
+                    "name": "low",
+                    "value": "low"
+                  },
+                  {
+                    "name": "high",
+                    "value": "high"
+                  },
+                  {
+                    "name": "max",
+                    "value": "max"
+                  }
+                ],
+                "type": "select"
+              }
+            ],
+            "sessionUpdate": "config_option_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "content": [
+              {
+                "content": {
+                  "text": "Tool invocation was not started because an earlier sibling ended the tool turn",
+                  "type": "text"
+                },
+                "type": "content"
+              }
+            ],
+            "sessionUpdate": "tool_call_update",
+            "status": "failed",
+            "toolCallId": "mock-tool-2"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "content": [
+              {
+                "content": {
+                  "text": "permission request denied",
+                  "type": "text"
+                },
+                "type": "content"
+              }
+            ],
+            "sessionUpdate": "tool_call_update",
+            "status": "failed",
+            "toolCallId": "mock-tool-1"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "content": {
+              "text": "request_permissions_then_bash <cwd>/extra :: printf hi",
+              "type": "text"
+            },
+            "sessionUpdate": "user_message_chunk"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "cost": {
+              "amount": 0.0,
+              "currency": "USD"
+            },
+            "sessionUpdate": "usage_update",
+            "size": 768928,
+            "used": 0
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "currentModeId": "full-auto",
+            "sessionUpdate": "current_mode_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "currentModeId": "suggest",
+            "sessionUpdate": "current_mode_update"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "entries": [],
+            "sessionUpdate": "plan"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "kind": "edit",
+            "rawInput": {
+              "permissions": {
+                "fileSystem": {
+                  "read": null,
+                  "write": [
+                    "<cwd>/extra"
+                  ]
+                },
+                "network": null
+              },
+              "reason": "mock provider needs a temporary write root"
+            },
+            "sessionUpdate": "tool_call",
+            "title": "request_permissions: <cwd>/extra",
+            "toolCallId": "mock-tool-1"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<uuid>",
+          "update": {
+            "kind": "execute",
+            "rawInput": {
+              "command": "printf hi"
+            },
+            "sessionUpdate": "tool_call",
+            "title": "bash: printf hi",
+            "toolCallId": "mock-tool-2"
+          }
+        }
+      }
+    ],
+    "responses": [
+      {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "result": {
+          "_meta": {
+            "orca.dev/projection": {
+              "version": 1
+            }
+          },
+          "agentCapabilities": {
+            "auth": {},
+            "loadSession": true,
+            "mcpCapabilities": {
+              "http": false,
+              "sse": true
+            },
+            "promptCapabilities": {
+              "audio": false,
+              "embeddedContext": false,
+              "image": false
+            },
+            "sessionCapabilities": {
+              "list": {}
+            }
+          },
+          "agentInfo": {
+            "name": "orca",
+            "title": "Orca",
+            "version": "test"
+          },
+          "authMethods": [],
+          "protocolVersion": 1
+        }
+      },
+      {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "configOptions": [
+            {
+              "currentValue": "auto",
+              "id": "model",
+              "name": "Model",
+              "options": [
+                {
+                  "name": "auto",
+                  "value": "auto"
+                },
+                {
+                  "name": "deepseek-flash",
+                  "value": "deepseek-flash"
+                },
+                {
+                  "name": "deepseek-v4-pro",
+                  "value": "deepseek-v4-pro"
+                }
+              ],
+              "type": "select"
+            },
+            {
+              "currentValue": "full-auto",
+              "id": "mode",
+              "name": "Approval mode",
+              "options": [
+                {
+                  "name": "plan",
+                  "value": "plan"
+                },
+                {
+                  "name": "suggest",
+                  "value": "suggest"
+                },
+                {
+                  "name": "auto-edit",
+                  "value": "auto-edit"
+                },
+                {
+                  "name": "full-auto",
+                  "value": "full-auto"
+                }
+              ],
+              "type": "select"
+            },
+            {
+              "currentValue": "max",
+              "id": "reasoning",
+              "name": "Reasoning effort",
+              "options": [
+                {
+                  "name": "low",
+                  "value": "low"
+                },
+                {
+                  "name": "high",
+                  "value": "high"
+                },
+                {
+                  "name": "max",
+                  "value": "max"
+                }
+              ],
+              "type": "select"
+            }
+          ],
+          "models": {
+            "availableModels": [
+              {
+                "modelId": "auto",
+                "name": "auto"
+              },
+              {
+                "modelId": "deepseek-flash",
+                "name": "deepseek-flash"
+              },
+              {
+                "modelId": "deepseek-v4-pro",
+                "name": "deepseek-v4-pro"
+              }
+            ],
+            "currentModelId": "auto"
+          },
+          "modes": {
+            "availableModes": [
+              {
+                "id": "plan",
+                "name": "plan"
+              },
+              {
+                "id": "suggest",
+                "name": "suggest"
+              },
+              {
+                "id": "auto-edit",
+                "name": "auto-edit"
+              },
+              {
+                "id": "full-auto",
+                "name": "full-auto"
+              }
+            ],
+            "currentModeId": "full-auto"
+          },
+          "sessionId": "<uuid>"
+        }
+      },
+      {
+        "id": 3,
+        "jsonrpc": "2.0",
+        "result": {}
+      },
+      {
+        "id": 4,
+        "jsonrpc": "2.0",
+        "result": {
+          "stopReason": "refusal"
+        }
+      }
+    ]
+  }
+]

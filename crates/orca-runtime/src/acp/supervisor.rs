@@ -2729,6 +2729,10 @@ mod tests {
     use crate::runtime_permission::RuntimePermissionRequest;
     use crate::thread::RuntimeThread;
 
+    // Host paths and sandbox warnings differ on Windows; the wire shapes do not.
+    #[cfg(unix)]
+    mod wire_baseline;
+
     // Liveness backstop for in-process ACP frame reads, connection joins,
     // and cancel arrival — NOT a latency assertion. Under full-suite
     // parallelism the in-process server can legitimately take more than a
