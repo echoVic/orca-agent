@@ -35,6 +35,8 @@ const BWRAP_BACKEND: &str = "bwrap";
 const LANDLOCK_BACKEND: &str = "landlock";
 const SECCOMP_BACKEND: &str = "seccomp";
 const LINUX_BACKEND_SET: &str = "bwrap+landlock+seccomp";
+/// The backend `probe_enforcement` selects when bubblewrap cannot run.
+const LANDLOCK_SECCOMP_BACKEND: &str = "landlock+seccomp";
 
 /// Resolved, canonicalized sandbox request shared by both backends.
 pub(crate) struct LinuxSandboxRequest {
@@ -142,7 +144,7 @@ fn fallback_enforcement_decision(
         EnforcementState::Unavailable
     };
     let backend = if state == EnforcementState::Enforced {
-        "landlock+seccomp"
+        LANDLOCK_SECCOMP_BACKEND
     } else {
         LINUX_BACKEND_SET
     };
@@ -265,7 +267,11 @@ pub(crate) fn policy_refusal(
                 .to_string(),
         });
     }
-    if decision.state != EnforcementState::Enforced || decision.backend == BWRAP_BACKEND {
+    // Only the Landlock fallback is held to what Landlock can express. An
+    // enforced decision from anything else (bubblewrap, or one a caller
+    // supplies, such as the test fixtures' "test-sandbox") is not refused here.
+    if decision.state != EnforcementState::Enforced || decision.backend != LANDLOCK_SECCOMP_BACKEND
+    {
         return None;
     }
     let reason = bwrap_only_policy_reason(request)?;
@@ -1145,6 +1151,22 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn only_the_landlock_fallback_is_held_to_what_landlock_can_enforce() {
+        // Tests and embedders can hand the shell their own enforced decision
+        // (the TUI and runtime fixtures use "test-sandbox"); it says nothing
+        // about Landlock, so it must not be refused for Landlock's limits.
+        let workspace = tempfile::tempdir().unwrap();
+        let git = workspace.path().join(".git");
+        std::fs::create_dir(&git).unwrap();
+        let mut request = workspace_request(workspace.path());
+        request.policy.read_only_roots = vec![git];
+        let decision =
+            SandboxEnforcementDecision::new(EnforcementState::Enforced, "test-sandbox", Vec::new());
+
+        assert_eq!(policy_refusal(&decision, &request), None);
     }
 
     #[test]
