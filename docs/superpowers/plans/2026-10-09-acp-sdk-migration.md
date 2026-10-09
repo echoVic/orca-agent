@@ -38,6 +38,12 @@
   - `daemon_probe.py` 全过。
   - `acp_param_probe.py` 在任务 5 更新期望前挂 2 项（见下文第 1 条），更新后全过。
 - **验证器：** 4 个仓库验证脚本和 hygiene 测试都通过，清单不用改。
+- **之后合入的 PR #125。**
+  - 计划写完后，#124 的修复（PR #125）合入 main：plain `--mode=acp` 不再在回答流完后把整段再发一遍，推理改为 `agent_thought_chunk`。
+  - 任务 1 在它之后录基准，所以基准记录的是修好后的行为。在合入后的 main 上录过一次，连跑 3 次稳定。
+  - PR #125 只改了 `agent.rs` 里 assistant 文本的发送和 `tests/acp_agent.rs`，任务 2–5 的步骤不受影响：
+    - 新代码里的 `agent_client_protocol::ContentChunk` 由任务 5 的路径替换处理；
+    - 新测试用方法调用，不是 `Agent::…`，任务 3 要改的仍是那 7 处。
 
 ## 与 spec 不同的地方（执行前请确认第 1、2 条）
 
@@ -1112,7 +1118,7 @@ grep -rlE '/Users/|/private/|/var/folders|/home/|/tmp/' crates/orca-runtime/src/
 - `stdio_read_text_file`、`stdio_write_text_file`：各有一个 `fs/*` 请求，id 为 -1。
 - `stdio_permission`：一个 `session/request_permission`，id 为 0。
 - `stdio_cancel`：prompt 的 `stopReason` 是 `cancelled`。
-- `stdio_prompt_with_tools`：有 `tool_call`、`tool_call_update` 和 `agent_message_chunk`。
+- `stdio_prompt_with_tools`：有 `tool_call`、`tool_call_update`，一条 `agent_message_chunk`（`Mock completed after tool execution.`）和两条 `agent_thought_chunk`（推理）。回答只发一遍，推理不混进回答（#124）。
 - `daemon_session_settings`：
   - 第一个连接：`session/new` 的结果有 `configOptions`、`models`、`modes`、`sessionId`；`session/set_model` 回 `{}`；首尾带空格的模型名（id 6、7）回 -32602；`session/list` 列出 1 个会话。
   - 第二个连接：`session/load` 的结果有 `configOptions`、`models`、`modes`。
