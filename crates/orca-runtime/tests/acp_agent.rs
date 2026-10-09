@@ -798,6 +798,8 @@ fn acp_message_is_sent_when_only_its_reasoning_was_streamed() {
 fn acp_message_is_still_sent_in_full_when_its_stream_is_discarded() {
     // "Hello" is not a prefix of "Goodbye", so the runtime discards the stream
     // before completing the response; the client must still get the answer.
+    // ACP cannot take back chunks already sent, so the discarded text stays
+    // ahead of it. (A shared-session observer is told to reload instead.)
     let updates = prompt_updates(TestBehavior::StreamAndComplete {
         reasoning_deltas: vec![],
         message_deltas: vec!["Hel", "lo"],
@@ -805,8 +807,8 @@ fn acp_message_is_still_sent_in_full_when_its_stream_is_discarded() {
     });
 
     assert_eq!(
-        assistant_text(&updates).last().map(String::as_str),
-        Some("message:Goodbye")
+        assistant_text(&updates),
+        vec!["message:Hel", "message:lo", "message:Goodbye"]
     );
 }
 
