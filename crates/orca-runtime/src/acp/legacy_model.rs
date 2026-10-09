@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::SessionId;
+use agent_client_protocol::schema::v1::SessionId;
 use serde::{Deserialize, Serialize};
 
 type Meta = serde_json::Map<String, serde_json::Value>;
@@ -79,7 +79,10 @@ impl SessionModelState {
 }
 
 /// `session/set_model` parameters.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest,
+)]
+#[request(method = "session/set_model", response = SetSessionModelResponse)]
 #[serde(rename_all = "camelCase")]
 pub struct SetSessionModelRequest {
     pub session_id: SessionId,
@@ -99,7 +102,16 @@ impl SetSessionModelRequest {
 }
 
 /// `session/set_model` result.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    agent_client_protocol::JsonRpcResponse,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct SetSessionModelResponse {
     #[serde(skip_serializing_if = "Option::is_none", rename = "_meta")]

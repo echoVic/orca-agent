@@ -4417,11 +4417,7 @@ mod tests {
 
 fn digest_value(value: &Value) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(
-        serde_json::to_string(value)
-            .unwrap_or_else(|_| "null".to_string())
-            .as_bytes(),
-    );
+    hasher.update(super::state::sorted_json(value).as_bytes());
     orca_core::hex::lower(&hasher.finalize())
 }
 

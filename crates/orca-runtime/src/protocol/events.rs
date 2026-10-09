@@ -1,6 +1,5 @@
 use std::io::{self, Write};
 
-use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
@@ -112,11 +111,10 @@ impl Serialize for ServerEventEnvelope {
             }
             _ => {}
         }
-        let mut map = serializer.serialize_map(Some(object.len()))?;
-        for (key, value) in object {
-            map.serialize_entry(key, value)?;
-        }
-        map.end()
+        // The released wire has sorted keys. serde_json keeps insertion order
+        // instead once a dependency turns on `preserve_order` (the ACP SDK does).
+        value.sort_all_objects();
+        value.serialize(serializer)
     }
 }
 

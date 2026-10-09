@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_client_protocol::{
+use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, Error, SessionId, SessionInfoUpdate, SessionNotification,
     SessionUpdate,
 };
@@ -375,11 +375,14 @@ fn emit_usage(
         SessionNotification::new(
             id.clone(),
             SessionUpdate::UsageUpdate(
-                agent_client_protocol::UsageUpdate::new(context.used_tokens, context.limit_tokens)
-                    .cost(agent_client_protocol::Cost::new(
-                        usage.estimated_cost_usd_micros as f64 / 1_000_000.0,
-                        "USD",
-                    )),
+                agent_client_protocol::schema::v1::UsageUpdate::new(
+                    context.used_tokens,
+                    context.limit_tokens,
+                )
+                .cost(agent_client_protocol::schema::v1::Cost::new(
+                    usage.estimated_cost_usd_micros as f64 / 1_000_000.0,
+                    "USD",
+                )),
             ),
         )
         .meta(metadata(json!({"version": 1, "usage": usage}))),
@@ -408,7 +411,7 @@ pub(super) fn emit_user_images(
                 SessionNotification::new(
                     id.clone(),
                     SessionUpdate::UserMessageChunk(ContentChunk::new(ContentBlock::Image(
-                        agent_client_protocol::ImageContent::new(
+                        agent_client_protocol::schema::v1::ImageContent::new(
                             data.clone(),
                             media_type.as_str().to_string(),
                         ),
@@ -434,7 +437,7 @@ fn emit_settings(
     sender.send(SessionNotification::new(
         id.clone(),
         SessionUpdate::ConfigOptionUpdate(
-            agent_client_protocol::ConfigOptionUpdate::new(super::settings::options(
+            agent_client_protocol::schema::v1::ConfigOptionUpdate::new(super::settings::options(
                 settings, ceiling,
             ))
             .meta(super::agent::startup_warnings_meta(&warnings)),
@@ -442,15 +445,17 @@ fn emit_settings(
     ))?;
     sender.send(SessionNotification::new(
         id.clone(),
-        SessionUpdate::CurrentModeUpdate(agent_client_protocol::CurrentModeUpdate::new(
-            super::settings::mode_name(settings.approval_mode),
-        )),
+        SessionUpdate::CurrentModeUpdate(
+            agent_client_protocol::schema::v1::CurrentModeUpdate::new(super::settings::mode_name(
+                settings.approval_mode,
+            )),
+        ),
     ))
 }
 
 fn plan_update(plan: &crate::surface::SurfacePlanSnapshot) -> SessionUpdate {
     use crate::runtime_surface::{SurfacePlanPriority, SurfacePlanStatus};
-    use agent_client_protocol::{Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus};
+    use agent_client_protocol::schema::v1::{Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus};
     SessionUpdate::Plan(Plan::new(
         plan.items
             .iter()

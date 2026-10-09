@@ -1,19 +1,25 @@
 //! Standard ACP SDK connection used by the hosted TUI and headless attach.
+//!
+//! The SDK runs its handlers on `Send` tasks; attach clients keep their state
+//! on a `LocalSet`. The handlers only queue what arrives, and one local pump
+//! hands it to the [`ClientHandler`] in arrival order.
 
 use std::io;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
-use agent_client_protocol::{
-    Agent as _, CancelNotification, Client, ClientCapabilities, ClientSideConnection, ContentBlock,
-    Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason,
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{
+    CancelNotification, ClientCapabilities, ContentBlock, Implementation, InitializeRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
 };
+use agent_client_protocol::{Agent, ByteStreams, ConnectionTo, JsonRpcRequest, Responder};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, oneshot};
 
 use super::legacy_model::{SetSessionModelRequest, SetSessionModelResponse};
 
@@ -31,30 +37,21 @@ pub trait ClientHandler {
     ) -> agent_client_protocol::Result<()>;
 }
 
-/// The SDK's client role, played by a [`ClientHandler`].
-struct SdkClient(Rc<dyn ClientHandler>);
-
-#[async_trait::async_trait(?Send)]
-impl Client for SdkClient {
-    async fn request_permission(
-        &self,
-        request: RequestPermissionRequest,
-    ) -> agent_client_protocol::Result<RequestPermissionResponse> {
-        self.0.request_permission(request).await
-    }
-
-    async fn session_notification(
-        &self,
-        notification: SessionNotification,
-    ) -> agent_client_protocol::Result<()> {
-        self.0.session_notification(notification).await
-    }
+enum Incoming {
+    Permission(
+        RequestPermissionRequest,
+        Responder<RequestPermissionResponse>,
+    ),
+    Notification(SessionNotification),
+    /// Answered once everything queued before it has been handled.
+    Barrier(oneshot::Sender<()>),
 }
 
 /// Requests and notifications an attach client sends to the daemon.
 #[derive(Clone)]
 pub struct AgentHandle {
-    connection: Rc<ClientSideConnection>,
+    connection: ConnectionTo<Agent>,
+    incoming: mpsc::UnboundedSender<Incoming>,
 }
 
 impl AgentHandle {
@@ -62,67 +59,70 @@ impl AgentHandle {
         &self,
         request: InitializeRequest,
     ) -> agent_client_protocol::Result<InitializeResponse> {
-        self.connection.initialize(request).await
+        self.request(request).await
     }
 
     pub async fn new_session(
         &self,
         request: NewSessionRequest,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
-        self.connection.new_session(request).await
+        self.request(request).await
     }
 
     pub async fn load_session(
         &self,
         request: LoadSessionRequest,
     ) -> agent_client_protocol::Result<LoadSessionResponse> {
-        self.connection.load_session(request).await
+        self.request(request).await
     }
 
     pub async fn prompt(
         &self,
         request: PromptRequest,
     ) -> agent_client_protocol::Result<PromptResponse> {
-        self.connection.prompt(request).await
+        self.request(request).await
     }
 
     pub async fn set_session_model(
         &self,
         request: SetSessionModelRequest,
     ) -> agent_client_protocol::Result<SetSessionModelResponse> {
-        // SDK 0.10 carries its own copy of the unstable type.
-        self.connection
-            .set_session_model(
-                agent_client_protocol::SetSessionModelRequest::new(
-                    request.session_id,
-                    request.model_id.0.to_string(),
-                )
-                .meta(request.meta),
-            )
-            .await
-            .map(|response| SetSessionModelResponse {
-                meta: response.meta,
-            })
+        self.request(request).await
     }
 
     pub async fn set_session_config_option(
         &self,
         request: SetSessionConfigOptionRequest,
     ) -> agent_client_protocol::Result<SetSessionConfigOptionResponse> {
-        self.connection.set_session_config_option(request).await
+        self.request(request).await
     }
 
     pub async fn cancel(
         &self,
         notification: CancelNotification,
     ) -> agent_client_protocol::Result<()> {
-        self.connection.cancel(notification).await
+        self.connection.send_notification(notification)
+    }
+
+    async fn request<R: JsonRpcRequest>(
+        &self,
+        request: R,
+    ) -> agent_client_protocol::Result<R::Response> {
+        let result = self.connection.send_request(request).block_task().await;
+        // The daemon sends a turn's updates before the turn's response. Let the
+        // client handle everything that arrived first.
+        let (done, handled) = oneshot::channel();
+        if self.incoming.send(Incoming::Barrier(done)).is_ok() {
+            let _ = handled.await;
+        }
+        result
     }
 }
 
 pub struct Connection {
     pub agent: AgentHandle,
-    io: tokio::task::JoinHandle<agent_client_protocol::Result<()>>,
+    driver: tokio::task::JoinHandle<agent_client_protocol::Result<()>>,
+    pump: tokio::task::JoinHandle<()>,
 }
 
 pub struct AttachedSession {
@@ -175,7 +175,7 @@ impl Connection {
         Err(super::daemon::unsupported())
     }
 
-    /// Runs the connection on a `LocalSet` and initializes it.
+    /// Starts the connection on a `LocalSet` and initializes it.
     pub(crate) async fn connect_streams<R, W>(
         read: R,
         write: W,
@@ -187,19 +187,73 @@ impl Connection {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-        let (connection, io_task) = ClientSideConnection::new(
-            SdkClient(client),
-            write.compat_write(),
-            read.compat(),
-            |future| {
-                tokio::task::spawn_local(future);
-            },
+        let (incoming, mut queued) = mpsc::unbounded_channel();
+        let (opened, connection) = oneshot::channel();
+        let permissions = incoming.clone();
+        let notifications = incoming.clone();
+        let driver = tokio::task::spawn_local(
+            agent_client_protocol::Client
+                .builder()
+                .on_receive_request(
+                    async move |request: RequestPermissionRequest,
+                                responder: Responder<RequestPermissionResponse>,
+                                _cx| {
+                        let _ = permissions.send(Incoming::Permission(request, responder));
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_notification(
+                    async move |notification: SessionNotification, _cx| {
+                        let _ = notifications.send(Incoming::Notification(notification));
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_with(
+                    ByteStreams::new(write.compat_write(), read.compat()),
+                    async move |cx: ConnectionTo<Agent>| {
+                        let _ = opened.send(cx.clone());
+                        // The connection ends when the daemon hangs up or the
+                        // `Connection` is dropped (which aborts this task).
+                        cx.incoming_closed().await;
+                        Ok(())
+                    },
+                ),
         );
+        let pump = tokio::task::spawn_local(async move {
+            while let Some(message) = queued.recv().await {
+                match message {
+                    Incoming::Notification(notification) => {
+                        let _ = client.session_notification(notification).await;
+                    }
+                    Incoming::Permission(request, responder) => {
+                        let client = Rc::clone(&client);
+                        tokio::task::spawn_local(async move {
+                            let result = client.request_permission(request).await;
+                            let _ = responder.respond_with_result(result);
+                        });
+                    }
+                    Incoming::Barrier(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
+        let connection = match connection.await {
+            Ok(connection) => connection,
+            Err(_) => {
+                pump.abort();
+                return Err(io::Error::other("ACP connection closed before it opened"));
+            }
+        };
         let connection = Self {
             agent: AgentHandle {
-                connection: Rc::new(connection),
+                connection,
+                incoming,
             },
-            io: tokio::task::spawn_local(io_task),
+            driver,
+            pump,
         };
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -218,7 +272,7 @@ impl Connection {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.io.is_finished()
+        self.driver.is_finished()
     }
 
     /// `new` creates a session; all other selectors must be exact session IDs.
@@ -261,7 +315,8 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        self.io.abort();
+        self.driver.abort();
+        self.pump.abort();
     }
 }
 
@@ -364,10 +419,11 @@ mod tests {
         assert!(readiness_warnings(Some(&incompatible)).is_empty());
     }
 
-    /// Records the text of every agent message chunk.
+    /// Records the text of every agent message chunk, taking `delay` over each.
     #[derive(Default)]
     struct Recorder {
         texts: RefCell<Vec<String>>,
+        delay: Duration,
     }
 
     #[async_trait::async_trait(?Send)]
@@ -385,6 +441,7 @@ mod tests {
             &self,
             notification: SessionNotification,
         ) -> agent_client_protocol::Result<()> {
+            tokio::time::sleep(self.delay).await;
             if let SessionUpdate::AgentMessageChunk(chunk) = notification.update
                 && let ContentBlock::Text(text) = chunk.content
             {
@@ -518,6 +575,75 @@ mod tests {
             })
             .await
             .expect("the connection closes");
+        });
+    }
+
+    #[test]
+    fn updates_sent_before_a_response_are_handled_before_it_returns() {
+        run_local(async {
+            let recorder = Rc::new(Recorder {
+                delay: Duration::from_millis(20),
+                ..Recorder::default()
+            });
+            let (connection, mut daemon) = connected(recorder.clone()).await;
+            let agent = connection.agent.clone();
+            let prompt = tokio::task::spawn_local(async move {
+                agent
+                    .prompt(PromptRequest::new(
+                        "s-1",
+                        vec![ContentBlock::from("hi".to_string())],
+                    ))
+                    .await
+            });
+            let request = daemon.recv().await;
+            assert_eq!(request["method"], "session/prompt");
+            for text in ["one", "two"] {
+                daemon
+                    .send(
+                        json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+                            "sessionId": "s-1",
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {"type": "text", "text": text},
+                            },
+                        }}),
+                    )
+                    .await;
+            }
+            daemon
+                .send(json!({"jsonrpc": "2.0", "id": request["id"], "result": {"stopReason": "end_turn"}}))
+                .await;
+            let response = prompt.await.unwrap().unwrap();
+            assert_eq!(response.stop_reason, StopReason::EndTurn);
+            assert_eq!(*recorder.texts.borrow(), ["one", "two"]);
+        });
+    }
+
+    #[test]
+    fn a_request_dropped_while_outstanding_is_cancelled_on_the_wire() {
+        run_local(async {
+            let (connection, mut daemon) = connected(Rc::new(Recorder::default())).await;
+            let agent = connection.agent.clone();
+            let prompt = tokio::task::spawn_local(async move {
+                agent
+                    .prompt(PromptRequest::new(
+                        "s-1",
+                        vec![ContentBlock::from("hi".to_string())],
+                    ))
+                    .await
+            });
+            let request = daemon.recv().await;
+            assert_eq!(request["method"], "session/prompt");
+            prompt.abort();
+            // The daemon answers no notification, so it ignores this one.
+            assert_eq!(
+                daemon.recv().await,
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/cancel_request",
+                    "params": {"requestId": request["id"]},
+                })
+            );
         });
     }
 }

@@ -11,16 +11,17 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 
-use agent_client_protocol::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ClientCapabilities, ContentBlock, EmbeddedResourceResource, Error, Implementation,
     InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-    PromptResponse, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallContent,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use base64::Engine as _;
 use orca_core::config::{AdditionalWorkingDirectory, HistoryMode, RunConfig};
@@ -1622,15 +1623,17 @@ pub(super) fn replay_snapshot(
         let update = match item {
             SurfaceItem::UserMessage { input, .. } => replay_user_update(input),
             SurfaceItem::AssistantMessage { text, .. } => Some(SessionUpdate::AgentMessageChunk(
-                agent_client_protocol::ContentChunk::new(ContentBlock::from(
+                agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::from(
                     text.as_str().to_string(),
                 )),
             )),
-            SurfaceItem::AssistantReasoning { content, .. } => Some(
-                SessionUpdate::AgentThoughtChunk(agent_client_protocol::ContentChunk::new(
-                    ContentBlock::from(content.as_str().to_string()),
-                )),
-            ),
+            SurfaceItem::AssistantReasoning { content, .. } => {
+                Some(SessionUpdate::AgentThoughtChunk(
+                    agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::from(
+                        content.as_str().to_string(),
+                    )),
+                ))
+            }
             SurfaceItem::AssistantPlan { .. } => None,
             SurfaceItem::ToolResultMessage { .. } => None,
             SurfaceItem::SystemMessage { .. } => None,
@@ -1780,7 +1783,7 @@ pub(super) fn replay_user_update(
         },
     }?;
     Some(SessionUpdate::UserMessageChunk(
-        agent_client_protocol::ContentChunk::new(ContentBlock::from(text)),
+        agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::from(text)),
     ))
 }
 
@@ -2839,7 +2842,8 @@ fn emit_assistant_patch(
 }
 
 fn assistant_chunk(channel: AssistantChannel, text: &str) -> SessionUpdate {
-    let chunk = agent_client_protocol::ContentChunk::new(ContentBlock::from(text.to_string()));
+    let chunk =
+        agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::from(text.to_string()));
     match channel {
         AssistantChannel::Reasoning => SessionUpdate::AgentThoughtChunk(chunk),
         AssistantChannel::Message | AssistantChannel::Plan => {
@@ -2970,8 +2974,8 @@ impl OrcaAcpAgent {
                     .and_then(|meta| meta.get(super::observer::PROJECTION_META))
                     .is_some_and(|value| value["version"].as_u64() == Some(1));
         }
-        let mut session_capabilities =
-            SessionCapabilities::new().list(agent_client_protocol::SessionListCapabilities::new());
+        let mut session_capabilities = SessionCapabilities::new()
+            .list(agent_client_protocol::schema::v1::SessionListCapabilities::new());
         if !self.is_shared() {
             session_capabilities = session_capabilities
                 .additional_directories(SessionAdditionalDirectoriesCapabilities::new());
@@ -3179,21 +3183,25 @@ impl OrcaAcpAgent {
 
     pub async fn set_session_mode(
         &self,
-        args: agent_client_protocol::SetSessionModeRequest,
-    ) -> Result<agent_client_protocol::SetSessionModeResponse, Error> {
+        args: agent_client_protocol::schema::v1::SetSessionModeRequest,
+    ) -> Result<agent_client_protocol::schema::v1::SetSessionModeResponse, Error> {
         let patch =
             super::settings::mode_patch(&args.mode_id.to_string(), self.base_config.approval_mode)?;
         let settings = self.session_settings(&args.session_id, Some(patch)).await?;
         let warnings = settings_startup_warnings(&self.base_config, &settings);
-        Ok(agent_client_protocol::SetSessionModeResponse::new()
-            .meta(startup_warnings_meta(&warnings)))
+        Ok(
+            agent_client_protocol::schema::v1::SetSessionModeResponse::new()
+                .meta(startup_warnings_meta(&warnings)),
+        )
     }
 
     pub async fn set_session_config_option(
         &self,
-        args: agent_client_protocol::SetSessionConfigOptionRequest,
-    ) -> Result<agent_client_protocol::SetSessionConfigOptionResponse, Error> {
-        let agent_client_protocol::SessionConfigOptionValue::ValueId { value } = args.value else {
+        args: agent_client_protocol::schema::v1::SetSessionConfigOptionRequest,
+    ) -> Result<agent_client_protocol::schema::v1::SetSessionConfigOptionResponse, Error> {
+        let agent_client_protocol::schema::v1::SessionConfigOptionValue::ValueId { value } =
+            args.value
+        else {
             return Err(Error::invalid_params().data("setting requires a select value"));
         };
         let value = value.to_string();
@@ -3220,18 +3228,18 @@ impl OrcaAcpAgent {
         let settings = self.session_settings(&args.session_id, Some(patch)).await?;
         let warnings = settings_startup_warnings(&self.base_config, &settings);
         Ok(
-            agent_client_protocol::SetSessionConfigOptionResponse::new(super::settings::options(
-                &settings,
-                self.base_config.approval_mode,
-            ))
+            agent_client_protocol::schema::v1::SetSessionConfigOptionResponse::new(
+                super::settings::options(&settings, self.base_config.approval_mode),
+            )
             .meta(startup_warnings_meta(&warnings)),
         )
     }
 
     pub async fn list_sessions(
         &self,
-        args: agent_client_protocol::ListSessionsRequest,
-    ) -> Result<agent_client_protocol::ListSessionsResponse, Error> {
+        args: agent_client_protocol::schema::v1::ListSessionsRequest,
+        additional_directories: Vec<PathBuf>,
+    ) -> Result<agent_client_protocol::schema::v1::ListSessionsResponse, Error> {
         self.negotiated_client_capabilities()?;
         let cwd = args.cwd.or_else(|| {
             self.is_shared()
@@ -3245,7 +3253,7 @@ impl OrcaAcpAgent {
             )
             .map_err(|message| Error::invalid_params().data(message))?;
         }
-        if !args.additional_directories.is_empty() {
+        if !additional_directories.is_empty() {
             return Err(
                 Error::invalid_params().data("additional directory filtering is unsupported")
             );
@@ -3271,15 +3279,17 @@ impl OrcaAcpAgent {
                     .is_none_or(|cwd| Path::new(&session.cwd) == cwd)
             })
             .map(|session| {
-                agent_client_protocol::SessionInfo::new(
+                agent_client_protocol::schema::v1::SessionInfo::new(
                     SessionId::new(session.session_id),
                     PathBuf::from(session.cwd),
                 )
                 .title(session.title)
             })
             .collect();
-        Ok(agent_client_protocol::ListSessionsResponse::new(sessions)
-            .next_cursor(page.next_offset.map(|offset| offset.to_string())))
+        Ok(
+            agent_client_protocol::schema::v1::ListSessionsResponse::new(sessions)
+                .next_cursor(page.next_offset.map(|offset| offset.to_string())),
+        )
     }
 
     pub async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
@@ -3354,7 +3364,7 @@ mod tests {
         ToolInvocationStarted, ToolTerminalSource,
     };
     use crate::thread::RuntimeThread;
-    use agent_client_protocol::{
+    use agent_client_protocol::schema::v1::{
         EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
     };
     use orca_core::approval_types::ApprovalMode;
@@ -3442,7 +3452,7 @@ mod tests {
 
     #[test]
     fn prompt_content_decodes_supported_blocks_in_original_order() {
-        use agent_client_protocol::{
+        use agent_client_protocol::schema::v1::{
             EmbeddedResource, EmbeddedResourceResource, ResourceLink, TextResourceContents,
         };
 
@@ -3507,7 +3517,7 @@ mod tests {
 
     #[test]
     fn prompt_content_maps_image_blocks_before_surface_reservation() {
-        use agent_client_protocol::ImageContent;
+        use agent_client_protocol::schema::v1::ImageContent;
 
         for media_type in ["image/jpeg", "image/png", "image/gif", "image/webp"] {
             let decoded = decode_prompt_content(
@@ -3535,7 +3545,7 @@ mod tests {
 
     #[test]
     fn prompt_content_maps_http_image_uri_before_surface_reservation() {
-        use agent_client_protocol::ImageContent;
+        use agent_client_protocol::schema::v1::ImageContent;
 
         let decoded = decode_prompt_content(
             &[ContentBlock::Image(
@@ -3555,7 +3565,7 @@ mod tests {
 
     #[test]
     fn prompt_content_rejects_every_invalid_image_boundary_before_surface_reservation() {
-        use agent_client_protocol::ImageContent;
+        use agent_client_protocol::schema::v1::ImageContent;
 
         let cases = [
             (

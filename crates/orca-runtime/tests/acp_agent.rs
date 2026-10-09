@@ -12,11 +12,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use agent_client_protocol::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{
     AudioContent, CancelNotification, ClientCapabilities, ContentBlock, EmbeddedResource,
     EmbeddedResourceResource, FileSystemCapabilities, InitializeRequest, LoadSessionRequest,
-    NewSessionRequest, PromptRequest, ProtocolVersion, ResourceLink, SessionId,
-    SessionNotification, SessionUpdate, StopReason, TextResourceContents,
+    NewSessionRequest, PromptRequest, ResourceLink, SessionId, SessionNotification, SessionUpdate,
+    StopReason, TextResourceContents,
 };
 use orca_core::cancel::CancelToken;
 use orca_core::config::{

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use agent_client_protocol::{
+use agent_client_protocol::schema::v1::{
     AuthenticateRequest, CancelNotification, CreateTerminalRequest, CreateTerminalResponse,
     EnvVariable, InitializeRequest, KillTerminalRequest, KillTerminalResponse, LoadSessionRequest,
     NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
@@ -525,8 +525,10 @@ fn handle_inbound(
                 Ok(response_completion(facade, request_id, result))
             }
             "session/list" => {
-                let result = match decode::<agent_client_protocol::ListSessionsRequest>(params) {
-                    Ok(args) => agent.list_sessions(args).await,
+                let result = match decode_list_sessions(params) {
+                    Ok((args, additional_directories)) => {
+                        agent.list_sessions(args, additional_directories).await
+                    }
                     Err(error) => {
                         Err(agent_client_protocol::Error::invalid_params().data(error.to_string()))
                     }
@@ -543,7 +545,9 @@ fn handle_inbound(
                 Ok(response_completion(facade, request_id, result))
             }
             "session/set_mode" => {
-                let result = match decode::<agent_client_protocol::SetSessionModeRequest>(params) {
+                let result = match decode::<agent_client_protocol::schema::v1::SetSessionModeRequest>(
+                    params,
+                ) {
                     Ok(args) => agent.set_session_mode(args).await,
                     Err(error) => {
                         Err(agent_client_protocol::Error::invalid_params().data(error.to_string()))
@@ -552,14 +556,15 @@ fn handle_inbound(
                 Ok(response_completion(facade, request_id, result))
             }
             "session/set_config_option" => {
-                let result =
-                    match decode::<agent_client_protocol::SetSessionConfigOptionRequest>(params) {
-                        Ok(args) => agent.set_session_config_option(args).await,
-                        Err(error) => {
-                            Err(agent_client_protocol::Error::invalid_params()
-                                .data(error.to_string()))
-                        }
-                    };
+                let result = match decode::<
+                    agent_client_protocol::schema::v1::SetSessionConfigOptionRequest,
+                >(params)
+                {
+                    Ok(args) => agent.set_session_config_option(args).await,
+                    Err(error) => {
+                        Err(agent_client_protocol::Error::invalid_params().data(error.to_string()))
+                    }
+                };
                 Ok(response_completion(facade, request_id, result))
             }
             "session/prompt" => {
@@ -723,7 +728,7 @@ fn decode_request<T: DeserializeOwned>(params: Value) -> Result<T, agent_client_
 #[cfg(test)]
 mod decode_request_tests {
     use super::*;
-    use agent_client_protocol::InitializeRequest;
+    use agent_client_protocol::schema::v1::InitializeRequest;
 
     #[test]
     fn malformed_params_report_invalid_params_not_internal_error() {
@@ -738,6 +743,28 @@ mod decode_request_tests {
 
 fn decode<T: DeserializeOwned>(value: Value) -> Result<T, serde_json::Error> {
     serde_json::from_value(value)
+}
+
+/// Schema 1.x dropped the unstable `additionalDirectories` filter from
+/// `session/list`. Orca still refuses a non-empty one rather than list every
+/// directory's sessions.
+fn decode_list_sessions(
+    params: Value,
+) -> Result<
+    (
+        agent_client_protocol::schema::v1::ListSessionsRequest,
+        Vec<std::path::PathBuf>,
+    ),
+    serde_json::Error,
+> {
+    #[derive(serde::Deserialize)]
+    struct Filter {
+        #[serde(default, rename = "additionalDirectories")]
+        additional_directories: Vec<std::path::PathBuf>,
+    }
+    let request = decode(params.clone())?;
+    let filter = decode::<Filter>(params)?;
+    Ok((request, filter.additional_directories))
 }
 
 fn required_queue_revision(
@@ -2230,7 +2257,7 @@ fn handle_terminal_observation_response(routes: &TerminalObservationRoutes, valu
 }
 
 fn surface_terminal_exit_status(
-    status: agent_client_protocol::TerminalExitStatus,
+    status: agent_client_protocol::schema::v1::TerminalExitStatus,
 ) -> Result<SurfaceTerminalExitStatus, String> {
     let signal = status
         .signal
@@ -2695,10 +2722,10 @@ mod tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Instant;
 
-    use agent_client_protocol::RequestPermissionOutcome;
-    use agent_client_protocol::{
+    use agent_client_protocol::schema::v1::RequestPermissionOutcome;
+    use agent_client_protocol::schema::v1::{
         CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
-        Implementation, InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
+        Implementation, InitializeRequest, NewSessionRequest, PromptRequest,
         RequestPermissionRequest, RequestPermissionResponse, ToolCallId, ToolCallUpdate,
         ToolCallUpdateFields,
     };
@@ -2729,6 +2756,7 @@ mod tests {
     };
     use crate::runtime_permission::RuntimePermissionRequest;
     use crate::thread::RuntimeThread;
+    use agent_client_protocol::schema::ProtocolVersion;
 
     // Host paths and sandbox warnings differ on Windows; the wire shapes do not.
     #[cfg(unix)]
@@ -3767,6 +3795,49 @@ mod tests {
         });
     }
 
+    #[test]
+    fn a_wrong_typed_optional_field_reads_as_absent() {
+        // ACP schema 1.x reads an optional field of the wrong type as absent:
+        // `clientCapabilities: 42` is a client with no capabilities, where
+        // schema 0.11 refused the request.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&runtime, async {
+            let host =
+                RuntimeHost::start_with_executor(Arc::new(CompleteWithMessageExecutor)).unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (client_read, mut client_write) = tokio::io::split(client);
+            let (server_read, server_write) = tokio::io::split(server);
+            let connection = tokio::task::spawn_local(run_connection(
+                host.surface_handle(),
+                test_config(cwd.path().to_path_buf()),
+                server_read,
+                server_write,
+            ));
+            let mut client_read = BufReader::new(client_read);
+            write_request(
+                &mut client_write,
+                1,
+                "initialize",
+                json!({"protocolVersion": 1, "clientCapabilities": 42}),
+            )
+            .await;
+            let initialized = read_response(&mut client_read, 1).await;
+            assert_eq!(initialized["result"]["protocolVersion"], 1, "{initialized}");
+            client_write.shutdown().await.unwrap();
+            tokio::time::timeout(TEST_TIMEOUT, connection)
+                .await
+                .expect("connection shutdown")
+                .expect("connection task")
+                .expect("clean connection");
+            host.shutdown().unwrap();
+        });
+    }
+
     /// Collects the attach client's agent message text.
     #[derive(Default)]
     struct AttachTexts(RefCell<Vec<String>>);
@@ -3784,9 +3855,9 @@ mod tests {
 
         async fn session_notification(
             &self,
-            notification: agent_client_protocol::SessionNotification,
+            notification: agent_client_protocol::schema::v1::SessionNotification,
         ) -> agent_client_protocol::Result<()> {
-            if let agent_client_protocol::SessionUpdate::AgentMessageChunk(chunk) =
+            if let agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(chunk) =
                 notification.update
                 && let ContentBlock::Text(text) = chunk.content
             {
@@ -3839,7 +3910,7 @@ mod tests {
                 .expect("prompt");
             assert_eq!(
                 response.stop_reason,
-                agent_client_protocol::StopReason::EndTurn
+                agent_client_protocol::schema::v1::StopReason::EndTurn
             );
             tokio::time::timeout(TEST_TIMEOUT, async {
                 while texts.0.borrow().is_empty() {
@@ -3995,7 +4066,7 @@ mod tests {
                         value["id"].as_i64().expect("permission request id"),
                         serde_json::to_value(RequestPermissionResponse::new(
                             RequestPermissionOutcome::Selected(
-                                agent_client_protocol::SelectedPermissionOutcome::new(
+                                agent_client_protocol::schema::v1::SelectedPermissionOutcome::new(
                                     "reject_once",
                                 ),
                             ),

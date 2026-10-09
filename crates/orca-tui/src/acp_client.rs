@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use agent_client_protocol::{
+use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, ImageContent, PermissionOption,
     PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
@@ -206,7 +206,7 @@ impl Projection {
         self.dirty = true;
     }
 
-    fn plan(&mut self, plan: agent_client_protocol::Plan) {
+    fn plan(&mut self, plan: agent_client_protocol::schema::v1::Plan) {
         let message = ChatMessage::PlanUpdate {
             explanation: None,
             plan: plan
@@ -215,11 +215,15 @@ impl Projection {
                 .map(|entry| PlanItem {
                     step: entry.content,
                     status: match entry.status {
-                        agent_client_protocol::PlanEntryStatus::Pending => PlanStatus::Pending,
-                        agent_client_protocol::PlanEntryStatus::InProgress => {
+                        agent_client_protocol::schema::v1::PlanEntryStatus::Pending => {
+                            PlanStatus::Pending
+                        }
+                        agent_client_protocol::schema::v1::PlanEntryStatus::InProgress => {
                             PlanStatus::InProgress
                         }
-                        agent_client_protocol::PlanEntryStatus::Completed => PlanStatus::Completed,
+                        agent_client_protocol::schema::v1::PlanEntryStatus::Completed => {
+                            PlanStatus::Completed
+                        }
                         _ => PlanStatus::Pending,
                     },
                 })
@@ -288,7 +292,11 @@ impl Projection {
         }
     }
 
-    fn usage(&mut self, update: agent_client_protocol::UsageUpdate, meta: &ProjectionMeta) {
+    fn usage(
+        &mut self,
+        update: agent_client_protocol::schema::v1::UsageUpdate,
+        meta: &ProjectionMeta,
+    ) {
         self.metrics.context_used_tokens = usize::try_from(update.used).unwrap_or(usize::MAX);
         self.metrics.context_limit_tokens = usize::try_from(update.size).unwrap_or(usize::MAX);
         if let Some(usage) = &meta.usage {
@@ -1287,7 +1295,7 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::{
+    use agent_client_protocol::schema::v1::{
         ContentChunk, Cost, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionInfoUpdate,
         ToolCallUpdate, UsageUpdate,
     };
@@ -1779,7 +1787,7 @@ mod tests {
                 key,
                 key,
                 value,
-                Vec::<agent_client_protocol::SessionConfigSelectOption>::new(),
+                Vec::<agent_client_protocol::schema::v1::SessionConfigSelectOption>::new(),
             )
         })
         .collect();
@@ -1787,7 +1795,7 @@ mod tests {
             .session_notification(SessionNotification::new(
                 SESSION,
                 SessionUpdate::ConfigOptionUpdate(
-                    agent_client_protocol::ConfigOptionUpdate::new(options).meta(
+                    agent_client_protocol::schema::v1::ConfigOptionUpdate::new(options).meta(
                         serde_json::Map::from_iter([(
                             orca_runtime::acp::READINESS_META.to_string(),
                             json!({
@@ -2285,11 +2293,11 @@ mod tests {
             };
             let initialize = peer.recv().await;
             assert_eq!(initialize["method"], "initialize");
-            let _: agent_client_protocol::InitializeRequest =
+            let _: agent_client_protocol::schema::v1::InitializeRequest =
                 serde_json::from_value(initialize["params"].clone()).unwrap();
             peer.send(json!({
                 "jsonrpc": "2.0", "id": initialize["id"],
-                "result": agent_client_protocol::InitializeResponse::new(agent_client_protocol::ProtocolVersion::V1)
+                "result": agent_client_protocol::schema::v1::InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
             })).await;
             peer
         }

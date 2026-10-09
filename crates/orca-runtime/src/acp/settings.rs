@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use agent_client_protocol::{
+use agent_client_protocol::schema::v1::{
     Error, SessionConfigOption, SessionConfigSelectOption, SessionMode, SessionModeState,
 };
 use orca_core::approval_types::ApprovalMode;

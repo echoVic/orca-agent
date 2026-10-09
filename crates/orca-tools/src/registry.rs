@@ -2062,7 +2062,9 @@ fn execute_list_mcp_resources(request: &ToolRequest, ctx: &ToolContext<'_>) -> T
             return ToolResult::failed(request, error, None);
         }
     };
-    let output = serde_json::to_value(&listing.resources).and_then(|resources| {
+    let output = serde_json::to_value(&listing.resources).and_then(|mut resources| {
+        // The model has always seen these keys sorted.
+        resources.sort_all_objects();
         serde_json::to_string(&ResourceList {
             resources,
             errors: listing.errors,
@@ -2101,12 +2103,15 @@ fn execute_list_mcp_resource_templates(request: &ToolRequest, ctx: &ToolContext<
                 return ToolResult::failed(request, error, None);
             }
         };
-    let output = serde_json::to_value(&listing.resource_templates).and_then(|resource_templates| {
-        serde_json::to_string(&ResourceTemplateList {
-            resource_templates,
-            errors: listing.errors,
-        })
-    });
+    let output =
+        serde_json::to_value(&listing.resource_templates).and_then(|mut resource_templates| {
+            // The model has always seen these keys sorted.
+            resource_templates.sort_all_objects();
+            serde_json::to_string(&ResourceTemplateList {
+                resource_templates,
+                errors: listing.errors,
+            })
+        });
     match output {
         Ok(output) => ToolResult::completed(request, output, false),
         Err(error) => ToolResult::failed(

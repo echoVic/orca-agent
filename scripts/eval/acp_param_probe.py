@@ -175,25 +175,21 @@ def main() -> int:
 
         # 3. Malformed params on known methods: -32602 + id echo. Both shapes a real
         #    client produces: the whole `params` value of the wrong JSON kind, and a
-        #    single field of the wrong type (schema/version skew).
+        #    required field of the wrong type. (ACP schema 1.x reads an optional field
+        #    of the wrong type as absent, so `clientCapabilities: 42` is not an error.)
         client_info = {"name": "acp-param-probe", "version": "0.0.1"}
-        malformed: list[tuple[int, str, object]] = [
-            (3, "initialize", "not-an-object"),
-            (4, "session/new", "not-an-object"),
-            (5, "session/prompt", "not-an-object"),
-            (6, "initialize", {"protocolVersion": 1, "clientCapabilities": 42, "clientInfo": client_info}),
-            (7, "session/new", {"cwd": 42, "mcpServers": []}),
-            (8, "session/load", {"sessionId": 42, "cwd": work, "mcpServers": []}),
-            (9, "authenticate", {"methodId": 42}),
-            (15, "orca.dev/session/queue/list", "not-an-object"),
-            (16, "session/set_config_option", {"sessionId": 42}),
+        malformed: list[tuple[int, str, str, object]] = [
+            (3, "initialize", "params not an object", "not-an-object"),
+            (4, "session/new", "params not an object", "not-an-object"),
+            (5, "session/prompt", "params not an object", "not-an-object"),
+            (6, "initialize", "protocolVersion wrong type", {"protocolVersion": "one", "clientInfo": client_info}),
+            (7, "session/new", "cwd wrong type", {"cwd": 42, "mcpServers": []}),
+            (8, "session/load", "sessionId wrong type", {"sessionId": 42, "cwd": work, "mcpServers": []}),
+            (9, "authenticate", "methodId wrong type", {"methodId": 42}),
+            (15, "orca.dev/session/queue/list", "params not an object", "not-an-object"),
+            (16, "session/set_config_option", "sessionId wrong type", {"sessionId": 42}),
         ]
-        for request_id, method, params in malformed:
-            if isinstance(params, str):
-                shape = "params not an object"
-            else:
-                bad = next(key for key, value in params.items() if key != "protocolVersion")
-                shape = f"{bad} wrong type"
+        for request_id, method, shape, params in malformed:
             bridge.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
             reply = bridge.await_id(request_id, 15.0)
             code = ((reply or {}).get("error") or {}).get("code")

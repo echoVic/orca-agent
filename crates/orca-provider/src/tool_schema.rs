@@ -43,6 +43,7 @@ pub fn deepseek_strict_tools_schema_for_endpoint(
                         .expect("provider-generated parameters"),
                 );
                 function.insert("strict".to_string(), Value::Bool(true));
+                tool.sort_all_objects();
             }
             tool
         })
@@ -59,15 +60,20 @@ fn sort_tools_by_name(tools: &mut [Value]) {
     });
 }
 
+/// DeepSeek has always received tool schemas with sorted keys, and a prompt
+/// cache prefix depends on the exact bytes. serde_json keeps insertion order
+/// once a dependency turns on `preserve_order` (the ACP SDK does), so sort.
 fn deepseek_tool_schema(definition: &ProviderToolDefinition) -> Value {
-    json!({
+    let mut tool = json!({
         "type": "function",
         "function": {
             "name": definition.name,
             "description": definition.description,
             "parameters": definition.input_schema,
         }
-    })
+    });
+    tool.sort_all_objects();
+    tool
 }
 
 fn is_strict_capable_endpoint(base_url: &str) -> bool {

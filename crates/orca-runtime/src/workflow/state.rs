@@ -800,12 +800,18 @@ pub fn input_hash(prompt: &str, opts: &Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(prompt.as_bytes());
     hasher.update(b"\0");
-    hasher.update(
-        serde_json::to_string(opts)
-            .unwrap_or_else(|_| "null".to_string())
-            .as_bytes(),
-    );
+    hasher.update(sorted_json(opts).as_bytes());
     orca_core::hex::lower(&hasher.finalize())
+}
+
+/// `value` as JSON with every object's keys sorted, so a digest does not
+/// depend on the order the keys arrived in. serde_json keeps insertion order
+/// once a dependency turns on `preserve_order` (the ACP SDK does); recorded
+/// digests were made with sorted keys.
+pub(crate) fn sorted_json(value: &Value) -> String {
+    let mut value = value.clone();
+    value.sort_all_objects();
+    serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
 }
 
 fn cache_key(call_path: &str, input_hash: &str) -> String {
@@ -1072,5 +1078,23 @@ mod read_retry_tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(calls, 1);
+    }
+}
+
+#[cfg(test)]
+mod input_hash_tests {
+    use super::*;
+
+    #[test]
+    fn input_hash_ignores_the_order_of_option_keys() {
+        let sorted: Value = serde_json::from_str(r#"{"a":1,"b":{"c":2,"d":3}}"#).unwrap();
+        let shuffled: Value = serde_json::from_str(r#"{"b":{"d":3,"c":2},"a":1}"#).unwrap();
+        assert_eq!(input_hash("p", &shuffled), input_hash("p", &sorted));
+        // A run recorded before serde_json kept insertion order hashed the
+        // sorted text; resuming it must find the same cached calls.
+        assert_eq!(
+            input_hash("p", &shuffled),
+            "089522e635b5f0168bf302aef3a77f1403668f34a9f8bea0050885363587d479"
+        );
     }
 }
