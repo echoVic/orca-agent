@@ -96,6 +96,7 @@ mod slash_command_actions;
 mod slash_menu_actions;
 mod state_reducer;
 mod status_key_actions;
+mod stderr_capture;
 mod stdio_guard;
 mod streaming_markdown;
 mod submitted_turn;

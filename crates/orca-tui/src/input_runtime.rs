@@ -332,6 +332,7 @@ impl RestoreRegistration {
                     )
                 {
                     let _ = active.handle.restore();
+                    crate::stderr_capture::restore_for_panic();
                 }
                 previous(info);
             }));
