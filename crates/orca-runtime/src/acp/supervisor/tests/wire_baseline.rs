@@ -21,12 +21,21 @@ fn client_info() -> Value {
     json!({"name": "wire-baseline", "version": "0.0.0"})
 }
 
+/// Runs a scenario with its own Orca home. `session/list` pages over every
+/// saved session in the home, so in a process where other tests save many,
+/// this scenario's own session could fall off the first page.
 fn run(scenario: impl Future<Output = ()>) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    tokio::task::LocalSet::new().block_on(&runtime, scenario);
+    crate::history::with_redirected_orca_home("acp-wire", |home| {
+        // The agent lists and opens sessions on blocking threads, which do
+        // not inherit the redirect of the test thread.
+        let home = home.to_path_buf();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_start(move || orca_core::home::install_test_orca_home(Some(home.clone())))
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, scenario);
+    });
 }
 
 /// A daemon (shared sessions) or stdio (one connection) ACP endpoint.
