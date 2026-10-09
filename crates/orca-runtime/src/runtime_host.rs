@@ -29739,6 +29739,102 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_a_turn_ends_its_running_sync_agent_as_cancelled() {
+        // Cancelled mid-answer, as an Esc while the agent thinks is.
+        cancel_a_turn_running_a_sync_agent(|agent| agent.child_thread_id.is_some());
+    }
+
+    #[test]
+    fn cancelling_a_turn_as_its_sync_agent_starts_ends_the_agent_as_cancelled() {
+        cancel_a_turn_running_a_sync_agent(|_| true);
+    }
+
+    fn cancel_a_turn_running_a_sync_agent(ready: impl Fn(&surface::SurfaceSubagent) -> bool) {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let host = RuntimeHost::start().expect("start cancelled agent host");
+        let thread = host
+            .start_thread(config, "cancelled sync agent")
+            .expect("start cancelled agent thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let (operation_id, _) = admit_surface_turn(
+            &surface,
+            &attachment,
+            "subagent sync mock_stream_delay_ms 10000",
+        );
+        let snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while !snapshot()
+            .subagents
+            .iter()
+            .any(|agent| agent.status == surface::SurfaceSubagentStatus::Running && ready(agent))
+        {
+            assert!(Instant::now() < deadline, "the agent never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(matches!(
+            committed_surface_value(
+                attachment
+                    .client
+                    .cancel_operation(surface_request_id(), operation_id.clone())
+                    .expect("cancel the turn"),
+            ),
+            surface::CancelOperationOutput::Accepted { .. }
+        ));
+        let surface::WaitOperationTerminalResult::Terminal { value } = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait for the cancelled turn")
+        else {
+            panic!("the cancelled turn reached no terminal");
+        };
+
+        assert!(
+            matches!(
+                value.terminal,
+                surface::OperationTerminal::Cancelled {
+                    reason: surface::CancelReason::User,
+                }
+            ),
+            "{:?}",
+            value.terminal
+        );
+        let snapshot = snapshot();
+        assert!(
+            snapshot
+                .subagents
+                .iter()
+                .all(|agent| agent.status == surface::SurfaceSubagentStatus::Cancelled),
+            "{:?}",
+            snapshot.subagents
+        );
+        assert!(
+            snapshot
+                .tasks
+                .iter()
+                .filter(|task| task.task_type == surface::SurfaceTaskType::Subagent)
+                .all(|task| task.status == surface::SurfaceTaskStatus::Cancelled),
+            "{:?}",
+            snapshot
+                .tasks
+                .iter()
+                .map(|task| task.status)
+                .collect::<Vec<_>>()
+        );
+        host.shutdown().expect("shutdown cancelled agent host");
+    }
+
+    #[test]
     fn a_finished_sync_agents_transcript_is_read_from_its_child_session() {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
