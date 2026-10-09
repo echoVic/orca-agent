@@ -44,6 +44,18 @@ and `session/cancel`. `session/load` requires an exact canonical session UUID
 and the daemon workspace. Each connection can attach at most four sessions.
 The daemon caps active connections and loaded sessions at 64 each.
 
+## Protocol
+
+- The daemon speaks ACP v1 through `agent-client-protocol` 3.2 (schema 1.10).
+  It still reports `models` from `session/new` and `session/load` and accepts
+  `session/set_model`: schema 1.x removed that session model API, and clients
+  built on it keep working.
+- Requests are decoded as schema 1.x specifies. An optional field of the wrong
+  type reads as absent, and an invalid entry in a list such as `mcpServers` is
+  skipped. A required field of the wrong type, or `params` that are not an
+  object, is `-32602 Invalid params`. `session/list` still refuses a non-empty
+  `additionalDirectories` filter.
+
 ## Ownership and Recovery
 
 - A session has one mutation lease. A competing prompt or settings mutation is
@@ -169,6 +181,11 @@ coverage in `crates/orca-runtime/src/acp/supervisor.rs` uses the existing
 `fs/read_text_file` calls: only the submitting connection receives the request,
 an observer's matching response ID cannot settle it, the owner's response
 completes it, and cancellation/disconnect fail closed even with late responses.
+
+`acp::supervisor::tests::wire_baseline` drives eleven scenarios with literal
+JSON-RPC frames and compares everything the daemon writes with
+`crates/orca-runtime/src/golden/acp_wire/`. Regenerate the files with
+`ORCA_UPDATE_GOLDEN=1` only for an intended wire change, and review the diff.
 
 Run under the coordinator's serialized build schedule:
 
