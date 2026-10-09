@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use agent_client_protocol::{
-    Agent, AuthenticateRequest, CancelNotification, CreateTerminalRequest, CreateTerminalResponse,
+    AuthenticateRequest, CancelNotification, CreateTerminalRequest, CreateTerminalResponse,
     EnvVariable, InitializeRequest, KillTerminalRequest, KillTerminalResponse, LoadSessionRequest,
     NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
     ReleaseTerminalRequest, ReleaseTerminalResponse, SessionId, TerminalOutputRequest,
@@ -495,7 +495,7 @@ fn handle_inbound(
             "initialize" => {
                 let result = decode_request::<InitializeRequest>(params);
                 let result = match result {
-                    Ok(args) => Agent::initialize(agent.as_ref(), args).await,
+                    Ok(args) => agent.initialize(args).await,
                     Err(error) => Err(error),
                 };
                 Ok(response_completion(facade, request_id, result))
@@ -503,7 +503,7 @@ fn handle_inbound(
             "authenticate" => {
                 let result = decode_request::<AuthenticateRequest>(params);
                 let result = match result {
-                    Ok(args) => Agent::authenticate(agent.as_ref(), args).await,
+                    Ok(args) => agent.authenticate(args).await,
                     Err(error) => Err(error),
                 };
                 Ok(response_completion(facade, request_id, result))
@@ -511,7 +511,7 @@ fn handle_inbound(
             "session/new" => {
                 let result = decode_request::<NewSessionRequest>(params);
                 let result = match result {
-                    Ok(args) => Agent::new_session(agent.as_ref(), args).await,
+                    Ok(args) => agent.new_session(args).await,
                     Err(error) => Err(error),
                 };
                 Ok(response_completion(facade, request_id, result))
@@ -519,14 +519,14 @@ fn handle_inbound(
             "session/load" => {
                 let result = decode_request::<LoadSessionRequest>(params);
                 let result = match result {
-                    Ok(args) => Agent::load_session(agent.as_ref(), args).await,
+                    Ok(args) => agent.load_session(args).await,
                     Err(error) => Err(error),
                 };
                 Ok(response_completion(facade, request_id, result))
             }
             "session/list" => {
                 let result = match decode::<agent_client_protocol::ListSessionsRequest>(params) {
-                    Ok(args) => Agent::list_sessions(agent.as_ref(), args).await,
+                    Ok(args) => agent.list_sessions(args).await,
                     Err(error) => {
                         Err(agent_client_protocol::Error::invalid_params().data(error.to_string()))
                     }
@@ -535,7 +535,7 @@ fn handle_inbound(
             }
             "session/set_model" => {
                 let result = match decode::<agent_client_protocol::SetSessionModelRequest>(params) {
-                    Ok(args) => Agent::set_session_model(agent.as_ref(), args).await,
+                    Ok(args) => agent.set_session_model(args).await,
                     Err(error) => {
                         Err(agent_client_protocol::Error::invalid_params().data(error.to_string()))
                     }
@@ -544,7 +544,7 @@ fn handle_inbound(
             }
             "session/set_mode" => {
                 let result = match decode::<agent_client_protocol::SetSessionModeRequest>(params) {
-                    Ok(args) => Agent::set_session_mode(agent.as_ref(), args).await,
+                    Ok(args) => agent.set_session_mode(args).await,
                     Err(error) => {
                         Err(agent_client_protocol::Error::invalid_params().data(error.to_string()))
                     }
@@ -554,7 +554,7 @@ fn handle_inbound(
             "session/set_config_option" => {
                 let result =
                     match decode::<agent_client_protocol::SetSessionConfigOptionRequest>(params) {
-                        Ok(args) => Agent::set_session_config_option(agent.as_ref(), args).await,
+                        Ok(args) => agent.set_session_config_option(args).await,
                         Err(error) => {
                             Err(agent_client_protocol::Error::invalid_params()
                                 .data(error.to_string()))
@@ -606,11 +606,12 @@ fn handle_inbound(
                         message: format!("invalid ACP cancel: {error}"),
                     })?;
                 let session_id = args.session_id.clone();
-                Agent::cancel(agent.as_ref(), args).await.map_err(|error| {
-                    RpcFacadeError::Protocol {
+                agent
+                    .cancel(args)
+                    .await
+                    .map_err(|error| RpcFacadeError::Protocol {
                         message: format!("ACP cancel failed: {error:?}"),
-                    }
-                })?;
+                    })?;
                 retire_session_interaction_routes(&client_bridge, &interaction_routes, &session_id);
                 retire_session_read_text_file_routes(&read_text_file_routes, &session_id);
                 retire_session_write_text_file_routes(&write_text_file_routes, &session_id);

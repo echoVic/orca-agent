@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use agent_client_protocol::{
-    Agent, AudioContent, CancelNotification, ClientCapabilities, ContentBlock, EmbeddedResource,
+    AudioContent, CancelNotification, ClientCapabilities, ContentBlock, EmbeddedResource,
     EmbeddedResourceResource, FileSystemCapabilities, InitializeRequest, LoadSessionRequest,
     NewSessionRequest, PromptRequest, ProtocolVersion, ResourceLink, SessionId,
     SessionNotification, SessionUpdate, StopReason, TextResourceContents,
@@ -1134,7 +1134,8 @@ fn acp_cancel_stops_in_flight_prompt() {
 
     let stop_reason = local.block_on(&rt, async {
         initialize_agent(&agent).await;
-        let session = Agent::new_session(&agent, NewSessionRequest::new(cwd.path().to_path_buf()))
+        let session = agent
+            .new_session(NewSessionRequest::new(cwd.path().to_path_buf()))
             .await
             .expect("new_session");
 
@@ -1143,15 +1144,13 @@ fn acp_cancel_stops_in_flight_prompt() {
 
         // Poll prompt first so it enters start_turn, then issue cancellation
         // immediately. This exercises the pre-install cancellation window.
-        let prompt_fut = Agent::prompt(
-            &agent,
-            PromptRequest::new(
-                session_id_for_prompt,
-                vec![ContentBlock::from("long running".to_string())],
-            ),
-        );
+        let prompt_fut = agent.prompt(PromptRequest::new(
+            session_id_for_prompt,
+            vec![ContentBlock::from("long running".to_string())],
+        ));
         let cancel_fut = async {
-            Agent::cancel(&agent, CancelNotification::new(session_id_for_cancel))
+            agent
+                .cancel(CancelNotification::new(session_id_for_cancel))
                 .await
                 .expect("cancel");
         };
@@ -1190,7 +1189,8 @@ fn acp_cancel_reports_runtime_commit_failure_before_retry_succeeds() {
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
         initialize_agent(&agent).await;
-        let session = Agent::new_session(&agent, NewSessionRequest::new(cwd.path().to_path_buf()))
+        let session = agent
+            .new_session(NewSessionRequest::new(cwd.path().to_path_buf()))
             .await
             .expect("new_session");
         let transcript =
@@ -1199,13 +1199,10 @@ fn acp_cancel_reports_runtime_commit_failure_before_retry_succeeds() {
         let transcript_path = transcript.path;
         let backup_path = transcript_path.with_extension("cancel-error-backup");
 
-        let prompt_fut = Agent::prompt(
-            &agent,
-            PromptRequest::new(
-                session.session_id.clone(),
-                vec![ContentBlock::from("long running".to_string())],
-            ),
-        );
+        let prompt_fut = agent.prompt(PromptRequest::new(
+            session.session_id.clone(),
+            vec![ContentBlock::from("long running".to_string())],
+        ));
         let cancel_fut = async {
             while executor.call_count() == 0 {
                 tokio::task::yield_now().await;
@@ -1213,14 +1210,16 @@ fn acp_cancel_reports_runtime_commit_failure_before_retry_succeeds() {
             std::fs::rename(&transcript_path, &backup_path).expect("hide ACP transcript");
             std::fs::create_dir(&transcript_path).expect("block ACP transcript writes");
             assert!(
-                Agent::cancel(&agent, CancelNotification::new(session.session_id.clone()),)
+                agent
+                    .cancel(CancelNotification::new(session.session_id.clone()),)
                     .await
                     .is_err(),
                 "ACP cancel must report a runtime commit failure"
             );
             std::fs::remove_dir(&transcript_path).expect("remove blocking transcript directory");
             std::fs::rename(&backup_path, &transcript_path).expect("restore ACP transcript");
-            Agent::cancel(&agent, CancelNotification::new(session.session_id))
+            agent
+                .cancel(CancelNotification::new(session.session_id))
                 .await
                 .expect("retry ACP cancel after restoring persistence");
         };

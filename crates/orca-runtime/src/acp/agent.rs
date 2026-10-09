@@ -1,4 +1,4 @@
-//! ACP [`Agent`] implementation projected onto the runtime-owned typed surface.
+//! The ACP agent, projected onto the runtime-owned typed surface.
 //!
 //! The adapter retains only ACP transport correlation. Runtime threads,
 //! operation lifecycle, interactions, cancellation and terminal facts remain
@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
+    AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ClientCapabilities, ContentBlock, EmbeddedResourceResource, Error, Implementation,
     InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, PermissionOption,
@@ -2952,9 +2952,8 @@ fn cancel_surface_operation(prepared: &PreparedSurfacePrompt) -> Result<(), Stri
     }
 }
 
-#[async_trait::async_trait(?Send)]
-impl Agent for OrcaAcpAgent {
-    async fn initialize(&self, args: InitializeRequest) -> Result<InitializeResponse, Error> {
+impl OrcaAcpAgent {
+    pub async fn initialize(&self, args: InitializeRequest) -> Result<InitializeResponse, Error> {
         {
             let mut state = self.state.borrow_mut();
             if state.client_capabilities.is_some() || !state.sessions.is_empty() {
@@ -2993,14 +2992,14 @@ impl Agent for OrcaAcpAgent {
             ))
     }
 
-    async fn authenticate(
+    pub async fn authenticate(
         &self,
         _args: AuthenticateRequest,
     ) -> Result<AuthenticateResponse, Error> {
         Ok(AuthenticateResponse::new())
     }
 
-    async fn new_session(&self, args: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+    pub async fn new_session(&self, args: NewSessionRequest) -> Result<NewSessionResponse, Error> {
         self.negotiated_client_capabilities()?;
         let config = self
             .build_session_config(args.cwd, args.mcp_servers, args.additional_directories)
@@ -3053,7 +3052,10 @@ impl Agent for OrcaAcpAgent {
         Ok(NewSessionResponse::new(session_id).meta(startup_warnings_meta(&startup_warnings)))
     }
 
-    async fn load_session(&self, args: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
+    pub async fn load_session(
+        &self,
+        args: LoadSessionRequest,
+    ) -> Result<LoadSessionResponse, Error> {
         self.negotiated_client_capabilities()?;
         if self.state.borrow().sessions.contains_key(&args.session_id) {
             return Err(Error::invalid_params().data("ACP session is already loaded"));
@@ -3122,12 +3124,12 @@ impl Agent for OrcaAcpAgent {
         Ok(LoadSessionResponse::new().meta(startup_warnings_meta(&startup_warnings)))
     }
 
-    async fn prompt(&self, args: PromptRequest) -> Result<PromptResponse, Error> {
+    pub async fn prompt(&self, args: PromptRequest) -> Result<PromptResponse, Error> {
         let admitted = self.admit_prompt(args, None).await?;
         self.complete_prompt(admitted).await
     }
 
-    async fn set_session_model(
+    pub async fn set_session_model(
         &self,
         args: agent_client_protocol::SetSessionModelRequest,
     ) -> Result<agent_client_protocol::SetSessionModelResponse, Error> {
@@ -3145,7 +3147,7 @@ impl Agent for OrcaAcpAgent {
         Ok(agent_client_protocol::SetSessionModelResponse::new())
     }
 
-    async fn set_session_mode(
+    pub async fn set_session_mode(
         &self,
         args: agent_client_protocol::SetSessionModeRequest,
     ) -> Result<agent_client_protocol::SetSessionModeResponse, Error> {
@@ -3157,7 +3159,7 @@ impl Agent for OrcaAcpAgent {
             .meta(startup_warnings_meta(&warnings)))
     }
 
-    async fn set_session_config_option(
+    pub async fn set_session_config_option(
         &self,
         args: agent_client_protocol::SetSessionConfigOptionRequest,
     ) -> Result<agent_client_protocol::SetSessionConfigOptionResponse, Error> {
@@ -3196,7 +3198,7 @@ impl Agent for OrcaAcpAgent {
         )
     }
 
-    async fn list_sessions(
+    pub async fn list_sessions(
         &self,
         args: agent_client_protocol::ListSessionsRequest,
     ) -> Result<agent_client_protocol::ListSessionsResponse, Error> {
@@ -3250,7 +3252,7 @@ impl Agent for OrcaAcpAgent {
             .next_cursor(page.next_offset.map(|offset| offset.to_string())))
     }
 
-    async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
+    pub async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         if let Some(bridge) = self.client_bridge.as_ref() {
             bridge.cancel_session(&args.session_id);
             bridge.wait_for_capability_writes(&args.session_id).await;
