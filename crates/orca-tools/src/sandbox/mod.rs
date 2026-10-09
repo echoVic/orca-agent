@@ -154,6 +154,33 @@ pub fn read_only_bash_command(context: ReadOnlySandboxCommandContext<'_>) -> Com
     command
 }
 
+/// Why a host whose sandbox backend enforces still refuses commands under a
+/// policy, in the launch's own words, and what would let them run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxPolicyRefusal {
+    pub detail: String,
+    pub remediation: String,
+}
+
+/// Why commands under this workspace-write policy would be refused on a host
+/// whose sandbox `decision` describes, or `None` when they would run. A
+/// decision that enforces nothing is not a policy refusal: it refuses every
+/// policy and is reported as such.
+pub fn workspace_write_policy_refusal(
+    context: &WorkspaceWriteSandboxCommandContext<'_>,
+    decision: &SandboxEnforcementDecision,
+) -> Option<SandboxPolicyRefusal> {
+    platform::workspace_write_policy_refusal(context, decision)
+}
+
+/// [`workspace_write_policy_refusal`] for a read-only policy.
+pub fn read_only_policy_refusal(
+    context: &ReadOnlySandboxCommandContext<'_>,
+    decision: &SandboxEnforcementDecision,
+) -> Option<SandboxPolicyRefusal> {
+    platform::read_only_policy_refusal(context, decision)
+}
+
 pub fn platform_default_read_roots() -> Vec<PathBuf> {
     platform::platform_default_read_roots()
 }
@@ -520,6 +547,21 @@ mod platform {
         crate::sandbox::seatbelt::read_only_bash_command(context)
     }
 
+    // Seatbelt expresses every policy these builders produce.
+    pub fn workspace_write_policy_refusal(
+        _context: &WorkspaceWriteSandboxCommandContext<'_>,
+        _decision: &SandboxEnforcementDecision,
+    ) -> Option<SandboxPolicyRefusal> {
+        None
+    }
+
+    pub fn read_only_policy_refusal(
+        _context: &ReadOnlySandboxCommandContext<'_>,
+        _decision: &SandboxEnforcementDecision,
+    ) -> Option<SandboxPolicyRefusal> {
+        None
+    }
+
     pub fn plain_bash_command(command: &str, cwd: &Path) -> Command {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command).current_dir(cwd);
@@ -594,8 +636,25 @@ mod platform {
     pub fn workspace_write_bash_command(
         context: WorkspaceWriteSandboxCommandContext<'_>,
     ) -> Command {
+        crate::sandbox::linux::sandbox_command(workspace_write_request(&context))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn workspace_write_policy_refusal(
+        context: &WorkspaceWriteSandboxCommandContext<'_>,
+        decision: &SandboxEnforcementDecision,
+    ) -> Option<SandboxPolicyRefusal> {
+        crate::sandbox::linux::policy_refusal(decision, &workspace_write_request(context))
+    }
+
+    /// The policy a workspace-write command runs under: what the launch
+    /// enforces and what the readiness checks evaluate.
+    #[cfg(target_os = "linux")]
+    fn workspace_write_request(
+        context: &WorkspaceWriteSandboxCommandContext<'_>,
+    ) -> crate::sandbox::linux::LinuxSandboxRequest {
         use crate::sandbox::bwrap::{LinuxReadScope, LinuxSandboxPolicy};
-        use crate::sandbox::linux::{LinuxSandboxRequest, sandbox_command};
+        use crate::sandbox::linux::LinuxSandboxRequest;
 
         let cwd = context
             .cwd
@@ -666,7 +725,7 @@ mod platform {
             }
         }
 
-        let request = LinuxSandboxRequest {
+        LinuxSandboxRequest {
             command: context.command.to_string(),
             policy: LinuxSandboxPolicy {
                 cwd,
@@ -684,8 +743,7 @@ mod platform {
             // partially enforced Landlock ruleset must never become a host
             // shell, even when the profile allows writes inside the workspace.
             strict: true,
-        };
-        sandbox_command(request)
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -764,8 +822,24 @@ mod platform {
 
     #[cfg(target_os = "linux")]
     pub fn read_only_bash_command(context: ReadOnlySandboxCommandContext<'_>) -> Command {
+        crate::sandbox::linux::sandbox_command(read_only_request(&context))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn read_only_policy_refusal(
+        context: &ReadOnlySandboxCommandContext<'_>,
+        decision: &SandboxEnforcementDecision,
+    ) -> Option<SandboxPolicyRefusal> {
+        crate::sandbox::linux::policy_refusal(decision, &read_only_request(context))
+    }
+
+    /// The policy a read-only command runs under.
+    #[cfg(target_os = "linux")]
+    fn read_only_request(
+        context: &ReadOnlySandboxCommandContext<'_>,
+    ) -> crate::sandbox::linux::LinuxSandboxRequest {
         use crate::sandbox::bwrap::{LinuxReadScope, LinuxSandboxPolicy};
-        use crate::sandbox::linux::{LinuxSandboxRequest, sandbox_command};
+        use crate::sandbox::linux::LinuxSandboxRequest;
 
         let cwd = context
             .cwd
@@ -815,7 +889,7 @@ mod platform {
             }
         }
 
-        let request = LinuxSandboxRequest {
+        LinuxSandboxRequest {
             command: context.command.to_string(),
             policy: LinuxSandboxPolicy {
                 cwd,
@@ -833,8 +907,25 @@ mod platform {
             // is an intentional capability, but it does not make additional
             // writes or network filtering safe to run best-effort.
             strict: true,
-        };
-        sandbox_command(request)
+        }
+    }
+
+    // Outside Linux these builders return an error command for every
+    // non-dangerous policy; that is reported with the backend decision.
+    #[cfg(not(target_os = "linux"))]
+    pub fn workspace_write_policy_refusal(
+        _context: &WorkspaceWriteSandboxCommandContext<'_>,
+        _decision: &SandboxEnforcementDecision,
+    ) -> Option<SandboxPolicyRefusal> {
+        None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn read_only_policy_refusal(
+        _context: &ReadOnlySandboxCommandContext<'_>,
+        _decision: &SandboxEnforcementDecision,
+    ) -> Option<SandboxPolicyRefusal> {
+        None
     }
 
     #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
@@ -877,29 +968,33 @@ mod platform {
             let workspace = parent.path().join("workspace");
             std::fs::create_dir_all(workspace.join(".git/hooks")).unwrap();
             std::fs::write(workspace.join(".git/config"), "[core]\n").unwrap();
-            if !crate::sandbox::linux::enforced_available(&workspace) {
-                return;
-            }
             let git_dir = workspace.join(".git").canonicalize().unwrap();
             let read_only = [git_dir.join("config"), git_dir.join("hooks")];
+            let context = WorkspaceWriteSandboxCommandContext {
+                command: "printf ok > .git/probe; printf x >> .git/config; printf y > .git/hooks/pre-commit; true",
+                cwd: &workspace,
+                readable_roots: &[],
+                additional_roots: &[],
+                metadata_writable_roots: std::slice::from_ref(&git_dir),
+                metadata_read_only_paths: &read_only,
+                denied_roots: &[],
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+                allowed_unix_socket_roots: &[],
+            };
+            // Keeping .git/config read-only inside the granted .git needs
+            // bubblewrap; a host with only Landlock refuses the command.
+            let decision = crate::sandbox::enforcement_decision();
+            if decision.state != EnforcementState::Enforced
+                || crate::sandbox::workspace_write_policy_refusal(&context, &decision).is_some()
+            {
+                return;
+            }
 
-            let output = crate::sandbox::workspace_write_bash_command(
-                WorkspaceWriteSandboxCommandContext {
-                    command: "printf ok > .git/probe; printf x >> .git/config; printf y > .git/hooks/pre-commit; true",
-                    cwd: &workspace,
-                    readable_roots: &[],
-                    additional_roots: &[],
-                    metadata_writable_roots: std::slice::from_ref(&git_dir),
-                    metadata_read_only_paths: &read_only,
-                    denied_roots: &[],
-                    network_access: false,
-                    exclude_tmpdir_env_var: false,
-                    exclude_slash_tmp: false,
-                    allowed_unix_socket_roots: &[],
-                },
-            )
-            .output()
-            .unwrap();
+            let output = crate::sandbox::workspace_write_bash_command(context)
+                .output()
+                .unwrap();
 
             assert!(
                 output.status.success(),
