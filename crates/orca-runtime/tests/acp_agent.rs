@@ -28,7 +28,7 @@ use orca_core::config::{
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelSelection;
-use orca_core::provider_types::ProviderResponse;
+use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_config::SubagentConfig;
 use orca_core::thread_identity::TurnId;
 use orca_runtime::acp::OrcaAcpAgent;
@@ -248,8 +248,19 @@ fn test_config(cwd: PathBuf) -> RunConfig {
 // --- Scripted executor that emits events through the EventFactory ---
 
 enum TestBehavior {
-    EmitMessageAndComplete { message: String },
-    Fail { message: String },
+    EmitMessageAndComplete {
+        message: String,
+    },
+    /// Streams the deltas as provider steps, then commits `message` as the
+    /// completed response, the way a streaming provider turn does.
+    StreamAndComplete {
+        reasoning_deltas: Vec<&'static str>,
+        message_deltas: Vec<&'static str>,
+        message: &'static str,
+    },
+    Fail {
+        message: String,
+    },
     WaitForCancel,
 }
 
@@ -325,6 +336,40 @@ impl ThreadOperationExecutor for AcpTestExecutor {
                         .with_optional_observer(request.event_observer());
                     sink.emit(events.assistant_message_delta(&identity, &message))?;
                 }
+                Ok(RunStatus::Success.into())
+            }
+            TestBehavior::StreamAndComplete {
+                reasoning_deltas,
+                message_deltas,
+                message,
+            } => {
+                let turn_request = request.thread_turn_request(generation);
+                let ingress = turn_request
+                    .provider_response_ingress()
+                    .expect("a surface-backed turn exposes its provider response ingress");
+                let mut response = RuntimeModelResponse::new(
+                    ProviderResponse {
+                        steps: Vec::new(),
+                        assistant_content: Some(message.to_string()),
+                        assistant_reasoning: (!reasoning_deltas.is_empty())
+                            .then(|| reasoning_deltas.concat()),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    },
+                    request.turn_id().clone(),
+                );
+                let steps = reasoning_deltas
+                    .into_iter()
+                    .map(|delta| ProviderStep::ReasoningDelta(delta.to_string()))
+                    .chain(
+                        message_deltas
+                            .into_iter()
+                            .map(|delta| ProviderStep::MessageDelta(delta.to_string())),
+                    );
+                for step in steps {
+                    ingress.commit_provider_step(&response.identity, &step)?;
+                }
+                ingress.commit_response(&mut response)?;
                 Ok(RunStatus::Success.into())
             }
             TestBehavior::Fail { message } => Err(io::Error::other(message)),
@@ -637,6 +682,134 @@ fn acp_new_session_and_prompt_produces_message_chunk_notification() {
 
     drop(session_id);
     host.shutdown().expect("shutdown");
+}
+
+/// The assistant text a client receives, in order, tagged by chunk kind.
+fn assistant_text(updates: &[SessionUpdate]) -> Vec<String> {
+    updates
+        .iter()
+        .filter_map(|update| {
+            let (kind, chunk) = match update {
+                SessionUpdate::AgentMessageChunk(chunk) => ("message", chunk),
+                SessionUpdate::AgentThoughtChunk(chunk) => ("thought", chunk),
+                _ => return None,
+            };
+            let ContentBlock::Text(text) = &chunk.content else {
+                panic!("expected a text chunk, got {:?}", chunk.content);
+            };
+            Some(format!("{kind}:{}", text.text))
+        })
+        .collect()
+}
+
+/// Runs one prompt through the agent and returns every update it produced.
+fn prompt_updates(behavior: TestBehavior) -> Vec<SessionUpdate> {
+    let _home = OrcaHomeGuard::new();
+    let base_cwd = tempfile::tempdir().unwrap();
+    let session_cwd = tempfile::tempdir().unwrap();
+    let executor = Arc::new(AcpTestExecutor::new(vec![behavior]));
+    let host = RuntimeHost::start_with_executor(executor).expect("start host");
+    let (note_tx, mut note_rx) = mpsc::channel::<SessionNotification>(256);
+    let agent = OrcaAcpAgent::new(
+        host.surface_handle(),
+        test_config(base_cwd.path().to_path_buf()),
+        note_tx,
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let stop_reason = local.block_on(&rt, async {
+        initialize_agent(&agent).await;
+        let session = agent
+            .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
+            .await
+            .expect("new_session");
+        agent
+            .prompt(PromptRequest::new(
+                session.session_id,
+                vec![ContentBlock::from("Say something".to_string())],
+            ))
+            .await
+            .expect("prompt")
+            .stop_reason
+    });
+    assert_eq!(stop_reason, StopReason::EndTurn);
+
+    let updates = drain_notifications(&mut note_rx);
+    host.shutdown().expect("shutdown");
+    updates
+}
+
+#[test]
+fn acp_unstreamed_message_is_sent_once_when_the_response_completes() {
+    let updates = prompt_updates(TestBehavior::EmitMessageAndComplete {
+        message: "Hello from Orca!".to_string(),
+    });
+
+    assert_eq!(assistant_text(&updates), vec!["message:Hello from Orca!"]);
+}
+
+#[test]
+fn acp_streamed_message_is_not_sent_again_when_the_response_completes() {
+    let updates = prompt_updates(TestBehavior::StreamAndComplete {
+        reasoning_deltas: vec![],
+        message_deltas: vec!["Hel", "lo, ", "world"],
+        message: "Hello, world",
+    });
+
+    assert_eq!(
+        assistant_text(&updates),
+        vec!["message:Hel", "message:lo, ", "message:world"]
+    );
+}
+
+#[test]
+fn acp_streamed_reasoning_is_sent_as_thought_chunks_not_message_text() {
+    let updates = prompt_updates(TestBehavior::StreamAndComplete {
+        reasoning_deltas: vec!["Let me ", "think."],
+        message_deltas: vec!["Done"],
+        message: "Done",
+    });
+
+    assert_eq!(
+        assistant_text(&updates),
+        vec!["thought:Let me ", "thought:think.", "message:Done"]
+    );
+}
+
+#[test]
+fn acp_message_is_sent_when_only_its_reasoning_was_streamed() {
+    let updates = prompt_updates(TestBehavior::StreamAndComplete {
+        reasoning_deltas: vec!["thinking"],
+        message_deltas: vec![],
+        message: "answer",
+    });
+
+    assert_eq!(
+        assistant_text(&updates),
+        vec!["thought:thinking", "message:answer"]
+    );
+}
+
+#[test]
+fn acp_message_is_still_sent_in_full_when_its_stream_is_discarded() {
+    // "Hello" is not a prefix of "Goodbye", so the runtime discards the stream
+    // before completing the response; the client must still get the answer.
+    // ACP cannot take back chunks already sent, so the discarded text stays
+    // ahead of it. (A shared-session observer is told to reload instead.)
+    let updates = prompt_updates(TestBehavior::StreamAndComplete {
+        reasoning_deltas: vec![],
+        message_deltas: vec!["Hel", "lo"],
+        message: "Goodbye",
+    });
+
+    assert_eq!(
+        assistant_text(&updates),
+        vec!["message:Hel", "message:lo", "message:Goodbye"]
+    );
 }
 
 #[test]
