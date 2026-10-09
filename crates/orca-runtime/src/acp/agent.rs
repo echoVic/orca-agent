@@ -39,16 +39,17 @@ use crate::surface::{
     SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceImageDetail,
     SurfaceImageSource, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionId,
     SurfaceInteractionKind, SurfaceInteractionRequest, SurfaceInteractionRoute,
-    SurfaceInteractionView, SurfaceMcpElicitationDecision, SurfaceMcpElicitationRequest,
-    SurfaceOperationId, SurfacePermissionClientDecision, SurfacePermissionProfile,
-    SurfaceRequestId, SurfaceSchema, SurfaceSubscriptionItem, SurfaceToolResultKind,
-    SurfaceUserInputDecision, ToolPatch, TurnRequestBudgetScope, UncommittedMutation,
+    SurfaceInteractionView, SurfaceItemId, SurfaceMcpElicitationDecision,
+    SurfaceMcpElicitationRequest, SurfaceOperationId, SurfacePermissionClientDecision,
+    SurfacePermissionProfile, SurfaceRequestId, SurfaceSchema, SurfaceStreamId,
+    SurfaceSubscriptionItem, SurfaceToolResultKind, SurfaceUserInputDecision, ToolPatch,
+    TurnRequestBudgetScope, UncommittedMutation,
 };
 
 use crate::runtime_surface::{
-    AcpAttachmentCapabilityProfile, AcpStandardCapabilitySet, CapabilityRevision, OperationPatch,
-    RuntimeSurfaceRecordedThreadLoadError, SurfaceItem, SurfacePlanPriority, SurfacePlanStatus,
-    SurfaceToolAction, SurfaceToolViewState,
+    AcpAttachmentCapabilityProfile, AcpStandardCapabilitySet, AssistantChannel, CapabilityRevision,
+    OperationPatch, RuntimeSurfaceRecordedThreadLoadError, SurfaceItem, SurfacePlanPriority,
+    SurfacePlanStatus, SurfaceToolAction, SurfaceToolViewState,
 };
 
 pub(crate) const ACP_NOTIFICATION_CAPACITY: usize = 256;
@@ -1352,6 +1353,7 @@ struct PreparedSurfacePrompt {
     terminal_cleanup_dispatch: Option<crate::runtime_surface::AcpTerminalCleanupDispatchReceiver>,
     client_bridge: Option<Arc<AcpClientBridge>>,
     tool_outputs: HashMap<String, ToolOutputAccumulator>,
+    assistant_streams: HashMap<SurfaceStreamId, StreamedItem>,
     detached: bool,
     _turn_lease: Option<super::shared::TurnLease>,
 }
@@ -1360,6 +1362,11 @@ struct PreparedSurfacePrompt {
 pub(super) struct ToolOutputAccumulator {
     text: String,
     next_offset: u64,
+}
+
+struct StreamedItem {
+    item_id: SurfaceItemId,
+    channel: AssistantChannel,
 }
 
 impl PreparedSurfacePrompt {
@@ -1994,6 +2001,7 @@ fn prepare_surface_prompt(
         terminal_cleanup_dispatch,
         client_bridge,
         tool_outputs: HashMap::new(),
+        assistant_streams: HashMap::new(),
         detached: false,
         _turn_lease: None,
     })
@@ -2709,19 +2717,8 @@ pub(super) fn emit_surface_event(
     event: &SurfaceEvent,
     tool_outputs: &mut HashMap<String, ToolOutputAccumulator>,
 ) {
+    // Assistant text needs per-stream state, so it goes through `emit_assistant_patch`.
     let update = match event {
-        SurfaceEvent::Assistant(AssistantPatch::Delta { text, .. }) => Some(
-            SessionUpdate::AgentMessageChunk(agent_client_protocol::ContentChunk::new(
-                ContentBlock::from(text.as_str().to_string()),
-            )),
-        ),
-        SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted { response }) => {
-            response.message_item.as_ref().map(|item| {
-                SessionUpdate::AgentMessageChunk(agent_client_protocol::ContentChunk::new(
-                    ContentBlock::from(item.text.as_str().to_string()),
-                ))
-            })
-        }
         SurfaceEvent::Tool(ToolPatch::Requested { request }) => Some(SessionUpdate::ToolCall(
             ToolCall::new(
                 ToolCallId::new(request.tool_call_id.as_str().to_string()),
@@ -2794,6 +2791,62 @@ pub(super) fn emit_surface_event(
     }
 }
 
+/// Sends a prompt's assistant text to the client.
+///
+/// A response only completes once every open stream holds exactly the completed
+/// text, so an item that streamed has already been sent in full and is not sent
+/// again. A discarded stream no longer counts, so its completed message still
+/// goes out.
+fn emit_assistant_patch(
+    session_id: &SessionId,
+    note_tx: &AcpNotificationSender,
+    patch: &AssistantPatch,
+    streams: &mut HashMap<SurfaceStreamId, StreamedItem>,
+) {
+    let update = match patch {
+        AssistantPatch::StreamOpened { stream } => {
+            streams.insert(
+                stream.stream_id.clone(),
+                StreamedItem {
+                    item_id: stream.item_id.clone(),
+                    channel: stream.channel,
+                },
+            );
+            None
+        }
+        AssistantPatch::Delta {
+            stream_id, text, ..
+        } => {
+            let channel = streams
+                .get(stream_id)
+                .map_or(AssistantChannel::Message, |stream| stream.channel);
+            Some(assistant_chunk(channel, text.as_str()))
+        }
+        AssistantPatch::ResponseCompleted { response } => response
+            .message_item
+            .as_ref()
+            .filter(|item| !streams.values().any(|stream| stream.item_id == item.id))
+            .map(|item| assistant_chunk(AssistantChannel::Message, item.text.as_str())),
+        AssistantPatch::StreamDiscarded { stream_id, .. } => {
+            streams.remove(stream_id);
+            None
+        }
+    };
+    if let Some(update) = update {
+        let _ = note_tx.send(SessionNotification::new(session_id.clone(), update));
+    }
+}
+
+fn assistant_chunk(channel: AssistantChannel, text: &str) -> SessionUpdate {
+    let chunk = agent_client_protocol::ContentChunk::new(ContentBlock::from(text.to_string()));
+    match channel {
+        AssistantChannel::Reasoning => SessionUpdate::AgentThoughtChunk(chunk),
+        AssistantChannel::Message | AssistantChannel::Plan => {
+            SessionUpdate::AgentMessageChunk(chunk)
+        }
+    }
+}
+
 /// Frozen intent: answer only interactions selected for this ACP attachment,
 /// then submit the typed answer through the broker's interaction-id selector;
 /// any bridge, decode, or commit failure cancels the owning operation closed.
@@ -2859,6 +2912,10 @@ fn project_surface_event(
                 return Err(format!("ACP interaction response failed: {error:?}"));
             }
         }
+    }
+    if let SurfaceEvent::Assistant(patch) = event {
+        emit_assistant_patch(session_id, note_tx, patch, &mut prepared.assistant_streams);
+        return Ok(());
     }
     emit_surface_event(session_id, note_tx, event, &mut prepared.tool_outputs);
     Ok(())
