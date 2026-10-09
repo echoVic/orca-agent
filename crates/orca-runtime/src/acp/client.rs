@@ -11,9 +11,11 @@ use agent_client_protocol::{
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModelRequest, SetSessionModelResponse, StopReason,
+    SetSessionConfigOptionResponse, StopReason,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+
+use super::legacy_model::{SetSessionModelRequest, SetSessionModelResponse};
 
 /// What an attach client does with the daemon's requests and notifications.
 #[async_trait::async_trait(?Send)]
@@ -88,7 +90,19 @@ impl AgentHandle {
         &self,
         request: SetSessionModelRequest,
     ) -> agent_client_protocol::Result<SetSessionModelResponse> {
-        self.connection.set_session_model(request).await
+        // SDK 0.10 carries its own copy of the unstable type.
+        self.connection
+            .set_session_model(
+                agent_client_protocol::SetSessionModelRequest::new(
+                    request.session_id,
+                    request.model_id.0.to_string(),
+                )
+                .meta(request.meta),
+            )
+            .await
+            .map(|response| SetSessionModelResponse {
+                meta: response.meta,
+            })
     }
 
     pub async fn set_session_config_option(

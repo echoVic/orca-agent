@@ -3,10 +3,11 @@
 use std::collections::BTreeSet;
 
 use agent_client_protocol::{
-    Error, ModelInfo, SessionConfigOption, SessionConfigSelectOption, SessionMode,
-    SessionModeState, SessionModelState,
+    Error, SessionConfigOption, SessionConfigSelectOption, SessionMode, SessionModeState,
 };
 use orca_core::approval_types::ApprovalMode;
+
+use super::legacy_model::{ModelInfo, SessionModelState};
 
 use crate::surface::{
     AttachResult, DetachRequest, FreshAttachRequest, MutationReply, NonEmptyVec,

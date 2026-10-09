@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 
+use super::legacy_model::{SetSessionModelRequest, SetSessionModelResponse, WithModels};
 use crate::surface::{
     AcpRequestId, AssistantPatch, AttachResult, CanonicalMime, CanonicalPath, CanonicalUri,
     DisplayText, FailureClass, FreshAttachRequest, MutationReply, NonEmptyText, NonEmptyVec,
@@ -3000,6 +3001,15 @@ impl OrcaAcpAgent {
     }
 
     pub async fn new_session(&self, args: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+        Ok(self.new_session_with_models(args).await?.response)
+    }
+
+    /// `session/new` as it goes on the wire: a daemon session also reports the
+    /// legacy `models`.
+    pub(super) async fn new_session_with_models(
+        &self,
+        args: NewSessionRequest,
+    ) -> Result<WithModels<NewSessionResponse>, Error> {
         self.negotiated_client_capabilities()?;
         let config = self
             .build_session_config(args.cwd, args.mcp_servers, args.additional_directories)
@@ -3009,17 +3019,19 @@ impl OrcaAcpAgent {
             let id = self.open_shared_session(config, None).await?;
             let settings = self.session_settings(&id, None).await?;
             let startup_warnings = settings_startup_warnings(&readiness_config, &settings);
-            return Ok(NewSessionResponse::new(id)
-                .models(super::settings::models(&settings))
-                .modes(super::settings::modes(
-                    &settings,
-                    self.base_config.approval_mode,
-                ))
-                .config_options(super::settings::options(
-                    &settings,
-                    self.base_config.approval_mode,
-                ))
-                .meta(startup_warnings_meta(&startup_warnings)));
+            return Ok(WithModels {
+                response: NewSessionResponse::new(id)
+                    .modes(super::settings::modes(
+                        &settings,
+                        self.base_config.approval_mode,
+                    ))
+                    .config_options(super::settings::options(
+                        &settings,
+                        self.base_config.approval_mode,
+                    ))
+                    .meta(startup_warnings_meta(&startup_warnings)),
+                models: Some(super::settings::models(&settings)),
+            });
         }
         let surface_host = self.surface_host.clone();
         let thread =
@@ -3049,13 +3061,26 @@ impl OrcaAcpAgent {
         );
         let settings = self.session_settings(&session_id, None).await?;
         let startup_warnings = settings_startup_warnings(&readiness_config, &settings);
-        Ok(NewSessionResponse::new(session_id).meta(startup_warnings_meta(&startup_warnings)))
+        Ok(WithModels {
+            response: NewSessionResponse::new(session_id)
+                .meta(startup_warnings_meta(&startup_warnings)),
+            models: None,
+        })
     }
 
     pub async fn load_session(
         &self,
         args: LoadSessionRequest,
     ) -> Result<LoadSessionResponse, Error> {
+        Ok(self.load_session_with_models(args).await?.response)
+    }
+
+    /// `session/load` as it goes on the wire: a daemon session also reports
+    /// the legacy `models`.
+    pub(super) async fn load_session_with_models(
+        &self,
+        args: LoadSessionRequest,
+    ) -> Result<WithModels<LoadSessionResponse>, Error> {
         self.negotiated_client_capabilities()?;
         if self.state.borrow().sessions.contains_key(&args.session_id) {
             return Err(Error::invalid_params().data("ACP session is already loaded"));
@@ -3069,17 +3094,19 @@ impl OrcaAcpAgent {
             let id = self.open_shared_session(config, Some(selector)).await?;
             let settings = self.session_settings(&id, None).await?;
             let startup_warnings = settings_startup_warnings(&readiness_config, &settings);
-            return Ok(LoadSessionResponse::new()
-                .models(super::settings::models(&settings))
-                .modes(super::settings::modes(
-                    &settings,
-                    self.base_config.approval_mode,
-                ))
-                .config_options(super::settings::options(
-                    &settings,
-                    self.base_config.approval_mode,
-                ))
-                .meta(startup_warnings_meta(&startup_warnings)));
+            return Ok(WithModels {
+                response: LoadSessionResponse::new()
+                    .modes(super::settings::modes(
+                        &settings,
+                        self.base_config.approval_mode,
+                    ))
+                    .config_options(super::settings::options(
+                        &settings,
+                        self.base_config.approval_mode,
+                    ))
+                    .meta(startup_warnings_meta(&startup_warnings)),
+                models: Some(super::settings::models(&settings)),
+            });
         }
         let surface_host = self.surface_host.clone();
         let thread = tokio::task::spawn_blocking(move || {
@@ -3121,7 +3148,10 @@ impl OrcaAcpAgent {
         );
         let settings = self.session_settings(&args.session_id, None).await?;
         let startup_warnings = settings_startup_warnings(&readiness_config, &settings);
-        Ok(LoadSessionResponse::new().meta(startup_warnings_meta(&startup_warnings)))
+        Ok(WithModels {
+            response: LoadSessionResponse::new().meta(startup_warnings_meta(&startup_warnings)),
+            models: None,
+        })
     }
 
     pub async fn prompt(&self, args: PromptRequest) -> Result<PromptResponse, Error> {
@@ -3131,8 +3161,8 @@ impl OrcaAcpAgent {
 
     pub async fn set_session_model(
         &self,
-        args: agent_client_protocol::SetSessionModelRequest,
-    ) -> Result<agent_client_protocol::SetSessionModelResponse, Error> {
+        args: SetSessionModelRequest,
+    ) -> Result<SetSessionModelResponse, Error> {
         let model = args.model_id.to_string();
         orca_core::model::validate_model(&model)
             .map_err(|message| Error::invalid_params().data(message))?;
@@ -3144,7 +3174,7 @@ impl OrcaAcpAgent {
             }),
         )
         .await?;
-        Ok(agent_client_protocol::SetSessionModelResponse::new())
+        Ok(SetSessionModelResponse::default())
     }
 
     pub async fn set_session_mode(

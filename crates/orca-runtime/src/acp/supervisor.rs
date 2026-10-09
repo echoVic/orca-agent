@@ -511,7 +511,7 @@ fn handle_inbound(
             "session/new" => {
                 let result = decode_request::<NewSessionRequest>(params);
                 let result = match result {
-                    Ok(args) => agent.new_session(args).await,
+                    Ok(args) => agent.new_session_with_models(args).await,
                     Err(error) => Err(error),
                 };
                 Ok(response_completion(facade, request_id, result))
@@ -519,7 +519,7 @@ fn handle_inbound(
             "session/load" => {
                 let result = decode_request::<LoadSessionRequest>(params);
                 let result = match result {
-                    Ok(args) => agent.load_session(args).await,
+                    Ok(args) => agent.load_session_with_models(args).await,
                     Err(error) => Err(error),
                 };
                 Ok(response_completion(facade, request_id, result))
@@ -534,7 +534,7 @@ fn handle_inbound(
                 Ok(response_completion(facade, request_id, result))
             }
             "session/set_model" => {
-                let result = match decode::<agent_client_protocol::SetSessionModelRequest>(params) {
+                let result = match decode::<super::legacy_model::SetSessionModelRequest>(params) {
                     Ok(args) => agent.set_session_model(args).await,
                     Err(error) => {
                         Err(agent_client_protocol::Error::invalid_params().data(error.to_string()))

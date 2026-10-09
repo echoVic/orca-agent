@@ -6,6 +6,7 @@
 mod agent;
 pub mod client;
 pub mod daemon;
+pub mod legacy_model;
 mod observer;
 #[allow(dead_code)]
 pub(crate) mod rpc_facade;

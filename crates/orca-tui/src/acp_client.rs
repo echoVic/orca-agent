@@ -15,8 +15,8 @@ use agent_client_protocol::{
     PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
     SessionConfigKind, SessionConfigOption, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModelRequest, StopReason, ToolCallContent,
-    ToolCallStatus, ToolCallUpdateFields,
+    SetSessionConfigOptionRequest, StopReason, ToolCallContent, ToolCallStatus,
+    ToolCallUpdateFields,
 };
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
@@ -28,6 +28,7 @@ use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_runtime::acp::{
     PROJECTION_META,
     client::{AgentHandle, ClientHandler, Connection, readiness_warnings},
+    legacy_model::SetSessionModelRequest,
 };
 use orca_runtime::mentions::MentionBindings;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
