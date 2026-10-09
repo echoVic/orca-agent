@@ -16676,6 +16676,18 @@ impl ThreadActor {
         });
     }
 
+    /// An interrupt pauses the queue as a new revision even when it is paused
+    /// already, so that a start sent before the interrupt is stale. The TUI
+    /// restarts a paused queue with the user's next message, and that start
+    /// lands once the message's turn has ended: it would undo the pause of an
+    /// interrupt during that very turn, and finished agents would then wake
+    /// the thread the user had just stopped.
+    fn pause_prompt_queue_for_interrupt(&mut self) {
+        let _ = self.apply_prompt_queue_action(crate::prompt_queue::PromptQueueAction::Pause {
+            expected_revision: self.prompt_queue.snapshot().revision,
+        });
+    }
+
     /// Steer input the finished operation accepted but never showed the
     /// model, because its turn failed or was stopped first. (A turn that ends
     /// on its own refuses input it can no longer answer.) It goes to the
@@ -19795,7 +19807,7 @@ impl ThreadActor {
                     if is_background {
                         self.cancel_surface_idle(&client, request_id, operation_id)
                     } else {
-                        self.pause_prompt_queue_for_boundary();
+                        self.pause_prompt_queue_for_interrupt();
                         self.cancel_surface_running(active, &client, request_id, operation_id)
                     }
                 } else {
@@ -20791,14 +20803,14 @@ impl ThreadActor {
                 let result = if active.generation.cancel.is_cancelled() {
                     InterruptOperationResult::AlreadyRequested { generation }
                 } else {
-                    self.pause_prompt_queue_for_boundary();
+                    self.pause_prompt_queue_for_interrupt();
                     Self::cancel_active_task_tree(active);
                     InterruptOperationResult::Requested { generation }
                 };
                 let _ = reply.send(Ok(result));
             }
             ThreadCommand::InterruptActive { reply } => {
-                self.pause_prompt_queue_for_boundary();
+                self.pause_prompt_queue_for_interrupt();
                 Self::cancel_active_task_tree(active);
                 let _ = reply.send(Ok(()));
             }
@@ -40583,6 +40595,55 @@ mod tests {
         assert_eq!(unchanged.items.len(), 1);
         assert_eq!(unchanged.items[0].id, paused.items[0].id);
         host.shutdown().expect("shutdown queue pause host");
+    }
+
+    #[test]
+    fn a_queue_start_sent_before_an_interrupt_leaves_the_queue_paused() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start stale queue start host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "stale queue start",
+            )
+            .expect("start stale queue start thread");
+        // An earlier interrupt left the queue paused.
+        let paused = thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Pause {
+                expected_revision: crate::prompt_queue::QueueRevision::ZERO,
+            })
+            .expect("pause the queue");
+        // The TUI restarts the queue with the user's next message, but the
+        // restart lands once that message's turn has ended: here, after the
+        // user interrupted that turn as well.
+        let active = thread
+            .start_turn(
+                HostedTurnRequest::new("mock_stream_delay_ms 30000"),
+                io::sink(),
+            )
+            .expect("start interruptible turn");
+        active.interrupt().expect("interrupt active turn");
+        active.wait();
+
+        let late_start = thread.prompt_queue(crate::prompt_queue::PromptQueueAction::Start {
+            expected_revision: paused.revision,
+        });
+
+        assert!(
+            matches!(
+                &late_start,
+                Err(crate::prompt_queue::PromptQueueMutationError::RevisionConflict { current })
+                    if current.paused
+            ),
+            "{late_start:?}"
+        );
+        assert!(
+            thread
+                .prompt_queue(crate::prompt_queue::PromptQueueAction::List)
+                .expect("read queue after the late start")
+                .paused
+        );
+        host.shutdown().expect("shutdown stale queue start host");
     }
 
     #[test]
