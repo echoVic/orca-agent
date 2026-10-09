@@ -13,11 +13,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use agent_client_protocol::{
-    Agent, AgentSideConnection, AudioContent, CancelNotification, Client, ClientCapabilities,
-    ClientSideConnection, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
-    FileSystemCapabilities, Implementation, InitializeRequest, LoadSessionRequest,
-    NewSessionRequest, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SessionId,
+    Agent, AudioContent, CancelNotification, ClientCapabilities, ContentBlock, EmbeddedResource,
+    EmbeddedResourceResource, FileSystemCapabilities, InitializeRequest, LoadSessionRequest,
+    NewSessionRequest, PromptRequest, ProtocolVersion, ResourceLink, SessionId,
     SessionNotification, SessionUpdate, StopReason, TextResourceContents,
 };
 use orca_core::cancel::CancelToken;
@@ -40,134 +38,9 @@ use orca_runtime::runtime_host::{
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 use orca_runtime::thread::RuntimeThread;
 use tokio::sync::mpsc;
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-#[derive(Clone, Default)]
-struct WireTestClient {
-    updates: Arc<Mutex<Vec<SessionNotification>>>,
-}
-
-#[async_trait::async_trait(?Send)]
-impl Client for WireTestClient {
-    async fn request_permission(
-        &self,
-        _args: RequestPermissionRequest,
-    ) -> agent_client_protocol::Result<RequestPermissionResponse> {
-        Ok(RequestPermissionResponse::new(
-            RequestPermissionOutcome::Cancelled,
-        ))
-    }
-
-    async fn session_notification(
-        &self,
-        args: SessionNotification,
-    ) -> agent_client_protocol::Result<()> {
-        self.updates.lock().unwrap().push(args);
-        Ok(())
-    }
-}
-
-fn wire_connection_pair(
-    agent: OrcaAcpAgent,
-    client: WireTestClient,
-) -> (ClientSideConnection, AgentSideConnection, WireTestClient) {
-    let (client_stream, agent_stream) = tokio::io::duplex(64 * 1024);
-    let (client_read, client_write) = tokio::io::split(client_stream);
-    let (agent_read, agent_write) = tokio::io::split(agent_stream);
-    let (agent_connection, agent_io) = AgentSideConnection::new(
-        agent,
-        agent_write.compat_write(),
-        agent_read.compat(),
-        |future| {
-            tokio::task::spawn_local(future);
-        },
-    );
-    let (client_connection, client_io) = ClientSideConnection::new(
-        client.clone(),
-        client_write.compat_write(),
-        client_read.compat(),
-        |future| {
-            tokio::task::spawn_local(future);
-        },
-    );
-    tokio::task::spawn_local(agent_io);
-    tokio::task::spawn_local(client_io);
-    (client_connection, agent_connection, client)
-}
-
-#[test]
-fn acp_wire_round_trip_projects_typed_prompt_updates() {
-    let _home = OrcaHomeGuard::new();
-    let base_cwd = tempfile::tempdir().unwrap();
-    let session_cwd = tempfile::tempdir().unwrap();
-    let executor = Arc::new(AcpTestExecutor::new(vec![
-        TestBehavior::EmitMessageAndComplete {
-            message: "wire hello".to_string(),
-        },
-    ]));
-    let host = RuntimeHost::start_with_executor(executor).expect("start host");
-    let (note_tx, mut note_rx) = mpsc::channel::<SessionNotification>(256);
-    let agent = OrcaAcpAgent::new(
-        host.surface_handle(),
-        test_config(base_cwd.path().to_path_buf()),
-        note_tx,
-    );
-    let client = WireTestClient::default();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async {
-        let (client_connection, agent_connection, client_state) =
-            wire_connection_pair(agent, client);
-        tokio::task::spawn_local(async move {
-            while let Some(notification) = note_rx.recv().await {
-                if agent_connection
-                    .session_notification(notification)
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        client_connection
-            .initialize(
-                InitializeRequest::new(ProtocolVersion::V1)
-                    .client_info(Implementation::new("wire-test", "0.0.0")),
-            )
-            .await
-            .expect("wire initialize");
-        let session = client_connection
-            .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
-            .await
-            .expect("wire new session");
-        let response = client_connection
-            .prompt(PromptRequest::new(
-                session.session_id,
-                vec![ContentBlock::from("wire prompt".to_string())],
-            ))
-            .await
-            .expect("wire prompt");
-        assert_eq!(response.stop_reason, StopReason::EndTurn);
-        for _ in 0..50 {
-            if !client_state.updates.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        let updates = client_state.updates.lock().unwrap();
-        assert!(updates.iter().any(|notification| {
-            matches!(&notification.update, SessionUpdate::AgentMessageChunk(chunk)
-                if matches!(&chunk.content, ContentBlock::Text(text) if text.text.contains("wire hello")))
-        }), "wire updates: {updates:?}");
-    });
-    host.shutdown().expect("shutdown host");
-}
 
 struct OrcaHomeGuard {
     previous: Option<OsString>,

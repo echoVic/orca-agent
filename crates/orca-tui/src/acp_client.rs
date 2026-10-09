@@ -11,12 +11,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use agent_client_protocol::{
-    Agent, CancelNotification, Client, ClientCapabilities, ContentBlock, ImageContent,
-    PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModelRequest,
-    StopReason, ToolCallContent, ToolCallStatus, ToolCallUpdateFields,
+    CancelNotification, ClientCapabilities, ContentBlock, ImageContent, PermissionOption,
+    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigKind, SessionConfigOption, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModelRequest, StopReason, ToolCallContent,
+    ToolCallStatus, ToolCallUpdateFields,
 };
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
@@ -27,7 +27,7 @@ use orca_core::conversation::{ImageDetail, ImageInput, ImageSource};
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_runtime::acp::{
     PROJECTION_META,
-    client::{Connection, readiness_warnings},
+    client::{AgentHandle, ClientHandler, Connection, readiness_warnings},
 };
 use orca_runtime::mentions::MentionBindings;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
@@ -524,7 +524,7 @@ fn permission_outcome(
 }
 
 #[async_trait::async_trait(?Send)]
-impl Client for TuiClient {
+impl ClientHandler for TuiClient {
     async fn request_permission(
         &self,
         args: RequestPermissionRequest,
@@ -1070,7 +1070,7 @@ fn retry_delay(attempts: &mut u32) -> Option<Duration> {
 }
 
 async fn control_request(
-    agent: &impl Agent,
+    agent: &AgentHandle,
     session: SessionId,
     action: UserAction,
 ) -> Result<(), String> {
@@ -1260,7 +1260,7 @@ pub(crate) fn run(
                             let agent = connection.agent.clone();
                             let session = id.clone();
                             control = Some(tokio::task::spawn_local(async move {
-                                control_request(agent.as_ref(), session, action).await
+                                control_request(&agent, session, action).await
                             }));
                         }
                         UserAction::PasteImages { request_id, request } => {
@@ -2583,9 +2583,9 @@ mod tests {
             let intent = crate::slash_command_actions::encode_settings_intent(
                 Some("deepseek-v4-pro"), Some(ReasoningEffort::High), None,
             );
-            control_request(connection.agent.as_ref(), SessionId::new(SESSION),
+            control_request(&connection.agent, SessionId::new(SESSION),
                 UserAction::SetModel(intent)).await.unwrap();
-            let error = control_request(connection.agent.as_ref(), SessionId::new(SESSION),
+            let error = control_request(&connection.agent, SessionId::new(SESSION),
                 UserAction::SetModel(orca_core::model::LEGACY_FLASH_MODEL.into())).await.unwrap_err();
             assert!(error.contains("settings lease denied"));
             let mut renderer = Renderer::new();
@@ -2595,7 +2595,7 @@ mod tests {
             assert_eq!(renderer.state.status, crate::types::AppStatus::Idle);
             assert_eq!(renderer.state.model_name, "mock", "denial must not publish optimistic settings");
             let mode = crate::slash_command_actions::encode_settings_intent(None, None, Some(ApprovalMode::Plan));
-            assert!(control_request(connection.agent.as_ref(), SessionId::new(SESSION),
+            assert!(control_request(&connection.agent, SessionId::new(SESSION),
                 UserAction::SetModel(mode)).await.unwrap_err().contains("not available"));
             peer.await.unwrap();
         }).await;

@@ -3766,6 +3766,98 @@ mod tests {
         });
     }
 
+    /// Collects the attach client's agent message text.
+    #[derive(Default)]
+    struct AttachTexts(RefCell<Vec<String>>);
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::acp::client::ClientHandler for AttachTexts {
+        async fn request_permission(
+            &self,
+            _request: RequestPermissionRequest,
+        ) -> agent_client_protocol::Result<RequestPermissionResponse> {
+            Ok(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Cancelled,
+            ))
+        }
+
+        async fn session_notification(
+            &self,
+            notification: agent_client_protocol::SessionNotification,
+        ) -> agent_client_protocol::Result<()> {
+            if let agent_client_protocol::SessionUpdate::AgentMessageChunk(chunk) =
+                notification.update
+                && let ContentBlock::Text(text) = chunk.content
+            {
+                self.0.borrow_mut().push(text.text);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_attach_client_round_trips_a_prompt_with_the_daemon_connection() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&runtime, async {
+            let host =
+                RuntimeHost::start_with_executor(Arc::new(CompleteWithMessageExecutor)).unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (client_read, client_write) = tokio::io::split(client);
+            let (server_read, server_write) = tokio::io::split(server);
+            let daemon = tokio::task::spawn_local(run_connection(
+                host.surface_handle(),
+                test_config(cwd.path().to_path_buf()),
+                server_read,
+                server_write,
+            ));
+            let texts = Rc::new(AttachTexts::default());
+            let connection = crate::acp::client::Connection::connect_streams(
+                client_read,
+                client_write,
+                texts.clone(),
+                ClientCapabilities::new(),
+            )
+            .await
+            .expect("attach client connects");
+            let session = connection
+                .attach(cwd.path(), "new")
+                .await
+                .expect("session/new");
+            let response = connection
+                .agent
+                .prompt(PromptRequest::new(
+                    session,
+                    vec![ContentBlock::from("complete".to_string())],
+                ))
+                .await
+                .expect("prompt");
+            assert_eq!(
+                response.stop_reason,
+                agent_client_protocol::StopReason::EndTurn
+            );
+            tokio::time::timeout(TEST_TIMEOUT, async {
+                while texts.0.borrow().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the update reaches the client");
+            assert_eq!(*texts.0.borrow(), ["typed update"]);
+            drop(connection);
+            tokio::time::timeout(TEST_TIMEOUT, daemon)
+                .await
+                .expect("connection shutdown")
+                .expect("connection task")
+                .expect("clean connection");
+            host.shutdown().unwrap();
+        });
+    }
+
     #[test]
     fn production_connection_routes_standard_interactions_and_fails_unnegotiated_extensions_closed()
     {
