@@ -1282,6 +1282,7 @@ fn cold_owner_takeover_reconciles_crashed_workflow_task_and_operation() {
     unsafe { std::env::set_var("ORCA_HOME", home.path()) };
     let transcript =
         orca_runtime::history::load_session(&session_id).expect("crashed workflow session");
+    wait_for_crashed_owner_lease(&transcript.path);
     let mut config = test_config(cwd.path().to_path_buf());
     config.approval_mode = ApprovalMode::FullAuto;
     config.history_mode = HistoryMode::Resume(session_id);
@@ -1398,6 +1399,7 @@ fn cold_owner_takeover_settles_workflow_when_task_exists_but_run_state_is_missin
     unsafe { std::env::set_var("ORCA_HOME", home.path()) };
     let transcript =
         orca_runtime::history::load_session(&session_id).expect("crashed workflow session");
+    wait_for_crashed_owner_lease(&transcript.path);
     let mut config = test_config(cwd.path().to_path_buf());
     config.approval_mode = ApprovalMode::FullAuto;
     config.history_mode = HistoryMode::Resume(session_id);
@@ -1471,17 +1473,19 @@ fn cold_owner_takeover_preserves_durable_workflow_success_before_projection() {
     let fixture_output = home
         .path()
         .join("workflow-completed-before-projection.json");
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("typed_workflow_crash_fixture")
-        .arg("--nocapture")
-        .env("ORCA_WORKFLOW_CRASH_FIXTURE", "1")
-        .env("ORCA_WORKFLOW_HOLD_FIXTURE", "1")
-        .env("ORCA_WORKFLOW_CRASH_HOME", home.path())
-        .env("ORCA_WORKFLOW_CRASH_CWD", cwd.path())
-        .env("ORCA_WORKFLOW_CRASH_OUTPUT", &fixture_output)
-        .spawn()
-        .expect("spawn held workflow fixture");
+    let mut fixture = HeldFixture(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("typed_workflow_crash_fixture")
+            .arg("--nocapture")
+            .env("ORCA_WORKFLOW_CRASH_FIXTURE", "1")
+            .env("ORCA_WORKFLOW_HOLD_FIXTURE", "1")
+            .env("ORCA_WORKFLOW_CRASH_HOME", home.path())
+            .env("ORCA_WORKFLOW_CRASH_CWD", cwd.path())
+            .env("ORCA_WORKFLOW_CRASH_OUTPUT", &fixture_output)
+            .spawn()
+            .expect("spawn held workflow fixture"),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     while !fixture_output.exists() {
         assert!(
@@ -1528,8 +1532,8 @@ fn cold_owner_takeover_preserves_durable_workflow_success_before_projection() {
     run_state["status"] = serde_json::Value::String("completed".to_string());
     run_state["finalSummary"] = serde_json::Value::String("durable workflow result".to_string());
     run_state["error"] = serde_json::Value::Null;
-    child.kill().expect("crash held workflow fixture");
-    child.wait().expect("reap held workflow fixture");
+    fixture.0.kill().expect("crash held workflow fixture");
+    fixture.0.wait().expect("reap held workflow fixture");
     fs::write(
         &run_state_path,
         serde_json::to_vec_pretty(&run_state).expect("serialize durable workflow outcome"),
@@ -1540,6 +1544,7 @@ fn cold_owner_takeover_preserves_durable_workflow_success_before_projection() {
     unsafe { std::env::set_var("ORCA_HOME", home.path()) };
     let transcript =
         orca_runtime::history::load_session(&session_id).expect("crashed workflow session");
+    wait_for_crashed_owner_lease(&transcript.path);
     let mut config = test_config(cwd.path().to_path_buf());
     config.approval_mode = ApprovalMode::FullAuto;
     config.history_mode = HistoryMode::Resume(session_id);
@@ -1619,17 +1624,19 @@ fn workflow_launch_replay_uses_surface_identity_when_activation_store_is_missing
     )
     .expect("trusted workflow workspace");
     let fixture_output = home.path().join("workflow-launch-surface-identity.json");
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("typed_workflow_crash_fixture")
-        .arg("--nocapture")
-        .env("ORCA_WORKFLOW_CRASH_FIXTURE", "1")
-        .env("ORCA_WORKFLOW_HOLD_FIXTURE", "1")
-        .env("ORCA_WORKFLOW_CRASH_HOME", home.path())
-        .env("ORCA_WORKFLOW_CRASH_CWD", cwd.path())
-        .env("ORCA_WORKFLOW_CRASH_OUTPUT", &fixture_output)
-        .spawn()
-        .expect("spawn held workflow fixture");
+    let mut fixture = HeldFixture(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("typed_workflow_crash_fixture")
+            .arg("--nocapture")
+            .env("ORCA_WORKFLOW_CRASH_FIXTURE", "1")
+            .env("ORCA_WORKFLOW_HOLD_FIXTURE", "1")
+            .env("ORCA_WORKFLOW_CRASH_HOME", home.path())
+            .env("ORCA_WORKFLOW_CRASH_CWD", cwd.path())
+            .env("ORCA_WORKFLOW_CRASH_OUTPUT", &fixture_output)
+            .spawn()
+            .expect("spawn held workflow fixture"),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     while !fixture_output.exists() {
         assert!(
@@ -1672,13 +1679,14 @@ fn workflow_launch_replay_uses_surface_identity_when_activation_store_is_missing
         serde_json::to_vec_pretty(&tasks).expect("serialize activation store gap"),
     )
     .expect("remove activation-only workflow input");
-    child.kill().expect("crash held workflow fixture");
-    child.wait().expect("reap held workflow fixture");
+    fixture.0.kill().expect("crash held workflow fixture");
+    fixture.0.wait().expect("reap held workflow fixture");
 
     let previous_home = std::env::var_os("ORCA_HOME");
     unsafe { std::env::set_var("ORCA_HOME", home.path()) };
     let transcript =
         orca_runtime::history::load_session(&session_id).expect("crashed workflow session");
+    wait_for_crashed_owner_lease(&transcript.path);
     let mut config = test_config(cwd.path().to_path_buf());
     config.approval_mode = ApprovalMode::FullAuto;
     config.history_mode = HistoryMode::Resume(session_id);
@@ -1777,9 +1785,15 @@ fn typed_workflow_crash_fixture() {
         MutationReply::Committed { value, .. } => value,
         _ => panic!("fixture workflow launch must commit"),
     };
-    fs::write(
-        output_path,
-        serde_json::to_vec(&serde_json::json!({
+    #[cfg(unix)]
+    if std::env::var_os("ORCA_WORKFLOW_HOLD_FIXTURE").is_some() {
+        leave_a_child_between_fork_and_exec();
+    }
+    // The test reads the identity as soon as the file exists, so it must
+    // appear whole.
+    orca_platform::fs::atomic_write(
+        &output_path,
+        &serde_json::to_vec(&serde_json::json!({
             "session_id": thread.thread_id(),
             "request_id": uuid::Uuid::from_bytes(*launch_request_id.as_bytes()).to_string(),
             "operation_id": uuid::Uuid::from_bytes(
@@ -1790,6 +1804,7 @@ fn typed_workflow_crash_fixture() {
             "task_id": output.workflow.task_id.as_str(),
         }))
         .expect("serialize fixture identity"),
+        orca_platform::fs::AtomicWritePolicy::NoFollow,
     )
     .expect("write fixture identity");
     if std::env::var_os("ORCA_WORKFLOW_HOLD_FIXTURE").is_some() {
@@ -1798,6 +1813,64 @@ fn typed_workflow_crash_fixture() {
         }
     }
     std::process::exit(0);
+}
+
+/// Kills a held crash fixture however the test ends. Left running after a
+/// failed assertion, it would hold the test's output pipes open and keep
+/// writing into a deleted home.
+struct HeldFixture(std::process::Child);
+
+impl Drop for HeldFixture {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Leave a child of this process between fork and exec, as the owner's own
+/// launch of the workflow host can be at the moment the owner is killed. Until
+/// it execs, that child shares every descriptor of this process, including the
+/// lock behind the surface owner lease (issue #119). Returns once it exists.
+#[cfg(unix)]
+fn leave_a_child_between_fork_and_exec() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let (mut forked, signal) = std::io::pipe().expect("fork signal pipe");
+    let mut child = Command::new("true");
+    // SAFETY: write and sleep are async-signal-safe, and the pipe stays open
+    // in the forked child until it execs.
+    unsafe {
+        child.pre_exec(move || {
+            let _ = libc::write(signal.as_raw_fd(), b"f".as_ptr().cast(), 1);
+            libc::sleep(1);
+            Ok(())
+        });
+    }
+    std::thread::spawn(move || {
+        let _ = child.status();
+    });
+    forked
+        .read_exact(&mut [0; 1])
+        .expect("the child has been forked");
+}
+
+/// Wait until a crashed owner's surface lease is released. The lease is an
+/// exclusive lock on the session's `surface-owner.lock`, and a child the owner
+/// forked shortly before it died holds that lock until the child execs, so the
+/// owner's exit is not yet the release (issue #119). Taking the lock is.
+fn wait_for_crashed_owner_lease(session_path: &std::path::Path) {
+    let lock_path = session_path.with_extension("surface-owner.lock");
+    let (released, release) = mpsc::channel();
+    std::thread::spawn(move || {
+        let lock = orca_platform::fs::ExclusiveFileLock::acquire(&lock_path).map(drop);
+        let _ = released.send(lock);
+    });
+    release
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the crashed owner's surface lease must be released")
+        .expect("lock the released surface lease");
 }
 
 fn test_config(cwd: std::path::PathBuf) -> RunConfig {
