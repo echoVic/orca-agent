@@ -3902,6 +3902,15 @@ impl RuntimeThreadHandle {
         receive_reply(reply_rx, "runtime thread")?
     }
 
+    /// An event producer on the thread's own sequence, as its turns publish
+    /// on: what it publishes goes on with the session's sequence and into
+    /// its history. Only an idle thread has one to share.
+    pub fn fork_events(&self) -> Result<EventFactory, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::ForkEvents { reply: reply_tx })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
     /// Request a read-only display recap. The provider call runs in a worker
     /// owned by the runtime actor and never mutates the surface ledger.
     pub fn request_recap(
@@ -5334,6 +5343,9 @@ enum ThreadCommand {
     },
     ReadSnapshot {
         reply: SyncSender<Result<RuntimeThreadSnapshot, RuntimeHostError>>,
+    },
+    ForkEvents {
+        reply: SyncSender<Result<EventFactory, RuntimeHostError>>,
     },
     RequestRecap {
         request: crate::recap::RecapRequest,
@@ -18567,6 +18579,9 @@ impl ThreadActor {
                 ThreadCommand::ReadState { reply } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
+                ThreadCommand::ForkEvents { reply } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
                 ThreadCommand::ReadSnapshot { reply } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
@@ -19656,6 +19671,14 @@ impl ThreadActor {
                             self.usage_ledger.totals(),
                         )
                     })
+                    .ok_or(RuntimeHostError::ThreadUnavailable);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::ForkEvents { reply } => {
+                let result = self
+                    .state
+                    .as_ref()
+                    .map(|state| state.events.fork())
                     .ok_or(RuntimeHostError::ThreadUnavailable);
                 let _ = reply.send(result);
             }
@@ -20889,6 +20912,11 @@ impl ThreadActor {
                 let _ = reply.send(Ok(RuntimeThreadState::Running { generation, phase }));
             }
             ThreadCommand::ReadSnapshot { reply } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
+            ThreadCommand::ForkEvents { reply } => {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
                     operation_id: active.operation_id,
                 }));

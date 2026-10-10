@@ -1695,21 +1695,38 @@ fn stop_before_the_turn<W: io::Write>(
         checkpoint_id: None,
     };
     let _ = thread.mutate(RuntimeThreadMutation::RecordTerminal(terminal.clone()));
-    let _ = host.shutdown();
+    // On the thread's own sequence, as a turn's events are: a resumed
+    // session's go on from its earlier runs' instead of starting over.
+    let mut events = thread
+        .fork_events()
+        .unwrap_or_else(|_| EventFactory::new(thread.thread_id().to_string()));
     let cwd = match &config.cwd {
         Some(cwd) => cwd.clone(),
         None => std::env::current_dir()?,
     };
-    let mut events = EventFactory::new(thread.thread_id().to_string());
     let mut sink = EventSink::new(&mut writer, config.output_format);
-    sink.emit(events.session_started(
-        &cwd.display().to_string(),
-        config.approval_mode.as_str(),
-        config.provider.as_str(),
-        config.verifier.as_deref(),
-        thread.startup_warnings(),
-    ))?;
-    sink.emit(events.session_completed_terminal(&terminal, thread.session_id()))?;
+    let emitted = sink
+        .emit(events.session_started(
+            &cwd.display().to_string(),
+            config.approval_mode.as_str(),
+            config.provider.as_str(),
+            config.verifier.as_deref(),
+            thread.startup_warnings(),
+        ))
+        .and_then(|()| {
+            sink.emit(events.session_completed_terminal(&terminal, thread.session_id()))
+        });
+    drop(sink);
+    let _ = host.shutdown();
+    emitted?;
+    if config.output_format == OutputFormat::Text
+        && let Some(session_id) = thread.session_id()
+    {
+        writeln!(
+            writer,
+            "To continue this session, run: orca exec resume {session_id}"
+        )?;
+    }
     Ok(exit_code)
 }
 
@@ -2647,6 +2664,121 @@ mod tests {
             transcript.messages
         );
         assert_eq!(transcript.completion_status.as_deref(), Some("cancelled"));
+    }
+
+    /// A resumed run that a signal stops before its turn goes on with its
+    /// session's event sequence, as a resumed turn does: starting it over
+    /// would repeat (run_id, seq) pairs the session's first run published.
+    #[cfg(unix)]
+    #[test]
+    fn a_resumed_run_signalled_before_its_turn_continues_its_event_sequence() {
+        if !in_a_process_of_its_own(
+            "a_resumed_run_signalled_before_its_turn_continues_its_event_sequence",
+        ) {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let interrupted = Arc::new(AtomicI32::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let handler =
+            TerminationSignalHandler::install(Arc::clone(&interrupted), Arc::clone(&finished));
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(workspace.path().to_path_buf());
+        config.output_format = OutputFormat::Jsonl;
+        config.history_mode = HistoryMode::Record;
+        let events = |output: Vec<u8>| {
+            String::from_utf8(output)
+                .expect("utf8 events")
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json event"))
+                .collect::<Vec<_>>()
+        };
+
+        config.prompt = "the first run".to_string();
+        let mut first = Vec::new();
+        assert_eq!(
+            run_headless(config.clone(), &mut first, None, &handler, &interrupted)
+                .expect("the first run"),
+            0
+        );
+        let first = events(first);
+        let session_id = first
+            .last()
+            .and_then(|event| event["payload"]["session_id"].as_str())
+            .expect("the recorded session's id")
+            .to_string();
+        let first_seqs = first
+            .iter()
+            .map(|event| event["seq"].as_u64().expect("seq"))
+            .collect::<Vec<_>>();
+
+        let recorded = raise_sigterm(&interrupted);
+        config.prompt = "a prompt the signal came before".to_string();
+        config.history_mode = HistoryMode::Resume(session_id);
+        let mut stopped = Vec::new();
+        let exit_code = run_headless(config, &mut stopped, None, &handler, &interrupted);
+        finished.store(true, Ordering::SeqCst);
+        drop(handler);
+
+        assert!(
+            recorded,
+            "the handler did not record SIGTERM within a second"
+        );
+        assert_eq!(exit_code.expect("the stopped run"), 143);
+        let stopped = events(stopped);
+        for event in &stopped {
+            let seq = event["seq"].as_u64().expect("seq");
+            assert!(
+                !first_seqs.contains(&seq),
+                "seq {seq} repeats the first run's {first_seqs:?}: {stopped:?}"
+            );
+        }
+    }
+
+    /// Text output tells how to continue a session a signal stopped before its
+    /// turn, as it does for a turn that did not succeed.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_signalled_before_its_turn_says_how_to_continue_its_session() {
+        if !in_a_process_of_its_own(
+            "a_run_signalled_before_its_turn_says_how_to_continue_its_session",
+        ) {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let interrupted = Arc::new(AtomicI32::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let handler =
+            TerminationSignalHandler::install(Arc::clone(&interrupted), Arc::clone(&finished));
+        let recorded = raise_sigterm(&interrupted);
+
+        let mut config = config(SubagentConfig::default());
+        config.prompt = "a prompt the signal came before".to_string();
+        config.cwd = Some(workspace.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let mut output = Vec::new();
+        let exit_code = run_headless(config, &mut output, None, &handler, &interrupted);
+        finished.store(true, Ordering::SeqCst);
+        drop(handler);
+
+        assert!(
+            recorded,
+            "the handler did not record SIGTERM within a second"
+        );
+        assert_eq!(exit_code.expect("the stopped run"), 143);
+        let session_id = crate::history::list_sessions(1)
+            .expect("the session list")
+            .first()
+            .expect("the recorded session")
+            .session_id
+            .clone();
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(
+            output.contains(&format!(
+                "To continue this session, run: orca exec resume {session_id}"
+            )),
+            "{output}"
+        );
     }
 
     #[test]
