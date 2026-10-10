@@ -516,7 +516,21 @@ impl TerminalDriver for QwerttyDriver {
     }
 
     async fn suspend(&mut self) -> io::Result<()> {
-        self.session.suspend().await.map_err(qwertty_error)
+        // qwertty stops the process group with SIGTSTP, which the listener
+        // its signal stream installed catches too: tokio never gives a signal
+        // back its default disposition. The process then never stopped, and
+        // each SIGTSTP it caught asked for another suspend, over and over.
+        // SIGTSTP stops it now, and the listener is back once SIGCONT has
+        // continued it.
+        #[cfg(unix)]
+        let _stops = DefaultSignalDisposition::take(libc::SIGTSTP)?;
+        self.session.suspend().await.map_err(|error| match error {
+            // No job-control shell would continue it.
+            error @ qwertty::Error::DegenerateProcessGroup { .. } => {
+                io::Error::new(io::ErrorKind::Unsupported, error)
+            }
+            error => qwertty_error(error),
+        })
     }
 
     async fn resume(&mut self) -> io::Result<()> {
@@ -578,6 +592,38 @@ fn terminal_hung_up(error: &io::Error) -> bool {
 #[cfg(not(unix))]
 fn terminal_hung_up(_error: &io::Error) -> bool {
     false
+}
+
+/// Gives a signal its default disposition until dropped, then puts back the
+/// one it had.
+#[cfg(unix)]
+struct DefaultSignalDisposition {
+    signal: libc::c_int,
+    previous: libc::sigaction,
+}
+
+#[cfg(unix)]
+impl DefaultSignalDisposition {
+    fn take(signal: libc::c_int) -> io::Result<Self> {
+        // SAFETY: an all-zero sigaction is a valid one with no flags and an
+        // empty mask; SIG_DFL needs no handler.
+        let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
+        default.sa_sigaction = libc::SIG_DFL;
+        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: both point to sigaction values this function owns.
+        if unsafe { libc::sigaction(signal, &default, &mut previous) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { signal, previous })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DefaultSignalDisposition {
+    fn drop(&mut self) {
+        // SAFETY: `previous` is what sigaction gave back for this signal.
+        unsafe { libc::sigaction(self.signal, &self.previous, std::ptr::null_mut()) };
+    }
 }
 
 fn qwertty_error(error: qwertty::Error) -> io::Error {
@@ -729,11 +775,30 @@ async fn drive_terminal<D: TerminalDriver>(
                                 }
                             }
                         }
-                        if let Err(error) = driver.suspend().await {
-                            wait_for_main_teardown = true;
-                            break Err(error);
+                        match driver.suspend().await {
+                            Ok(()) => suspended = true,
+                            // Nothing to stop under, as for a session leader
+                            // with no job-control shell: the TUI comes back.
+                            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                                if let Err(error) = driver.resume().await {
+                                    wait_for_main_teardown = true;
+                                    break Err(error);
+                                }
+                                if !send_control_until_stopped(
+                                    control_tx.as_ref().expect("control sender is live"),
+                                    InputControl::Resumed,
+                                    &mut stop_rx,
+                                )
+                                .await
+                                {
+                                    break Ok(());
+                                }
+                            }
+                            Err(error) => {
+                                wait_for_main_teardown = true;
+                                break Err(error);
+                            }
                         }
-                        suspended = true;
                     }
                     TerminalActivity::Continue if suspended => {
                         if let Err(error) = driver.resume().await {
@@ -892,6 +957,9 @@ mod tests {
         /// Once its activities are read, its input ends, and leaving it
         /// fails with EIO, as a terminal's does once its other end closed.
         hung_up: bool,
+        /// Its suspend is refused, as a session leader's is: no job-control
+        /// shell would continue it.
+        refuses_suspend: bool,
     }
 
     impl FakeDriver {
@@ -906,6 +974,7 @@ mod tests {
                 activities: events.into_iter().map(TerminalActivity::Event).collect(),
                 fail_at: None,
                 hung_up: false,
+                refuses_suspend: false,
             }
         }
 
@@ -919,7 +988,13 @@ mod tests {
                 activities: activities.into_iter().collect(),
                 fail_at: None,
                 hung_up: false,
+                refuses_suspend: false,
             }
+        }
+
+        fn refusing_suspend(mut self) -> Self {
+            self.refuses_suspend = true;
+            self
         }
 
         fn failing(mut self, operation: &'static str) -> Self {
@@ -984,7 +1059,14 @@ mod tests {
         }
 
         async fn suspend(&mut self) -> io::Result<()> {
-            self.record("suspend")
+            self.record("suspend")?;
+            if self.refuses_suspend {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "no job-control shell to resume it",
+                ));
+            }
+            Ok(())
         }
 
         async fn resume(&mut self) -> io::Result<()> {
@@ -1379,6 +1461,75 @@ mod tests {
                         "read",
                         "suspend",
                         "read",
+                        "resume",
+                        "read",
+                        "leave"
+                    ]
+                );
+            });
+    }
+
+    /// A suspend with no job-control shell to stop under, as for a session
+    /// leader, is refused: the TUI comes straight back instead of ending.
+    #[test]
+    fn a_refused_suspend_resumes_the_tui_at_once() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let driver = FakeDriver::with_activities(
+                    Arc::clone(&calls),
+                    [TerminalActivity::Suspend, TerminalActivity::Terminate],
+                )
+                .refusing_suspend();
+                let (startup_tx, startup_rx) = mpsc::bounded(1);
+                let (event_tx, event_rx) = mpsc::bounded(1);
+                let (control_tx, control_rx) = mpsc::bounded(1);
+                let (stop_tx, stop_rx) = watch::channel(false);
+
+                let task = tokio::spawn(drive_terminal(
+                    driver,
+                    ThemeName::Dark,
+                    TerminalColorLevel::TrueColor,
+                    startup_tx,
+                    event_tx,
+                    control_tx,
+                    stop_rx,
+                    None,
+                ));
+                assert!(matches!(
+                    wait_for_startup(&startup_rx).await,
+                    StartupMessage::Ready(_)
+                ));
+                let InputControl::Suspend { acknowledge } = wait_for_control(&control_rx).await
+                else {
+                    panic!("expected suspend control");
+                };
+                acknowledge.send(()).expect("acknowledge suspend");
+                assert!(matches!(
+                    wait_for_control(&control_rx).await,
+                    InputControl::Resumed
+                ));
+                for _ in 0..100 {
+                    if matches!(event_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                stop_tx.send(true).expect("stop receiver alive");
+                task.await.expect("driver task").expect("clean signal exit");
+
+                assert_eq!(
+                    *calls.lock().expect("calls lock"),
+                    [
+                        "alternate",
+                        "mouse",
+                        "paste",
+                        "keyboard",
+                        "read",
+                        "suspend",
                         "resume",
                         "read",
                         "leave"

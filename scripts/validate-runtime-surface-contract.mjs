@@ -1325,7 +1325,8 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/input_adapter.rs:adapt_key:state.insert", 2],
   ["crates/orca-tui/src/input_adapter.rs:adapt_modifiers:adapted.insert", 1],
   ["crates/orca-tui/src/input_adapter.rs:adapt:key.modifiers.insert", 1],
-  ["crates/orca-tui/src/input_runtime.rs:drive_terminal:driver.resume", 1],
+  // A refused suspend resumes the terminal at once.
+  ["crates/orca-tui/src/input_runtime.rs:drive_terminal:driver.resume", 2],
   ["crates/orca-tui/src/input_runtime.rs:resume:self.session.resume", 1],
   ["crates/orca-tui/src/mention_search_manager.rs:drop:self.shutdown", 1],
   ["crates/orca-tui/src/mention_search_manager.rs:sync_at_cursor:state.mention.candidates.clear", 2],

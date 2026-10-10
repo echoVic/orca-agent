@@ -530,7 +530,21 @@
       "tui-pty-contract-signal-libc",
       "tests/tui_pty_contract.rs",
       "unix_libc_process",
-      6,
+      10,
+      "windows-test-portability"
+    ],
+    [
+      "tui-pty-contract-job-control-shell",
+      "tests/tui_pty_contract.rs",
+      "unix_shell_spawn",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "tui-pty-contract-job-control-session",
+      "tests/tui_pty_contract.rs",
+      "unix_std_api",
+      1,
       "windows-test-portability"
     ],
     [

@@ -1347,6 +1347,146 @@ fn tui_exit_from_first_run_setup_starts_no_mcp_server() {
     );
 }
 
+/// Under a job-control shell SIGTSTP stops the TUI as it does any job: the
+/// shell gets the terminal back, and `fg` brings the TUI back where it was.
+/// The stop the TUI sent its process group was caught by the SIGTSTP
+/// listener its terminal session installs, so it put the terminal back,
+/// never stopped, and spun on its own SIGTSTPs.
+#[test]
+fn sigtstp_stops_the_tui_under_a_job_control_shell_and_fg_brings_it_back() {
+    use std::os::unix::process::CommandExt;
+
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let pid_file = cwd.path().join("orca.pid");
+    let mut bash = Command::new("bash");
+    bash.args(["--norc", "--noprofile", "-i"])
+        .env("PS1", "SHELL> ");
+    // A session of its own, with the PTY as its terminal, as a terminal
+    // window gives its shell: bash then runs each command as a job.
+    unsafe {
+        bash.pre_exec(|| {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut process = PtyProcess::spawn_command(bash, home.path()).expect("spawn bash in PTY");
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "SHELL>",
+        Duration::from_secs(10),
+        "bash did not prompt",
+    );
+    process
+        .write(
+            format!(
+                "sh -c 'printf %s \"$$\" > {}; exec {} --provider mock --cwd {}'\r",
+                pid_file.display(),
+                env!("CARGO_BIN_EXE_orca"),
+                cwd.path().display()
+            )
+            .as_bytes(),
+        )
+        .expect("run orca as a job");
+    accept_new_workspace(&mut process, &mut output);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "orca never wrote its pid");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let _orca = KillOnDrop(pid);
+    receive_until(
+        &process,
+        &mut output,
+        "Message Orca",
+        Duration::from_secs(10),
+        "the TUI did not open its composer",
+    );
+
+    process.drain_output(&mut output);
+    let stopped_at = output.len();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTSTP) }, 0, "send SIGTSTP");
+    wait_for_process_state(pid, |state| state.contains('T'), "stopped");
+    receive_until(
+        &process,
+        &mut output,
+        "Stopped",
+        Duration::from_secs(10),
+        "bash did not report the job stopped",
+    );
+    assert!(contains_rendered_text(&output[stopped_at..], "Stopped"));
+
+    process.write(b"fg\r").expect("bring orca back");
+    wait_for_process_state(pid, |state| !state.contains('T'), "continued");
+    process.drain_output(&mut output);
+    let continued_at = output.len();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !contains_rendered_text(&output[continued_at..], "Message Orca") {
+        assert!(
+            Instant::now() < deadline,
+            "the TUI did not come back; output={}",
+            String::from_utf8_lossy(&output[continued_at..])
+        );
+        if let Some(chunk) = process.receive_output(Duration::from_millis(250)) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+
+    process.write(&[0x03]).expect("arm the idle exit");
+    receive_until(
+        &process,
+        &mut output,
+        "Press Ctrl+C again to quit.",
+        Duration::from_secs(10),
+        "the TUI did not arm its idle exit",
+    );
+    process.write(&[0x03]).expect("quit the TUI");
+    wait_for_process_state(pid, str::is_empty, "gone");
+    process.write(b"exit\r").expect("leave bash");
+    process.wait_for_exit(Duration::from_secs(10));
+}
+
+/// SIGKILLs a process a test started indirectly, should it still run when
+/// the test ends.
+struct KillOnDrop(libc::pid_t);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        unsafe { libc::kill(self.0, libc::SIGKILL) };
+    }
+}
+
+/// Waits up to ten seconds for `pid`'s state, as `ps -o stat=` gives it
+/// (empty once it is gone), to satisfy `expected`.
+fn wait_for_process_state(pid: libc::pid_t, expected: impl Fn(&str) -> bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default();
+        if expected(&state) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "orca was not {what} within 10s; its state is {state:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn tui_sigterm_quits_like_exit_and_stops_mcp_servers() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
