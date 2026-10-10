@@ -136,9 +136,10 @@ fn adopt_process_temp_home() -> PathBuf {
 /// The temporary home every test build in this process falls back to. It is
 /// created on first use, inside `<temp dir>/orca-th`, and this process
 /// never removes it: a detached child may still be writing to it when this one
-/// exits. Instead, the first use in each process removes the homes there that
-/// were last changed more than a day ago (see `prune_stale_test_homes`).
-/// This function does not touch the environment.
+/// exits. Instead, the first use in each process removes some of the homes
+/// there, and in the legacy group, that were last changed more than a day ago
+/// (see `prune_stale_test_homes`). This function does not touch the
+/// environment.
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub fn process_temp_home() -> &'static std::path::Path {
@@ -151,7 +152,14 @@ pub fn process_temp_home() -> &'static std::path::Path {
         let group = std::env::temp_dir().join(TEST_HOME_GROUP);
         std::fs::create_dir_all(&group)
             .and_then(|()| builder.tempdir_in(&group))
-            .inspect(|_| prune_stale_test_homes(&group))
+            .inspect(|_| {
+                prune_stale_test_homes(&group, TEST_HOME_PREFIX);
+                // No process makes homes in the legacy group any more: once
+                // its last one is pruned, it goes too.
+                let legacy = std::env::temp_dir().join(LEGACY_TEST_HOME_GROUP);
+                prune_stale_test_homes(&legacy, LEGACY_TEST_HOME_PREFIX);
+                let _ = std::fs::remove_dir(legacy);
+            })
             // Grouping is a convenience: on a temp dir shared between users
             // the group may belong to someone else, and the home must still
             // be created.
@@ -176,6 +184,19 @@ const TEST_HOME_GROUP: &str = "orca-th";
 #[cfg(any(test, feature = "test-utils"))]
 const TEST_HOME_PREFIX: &str = "h-";
 
+/// The group, and the name prefix, the temporary homes had before e51e7a52.
+#[cfg(any(test, feature = "test-utils"))]
+const LEGACY_TEST_HOME_GROUP: &str = "orca-test-homes";
+#[cfg(any(test, feature = "test-utils"))]
+const LEGACY_TEST_HOME_PREFIX: &str = "orca-test-home-";
+
+/// How many stale homes one process removes from a group at most. After a
+/// day without tests a group can hold thousands, and removing them all held
+/// up the process's first test for seconds; the processes after it take the
+/// rest.
+#[cfg(any(test, feature = "test-utils"))]
+const MAX_PRUNED_TEST_HOMES: usize = 32;
+
 /// How long ago a temporary home must have last changed for another process
 /// to remove it: far longer than any test run, and than any child it leaves
 /// behind still writing there.
@@ -183,21 +204,26 @@ const TEST_HOME_PREFIX: &str = "h-";
 const STALE_TEST_HOME_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Removes from `group` the temporary homes that earlier test processes left
-/// there: each real directory named `h-*` last changed more than
-/// [`STALE_TEST_HOME_AGE`] ago. Nothing else in `group` is touched, a link or
-/// a file of that name included, and no link is ever followed. Every error is
-/// ignored: what cannot be read or removed stays, and the tests go on.
+/// there, [`MAX_PRUNED_TEST_HOMES`] at most: each real directory whose name
+/// starts with `prefix`, last changed more than [`STALE_TEST_HOME_AGE`] ago.
+/// Nothing else in `group` is touched, a link or a file of that name
+/// included, and no link is ever followed. Every error is ignored: what
+/// cannot be read or removed stays, and the tests go on.
 #[cfg(any(test, feature = "test-utils"))]
-fn prune_stale_test_homes(group: &std::path::Path) {
+fn prune_stale_test_homes(group: &std::path::Path, prefix: &str) {
     let Ok(entries) = std::fs::read_dir(group) else {
         return;
     };
     let now = std::time::SystemTime::now();
+    let mut pruned = 0;
     for entry in entries.flatten() {
+        if pruned == MAX_PRUNED_TEST_HOMES {
+            break;
+        }
         if !entry
             .file_name()
             .to_str()
-            .is_some_and(|name| name.starts_with(TEST_HOME_PREFIX))
+            .is_some_and(|name| name.starts_with(prefix))
         {
             continue;
         }
@@ -217,6 +243,7 @@ fn prune_stale_test_homes(group: &std::path::Path) {
         if stale {
             // Removes a link inside the home, never what it names.
             let _ = std::fs::remove_dir_all(entry.path());
+            pruned += 1;
         }
     }
 }
@@ -475,7 +502,7 @@ mod tests {
             .expect("run touch");
         assert!(touched.success(), "touch -h failed: {touched}");
 
-        prune_stale_test_homes(group.path());
+        prune_stale_test_homes(group.path(), TEST_HOME_PREFIX);
 
         assert!(!stale.exists(), "the stale test home is still there");
         for kept in [&recent, &fresh, &unrelated, &target] {
@@ -490,6 +517,66 @@ mod tests {
             std::fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()),
             "the link went"
         );
+    }
+
+    /// After a day without tests the group can hold thousands of stale
+    /// homes. One process removes a bounded number of them, so its first
+    /// test is not held up for seconds; the processes after it take the rest.
+    #[cfg(unix)]
+    #[test]
+    fn pruning_removes_a_bounded_number_of_homes_at_a_time() {
+        let group = tempfile::tempdir().expect("a scratch group");
+        let count = MAX_PRUNED_TEST_HOMES + 8;
+        for index in 0..count {
+            let home = group.path().join(format!("{TEST_HOME_PREFIX}{index}"));
+            std::fs::create_dir(&home).expect("a stale test home");
+            last_changed(&home, 25 * HOURS);
+        }
+        let left = || std::fs::read_dir(group.path()).expect("the group").count();
+
+        prune_stale_test_homes(group.path(), TEST_HOME_PREFIX);
+        assert_eq!(left(), count - MAX_PRUNED_TEST_HOMES);
+        prune_stale_test_homes(group.path(), TEST_HOME_PREFIX);
+        assert_eq!(left(), 0);
+    }
+
+    /// The group the temporary homes went to before e51e7a52 is pruned too,
+    /// and goes once it is empty: no process makes homes there any more.
+    #[cfg(unix)]
+    #[test]
+    fn the_first_home_of_a_process_prunes_the_legacy_group() {
+        const CHILD_ENV: &str = "ORCA_TEST_HOME_PRUNING_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let _ = process_temp_home();
+            return;
+        }
+        let temp = tempfile::tempdir().expect("a scratch temp dir");
+        let legacy = temp.path().join(LEGACY_TEST_HOME_GROUP);
+        let stale = legacy.join(format!("{LEGACY_TEST_HOME_PREFIX}stale"));
+        std::fs::create_dir_all(&stale).expect("a stale legacy test home");
+        std::fs::write(stale.join("content"), b"").expect("its content");
+        last_changed(&stale, 25 * HOURS);
+
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "home::tests::the_first_home_of_a_process_prunes_the_legacy_group",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("TMPDIR", temp.path())
+            .output()
+            .expect("run the test in a process of its own");
+
+        assert!(
+            child.status.success() && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+            "the child failed ({}): {}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(!legacy.exists(), "the legacy group is still there");
     }
 
     /// The first home of a process prunes the group it is created in. The
