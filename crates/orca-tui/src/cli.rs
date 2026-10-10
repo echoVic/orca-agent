@@ -45,21 +45,25 @@ pub fn run(config: RunConfig) -> i32 {
 
     match update_preflight(config.update_check, &config.app_version) {
         UpdatePreflight::Continue => {}
-        UpdatePreflight::Prompt(info) => match prompt_for_update(&info) {
-            Ok(UpdatePromptChoice::UpdateNow) => {
-                return run_upgrade_command(&current_update_action());
-            }
-            Ok(UpdatePromptChoice::Skip) => {}
-            Ok(UpdatePromptChoice::SkipUntilNext) => {
-                if let Err(error) = dismiss_version(&info.latest) {
-                    eprintln!("orca: warning: failed to save update dismissal: {error}");
+        UpdatePreflight::Prompt(info) => {
+            #[cfg(unix)]
+            let _signals = quit_before_the_tui_on_termination_signals();
+            match prompt_for_update(&info) {
+                Ok(UpdatePromptChoice::UpdateNow) => {
+                    return run_upgrade_command(&current_update_action());
+                }
+                Ok(UpdatePromptChoice::Skip) => {}
+                Ok(UpdatePromptChoice::SkipUntilNext) => {
+                    if let Err(error) = dismiss_version(&info.latest) {
+                        eprintln!("orca: warning: failed to save update dismissal: {error}");
+                    }
+                }
+                Ok(UpdatePromptChoice::Quit) => return 130,
+                Err(error) => {
+                    eprintln!("orca: warning: failed to read update choice: {error}");
                 }
             }
-            Ok(UpdatePromptChoice::Quit) => return 130,
-            Err(error) => {
-                eprintln!("orca: warning: failed to read update choice: {error}");
-            }
-        },
+        }
     }
 
     crate::app::run_tui(config)
@@ -214,6 +218,39 @@ fn run_upgrade_command(action: &UpdateAction) -> i32 {
     }
 }
 
+/// SIGINT, SIGTERM and SIGHUP while the update prompt waits, or an update
+/// it started runs, end orca at once with the signal's exit code, as Ctrl+C
+/// does there, once the terminal has left raw mode: nothing else has started
+/// yet. Left to their default disposition they ended it in raw mode. Hold
+/// the guard until the TUI takes the signals over. `None` when the handlers
+/// could not be set up.
+#[cfg(unix)]
+fn quit_before_the_tui_on_termination_signals()
+-> Option<orca_runtime::termination_signals::TerminationSignalGuard> {
+    use orca_runtime::termination_signals::{TerminationSignal, handle_termination_signals};
+    handle_termination_signals(
+        &[
+            TerminationSignal::Interrupt,
+            TerminationSignal::Terminate,
+            TerminationSignal::Hangup,
+        ],
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |signal| {
+            leave_raw_mode_now();
+            std::process::exit(signal.exit_code());
+        },
+        leave_raw_mode_now,
+    )
+}
+
+/// Leaves raw mode and the prompt's line, whatever the prompt is doing.
+#[cfg(unix)]
+fn leave_raw_mode_now() {
+    let _ = terminal::disable_raw_mode();
+    // Straight to the descriptor: the prompt may hold stdout's lock.
+    let _ = unsafe { libc::write(libc::STDOUT_FILENO, b"\r\n".as_ptr().cast(), 2) };
+}
+
 struct RawModeGuard;
 
 impl Drop for RawModeGuard {
@@ -227,6 +264,42 @@ mod tests {
     use orca_runtime::update_check::{UpdateAction, UpdateInfo};
 
     use super::*;
+
+    /// SIGTERM while the update prompt waits ends orca with SIGTERM's exit
+    /// code, after leaving raw mode, instead of killing it in raw mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_termination_signal_before_the_tui_exits_with_its_code() {
+        const CHILD_ENV: &str = "ORCA_TEST_SIGNAL_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let _signals = quit_before_the_tui_on_termination_signals();
+            assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0, "raise SIGTERM");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            return;
+        }
+        let started = std::time::Instant::now();
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "cli::tests::a_termination_signal_before_the_tui_exits_with_its_code",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run the test in a process of its own");
+        assert_eq!(
+            child.status.code(),
+            Some(143),
+            "{}; stderr: {}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "the signal must end it at once"
+        );
+    }
 
     #[test]
     fn update_prompt_choice_navigation_wraps() {
