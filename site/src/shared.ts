@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.8";
+export const releaseVersion = "v0.5.9";
 
 export const releases = [
+  {
+    version: "v0.5.9",
+    date: "2026-10-10",
+    title: "ACP SDK 3.2, steadier Esc, attach and suspend",
+    body: "The ACP daemon and orca attach move to the ACP SDK 3.2 with the v1 wire unchanged, and orca --mode=acp sends a streamed answer once with its reasoning as thoughts. An attached TUI survives a failed turn, reloaded sessions show reasoning before the answer, and session/list finds a workspace's older sessions. Esc no longer draws errors over the screen or restarts a turn on its own, a cancelled sync agent ends as cancelled, SIGTSTP from a job-control shell stops Orca until fg, and a message sent as a turn starts queues in order. On Landlock-only Linux hosts, orca doctor and the shell now agree.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.9",
+  },
   {
     version: "v0.5.8",
     date: "2026-10-09",
