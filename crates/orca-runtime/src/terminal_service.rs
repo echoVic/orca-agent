@@ -890,13 +890,14 @@ impl TerminalServiceState {
         // A deadline stop is recorded on the session's terminal state, but the
         // command may have been observed terminal before that stamp existed
         // (the supervisor's next maintenance tick). The session's own deadline
-        // is the tiebreaker: if it has expired and the command is terminal,
-        // the deadline is what ended it.
+        // is the tiebreaker: a command recorded terminal at or after its
+        // deadline was ended by it, and one recorded before it ended on its
+        // own, however late it is read.
         let deadline_expired = self
             .sessions
             .get(session_id)
-            .and_then(|session| session.deadline)
-            .is_some_and(|(deadline, _source)| Instant::now() >= deadline);
+            .and_then(|session| session.deadline.zip(session.completed_at))
+            .is_some_and(|((deadline, _source), completed_at)| completed_at >= deadline);
         let deadline_reached = terminal.deadline_reached
             || (deadline_expired && terminal.status != TaskStatus::Running);
         let deadline_source = terminal.deadline_source.or_else(|| {
@@ -2765,6 +2766,51 @@ mod tests {
                 "before-restart"
             );
         }
+    }
+
+    #[test]
+    fn a_command_that_ended_before_its_deadline_is_not_timed_out_when_read_after_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let overlay = TurnPermissionOverlay::default();
+        let (service, _registry) = service(temp.path());
+        // Long enough for PowerShell to start and exit well before it.
+        let after = Duration::from_secs(4);
+        let deadline = ExecutionDeadline {
+            after,
+            source: "caller timeout_ms",
+        };
+        let started_at = Instant::now();
+        let started = start(
+            &service,
+            request_with_deadline("exit 0", temp.path(), &overlay, Some(deadline)),
+            Duration::ZERO,
+            8 * 1024,
+            || false,
+        )
+        .expect("started");
+        let read = || {
+            service
+                .read_output(&started.task_id, 8 * 1024)
+                .expect("read")
+                .expect("known task")
+        };
+        let ended = loop {
+            let observed = read();
+            if observed.status != "running" {
+                break observed;
+            }
+            assert!(
+                started_at.elapsed() < after,
+                "the command did not end in time"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert_ne!(ended.termination, "timed_out", "{ended:?}");
+
+        std::thread::sleep((started_at + after + Duration::from_millis(300)) - Instant::now());
+        let late = read();
+        assert_ne!(late.termination, "timed_out", "{late:?}");
+        assert!(!late.deadline_reached, "{late:?}");
     }
 
     #[test]
