@@ -1825,6 +1825,51 @@ fn failed_terminal_without_an_error_explains_the_missing_diagnostic() {
     ));
 }
 
+/// An error the TUI shows for something the user did, such as a command
+/// typed while the turn runs, says nothing about how the turn ended.
+#[test]
+fn a_local_error_during_a_turn_does_not_stand_for_how_it_ended() {
+    let mut state = state();
+    state.push_message(ChatMessage::User("run it".to_string()));
+    state.enter_running();
+    state.push_message(ChatMessage::Error("Unknown command: /nope".to_string()));
+
+    state.update(TuiEvent::SessionCompleted {
+        status: "cancelled".to_string(),
+    });
+
+    assert!(matches!(
+        state.transcript.messages.last(),
+        Some(ChatMessage::Diagnostic(diagnostic)) if diagnostic.code() == "operation.cancelled"
+    ));
+}
+
+/// What explained the last turn's end, or an error shown while idle, does
+/// not explain a connection lost after it.
+#[test]
+fn a_disconnect_after_a_turn_ended_says_the_connection_was_lost() {
+    let mut state = state();
+    state.push_message(ChatMessage::User("run it".to_string()));
+    state.enter_running();
+    state.update(TuiEvent::Error(
+        "DeepSeek provider error: 503 Service Unavailable".to_string(),
+    ));
+    state.update(TuiEvent::SessionCompleted {
+        status: "failed".to_string(),
+    });
+    state.push_message(ChatMessage::Error("Unknown command: /nope".to_string()));
+    state.update(TuiEvent::Error("could not load the goal".to_string()));
+
+    state.update(TuiEvent::SessionCompleted {
+        status: "disconnected".to_string(),
+    });
+
+    assert!(matches!(
+        state.transcript.messages.last(),
+        Some(ChatMessage::Diagnostic(diagnostic)) if diagnostic.code() == "connection.disconnected"
+    ));
+}
+
 #[test]
 fn cancelled_terminal_without_an_error_explains_the_stop() {
     let mut state = state();

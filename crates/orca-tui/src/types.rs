@@ -694,6 +694,11 @@ pub struct AppState {
     pub(crate) focus_cycle: u64,
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
+    /// The turn under way, or the one that just ended, has shown a diagnostic
+    /// the runtime reported, so its end needs no generic one (see
+    /// `TuiEvent::SessionCompleted`). An error the TUI shows for something the
+    /// user did (`ChatMessage::Error`) is not one. Cleared when a turn starts
+    /// and when one ends.
     pub(crate) turn_diagnostic_seen: bool,
     /// Why the TUI exits on its own, printed once the terminal is restored.
     pub(crate) exit_message: Option<String>,
@@ -1337,7 +1342,7 @@ impl AppState {
 
     pub(crate) fn push_message(&mut self, message: ChatMessage) {
         self.reconcile_message_tracking();
-        if matches!(&message, ChatMessage::Diagnostic(_) | ChatMessage::Error(_)) {
+        if matches!(&message, ChatMessage::Diagnostic(_)) {
             self.turn_diagnostic_seen = true;
         }
         if let ChatMessage::ToolCall { id, .. } = &message {
@@ -1659,6 +1664,7 @@ impl AppState {
         } else {
             self.status = status;
             self.running_started_at = None;
+            self.turn_diagnostic_seen = false;
         }
     }
 

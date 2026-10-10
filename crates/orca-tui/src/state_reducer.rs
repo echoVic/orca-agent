@@ -961,11 +961,14 @@ impl AppState {
                 self.denied_approval_stops_turn = false;
                 self.invalidate_recap();
                 let was_backgrounded = self.suppress_background_main_session_output;
-                let fallback_diagnostic = if self.current_turn_has_diagnostic() {
-                    None
-                } else {
-                    TuiDiagnostic::from_completion_status(&status)
-                };
+                // What the turn showed explains its end, but never a lost
+                // connection, which comes from outside the turn.
+                let fallback_diagnostic =
+                    if status != "disconnected" && self.current_turn_has_diagnostic() {
+                        None
+                    } else {
+                        TuiDiagnostic::from_completion_status(&status)
+                    };
                 self.suppress_background_main_session_output = false;
                 self.approval_dialog = None;
                 self.interaction.pending_input = None;
