@@ -84,17 +84,19 @@ fn browse_mode_lists_direct_children_while_catalog_builds() {
     .unwrap();
     session.update(SearchMode::browse("src/"));
 
+    // The catalog is still being built: a snapshot can come before it has
+    // found both children, so wait for the one that lists them.
     let snapshot = wait_for_snapshot(&session, &notify_rx, |snapshot| {
-        snapshot.mode == SearchMode::browse("src/") && !snapshot.matches.is_empty()
+        let lists = |path: &str| {
+            snapshot
+                .matches
+                .iter()
+                .any(|candidate| candidate.path == path)
+        };
+        snapshot.mode == SearchMode::browse("src/") && lists("src/nested/") && lists("src/lib.rs")
     });
 
     assert_eq!(snapshot.matches[0].path, "src/nested/");
-    assert!(
-        snapshot
-            .matches
-            .iter()
-            .any(|candidate| candidate.path == "src/lib.rs")
-    );
     assert!(
         snapshot
             .matches
