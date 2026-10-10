@@ -900,9 +900,10 @@ where
 
 /// Starts the same bounded facade on a [`tokio::task::LocalSet`].
 ///
-/// ACP 0.10.4 exposes `?Send` handler futures, so the production adapter uses
-/// this entry point while retaining the same reader, writer, budgets,
-/// acknowledgements and joined shutdown as the `Send` test facade.
+/// The ACP agent keeps its state in `Rc<RefCell<_>>`, so its handler futures
+/// are not `Send`; the production adapter uses this entry point while
+/// retaining the same reader, writer, budgets, acknowledgements and joined
+/// shutdown as the `Send` test facade.
 pub(crate) fn spawn_local_rpc_facade<R, W>(
     reader: R,
     writer: W,
