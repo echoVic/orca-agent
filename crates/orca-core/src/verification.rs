@@ -389,12 +389,17 @@ mod tests {
         );
 
         // Long enough that process startup cannot consume it (PowerShell on a
-        // loaded Windows runner can take more than 2 s to print "before"), and
-        // far shorter than the 30 s descendant.
-        let result = run_with_timeout(&command, Duration::from_secs(5));
+        // loaded Windows runner has taken more than 5 s to print "before"),
+        // and far shorter than the 30 s descendant.
+        let budget = if cfg!(windows) {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(5)
+        };
+        let result = run_with_timeout(&command, budget);
 
         assert!(
-            start.elapsed() < Duration::from_secs(15),
+            start.elapsed() < budget + Duration::from_secs(10),
             "verifier should not wait for descendant processes"
         );
         assert!(!result.success);
