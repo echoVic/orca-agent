@@ -1217,6 +1217,8 @@ pub(crate) fn run(
                     if let Some(control) = control { control.abort(); }
                     return Ok(());
                 }
+                // Checked before the prompt: a prompt the daemon hung up on is
+                // a lost turn, not a failed one, and the hangup shows here first.
                 if connection.is_closed() || client.reload.get() {
                     client.disconnect(&mut prompt);
                     if let Some(control) = control.take() { control.abort(); }

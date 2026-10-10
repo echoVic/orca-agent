@@ -24,6 +24,11 @@ use tokio::sync::{mpsc, oneshot};
 use super::legacy_model::{SetSessionModelRequest, SetSessionModelResponse};
 
 /// What an attach client does with the daemon's requests and notifications.
+///
+/// Notifications are handled one at a time, in arrival order, and an
+/// [`AgentHandle`] request returns only after the notifications that arrived
+/// before its response, so `session_notification` must not wait on one. Each
+/// permission request runs in a task of its own and may wait for the user.
 #[async_trait::async_trait(?Send)]
 pub trait ClientHandler {
     async fn request_permission(
@@ -37,14 +42,36 @@ pub trait ClientHandler {
     ) -> agent_client_protocol::Result<()>;
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 enum Incoming {
-    Permission(
-        RequestPermissionRequest,
-        Responder<RequestPermissionResponse>,
-    ),
+    Permission(RequestPermissionRequest, PermissionReply),
     Notification(SessionNotification),
     /// Answered once everything queued before it has been handled.
     Barrier(oneshot::Sender<()>),
+}
+
+/// Answers a permission request with an error if it is dropped unanswered,
+/// so the daemon never waits on a client that stopped handling it.
+struct PermissionReply(Option<Responder<RequestPermissionResponse>>);
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl PermissionReply {
+    fn send(mut self, result: agent_client_protocol::Result<RequestPermissionResponse>) {
+        if let Some(responder) = self.0.take() {
+            let _ = responder.respond_with_result(result);
+        }
+    }
+}
+
+impl Drop for PermissionReply {
+    fn drop(&mut self) {
+        if let Some(responder) = self.0.take() {
+            let _ = responder.respond_with_error(
+                agent_client_protocol::Error::internal_error()
+                    .data("the ACP client stopped before answering"),
+            );
+        }
+    }
 }
 
 /// Requests and notifications an attach client sends to the daemon.
@@ -121,8 +148,20 @@ impl AgentHandle {
 
 pub struct Connection {
     pub agent: AgentHandle,
+    tasks: Tasks,
+}
+
+/// The connection's local tasks, stopped when dropped.
+struct Tasks {
     driver: tokio::task::JoinHandle<agent_client_protocol::Result<()>>,
     pump: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Tasks {
+    fn drop(&mut self) {
+        self.driver.abort();
+        self.pump.abort();
+    }
 }
 
 pub struct AttachedSession {
@@ -176,6 +215,7 @@ impl Connection {
     }
 
     /// Starts the connection on a `LocalSet` and initializes it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) async fn connect_streams<R, W>(
         read: R,
         write: W,
@@ -198,7 +238,8 @@ impl Connection {
                     async move |request: RequestPermissionRequest,
                                 responder: Responder<RequestPermissionResponse>,
                                 _cx| {
-                        let _ = permissions.send(Incoming::Permission(request, responder));
+                        let reply = PermissionReply(Some(responder));
+                        let _ = permissions.send(Incoming::Permission(request, reply));
                         Ok(())
                     },
                     agent_client_protocol::on_receive_request!(),
@@ -227,11 +268,10 @@ impl Connection {
                     Incoming::Notification(notification) => {
                         let _ = client.session_notification(notification).await;
                     }
-                    Incoming::Permission(request, responder) => {
+                    Incoming::Permission(request, reply) => {
                         let client = Rc::clone(&client);
                         tokio::task::spawn_local(async move {
-                            let result = client.request_permission(request).await;
-                            let _ = responder.respond_with_result(result);
+                            reply.send(client.request_permission(request).await);
                         });
                     }
                     Incoming::Barrier(done) => {
@@ -240,20 +280,17 @@ impl Connection {
                 }
             }
         });
-        let connection = match connection.await {
-            Ok(connection) => connection,
-            Err(_) => {
-                pump.abort();
-                return Err(io::Error::other("ACP connection closed before it opened"));
-            }
+        // Dropping this future before the connection opens stops both tasks.
+        let tasks = Tasks { driver, pump };
+        let Ok(connection) = connection.await else {
+            return Err(io::Error::other("ACP connection closed before it opened"));
         };
         let connection = Self {
             agent: AgentHandle {
                 connection,
                 incoming,
             },
-            driver,
-            pump,
+            tasks,
         };
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -271,8 +308,14 @@ impl Connection {
         Ok(connection)
     }
 
+    /// Whether the daemon hung up or this side stopped handling its messages.
+    ///
+    /// A hangup shows here before any request it fails returns, so a caller
+    /// may check this first to tell a lost request from a failed one.
     pub fn is_closed(&self) -> bool {
-        self.driver.is_finished()
+        self.agent.connection.is_incoming_closed()
+            || self.tasks.driver.is_finished()
+            || self.tasks.pump.is_finished()
     }
 
     /// `new` creates a session; all other selectors must be exact session IDs.
@@ -310,13 +353,6 @@ impl Connection {
         })
         .await?
         .map_err(io::Error::other)
-    }
-}
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        self.driver.abort();
-        self.pump.abort();
     }
 }
 
@@ -388,6 +424,7 @@ pub fn run_headless(socket: &Path, cwd: &Path, selector: &str, prompt: String) -
 mod tests {
     use std::cell::RefCell;
 
+    use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields};
     use serde_json::{Value, json};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
 
@@ -449,6 +486,52 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// Panics on everything it handles, the way a handler bug would.
+    struct Panicking;
+
+    #[async_trait::async_trait(?Send)]
+    impl ClientHandler for Panicking {
+        async fn request_permission(
+            &self,
+            _request: RequestPermissionRequest,
+        ) -> agent_client_protocol::Result<RequestPermissionResponse> {
+            panic!("handler bug");
+        }
+
+        async fn session_notification(
+            &self,
+            _notification: SessionNotification,
+        ) -> agent_client_protocol::Result<()> {
+            panic!("handler bug");
+        }
+    }
+
+    /// A `session/update` frame carrying one agent message chunk.
+    fn agent_message(session: &str, text: &str) -> Value {
+        json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": session,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": text},
+            },
+        }})
+    }
+
+    /// A `session/request_permission` request with the given JSON-RPC id.
+    fn permission_request(id: u64) -> Value {
+        let request = RequestPermissionRequest::new(
+            "s-1",
+            ToolCallUpdate::new("t-1", ToolCallUpdateFields::new()),
+            Vec::new(),
+        );
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/request_permission",
+            "params": request,
+        })
     }
 
     /// The daemon end of a connection, scripted by the test.
@@ -560,21 +643,114 @@ mod tests {
             });
             assert_eq!(daemon.recv().await["method"], "session/prompt");
             drop(daemon);
-            let result = tokio::time::timeout(Duration::from_secs(5), prompt)
+            let error = tokio::time::timeout(Duration::from_secs(5), prompt)
                 .await
                 .expect("the prompt settles")
-                .unwrap();
+                .unwrap()
+                .expect_err("a lost turn is not a finished one");
             assert!(
-                result.is_err(),
-                "a lost turn is not a finished one: {result:?}"
+                agent_client_protocol::is_incoming_transport_closed(&error),
+                "{error:?}"
             );
+            // Callers check the connection before a finished request, so the
+            // hangup must show by the time the failed request does.
+            assert!(connection.is_closed());
+        });
+    }
+
+    #[test]
+    fn a_hangup_shows_while_the_client_is_still_writing() {
+        run_local(async {
+            let (connection, mut daemon) = connected(Rc::new(Recorder::default())).await;
+            let agent = connection.agent.clone();
+            // More than the pipe holds, so the client is still writing the
+            // prompt when the daemon stops sending.
+            let text = "x".repeat(256 * 1024);
+            let prompt = tokio::task::spawn_local(async move {
+                agent
+                    .prompt(PromptRequest::new("s-1", vec![ContentBlock::from(text)]))
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), daemon.read.fill_buf())
+                .await
+                .expect("the prompt starts")
+                .unwrap();
+            daemon.write.shutdown().await.unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(5), prompt)
+                .await
+                .expect("the prompt settles")
+                .unwrap()
+                .expect_err("a lost turn is not a finished one");
+            assert!(
+                agent_client_protocol::is_incoming_transport_closed(&error),
+                "{error:?}"
+            );
+            assert!(connection.is_closed());
+        });
+    }
+
+    #[test]
+    fn a_handler_panic_closes_the_connection_and_refuses_later_permissions() {
+        run_local(async {
+            let (connection, mut daemon) = connected(Rc::new(Panicking)).await;
+            daemon.send(agent_message("s-1", "lost")).await;
             tokio::time::timeout(Duration::from_secs(5), async {
                 while !connection.is_closed() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
-            .expect("the connection closes");
+            .expect("a stopped pump closes the connection");
+
+            // Nothing is left to ask the user, so the daemon must not wait.
+            daemon.send(permission_request(7)).await;
+            let reply = daemon.recv().await;
+            assert_eq!(reply["id"], 7);
+            assert!(reply["error"].is_object(), "{reply}");
+        });
+    }
+
+    #[test]
+    fn a_permission_handler_panic_still_answers_the_daemon() {
+        run_local(async {
+            let (_connection, mut daemon) = connected(Rc::new(Panicking)).await;
+            daemon.send(permission_request(7)).await;
+            let reply = daemon.recv().await;
+            assert_eq!(reply["id"], 7);
+            assert!(reply["error"].is_object(), "{reply}");
+        });
+    }
+
+    #[test]
+    fn a_connect_dropped_before_the_connection_opens_stops_its_tasks() {
+        run_local(async {
+            let recorder = Rc::new(Recorder::default());
+            let (client_end, daemon_end) = tokio::io::duplex(64 * 1024);
+            let (client_read, client_write) = tokio::io::split(client_end);
+            let connecting = Connection::connect_streams(
+                client_read,
+                client_write,
+                recorder.clone(),
+                ClientCapabilities::new(),
+            );
+            // The first poll starts the connection's tasks; the caller then
+            // gives up before the connection opens.
+            assert!(futures::FutureExt::now_or_never(connecting).is_none());
+
+            let mut daemon = BufReader::new(daemon_end);
+            let mut line = String::new();
+            let read = tokio::time::timeout(Duration::from_secs(5), daemon.read_line(&mut line))
+                .await
+                .expect("the abandoned connection hangs up")
+                .unwrap();
+            assert_eq!(read, 0, "{line}");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while Rc::strong_count(&recorder) > 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the abandoned connection releases its client");
         });
     }
 
@@ -598,17 +774,7 @@ mod tests {
             let request = daemon.recv().await;
             assert_eq!(request["method"], "session/prompt");
             for text in ["one", "two"] {
-                daemon
-                    .send(
-                        json!({"jsonrpc": "2.0", "method": "session/update", "params": {
-                            "sessionId": "s-1",
-                            "update": {
-                                "sessionUpdate": "agent_message_chunk",
-                                "content": {"type": "text", "text": text},
-                            },
-                        }}),
-                    )
-                    .await;
+                daemon.send(agent_message("s-1", text)).await;
             }
             daemon
                 .send(json!({"jsonrpc": "2.0", "id": request["id"], "result": {"stopReason": "end_turn"}}))
