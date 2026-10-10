@@ -104,6 +104,23 @@ const rejected = [
     "a global-path reqwest client",
     "fn f() { let _ = ::reqwest::Client::default(); }",
   ],
+  // `Default` fills a client the type names, without naming it in the call.
+  ["a client annotation filled by Default", "fn f() { let _c: reqwest::Client = Default::default(); }"],
+  [
+    "an imported client annotation filled by Default",
+    "use reqwest::blocking::Client;\nfn f() { let _c: Client = Default::default(); }",
+  ],
+  [
+    "a client annotation filled by a qualified Default",
+    "fn f() { let _c: ::reqwest::ClientBuilder = std::default::Default::default(); }",
+  ],
+  [
+    "an aliased client annotation filled by Default",
+    "type Http = reqwest::Client;\nfn f() { let _c: Http = Default::default(); }",
+  ],
+  ["a client returned from Default", "fn f() -> reqwest::Client { Default::default() }"],
+  ["Default through a qualified self type", "fn f() { let _ = <reqwest::Client as Default>::default(); }"],
+  ["default through a qualified self type", "fn f() { let _ = <reqwest::blocking::Client>::default(); }"],
   // A comment is not code: a `use` in one is no declaration, so it cannot
   // swallow the import that follows it, and a line in a block comment that
   // starts with `use` cannot swallow a call.
@@ -262,6 +279,15 @@ const allowed = [
   [
     "a call of another Client after a commented-out import",
     "/*\nuse reqwest::blocking::Client;\n*/\nfn f() { let _ = Client::new(); }",
+  ],
+  // `Default` fills something else than a client.
+  [
+    "Default for another type in a file that names the client",
+    "use reqwest::Client;\nfn f(_client: &Client) { let _n: u32 = Default::default(); }",
+  ],
+  [
+    "Default for an optional client",
+    "fn f() { let _c: Option<reqwest::Client> = Default::default(); }",
   ],
 ];
 for (const [name, source] of allowed) {

@@ -268,6 +268,19 @@ function directClientPatterns(code) {
     // A call, not a method (`.get(`), a path (`::get(`) or a definition.
     patterns.push(`(?<![\\w:.])(?<!\\bfn\\s+)(?:${any(getFunctions)})\\s*\\(`);
   }
+  // `Default` filling a client the type names: `let c: Client =
+  // Default::default();`, `-> Client { Default::default() }` and
+  // `<Client as Default>::default()`.
+  const types = [
+    `(?<!\\w)(?:${any(crate)})::(?:blocking::)?(?:Client|ClientBuilder)`,
+    ...(blocking.size > 0 ? [`(?<![\\w:])(?:${any(blocking)})::(?:Client|ClientBuilder)`] : []),
+    ...(clientTypes.size > 0 ? [`(?<![\\w:])(?:${any(clientTypes)})`] : []),
+  ];
+  const client = `(?:::)?(?:${types.join("|")})`;
+  const defaultCall = "(?:(?:::)?(?:std|core)::default::)?Default::default\\s*\\(";
+  patterns.push(`:\\s*${client}\\s*=\\s*${defaultCall}`);
+  patterns.push(`->\\s*${client}\\s*\\{\\s*${defaultCall}`);
+  patterns.push(`<\\s*${client}\\s*(?:as\\s+(?:(?:::)?(?:std|core)::default::)?Default\\s*)?>::default\\b`);
   return patterns.map((pattern) => new RegExp(pattern));
 }
 
