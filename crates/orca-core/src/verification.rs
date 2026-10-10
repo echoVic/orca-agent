@@ -384,14 +384,17 @@ mod tests {
     fn verifier_command_timeout_kills_descendant_processes() {
         let start = Instant::now();
         let command = platform_verifier_script(
-            "printf before; sleep 10 && printf after",
-            "[Console]::Out.Write('before'); [Console]::Out.Flush(); & \"$env:WINDIR\\System32\\ping.exe\" -n 11 127.0.0.1 > $null; [Console]::Out.Write('after')",
+            "printf before; sleep 30 && printf after",
+            "[Console]::Out.Write('before'); [Console]::Out.Flush(); & \"$env:WINDIR\\System32\\ping.exe\" -n 31 127.0.0.1 > $null; [Console]::Out.Write('after')",
         );
 
-        let result = run_with_timeout(&command, Duration::from_secs(2));
+        // Long enough that process startup cannot consume it (PowerShell on a
+        // loaded Windows runner can take more than 2 s to print "before"), and
+        // far shorter than the 30 s descendant.
+        let result = run_with_timeout(&command, Duration::from_secs(5));
 
         assert!(
-            start.elapsed() < Duration::from_secs(5),
+            start.elapsed() < Duration::from_secs(15),
             "verifier should not wait for descendant processes"
         );
         assert!(!result.success);
