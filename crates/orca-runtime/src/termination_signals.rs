@@ -37,11 +37,14 @@ pub const DUPLICATE_DELIVERY_WINDOW: Duration = Duration::from_millis(500);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TerminationSignal {
     /// SIGINT: Ctrl+C in a terminal or a wrapper script, or `kill -INT`. On
-    /// Windows, the console's Ctrl+C, the only one of these it delivers.
+    /// Windows, the console's Ctrl+C.
     Interrupt,
-    /// SIGTERM: `kill`, a CI cancel or a job timeout.
+    /// SIGTERM: `kill`, a CI cancel or a job timeout. On Windows, the
+    /// console's Ctrl+Break, which a job runner sends to a process group to
+    /// stop it, and the user logging off or the system shutting down.
     Terminate,
-    /// SIGHUP: the controlling terminal went away.
+    /// SIGHUP: the controlling terminal went away. On Windows, its console
+    /// window closed.
     Hangup,
 }
 
@@ -97,8 +100,10 @@ pub struct TerminationSignalGuard {
 /// stderr. Once `finished` is set, a signal is ignored, the thread ends, and
 /// `before_exit` never runs.
 ///
-/// Windows handles only [`TerminationSignal::Interrupt`], as the console's
-/// Ctrl+C. Returns `None`, handling none of them, when the thread or its
+/// On Windows the console's events stand for them (see
+/// [`TerminationSignal`]). Windows ends the process a few seconds after it
+/// reports a closed console, a logoff or a shutdown, whatever the grace
+/// period. Returns `None`, handling none of them, when the thread or its
 /// handlers could not be set up.
 #[must_use = "dropping the guard stops handling the signals"]
 pub fn handle_termination_signals(
@@ -232,7 +237,45 @@ struct Listeners {
     #[cfg(unix)]
     unix: Vec<(TerminationSignal, tokio::signal::unix::Signal)>,
     #[cfg(windows)]
-    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+    windows: Vec<(TerminationSignal, ConsoleEvent)>,
+}
+
+/// A handler for one of the console's events, which stand for the signals on
+/// Windows.
+#[cfg(windows)]
+enum ConsoleEvent {
+    CtrlC(tokio::signal::windows::CtrlC),
+    CtrlBreak(tokio::signal::windows::CtrlBreak),
+    CtrlClose(tokio::signal::windows::CtrlClose),
+    CtrlLogoff(tokio::signal::windows::CtrlLogoff),
+    CtrlShutdown(tokio::signal::windows::CtrlShutdown),
+}
+
+#[cfg(windows)]
+impl ConsoleEvent {
+    /// The handlers of the events that stand for `termination`.
+    fn register(termination: TerminationSignal) -> io::Result<Vec<Self>> {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+        Ok(match termination {
+            TerminationSignal::Interrupt => vec![Self::CtrlC(ctrl_c()?)],
+            TerminationSignal::Terminate => vec![
+                Self::CtrlBreak(ctrl_break()?),
+                Self::CtrlLogoff(ctrl_logoff()?),
+                Self::CtrlShutdown(ctrl_shutdown()?),
+            ],
+            TerminationSignal::Hangup => vec![Self::CtrlClose(ctrl_close()?)],
+        })
+    }
+
+    fn poll_recv(&mut self, context: &mut Context<'_>) -> Poll<Option<()>> {
+        match self {
+            Self::CtrlC(listener) => listener.poll_recv(context),
+            Self::CtrlBreak(listener) => listener.poll_recv(context),
+            Self::CtrlClose(listener) => listener.poll_recv(context),
+            Self::CtrlLogoff(listener) => listener.poll_recv(context),
+            Self::CtrlShutdown(listener) => listener.poll_recv(context),
+        }
+    }
 }
 
 impl Listeners {
@@ -257,12 +300,13 @@ impl Listeners {
         }
         #[cfg(windows)]
         {
-            let ctrl_c = if signals.contains(&TerminationSignal::Interrupt) {
-                Some(tokio::signal::windows::ctrl_c()?)
-            } else {
-                None
-            };
-            Ok(Self { ctrl_c })
+            let mut windows = Vec::new();
+            for &termination in signals {
+                for event in ConsoleEvent::register(termination)? {
+                    windows.push((termination, event));
+                }
+            }
+            Ok(Self { windows })
         }
     }
 
@@ -281,10 +325,10 @@ impl Listeners {
             }
         }
         #[cfg(windows)]
-        if let Some(ctrl_c) = &mut self.ctrl_c
-            && let Poll::Ready(Some(())) = ctrl_c.poll_recv(context)
-        {
-            return Poll::Ready(TerminationSignal::Interrupt);
+        for (termination, listener) in &mut self.windows {
+            if let Poll::Ready(Some(())) = listener.poll_recv(context) {
+                return Poll::Ready(*termination);
+            }
         }
         Poll::Pending
     }
@@ -608,5 +652,91 @@ mod tests {
             "the exit came {waited:?} after the signal that forced it, not just past \
              the {BEFORE_EXIT_BOUND:?} it waits for before_exit"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::os::windows::process::CommandExt as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::{TerminationSignal, handle_termination_signals};
+
+    /// The console's Ctrl+Break, as `GenerateConsoleCtrlEvent` names it.
+    const CTRL_BREAK_EVENT: u32 = 1;
+    /// Starts a process as the leader of a process group of its own, which a
+    /// console event can be sent to alone.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AllocConsole() -> i32;
+        fn GenerateConsoleCtrlEvent(ctrl_event: u32, process_group_id: u32) -> i32;
+    }
+
+    /// A job runner stops a console process group with Ctrl+Break, which
+    /// asks the process to terminate, as SIGTERM does. The test sends it to a
+    /// process group of its own: the test binary run again for just this
+    /// test.
+    #[test]
+    fn ctrl_break_asks_the_process_to_terminate() {
+        const CHILD_ENV: &str = "ORCA_TEST_CONSOLE_EVENT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let home = tempfile::tempdir().expect("an Orca home for the child");
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test executable"),
+            )
+            .args([
+                "--exact",
+                "termination_signals::windows_tests::ctrl_break_asks_the_process_to_terminate",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("ORCA_HOME", home.path())
+            .creation_flags(CREATE_NEW_PROCESS_GROUP)
+            .output()
+            .expect("run the test in a process group of its own");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "Ctrl+Break was not taken for a request to terminate ({}); stdout: {}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // A process started with no console gets one of its own; one that
+        // has one keeps it.
+        unsafe { AllocConsole() };
+        let finished = Arc::new(AtomicBool::new(false));
+        let (acting_tx, acting) = mpsc::channel();
+        let _signals = handle_termination_signals(
+            &[TerminationSignal::Interrupt, TerminationSignal::Terminate],
+            Arc::clone(&finished),
+            move |signal| {
+                let _ = acting_tx.send(signal);
+            },
+            || {},
+        )
+        .expect("the console event handlers");
+        // The child leads its process group, so the event reaches it alone.
+        assert_ne!(
+            unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, std::process::id()) },
+            0,
+            "send Ctrl+Break: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            acting
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the event's action ran"),
+            TerminationSignal::Terminate
+        );
+        finished.store(true, Ordering::SeqCst);
     }
 }

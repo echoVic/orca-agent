@@ -77,7 +77,9 @@ Any signal within half a second of the first counts as the same one: a
 wrapper script or a job runner that signals the whole process group can
 deliver it twice. A signal after that exits at once. If the cleanup takes
 longer than 10 seconds, orca exec exits without waiting for it. On Windows,
-Ctrl+C in the console is handled the same way and exits with 130.
+Ctrl+C in the console is handled the same way and exits with 130; Ctrl+Break,
+which a job runner sends to stop a process group, and a logoff or shutdown are
+handled as SIGTERM and exit with 143.
 
 ## Related commands
 
