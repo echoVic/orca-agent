@@ -101,11 +101,11 @@ impl PrestartReport {
             .send(TuiEvent::McpCatalogPrestart(McpCatalogView::from_registry(
                 registry,
             )));
-        // Once none is starting, what their startup left is said. The
-        // thread that takes them says it again when it is ready, in the
-        // same words, as it reads the same startup: the conversation shows
-        // each warning once.
-        if !*startup_reported && !registry.is_starting() {
+        // Once every first connection has ended, what their startup left is
+        // said. The thread that takes them says it again when it is ready,
+        // in the same words, as it reads the same startup: the conversation
+        // shows each warning once.
+        if !*startup_reported && registry.startup_statuses().is_some() {
             *startup_reported = true;
             for warning in orca_runtime::mcp_startup_warnings(registry) {
                 let _ = self.event_tx.send(TuiEvent::StartupWarning(warning));

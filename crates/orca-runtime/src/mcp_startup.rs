@@ -106,7 +106,9 @@ impl McpStartupWarnings {
     /// Takes the warnings, once, should `registry`'s startup have ended,
     /// and hands them to each report waiting for them.
     fn observe(&self, registry: &McpRegistry) {
-        if registry.is_starting() {
+        // Every first connection must have ended; a reconnect since is no
+        // part of the startup, and does not hold up its warnings.
+        if registry.startup_statuses().is_none() {
             return;
         }
         let (reports, subscription, warnings) = {
@@ -182,6 +184,70 @@ mod tests {
             startup_timeout_ms: Some(15_000),
             ..Default::default()
         }
+    }
+
+    /// A stdio server reconnected after its first connection ended is
+    /// starting again, but its startup is over: the warnings it left come at
+    /// once, not when that reconnect ends.
+    #[cfg(unix)]
+    #[test]
+    fn a_reconnect_after_startup_does_not_hold_up_its_warnings() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let generation = dir.path().join("generation");
+        // The first start answers at once; any later one takes 30 s first.
+        let server = stdio_server(
+            "again",
+            dir.path(),
+            &format!(
+                r#"#!/bin/sh
+if [ -f "{generation}" ]; then
+  sleep 30
+fi
+printf 1 > "{generation}"
+while IFS= read -r line; do
+  id=${{line#*'"id":'}}
+  id=${{id%%,*}}
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"again","version":"1"}}}}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[]}}}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+                generation = generation.display()
+            ),
+        );
+        let registry = orca_mcp::initialize_registry(&[server], None);
+        assert!(registry.wait_for_startup(&|| false));
+        let reconnecting = registry.clone();
+        let reconnect = std::thread::spawn(move || {
+            let _ = reconnecting.reconnect_server("again");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !registry.is_starting() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reconnect never began"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let (report_tx, report_rx) = std::sync::mpsc::channel();
+        let watch = McpStartupWarnings::watch(&registry);
+        watch.on_ended(&registry, move |warnings| {
+            let _ = report_tx.send(warnings);
+        });
+
+        assert_eq!(
+            report_rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(Vec::new()),
+            "the warnings waited for the reconnect"
+        );
+        registry.close();
+        let _ = reconnect.join();
     }
 
     #[test]

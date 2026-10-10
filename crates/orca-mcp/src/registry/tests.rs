@@ -3202,6 +3202,39 @@ fn the_startup_statuses_stay_as_startup_left_them_when_a_reconnect_fails() {
     assert_eq!(registry.startup_statuses(), Some(at_startup));
 }
 
+/// A server whose first connection has ended keeps what it came to in the
+/// startup record, though another server is still on its first connection
+/// when a reconnect of it fails: that failure was told to whoever asked for
+/// the reconnect, and is no failure of startup.
+#[cfg(unix)]
+#[test]
+fn a_reconnect_that_fails_while_another_server_starts_is_no_startup_failure() {
+    let quick_dir = tempfile::tempdir().expect("temp dir");
+    let slow_dir = tempfile::tempdir().expect("temp dir");
+    // Its first start serves, and the next one exits at once.
+    let (mut quick, _, _) = restarting_server_config(quick_dir.path(), None);
+    quick.name = "quick".to_string();
+    let slow = listing_server_config("slow", slow_dir.path(), "[]");
+    delay_starts(slow_dir.path(), "slow", 2);
+    let registry = initialize_registry(&[quick, slow], None);
+    wait_for("the quick server to connect", || {
+        registry.server_statuses()[0].state == McpServerState::Ready
+    });
+
+    registry
+        .reconnect_server("quick")
+        .expect_err("the server cannot start again");
+    assert!(registry.wait_for_startup(&|| false));
+
+    assert_eq!(
+        registry.startup_statuses(),
+        Some(vec![
+            status("quick", McpServerState::Ready),
+            status("slow", McpServerState::Ready),
+        ])
+    );
+}
+
 #[test]
 fn the_startup_statuses_stay_as_startup_left_them_when_a_login_follows() {
     use crate::oauth::test_server::{OAuthTestBehavior, OAuthTestServer};
@@ -4664,6 +4697,7 @@ fn a_snapshot_never_mixes_two_states_of_a_server() {
             prompts: Vec::new(),
             prompts_error: None,
             errors: Vec::new(),
+            startup: None,
         }],
         ..Default::default()
     });
