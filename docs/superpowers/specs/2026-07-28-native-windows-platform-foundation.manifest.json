@@ -205,6 +205,13 @@
       "conpty-tui-plan"
     ],
     [
+      "tui-update-prompt-signal-test",
+      "crates/orca-tui/src/cli.rs",
+      "unix_libc_process",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "verification-unix-command-api",
       "crates/orca-core/src/verification.rs",
       "unix_std_api",

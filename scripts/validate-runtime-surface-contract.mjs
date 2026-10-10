@@ -1205,7 +1205,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   // Ending first-run setup starts the MCP servers held back for it
   // (SetupFinished), and then sends the initial prompt.
   ["crates/orca-tui/src/setup_actions.rs:finish_setup:user_action.route", 2],
-  ["crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:user_action.route", 14],
+  ["crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:user_action.route", 13],
   ["crates/orca-tui/src/slash_command_actions.rs:request_recap:user_action.route", 1],
   ["crates/orca-tui/src/mcp_dialog_actions.rs:start_action:user_action.route", 1],
   ["crates/orca-tui/src/slash_command_actions.rs:run_mcp_prompt:user_action.route", 1],
