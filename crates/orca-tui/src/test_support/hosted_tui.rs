@@ -293,7 +293,7 @@ impl Tui {
                 continue;
             };
             let seen = event.clone();
-            self.state.update(event);
+            self.show(event);
             if done(&self.state, Some(&seen)) {
                 return;
             }
@@ -316,7 +316,30 @@ impl Tui {
                 continue;
             };
             seen(&event);
-            self.state.update(event);
+            self.show(event);
+        }
+    }
+
+    /// Shows the renderer `event` as `orca` does: the word that the turn a
+    /// held message waits for is active, or will not be, ends the hold.
+    fn show(&mut self, event: TuiEvent) {
+        let action_tx = self.state.event_tx.clone();
+        match event {
+            TuiEvent::OperationActive { token } => {
+                crate::idle_submit_actions::release_held_submissions(
+                    &mut self.state,
+                    &action_tx,
+                    token,
+                );
+            }
+            TuiEvent::TurnNotStarted { token } => {
+                crate::idle_submit_actions::continue_held_submissions(
+                    &mut self.state,
+                    &action_tx,
+                    token,
+                );
+            }
+            event => self.state.update(event),
         }
     }
 

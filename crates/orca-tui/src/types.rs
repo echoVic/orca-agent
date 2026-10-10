@@ -603,16 +603,22 @@ pub struct AppState {
     /// shows, and the prompt given with it is sent then. What the user sends
     /// meanwhile is held in `held_submissions`.
     pub(crate) startup_history_pending: bool,
-    /// The history has loaded and the turn that was started after it, with the
-    /// prompt given on the command line or with the first message held, is not
-    /// active yet; the token is the name the submit that started it carries.
-    /// What the user sends is still held, until the operation of that submit is
-    /// active (`TuiEvent::OperationActive` with the token) and a message can
-    /// be queued behind it, or until it is known that it will not be
+    /// A turn was started between turns, with a message sent then, the prompt
+    /// given on the command line after the resumed history loaded, or the
+    /// first message held, and it is not active yet; the token is the name
+    /// the submit that started it carries. What the user sends is held,
+    /// until the operation of that submit is active
+    /// (`TuiEvent::OperationActive` with the token) and a message can be
+    /// queued behind it, or until it is known that it will not be
     /// (`TuiEvent::TurnNotStarted` with the token). The events of any other
     /// submit or operation, which come in the controller's own order, change
-    /// nothing.
-    pub(crate) startup_turn: Option<SubmitToken>,
+    /// nothing. Sent at once, a message took the controller's line behind
+    /// the whole turn, where nothing shows it, and one sent a moment later,
+    /// once the turn was active, the runtime's queue ahead of it.
+    pub(crate) awaited_turn: Option<SubmitToken>,
+    /// Since when the TUI has sat idle with `awaited_turn` still set, for
+    /// [`crate::idle_submit_actions::release_stale_turn_hold`].
+    pub(crate) turn_hold_idle_since: Option<std::time::Instant>,
     /// How many tokens have been given to submits.
     pub(crate) next_submit_token: u64,
     /// What the user sent while the hold lasted, in order.
@@ -1034,7 +1040,8 @@ impl AppState {
             denied_approval_stops_turn: false,
             runtime_turn_id: None,
             startup_history_pending: false,
-            startup_turn: None,
+            awaited_turn: None,
+            turn_hold_idle_since: None,
             next_submit_token: 0,
             held_submissions: Vec::new(),
             setup_step: 0,

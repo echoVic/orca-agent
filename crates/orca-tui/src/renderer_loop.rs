@@ -133,6 +133,9 @@ impl<'a, 'text> RendererLoopOwner<'a, 'text> {
             if flush_expired_insert_escape(now, vim_state, textarea, state, config) {
                 frame.mark_dirty();
             }
+            if crate::idle_submit_actions::release_stale_turn_hold(now, state, action_tx) {
+                frame.mark_dirty();
+            }
             let poll_timeout = frame.prepare_iteration(now, state, presentation);
 
             let input_events =

@@ -50,6 +50,8 @@ impl RendererFrameOwner {
             || state.viewport.copy_notice.is_some()
             || state.viewport.drag_edge_scroll.is_some()
             || state.edit_highlight_needs_tick()
+            // Keeps the loop waking while a turn hold may need ending.
+            || state.awaited_turn.is_some()
             || presentation.animation_active(state.status);
         if state.viewport.copy_notice.is_some() && state.copy_notice_at(now).is_none() {
             state.viewport.copy_notice = None;

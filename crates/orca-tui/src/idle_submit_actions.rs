@@ -265,6 +265,13 @@ pub(crate) fn submit_user_message(
         });
         return;
     }
+    // What is sent before the turn this starts is active waits for it (see
+    // `AppState::awaited_turn`). An attached session's turns are the
+    // daemon's: no word of them comes back by token.
+    let token = (!state.attached_session).then(|| state.new_submit_token());
+    if token.is_some() {
+        state.awaited_turn = token;
+    }
     send_user_message(
         state,
         action_tx,
@@ -272,13 +279,13 @@ pub(crate) fn submit_user_message(
         prompt,
         bindings,
         images,
-        None,
+        token,
     );
 }
 
 /// What [`submit_user_message`] does when nothing is held back. `token` names
 /// the message to the controller, which says it back when the message's turn
-/// is active or will not be: see [`AppState::startup_turn`].
+/// is active or will not be: see [`AppState::awaited_turn`].
 fn send_user_message(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
@@ -306,7 +313,7 @@ fn send_user_message(
 /// given on the command line, if there is one. If the messages the user sent
 /// meanwhile were held, the prompt's turn is the one they wait for, and it is
 /// named by a token that the controller says back when that turn is active
-/// (see [`AppState::startup_turn`]). Without a prompt, the first held message
+/// (see [`AppState::awaited_turn`]). Without a prompt, the first held message
 /// starts its turn instead.
 pub(crate) fn start_turn_after_history(
     state: &mut AppState,
@@ -318,7 +325,7 @@ pub(crate) fn start_turn_after_history(
         Some(prompt) => {
             let token = waited_for_history.then(|| state.new_submit_token());
             if token.is_some() {
-                state.startup_turn = token;
+                state.awaited_turn = token;
             }
             let bindings = MentionBindings::new(&prompt);
             send_user_message(
@@ -345,12 +352,12 @@ pub(crate) fn start_turn_after_history(
 /// there is no prompt to start one.
 pub(crate) fn start_held_turn(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>) {
     if state.held_submissions.is_empty() {
-        state.startup_turn = None;
+        state.awaited_turn = None;
         return;
     }
     let (visible_text, prompt, bindings, images) = state.held_submissions.remove(0).into_plain();
     let token = state.new_submit_token();
-    state.startup_turn = Some(token);
+    state.awaited_turn = Some(token);
     send_user_message(
         state,
         action_tx,
@@ -375,7 +382,7 @@ pub(crate) fn release_held_submissions(
     if !state.waits_for_turn_of(token) {
         return;
     }
-    state.startup_turn = None;
+    state.awaited_turn = None;
     for held in std::mem::take(&mut state.held_submissions) {
         let text = held.visible_text().to_string();
         let queued = held
@@ -402,6 +409,33 @@ pub(crate) fn continue_held_submissions(
     }
 }
 
+/// How long a turn hold may sit idle before it ends on its own.
+pub(crate) const STALE_TURN_HOLD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Ends a turn hold that has sat idle, nothing running, for
+/// [`STALE_TURN_HOLD`]: its submit was refused and the word that its turn did
+/// not start never came, as can happen when another conversation takes the
+/// controller's place right behind it. What is held goes on as if the turn
+/// had not started. Whether it ended one.
+pub(crate) fn release_stale_turn_hold(
+    now: std::time::Instant,
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+) -> bool {
+    if state.awaited_turn.is_none() || state.status != AppStatus::Idle {
+        state.turn_hold_idle_since = None;
+        return false;
+    }
+    let since = *state.turn_hold_idle_since.get_or_insert(now);
+    if now.saturating_duration_since(since) < STALE_TURN_HOLD {
+        return false;
+    }
+    state.turn_hold_idle_since = None;
+    let token = state.awaited_turn;
+    continue_held_submissions(state, action_tx, token);
+    true
+}
+
 fn reset_composer_after_submit(
     textarea: &mut TextArea,
     vim_state: &mut VimState,
@@ -419,6 +453,7 @@ mod tests {
     use super::*;
     use crate::composer_textarea::{make_textarea_with_text, textarea_text};
     use crate::protocol::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiMcpElicitationMode};
+    use crate::queued_input::QueuedUserMessage;
     use crate::test_support::test_run_config;
     use orca_core::cancel::OperationIdAllocator;
     use orca_core::config::ThemeName;
@@ -949,7 +984,7 @@ mod tests {
             ] if text == "inspect [Image #1]" && image.label == "[Image #1]"
         ));
         assert!(state.held_submissions.is_empty());
-        assert!(state.startup_turn.is_some(), "its turn is not active yet");
+        assert!(state.awaited_turn.is_some(), "its turn is not active yet");
     }
 
     /// A skill run with its `/skill-id` alias is held like a message typed
@@ -1045,7 +1080,7 @@ mod tests {
         // the paste in it, as it would have when typed then.
         history_loads(&mut state);
         let token = state.new_submit_token();
-        state.startup_turn = Some(token);
+        state.awaited_turn = Some(token);
         release_held_submissions(&mut state, &action_tx, Some(token));
 
         let Ok(UserAction::QueuePrompt { prompt, .. }) = action_rx.try_recv() else {
@@ -1066,7 +1101,7 @@ mod tests {
             "/tmp".to_string(),
         );
         let token = state.new_submit_token();
-        state.startup_turn = Some(token);
+        state.awaited_turn = Some(token);
         let mut config = test_run_config();
         let shared = Arc::new(Mutex::new(config.clone()));
         let theme = Theme::named(ThemeName::Dark);
@@ -1106,7 +1141,7 @@ mod tests {
             "/tmp".to_string(),
         );
         let token = state.new_submit_token();
-        state.startup_turn = Some(token);
+        state.awaited_turn = Some(token);
         state.held_submissions.push(HeldSubmission::Plain {
             visible_text: "review the diff".to_string(),
             prompt: "review the diff".to_string(),
@@ -1127,5 +1162,101 @@ mod tests {
             Some("could not queue \"review the diff\"")
         );
         assert!(!state.holds_submissions());
+    }
+
+    /// A message sent between turns starts a turn that is not active at
+    /// once. What the user sends before it is waits for it, then joins the
+    /// runtime's queue behind it in order: sent at once, a follow-up took the
+    /// controller's line behind that whole turn, and one sent a moment later,
+    /// once the turn was active, the queue ahead of it.
+    #[test]
+    fn what_is_sent_before_a_new_turn_is_active_waits_and_then_queues_in_order() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let send = |state: &mut AppState, text: &str| {
+            submit_user_message(
+                state,
+                &action_tx,
+                text.to_string(),
+                text.to_string(),
+                MentionBindings::new(text),
+                Vec::new(),
+                Vec::new(),
+            );
+        };
+
+        send(&mut state, "first");
+        let token = match action_rx.try_recv() {
+            Ok(UserAction::SubmitWithMentions { prompt, token, .. }) if prompt == "first" => token,
+            other => panic!("expected the first submit, got {other:?}"),
+        };
+        assert!(token.is_some(), "the turn it starts is named");
+        let follow_up = QueuedUserMessage::from_composer(
+            "second".to_string(),
+            Vec::new(),
+            MentionBindings::default(),
+        )
+        .expect("a follow-up");
+        assert!(crate::queued_input_actions::dispatch_follow_up(
+            &mut state,
+            &action_tx,
+            follow_up,
+            crate::queued_input_actions::FollowUp::Queue,
+        ));
+        assert!(
+            action_rx
+                .try_iter()
+                .all(|action| !matches!(action, UserAction::QueuePrompt { .. })),
+            "the follow-up waits for the turn"
+        );
+
+        release_held_submissions(&mut state, &action_tx, token);
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::QueuePrompt { prompt, .. }) if prompt == "second"
+        ));
+        assert!(!state.holds_submissions());
+    }
+
+    /// A hold whose turn never answers, its submit refused and the word that
+    /// it did not start lost, must not keep what the user sends from ever
+    /// going out: once the TUI has sat idle with nothing running for a while,
+    /// the hold ends as if the turn had not started.
+    #[test]
+    fn a_turn_hold_left_idle_ends_on_its_own() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let token = state.new_submit_token();
+        state.awaited_turn = Some(token);
+        state.held_submissions.push(HeldSubmission::Plain {
+            visible_text: "still waiting".to_string(),
+            prompt: "still waiting".to_string(),
+            bindings: MentionBindings::default(),
+            images: Vec::new(),
+            pending_pastes: Vec::new(),
+        });
+        assert_eq!(state.status, AppStatus::Idle);
+        let now = std::time::Instant::now();
+
+        release_stale_turn_hold(now, &mut state, &action_tx);
+        release_stale_turn_hold(now + STALE_TURN_HOLD / 2, &mut state, &action_tx);
+        assert!(action_rx.try_recv().is_err(), "not yet");
+        release_stale_turn_hold(now + STALE_TURN_HOLD * 2, &mut state, &action_tx);
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == "still waiting"
+        ));
     }
 }

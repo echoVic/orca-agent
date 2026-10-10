@@ -1036,7 +1036,7 @@ mod tests {
         ));
         assert_eq!(tui.state.status, AppStatus::Running);
         assert!(!tui.state.startup_history_pending);
-        assert_eq!(tui.state.startup_turn, Some(token));
+        assert_eq!(tui.state.awaited_turn, Some(token));
         assert_eq!(tui.held(), ["typed"], "still on screen, and only once");
 
         // The operation is active: the message queues behind it, in the
@@ -1051,7 +1051,7 @@ mod tests {
             "{sent:?}"
         );
         assert!(tui.state.held_submissions.is_empty());
-        assert_eq!(tui.state.startup_turn, None);
+        assert_eq!(tui.state.awaited_turn, None);
 
         let (queue, turn_id) = queue_after(&sent[0]);
         tui.receive(TuiEvent::PromptQueueUpdated(queue));
@@ -1128,9 +1128,10 @@ mod tests {
 
         tui.type_and_press_enter("later");
 
+        // Sent at once, under a token: what comes after it waits for its turn.
         assert!(matches!(
             tui.sent().as_slice(),
-            [UserAction::SubmitWithMentions { prompt, token: None, .. }] if prompt == "later"
+            [UserAction::SubmitWithMentions { prompt, token: Some(_), .. }] if prompt == "later"
         ));
         assert_eq!(tui.user_messages(), ["later"]);
         assert!(tui.state.held_submissions.is_empty());
@@ -1444,7 +1445,7 @@ mod tests {
         }
         assert!(tui.sent().is_empty(), "{:?}", tui.sent());
         assert_eq!(tui.held(), ["A"]);
-        assert_eq!(tui.state.startup_turn, Some(token));
+        assert_eq!(tui.state.awaited_turn, Some(token));
 
         // The prompt is what the held messages wait for, and it starts.
         tui.receive(active(token));
@@ -1471,7 +1472,7 @@ mod tests {
 
         assert!(tui.sent().is_empty());
         assert_eq!(tui.held(), ["A"]);
-        assert_eq!(tui.state.startup_turn, Some(token));
+        assert_eq!(tui.state.awaited_turn, Some(token));
     }
 
     #[test]
@@ -1502,7 +1503,7 @@ mod tests {
         let a = token_of(&sent[0]);
         assert_ne!(a, cli);
         assert_eq!(tui.held(), ["B"]);
-        assert_eq!(tui.state.startup_turn, Some(a));
+        assert_eq!(tui.state.awaited_turn, Some(a));
 
         // What the refused prompt says late is not about A.
         tui.receive(TuiEvent::TurnNotStarted { token: Some(cli) });
@@ -1524,7 +1525,7 @@ mod tests {
         );
         let b = token_of(&sent[0]);
         assert!(tui.held().is_empty());
-        assert_eq!(tui.state.startup_turn, Some(b));
+        assert_eq!(tui.state.awaited_turn, Some(b));
 
         // Nothing is left to wait for, and what comes next is not held.
         for event in refused("B", Some(b)) {
@@ -1535,7 +1536,7 @@ mod tests {
         tui.type_and_press_enter("C");
         assert!(matches!(
             tui.sent().as_slice(),
-            [UserAction::SubmitWithMentions { prompt, token: None, .. }] if prompt == "C"
+            [UserAction::SubmitWithMentions { prompt, token: Some(_), .. }] if prompt == "C"
         ));
     }
 
