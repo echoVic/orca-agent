@@ -1450,7 +1450,21 @@ mod tests {
             server.requests_to("/register")[0].json()["redirect_uris"][0],
             format!("http://127.0.0.1:{port}/callback")
         );
-        TcpListener::bind(("127.0.0.1", port)).expect("the callback port is free again");
+        assert_freed(port);
+    }
+
+    /// Asserts that the login has let `port` go. A process another test
+    /// launches as the login ends holds a copy of the login's socket until
+    /// its launch is done, so the port can stay taken a moment longer.
+    fn assert_freed(port: u16) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while let Err(error) = TcpListener::bind(("127.0.0.1", port)) {
+            assert!(
+                Instant::now() < deadline,
+                "the callback port is still taken: {error}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// A port nothing listens on, for a login's callback.
@@ -1518,7 +1532,7 @@ mod tests {
             outcome,
             Err("login to MCP server 'docs' cancelled".to_string())
         );
-        TcpListener::bind(("127.0.0.1", port)).expect("the callback port is free again");
+        assert_freed(port);
         assert!(server.requests_to("/token").is_empty());
     }
 
@@ -1748,7 +1762,7 @@ mod tests {
             // The login is over, with the server still holding its request,
             // and nothing more asked of it; the port is free.
             assert_eq!(server.trail(), trail[..=held], "{path}");
-            TcpListener::bind(("127.0.0.1", port)).expect("the callback port is free");
+            assert_freed(port);
             assert!(
                 opened.try_recv().is_err(),
                 "{path}: a cancelled login opened the browser"
@@ -1785,7 +1799,7 @@ mod tests {
             server.requests_to("/register")[0].json()["redirect_uris"][0],
             format!("http://127.0.0.1:{port}/callback")
         );
-        TcpListener::bind(("127.0.0.1", port)).expect("the callback port is free again");
+        assert_freed(port);
         assert!(
             opened.try_recv().is_err(),
             "a cancelled login opened the browser"
