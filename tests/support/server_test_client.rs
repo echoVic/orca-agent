@@ -1567,7 +1567,7 @@ mod tests {
         let mut client = scripted_client(
             "printf '{\"id\":\"turn\",\"event\":\"turn_completed\",\"status\":\"failed\"}\\n'; sleep 5",
         );
-        client.set_event_timeout(Duration::from_secs(2));
+        client.set_event_timeout(Duration::from_secs(10));
 
         let started = Instant::now();
         let error = client
@@ -1576,7 +1576,10 @@ mod tests {
             })
             .expect_err("terminal predicate mismatch must be impossible");
 
-        assert!(started.elapsed() < Duration::from_millis(500), "{error}");
+        // Long before the script ends its output, 5 s after it starts, and the
+        // deadline: a shell slow to start on a loaded Windows runner is not
+        // the wait this is about.
+        assert!(started.elapsed() < Duration::from_secs(4), "{error}");
         assert!(error.to_string().contains("did not satisfy"), "{error}");
     }
 
