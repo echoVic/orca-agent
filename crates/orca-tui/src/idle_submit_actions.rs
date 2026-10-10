@@ -952,6 +952,65 @@ mod tests {
         assert!(state.startup_turn.is_some(), "its turn is not active yet");
     }
 
+    /// A skill run with its `/skill-id` alias is held like a message typed
+    /// then: sent at once, it went out before the command-line prompt and
+    /// the history coming after washed it off the screen.
+    #[test]
+    fn a_skill_run_typed_before_the_history_loads_is_held() {
+        let skill = format!("held-skill-{}", uuid::Uuid::new_v4().simple());
+        let skill_dir = orca_core::home::orca_home()
+            .expect("the test Orca home")
+            .join("skills")
+            .join(&skill);
+        std::fs::create_dir_all(&skill_dir).expect("the skill's directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: held\ndescription: held before the history\n---\nDo it.\n",
+        )
+        .expect("the skill");
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.startup_history_pending = true;
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text(&format!("/{skill}"), &vim, &theme);
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+        ));
+
+        assert!(action_rx.try_recv().is_err(), "nothing is sent yet");
+        assert_eq!(
+            state
+                .held_submissions_preview()
+                .map(|preview| preview.first),
+            Some(format!("${skill}")),
+            "it is listed above the composer"
+        );
+
+        history_loads(&mut state);
+        start_held_turn(&mut state, &action_tx);
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { prompt, .. }) if prompt == format!("${skill}")
+        ));
+        let _ = std::fs::remove_dir_all(skill_dir);
+    }
+
     #[test]
     fn a_held_message_queued_behind_a_turn_sends_what_was_pasted_into_it() {
         let (action_tx, action_rx) = mpsc::unbounded();

@@ -378,9 +378,18 @@ fn dispatch_slash_command(
                 None => format!("${id}"),
             };
             state.record_prompt(prompt.clone());
-            state.push_message(ChatMessage::User(prompt.clone()));
-            state.enter_running();
-            let _ = action_tx.send(UserAction::Submit(prompt));
+            // Sent as a message from the composer is: held while the
+            // conversation resumed at launch still loads.
+            let bindings = orca_runtime::mentions::MentionBindings::new(&prompt);
+            crate::idle_submit_actions::submit_user_message(
+                state,
+                action_tx,
+                prompt.clone(),
+                prompt,
+                bindings,
+                Vec::new(),
+                Vec::new(),
+            );
         }
         SlashCommand::WorkflowList => {
             state.show_workflows();
