@@ -72,6 +72,17 @@ impl TuiDiagnostic {
     pub(crate) fn from_message(context: DiagnosticContext, message: impl Into<String>) -> Self {
         let message = message.into();
         let lower = message.to_ascii_lowercase();
+        // A prompt whose connection went before its answer came may have run:
+        // a lost connection to look into, not a network failure to retry.
+        if lower.contains("delivery is uncertain") {
+            return Self::new(
+                DiagnosticLevel::Warning,
+                "connection.disconnected",
+                "Connection lost",
+                message,
+                Some(LOST_CONNECTION_ACTION),
+            );
+        }
         let (code, title, action) = if contains_any(
             &lower,
             &[
@@ -370,9 +381,7 @@ impl TuiDiagnostic {
                 "connection.disconnected",
                 "Connection lost",
                 "The client disconnected before the task outcome was confirmed.",
-                Some(
-                    "Reconnect and inspect the restored session before resubmitting; Orca does not automatically resend uncertain prompts.",
-                ),
+                Some(LOST_CONNECTION_ACTION),
             )),
             "failed" | "error" => Some(Self::new(
                 DiagnosticLevel::Error,
@@ -614,6 +623,9 @@ fn bounded_detail(detail: String) -> String {
     format!("{}... [diagnostic truncated]", &detail[..end])
 }
 
+/// What to do about a task whose connection went before its outcome came.
+const LOST_CONNECTION_ACTION: &str = "Reconnect and inspect the restored session before resubmitting; Orca does not automatically resend uncertain prompts.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,6 +642,26 @@ mod tests {
         assert_eq!(diagnostic.title(), "Provider limit reached");
         assert!(diagnostic.detail().contains("429"));
         assert!(diagnostic.action().unwrap().contains("quota"));
+    }
+
+    /// A prompt the ACP daemon hung up on may have run: it is a lost
+    /// connection to look into, not a network failure to retry.
+    #[test]
+    fn a_prompt_lost_with_its_connection_is_not_a_failure_to_retry() {
+        let diagnostic = TuiDiagnostic::from_message(
+            DiagnosticContext::Input,
+            "ACP disconnected; prompt delivery is uncertain. Inspect the reloaded session \
+             before resubmitting. Nothing was resent.",
+        );
+
+        assert_eq!(diagnostic.code(), "connection.disconnected");
+        assert_eq!(diagnostic.level(), DiagnosticLevel::Warning);
+        assert!(diagnostic.detail().contains("Nothing was resent"));
+        assert!(
+            !diagnostic.action().unwrap().contains("retry"),
+            "{:?}",
+            diagnostic.action()
+        );
     }
 
     #[test]
