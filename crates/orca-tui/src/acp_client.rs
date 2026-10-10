@@ -64,9 +64,27 @@ struct ProjectionMeta {
     phase: Option<String>,
     active: Option<bool>,
     stop_reason: Option<StopReason>,
-    error: Option<agent_client_protocol::Error>,
+    error: Option<TerminalError>,
     terminal: Option<orca_runtime::surface::OperationTerminal>,
     usage: Option<orca_runtime::surface::UsageTotals>,
+}
+
+/// Why a turn failed, as projection metadata carries it.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum TerminalError {
+    Standard(agent_client_protocol::Error),
+    /// What daemons up to v0.5.8 sent.
+    Text(String),
+}
+
+impl std::fmt::Display for TerminalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Standard(error) => error.fmt(f),
+            Self::Text(text) => f.write_str(text),
+        }
+    }
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -1980,6 +1998,61 @@ mod tests {
         );
     }
 
+    /// The terminal metadata a daemon up to v0.5.8 sent for a turn that failed:
+    /// the error as plain text beside the typed terminal.
+    fn legacy_failed_terminal(phase: &str) -> SessionNotification {
+        note(
+            SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new()),
+            json!({
+                "version": 1,
+                "phase": phase,
+                "active": false,
+                "terminal": {"AbortedByRuntimeRestart": {"last_generation": 0}},
+                "stopReason": null,
+                "error": "ACP operation aborted by runtime restart",
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_older_daemons_failed_turn_ends_the_turn_without_a_reload() {
+        let (client, events, _) = client();
+        let mut renderer = Renderer::new();
+        client
+            .session_notification(phase("ready", true))
+            .await
+            .unwrap();
+        client
+            .session_notification(legacy_failed_terminal("terminal"))
+            .await
+            .unwrap();
+        renderer.drain(&events);
+
+        assert!(!client.reload.get());
+        assert_eq!(renderer.state.status, crate::types::AppStatus::Idle);
+        assert!(
+            renderer
+                .state
+                .transcript
+                .messages
+                .iter()
+                .any(|row| matches!(row, ChatMessage::Diagnostic(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_daemons_snapshot_after_a_failed_turn_finishes_loading() {
+        let (client, _events, _) = client();
+        client
+            .session_notification(legacy_failed_terminal("ready"))
+            .await
+            .unwrap();
+
+        // Asking to reload would load the same snapshot again, forever.
+        assert!(!client.reload.get());
+        assert!(client.projection.borrow().ready);
+    }
+
     #[tokio::test]
     async fn typed_terminal_metadata_preserves_failure_class_and_action() {
         let (client, events, _) = client();
@@ -2003,6 +2076,9 @@ mod tests {
                     "phase": "terminal",
                     "active": false,
                     "terminal": terminal,
+                    "stopReason": null,
+                    "error": agent_client_protocol::Error::internal_error()
+                        .data("DeepSeek returned 503 Service Unavailable"),
                 }),
             ))
             .await

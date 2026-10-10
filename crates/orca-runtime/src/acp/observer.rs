@@ -107,8 +107,11 @@ fn state_with_terminal(
         let outcome = super::agent::terminal_to_stop_reason(terminal);
         projection["stopReason"] =
             serde_json::to_value(outcome.as_ref().ok()).expect("ACP stop reason serializes");
-        projection["error"] =
-            serde_json::to_value(outcome.err()).expect("ACP terminal error serializes");
+        // The standard error the prompt's owner receives for the same turn.
+        let error = outcome
+            .err()
+            .map(|message| Error::internal_error().data(message));
+        projection["error"] = serde_json::to_value(error).expect("ACP terminal error serializes");
     }
     sender.send(
         SessionNotification::new(

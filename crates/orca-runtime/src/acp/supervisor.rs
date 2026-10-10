@@ -4696,12 +4696,16 @@ mod tests {
                 match completion {
                     Completion::OwnerResponse => assert_eq!(outcome["stopReason"], "end_turn"),
                     Completion::Cancel => assert_eq!(outcome["stopReason"], "cancelled"),
-                    Completion::Disconnect => assert!(
-                        outcome["error"]
-                            .as_str()
-                            .is_some_and(|error| !error.is_empty()),
-                        "owner disconnect must fail the pending read: {terminal}"
-                    ),
+                    // The same standard error the owner's prompt gets.
+                    Completion::Disconnect => {
+                        assert_eq!(outcome["error"]["code"], -32603, "{terminal}");
+                        assert!(
+                            outcome["error"]["data"]
+                                .as_str()
+                                .is_some_and(|error| !error.is_empty()),
+                            "owner disconnect must fail the pending read: {terminal}"
+                        );
+                    }
                 }
                 write_raw_response(
                     &mut observer_write,
