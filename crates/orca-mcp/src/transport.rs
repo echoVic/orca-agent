@@ -2260,6 +2260,11 @@ async fn read_bounded_async_sse_response(
                 continue;
             }
         };
+        // As in `read_sse_stream`: a body that comes faster than the wait
+        // above never lets it run out, so a cancel is looked for here too.
+        if cancel.load(Ordering::Acquire) {
+            return Err("MCP tool call cancelled".to_string());
+        }
         let Some(chunk) = chunk else {
             break;
         };
@@ -4259,6 +4264,55 @@ done
             returned_after < CANCEL_AFTER + Duration::from_millis(150),
             "the call returned {returned_after:?} after it began, cancelled after \
              {CANCEL_AFTER:?}, with a stream that lasts {STREAM_FOR:?}"
+        );
+    }
+
+    /// The same for a JSON body that keeps coming: it is read whole, so a
+    /// cancel must not wait for its end either.
+    #[test]
+    fn a_cancel_stops_a_call_whose_json_body_keeps_coming() {
+        const STREAM_FOR: Duration = Duration::from_secs(5);
+        const CANCEL_AFTER: Duration = Duration::from_millis(100);
+        let server = OneShotSseServer::start(|stream| {
+            let _ = read_http_request(stream);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
+            );
+            // Whitespace every 5 ms, until the body ends or the client hangs up.
+            let ends = Instant::now() + STREAM_FOR;
+            while Instant::now() < ends
+                && stream
+                    .write_all(b"    ")
+                    .and_then(|()| stream.flush())
+                    .is_ok()
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let config = McpServerConfig {
+            name: "streaming".to_string(),
+            transport: McpTransportKind::Http,
+            url: Some(server.url()),
+            startup_timeout_ms: Some(10_000),
+            tool_timeout_ms: Some(10_000),
+            ..Default::default()
+        };
+        let transport =
+            StreamableHttpTransport::new(&config, no_auth(&config)).expect("an HTTP transport");
+        let started = Instant::now();
+
+        let error = transport
+            .call_tool_with_elicitation_handler_or_cancel("slow", json!({}), None, &|| {
+                started.elapsed() >= CANCEL_AFTER
+            })
+            .expect_err("the call is cancelled");
+        let returned_after = started.elapsed();
+
+        assert_eq!(error, "MCP tool call cancelled");
+        assert!(
+            returned_after < CANCEL_AFTER + Duration::from_millis(150),
+            "the call returned {returned_after:?} after it began, cancelled after \
+             {CANCEL_AFTER:?}, with a body that lasts {STREAM_FOR:?}"
         );
     }
 
