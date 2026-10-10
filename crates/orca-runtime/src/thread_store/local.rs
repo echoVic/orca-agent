@@ -496,6 +496,15 @@ pub fn list_session_page(
     session_index::list_page(offset, limit, include_archived, search_term)
 }
 
+/// A page of unarchived sessions whose working directory is exactly `cwd`.
+pub fn list_session_page_in_cwd(
+    offset: usize,
+    limit: usize,
+    cwd: &str,
+) -> io::Result<SessionSummaryPage> {
+    session_index::list_page_in_cwd(offset, limit, cwd)
+}
+
 pub fn list_sessions_with_archived(
     limit: usize,
     include_archived: bool,

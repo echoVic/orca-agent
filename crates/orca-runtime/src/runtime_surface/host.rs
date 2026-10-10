@@ -63,6 +63,16 @@ impl RuntimeSurfaceHostHandle {
         crate::history::list_session_page(offset, limit, false, search_term)
     }
 
+    /// Like [`Self::list_saved_session_page`], counting only sessions whose
+    /// working directory is exactly `cwd`.
+    pub fn list_saved_session_page_in_cwd(
+        offset: usize,
+        limit: usize,
+        cwd: &str,
+    ) -> std::io::Result<crate::history::SessionSummaryPage> {
+        crate::history::list_session_page_in_cwd(offset, limit, cwd)
+    }
+
     pub fn load_saved_session(
         selector: &str,
     ) -> std::io::Result<crate::history::SessionTranscript> {

@@ -21,8 +21,8 @@ pub(crate) use local::orca_home;
 pub(crate) use local::sessions_dir;
 pub use local::{
     JsonlThreadStore, SearchHit, SessionStore, archive_session, compress_session, delete_session,
-    list_session_page, list_sessions, list_sessions_with_archived, load_session, rename_session,
-    search_sessions,
+    list_session_page, list_session_page_in_cwd, list_sessions, list_sessions_with_archived,
+    load_session, rename_session, search_sessions,
 };
 pub(crate) use pagination::{page_thread_items, page_thread_turns};
 pub(crate) use projection::{

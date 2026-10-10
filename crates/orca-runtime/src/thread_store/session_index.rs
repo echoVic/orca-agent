@@ -39,6 +39,17 @@ pub(crate) fn list_page(
     list_page_at(&home, offset, limit, include_archived, search_term)
 }
 
+/// Like [`list_page`] without archived sessions or a title search, counting
+/// only sessions whose working directory is exactly `cwd`.
+pub(crate) fn list_page_in_cwd(
+    offset: usize,
+    limit: usize,
+    cwd: &str,
+) -> io::Result<SessionSummaryPage> {
+    let home = orca_home();
+    list_page_filtered(&home, offset, limit, false, None, Some(cwd))
+}
+
 fn list_page_at(
     home: &Path,
     offset: usize,
@@ -46,15 +57,30 @@ fn list_page_at(
     include_archived: bool,
     search_term: Option<&str>,
 ) -> io::Result<SessionSummaryPage> {
+    list_page_filtered(home, offset, limit, include_archived, search_term, None)
+}
+
+fn list_page_filtered(
+    home: &Path,
+    offset: usize,
+    limit: usize,
+    include_archived: bool,
+    search_term: Option<&str>,
+    cwd: Option<&str>,
+) -> io::Result<SessionSummaryPage> {
     let mut connection = open_index(&home)?;
     seed_recent_if_empty(&mut connection, home, include_archived)?;
     spawn_backfill_if_needed(home.to_path_buf());
 
     let page_size = limit.max(1);
+    // A cached summary that is not JSON matches no cwd rather than failing
+    // the page.
     let sql = "SELECT summary_json, path, archived, updated_at_ms
          FROM sessions
          WHERE (?1 = 1 OR archived = 0)
            AND (?2 = '' OR instr(lower(title), lower(?2)) > 0)
+           AND (?5 IS NULL OR CASE WHEN json_valid(summary_json)
+                THEN json_extract(summary_json, '$.cwd') END = ?5)
          ORDER BY updated_at_ms DESC, created_at_ms DESC, session_id DESC
          LIMIT ?3 OFFSET ?4";
     let mut statement = connection.prepare(sql).map_err(io::Error::other)?;
@@ -64,7 +90,8 @@ fn list_page_at(
                 include_archived,
                 search_term.unwrap_or_default(),
                 i64::try_from(page_size.saturating_add(1)).unwrap_or(i64::MAX),
-                i64::try_from(offset).unwrap_or(i64::MAX)
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                cwd
             ],
             |row| {
                 let summary_json: String = row.get(0)?;
@@ -805,6 +832,62 @@ mod tests {
     }
 
     #[test]
+    fn a_cwd_page_counts_only_sessions_in_that_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let connection = open_index(home.path()).unwrap();
+        let mine = home.path().join("mine");
+        // Another workspace's sessions are the most recent ones.
+        for index in 0..30 {
+            let cwd = if index < 3 { &mine } else { home.path() };
+            let summary = write_legacy_session_in(home.path(), index, cwd);
+            upsert_summary_with_connection(&connection, &summary).unwrap();
+        }
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO index_meta(key, value)
+                 VALUES('backfill_complete', '1')",
+                [],
+            )
+            .unwrap();
+        let ids = |page: &SessionSummaryPage| {
+            page.sessions
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mine = mine.to_str().unwrap();
+        let first = list_page_filtered(home.path(), 0, 2, false, None, Some(mine)).unwrap();
+        assert_eq!(ids(&first), ["session-02", "session-01"]);
+        assert_eq!(first.next_offset, Some(2));
+        let second = list_page_filtered(home.path(), 2, 2, false, None, Some(mine)).unwrap();
+        assert_eq!(ids(&second), ["session-00"]);
+        assert_eq!(second.next_offset, None);
+    }
+
+    #[test]
+    fn a_cwd_page_skips_a_cached_summary_that_is_not_json() {
+        let home = tempfile::tempdir().unwrap();
+        let connection = open_index(home.path()).unwrap();
+        for index in 0..2 {
+            let summary = write_legacy_session(home.path(), index);
+            upsert_summary_with_connection(&connection, &summary).unwrap();
+        }
+        connection
+            .execute(
+                "UPDATE sessions SET summary_json = 'not json'
+                 WHERE session_id = 'session-00'",
+                [],
+            )
+            .unwrap();
+
+        let cwd = home.path().to_str().unwrap();
+        let page = list_page_filtered(home.path(), 0, 20, false, None, Some(cwd)).unwrap();
+        assert_eq!(page.sessions.len(), 1);
+        assert_eq!(page.sessions[0].session_id, "session-01");
+    }
+
+    #[test]
     fn corrupt_index_rebuilds_and_legacy_sessions_backfill() {
         let home = tempfile::tempdir().unwrap();
 
@@ -1063,8 +1146,12 @@ mod tests {
     }
 
     fn write_legacy_session(home: &Path, index: usize) -> SessionSummary {
+        write_legacy_session_in(home, index, home)
+    }
+
+    fn write_legacy_session_in(home: &Path, index: usize, cwd: &Path) -> SessionSummary {
         let mut meta = history::create_meta(
-            home,
+            cwd,
             "mock",
             Some("model".to_string()),
             &format!("indexed session {index:02}"),

@@ -22,7 +22,8 @@ pub use crate::thread_store::{
     StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn, StoredThreadTurnPage,
     ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore,
     TurnItemsView, archive_session, compress_session, delete_session, list_session_page,
-    list_sessions, list_sessions_with_archived, load_session, rename_session, search_sessions,
+    list_session_page_in_cwd, list_sessions, list_sessions_with_archived, load_session,
+    rename_session, search_sessions,
 };
 
 const SESSION_SCHEMA_VERSION: u32 = 1;

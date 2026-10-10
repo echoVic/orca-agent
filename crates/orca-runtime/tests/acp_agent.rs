@@ -15,9 +15,9 @@ use std::time::Duration;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AudioContent, CancelNotification, ClientCapabilities, ContentBlock, EmbeddedResource,
-    EmbeddedResourceResource, FileSystemCapabilities, InitializeRequest, LoadSessionRequest,
-    NewSessionRequest, PromptRequest, ResourceLink, SessionId, SessionNotification, SessionUpdate,
-    StopReason, TextResourceContents,
+    EmbeddedResourceResource, FileSystemCapabilities, InitializeRequest, ListSessionsRequest,
+    LoadSessionRequest, NewSessionRequest, PromptRequest, ResourceLink, SessionId,
+    SessionNotification, SessionUpdate, StopReason, TextResourceContents,
 };
 use orca_core::cancel::CancelToken;
 use orca_core::config::{
@@ -31,6 +31,7 @@ use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_config::SubagentConfig;
 use orca_core::thread_identity::TurnId;
 use orca_runtime::acp::OrcaAcpAgent;
+use orca_runtime::history::SessionWriter;
 use orca_runtime::model_response::RuntimeModelResponse;
 use orca_runtime::runtime_host::{
     GenerationContext, HostedTurnRequest, RuntimeHost, ThreadOperationExecutor,
@@ -489,6 +490,48 @@ fn acp_load_session_replaces_persisted_additional_directories() {
         )]
     );
     second_host.shutdown().expect("shutdown second host");
+}
+
+#[test]
+fn acp_session_list_pages_only_the_requested_cwd() {
+    let _home = OrcaHomeGuard::new();
+    let base_cwd = tempfile::tempdir().unwrap();
+    let mine = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    // More sessions than a page holds, all newer than the one asked for.
+    SessionWriter::start(mine.path(), "mock", None, "mine").unwrap();
+    for index in 0..101 {
+        SessionWriter::start(other.path(), "mock", None, &format!("other {index}")).unwrap();
+    }
+    orca_runtime::history::list_sessions_with_archived(usize::MAX, false).unwrap();
+    let host = RuntimeHost::start_with_executor(Arc::new(AcpTestExecutor::new(vec![])))
+        .expect("start host");
+    let (note_tx, _note_rx) = mpsc::channel::<SessionNotification>(256);
+    let agent = OrcaAcpAgent::new(
+        host.surface_handle(),
+        test_config(base_cwd.path().to_path_buf()),
+        note_tx,
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let page = tokio::task::LocalSet::new().block_on(&rt, async {
+        initialize_agent(&agent).await;
+        agent
+            .list_sessions(
+                ListSessionsRequest::new().cwd(mine.path().to_path_buf()),
+                Vec::new(),
+            )
+            .await
+            .expect("session/list")
+    });
+
+    assert_eq!(page.sessions.len(), 1, "{page:?}");
+    assert_eq!(page.sessions[0].cwd, mine.path());
+    assert_eq!(page.next_cursor, None);
+    host.shutdown().expect("shutdown");
 }
 
 #[test]

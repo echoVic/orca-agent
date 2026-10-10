@@ -3265,8 +3265,17 @@ impl OrcaAcpAgent {
             .transpose()
             .map_err(|_| Error::invalid_params().data("invalid session list cursor"))?
             .unwrap_or(0);
-        let page = tokio::task::spawn_blocking(move || {
-            RuntimeSurfaceHostHandle::list_saved_session_page(offset, 100, None)
+        // Filter while paging, or a page could come back empty ahead of the
+        // sessions asked for. Saved sessions keep a lexically normal cwd.
+        let filter = cwd
+            .as_deref()
+            .map(|cwd| cwd.components().collect::<PathBuf>())
+            .map(|cwd| cwd.to_string_lossy().into_owned());
+        let page = tokio::task::spawn_blocking(move || match filter {
+            Some(cwd) => {
+                RuntimeSurfaceHostHandle::list_saved_session_page_in_cwd(offset, 100, &cwd)
+            }
+            None => RuntimeSurfaceHostHandle::list_saved_session_page(offset, 100, None),
         })
         .await
         .map_err(Error::into_internal_error)?
