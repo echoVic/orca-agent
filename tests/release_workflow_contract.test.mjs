@@ -63,3 +63,15 @@ test("final verification always runs and rejects a partial publication", () => {
     assert.match(workflow, new RegExp(`test "\\$${variable}" = success`));
   }
 });
+
+test("the Windows npm smoke waits until npm installs the runner's platform package", () => {
+  const verify = workflow.slice(workflow.indexOf("  verify-windows:"), workflow.indexOf("- name: Smoke the published PowerShell installer"));
+  for (const alias of ["@blade-ai/orca-win32-x64", "@blade-ai/orca-win32-arm64"]) {
+    assert.match(verify, new RegExp(`npm_alias: "${alias}"`));
+  }
+  // npm installs the main package without an optional dependency it cannot
+  // resolve yet, so a successful install alone does not end the wait.
+  assert.match(verify, /\$platform = Join-Path \$root "node_modules\/\$\{\{ matrix\.npm_alias \}\}\/package\.json"/);
+  assert.match(verify, /if \(\$LASTEXITCODE -eq 0 -and \(Test-Path \$platform\)\) \{ break \}/);
+  assert.match(verify, /--prefer-online/);
+});

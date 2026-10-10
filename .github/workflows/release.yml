@@ -463,8 +463,10 @@ jobs:
         include:
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
+            npm_alias: "@blade-ai/orca-win32-x64"
           - runner: windows-11-arm
             target: aarch64-pc-windows-msvc
+            npm_alias: "@blade-ai/orca-win32-arm64"
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -483,13 +485,17 @@ jobs:
           New-Item -ItemType Directory -Force -Path $root | Out-Null
           Set-Content -Path (Join-Path $root "package.json") -Value '{"private":true}'
           Push-Location $root
-          # npm can take minutes after a publish to serve the new version.
+          # npm can take minutes after a publish to serve the new version, and
+          # until it serves this runner's platform package it installs the main
+          # one without it, so wait for both.
+          $platform = Join-Path $root "node_modules/${{ matrix.npm_alias }}/package.json"
           $attempts = 60
           for ($attempt = 1; $attempt -le $attempts; $attempt++) {
-            npm install --ignore-scripts --save-exact "@blade-ai/orca@${{ needs.version.outputs.version }}"
-            if ($LASTEXITCODE -eq 0) { break }
-            if ($attempt -eq $attempts) { throw "npm install failed $attempts times" }
-            Write-Host "npm install attempt $attempt/$attempts failed; retrying in 15s"
+            npm install --ignore-scripts --save-exact --prefer-online "@blade-ai/orca@${{ needs.version.outputs.version }}"
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $platform)) { break }
+            if ($attempt -eq $attempts) { throw "npm install did not bring ${{ matrix.npm_alias }} in $attempts attempts" }
+            Write-Host "npm install attempt $attempt/$attempts failed or lacked ${{ matrix.npm_alias }}; retrying in 15s"
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $root "node_modules"), (Join-Path $root "package-lock.json")
             Start-Sleep -Seconds 15
           }
           node (Join-Path $root "node_modules/@blade-ai/orca/bin/orca.js") --version
