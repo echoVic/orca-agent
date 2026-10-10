@@ -1426,10 +1426,11 @@ fn sigtstp_stops_the_tui_under_a_job_control_shell_and_fg_brings_it_back() {
     );
     assert!(contains_rendered_text(&output[stopped_at..], "Stopped"));
 
-    process.write(b"fg\r").expect("bring orca back");
-    wait_for_process_state(pid, |state| !state.contains('T'), "continued");
+    // Marked before `fg`: the TUI may redraw before the test sees it run.
     process.drain_output(&mut output);
     let continued_at = output.len();
+    process.write(b"fg\r").expect("bring orca back");
+    wait_for_process_state(pid, |state| !state.contains('T'), "continued");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !contains_rendered_text(&output[continued_at..], "Message Orca") {
         assert!(
