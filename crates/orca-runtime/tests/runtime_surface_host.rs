@@ -39,6 +39,51 @@ use orca_runtime::surface::{
 };
 
 static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Points ORCA_HOME at a home of the test's own until dropped, holding
+/// [`ORCA_HOME_TEST_LOCK`] meanwhile, and puts it back even when the test
+/// panics. The runtimes these tests start read the process-wide ORCA_HOME,
+/// so under a threaded harness no two may share it, see it change mid-test,
+/// or have it removed under them; nor may one panic poison the lock for the
+/// rest.
+struct OrcaHomeGuard {
+    previous: Option<std::ffi::OsString>,
+    _home: Option<tempfile::TempDir>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl OrcaHomeGuard {
+    /// A fresh temporary home.
+    fn fresh() -> Self {
+        let home = tempdir().expect("temporary ORCA_HOME");
+        let mut guard = Self::at(home.path());
+        guard._home = Some(home);
+        guard
+    }
+
+    /// `home`, which the test keeps.
+    fn at(home: &std::path::Path) -> Self {
+        let lock = ORCA_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home) };
+        Self {
+            previous,
+            _home: None,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for OrcaHomeGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+}
 const EPHEMERAL_CONFIG_CHILD_ENV: &str = "ORCA_RUNTIME_SURFACE_EPHEMERAL_CONFIG_CHILD";
 const EPHEMERAL_CONFIG_CWD_ENV: &str = "ORCA_RUNTIME_SURFACE_EPHEMERAL_CONFIG_CWD";
 
@@ -66,6 +111,7 @@ impl ThreadOperationExecutor for ObserveAutoMemoryExecutor {
 
 #[test]
 fn closed_host_facade_starts_a_typed_thread_surface() {
+    let _home = OrcaHomeGuard::fresh();
     let cwd = tempdir().expect("temp cwd");
     let host = RuntimeHost::start().expect("runtime host");
     let surface_host = host.surface_handle();
@@ -97,6 +143,7 @@ fn closed_host_facade_starts_a_typed_thread_surface() {
 
 #[test]
 fn explicit_history_disabled_one_shot_starts_an_ephemeral_typed_surface() {
+    let _home = OrcaHomeGuard::fresh();
     if std::env::var_os(EPHEMERAL_CONFIG_CHILD_ENV).is_none() {
         let home = tempdir().expect("temporary ORCA_HOME");
         let cwd = tempdir().expect("temp cwd");
@@ -251,6 +298,7 @@ fn explicit_history_disabled_one_shot_starts_an_ephemeral_typed_surface() {
 
 #[test]
 fn not_admitted_one_shot_closes_and_rejects_reuse() {
+    let _home = OrcaHomeGuard::fresh();
     let cwd = tempdir().expect("temp cwd");
     let host = RuntimeHost::start().expect("runtime host");
     let mut config = test_config(cwd.path().to_path_buf());
@@ -343,6 +391,7 @@ fn not_admitted_one_shot_closes_and_rejects_reuse() {
 
 #[test]
 fn typed_thread_snapshot_preserves_configured_additional_directories() {
+    let _home = OrcaHomeGuard::fresh();
     let cwd = tempdir().expect("temp cwd");
     let extra = tempdir().expect("additional cwd");
     let host = RuntimeHost::start().expect("runtime host");
@@ -404,6 +453,7 @@ fn typed_thread_snapshot_preserves_configured_additional_directories() {
 
 #[test]
 fn unbound_thread_facade_does_not_issue_acp_surface_authority() {
+    let _home = OrcaHomeGuard::fresh();
     let cwd = tempdir().expect("temp cwd");
     let host = RuntimeHost::start().expect("runtime host");
     let thread = host
@@ -416,6 +466,7 @@ fn unbound_thread_facade_does_not_issue_acp_surface_authority() {
 
 #[test]
 fn tui_surface_can_commit_and_publish_pinned_context() {
+    let _home = OrcaHomeGuard::fresh();
     let cwd = tempdir().expect("temp cwd");
     let host = RuntimeHost::start().expect("runtime host");
     let thread = host
@@ -465,6 +516,7 @@ fn tui_surface_can_commit_and_publish_pinned_context() {
 
 #[test]
 fn tui_surface_manual_compaction_is_durable_before_terminal() {
+    let _home = OrcaHomeGuard::fresh();
     let cwd = tempdir().expect("temp cwd");
     let host = RuntimeHost::start().expect("runtime host");
     let thread = host
@@ -554,6 +606,7 @@ fn tui_surface_manual_compaction_is_durable_before_terminal() {
 
 #[test]
 fn typed_thread_expands_mentions_with_runtime_owned_registry() {
+    let _home = OrcaHomeGuard::fresh();
     let cwd = tempdir().expect("temp cwd");
     fs::write(cwd.path().join("context.txt"), "runtime-owned context").expect("context file");
     let root = cwd.path().canonicalize().expect("canonical cwd");
@@ -587,6 +640,7 @@ fn typed_thread_expands_mentions_with_runtime_owned_registry() {
 
 #[test]
 fn typed_thread_discovers_mention_catalog_with_runtime_owned_registry() {
+    let _home = OrcaHomeGuard::fresh();
     let cwd = tempdir().expect("temp cwd");
     let manifest_dir = cwd.path().join(".orca/plugins/github/.codex-plugin");
     fs::create_dir_all(&manifest_dir).expect("plugin directory");
@@ -615,6 +669,7 @@ fn typed_thread_discovers_mention_catalog_with_runtime_owned_registry() {
 
 #[test]
 fn closed_thread_facade_owns_task_control_and_background_approval() {
+    let _home = OrcaHomeGuard::fresh();
     let cwd = tempdir().expect("temp cwd");
     let host = RuntimeHost::start().expect("runtime host");
     let runtime_thread = host
@@ -679,7 +734,6 @@ fn typed_workflow_launch_commits_task_workflow_and_operation_before_returning() 
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
     }
-    let _lock = ORCA_HOME_TEST_LOCK.lock().unwrap();
     let home = tempdir().expect("temporary ORCA_HOME");
     let cwd = tempdir().expect("workflow cwd");
     let workflow_dir = cwd.path().join(".orca").join("workflows");
@@ -695,8 +749,7 @@ fn typed_workflow_launch_commits_task_workflow_and_operation_before_returning() 
         orca_core::config::folder_trust::TrustLevel::Trusted,
     )
     .expect("trusted workflow workspace");
-    let previous_home = std::env::var_os("ORCA_HOME");
-    unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+    let _home = OrcaHomeGuard::at(home.path());
 
     let mut config = test_config(cwd.path().to_path_buf());
     config.approval_mode = ApprovalMode::FullAuto;
@@ -962,10 +1015,6 @@ fn typed_workflow_launch_commits_task_workflow_and_operation_before_returning() 
         &operation.operation_id == operation_id && operation.terminal.is_some()
     }));
     restarted_host.shutdown().expect("shutdown restarted host");
-    match previous_home {
-        Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
-        None => unsafe { std::env::remove_var("ORCA_HOME") },
-    }
 }
 
 #[test]
@@ -973,7 +1022,6 @@ fn typed_workflow_background_cancel_commits_stop_and_terminalizes() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
     }
-    let _lock = ORCA_HOME_TEST_LOCK.lock().unwrap();
     let home = tempdir().expect("temporary ORCA_HOME");
     let cwd = tempdir().expect("workflow cwd");
     let workflow_dir = cwd.path().join(".orca").join("workflows");
@@ -989,8 +1037,7 @@ fn typed_workflow_background_cancel_commits_stop_and_terminalizes() {
         orca_core::config::folder_trust::TrustLevel::Trusted,
     )
     .expect("trusted workflow workspace");
-    let previous_home = std::env::var_os("ORCA_HOME");
-    unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+    let _home = OrcaHomeGuard::at(home.path());
 
     let mut config = test_config(cwd.path().to_path_buf());
     config.approval_mode = ApprovalMode::FullAuto;
@@ -1095,10 +1142,6 @@ fn typed_workflow_background_cancel_commits_stop_and_terminalizes() {
     }));
 
     host.shutdown().expect("shutdown runtime host");
-    match previous_home {
-        Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-        None => unsafe { std::env::remove_var("ORCA_HOME") },
-    }
 }
 
 #[test]
@@ -1106,7 +1149,6 @@ fn restarted_runtime_terminalizes_an_inflight_typed_workflow_and_its_task() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
     }
-    let _lock = ORCA_HOME_TEST_LOCK.lock().unwrap();
     let home = tempdir().expect("temporary ORCA_HOME");
     let cwd = tempdir().expect("workflow cwd");
     let workflow_dir = cwd.path().join(".orca").join("workflows");
@@ -1122,8 +1164,7 @@ fn restarted_runtime_terminalizes_an_inflight_typed_workflow_and_its_task() {
         orca_core::config::folder_trust::TrustLevel::Trusted,
     )
     .expect("trusted workflow workspace");
-    let previous_home = std::env::var_os("ORCA_HOME");
-    unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+    let _home = OrcaHomeGuard::at(home.path());
 
     let mut config = test_config(cwd.path().to_path_buf());
     config.approval_mode = ApprovalMode::FullAuto;
@@ -1217,10 +1258,6 @@ fn restarted_runtime_terminalizes_an_inflight_typed_workflow_and_its_task() {
             )
     }));
     restarted_host.shutdown().expect("shutdown restarted host");
-    match previous_home {
-        Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
-        None => unsafe { std::env::remove_var("ORCA_HOME") },
-    }
 }
 
 #[test]
@@ -1228,7 +1265,6 @@ fn cold_owner_takeover_reconciles_crashed_workflow_task_and_operation() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
     }
-    let _lock = ORCA_HOME_TEST_LOCK.lock().unwrap();
     let home = tempdir().expect("temporary ORCA_HOME");
     let cwd = tempdir().expect("workflow cwd");
     let workflow_dir = cwd.path().join(".orca").join("workflows");
@@ -1278,8 +1314,7 @@ fn cold_owner_takeover_reconciles_crashed_workflow_task_and_operation() {
         .expect("fixture workflow run id");
     let task_id = identity["task_id"].as_str().expect("fixture task id");
 
-    let previous_home = std::env::var_os("ORCA_HOME");
-    unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+    let _home = OrcaHomeGuard::at(home.path());
     let transcript =
         orca_runtime::history::load_session(&session_id).expect("crashed workflow session");
     wait_for_crashed_owner_lease(&transcript.path);
@@ -1320,10 +1355,6 @@ fn cold_owner_takeover_reconciles_crashed_workflow_task_and_operation() {
             && task.status == orca_runtime::surface::SurfaceTaskStatus::Stopped
     }));
     host.shutdown().expect("shutdown takeover host");
-    match previous_home {
-        Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
-        None => unsafe { std::env::remove_var("ORCA_HOME") },
-    }
 }
 
 #[test]
@@ -1331,7 +1362,6 @@ fn cold_owner_takeover_settles_workflow_when_task_exists_but_run_state_is_missin
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
     }
-    let _lock = ORCA_HOME_TEST_LOCK.lock().unwrap();
     let home = tempdir().expect("temporary ORCA_HOME");
     let cwd = tempdir().expect("workflow cwd");
     let workflow_dir = cwd.path().join(".orca").join("workflows");
@@ -1395,8 +1425,7 @@ fn cold_owner_takeover_settles_workflow_when_task_exists_but_run_state_is_missin
     fs::remove_file(&run_state_path)
         .expect("simulate crash after TaskRegistry persistence but before run state creation");
 
-    let previous_home = std::env::var_os("ORCA_HOME");
-    unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+    let _home = OrcaHomeGuard::at(home.path());
     let transcript =
         orca_runtime::history::load_session(&session_id).expect("crashed workflow session");
     wait_for_crashed_owner_lease(&transcript.path);
@@ -1443,10 +1472,6 @@ fn cold_owner_takeover_settles_workflow_when_task_exists_but_run_state_is_missin
         "cold takeover must retire stale durable worker ownership"
     );
     host.shutdown().expect("shutdown takeover host");
-    match previous_home {
-        Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
-        None => unsafe { std::env::remove_var("ORCA_HOME") },
-    }
 }
 
 #[test]
@@ -1454,7 +1479,6 @@ fn cold_owner_takeover_preserves_durable_workflow_success_before_projection() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
     }
-    let _lock = ORCA_HOME_TEST_LOCK.lock().unwrap();
     let home = tempdir().expect("temporary ORCA_HOME");
     let cwd = tempdir().expect("workflow cwd");
     let workflow_dir = cwd.path().join(".orca").join("workflows");
@@ -1540,8 +1564,7 @@ fn cold_owner_takeover_preserves_durable_workflow_success_before_projection() {
     )
     .expect("persist workflow outcome before TaskRegistry projection");
 
-    let previous_home = std::env::var_os("ORCA_HOME");
-    unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+    let _home = OrcaHomeGuard::at(home.path());
     let transcript =
         orca_runtime::history::load_session(&session_id).expect("crashed workflow session");
     wait_for_crashed_owner_lease(&transcript.path);
@@ -1596,10 +1619,6 @@ fn cold_owner_takeover_preserves_durable_workflow_success_before_projection() {
             .expect("workflow worker JSON");
     assert_eq!(worker["active"], false);
     host.shutdown().expect("shutdown takeover host");
-    match previous_home {
-        Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
-        None => unsafe { std::env::remove_var("ORCA_HOME") },
-    }
 }
 
 #[test]
@@ -1607,7 +1626,6 @@ fn workflow_launch_replay_uses_surface_identity_when_activation_store_is_missing
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
     }
-    let _lock = ORCA_HOME_TEST_LOCK.lock().unwrap();
     let home = tempdir().expect("temporary ORCA_HOME");
     let cwd = tempdir().expect("workflow cwd");
     let workflow_dir = cwd.path().join(".orca").join("workflows");
@@ -1682,8 +1700,7 @@ fn workflow_launch_replay_uses_surface_identity_when_activation_store_is_missing
     fixture.0.kill().expect("crash held workflow fixture");
     fixture.0.wait().expect("reap held workflow fixture");
 
-    let previous_home = std::env::var_os("ORCA_HOME");
-    unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+    let _home = OrcaHomeGuard::at(home.path());
     let transcript =
         orca_runtime::history::load_session(&session_id).expect("crashed workflow session");
     wait_for_crashed_owner_lease(&transcript.path);
@@ -1729,10 +1746,6 @@ fn workflow_launch_replay_uses_surface_identity_when_activation_store_is_missing
                 && value.operation_id == Some(operation_id)
     ));
     host.shutdown().expect("shutdown takeover host");
-    match previous_home {
-        Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
-        None => unsafe { std::env::remove_var("ORCA_HOME") },
-    }
 }
 
 #[test]
