@@ -208,9 +208,7 @@ fn finish_setup(
     let _ = action_tx.send(UserAction::SetupFinished);
 
     if let Some(prompt) = initial_prompt {
-        state.push_message(ChatMessage::User(prompt.clone()));
-        state.enter_running();
-        let _ = action_tx.send(UserAction::Submit(prompt));
+        crate::idle_submit_actions::submit_command_line_prompt(state, action_tx, prompt);
     }
 }
 
@@ -421,10 +419,14 @@ mod tests {
             action_rx.try_recv(),
             Ok(UserAction::SetupFinished)
         ));
+        // The prompt starts its turn as a message sent from the composer
+        // does: what the user sends before that turn is active waits for it
+        // instead of going down the controller's line behind the whole turn.
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::Submit(prompt)) if prompt == "hello"
+            Ok(UserAction::SubmitWithMentions { prompt, token: Some(_), .. }) if prompt == "hello"
         ));
+        assert!(state.holds_submissions());
     }
 
     /// Reproduces the reported leak: a key typed into the composer while the

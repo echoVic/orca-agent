@@ -336,9 +336,7 @@ fn run_tui_inner(
         make_setup_textarea(pending_terminal_session.theme())
     } else {
         if !needs_setup && let Some(prompt) = initial_prompt.clone() {
-            state.push_message(ChatMessage::User(prompt.clone()));
-            state.enter_running();
-            let _ = action_tx.send(UserAction::Submit(prompt));
+            crate::idle_submit_actions::submit_command_line_prompt(&mut state, &action_tx, prompt);
         }
         make_textarea(&vim_state, pending_terminal_session.theme())
     };

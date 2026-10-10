@@ -283,6 +283,26 @@ pub(crate) fn submit_user_message(
     );
 }
 
+/// Sends the prompt given on the command line to start a new conversation,
+/// as a message from the composer is sent: what the user sends before its
+/// turn is active waits for it (see [`submit_user_message`]).
+pub(crate) fn submit_command_line_prompt(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+    prompt: String,
+) {
+    let bindings = MentionBindings::new(&prompt);
+    submit_user_message(
+        state,
+        action_tx,
+        prompt.clone(),
+        prompt,
+        bindings,
+        Vec::new(),
+        Vec::new(),
+    );
+}
+
 /// What [`submit_user_message`] does when nothing is held back. `token` names
 /// the message to the controller, which says it back when the message's turn
 /// is active or will not be: see [`AppState::awaited_turn`].

@@ -146,6 +146,50 @@ fn tui_cancel_returns_to_idle_through_the_runtime_surface() {
     );
 }
 
+/// A message sent the moment the command-line prompt's turn has started
+/// joins the queue behind it, in view. It used to go down the controller's
+/// line behind that whole turn, where nothing showed it, as if it were lost.
+#[test]
+fn a_message_sent_as_the_command_line_prompt_starts_is_queued_behind_it() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let released = cwd.path().join("released");
+    let mut process = PtyProcess::spawn_with_prompt(
+        home.path(),
+        cwd.path(),
+        &format!("mock_stream_release_marker {}", released.display()),
+    )
+    .expect("spawn TUI in PTY");
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    receive_until(
+        &process,
+        &mut output,
+        "Running 0s",
+        Duration::from_secs(20),
+        "the prompt's turn did not start",
+    );
+    process.write(b"sent at once\r").expect("send a message");
+
+    receive_until(
+        &process,
+        &mut output,
+        "Queued 1",
+        Duration::from_secs(10),
+        "the message was not queued while the prompt's turn ran",
+    );
+    assert!(
+        reconstruct_screen(&output).contains("sent at once"),
+        "the queue does not list the message; reconstructed screen=\n{}",
+        reconstruct_screen(&output)
+    );
+
+    cancel_running_turn_and_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
 /// A queued message the runtime has sent leaves the queue strip: it is the
 /// turn under way, which the conversation shows as the user's message, and
 /// the strip lists only what still waits. It used to stay at the top of the

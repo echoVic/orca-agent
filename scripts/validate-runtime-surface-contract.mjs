@@ -1155,7 +1155,6 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/prestart_mcp.rs:start_prestart_mcp:catalog.mutate", 1],
   ["crates/orca-tui/src/mcp_server_actions.rs:reconnect_prestarted:catalog.mutate", 1],
   ["crates/orca-tui/src/mcp_prompt_actions.rs:expand_prompt_on:catalog.mutate", 1],
-  ["crates/orca-tui/src/app.rs:run_tui_inner:user_action.route", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:host.shutdown", 1],
   ["crates/orca-tui/src/background_tasks.rs:handle_hosted_task_action:task.mutate", 5],
   [
@@ -1204,7 +1203,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:credentials.update", 2],
   // Ending first-run setup starts the MCP servers held back for it
   // (SetupFinished), and then sends the initial prompt.
-  ["crates/orca-tui/src/setup_actions.rs:finish_setup:user_action.route", 2],
+  ["crates/orca-tui/src/setup_actions.rs:finish_setup:user_action.route", 1],
   ["crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:user_action.route", 13],
   ["crates/orca-tui/src/slash_command_actions.rs:request_recap:user_action.route", 1],
   ["crates/orca-tui/src/mcp_dialog_actions.rs:start_action:user_action.route", 1],
