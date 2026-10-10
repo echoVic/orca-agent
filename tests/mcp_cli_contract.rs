@@ -546,7 +546,7 @@ struct SeenRequest {
 }
 
 /// A hand-rolled streamable HTTP MCP server, following the client in
-/// `crates/orca-mcp/src/transport.rs` (`StreamableHttpTransport`): it checks
+/// `crates/orca-mcp/src/transport/http.rs` (`StreamableHttpTransport`): it checks
 /// `Accept`, hands out a session ID on `initialize`, answers a notification
 /// with 202, accepts the closing `DELETE`, and answers everything with a
 /// plain `application/json` body. It advertises one read-only tool, `fetch`.

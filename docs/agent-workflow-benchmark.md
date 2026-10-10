@@ -69,7 +69,7 @@ All 8 agents were launched concurrently via `Promise.all()` in the `research` ph
 
 | Question | Answer | Source Evidence |
 |----------|--------|-----------------|
-| Transport protocols | stdio and SSE | `orca-mcp/src/transport.rs` |
+| Transport protocols | stdio and SSE | `orca-mcp/src/transport/` |
 | Dynamic discovery | At startup only (configured servers) | `config/mod.rs` — `mcp_servers: Vec<McpServerConfig>` loaded at init |
 | Namespacing | `mcp__<server>__<tool>` pattern | `README.md` — "namespaced tool names" |
 | Runtime health check | Not implemented | No liveness/heartbeat in `client.rs` |

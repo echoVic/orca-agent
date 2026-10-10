@@ -377,7 +377,7 @@ for (const [boundaryId] of baseline.foundation_exceptions) {
 
 const atomicJobSpawnContracts = [
   ["crates/orca-core/src/verification.rs", "launch_user_trusted("],
-  ["crates/orca-mcp/src/transport.rs", "launch_user_trusted("],
+  ["crates/orca-mcp/src/transport/stdio.rs", "launch_user_trusted("],
   ["crates/orca-runtime/src/hooks.rs", "launch_user_trusted("],
   ["crates/orca-runtime/src/subagent_async_worker.rs", "launch_user_trusted("],
   ["crates/orca-runtime/src/workflow/host.rs", "launch_user_trusted("],
@@ -424,7 +424,7 @@ assert.ok(
   "Windows process lookup must resolve PATHEXT launcher shims",
 );
 assert.ok(
-  readFileSync(path.join(repoRoot, "crates/orca-mcp/src/transport.rs"), "utf8").includes("resolve_program(command)"),
+  readFileSync(path.join(repoRoot, "crates/orca-mcp/src/transport/stdio.rs"), "utf8").includes("resolve_program(command)"),
   "MCP stdio launches must use the Windows PATHEXT-aware program resolver",
 );
 const toolProcessSource = readFileSync(

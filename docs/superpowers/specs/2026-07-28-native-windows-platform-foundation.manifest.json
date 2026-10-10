@@ -248,7 +248,7 @@
     ],
     [
       "mcp-transport-unix-process-api",
-      "crates/orca-mcp/src/transport.rs",
+      "crates/orca-mcp/src/transport/stdio.rs",
       "unix_std_api",
       4,
       "process-ownership-plan"
