@@ -3,6 +3,10 @@ use std::process::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
+#[path = "support/restricted_shell.rs"]
+mod restricted_shell;
+use restricted_shell::host_refuses_restricted_shells;
+
 #[test]
 fn suggest_denies_write_in_jsonl_mode() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
@@ -74,6 +78,9 @@ fn auto_edit_allows_sandboxed_shell_in_jsonl_mode() {
 
 #[test]
 fn permission_allow_rule_allows_matching_shell_in_jsonl_mode() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     if !matches!(
         orca_tools::sandbox::enforcement_state(),
         orca_core::capability::EnforcementState::Enforced

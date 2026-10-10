@@ -2787,6 +2787,38 @@ mod tests {
     /// How long a test server waits for the command under test to connect.
     const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 
+    /// Whether a test of what restricted commands do is skipped: where
+    /// bubblewrap cannot make its namespaces and only Landlock works, as in
+    /// a default Docker container, every restricted shell is refused (its
+    /// policy hides the Orca home from a global read, which Landlock cannot
+    /// enforce), and there is nothing to observe.
+    fn host_refuses_restricted_shells() -> bool {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let hidden = scratch.path().join("hidden");
+        std::fs::create_dir(&hidden).expect("hidden directory");
+        let refusal = orca_tools::sandbox::read_only_policy_refusal(
+            &orca_tools::sandbox::ReadOnlySandboxCommandContext {
+                command: "true",
+                cwd: scratch.path(),
+                readable_roots: &[],
+                additional_roots: &[],
+                metadata_writable_roots: &[],
+                denied_roots: std::slice::from_ref(&hidden),
+                network_access: false,
+                allow_global_read: true,
+                allowed_unix_socket_roots: &[],
+            },
+            &orca_tools::sandbox::enforcement_decision(),
+        );
+        if let Some(refusal) = &refusal {
+            eprintln!(
+                "skipped: this host runs no restricted shell: {}",
+                refusal.detail
+            );
+        }
+        refusal.is_some()
+    }
+
     /// Accepts the one connection a test server expects. It fails the test
     /// when the command never connects, where a plain `accept` would hang
     /// it, and with it every test the harness runs beside it.
@@ -3662,6 +3694,9 @@ extends = "parent"
     #[cfg(not(windows))]
     #[test]
     fn command_exec_permission_profile_domain_policy_blocks_denied_http_request() {
+        if host_refuses_restricted_shells() {
+            return;
+        }
         let mut config = test_run_config();
         let file_config: orca_core::config::file::FileConfig = toml::from_str(
             r#"
@@ -3706,6 +3741,9 @@ enabled = true
     #[cfg(not(windows))]
     #[test]
     fn command_exec_permission_profile_domain_policy_reports_blocked_host() {
+        if host_refuses_restricted_shells() {
+            return;
+        }
         let mut config = test_run_config();
         let file_config: orca_core::config::file::FileConfig = toml::from_str(
             r#"
@@ -4775,6 +4813,9 @@ enabled = true
     #[cfg(not(windows))]
     #[test]
     fn command_exec_permission_profile_domain_policy_allows_http_request() {
+        if host_refuses_restricted_shells() {
+            return;
+        }
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
         let port = listener.local_addr().expect("server addr").port();
         let server = std::thread::spawn(move || {
@@ -4836,6 +4877,9 @@ enabled = true
     #[cfg(not(windows))]
     #[test]
     fn command_exec_permission_profile_domain_policy_blocks_unallowlisted_local_request() {
+        if host_refuses_restricted_shells() {
+            return;
+        }
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
         let port = listener.local_addr().expect("server addr").port();
         let mut config = test_run_config();
@@ -4887,6 +4931,9 @@ enabled = true
     #[cfg(not(windows))]
     #[test]
     fn command_exec_permission_profile_domain_policy_blocks_localhost_resolution() {
+        if host_refuses_restricted_shells() {
+            return;
+        }
         let mut config = test_run_config();
         let file_config: orca_core::config::file::FileConfig = toml::from_str(
             r#"

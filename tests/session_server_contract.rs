@@ -14,11 +14,14 @@ use orca_runtime::history::SessionStore;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
+#[path = "support/restricted_shell.rs"]
+mod restricted_shell;
 #[path = "support/sandbox_test_parent.rs"]
 mod sandbox_test_support;
 #[path = "support/server_test_client.rs"]
 mod server_test_client;
 
+use restricted_shell::host_refuses_restricted_shells;
 use sandbox_test_support::sandbox_test_parent;
 use server_test_client::ServerTestClient;
 
@@ -3030,6 +3033,9 @@ fn server_mode_rejects_turn_control_thread_mismatch() {
 
 #[test]
 fn server_mode_controls_runtime_shell_session() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -3162,6 +3168,9 @@ fn server_mode_controls_runtime_shell_session() {
 
 #[test]
 fn server_mode_command_exec_returns_buffered_output() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -3282,6 +3291,9 @@ fn server_mode_command_exec_preserves_native_windows_argv() {
 
 #[test]
 fn server_mode_command_exec_preserves_legacy_script_command() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -3331,6 +3343,9 @@ fn server_mode_command_exec_preserves_legacy_script_command() {
 
 #[test]
 fn server_mode_command_exec_honors_cwd_and_env_overrides() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let command_dir = workspace.path().join("command-dir");
     std::fs::create_dir(&command_dir).expect("create command cwd");
@@ -3486,6 +3501,9 @@ fn server_mode_command_exec_uses_thread_additional_working_directories() {
 #[cfg(not(windows))]
 #[test]
 fn server_mode_command_exec_uses_session_network_domain_grants() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let home = tempdir().expect("orca home");
     let home_path = home.path();
     let workspace_root = tempdir().expect("workspace");
@@ -3684,6 +3702,9 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
 #[cfg(not(windows))]
 #[test]
 fn server_mode_session_network_deny_overrides_permission_profile_allow() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let home = tempdir().expect("orca home");
     let home_path = home.path();
     let workspace_root = tempdir().expect("workspace");
@@ -4788,6 +4809,9 @@ fn server_mode_command_exec_configured_permission_profile_materializes_minimal_s
 
 #[test]
 fn server_mode_command_exec_configured_permission_profile_enforces_network_domain_policy() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     with_orca_home(|home| {
         let workspace = tempdir().expect("workspace");
         std::fs::write(
@@ -5352,6 +5376,9 @@ fn server_mode_command_exec_workspace_write_allows_slash_tmp_by_default() {
 
 #[test]
 fn server_mode_command_exec_respects_buffered_output_cap() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -5402,6 +5429,9 @@ fn server_mode_command_exec_respects_buffered_output_cap() {
 
 #[test]
 fn server_mode_command_exec_caps_buffered_output_by_bytes() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -5492,6 +5522,9 @@ fn server_mode_command_exec_rejects_invalid_option_combinations() {
 
 #[test]
 fn server_mode_command_exec_with_process_id_can_be_terminated() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let started_marker = workspace.path().join("command-started");
     let release_marker = workspace.path().join("command-release");
@@ -5575,6 +5608,9 @@ fn server_mode_command_exec_with_process_id_can_be_terminated() {
 
 #[test]
 fn server_mode_command_exec_stops_active_processes_when_input_closes() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let started_marker = workspace.path().join("command-started");
     let release_marker = workspace.path().join("command-release");
@@ -5641,6 +5677,9 @@ fn server_mode_command_exec_stops_active_processes_when_input_closes() {
 #[cfg(unix)]
 #[test]
 fn server_mode_shell_stops_active_process_group_when_input_closes() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let started_marker = workspace.path().join("shell-started");
     let release_marker = workspace.path().join("shell-release");
@@ -5705,6 +5744,9 @@ fn server_mode_shell_stops_active_process_group_when_input_closes() {
 
 #[test]
 fn server_mode_command_exec_rejects_duplicate_active_process_id() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let duplicate_marker = workspace.path().join("duplicate-started");
     let duplicate_marker_arg = duplicate_marker.to_str().expect("marker path");
@@ -5792,6 +5834,9 @@ fn server_mode_command_exec_rejects_duplicate_active_process_id() {
 
 #[test]
 fn server_mode_command_exec_list_returns_active_process_snapshots() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let started_marker = workspace.path().join("command-started");
     let release_marker = workspace.path().join("command-release");
@@ -5925,6 +5970,9 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
 
 #[test]
 fn server_mode_command_exec_write_requires_input_or_close() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -5995,6 +6043,9 @@ fn server_mode_command_exec_write_requires_input_or_close() {
 
 #[test]
 fn server_mode_command_exec_resize_rejects_zero_dimensions() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -6066,6 +6117,9 @@ fn server_mode_command_exec_resize_rejects_zero_dimensions() {
 
 #[test]
 fn server_mode_command_exec_streams_output_and_accepts_write() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -6140,6 +6194,9 @@ fn server_mode_command_exec_streams_output_and_accepts_write() {
 
 #[test]
 fn server_mode_command_exec_read_drains_streaming_output() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let release_marker = workspace.path().join("command-release");
     let release_marker_arg = release_marker.to_str().expect("release marker path");
@@ -6236,6 +6293,9 @@ fn server_mode_command_exec_read_drains_streaming_output() {
 
 #[test]
 fn server_mode_command_exec_read_caps_streaming_output() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let release_marker = workspace.path().join("command-cap-release");
     let release_marker_arg = release_marker.to_str().expect("release marker path");
@@ -6344,6 +6404,9 @@ fn server_mode_command_exec_read_caps_streaming_output() {
 
 #[test]
 fn server_mode_command_exec_streaming_respects_output_cap() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let started_marker = workspace.path().join("stream-cap-started");
     let started_marker_arg = started_marker.to_str().expect("started marker path");
@@ -6435,6 +6498,9 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
 
 #[test]
 fn server_mode_command_exec_caps_streaming_output_by_bytes() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let started_marker = workspace.path().join("stream-byte-cap-started");
     let started_marker_arg = started_marker.to_str().expect("started marker path");
@@ -6519,6 +6585,9 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
 #[cfg(unix)]
 #[test]
 fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let started_marker = workspace.path().join("tty-size-started");
     let started_marker_arg = started_marker.to_str().expect("started marker path");
@@ -6659,6 +6728,9 @@ fn server_mode_reports_shell_capabilities() {
 
 #[test]
 fn server_mode_kills_runtime_shell_session() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -6743,6 +6815,9 @@ fn server_mode_kills_runtime_shell_session() {
 
 #[test]
 fn server_mode_task_stop_reaps_runtime_shell_session() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let home = workspace.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
@@ -6854,6 +6929,9 @@ fn server_mode_task_stop_reaps_runtime_shell_session() {
 
 #[test]
 fn server_mode_reads_runtime_shell_session_incrementally() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -6957,6 +7035,9 @@ fn server_mode_reads_runtime_shell_session_incrementally() {
 
 #[test]
 fn server_mode_shell_read_honors_output_byte_cap() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -7041,6 +7122,9 @@ fn server_mode_shell_read_honors_output_byte_cap() {
 
 #[test]
 fn server_mode_lists_runtime_shell_sessions() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let command = platform_shell_script(
         "printf ready; sleep 30",
@@ -7112,6 +7196,9 @@ fn server_mode_lists_runtime_shell_sessions() {
 
 #[test]
 fn server_mode_updates_runtime_shell_session_description() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -7189,6 +7276,9 @@ fn server_mode_updates_runtime_shell_session_description() {
 #[cfg(unix)]
 #[test]
 fn server_mode_starts_runtime_shell_session_with_pty() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -7252,6 +7342,9 @@ fn server_mode_starts_runtime_shell_session_with_pty() {
 #[cfg(unix)]
 #[test]
 fn server_mode_resizes_runtime_shell_pty_session() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -7346,6 +7439,9 @@ fn server_mode_resizes_runtime_shell_pty_session() {
 #[cfg(unix)]
 #[test]
 fn server_mode_starts_runtime_shell_pty_session_with_initial_size() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -7410,6 +7506,9 @@ fn server_mode_starts_runtime_shell_pty_session_with_initial_size() {
 
 #[test]
 fn server_mode_rejects_resize_for_pipe_shell_session() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()
         .args([
@@ -8603,6 +8702,9 @@ fn server_mode_permission_updates_remove_directories_by_destination() {
 
 #[test]
 fn server_mode_request_permissions_waits_for_permission_response() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let parent = sandbox_test_parent("orca-request-permissions-turn-");
     let workspace = parent.path().join("workspace");
     let home = parent.path().join("home");
@@ -8815,6 +8917,9 @@ fn server_mode_input_eof_cancels_pending_user_input_request() {
 
 #[test]
 fn server_mode_request_permissions_propagates_strict_auto_review() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let home = workspace.path().join("home");
     let extra = workspace.path().join("extra");
@@ -8944,6 +9049,9 @@ fn server_mode_request_permissions_propagates_strict_auto_review() {
 
 #[test]
 fn server_mode_request_permissions_strict_auto_review_prompts_subsequent_command() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let home = workspace.path().join("home");
     let extra = workspace.path().join("extra");
@@ -9209,6 +9317,9 @@ fn server_mode_lists_and_searches_threads() {
 
 #[test]
 fn server_mode_request_permissions_session_scope_persists_directory_grant() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let parent = sandbox_test_parent("orca-request-permissions-session-");
     let workspace = parent.path().join("workspace");
     let home = parent.path().join("home");
@@ -9342,6 +9453,9 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
 
 #[test]
 fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let parent = sandbox_test_parent("orca-request-permissions-entries-");
     let workspace = parent.path().join("workspace");
     let home = parent.path().join("home");
@@ -9479,6 +9593,9 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
 
 #[test]
 fn server_mode_request_permissions_session_scope_accepts_workspace_roots_entries() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let home = workspace.path().join("home");
     let docs = workspace.path().join("docs");
@@ -9602,6 +9719,9 @@ fn server_mode_request_permissions_session_scope_accepts_workspace_roots_entries
 
 #[test]
 fn server_mode_turn_start_rebinds_runtime_workspace_roots_for_permission_grants() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let home = workspace.path().join("home");
     let old_root = workspace.path().join("old-root");

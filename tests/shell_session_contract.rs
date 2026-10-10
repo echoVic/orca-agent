@@ -12,6 +12,10 @@ use orca_runtime::shell_session::{
 };
 use orca_runtime::tasks::TaskRegistry;
 
+#[path = "support/restricted_shell.rs"]
+mod restricted_shell;
+use restricted_shell::host_refuses_restricted_shells;
+
 #[cfg(windows)]
 static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -116,6 +120,9 @@ fn marker_wait_script(started: &Path, release: &Path) -> String {
 
 #[test]
 fn shell_session_runs_interactive_stdin_and_records_task_result() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let tasks = TaskRegistry::new("session-shell".to_string());
@@ -168,6 +175,9 @@ fn shell_session_runs_interactive_stdin_and_records_task_result() {
 
 #[test]
 fn shell_session_applies_environment_overrides_and_unsets() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let tasks = TaskRegistry::new("session-shell".to_string());
@@ -245,6 +255,9 @@ fn sandboxed_shell_session_cannot_override_seatbelt_marker() {
 
 #[test]
 fn shell_session_kill_stops_running_task_and_collects_partial_output() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let started_marker = temp.path().join("shell-kill-started");
@@ -339,6 +352,9 @@ fn shell_session_kill_preserves_already_exited_terminal_with_buffered_output() {
 
 #[test]
 fn shell_session_reaps_task_stop_requests() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let started_marker = temp.path().join("shell-started");
@@ -399,6 +415,9 @@ fn wait_for_path(path: &std::path::Path) {
 
 #[test]
 fn shell_session_read_returns_incremental_output_without_waiting_for_exit() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let started_marker = temp.path().join("shell-started");
@@ -530,6 +549,9 @@ fn shell_session_updates_description_for_list_snapshots() {
 
 #[test]
 fn shell_session_terminate_all_preserves_natural_completion() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let _windows_sandbox = prepare_windows_sandbox(temp.path());
     let tasks = TaskRegistry::new("session-shell".to_string());
@@ -573,6 +595,9 @@ fn shell_session_terminate_all_preserves_natural_completion() {
 #[cfg(unix)]
 #[test]
 fn shell_session_pty_exposes_terminal_to_child_process() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks);
@@ -613,6 +638,9 @@ fn shell_session_pty_exposes_terminal_to_child_process() {
 #[cfg(unix)]
 #[test]
 fn shell_session_pty_starts_with_configured_window_size() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks);
