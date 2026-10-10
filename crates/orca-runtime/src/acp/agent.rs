@@ -1614,12 +1614,45 @@ fn replay_surface_snapshot(
     Ok(())
 }
 
+/// The snapshot's items in the order a client shows them. The surface keeps
+/// a response's message before its reasoning; a turn's run of assistant items
+/// replays its reasoning first, the order they streamed in and the TUI's
+/// restored history shows.
+fn replay_order(items: &[SurfaceItem]) -> Vec<&SurfaceItem> {
+    fn assistant_turn(item: &SurfaceItem) -> Option<&crate::runtime_surface::SurfaceTurnId> {
+        match item {
+            SurfaceItem::AssistantMessage { turn_id, .. }
+            | SurfaceItem::AssistantReasoning { turn_id, .. }
+            | SurfaceItem::AssistantPlan { turn_id, .. } => Some(turn_id),
+            _ => None,
+        }
+    }
+    let reasoning = |item: &&SurfaceItem| matches!(item, SurfaceItem::AssistantReasoning { .. });
+    let mut ordered = Vec::with_capacity(items.len());
+    let mut index = 0;
+    while index < items.len() {
+        let Some(turn_id) = assistant_turn(&items[index]) else {
+            ordered.push(&items[index]);
+            index += 1;
+            continue;
+        };
+        let start = index;
+        while index < items.len() && assistant_turn(&items[index]) == Some(turn_id) {
+            index += 1;
+        }
+        let run = &items[start..index];
+        ordered.extend(run.iter().filter(reasoning));
+        ordered.extend(run.iter().filter(|item| !reasoning(item)));
+    }
+    ordered
+}
+
 pub(super) fn replay_snapshot(
     snapshot: &crate::runtime_surface::SurfaceSnapshot,
     session_id: &SessionId,
     note_tx: &AcpNotificationSender,
 ) {
-    for item in snapshot.items.iter() {
+    for item in replay_order(&snapshot.items) {
         let update = match item {
             SurfaceItem::UserMessage { input, .. } => replay_user_update(input),
             SurfaceItem::AssistantMessage { text, .. } => Some(SessionUpdate::AgentMessageChunk(

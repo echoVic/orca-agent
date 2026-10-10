@@ -1054,6 +1054,75 @@ fn acp_typed_load_replays_surface_history_after_restart() {
     second_host.shutdown().expect("shutdown second host");
 }
 
+/// A loaded session replays a response's reasoning before its message, the
+/// order they streamed in, though the surface keeps the message first.
+#[test]
+fn acp_load_replays_reasoning_before_its_message() {
+    let _home = OrcaHomeGuard::new();
+    let base_cwd = tempfile::tempdir().unwrap();
+    let session_cwd = tempfile::tempdir().unwrap();
+    let first_host = RuntimeHost::start_with_executor(Arc::new(AcpTestExecutor::new(vec![
+        TestBehavior::StreamAndComplete {
+            reasoning_deltas: vec!["Let me ", "think."],
+            message_deltas: vec!["Done"],
+            message: "Done",
+        },
+    ])))
+    .expect("start first host");
+    let (first_note_tx, _first_note_rx) = mpsc::channel::<SessionNotification>(256);
+    let first_agent = OrcaAcpAgent::new(
+        first_host.surface_handle(),
+        test_config(base_cwd.path().to_path_buf()),
+        first_note_tx,
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let session_id = local.block_on(&rt, async {
+        initialize_agent(&first_agent).await;
+        let session = first_agent
+            .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
+            .await
+            .expect("new_session");
+        first_agent
+            .prompt(PromptRequest::new(
+                session.session_id.clone(),
+                vec![ContentBlock::from("think, then answer".to_string())],
+            ))
+            .await
+            .expect("prompt");
+        session.session_id
+    });
+    first_host.shutdown().expect("shutdown first host");
+
+    let second_host = RuntimeHost::start_with_executor(Arc::new(AcpTestExecutor::new(vec![])))
+        .expect("start second host");
+    let (second_note_tx, mut second_note_rx) = mpsc::channel::<SessionNotification>(256);
+    let second_agent = OrcaAcpAgent::new(
+        second_host.surface_handle(),
+        test_config(base_cwd.path().to_path_buf()),
+        second_note_tx,
+    );
+    local.block_on(&rt, async {
+        initialize_agent(&second_agent).await;
+        second_agent
+            .load_session(LoadSessionRequest::new(
+                session_id,
+                session_cwd.path().to_path_buf(),
+            ))
+            .await
+            .expect("load_session");
+    });
+
+    assert_eq!(
+        assistant_text(&drain_notifications(&mut second_note_rx)),
+        vec!["thought:Let me think.", "message:Done"]
+    );
+    second_host.shutdown().expect("shutdown second host");
+}
+
 #[test]
 fn acp_typed_surface_prompt_projects_runtime_batch_and_terminal() {
     let _home = OrcaHomeGuard::new();
