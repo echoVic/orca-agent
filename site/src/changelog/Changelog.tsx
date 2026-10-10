@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.10":
+        "When a turn ends without success and the runtime gave no more specific reason, the TUI says how it ended, Task interrupted or Connection lost for example, and an error shown for something you did during the turn, such as a mistyped command or an image that would not paste, or the previous turn's failure, no longer hides that notice. An attached TUI whose daemon hangs up while it sits idle now says the connection was lost. On Windows, orca exec takes Ctrl+Break, which job runners send to stop a process group, and a logoff or a shutdown as SIGTERM: it stops its task commands and MCP servers, writes the run's terminal record and exits with 143, where it used to end at once. Inside, the MCP transports split into stdio and HTTP modules and the /mcp panel moved out of the main UI file; nothing changes for users.",
       "v0.5.9":
         "The ACP daemon, the stdio bridge and orca attach move to agent-client-protocol 3.2 (schema 1.10); what the daemon writes is unchanged, it still reports models and accepts session/set_model, and an optional request field of the wrong type now reads as absent. orca --mode=acp sends a streamed answer once and its reasoning as thoughts. An attached TUI no longer reconnects and quits after a failed turn, a session reloaded over ACP shows each answer's reasoning before it, session/list pages count only the workspace's sessions, and a prompt lost with the daemon shows Connection lost. Esc no longer leaves stop errors drawn over the screen, a cancelled sync agent ends as cancelled, and an interrupt keeps the queue paused. A SIGTSTP from a job-control shell stops Orca and fg brings it back, the update prompt quits cleanly on SIGTERM and SIGHUP, and a message sent in the moment a turn starts queues behind it in order. On Linux hosts where only Landlock works, orca doctor and the shell agree about what can run. A command that ended before its deadline no longer reads as timed out, a cancelled MCP call stops even while its JSON body keeps arriving, deleted session files no longer cut the session list short, and on macOS a domain-restricted command no longer waits for the DNS configuration.",
       "v0.5.8":
@@ -694,6 +696,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.10":
+        "turn 没有成功结束、运行时又没给出更具体的原因时，TUI 会说明它是怎么结束的，例如 Task interrupted 或 Connection lost；turn 进行中因你的操作出现的错误（比如命令打错、图片粘贴失败），或者上一个 turn 的失败，不会再把这条说明挡掉。attach 的 TUI 空闲时 daemon 断开，现在会显示 Connection lost。Windows 上，orca exec 把 Ctrl+Break（任务调度器用它停止进程组）以及注销和关机当作 SIGTERM：停止任务命令和 MCP 服务器，写入本次运行的终止记录，退出码为 143，不再直接被结束。内部把 MCP 传输拆成 stdio 和 HTTP 两个模块，/mcp 面板也移出了主界面文件，对使用没有影响。",
       "v0.5.9":
         "ACP daemon、stdio bridge 和 orca attach 改用 agent-client-protocol 3.2（schema 1.10）；daemon 输出的内容不变，仍然返回 models、接受 session/set_model，请求里类型不对的可选字段现在按缺省处理。orca --mode=acp 的流式回答只发一次，推理内容作为 thought 发送。attach 的 TUI 遇到失败的 turn 不再反复重连后退出；通过 ACP 重新加载的会话，推理显示在回答之前；session/list 分页只计算当前工作区的会话；daemon 断开导致的 prompt 丢失显示为 Connection lost 警告。按 Esc 不再把停止任务的错误画在屏幕上，取消的同步 agent 显示为已取消，中断后队列保持暂停。在支持作业控制的 shell 里，SIGTSTP 会让 Orca 真正挂起，fg 可以恢复；更新提示收到 SIGTERM、SIGHUP 时正常退出；turn 刚开始那一刻发出的消息会按顺序排在它后面。在只有 Landlock 可用的 Linux 上，orca doctor 和 shell 对能否运行的判断一致。在截止时间前结束的命令不再显示为超时，JSON 响应体持续到达时也能取消 MCP 调用，被删除的会话文件不再让会话列表提前结束，macOS 上受域名限制的命令不再等待读取 DNS 配置。",
       "v0.5.8":

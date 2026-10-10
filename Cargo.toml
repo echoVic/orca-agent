@@ -58,7 +58,7 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 
 [package]
 name = "blade-deepseek"
-version = "0.5.9"
+version = "0.5.10"
 edition = "2024"
 description = "Orca: a DeepSeek-native coding agent"
 license = "MIT"
@@ -92,4 +92,4 @@ uuid = { workspace = true }
 
 [target.'cfg(windows)'.dev-dependencies]
 orca-windows-sandbox = { path = "crates/orca-windows-sandbox" }
-# release v0.5.9
+# release v0.5.10

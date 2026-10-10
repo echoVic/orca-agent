@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "blade-deepseek"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "base64 0.23.1",
  "clap",

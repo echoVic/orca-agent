@@ -256,7 +256,8 @@ More detail:
   `orca exec` from the moment it starts and in the TUI: running work and MCP
   servers are stopped, the session records how it ended, and the exit code is
   128 + the signal. Copies of one stop request that arrive together count
-  once.
+  once. On Windows, `orca exec` takes the console's Ctrl+C as SIGINT, and
+  Ctrl+Break, a logoff or a shutdown as SIGTERM.
 - Escape-driven cancellation commits one terminal child state and ignores late
   activity from the cancelled attempt, so a stopped subagent cannot flood the
   terminal while its parent returns to an interactive prompt.

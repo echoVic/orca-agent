@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.9";
+export const releaseVersion = "v0.5.10";
 
 export const releases = [
+  {
+    version: "v0.5.10",
+    date: "2026-10-11",
+    title: "Turn endings that always say why, Ctrl+Break on Windows",
+    body: "A turn that ends without success says why when nothing more specific did, also after an error you caused during the turn or the previous turn's failure, and an attached TUI whose daemon hangs up while idle says the connection was lost. On Windows, orca exec takes Ctrl+Break, a logoff and a shutdown as SIGTERM: it stops its run, writes the terminal record and exits with 143. The MCP transports and the /mcp panel moved into modules of their own.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.10",
+  },
   {
     version: "v0.5.9",
     date: "2026-10-10",
