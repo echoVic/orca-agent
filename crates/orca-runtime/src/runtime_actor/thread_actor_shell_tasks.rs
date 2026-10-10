@@ -3,6 +3,7 @@
 // (ShellTaskEnds) and the ThreadActor methods that publish them.
 use super::*;
 
+use super::thread_actor_generation::ActorCommitFailure;
 use crate::task_view::ShellEndDetail;
 use crate::terminal_service::{SHELL_TASK_END_CAPACITY, ShellTaskEnd, ShellTaskEndInbox};
 
@@ -23,28 +24,43 @@ pub(super) fn inject_shell_task_end_commit_failures(description: &str, count: u8
         .insert(description.to_string(), count);
 }
 
-/// Whether a test made this commit of the end of the command `description`
-/// fail; never outside tests.
+/// What was said when the end of the command a test names was dropped.
+#[cfg(test)]
+static DROPPED_SHELL_TASK_ENDS: std::sync::OnceLock<Mutex<HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(super) fn dropped_shell_task_end_message(description: &str) -> Option<String> {
+    DROPPED_SHELL_TASK_ENDS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(description)
+        .cloned()
+}
+
+/// The failure a test made this commit of the end of the command
+/// `description` meet; never one outside tests.
 #[cfg(not(test))]
-fn shell_task_end_commit_fails(_description: &str) -> bool {
-    false
+fn shell_task_end_commit_failure(_description: &str) -> Option<ActorCommitFailure> {
+    None
 }
 
 #[cfg(test)]
-fn shell_task_end_commit_fails(description: &str) -> bool {
+fn shell_task_end_commit_failure(description: &str) -> Option<ActorCommitFailure> {
     let mut failures = SHELL_TASK_END_COMMIT_FAILURES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(count) = failures.get_mut(description) else {
-        return false;
-    };
+    let count = failures.get_mut(description)?;
     if *count <= 1 {
         failures.remove(description);
     } else {
         *count -= 1;
     }
-    true
+    Some(ActorCommitFailure::Commit(
+        surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::AppendFailed),
+    ))
 }
 
 /// How the thread's commands that outlived their calls ended: what its
@@ -130,18 +146,15 @@ impl ThreadActor {
                 continue;
             };
             let batch = self.surface_event_batch_with_commit_id(events, None);
-            let committed = if shell_task_end_commit_fails(&pending.end.description) {
-                Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
-            } else {
-                self.commit_surface_actor_batch_with_retry(&batch)
+            let committed = match shell_task_end_commit_failure(&pending.end.description) {
+                Some(failure) => Err(failure),
+                None => self.commit_surface_actor_batch_naming_failure(&batch),
             };
             match committed {
                 Ok(()) => {
                     self.shell_task_ends.pending.pop_front();
                 }
-                // The commit helper reports every failure as the runtime being
-                // unavailable, so there is no cause to name.
-                Err(_) => {
+                Err(failure) => {
                     let pending = self
                         .shell_task_ends
                         .pending
@@ -149,10 +162,18 @@ impl ThreadActor {
                         .expect("the end that failed to commit is pending");
                     pending.failed_commits = pending.failed_commits.saturating_add(1);
                     if pending.failed_commits >= SHELL_TASK_END_COMMIT_ATTEMPTS {
-                        eprintln!(
-                            "orca: dropped how command task {} ended: its commit failed {} times",
+                        let message = format!(
+                            "orca: dropped how command task {} ended: its commit failed {} times, \
+                             the last because of {failure}",
                             pending.end.task_id, pending.failed_commits
                         );
+                        eprintln!("{message}");
+                        #[cfg(test)]
+                        DROPPED_SHELL_TASK_ENDS
+                            .get_or_init(|| Mutex::new(HashMap::new()))
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(pending.end.description.clone(), message);
                         self.shell_task_ends.pending.pop_front();
                     }
                     return;

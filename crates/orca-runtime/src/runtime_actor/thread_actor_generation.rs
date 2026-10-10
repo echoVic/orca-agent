@@ -2,6 +2,22 @@
 use super::*;
 use crate::subagent_event_relay::{RelayError, RelayRecord, SubagentEventRelayReader};
 
+/// Why the actor could not commit a batch.
+pub(super) enum ActorCommitFailure {
+    /// A manual compaction holds the surface until it settles.
+    ManualCompactionPending,
+    Commit(surface::SurfaceCommitError),
+}
+
+impl std::fmt::Display for ActorCommitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ManualCompactionPending => f.write_str("a manual compaction is pending"),
+            Self::Commit(error) => write!(f, "{error:?}"),
+        }
+    }
+}
+
 fn validate_relay_activity_envelope(
     reader: &SubagentEventRelayReader,
     record: &RelayRecord,
@@ -1082,24 +1098,32 @@ impl ThreadActor {
         &mut self,
         batch: &surface::SurfaceCommitBatch,
     ) -> Result<(), surface::SurfaceClientCommandError> {
+        self.commit_surface_actor_batch_naming_failure(batch)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)
+    }
+
+    /// Like [`Self::commit_surface_actor_batch_with_retry`], keeping why the
+    /// batch did not commit.
+    pub(super) fn commit_surface_actor_batch_naming_failure(
+        &mut self,
+        batch: &surface::SurfaceCommitBatch,
+    ) -> Result<(), ActorCommitFailure> {
         if self.operation_recovery.pending_manual_compaction.is_some() {
-            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            return Err(ActorCommitFailure::ManualCompactionPending);
         }
-        for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
             match self.resident_surface.coordinator.commit_actor_batch(batch) {
                 Ok(_) => return Ok(()),
-                Err(surface::SurfaceCommitError::Ledger(error))
-                    if attempt + 1 < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS
-                        && matches!(
-                            error,
-                            surface::SurfaceLedgerError::AppendFailed
-                                | surface::SurfaceLedgerError::PartialAppend
-                                | surface::SurfaceLedgerError::CheckpointFailed
-                        ) => {}
-                Err(_error) => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
+                Err(surface::SurfaceCommitError::Ledger(
+                    surface::SurfaceLedgerError::AppendFailed
+                    | surface::SurfaceLedgerError::PartialAppend
+                    | surface::SurfaceLedgerError::CheckpointFailed,
+                )) if attempts < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS => {}
+                Err(error) => return Err(ActorCommitFailure::Commit(error)),
             }
         }
-        Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
     }
 
     pub(super) fn commit_surface_provider_steps(

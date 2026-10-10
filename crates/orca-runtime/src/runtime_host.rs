@@ -40314,6 +40314,10 @@ mod tests {
         run(&after);
         wait_until_shown(&after);
         assert!(!shows(&dropped));
+        // The injected failure is a ledger append that keeps failing.
+        let message = thread_actor_shell_tasks::dropped_shell_task_end_message(&dropped)
+            .expect("the dropped end is reported");
+        assert!(message.contains("Ledger(AppendFailed)"), "{message}");
         thread.shutdown().expect("shutdown thread");
         host.shutdown().expect("shutdown host");
     }
