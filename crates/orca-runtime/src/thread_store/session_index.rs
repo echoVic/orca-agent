@@ -880,6 +880,14 @@ mod tests {
                 [],
             )
             .unwrap();
+        // A backfill would repair the row before the page is read.
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO index_meta(key, value)
+                 VALUES('backfill_complete', '1')",
+                [],
+            )
+            .unwrap();
 
         let cwd = home.path().to_str().unwrap();
         let page = list_page_filtered(home.path(), 0, 20, false, None, Some(cwd)).unwrap();
