@@ -8,13 +8,14 @@ use std::thread;
 use std::time::Duration;
 
 use hickory_resolver::TokioResolver;
-use hickory_resolver::config::LookupIpStrategy;
+use hickory_resolver::config::{LookupIpStrategy, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use orca_core::config::PermissionProfileNetworkAccess;
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{OnceCell, Semaphore, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
@@ -25,6 +26,7 @@ const MAX_PROXY_HEADER_BYTES: usize = 64 * 1024;
 const MAX_PROXY_HEADERS: usize = 100;
 const MAX_NETWORK_BLOCK_REPORTS: usize = 8;
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+const DNS_CONFIG_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROXY_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const OVERLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -134,14 +136,26 @@ impl RuntimeNetworkProxy {
         policy: RuntimeNetworkPolicy,
         block_reporter: Option<mpsc::SyncSender<RuntimeNetworkBlockReport>>,
     ) -> io::Result<Self> {
-        Self::start_with_connection_limit(policy, block_reporter, None, MAX_PROXY_CONNECTIONS)
+        Self::start_with_connection_limit(
+            policy,
+            block_reporter,
+            None,
+            MAX_PROXY_CONNECTIONS,
+            read_system_dns_config,
+        )
     }
 
     pub fn start_with_permission_gate(
         policy: RuntimeNetworkPolicy,
         permission_gate: Option<mpsc::SyncSender<RuntimeNetworkBlockRequest>>,
     ) -> io::Result<Self> {
-        Self::start_with_connection_limit(policy, None, permission_gate, MAX_PROXY_CONNECTIONS)
+        Self::start_with_connection_limit(
+            policy,
+            None,
+            permission_gate,
+            MAX_PROXY_CONNECTIONS,
+            read_system_dns_config,
+        )
     }
 
     fn start_with_connection_limit(
@@ -149,6 +163,7 @@ impl RuntimeNetworkProxy {
         block_reporter: Option<mpsc::SyncSender<RuntimeNetworkBlockReport>>,
         permission_gate: Option<mpsc::SyncSender<RuntimeNetworkBlockRequest>>,
         max_connections: usize,
+        read_dns_config: DnsConfigReader,
     ) -> io::Result<Self> {
         if max_connections == 0 {
             return Err(io::Error::new(
@@ -178,6 +193,7 @@ impl RuntimeNetworkProxy {
                     supervisor_active_connections,
                     shutdown_receiver,
                     startup_sender,
+                    read_dns_config,
                 ))
             })?;
 
@@ -213,7 +229,27 @@ impl RuntimeNetworkProxy {
         block_reporter: Option<mpsc::SyncSender<RuntimeNetworkBlockReport>>,
         max_connections: usize,
     ) -> io::Result<Self> {
-        Self::start_with_connection_limit(policy, block_reporter, None, max_connections)
+        Self::start_with_connection_limit(
+            policy,
+            block_reporter,
+            None,
+            max_connections,
+            read_system_dns_config,
+        )
+    }
+
+    #[cfg(test)]
+    fn start_with_dns_config_for_test(
+        policy: RuntimeNetworkPolicy,
+        read_dns_config: DnsConfigReader,
+    ) -> io::Result<Self> {
+        Self::start_with_connection_limit(
+            policy,
+            None,
+            None,
+            MAX_PROXY_CONNECTIONS,
+            read_dns_config,
+        )
     }
 
     pub fn proxy_url(&self) -> &str {
@@ -297,6 +333,7 @@ async fn run_proxy_supervisor(
     active_connections: Arc<AtomicUsize>,
     mut shutdown: oneshot::Receiver<()>,
     startup_sender: mpsc::SyncSender<io::Result<()>>,
+    read_dns_config: DnsConfigReader,
 ) -> io::Result<()> {
     let listener = match TcpListener::from_std(listener) {
         Ok(listener) => listener,
@@ -305,20 +342,7 @@ async fn run_proxy_supervisor(
             return Err(error);
         }
     };
-    let resolver = match TokioResolver::builder_tokio().and_then(|mut builder| {
-        // hickory 0.26 looks IPv6 up first by default. This proxy connects
-        // one address at a time, so it keeps the order it always had: IPv4
-        // first, IPv6 only for a host with no IPv4 address.
-        builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
-        builder.build()
-    }) {
-        Ok(resolver) => Arc::new(resolver),
-        Err(error) => {
-            let error = io::Error::other(format!("failed to initialize DNS resolver: {error}"));
-            let _ = startup_sender.send(Err(clone_io_error(&error)));
-            return Err(error);
-        }
-    };
+    let resolver = Arc::new(ProxyResolver::new(read_dns_config));
     let _ = startup_sender.send(Ok(()));
     let permits = Arc::new(Semaphore::new(max_connections));
     let mut connections = JoinSet::new();
@@ -374,6 +398,63 @@ async fn run_proxy_supervisor(
     result
 }
 
+/// Reads the system's DNS configuration.
+type DnsConfigReader = fn() -> Result<(ResolverConfig, ResolverOpts), String>;
+
+fn read_system_dns_config() -> Result<(ResolverConfig, ResolverOpts), String> {
+    hickory_resolver::system_conf::read_system_conf().map_err(|error| error.to_string())
+}
+
+/// The proxy's DNS resolver, built when a request first names a host to
+/// look up. Reading the system's DNS configuration can take a second or
+/// more (macOS asks configd, the first time in a process), and a request for
+/// an address, or one the policy refuses, never needs it: the proxy waits for
+/// it neither to start nor to serve those. A configuration that cannot be
+/// read fails the lookups, and only them.
+struct ProxyResolver {
+    read_config: DnsConfigReader,
+    resolver: OnceCell<Result<TokioResolver, String>>,
+}
+
+impl ProxyResolver {
+    fn new(read_config: DnsConfigReader) -> Self {
+        Self {
+            read_config,
+            resolver: OnceCell::new(),
+        }
+    }
+
+    async fn get(&self) -> io::Result<&TokioResolver> {
+        let built = timeout(
+            DNS_CONFIG_TIMEOUT,
+            self.resolver.get_or_init(|| async {
+                let (config, options) = tokio::task::spawn_blocking(self.read_config)
+                    .await
+                    .map_err(|error| error.to_string())??;
+                let mut builder =
+                    TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+                        .with_options(options);
+                // hickory 0.26 looks IPv6 up first by default. This proxy
+                // connects one address at a time, so it keeps the order it
+                // always had: IPv4 first, IPv6 only for a host with no IPv4
+                // address.
+                builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
+                builder.build().map_err(|error| error.to_string())
+            }),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "network proxy timed out reading the DNS configuration",
+            )
+        })?;
+        built.as_ref().map_err(|error| {
+            io::Error::other(format!("failed to initialize DNS resolver: {error}"))
+        })
+    }
+}
+
 struct ActiveConnectionGuard(Arc<AtomicUsize>);
 
 impl Drop for ActiveConnectionGuard {
@@ -397,7 +478,7 @@ async fn handle_proxy_connection(
     policy: &RuntimeNetworkPolicy,
     block_reporter: Option<&mpsc::SyncSender<RuntimeNetworkBlockReport>>,
     permission_gate: Option<&mpsc::SyncSender<RuntimeNetworkBlockRequest>>,
-    resolver: &TokioResolver,
+    resolver: &ProxyResolver,
 ) -> io::Result<()> {
     let request = {
         let mut reader = BufReader::new(&mut client);
@@ -599,7 +680,7 @@ async fn proxy_http(
     version: &str,
     headers: &[String],
     policy: &RuntimeNetworkPolicy,
-    resolver: &TokioResolver,
+    resolver: &ProxyResolver,
 ) -> io::Result<()> {
     let Some((host, port, path)) = parse_http_target(target, headers) else {
         write_forbidden(client, RuntimeNetworkBlockReason::Policy, None).await?;
@@ -630,7 +711,7 @@ async fn proxy_connect(
     client: &mut TcpStream,
     target: &str,
     policy: &RuntimeNetworkPolicy,
-    resolver: &TokioResolver,
+    resolver: &ProxyResolver,
 ) -> io::Result<()> {
     let (host, port) = split_host_port(target, 443);
     let upstream = connect_checked_resolved(&host, port, policy, resolver).await?;
@@ -648,11 +729,12 @@ async fn connect_checked_resolved(
     host: &str,
     port: u16,
     policy: &RuntimeNetworkPolicy,
-    resolver: &TokioResolver,
+    resolver: &ProxyResolver,
 ) -> io::Result<TcpStream> {
     let resolved = if let Ok(ip) = host.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, port)]
     } else {
+        let resolver = resolver.get().await?;
         let lookup = timeout(DNS_LOOKUP_TIMEOUT, resolver.lookup_ip(host))
             .await
             .map_err(|_| {
@@ -944,6 +1026,57 @@ mod tests {
             "expected {expected} active proxy connections, observed {}",
             proxy.active_connection_count()
         );
+    }
+
+    /// The proxy reads the system's DNS configuration only for a request
+    /// that needs a lookup. One it cannot read keeps it neither from
+    /// starting nor from serving an address, and fails a request for a
+    /// host name.
+    #[test]
+    fn a_dns_configuration_that_cannot_be_read_fails_only_lookups() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
+        let upstream_port = upstream.local_addr().expect("upstream addr").port();
+        let proxy = RuntimeNetworkProxy::start_with_dns_config_for_test(
+            RuntimeNetworkPolicy::new(HashMap::from([
+                (
+                    "127.0.0.1".to_string(),
+                    PermissionProfileNetworkAccess::Allow,
+                ),
+                (
+                    "allowed.example.com".to_string(),
+                    PermissionProfileNetworkAccess::Allow,
+                ),
+            ])),
+            || Err("no DNS configuration".to_string()),
+        )
+        .expect("start proxy");
+        let connect = |target: &str| {
+            let mut client = TcpStream::connect(proxy_addr(&proxy)).expect("connect proxy");
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            write!(
+                client,
+                "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n"
+            )
+            .expect("write CONNECT request");
+            let mut response = Vec::new();
+            let _ = client.read_to_end(&mut response);
+            String::from_utf8_lossy(&response).into_owned()
+        };
+
+        let address = std::thread::scope(|scope| {
+            let accepted = scope.spawn(|| upstream.accept().map(drop));
+            let response = connect(&format!("127.0.0.1:{upstream_port}"));
+            accepted
+                .join()
+                .expect("join upstream")
+                .expect("accept tunnel");
+            response
+        });
+        assert!(address.starts_with("HTTP/1.1 200"), "{address}");
+        let host = connect("allowed.example.com:443");
+        assert!(!host.starts_with("HTTP/1.1 200"), "{host}");
     }
 
     #[test]
