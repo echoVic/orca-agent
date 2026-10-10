@@ -73,6 +73,7 @@ fn list_page_filtered(
     spawn_backfill_if_needed(home.to_path_buf());
 
     let page_size = limit.max(1);
+    let wanted = page_size.saturating_add(1);
     // A cached summary that is not JSON matches no cwd rather than failing
     // the page.
     let sql = "SELECT summary_json, path, archived, updated_at_ms
@@ -83,81 +84,98 @@ fn list_page_filtered(
                 THEN json_extract(summary_json, '$.cwd') END = ?5)
          ORDER BY updated_at_ms DESC, created_at_ms DESC, session_id DESC
          LIMIT ?3 OFFSET ?4";
-    let mut statement = connection.prepare(sql).map_err(io::Error::other)?;
-    let rows = statement
-        .query_map(
-            params![
-                include_archived,
-                search_term.unwrap_or_default(),
-                i64::try_from(page_size.saturating_add(1)).unwrap_or(i64::MAX),
-                i64::try_from(offset).unwrap_or(i64::MAX),
-                cwd
-            ],
-            |row| {
-                let summary_json: String = row.get(0)?;
-                let path: String = row.get(1)?;
-                let archived: bool = row.get(2)?;
-                let updated_at_ms: i64 = row.get(3)?;
-                Ok((summary_json, path, archived, updated_at_ms))
-            },
-        )
-        .map_err(io::Error::other)?;
 
-    let mut sessions = Vec::with_capacity(page_size.saturating_add(1).min(1024));
-    let mut stale_paths = Vec::new();
+    let mut sessions = Vec::with_capacity(wanted.min(1024));
     let mut repaired_summaries = Vec::new();
-    for row in rows {
-        let (summary_json, path, archived, updated_at_ms) = row.map_err(io::Error::other)?;
-        let path = PathBuf::from(path);
-        if !is_regular_history_file(&path) {
-            // A deleted, replaced, or unsafe entry is no longer a catalog
-            // record. Parse failures are different: those remain visible.
-            stale_paths.push(path);
-            continue;
-        }
-        let cached_summary = serde_json::from_str::<SessionSummary>(&summary_json).ok();
-        let mut summary = match summarize_session_with_archive_flag(&path, archived) {
-            Ok(summary) => summary,
-            Err(_error) => {
-                // Keep the old catalog row visible even if a transient read
-                // fails. The SQLite cache is rebuildable, so malformed cache
-                // JSON must not turn one row into a whole-page failure.
-                let mut cached = cached_summary
-                    .clone()
-                    .unwrap_or_else(|| unreadable_summary(&path, archived, updated_at_ms));
-                cached.health = StoredSessionHealth::Quarantined;
-                cached.health_issue = Some(StoredSessionHealthIssue {
-                    code: "scan_failed".to_string(),
-                    line: None,
-                    offset: None,
-                });
-                cached.path = path.clone();
-                cached.archived = archived;
-                cached
+    // The rows a page reads start here. A row whose file is gone is dropped
+    // from the index once read, and the page reads on past it, so that the
+    // rows of files deleted outside Orca neither cut it short nor end the
+    // list.
+    let mut window = offset;
+    loop {
+        let need = wanted - sessions.len();
+        let mut read = 0;
+        let mut stale_paths = Vec::new();
+        let mut statement = connection.prepare(sql).map_err(io::Error::other)?;
+        let rows = statement
+            .query_map(
+                params![
+                    include_archived,
+                    search_term.unwrap_or_default(),
+                    i64::try_from(need).unwrap_or(i64::MAX),
+                    i64::try_from(window).unwrap_or(i64::MAX),
+                    cwd
+                ],
+                |row| {
+                    let summary_json: String = row.get(0)?;
+                    let path: String = row.get(1)?;
+                    let archived: bool = row.get(2)?;
+                    let updated_at_ms: i64 = row.get(3)?;
+                    Ok((summary_json, path, archived, updated_at_ms))
+                },
+            )
+            .map_err(io::Error::other)?;
+        for row in rows {
+            read += 1;
+            let (summary_json, path, archived, updated_at_ms) = row.map_err(io::Error::other)?;
+            let path = PathBuf::from(path);
+            if !is_regular_history_file(&path) {
+                // A deleted, replaced, or unsafe entry is no longer a catalog
+                // record. Parse failures are different: those remain visible.
+                stale_paths.push(path);
+                continue;
             }
-        };
-        // The source can change after index insertion. Re-scan before
-        // returning the row and repair derived health in place.
-        let needs_repair = cached_summary.as_ref().is_none_or(|cached| {
-            cached.source_fingerprint != summary.source_fingerprint
-                || cached.health != summary.health
-                || cached.health_issue != summary.health_issue
-                || cached.storage_identity != summary.storage_identity
-        });
-        if needs_repair {
-            repaired_summaries.push(summary.clone());
+            let cached_summary = serde_json::from_str::<SessionSummary>(&summary_json).ok();
+            let mut summary = match summarize_session_with_archive_flag(&path, archived) {
+                Ok(summary) => summary,
+                Err(_error) => {
+                    // Keep the old catalog row visible even if a transient read
+                    // fails. The SQLite cache is rebuildable, so malformed cache
+                    // JSON must not turn one row into a whole-page failure.
+                    let mut cached = cached_summary
+                        .clone()
+                        .unwrap_or_else(|| unreadable_summary(&path, archived, updated_at_ms));
+                    cached.health = StoredSessionHealth::Quarantined;
+                    cached.health_issue = Some(StoredSessionHealthIssue {
+                        code: "scan_failed".to_string(),
+                        line: None,
+                        offset: None,
+                    });
+                    cached.path = path.clone();
+                    cached.archived = archived;
+                    cached
+                }
+            };
+            // The source can change after index insertion. Re-scan before
+            // returning the row and repair derived health in place.
+            let needs_repair = cached_summary.as_ref().is_none_or(|cached| {
+                cached.source_fingerprint != summary.source_fingerprint
+                    || cached.health != summary.health
+                    || cached.health_issue != summary.health_issue
+                    || cached.storage_identity != summary.storage_identity
+            });
+            if needs_repair {
+                repaired_summaries.push(summary.clone());
+            }
+            summary.path = path;
+            summary.archived = archived;
+            if let Some(updated_at) = DateTime::<Utc>::from_timestamp_millis(updated_at_ms) {
+                summary.updated_at = updated_at;
+            }
+            sessions.push(summary);
         }
-        summary.path = path;
-        summary.archived = archived;
-        if let Some(updated_at) = DateTime::<Utc>::from_timestamp_millis(updated_at_ms) {
-            summary.updated_at = updated_at;
-        }
-        sessions.push(summary);
-    }
-    drop(statement);
+        drop(statement);
 
-    for path in stale_paths {
-        let _ = remove_path_with_connection(&connection, &path);
+        let removed: usize = stale_paths
+            .iter()
+            .map(|path| remove_path_with_connection(&connection, path).unwrap_or(0))
+            .sum();
+        // Read on only when this window was full and had rows that are gone:
+        // what is left of it now comes before the next window.
+        if stale_paths.is_empty() || read < need {
+            break;
+        }
+        window += read - removed;
     }
     for summary in repaired_summaries {
         let _ = upsert_summary_with_connection(&connection, &summary);
@@ -256,7 +274,7 @@ pub(crate) fn remove_path(path: &Path) -> io::Result<()> {
         return Ok(());
     };
     let connection = open_index(&home)?;
-    remove_path_with_connection(&connection, path)
+    remove_path_with_connection(&connection, path).map(drop)
 }
 
 fn clear_recent_touch(path: &Path) {
@@ -579,14 +597,14 @@ fn upsert_summary_with_connection(
     Ok(())
 }
 
-fn remove_path_with_connection(connection: &Connection, path: &Path) -> io::Result<()> {
+/// Drops the row of `path`, and says how many rows went.
+fn remove_path_with_connection(connection: &Connection, path: &Path) -> io::Result<usize> {
     connection
         .execute(
             "DELETE FROM sessions WHERE path = ?1",
             [path.to_string_lossy()],
         )
-        .map_err(io::Error::other)?;
-    Ok(())
+        .map_err(io::Error::other)
 }
 
 fn summary_from_meta(path: &Path, meta: SessionMeta, archived: bool) -> io::Result<SessionSummary> {
@@ -861,6 +879,45 @@ mod tests {
         assert_eq!(ids(&first), ["session-02", "session-01"]);
         assert_eq!(first.next_offset, Some(2));
         let second = list_page_filtered(home.path(), 2, 2, false, None, Some(mine)).unwrap();
+        assert_eq!(ids(&second), ["session-00"]);
+        assert_eq!(second.next_offset, None);
+    }
+
+    /// Session files deleted outside Orca leave rows behind until a page
+    /// meets them. A page whose rows are all such leftovers neither comes
+    /// back short nor ends the list: it goes on to the sessions after them.
+    #[test]
+    fn deleted_session_files_do_not_cut_a_page_short() {
+        let home = tempfile::tempdir().unwrap();
+        let connection = open_index(home.path()).unwrap();
+        let mut paths = Vec::new();
+        for index in 0..6 {
+            let summary = write_legacy_session(home.path(), index);
+            paths.push(summary.path.clone());
+            upsert_summary_with_connection(&connection, &summary).unwrap();
+        }
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO index_meta(key, value)
+                 VALUES('backfill_complete', '1')",
+                [],
+            )
+            .unwrap();
+        // The three most recent are gone.
+        for path in &paths[3..] {
+            fs::remove_file(path).unwrap();
+        }
+        let ids = |page: &SessionSummaryPage| {
+            page.sessions
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let first = list_page_at(home.path(), 0, 2, false, None).unwrap();
+        assert_eq!(ids(&first), ["session-02", "session-01"]);
+        assert_eq!(first.next_offset, Some(2));
+        let second = list_page_at(home.path(), 2, 2, false, None).unwrap();
         assert_eq!(ids(&second), ["session-00"]);
         assert_eq!(second.next_offset, None);
     }
