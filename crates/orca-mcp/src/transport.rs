@@ -3469,6 +3469,9 @@ done
         transport.initialize().expect("initialize MCP");
         transport.list_tools(None).expect("list tools");
 
+        // The cancel comes once the server has answered, and once the reader
+        // has had time to take the answer from the pipe: what wins is a
+        // response the call has observed, not one still on its way.
         let result = transport.call_tool_with_elicitation_handler_or_cancel(
             "finish",
             Value::Object(Default::default()),
@@ -3478,6 +3481,7 @@ done
                 while !completed_file.exists() && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(5));
                 }
+                std::thread::sleep(Duration::from_millis(200));
                 completed_file.exists()
             },
         );
