@@ -32,7 +32,6 @@ pub(crate) struct QueuedComposerState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QueuedPreviewSnapshot {
     pub(crate) len: usize,
-    pub(crate) running: bool,
     pub(crate) first: String,
     pub(crate) second: Option<String>,
     pub(crate) latest: Option<String>,
@@ -174,7 +173,15 @@ impl QueuedSubmissionState {
         if self.pending_edit.is_some() {
             return None;
         }
-        let item = self.projection.items.last()?;
+        // The message the runtime has sent is the turn under way, not one to
+        // take back.
+        let running = self.projection.running_item().map(|item| &item.id);
+        let item = self
+            .projection
+            .items
+            .iter()
+            .rev()
+            .find(|item| Some(&item.id) != running)?;
         self.pending_edit = Some(PendingQueuedEdit {
             id: item.id.clone(),
             composer: self
@@ -297,19 +304,26 @@ impl QueuedSubmissionState {
 }
 
 impl QueuedPreviewSnapshot {
+    /// The messages of the runtime's queue that wait to be sent. The one it
+    /// has sent stays in its queue until its turn ends, but it is the turn
+    /// under way, which the conversation shows as the user's message.
     fn from_projection(
         projection: &orca_runtime::prompt_queue::PromptQueueSnapshot,
     ) -> Option<Self> {
-        let len = projection.items.len();
+        let running = projection.running_item().map(|item| &item.id);
+        let waiting = projection
+            .items
+            .iter()
+            .filter(|item| Some(&item.id) != running)
+            .collect::<Vec<_>>();
+        let len = waiting.len();
         let preview = |index: usize| {
-            projection
-                .items
+            waiting
                 .get(index)
                 .map(|item| compact_preview(&runtime_queue_preview_text(&item.input)))
         };
         Some(Self {
             len,
-            running: projection.running_item().is_some(),
             first: preview(0)?,
             second: (len == 2).then(|| preview(1)).flatten(),
             latest: (len > 2).then(|| preview(len - 1)).flatten(),
@@ -348,7 +362,6 @@ impl QueuedPreviewSnapshot {
         };
         Some(Self {
             len,
-            running: false,
             first,
             second,
             latest,
@@ -644,7 +657,6 @@ impl AppState {
         };
         Some(QueuedPreviewSnapshot {
             len,
-            running: false,
             first: preview(0)?,
             second: (len == 2).then(|| preview(1)).flatten(),
             latest: (len > 2).then(|| preview(len - 1)).flatten(),
@@ -1061,33 +1073,43 @@ mod tests {
         assert_eq!(snapshot.latest, None);
     }
 
+    /// A queued message that has been sent is the turn under way, which the
+    /// conversation shows as the user's message: the strip lists only the
+    /// ones still waiting, and none once they have all been sent.
     #[test]
-    fn runtime_queue_preview_marks_accepted_head_as_running() {
-        let mut runtime = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
-            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
-        );
-        let added = runtime
-            .apply(
-                orca_runtime::prompt_queue::PromptQueueAction::Add {
-                    input: "running".into(),
-                },
-                1,
-            )
-            .expect("queue item");
-        let submission_id = added.items[0].id.clone();
-        let client_user_message_id = added.items[0].client_user_message_id.clone();
-        let mut snapshot = added;
-        snapshot.dispatch = Some(orca_runtime::prompt_queue::QueueDispatchFence::Accepted {
-            submission_id,
-            client_user_message_id,
-            operation_id: "operation-1".to_string(),
-            accepted_revision: snapshot.revision,
-        });
-
-        let preview = QueuedPreviewSnapshot::from_projection(&snapshot).expect("preview");
-        assert!(preview.running);
+    fn a_sent_queued_message_leaves_the_queue_preview() {
+        let preview = QueuedPreviewSnapshot::from_projection(
+            &crate::test_support::runtime_queue_running_the_first(&["sent", "waiting"]),
+        )
+        .expect("preview");
         assert_eq!(preview.len, 1);
-        assert_eq!(preview.first, "running");
+        assert_eq!(preview.first, "waiting");
+        assert_eq!(preview.second, None);
+
+        assert!(
+            QueuedPreviewSnapshot::from_projection(
+                &crate::test_support::runtime_queue_running_the_first(&["sent"])
+            )
+            .is_none()
+        );
+    }
+
+    /// Alt+Up takes back the latest message still waiting, never the one
+    /// already sent, which is no longer in the queue as the strip shows it.
+    #[test]
+    fn editing_the_latest_queued_message_skips_the_one_sent() {
+        let mut queue = QueuedSubmissionState::default();
+        let snapshot = crate::test_support::runtime_queue_running_the_first(&["sent"]);
+        queue.replace_runtime_projection(snapshot, None);
+        assert!(queue.begin_latest_edit().is_none());
+
+        let snapshot = crate::test_support::runtime_queue_running_the_first(&["sent", "waiting"]);
+        let waiting = snapshot.items[1].id.clone();
+        queue.replace_runtime_projection(snapshot, None);
+        assert!(matches!(
+            queue.begin_latest_edit(),
+            Some(orca_runtime::prompt_queue::PromptQueueAction::Delete { id, .. }) if id == waiting
+        ));
     }
 
     #[test]

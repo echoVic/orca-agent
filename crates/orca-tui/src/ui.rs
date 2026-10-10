@@ -1036,17 +1036,10 @@ fn queued_preview_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line
     let snapshot = view.preview;
     let header = view.error.as_ref().map_or_else(
         || {
-            if snapshot.running {
-                format!(
-                    " Running queued task · {} pending · Ctrl+Enter send now · Alt+Up edit latest",
-                    snapshot.len.saturating_sub(1)
-                )
-            } else {
-                format!(
-                    " Queued {} · Ctrl+Enter send now · Alt+Up edit latest",
-                    snapshot.len
-                )
-            }
+            format!(
+                " Queued {} · Ctrl+Enter send now · Alt+Up edit latest",
+                snapshot.len
+            )
         },
         |error| format!(" Queue error · {error}"),
     );
@@ -1074,9 +1067,8 @@ fn preview_strip(
     let item_style = Style::default()
         .fg(theme.muted)
         .add_modifier(Modifier::ITALIC);
-    let first_prefix = if snapshot.running { " ▶ " } else { " ↳ " };
     lines.push(Line::from(Span::styled(
-        truncate_to_display_width(&format!("{first_prefix}{}", snapshot.first), width),
+        truncate_to_display_width(&format!(" ↳ {}", snapshot.first), width),
         item_style,
     )));
     if let Some(second) = snapshot.second {
@@ -7593,6 +7585,28 @@ mod tests {
         // Running as far as the TUI knows, as it is once the prompt is sent.
         state.enter_running();
         assert_eq!(queued_preview_lines(&state, 80, &theme).len(), 3);
+    }
+
+    /// The queued message the runtime has sent is the turn under way, shown
+    /// in the conversation as the user's message: the strip lists only the
+    /// ones still waiting, as the queue it is.
+    #[test]
+    fn a_sent_queued_message_leaves_the_strip() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.update(TuiEvent::PromptQueueUpdated(
+            crate::test_support::runtime_queue_running_the_first(&["sent", "waiting"]),
+        ));
+
+        let lines = queued_preview_lines(&state, 80, &theme)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("Queued 1"), "{lines:?}");
+        assert!(lines[1].contains("waiting"), "{lines:?}");
+        assert!(!lines.iter().any(|line| line.contains("sent")), "{lines:?}");
     }
 
     #[test]

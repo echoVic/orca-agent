@@ -224,6 +224,33 @@ pub(crate) mod test_support {
             .join("\n")
     }
 
+    /// The runtime's queue `texts`, the first of them sent and running.
+    pub(crate) fn runtime_queue_running_the_first(
+        texts: &[&str],
+    ) -> orca_runtime::prompt_queue::PromptQueueSnapshot {
+        let mut runtime = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
+            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
+        );
+        let mut snapshot = orca_runtime::prompt_queue::PromptQueueSnapshot::default();
+        for (index, text) in texts.iter().enumerate() {
+            snapshot = runtime
+                .apply(
+                    orca_runtime::prompt_queue::PromptQueueAction::Add {
+                        input: (*text).into(),
+                    },
+                    index as i64 + 1,
+                )
+                .expect("queue item");
+        }
+        snapshot.dispatch = Some(orca_runtime::prompt_queue::QueueDispatchFence::Accepted {
+            submission_id: snapshot.items[0].id.clone(),
+            client_user_message_id: snapshot.items[0].client_user_message_id.clone(),
+            operation_id: "operation-1".to_string(),
+            accepted_revision: snapshot.revision,
+        });
+        snapshot
+    }
+
     /// The text of the conversation's last message, when it is a notice.
     pub(crate) fn last_notice(state: &crate::types::AppState) -> Option<&str> {
         match state.transcript.messages.last() {

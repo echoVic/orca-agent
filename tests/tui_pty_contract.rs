@@ -146,6 +146,72 @@ fn tui_cancel_returns_to_idle_through_the_runtime_surface() {
     );
 }
 
+/// A queued message the runtime has sent leaves the queue strip: it is the
+/// turn under way, which the conversation shows as the user's message, and
+/// the strip lists only what still waits. It used to stay at the top of the
+/// strip, marked as running, as if it had not been sent.
+#[test]
+fn a_queued_message_leaves_the_strip_once_it_is_sent() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let first_released = cwd.path().join("first-released");
+    let second_released = cwd.path().join("second-released");
+    let mut process = PtyProcess::spawn_with_prompt(
+        home.path(),
+        cwd.path(),
+        &format!("mock_stream_release_marker {}", first_released.display()),
+    )
+    .expect("spawn TUI in PTY");
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    receive_until(
+        &process,
+        &mut output,
+        "Running 0s",
+        Duration::from_secs(20),
+        "the first turn did not start",
+    );
+    process
+        .write(format!("mock_stream_release_marker {}\r", second_released.display()).as_bytes())
+        .expect("queue a message");
+    process.write(b"third waits\r").expect("queue another");
+    receive_until(
+        &process,
+        &mut output,
+        "Queued 2",
+        Duration::from_secs(10),
+        "the two messages were not queued",
+    );
+
+    std::fs::write(&first_released, "").expect("end the first turn");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let screen = reconstruct_screen(&output);
+        let lines = screen.lines().collect::<Vec<_>>();
+        if let Some(header) = lines.iter().position(|line| line.contains("Queued 1")) {
+            assert!(
+                lines
+                    .get(header + 1)
+                    .is_some_and(|line| line.contains("third waits")),
+                "the strip still lists the message sent; reconstructed screen=\n{screen}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the strip did not let go of the message sent; reconstructed screen=\n{screen}"
+        );
+        if let Some(chunk) = process.receive_output(Duration::from_millis(50)) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+
+    cancel_running_turn_and_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
 #[test]
 fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
