@@ -2784,6 +2784,42 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     const EOF_EVENT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// How long a test server waits for the command under test to connect.
+    const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Accepts the one connection a test server expects. It fails the test
+    /// when the command never connects, where a plain `accept` would hang
+    /// it, and with it every test the harness runs beside it.
+    fn accept_within(listener: &std::net::TcpListener, timeout: Duration) -> std::net::TcpStream {
+        listener
+            .set_nonblocking(true)
+            .expect("non-blocking listener");
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // macOS gives the accepted stream the listener's O_NONBLOCK.
+                    stream.set_nonblocking(false).expect("blocking stream");
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the command never connected within {timeout:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept request: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "never connected")]
+    fn a_test_server_gives_up_when_nothing_connects() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+        accept_within(&listener, Duration::from_millis(100));
+    }
 
     #[test]
     fn command_sandbox_enforcement_reports_the_selected_backend() {
@@ -3724,7 +3760,7 @@ enabled = true
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
             let port = listener.local_addr().expect("server addr").port();
             let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut stream = accept_within(&listener, ACCEPT_TIMEOUT);
                 let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
                 let mut line = String::new();
                 while reader.read_line(&mut line).expect("read request") != 0 {
@@ -3859,7 +3895,7 @@ enabled = true
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
             let port = listener.local_addr().expect("server addr").port();
             let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut stream = accept_within(&listener, ACCEPT_TIMEOUT);
                 let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
                 let mut line = String::new();
                 while reader.read_line(&mut line).expect("read request") != 0 {
@@ -4465,7 +4501,7 @@ enabled = true
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
             let port = listener.local_addr().expect("server addr").port();
             let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut stream = accept_within(&listener, ACCEPT_TIMEOUT);
                 let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
                 let mut line = String::new();
                 while reader.read_line(&mut line).expect("read request") != 0 {
@@ -4742,7 +4778,7 @@ enabled = true
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
         let port = listener.local_addr().expect("server addr").port();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut stream = accept_within(&listener, ACCEPT_TIMEOUT);
             let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
             let mut line = String::new();
             while reader.read_line(&mut line).expect("read request") != 0 {
