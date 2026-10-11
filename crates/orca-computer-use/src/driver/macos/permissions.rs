@@ -20,13 +20,23 @@ unsafe extern "C-unwind" fn passthrough(
     event.as_ptr()
 }
 
+fn probe_parameters() -> (
+    CGEventTapLocation,
+    CGEventTapPlacement,
+    CGEventTapOptions,
+    u64,
+) {
+    super::esc_tap::parameters()
+}
+
 pub(super) fn check() -> Permissions {
+    let (location, placement, options, mask) = probe_parameters();
     let tap = unsafe {
         CGEvent::tap_create(
-            CGEventTapLocation::HIDEventTap,
-            CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::ListenOnly,
-            1 << CGEventType::KeyDown.0,
+            location,
+            placement,
+            options,
+            mask,
             Some(passthrough),
             std::ptr::null_mut(),
         )
@@ -42,10 +52,22 @@ pub(super) fn check() -> Permissions {
     }
 }
 
-pub(super) fn host_bundle_id() -> Option<String> {
-    if let Ok(bundle_id) = std::env::var("__CFBundleIdentifier") {
-        return Some(bundle_id);
+fn detect_host(
+    mut environment: impl FnMut(&str) -> Option<String>,
+    parent_host: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if environment("TMUX").is_some() || environment("STY").is_some() {
+        return None;
     }
+    environment("__CFBundleIdentifier").or_else(parent_host)
+}
+pub(super) fn host_bundle_id() -> Option<String> {
+    detect_host(
+        |name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()),
+        parent_host_bundle_id,
+    )
+}
+fn parent_host_bundle_id() -> Option<String> {
     let mut pid = std::process::id() as i32;
     while let Some(parent) = parent_pid(pid) {
         if parent <= 0 || parent == pid {
@@ -86,4 +108,43 @@ fn parent_pid(pid: i32) -> Option<i32> {
     Some(i32::from_ne_bytes(
         record[PPID_OFFSET..PPID_OFFSET + 4].try_into().ok()?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn permission_probe_matches_the_listener_tap() {
+        assert_eq!(probe_parameters(), super::super::esc_tap::parameters());
+    }
+    #[test]
+    fn multiplexers_never_trust_an_inherited_or_parent_host() {
+        for (tmux, screen, expected) in [
+            (false, false, Some("host")),
+            (true, false, None),
+            (false, true, None),
+        ] {
+            let host = detect_host(
+                |key| match key {
+                    "__CFBundleIdentifier" => Some("host".into()),
+                    "TMUX" if tmux => Some("/tmp/test-tmux".into()),
+                    "STY" if screen => Some("screen-session".into()),
+                    _ => None,
+                },
+                || Some("parent".into()),
+            );
+            assert_eq!(host.as_deref(), expected);
+        }
+        assert_eq!(
+            detect_host(
+                |key| (key == "TMUX").then(String::new),
+                || Some("parent".into())
+            ),
+            None
+        );
+        assert_eq!(
+            detect_host(|_| None, || Some("parent".into())),
+            Some("parent".into())
+        );
+    }
 }

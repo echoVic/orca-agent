@@ -16,6 +16,29 @@ use super::{error, events::HID_MARKER};
 use crate::protocol::{DriverError, DriverEvent, DriverLine, ErrorKind, EventLine};
 use crate::serve::LineWriter;
 
+pub(super) fn parameters() -> (
+    CGEventTapLocation,
+    CGEventTapPlacement,
+    CGEventTapOptions,
+    u64,
+) {
+    (
+        CGEventTapLocation::SessionEventTap,
+        CGEventTapPlacement::HeadInsertEventTap,
+        CGEventTapOptions::Default,
+        (1 << CGEventType::KeyDown.0) | (1 << CGEventType::KeyUp.0),
+    )
+}
+fn install_error(listening_access: bool) -> DriverError {
+    let mut message = "Could not install the Esc listener; open System Settings → Privacy & Security → Accessibility and allow the terminal running Orca".to_owned();
+    if !listening_access {
+        message.push_str(
+            "; also enable Privacy & Security → Input Monitoring for keyboard event listening",
+        );
+    }
+    error(ErrorKind::PermissionMissing, message)
+}
+
 struct Context {
     aborted: Arc<AtomicBool>,
     events: crossbeam_channel::Sender<()>,
@@ -136,20 +159,20 @@ impl EscTap {
                     events,
                     tap: None,
                 });
+                let (location, placement, options, mask) = parameters();
                 let tap = unsafe {
                     CGEvent::tap_create(
-                        CGEventTapLocation::SessionEventTap,
-                        CGEventTapPlacement::HeadInsertEventTap,
-                        CGEventTapOptions::Default,
-                        (1 << CGEventType::KeyDown.0) | (1 << CGEventType::KeyUp.0),
+                        location,
+                        placement,
+                        options,
+                        mask,
                         Some(callback),
                         (&mut *context as *mut Context).cast(),
                     )
                 };
                 let Some(tap) = tap else {
-                    let _ = ready.send(Err(error(
-                        ErrorKind::PermissionMissing,
-                        "Could not install the Esc listener",
+                    let _ = ready.send(Err(install_error(
+                        objc2_core_graphics::CGPreflightListenEventAccess(),
                     )));
                     return;
                 };
@@ -320,4 +343,19 @@ fn a_full_esc_notice_queue_still_aborts_without_waiting() {
     }
     assert!(aborted.load(Ordering::SeqCst));
     assert_eq!(queued.len(), ESC_QUEUE_CAPACITY);
+}
+
+#[cfg(test)]
+#[test]
+fn listener_install_error_names_the_required_settings_panes() {
+    for listening in [false, true] {
+        let failure = install_error(listening);
+        assert_eq!(failure.kind, ErrorKind::PermissionMissing);
+        assert!(
+            failure
+                .message
+                .contains("Privacy & Security → Accessibility")
+        );
+        assert_eq!(failure.message.contains("Input Monitoring"), !listening);
+    }
 }
