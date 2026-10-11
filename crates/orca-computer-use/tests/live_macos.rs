@@ -195,6 +195,21 @@ impl Drop for Live {
     }
 }
 
+fn bundle_pids(bundle_id: &str) -> HashSet<i32> {
+    NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str(bundle_id))
+        .iter()
+        .map(|app| app.processIdentifier())
+        .collect()
+}
+
+fn register_launch_pids(
+    registered: &mut HashSet<i32>,
+    before: &HashSet<i32>,
+    after: &HashSet<i32>,
+) {
+    registered.extend(after.difference(before).copied());
+}
+
 fn cleanup_pids(running: &HashSet<i32>, launched: &HashSet<i32>) -> Vec<i32> {
     let mut pids: Vec<_> = launched.difference(running).copied().collect();
     pids.sort_unstable();
@@ -312,16 +327,20 @@ fn a_second_driver_finds_the_session_lock_held() {
         live.apps().iter().any(|app| app.pid == Some(pid)),
         "owner can list apps"
     );
-    let launched = live
-        .client
-        .call(
-            Request::LaunchApp {
-                app: "dev.orca.cu-fixture".into(),
-                open: vec![],
-            },
-            Duration::from_secs(60),
-        )
-        .unwrap();
+    let before = bundle_pids("dev.orca.cu-fixture");
+    let launched = live.client.call(
+        Request::LaunchApp {
+            app: "dev.orca.cu-fixture".into(),
+            open: vec![],
+        },
+        Duration::from_secs(60),
+    );
+    register_launch_pids(
+        &mut live.launched,
+        &before,
+        &bundle_pids("dev.orca.cu-fixture"),
+    );
+    let launched = launched.unwrap();
     assert!(
         matches!(launched, Reply::Launched { app } if app.pid == Some(pid)),
         "owner can launch its fixture"
@@ -338,7 +357,14 @@ fn a_second_driver_finds_the_session_lock_held() {
         ]
     };
     for request in requests() {
-        let error = second.handle(request, &output).unwrap_err();
+        let before = bundle_pids("dev.orca.cu-fixture");
+        let result = second.handle(request, &output);
+        register_launch_pids(
+            &mut live.launched,
+            &before,
+            &bundle_pids("dev.orca.cu-fixture"),
+        );
+        let error = result.unwrap_err();
         assert_eq!(error.kind, ErrorKind::LockHeld);
         assert_eq!(error.message, "another Orca session is using the computer");
     }
@@ -347,7 +373,14 @@ fn a_second_driver_finds_the_session_lock_held() {
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::LockHeld);
     for request in requests() {
-        let error = second.handle(request, &output).unwrap_err();
+        let before = bundle_pids("dev.orca.cu-fixture");
+        let result = second.handle(request, &output);
+        register_launch_pids(
+            &mut live.launched,
+            &before,
+            &bundle_pids("dev.orca.cu-fixture"),
+        );
+        let error = result.unwrap_err();
         assert_eq!(error.kind, ErrorKind::LockHeld);
         assert_eq!(error.message, "another Orca session is using the computer");
     }
@@ -361,7 +394,7 @@ fn launch_app_opens_a_file_in_textedit() {
     };
     let file = live.directory.path().join("orca-cu-test.txt");
     std::fs::write(&file, "Orca computer use fixture document\n").unwrap();
-    // Record the returned PID before assertions; never infer ownership from a process sweep.
+    let before = bundle_pids("com.apple.TextEdit");
     let result = live.client.call(
         Request::LaunchApp {
             app: "com.apple.TextEdit".into(),
@@ -369,12 +402,11 @@ fn launch_app_opens_a_file_in_textedit() {
         },
         Duration::from_secs(60),
     );
-    if let Ok(Reply::Launched { app }) = &result
-        && let Some(pid) = app.pid
-        && !live.running.contains(&pid)
-    {
-        live.launched.insert(pid);
-    }
+    register_launch_pids(
+        &mut live.launched,
+        &before,
+        &bundle_pids("com.apple.TextEdit"),
+    );
     let Reply::Launched { app } = result.unwrap() else {
         panic!("expected launched app")
     };
@@ -403,6 +435,7 @@ fn opening_a_nonexistent_file_in_already_running_textedit_returns_an_error() {
     }
     let file = live.directory.path().join("native-open-control.txt");
     std::fs::write(&file, "Native launch completion control\n").unwrap();
+    let before = bundle_pids("com.apple.TextEdit");
     let result = live.client.call(
         Request::LaunchApp {
             app: "com.apple.TextEdit".into(),
@@ -410,11 +443,11 @@ fn opening_a_nonexistent_file_in_already_running_textedit_returns_an_error() {
         },
         Duration::from_secs(60),
     );
-    if let Ok(Reply::Launched { app }) = &result
-        && let Some(pid) = app.pid
-    {
-        live.launched.insert(pid);
-    }
+    register_launch_pids(
+        &mut live.launched,
+        &before,
+        &bundle_pids("com.apple.TextEdit"),
+    );
     let Reply::Launched { app } = result.unwrap() else {
         panic!("expected successful launch control")
     };
@@ -423,12 +456,18 @@ fn opening_a_nonexistent_file_in_already_running_textedit_returns_an_error() {
         "valid file opens in the same TextEdit process"
     );
     let missing = live.directory.path().join("does-not-exist.txt");
+    let before = bundle_pids("com.apple.TextEdit");
     let result = live.client.call(
         Request::LaunchApp {
             app: "com.apple.TextEdit".into(),
             open: vec![missing.to_string_lossy().into_owned()],
         },
         Duration::from_secs(60),
+    );
+    register_launch_pids(
+        &mut live.launched,
+        &before,
+        &bundle_pids("com.apple.TextEdit"),
     );
     let Err(CallError::Driver(error)) = result else {
         panic!("native open failure was hidden: {result:?}")
@@ -466,5 +505,29 @@ fn cleanup_preserves_an_app_launched_by_another_live_session() {
     assert!(
         owner.apps().iter().any(|app| app.pid == Some(pid)),
         "cleanup must leave another session's app running"
+    );
+}
+
+#[test]
+#[ignore]
+fn launch_attribution_registers_only_pids_that_appeared_during_the_request() {
+    let before = HashSet::from([10, 20]);
+    let after = HashSet::from([20, 42, 43]);
+    let mut registered = HashSet::from([7]);
+    register_launch_pids(&mut registered, &before, &after);
+    assert_eq!(registered, HashSet::from([7, 42, 43]));
+    assert!(
+        !registered.contains(&20),
+        "pre-request process is never claimed"
+    );
+    assert!(
+        !registered.contains(&10),
+        "exited pre-request process is never claimed"
+    );
+    register_launch_pids(&mut registered, &after, &after);
+    assert_eq!(
+        registered,
+        HashSet::from([7, 42, 43]),
+        "a request with no new process claims nothing"
     );
 }
