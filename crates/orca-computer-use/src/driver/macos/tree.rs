@@ -23,6 +23,7 @@ pub(crate) struct TableEntry {
     pub role: String,
     pub label: Option<String>,
     pub secure: bool,
+    window_frame_control: bool,
 }
 
 const ROLES: &[&str] = &[
@@ -87,8 +88,13 @@ impl TreeNode for AxElement {
         }
         let role = read!(self.attribute_string("AXRole")).unwrap_or_default();
         let retained_role = ROLES.contains(&role.as_str());
-        let secure =
-            read!(self.attribute_string("AXSubrole")).as_deref() == Some("AXSecureTextField");
+        let subrole = read!(self.attribute_string("AXSubrole"));
+        let secure = subrole.as_deref() == Some("AXSecureTextField");
+        let window_frame_control = role == "AXButton"
+            && matches!(
+                subrole.as_deref(),
+                Some("AXCloseButton" | "AXMinimizeButton" | "AXZoomButton" | "AXFullScreenButton")
+            );
         let description = if role == "AXStaticText" || role == "AXImage" {
             read!(self.optional_attribute_string("AXDescription")).filter(|s| !s.is_empty())
         } else {
@@ -137,6 +143,7 @@ impl TreeNode for AxElement {
                 role,
                 label,
                 secure,
+                window_frame_control,
             };
             return Ok(Some((element, entry)));
         }
@@ -190,6 +197,7 @@ fn walk<N: TreeNode>(
 fn poll<E>(
     deadline: Instant,
     mut traversal: impl FnMut(Instant, &mut Vec<Element>, &mut Vec<E>) -> Result<(), DriverError>,
+    ready: impl Fn(&[E]) -> bool,
 ) -> Result<(Vec<Element>, Vec<E>), DriverError> {
     let mut elements = vec![];
     let mut entries = vec![];
@@ -198,8 +206,18 @@ fn poll<E>(
         if Instant::now() >= deadline {
             return Ok((elements, entries));
         }
-        traversal(deadline, &mut elements, &mut entries)?;
-        if !elements.is_empty() || Instant::now() >= deadline {
+        // Each retry is a fresh snapshot, not an append to the frame controls
+        // from the previous traversal. Keep the last nonempty snapshot if the
+        // budget expires before a retry can retain any elements.
+        let mut next_elements = vec![];
+        let mut next_entries = vec![];
+        traversal(deadline, &mut next_elements, &mut next_entries)?;
+        let is_ready = ready(&next_entries);
+        if !next_elements.is_empty() {
+            elements = next_elements;
+            entries = next_entries;
+        }
+        if is_ready || Instant::now() >= deadline {
             return Ok((elements, entries));
         }
         thread::sleep(
@@ -215,16 +233,20 @@ pub(super) fn collect(
     max_elements: u32,
 ) -> Result<(Vec<Element>, Vec<TableEntry>, u32, bool), DriverError> {
     let deadline = Instant::now() + Duration::from_secs(3);
-    let (mut elements, entries) = poll(deadline, |deadline, elements, entries| {
-        walk(
-            window.clone(),
-            Depth::default(),
-            geometry,
-            deadline,
-            elements,
-            entries,
-        )
-    })?;
+    let (mut elements, entries) = poll(
+        deadline,
+        |deadline, elements, entries| {
+            walk(
+                window.clone(),
+                Depth::default(),
+                geometry,
+                deadline,
+                elements,
+                entries,
+            )
+        },
+        |entries| entries.iter().any(|entry| !entry.window_frame_control),
+    )?;
     let no_element_tree = elements.is_empty();
     if let Some(query) = query {
         elements = filter_elements(&elements, query);
@@ -260,6 +282,111 @@ mod tests {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    fn button(id: u32, label: &str) -> Element {
+        Element {
+            id,
+            depth: 0,
+            role: "button".into(),
+            label: Some(label.into()),
+            value: None,
+            secure: false,
+            frame: [0; 4],
+        }
+    }
+
+    #[test]
+    fn frame_buttons_are_retried_until_content_arrives_without_duplicates() {
+        let mut calls = 0;
+        let (elements, entries) = poll(
+            Instant::now() + Duration::from_secs(1),
+            |_, elements, entries| {
+                calls += 1;
+                elements.push(button(1, "Close"));
+                entries.push(true);
+                if calls == 2 {
+                    elements.push(button(2, "Content"));
+                    entries.push(false);
+                }
+                Ok(())
+            },
+            |entries| entries.iter().any(|frame: &bool| !frame),
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(
+            elements
+                .iter()
+                .map(|element| element.id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(entries, [true, false]);
+    }
+
+    #[test]
+    fn a_title_bar_only_window_keeps_its_buttons_after_the_budget() {
+        let started = Instant::now();
+        let budget = Duration::from_millis(50);
+        let mut calls = 0;
+        let (elements, entries) = poll(
+            started + budget,
+            |_, elements, entries| {
+                calls += 1;
+                elements.push(button(1, "Close"));
+                entries.push(true);
+                Ok(())
+            },
+            |entries| entries.iter().any(|frame: &bool| !frame),
+        )
+        .unwrap();
+        assert!(started.elapsed() >= budget);
+        assert_eq!(calls, 1, "no retry after the final capped sleep");
+        assert_eq!(elements[0].label.as_deref(), Some("Close"));
+        assert_eq!(entries, [true]);
+    }
+
+    #[test]
+    fn a_content_button_returns_in_the_first_traversal() {
+        let mut calls = 0;
+        let (_, entries) = poll(
+            Instant::now() + Duration::from_secs(3),
+            |_, elements, entries| {
+                calls += 1;
+                elements.push(button(1, "Content"));
+                entries.push(false);
+                Ok(())
+            },
+            |entries| entries.iter().any(|frame: &bool| !frame),
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(entries, [false]);
+    }
+
+    #[test]
+    fn an_empty_final_traversal_keeps_the_last_frame_snapshot() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut calls = 0;
+        let (elements, entries) = poll(
+            deadline,
+            |_, elements, entries| {
+                calls += 1;
+                if calls == 1 {
+                    elements.push(button(1, "Close"));
+                    entries.push(true);
+                } else {
+                    thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                }
+                Ok(())
+            },
+            |entries| entries.iter().any(|frame: &bool| !frame),
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(elements[0].label.as_deref(), Some("Close"));
+        assert_eq!(entries, [true]);
+    }
 
     #[derive(Clone)]
     struct Node {
@@ -335,6 +462,7 @@ mod regression_tests {
                     entries,
                 )
             },
+            |entries| !entries.is_empty(),
         )
         .unwrap();
         let filtered = filter_elements(&elements, "Wanted");
@@ -367,6 +495,7 @@ mod regression_tests {
                     entries,
                 )
             },
+            |entries| !entries.is_empty(),
         )
         .unwrap();
         assert_eq!(filter_elements(&elements, "Wanted").len(), 2);
@@ -393,16 +522,20 @@ mod regression_tests {
         };
         let start = Instant::now();
         let budget = Duration::from_secs(3);
-        let (elements, _) = poll(start + budget, |deadline, elements, entries| {
-            walk(
-                tree.clone(),
-                Depth::default(),
-                geometry(),
-                deadline,
-                elements,
-                entries,
-            )
-        })
+        let (elements, _) = poll(
+            start + budget,
+            |deadline, elements, entries| {
+                walk(
+                    tree.clone(),
+                    Depth::default(),
+                    geometry(),
+                    deadline,
+                    elements,
+                    entries,
+                )
+            },
+            |entries| !entries.is_empty(),
+        )
         .unwrap();
         assert!(
             elements.is_empty(),
@@ -418,11 +551,15 @@ mod regression_tests {
     fn no_retry_starts_after_the_final_sleep() {
         let deadline = Instant::now() + Duration::from_millis(50);
         let mut calls = 0;
-        poll::<()>(deadline, |deadline, _, _| {
-            assert!(Instant::now() < deadline, "retry began after the deadline");
-            calls += 1;
-            Ok(())
-        })
+        poll::<()>(
+            deadline,
+            |deadline, _, _| {
+                assert!(Instant::now() < deadline, "retry began after the deadline");
+                calls += 1;
+                Ok(())
+            },
+            |entries| !entries.is_empty(),
+        )
         .unwrap();
         assert_eq!(calls, 1);
     }

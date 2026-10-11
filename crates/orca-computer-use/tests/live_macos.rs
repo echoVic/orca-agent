@@ -1210,7 +1210,9 @@ fn observe_of_an_electron_app_waits_for_its_tree() {
             Duration::from_secs(60),
         );
         register_launch_pids(&mut live.launched, &before, &bundle_pids(&bundle));
-        result.unwrap();
+        let Reply::Launched { app } = result.unwrap() else {
+            panic!("expected launched Electron app");
+        };
         let observation = live.observe(&bundle, None);
         eprintln!(
             "Electron {bundle}: no_element_tree={}, elements={}, buttons={}, text_fields={}; fixture control has both roles",
@@ -1226,6 +1228,14 @@ fn observe_of_an_electron_app_waits_for_its_tree() {
                 .iter()
                 .filter(|e| e.role == "text field")
                 .count()
+        );
+        let frame_buttons = title_bar_button_frames(app.pid.unwrap(), &observation);
+        assert!(
+            observation
+                .elements
+                .iter()
+                .any(|element| element.role != "button" || !frame_buttons.contains(&element.frame)),
+            "Electron observation must contain content beyond the window's title-bar buttons"
         );
         assert!(!observation.no_element_tree);
         assert!(
@@ -2396,6 +2406,73 @@ fn a_driver_hid_post_is_not_user_interference() {
         None,
         Some(8.0)
     ));
+}
+
+fn title_bar_button_frames(pid: i32, observation: &Observation) -> Vec<[i32; 4]> {
+    use objc2_application_services::{AXUIElement, AXValue, AXValueType};
+    use objc2_core_foundation::{CFString, CGPoint, CGSize};
+    fn frame(element: &AXUIElement) -> [f64; 4] {
+        let mut point = CGPoint::default();
+        let mut size = CGSize::default();
+        for (name, kind, pointer) in [
+            (
+                "AXPosition",
+                AXValueType::CGPoint,
+                std::ptr::NonNull::from(&mut point).cast(),
+            ),
+            (
+                "AXSize",
+                AXValueType::CGSize,
+                std::ptr::NonNull::from(&mut size).cast(),
+            ),
+        ] {
+            let value = fixture_ax_value(element, name)
+                .unwrap()
+                .downcast::<AXValue>()
+                .unwrap();
+            assert!(unsafe { value.value(kind, pointer) });
+        }
+        [point.x, point.y, size.width, size.height]
+    }
+    let app = unsafe { AXUIElement::new_application(pid) };
+    let window = fixture_ax_value(&app, "AXMainWindow")
+        .unwrap()
+        .downcast::<AXUIElement>()
+        .unwrap();
+    let [x, y, width, height] = frame(&window);
+    let screenshot = observation.screenshot.as_ref().unwrap();
+    let geometry = orca_computer_use::geometry::CaptureGeometry {
+        window_origin: (x, y),
+        window_size: (width, height),
+        image_size: (screenshot.width, screenshot.height),
+    };
+    let mut frames = vec![];
+    for name in [
+        "AXCloseButton",
+        "AXMinimizeButton",
+        "AXZoomButton",
+        "AXFullScreenButton",
+    ] {
+        let Some(value) = fixture_ax_value(&window, name) else {
+            continue;
+        };
+        let button = value.downcast::<AXUIElement>().unwrap();
+        let subrole = fixture_ax_value(&button, "AXSubrole")
+            .unwrap()
+            .downcast::<CFString>()
+            .unwrap()
+            .to_string();
+        assert!(matches!(
+            subrole.as_str(),
+            "AXCloseButton" | "AXMinimizeButton" | "AXZoomButton" | "AXFullScreenButton"
+        ));
+        frames.push(geometry.to_image(frame(&button)));
+    }
+    assert!(
+        !frames.is_empty(),
+        "positive control: native window frame buttons are identifiable by subrole"
+    );
+    frames
 }
 
 fn fixture_ax_value(

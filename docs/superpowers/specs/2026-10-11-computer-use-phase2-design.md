@@ -228,3 +228,5 @@ Step 7：各代码修复分别提交；本节使用任务简报指定的提交�
 - `launch` 在已启动进程出现后启用无障碍支持，等到 `AXWindows` 可读且非空再返回；无窗口的应用最多等 10 秒后仍启动成功，等待受原 60 秒 launch deadline 限制，最后一次 AX 调用的 timeout 也不超过剩余时间。打开文件的路径使用同一就绪检查并刷新返回的窗口信息。Electron 测试已删除 harness 的 capture-window wait 和 3 秒 observe retry；Cherry Studio 现在在 `launch_app` 返回后立即观察成功，仍记录元素及控件数量。
 
 Step 3 的真机测试现在是 `typing_with_a_chinese_input_method_enters_the_text_exactly`：通过 Text Input Sources 的 `TISCopyCurrentKeyboardInputSource`／`kTISPropertyInputSourceID` 读取并打印当前 ID，只接受 `com.apple.inputmethod.SCIM` 或 `com.apple.inputmethod.TCIM` 及其子 ID，否则明确 skip；测试不切换输入法。Chinese 分支用现有 `type` 输入 `abc 中文`，核对最后一条输入日志和 Name 字段当前值均完全相同。本轮在 `com.apple.keylayout.ABC` 上只验证了 skip；中文输入实际结果仍是 `pending: run with the user`，`type` 投递实现没有改动。
+
+**修复轮次 2（2026-10-12）**：元素树的 3 秒 poll 不再把窗口自身的 `AXCloseButton`、`AXMinimizeButton`、`AXZoomButton`、`AXFullScreenButton` 当作内容就绪；这些按钮照常保留在观察里。已有内容控件时第一轮立即返回；只有标题栏按钮时等待同一预算，超时后仍返回它们。每次重试重新构建快照，避免重复元素／id，并保留预算耗尽前最后一个非空快照。Cherry Studio 在 `launch_app` 返回后立即观察的加强回归先只得到 3 个标题栏按钮而失败，修复后得到 70 个元素、31 个按钮，且通过原生 subrole／frame 核对确有非标题栏内容；没有 harness retry。
