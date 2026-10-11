@@ -1825,6 +1825,7 @@ fn capability_set_for_action_kind(action_kind: ActionKind) -> CapabilitySet {
         ActionKind::Network => CapabilitySet::network_search(),
         ActionKind::Agent => CapabilitySet::agent_delegate(),
         ActionKind::Shell => CapabilitySet::shell_execute(),
+        ActionKind::Computer => CapabilitySet::new(vec![ToolCapability::ComputerUse]),
     }
 }
 
@@ -1834,7 +1835,7 @@ fn renderer_for_action_kind(action_kind: ActionKind) -> RendererHint {
         ActionKind::Write => RendererHint::Write,
         ActionKind::Network => RendererHint::Network,
         ActionKind::Agent => RendererHint::Agent,
-        ActionKind::Shell => RendererHint::Shell,
+        ActionKind::Shell | ActionKind::Computer => RendererHint::Shell,
     }
 }
 

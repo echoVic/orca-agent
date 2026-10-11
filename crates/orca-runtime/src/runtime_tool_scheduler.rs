@@ -101,6 +101,7 @@ mod tests {
                 },
                 ..SubagentConfig::default()
             },
+            computer_use: orca_core::config::ComputerUseConfig::default(),
             tools: ToolConfig {
                 max_read_parallel: 3,
                 ..ToolConfig::default()

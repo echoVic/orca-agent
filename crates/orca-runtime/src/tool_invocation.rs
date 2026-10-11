@@ -19,6 +19,7 @@ pub struct ToolInvocation {
     pub requested: ToolRequest,
     pub effective: ToolRequest,
     pub action: Option<ActionKind>,
+    pub approval_preview: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -276,6 +277,7 @@ pub fn prepare_tool_invocation(
         requested: tool_request.clone(),
         effective,
         action,
+        approval_preview: None,
     }
 }
 
@@ -306,6 +308,7 @@ pub fn prepare_tool_invocation_with_external(
         requested: tool_request.clone(),
         effective,
         action,
+        approval_preview: None,
     }
 }
 
@@ -423,7 +426,7 @@ pub fn approval_request_for_invocation(invocation: &ToolInvocation) -> Option<Ap
         ),
         tool: Some(invocation.effective.name.as_str().to_string()),
         target: invocation.effective.target.clone(),
-        preview: None,
+        preview: invocation.approval_preview.clone(),
     })
 }
 
@@ -487,6 +490,7 @@ mod tests {
                 max_depth: 1,
                 ..SubagentConfig::default()
             },
+            computer_use: orca_core::config::ComputerUseConfig::default(),
             tools: ToolConfig {
                 shell_enforcement_decision: Some(
                     orca_core::capability::SandboxEnforcementDecision::new(
@@ -524,6 +528,24 @@ mod tests {
 
     fn schema_names(tools: &[ProviderToolDefinition]) -> Vec<&str> {
         tools.iter().map(|tool| tool.name.as_str()).collect()
+    }
+
+    #[test]
+    fn an_approval_request_carries_the_invocation_preview() {
+        let requested = request(
+            ToolName::plain("computer"),
+            ActionKind::Computer,
+            Some("com.apple.Safari"),
+            None,
+        );
+        let invocation = ToolInvocation {
+            effective: requested.clone(),
+            requested,
+            action: Some(ActionKind::Computer),
+            approval_preview: Some("operate Safari".into()),
+        };
+        let approval = approval_request_for_invocation(&invocation).unwrap();
+        assert_eq!(approval.preview.as_deref(), Some("operate Safari"));
     }
 
     #[test]
@@ -652,6 +674,7 @@ mod tests {
             requested: request.clone(),
             effective: request,
             action: Some(ActionKind::Shell),
+            approval_preview: None,
         };
         let readiness = crate::shell_readiness::ShellReadiness::Blocked {
             detail: "seatbelt probe terminated by signal 6".to_string(),
@@ -859,6 +882,7 @@ mod tests {
                 None,
             ),
             action: Some(ActionKind::Read),
+            approval_preview: None,
         };
 
         let approval = approval_request_for_invocation(&invocation).expect("approval");

@@ -182,7 +182,8 @@ pub fn execute_external_tool_with_policy_or_cancel_with_profile(
             orca_core::capability::CapabilitySet::read_only()
         }
         orca_core::approval_types::ActionKind::Write
-        | orca_core::approval_types::ActionKind::Shell => {
+        | orca_core::approval_types::ActionKind::Shell
+        | orca_core::approval_types::ActionKind::Computer => {
             orca_core::capability::CapabilitySet::workspace_write()
         }
         orca_core::approval_types::ActionKind::Network => orca_core::capability::CapabilitySet {
@@ -401,7 +402,7 @@ schema = { env = { type = "string", description = "environment" } }
             ),
             (
                 format!("{head}action_kind = \"abc-SECRET\"\ncommand = \"echo\"\n"),
-                "unknown variant in `action_kind`, expected one of `read`, `write`, `network`, `agent`, `shell`",
+                "unknown variant in `action_kind`, expected one of `read`, `write`, `network`, `agent`, `shell`, `computer`",
                 "abc-SECRET",
             ),
             (

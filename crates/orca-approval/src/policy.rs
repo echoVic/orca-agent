@@ -49,6 +49,8 @@ impl ApprovalPolicy {
         // Plan is a hard capability ceiling. Configuration rules can tighten
         // it further, but they can never mint write, network, agent, or shell
         // authority.
+        // Computer observations may reach approval in plan mode; the runtime
+        // precheck rejects other computer actions before this policy.
         if self.mode == ApprovalMode::Plan
             && matches!(
                 request.action,
@@ -97,6 +99,7 @@ impl ApprovalPolicy {
                 ApprovalMode::AutoEdit,
                 ActionKind::Network | ActionKind::Agent | ActionKind::Shell,
             ) => ApprovalDecision::Allow,
+            (_, ActionKind::Computer) => ApprovalDecision::Ask,
             (ApprovalMode::FullAuto, _) => ApprovalDecision::Allow,
         };
 
@@ -137,6 +140,56 @@ mod tests {
             target: None,
             preview: None,
         }
+    }
+
+    #[test]
+    fn computer_actions_ask_in_every_mode() {
+        for mode in [
+            ApprovalMode::Plan,
+            ApprovalMode::Suggest,
+            ApprovalMode::AutoEdit,
+            ApprovalMode::FullAuto,
+        ] {
+            let resolution = ApprovalPolicy::new(mode).resolve_for_tool(
+                &make_request(ActionKind::Computer),
+                "computer",
+                Some("com.apple.Safari"),
+            );
+            assert_eq!(resolution.decision, ApprovalDecision::Ask, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn an_exact_app_rule_allows_that_app_and_a_whole_tool_deny_still_wins() {
+        let policy =
+            ApprovalPolicy::new(ApprovalMode::Suggest).with_rules(vec![PermissionRule::new(
+                "computer",
+                "com.apple.TextEdit",
+                Decision::Allow,
+            )]);
+        let request = make_request(ActionKind::Computer);
+        assert_eq!(
+            policy
+                .resolve_for_tool(&request, "computer", Some("com.apple.TextEdit"))
+                .decision,
+            ApprovalDecision::Allow
+        );
+        assert_eq!(
+            policy
+                .resolve_for_tool(&request, "computer", Some("com.apple.Safari"))
+                .decision,
+            ApprovalDecision::Ask
+        );
+        let denied = ApprovalPolicy::new(ApprovalMode::FullAuto).with_rules(vec![
+            PermissionRule::new("computer", "com.apple.TextEdit", Decision::Allow),
+            PermissionRule::whole_tool("computer", Decision::Deny),
+        ]);
+        assert_eq!(
+            denied
+                .resolve_for_tool(&request, "computer", Some("com.apple.TextEdit"))
+                .decision,
+            ApprovalDecision::Deny
+        );
     }
 
     #[test]

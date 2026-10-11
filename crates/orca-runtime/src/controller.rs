@@ -2321,6 +2321,7 @@ mod tests {
             hooks: Vec::new(),
             external_tools: Vec::new(),
             subagents,
+            computer_use: orca_core::config::ComputerUseConfig::default(),
             tools: orca_core::config::ToolConfig {
                 shell_enforcement_decision: Some(
                     orca_core::capability::SandboxEnforcementDecision::new(

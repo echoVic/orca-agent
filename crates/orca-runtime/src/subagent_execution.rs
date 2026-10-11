@@ -1040,6 +1040,7 @@ mod tests {
             external_tools: Vec::new(),
             hooks: Vec::new(),
             subagents,
+            computer_use: orca_core::config::ComputerUseConfig::default(),
             tools: Default::default(),
             workflows: Default::default(),
             theme: orca_core::config::ThemeName::Dark,

@@ -457,7 +457,11 @@ pub fn format_tool_result_for_model(result: &ToolResult) -> String {
 pub fn requires_approval(action: ActionKind) -> bool {
     matches!(
         action,
-        ActionKind::Write | ActionKind::Network | ActionKind::Agent | ActionKind::Shell
+        ActionKind::Write
+            | ActionKind::Network
+            | ActionKind::Agent
+            | ActionKind::Shell
+            | ActionKind::Computer
     )
 }
 
@@ -465,6 +469,11 @@ pub fn requires_approval(action: ActionKind) -> bool {
 mod tests {
     use super::*;
     use orca_core::goal_types::{ThreadGoal, ThreadGoalStatus};
+
+    #[test]
+    fn computer_actions_require_approval() {
+        assert!(requires_approval(ActionKind::Computer));
+    }
 
     #[test]
     fn plan_mode_requires_one_complete_proposed_plan_and_no_execution_prompt() {

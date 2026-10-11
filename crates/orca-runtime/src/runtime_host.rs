@@ -13613,7 +13613,8 @@ pub(crate) fn surface_tool_action(
         orca_core::approval_types::ActionKind::Write => surface::SurfaceToolAction::Write,
         orca_core::approval_types::ActionKind::Network => surface::SurfaceToolAction::Network,
         orca_core::approval_types::ActionKind::Agent => surface::SurfaceToolAction::Agent,
-        orca_core::approval_types::ActionKind::Shell => surface::SurfaceToolAction::Shell,
+        orca_core::approval_types::ActionKind::Shell
+        | orca_core::approval_types::ActionKind::Computer => surface::SurfaceToolAction::Shell,
     }
 }
 
@@ -26147,6 +26148,7 @@ mod tests {
             additional_working_directories: Vec::new(),
             budget: Default::default(),
             subagents: SubagentConfig::default(),
+            computer_use: orca_core::config::ComputerUseConfig::default(),
             tools: ToolConfig {
                 shell_enforcement_decision: Some(
                     orca_core::capability::SandboxEnforcementDecision::new(

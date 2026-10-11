@@ -10,9 +10,10 @@ use toml::Value;
 use crate::approval_rules::PermissionRules;
 use crate::approval_types::ApprovalMode;
 use crate::config::{
-    BudgetConfig, DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN, DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
-    MAX_WORKFLOW_AGENT_RETRIES, ModelRuntimeConfig, PermissionProfileConfig, ReasoningEffort,
-    ThemeName, ToolConfig, WorkflowConfig, WorkflowTeamConfig,
+    BudgetConfig, ComputerUseConfig, DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN,
+    DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS, MAX_WORKFLOW_AGENT_RETRIES, ModelRuntimeConfig,
+    PermissionProfileConfig, ReasoningEffort, ThemeName, ToolConfig, WorkflowConfig,
+    WorkflowTeamConfig,
 };
 use crate::model::ModelDefinition;
 use crate::subagent_config::SubagentConfig;
@@ -47,6 +48,8 @@ pub struct FileConfig {
     pub subagents: SubagentConfig,
     #[serde(default)]
     pub tools: ToolConfig,
+    #[serde(default)]
+    pub computer_use: ComputerUseConfig,
     #[serde(default)]
     pub workflows: WorkflowFileConfig,
     #[serde(default)]
@@ -98,6 +101,8 @@ struct RawFileConfig {
     #[serde(default)]
     pub tools: ToolConfig,
     #[serde(default)]
+    pub computer_use: ComputerUseConfig,
+    #[serde(default)]
     pub workflows: WorkflowFileConfig,
     #[serde(default)]
     pub theme: ThemeName,
@@ -132,6 +137,7 @@ impl Default for FileConfig {
             permission_profiles: HashMap::new(),
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
+            computer_use: ComputerUseConfig::default(),
             workflows: WorkflowFileConfig::default(),
             theme: ThemeName::default(),
             vim_mode: false,
@@ -168,6 +174,7 @@ impl From<RawFileConfig> for FileConfig {
             permission_profiles: raw.permission_profiles,
             subagents: raw.subagents,
             tools: raw.tools,
+            computer_use: raw.computer_use,
             workflows,
             theme: raw.theme,
             vim_mode: raw.vim_mode,
@@ -496,6 +503,7 @@ fn remove_project_denied_fields(value: &mut Value) {
             "subagents",
             "workflows",
             "tools",
+            "computer_use",
             "budget",
         ] {
             table.remove(key);
@@ -661,6 +669,62 @@ mod tests {
             return FileConfig::default();
         };
         toml::from_str(&content).unwrap_or_default()
+    }
+
+    #[test]
+    fn computer_use_foreground_fallback_defaults_on_and_reads_from_the_file() {
+        let config: FileConfig = toml::from_str("").unwrap();
+        assert!(config.computer_use.foreground_fallback);
+        let config: FileConfig =
+            toml::from_str("[computer_use]\nforeground_fallback = false\n").unwrap();
+        assert!(!config.computer_use.foreground_fallback);
+    }
+
+    #[test]
+    fn a_project_config_cannot_turn_off_the_foreground_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(project_dir.join(".orca")).unwrap();
+        std::fs::write(&user_path, "").unwrap();
+        std::fs::write(
+            project_dir.join(".orca/config.toml"),
+            "[computer_use]\nforeground_fallback = false\n",
+        )
+        .unwrap();
+        crate::config::folder_trust::set_trust_with_config_dir(
+            &project_dir,
+            dir.path(),
+            crate::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+        let config = load_layered_config_from_paths(&user_path, &project_dir);
+        assert!(config.computer_use.foreground_fallback);
+    }
+
+    #[test]
+    fn computer_use_foreground_config_never_persists_interactive() {
+        let config: FileConfig =
+            toml::from_str("[computer_use]\nforeground_fallback = false\ninteractive = true\n")
+                .unwrap();
+        assert!(!config.computer_use.interactive);
+        let serialized = toml::to_string(&crate::config::ComputerUseConfig {
+            foreground_fallback: false,
+            interactive: true,
+        })
+        .unwrap();
+        assert!(!serialized.contains("interactive"));
+        let restored: crate::config::ComputerUseConfig = toml::from_str(&serialized).unwrap();
+        assert!(!restored.foreground_fallback);
+        assert!(!restored.interactive);
+        assert_eq!(
+            FileConfig::default().computer_use,
+            crate::config::ComputerUseConfig::default()
+        );
+        assert_eq!(
+            crate::config::RunConfig::default().computer_use,
+            crate::config::ComputerUseConfig::default()
+        );
     }
 
     #[test]

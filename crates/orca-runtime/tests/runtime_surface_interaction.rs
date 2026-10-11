@@ -4785,6 +4785,7 @@ fn test_config(cwd: PathBuf, history_mode: HistoryMode) -> RunConfig {
         additional_working_directories: Vec::new(),
         budget: Default::default(),
         subagents: SubagentConfig::default(),
+        computer_use: orca_core::config::ComputerUseConfig::default(),
         tools: ToolConfig::default(),
         workflows: WorkflowConfig::default(),
         theme: ThemeName::default(),
