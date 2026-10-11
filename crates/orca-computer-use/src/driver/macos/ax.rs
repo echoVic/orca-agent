@@ -1,6 +1,7 @@
 //! Owned accessibility handles. Unsupported optional attributes are absent;
 //! native failures (including invalid handles) remain typed driver errors.
 use std::ptr::NonNull;
+use std::time::Instant;
 
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{
@@ -46,13 +47,13 @@ impl AxElement {
     }
 
     fn attribute(&self, name: &str) -> Result<Option<CFRetained<CFType>>, DriverError> {
-        self.attribute_with_empty_label(name, false)
+        self.attribute_with_optional_absence(name, false)
     }
 
-    fn attribute_with_empty_label(
+    fn attribute_with_optional_absence(
         &self,
         name: &str,
-        empty_label: bool,
+        optional: bool,
     ) -> Result<Option<CFRetained<CFType>>, DriverError> {
         let mut value = std::ptr::null();
         let result = unsafe {
@@ -63,10 +64,7 @@ impl AxElement {
             return Ok(None);
         }
         match check(result, name) {
-            // AppKit's unlabeled NSTextView advertises AXDescription but
-            // returns kAXErrorFailure. Only this optional label failure is
-            // absent; timeouts and stale handles always propagate.
-            Err(_) if empty_label && result == AXError::Failure => return Ok(None),
+            Err(_) if optional && result == AXError::Failure => return Ok(None),
             result => result?,
         }
         Ok(NonNull::new(value.cast_mut()).map(|value| unsafe { CFRetained::from_raw(value) }))
@@ -85,14 +83,24 @@ impl AxElement {
         }))
     }
 
-    pub(super) fn label_attribute(&self, name: &str) -> Result<Option<String>, DriverError> {
+    // R7: traversal's optional title/description/label/placeholder/value reads
+    // treat NoValue, AttributeUnsupported and Failure as absent. Required
+    // role/position/size/window/children reads and actions must not use this.
+    pub(super) fn optional_attribute_string(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, DriverError> {
         Ok(self
-            .attribute_with_empty_label(name, true)?
+            .attribute_with_optional_absence(name, true)?
             .and_then(|value| {
-                value
-                    .downcast_ref::<CFString>()
-                    .map(ToString::to_string)
-                    .filter(|s| !s.is_empty())
+                if let Some(text) = value.downcast_ref::<CFString>() {
+                    Some(text.to_string())
+                } else {
+                    value
+                        .downcast_ref::<CFNumber>()
+                        .and_then(|n| n.as_f64())
+                        .map(|n| n.to_string())
+                }
             }))
     }
 
@@ -111,6 +119,17 @@ impl AxElement {
     }
 
     pub(crate) fn elements(&self, name: &str) -> Result<Vec<Self>, DriverError> {
+        self.elements_with_deadline(name, None)
+    }
+
+    fn elements_with_deadline(
+        &self,
+        name: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<Self>, DriverError> {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(vec![]);
+        }
         let Some(value) = self.attribute(name)? else {
             return Ok(vec![]);
         };
@@ -118,6 +137,7 @@ impl AxElement {
             return Ok(vec![]);
         };
         (0..array.len())
+            .take_while(|_| deadline.is_none_or(|d| Instant::now() < d))
             .filter_map(|i| {
                 // AX arrays own Core Foundation objects; validate each dynamic type.
                 let value = unsafe { &*array.value_at_index(i as isize).cast::<CFType>() };
@@ -129,11 +149,31 @@ impl AxElement {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn children(&self) -> Result<Vec<Self>, DriverError> {
         self.elements("AXChildren")
     }
 
+    pub(super) fn children_until(&self, deadline: Instant) -> Result<Vec<Self>, DriverError> {
+        self.elements_with_deadline("AXChildren", Some(deadline))
+    }
+
     pub(crate) fn position_size(&self) -> Result<[f64; 4], DriverError> {
+        self.position_size_with_deadline(None)?
+            .ok_or_else(|| error(ErrorKind::Failed, "Accessibility position/size is missing"))
+    }
+
+    pub(super) fn position_size_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<[f64; 4]>, DriverError> {
+        self.position_size_with_deadline(Some(deadline))
+    }
+
+    fn position_size_with_deadline(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<Option<[f64; 4]>, DriverError> {
         let mut point = CGPoint::default();
         let mut size = CGSize::default();
         for (name, kind, pointer) in [
@@ -148,6 +188,9 @@ impl AxElement {
                 NonNull::from(&mut size).cast(),
             ),
         ] {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Ok(None);
+            }
             let value = self.attribute(name)?.ok_or_else(|| {
                 error(
                     ErrorKind::Failed,
@@ -164,7 +207,7 @@ impl AxElement {
                 return Err(error(ErrorKind::Failed, format!("Could not decode {name}")));
             }
         }
-        Ok([point.x, point.y, size.width, size.height])
+        Ok(Some([point.x, point.y, size.width, size.height]))
     }
 
     // These native operations are the Task 7 action interface.
