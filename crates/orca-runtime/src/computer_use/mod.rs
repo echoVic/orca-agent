@@ -5,19 +5,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use orca_computer_use::client::{
-    CallError, DriverClient, DriverLauncher, HelloInfo, LaunchedDriver,
+    CallError, DriverClient, DriverLauncher, EventCallback, HelloInfo, LaunchedDriver,
 };
 use orca_computer_use::protocol::{DriverError, ErrorKind, Observation, Reply, Request};
 use orca_core::approval_types::ApprovalMode;
+use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 
 use crate::extension::ExtensionData;
 
+pub(crate) mod execute;
 pub(crate) mod prepare;
+pub(crate) mod turn;
+pub(crate) mod visibility;
 
 pub(crate) struct ComputerUseService {
     launcher: Arc<dyn DriverLauncher>,
-    state: Mutex<ServiceState>,
+    state: Arc<Mutex<ServiceState>>,
 }
 
 #[derive(Default)]
@@ -27,6 +31,8 @@ struct ServiceState {
     version_mismatch: Option<DriverError>,
     observations: HashMap<(String, u32), SecureObservation>,
     latest_window: HashMap<String, u32>,
+    turn_cancel: Option<CancelToken>,
+    turn_generation: Option<u64>,
 }
 
 struct SecureObservation {
@@ -35,13 +41,16 @@ struct SecureObservation {
 }
 
 impl ServiceState {
-    fn start(&mut self, launcher: &dyn DriverLauncher) -> Result<(), DriverError> {
+    fn start(
+        &mut self,
+        launcher: &dyn DriverLauncher,
+        on_event: EventCallback,
+    ) -> Result<(), DriverError> {
         if let Some(error) = &self.version_mismatch {
             return Err(error.clone());
         }
         if self.driver.is_none() {
-            // Task 10 attaches the turn's Esc handling to driver events.
-            match DriverClient::start(launcher, Arc::new(|_| {})) {
+            match DriverClient::start(launcher, on_event) {
                 Ok((client, hello)) => {
                     self.generation = self
                         .generation
@@ -65,6 +74,7 @@ impl ServiceState {
             client.close();
         }
         self.driver = None;
+        self.turn_generation = None;
         self.observations.clear();
         self.latest_window.clear();
     }
@@ -79,7 +89,64 @@ impl ComputerUseService {
     pub(crate) fn new(launcher: Arc<dyn DriverLauncher>) -> Self {
         Self {
             launcher,
-            state: Mutex::new(ServiceState::default()),
+            state: Arc::new(Mutex::new(ServiceState::default())),
+        }
+    }
+
+    fn event_callback(&self, generation: u64) -> EventCallback {
+        // The client owns this callback; a weak state avoids a service/client cycle.
+        let state = Arc::downgrade(&self.state);
+        let launcher = Arc::clone(&self.launcher);
+        Arc::new(move |event| {
+            if event != orca_computer_use::protocol::DriverEvent::Esc {
+                return;
+            }
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let cancel = {
+                let state = state.lock().expect("computer-use service lock poisoned");
+                if state.generation != generation {
+                    return;
+                }
+                state.turn_cancel.clone()
+            };
+            if let Some(cancel) = cancel {
+                cancel.cancel();
+                Self {
+                    launcher: Arc::clone(&launcher),
+                    state,
+                }
+                .cancel_in_flight();
+            }
+        })
+    }
+
+    pub(crate) fn start_turn(&self, cancel: &CancelToken) {
+        self.state
+            .lock()
+            .expect("computer-use service lock poisoned")
+            .turn_cancel = Some(cancel.clone());
+        let _ = self.call(Request::Turn { active: true }, Duration::from_secs(30));
+    }
+
+    pub(crate) fn end_turn(&self) {
+        let client = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("computer-use service lock poisoned");
+            state.turn_cancel = None;
+            state.turn_generation = None;
+            state.driver.as_ref().map(|(client, _)| Arc::clone(client))
+        };
+        // Do not launch a replacement driver just to end an interrupted turn.
+        if let Some(client) = client
+            && client
+                .call(Request::Turn { active: false }, Duration::from_secs(30))
+                .is_err()
+        {
+            self.reset();
         }
     }
 
@@ -89,37 +156,61 @@ impl ComputerUseService {
             .state
             .lock()
             .expect("computer-use service lock poisoned");
-        state.start(&*self.launcher)?;
+        let generation = state.generation + 1;
+        state.start(&*self.launcher, self.event_callback(generation))?;
         Ok(state.driver.as_ref().expect("started driver").1.clone())
     }
 
     pub(crate) fn call(&self, request: Request, timeout: Duration) -> Result<Reply, CallError> {
-        let (client, generation) = {
+        let (client, generation, rearm_turn) = {
             let mut state = self
                 .state
                 .lock()
                 .expect("computer-use service lock poisoned");
-            state.start(&*self.launcher).map_err(CallError::Driver)?;
+            let generation = state.generation + 1;
+            state
+                .start(&*self.launcher, self.event_callback(generation))
+                .map_err(CallError::Driver)?;
             (
                 Arc::clone(&state.driver.as_ref().expect("started driver").0),
                 state.generation,
+                state.turn_cancel.is_some()
+                    && state.turn_generation != Some(state.generation)
+                    && !matches!(request, Request::Turn { .. }),
             )
         };
-        let result = client.call(request, timeout);
-        if matches!(result, Err(CallError::TimedOut | CallError::Disconnected)) {
-            let mut state = self
-                .state
-                .lock()
-                .expect("computer-use service lock poisoned");
-            if state.generation == generation {
+        // Authorization may already have restarted the driver through hello.
+        // Arm each generation once, and share the request's timeout with rearming.
+        let started = std::time::Instant::now();
+        let is_turn_start = matches!(request, Request::Turn { active: true });
+        let mut turn_armed = false;
+        let result = if rearm_turn {
+            client
+                .call(Request::Turn { active: true }, timeout)
+                .and_then(|_| {
+                    turn_armed = true;
+                    client.call(request, timeout.saturating_sub(started.elapsed()))
+                })
+        } else {
+            let result = client.call(request, timeout);
+            turn_armed = is_turn_start && result.is_ok();
+            result
+        };
+        let mut state = self
+            .state
+            .lock()
+            .expect("computer-use service lock poisoned");
+        if state.generation == generation {
+            if matches!(result, Err(CallError::TimedOut | CallError::Disconnected)) {
                 state.reset();
+            } else if turn_armed {
+                state.turn_generation = Some(generation);
             }
         }
         result
     }
 
     /// Disconnects the active call without waiting for a driver reply.
-    #[allow(dead_code)] // Used by Task 10's Esc path.
     pub(crate) fn cancel_in_flight(&self) {
         let client = self
             .state
@@ -134,7 +225,6 @@ impl ComputerUseService {
     }
 
     /// Drops the client and its observations; the next call starts a new driver.
-    #[allow(dead_code)] // Used by Task 10 tool cancellation.
     pub(crate) fn reset(&self) {
         self.state
             .lock()
@@ -142,7 +232,6 @@ impl ComputerUseService {
             .reset();
     }
 
-    #[allow(dead_code)] // Used by Task 10 observation results.
     pub(crate) fn record_observation(&self, observation: &Observation) {
         let mut state = self
             .state
@@ -420,7 +509,10 @@ mod tests {
             // request cannot finish its cleanup before the new driver exists.
             let mut state = service.state.lock().unwrap();
             state.reset();
-            state.start(&*service.launcher).unwrap();
+            let generation = state.generation + 1;
+            state
+                .start(&*service.launcher, service.event_callback(generation))
+                .unwrap();
         }
         let outcome = result.recv_timeout(Duration::from_millis(500));
         assert!(

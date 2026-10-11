@@ -154,6 +154,14 @@ pub(crate) fn provider_config_for_agent_loop(
     );
     if let Some(tools) = tools_override.as_mut() {
         omit_unavailable_shell_launch_tools(tools, &shell_readiness);
+        if !crate::computer_use::visibility::tool_visible(
+            config,
+            subagent_depth,
+            tool_policy.allowed_tools(),
+            orca_computer_use::apps::host_supported(),
+        ) {
+            tools.retain(|tool| tool.name != "computer");
+        }
     }
     let mut provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
@@ -432,6 +440,39 @@ pub fn approval_request_for_invocation(invocation: &ToolInvocation) -> Option<Ap
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_tools_omit_computer_outside_the_tui() {
+        let registry = orca_mcp::McpRegistry::default();
+        let policy = super::AgentToolPolicyContext::unrestricted();
+        let raw = super::provider_tool_schema_override(
+            0,
+            &orca_core::subagent_types::SubagentType::General,
+            policy,
+            &registry,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            raw.iter().any(|tool| tool.name == "computer"),
+            "computer must be registered before testing its visibility"
+        );
+        let config = orca_core::config::RunConfig::default();
+        let provider = super::provider_config_for_agent_loop(
+            &config,
+            0,
+            &orca_core::subagent_types::SubagentType::General,
+            policy,
+            &registry,
+        );
+        assert!(
+            !provider
+                .tools_override
+                .unwrap()
+                .iter()
+                .any(|tool| tool.name == "computer")
+        );
+    }
+
     use orca_core::approval_rules::PermissionRules;
     use orca_core::approval_types::{ActionKind, ApprovalMode};
     use orca_core::config::{

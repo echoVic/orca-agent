@@ -172,6 +172,21 @@ impl<'a> RuntimeToolRouter<'a> {
 
         let mut dispatch_child_budget_usage = None;
         let result = match self.runtime.classify_dispatch(execution_request, goal_mode) {
+            RuntimeSpecialToolDispatch::Computer => {
+                let stores = extension_stores.unwrap_or_else(|| {
+                    RuntimeExtensionStores::new(
+                        &self.runtime.thread_extensions,
+                        &self.runtime.turn_extensions,
+                    )
+                });
+                Ok(crate::computer_use::execute::execute(
+                    execution_request,
+                    config,
+                    stores,
+                    cwd,
+                    cancel,
+                ))
+            }
             RuntimeSpecialToolDispatch::GetGoal
             | RuntimeSpecialToolDispatch::CreateGoal
             | RuntimeSpecialToolDispatch::UpdateGoal => {

@@ -107,7 +107,9 @@ pub fn prepare_interactive(request: InteractiveLaunchRequest) -> Result<RunConfi
         base_url: request.base_url,
         reasoning_effort: None,
     };
-    build_run_config(config_request)
+    let mut config = build_run_config(config_request)?;
+    config.computer_use.interactive = true;
+    Ok(config)
 }
 
 pub fn run_protocol(request: ProtocolLaunchRequest) -> i32 {
@@ -359,6 +361,30 @@ mod tests {
 
         let config = prepare_interactive(request).expect("interactive config");
         assert_eq!(config.cwd.as_deref(), Some(cwd.path()));
+    }
+
+    #[test]
+    fn the_interactive_launch_marks_computer_use_interactive() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().expect("temporary workspace");
+        let request = InteractiveLaunchRequest {
+            app_version: "0.2.55".to_string(),
+            resume: None,
+            fork: None,
+            continue_latest: false,
+            session_picker: false,
+            cwd: Some(cwd.path().to_path_buf()),
+            model: None,
+            mode: None,
+            api_key: Some("test-key".to_string()),
+            base_url: None,
+            provider: ProviderKind::Mock,
+            prompt: vec!["hello".to_string()],
+        };
+
+        let config = prepare_interactive(request).expect("interactive config");
+        assert!(config.computer_use.interactive);
     }
 
     #[test]

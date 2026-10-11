@@ -2146,21 +2146,10 @@ mod tests {
         );
     }
 
-    // Task 10 adds the built-in schema. This fixture lets these tests exercise
-    // validation, preparation and approval through the real execution path now.
     fn computer_config() -> RunConfig {
         let mut config = config_with_permission_rules(PermissionRules::default());
         config.approval_mode = ApprovalMode::Suggest;
         config.computer_use.interactive = true;
-        config
-            .external_tools
-            .push(orca_core::external_config::ExternalToolConfig {
-                name: "computer".into(),
-                description: "Computer-use approval test schema".into(),
-                action_kind: ActionKind::Computer,
-                command: "must never run".into(),
-                schema: serde_json::json!({"type":"object"}),
-            });
         config
     }
 
@@ -2170,15 +2159,29 @@ mod tests {
         use_extension_stores: bool,
         handler: &(dyn crate::runtime_approval::RuntimeApprovalHandler + Send + Sync),
     ) -> (RunStatus, ToolResult, Vec<serde_json::Value>) {
+        execute_computer_arguments_for_approval(
+            config,
+            desktop,
+            use_extension_stores,
+            handler,
+            serde_json::json!({"action":"observe", "app":"TextEdit"}),
+        )
+    }
+
+    fn execute_computer_arguments_for_approval(
+        config: &RunConfig,
+        desktop: orca_computer_use::fake::FakeDesktop,
+        use_extension_stores: bool,
+        handler: &(dyn crate::runtime_approval::RuntimeApprovalHandler + Send + Sync),
+        arguments: serde_json::Value,
+    ) -> (RunStatus, ToolResult, Vec<serde_json::Value>) {
         let cwd = tempfile::tempdir().unwrap();
         let request = ToolRequest {
             id: "computer-1".into(),
             name: ToolName::Computer,
             action: ActionKind::Computer,
             target: None,
-            raw_arguments: Some(
-                serde_json::json!({"action":"observe", "app":"TextEdit"}).to_string(),
-            ),
+            raw_arguments: Some(arguments.to_string()),
         };
         let policy = policy_for_tool_execution(config);
         let instructions = ProjectInstructions::default();
@@ -2259,6 +2262,52 @@ mod tests {
     }
 
     #[test]
+    fn an_approved_computer_call_executes_through_the_runtime_router() {
+        struct AllowComputer;
+        impl crate::runtime_approval::RuntimeApprovalHandler for AllowComputer {
+            fn resolve_interactive(
+                &self,
+                approval: &ApprovalRequest,
+                _request: &ToolRequest,
+            ) -> io::Result<orca_core::approval_types::ApprovalResolution> {
+                assert_eq!(approval.target.as_deref(), Some("com.apple.TextEdit"));
+                Ok(orca_core::approval_types::ApprovalResolution {
+                    id: approval.id.clone(),
+                    decision: ApprovalDecision::Allow,
+                    reason: "allowed in test".into(),
+                })
+            }
+        }
+        let mut config = computer_config();
+        config.model =
+            orca_core::model::ModelSelection::from_unchecked(Some("deepseek-flash".into()));
+        for use_extension_stores in [false, true] {
+            let (_, result, emitted) = execute_computer_for_approval(
+                &config,
+                orca_computer_use::fake::FakeDesktop::with_textedit(),
+                use_extension_stores,
+                &AllowComputer,
+            );
+            assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+            assert!(
+                result
+                    .output
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("TextEdit \"probe.rtf\": screenshot")
+            );
+            assert_eq!(result.images.len(), 1);
+            assert_eq!(
+                emitted
+                    .iter()
+                    .filter(|event| event["type"] == "tool.call.completed")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn a_computer_call_asks_with_the_bundle_id_as_its_target() {
         for use_extension_stores in [false, true] {
             let handler = ComputerApprovalRecording::default();
@@ -2317,15 +2366,13 @@ mod tests {
     fn tool_execution_validation_failure_publishes_once_before_preparation() {
         let mut config = computer_config();
         config.computer_use.interactive = false;
-        config.external_tools[0].schema = serde_json::json!({
-            "type": "object", "required": ["missing"]
-        });
         let handler = ComputerApprovalRecording::default();
-        let (status, result, emitted) = execute_computer_for_approval(
+        let (status, result, emitted) = execute_computer_arguments_for_approval(
             &config,
             orca_computer_use::fake::FakeDesktop::with_textedit(),
             true,
             &handler,
+            serde_json::json!({"app":"TextEdit"}),
         );
         assert_eq!(status, RunStatus::Failed);
         assert_eq!(
@@ -2337,7 +2384,7 @@ mod tests {
             error.starts_with("tool arguments failed schema validation:"),
             "{error}"
         );
-        assert!(error.contains("missing"), "{error}");
+        assert!(error.contains("action"), "{error}");
         assert!(handler.0.lock().unwrap().is_empty());
         assert_eq!(
             emitted
