@@ -140,7 +140,6 @@ def main() -> int:
             "discovered tool offered to the model",
             offered,
             f"exit={ok_run.returncode}",
-            issue="" if offered else "blocked by #85",
         )
 
         calls = [entry for entry in ok_entries
