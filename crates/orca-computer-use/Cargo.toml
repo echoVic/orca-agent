@@ -1,0 +1,16 @@
+[package]
+name = "orca-computer-use"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true, features = ["png"] }
+base64 = { workspace = true }
+orca-core = { path = "../orca-core" }
+orca-platform = { path = "../orca-platform" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSProcessInfo"] }

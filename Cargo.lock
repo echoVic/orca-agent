@@ -2360,6 +2360,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "orca-computer-use"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "image",
+ "objc2-foundation",
+ "orca-core",
+ "orca-platform",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "orca-core"
 version = "0.1.0"
 dependencies = [
