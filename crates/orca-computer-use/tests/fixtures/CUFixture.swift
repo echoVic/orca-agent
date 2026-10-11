@@ -88,7 +88,7 @@ submenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEqui
 edit.submenu = submenu; menu.addItem(edit); app.mainMenu = menu
 let controller = Controller()
 let window = ProbeWindow(contentRect: NSRect(x: 200, y: 200, width: 640, height: 480),
-                      styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+                      styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
 window.title = "Orca CU Fixture"
 let button = NSButton(title: "Increment", target: controller, action: #selector(Controller.increment(_:)))
 button.frame = NSRect(x: 20, y: 420, width: 120, height: 32)
@@ -106,7 +106,18 @@ secure.setAccessibilityLabel("Password")
 let scroll = NSScrollView(frame: NSRect(x: 20, y: 140, width: 300, height: 220))
 let text = NSTextView(frame: scroll.bounds)
 text.string = (1...200).map { "line \($0)" }.joined(separator: "\n")
-scroll.documentView = text; scroll.hasVerticalScroller = true; scroll.setAccessibilityLabel("List")
+scroll.documentView = text; scroll.hasVerticalScroller = !CommandLine.arguments.contains("--foreground-scroll-probe");
+if CommandLine.arguments.contains("--rows-probe") {
+    let rows = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 3000))
+    for index in 1...50 {
+        let row = NSButton(title: "Row \(index)", target: controller, action: #selector(Controller.increment(_:)))
+        row.setAccessibilityLabel("Row \(index)")
+        row.frame = NSRect(x: 10, y: (index - 1) * 60, width: 250, height: 30)
+        rows.addSubview(row)
+    }
+    scroll.documentView = rows
+}
+ scroll.setAccessibilityLabel("List")
 scroll.contentView.postsBoundsChangedNotifications = true
 NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification,
                                        object: scroll.contentView, queue: nil) { _ in

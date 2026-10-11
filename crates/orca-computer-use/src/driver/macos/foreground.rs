@@ -50,11 +50,17 @@ struct Restore {
     application: Retained<NSRunningApplication>,
     pointer: CGPoint,
     restored: bool,
+    minimized_window: Option<AxElement>,
 }
 
 impl Restore {
     fn finish(&mut self) -> Result<(), DriverError> {
-        // Always attempt both native restores, even if activation fails.
+        // Attempt every restore, including the target's minimized state.
+        let minimized = self
+            .minimized_window
+            .as_ref()
+            .map(|window| window.set_bool("AXMinimized", true))
+            .transpose();
         let app = activate(&self.application);
         let warped = CGWarpMouseCursorPosition(self.pointer);
         let pointer = if warped == CGError::Success {
@@ -79,6 +85,12 @@ impl Restore {
         // Explicit finish attempted every restore; Drop is only the unwind guard.
         self.restored = true;
         let mut failures = vec![];
+        if let Err(failure) = minimized {
+            failures.push(format!(
+                "The target window was not minimized again: {}",
+                failure.message
+            ));
+        }
         if let Err(failure) = app {
             failures.push(format!(
                 "The previous app was not restored: {}",
@@ -108,6 +120,7 @@ fn point(
     table: &ElementTable,
     application: &AxElement,
     target: Target,
+    window: &AxElement,
 ) -> Result<CGPoint, DriverError> {
     let (x, y) = match target {
         Target::Point { point } => table.geometry.to_screen(point).ok_or_else(|| {
@@ -117,8 +130,9 @@ fn point(
             )
         })?,
         Target::Element { .. } => {
-            let frame = actions::target_element(table, application, target)?.position_size()?;
-            (frame[0] + frame[2] / 2.0, frame[1] + frame[3] / 2.0)
+            let element = actions::target_element(table, application, target)?;
+            let point = element_click_point(&element, window)?;
+            (point.x, point.y)
         }
     };
     Ok(CGPoint::new(x, y))
@@ -169,9 +183,6 @@ pub(super) fn run(
         Action::Click { target, .. } | Action::Scroll { target, .. } => Some(*target),
         Action::Type { target, .. } | Action::Key { target, .. } => *target,
     };
-    let location = target
-        .map(|target| point(table, application, target))
-        .transpose()?;
     let enters_text = match &params.action {
         Action::Type { .. } => true,
         Action::Key { keys, .. } => parse_combo(keys)
@@ -211,17 +222,27 @@ pub(super) fn run(
         application: old,
         pointer: CGEvent::location(Some(&pointer_event)),
         restored: false,
+        minimized_window: window
+            .attribute_bool("AXMinimized")?
+            .unwrap_or(false)
+            .then(|| window.clone()),
     };
     let result = (|| {
         check_abort(aborted)?;
         let target = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
             .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
+        if restore.minimized_window.is_some() {
+            window.set_bool("AXMinimized", false)?;
+        }
         activate(&target)?;
         window.perform("AXRaise")?;
         // Activation/raise can precede AppKit's key-window transition.
         // Keep this pause short and check abort again before any HID post.
         thread::sleep(Duration::from_millis(50));
         check_window(window, table)?;
+        let location = target_location(params)
+            .map(|target| point(table, application, target, window))
+            .transpose()?;
         let mut hid = HidEvents::new(pid, aborted)?;
         let result = (|| {
             match &params.action {
@@ -335,4 +356,64 @@ fn successful_actions_keep_success_when_restoration_fails() {
         )
         .is_err()
     );
+}
+
+fn target_location(params: &ActParams) -> Option<Target> {
+    match &params.action {
+        Action::Click { target, .. } | Action::Scroll { target, .. } => Some(*target),
+        Action::Type { target, .. } | Action::Key { target, .. } => *target,
+    }
+}
+fn element_click_point(element: &AxElement, window: &AxElement) -> Result<CGPoint, DriverError> {
+    if let Some(point) = visible_center(element.position_size()?, window.position_size()?) {
+        return Ok(point);
+    }
+    // ScrollToVisible can be unsupported. Re-read either way, never click through.
+    let _ = element.perform("AXScrollToVisible");
+    visible_center(element.position_size()?, window.position_size()?).ok_or_else(|| {
+        error(
+            ErrorKind::Failed,
+            "The element is outside the visible window; observe again",
+        )
+    })
+}
+fn visible_center(frame: [f64; 4], window: [f64; 4]) -> Option<CGPoint> {
+    if frame.into_iter().chain(window).any(|v| !v.is_finite())
+        || frame[2] <= 0.0
+        || frame[3] <= 0.0
+        || window[2] <= 0.0
+        || window[3] <= 0.0
+    {
+        return None;
+    }
+    let left = frame[0].max(window[0]);
+    let top = frame[1].max(window[1]);
+    let right = (frame[0] + frame[2]).min(window[0] + window[2]);
+    let bottom = (frame[1] + frame[3]).min(window[1] + window[3]);
+    (right > left && bottom > top).then(|| CGPoint::new((left + right) / 2.0, (top + bottom) / 2.0))
+}
+
+#[cfg(test)]
+#[test]
+fn click_centers_stay_in_the_visible_intersection() {
+    let window = [100.0, 100.0, 200.0, 100.0];
+    assert!(visible_center([110.0, 300.0, 30.0, 20.0], window).is_none());
+    assert!(visible_center([110.0, 110.0, 0.0, 20.0], window).is_none());
+    assert_eq!(
+        visible_center([110.0, 180.0, 100.0, 200.0], window),
+        Some(CGPoint::new(160.0, 190.0))
+    );
+    assert_eq!(
+        visible_center([110.0, 110.0, 100.0, 20.0], window),
+        Some(CGPoint::new(160.0, 120.0))
+    );
+}
+#[cfg(feature = "test-utils")]
+pub fn test_element_click_point(
+    element: objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>,
+    window: objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>,
+) -> Result<CGPoint, DriverError> {
+    let element = AxElement::from_owned(element)?;
+    let window = AxElement::from_owned(window)?;
+    element_click_point(&element, &window)
 }

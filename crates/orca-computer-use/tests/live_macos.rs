@@ -2543,24 +2543,27 @@ fn fixture_screen_point(
             std::ptr::NonNull::from(&mut size).cast(),
         )
     });
-    let frame = observation
-        .elements
-        .iter()
-        .find(|element| element.label.as_deref() == Some(name))
-        .unwrap()
-        .frame;
     let image = observation.screenshot.as_ref().unwrap();
+    let image_point = if name == "canvas" {
+        [f64::from(image.width) * 0.75, f64::from(image.height) * 0.5]
+    } else {
+        let frame = observation
+            .elements
+            .iter()
+            .find(|e| e.label.as_deref() == Some(name))
+            .unwrap()
+            .frame;
+        [
+            f64::from(frame[0]) + f64::from(frame[2]) / 2.0,
+            f64::from(frame[1]) + f64::from(frame[3]) / 2.0,
+        ]
+    };
     let geometry = orca_computer_use::geometry::CaptureGeometry {
         window_origin: (origin.x, origin.y),
         window_size: (size.width, size.height),
         image_size: (image.width, image.height),
     };
-    let (x, y) = geometry
-        .to_screen([
-            f64::from(frame[0]) + f64::from(frame[2]) / 2.0,
-            f64::from(frame[1]) + f64::from(frame[3]) / 2.0,
-        ])
-        .unwrap();
+    let (x, y) = geometry.to_screen(image_point).unwrap();
     CGPoint::new(x, y)
 }
 
@@ -3310,5 +3313,263 @@ fn launching_a_cold_app_does_not_activate_it() {
                 .any(|e| e.label.as_deref() == Some("Increment")),
             "ready window positive control"
         );
+    });
+}
+
+fn set_fixture_ax_bool(element: &objc2_application_services::AXUIElement, name: &str, value: bool) {
+    use objc2_application_services::AXError;
+    use objc2_core_foundation::{CFBoolean, CFString};
+    assert_eq!(
+        unsafe {
+            element.set_attribute_value(&CFString::from_str(name), CFBoolean::new(value).as_ref())
+        },
+        AXError::Success
+    );
+}
+fn fixture_window(
+    pid: i32,
+) -> objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement> {
+    let application = unsafe { objc2_application_services::AXUIElement::new_application(pid) };
+    fixture_ax_value(&application, "AXMainWindow")
+        .unwrap()
+        .downcast()
+        .unwrap()
+}
+#[test]
+#[ignore]
+fn an_offscreen_row_is_scrolled_in_or_refused_before_hid_clicking() {
+    run_live_test(|| {
+        use orca_computer_use::driver::macos::test_element_click_point;
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) = live.launch_fixture_with_flags(&["--rows-probe"]);
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let row = obs
+            .elements
+            .iter()
+            .find(|e| e.label.as_deref().is_some_and(|s| s.starts_with("Row ")) && e.frame[3] == 0)
+            .expect("offscreen row");
+        let window = fixture_window(pid);
+        let native_row = fixture_ax_named(&window, row.label.as_ref().unwrap()).unwrap();
+        let point = test_element_click_point(native_row, window.clone());
+        if let Ok(point) = point {
+            // Read-only RED: the old native frame center was outside the window.
+            let system = unsafe { objc2_application_services::AXUIElement::new_system_wide() };
+            let mut hit = std::ptr::null();
+            assert_eq!(
+                unsafe {
+                    system.copy_element_at_position(
+                        point.x as f32,
+                        point.y as f32,
+                        std::ptr::NonNull::from(&mut hit),
+                    )
+                },
+                objc2_application_services::AXError::Success,
+                "native point must be hittable inside the fixture"
+            );
+            let hit = unsafe {
+                objc2_core_foundation::CFRetained::from_raw(
+                    std::ptr::NonNull::new(hit.cast_mut()).unwrap(),
+                )
+            };
+            let mut owner = 0;
+            assert_eq!(
+                unsafe { hit.pid(std::ptr::NonNull::from(&mut owner)) },
+                objc2_application_services::AXError::Success
+            );
+            assert_eq!(
+                owner, pid,
+                "offscreen native center would click through to another app"
+            );
+        } else {
+            assert_eq!(
+                point.unwrap_err().message,
+                "The element is outside the visible window; observe again"
+            );
+        }
+        let before = orca_computer_use::driver::macos::last_test_process_hid_post();
+        let outcome = live.act_with_fallback(
+            Action::Click {
+                target: Target::Element { element: row.id },
+                button: Button::Left,
+                count: 1,
+                modifiers: vec!["shift".into()],
+            },
+            false,
+            true,
+        );
+        match outcome {
+            Ok(outcome) => {
+                assert!(outcome.foreground_used);
+                live.assert_log_contains(&log, r#""count":1"#);
+            }
+            Err(failure) => {
+                assert_eq!(
+                    failure.message,
+                    "The element is outside the visible window; observe again"
+                );
+                assert_eq!(
+                    orca_computer_use::driver::macos::last_test_process_hid_post(),
+                    before
+                );
+            }
+        }
+        let fresh = live.observe("dev.orca.cu-fixture", None);
+        live.act_with_fallback(
+            click_target(live.point_inside(&fresh, "canvas")),
+            false,
+            true,
+        )
+        .unwrap();
+        live.assert_log_contains(&log, r#""type":"canvas_click""#);
+    });
+}
+#[test]
+#[ignore]
+fn a_finder_window_covering_the_canvas_is_refused_without_posting() {
+    run_live_test(|| {
+        use orca_computer_use::driver::macos::test_check_click_point;
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) = live.launch_fixture();
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let point = fixture_screen_point(pid, &obs, "canvas");
+        let output = Command::new("osascript")
+            .args([
+                "-e",
+                "tell application \"Finder\"
+set probe to make new Finder window
+set bounds of probe to {100, 100, 1100, 1000}
+activate
+return id of probe
+end tell",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let finder = FinderWindow(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        );
+        live.make_finder_frontmost();
+        // Probe is read-only; RED never sends a click into Finder or the host.
+        assert_eq!(
+            test_check_click_point(pid, point).unwrap_err().message,
+            "Another window covers the target point"
+        );
+        let before = orca_computer_use::driver::macos::last_test_process_hid_post();
+        let failure =
+            orca_computer_use::driver::macos::test_click_at_point(pid, point).unwrap_err();
+        assert_eq!(failure.message, "Another window covers the target point");
+        assert_eq!(
+            orca_computer_use::driver::macos::last_test_process_hid_post(),
+            before,
+            "Finder received no marked event"
+        );
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("canvas_click")
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+        drop(finder);
+        live.fixture_frontmost(pid);
+        live.act_with_fallback(click_target(live.point_inside(&obs, "canvas")), false, true)
+            .unwrap();
+        live.assert_log_contains(&log, r#""type":"canvas_click""#);
+    });
+}
+#[test]
+#[ignore]
+fn a_minimized_window_is_clicked_then_minimized_again() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let pid = bundle_pids("dev.orca.cu-fixture")
+            .into_iter()
+            .next()
+            .unwrap();
+        let window = fixture_window(pid);
+        live.act_with_fallback(click_target(live.point_inside(&obs, "canvas")), false, true)
+            .unwrap();
+        set_fixture_ax_bool(&window, "AXMinimized", true);
+        thread::sleep(Duration::from_millis(250));
+        assert!(
+            fixture_ax_value(&window, "AXMinimized")
+                .unwrap()
+                .downcast::<objc2_core_foundation::CFBoolean>()
+                .unwrap()
+                .value()
+        );
+        let outcome = live
+            .act_with_fallback(click_target(live.point_inside(&obs, "canvas")), false, true)
+            .unwrap();
+        assert!(outcome.foreground_used);
+        assert!(
+            fixture_ax_value(&window, "AXMinimized")
+                .unwrap()
+                .downcast::<objc2_core_foundation::CFBoolean>()
+                .unwrap()
+                .value()
+        );
+        let clicks = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|s| s.contains("canvas_click"))
+            .count();
+        assert_eq!(clicks, 2);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn a_foreground_scroll_moves_the_target_list_and_restores_the_pointer() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) = live.launch_fixture_with_flags(&["--foreground-scroll-probe"]);
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let away = fixture_screen_point(pid, &obs, "Name");
+        assert_eq!(
+            CGWarpMouseCursorPosition(away),
+            objc2_core_graphics::CGError::Success
+        );
+        live.background_state = Some((pid, CGEvent::location(Some(&CGEvent::new(None).unwrap()))));
+        let outcome = live
+            .act_with_fallback(
+                Action::Scroll {
+                    target: element_named(&obs, "List"),
+                    direction: Direction::Down,
+                    amount: 5,
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert!(
+            outcome.foreground_used,
+            "fixture has no background scroll bar"
+        );
+        live.assert_log_contains(&log, r#""type":"scroll""#);
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "scroll" && e["y"].as_f64().is_some_and(|y| y > 0.0)),
+            "foreground wheel must move the list while the pointer started away"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
     });
 }

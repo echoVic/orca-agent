@@ -191,6 +191,18 @@ impl MacDriver {
                     }
                     note.push_str("The window closed after the action; observe again.");
                 }
+                Err(failure)
+                    if failure.kind == ErrorKind::WindowNotFound
+                        && ax_window.attribute_bool("AXMinimized").ok().flatten() == Some(true) =>
+                {
+                    let note = outcome.note.get_or_insert_with(String::new);
+                    if !note.is_empty() {
+                        note.push_str("; ");
+                    }
+                    note.push_str(
+                        "The window was minimized again after the action; observe again.",
+                    );
+                }
                 Err(failure) => return Err(failure),
             }
         }

@@ -33,11 +33,19 @@ fn check(result: AXError, operation: &str) -> Result<(), DriverError> {
 }
 
 impl AxElement {
+    pub(super) fn system_wide() -> Result<Self, DriverError> {
+        Self::from_owned(unsafe { AXUIElement::new_system_wide() })
+    }
+    pub(super) fn pid(&self) -> Result<i32, DriverError> {
+        let mut pid = 0;
+        check(unsafe { self.0.pid(NonNull::from(&mut pid)) }, "read pid")?;
+        Ok(pid)
+    }
     pub(crate) fn application(pid: i32) -> Result<Self, DriverError> {
         Self::from_owned(unsafe { AXUIElement::new_application(pid) })
     }
 
-    fn from_owned(element: CFRetained<AXUIElement>) -> Result<Self, DriverError> {
+    pub(super) fn from_owned(element: CFRetained<AXUIElement>) -> Result<Self, DriverError> {
         check(
             unsafe { element.set_messaging_timeout(2.0) },
             "set message timeout",

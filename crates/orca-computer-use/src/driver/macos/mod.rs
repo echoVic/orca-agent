@@ -5,7 +5,11 @@ mod capture;
 mod esc_tap;
 mod events;
 #[cfg(feature = "test-utils")]
-pub use events::{last_test_process_hid_post, with_held_test_input};
+pub use events::{
+    last_test_process_hid_post, test_check_click_point, test_click_at_point, with_held_test_input,
+};
+#[cfg(feature = "test-utils")]
+pub use foreground::test_element_click_point;
 mod foreground;
 mod permissions;
 mod tree;

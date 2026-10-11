@@ -201,6 +201,7 @@ impl<'a> HidEvents<'a> {
         count: u8,
         modifiers: Modifiers,
     ) -> Result<(), DriverError> {
+        check_click_point(self.pid, point)?;
         self.modifiers(modifiers)?;
         let (button, down, up) = match button {
             Button::Left => (
@@ -232,6 +233,8 @@ impl<'a> HidEvents<'a> {
                     i64::from(count),
                 );
             }
+            // Recheck immediately before the mouse down, after move/modifiers.
+            check_click_point(self.pid, point)?;
             self.releases.push(up.clone());
             self.post(&down)?;
             self.post(&up)?;
@@ -375,4 +378,30 @@ pub fn with_held_test_input(
     while_held();
     hid.release();
     Ok(())
+}
+
+#[cfg(feature = "test-utils")]
+pub fn test_check_click_point(pid: i32, point: CGPoint) -> Result<(), DriverError> {
+    check_click_point(pid, point)
+}
+fn check_click_point(pid: i32, point: CGPoint) -> Result<(), DriverError> {
+    let hit_pid = super::ax::AxElement::system_wide()
+        .and_then(|system| system.element_at_position(point.x as f32, point.y as f32))
+        .and_then(|element| element.pid());
+    if hit_pid.is_ok_and(|owner| owner == pid) {
+        Ok(())
+    } else {
+        Err(error(
+            ErrorKind::Failed,
+            "Another window covers the target point",
+        ))
+    }
+}
+
+/// Exercise the real HID click guard with a cover kept in front; full fallback
+/// activation would raise the fixture over an ordinary Finder window first.
+#[cfg(feature = "test-utils")]
+pub fn test_click_at_point(pid: i32, point: CGPoint) -> Result<(), DriverError> {
+    let aborted = AtomicBool::new(false);
+    HidEvents::new(pid, &aborted)?.click(point, Button::Left, 1, Modifiers::default())
 }
