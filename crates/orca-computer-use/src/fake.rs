@@ -132,6 +132,17 @@ impl FakeDesktop {
         }
     }
 
+    /// Adds another window to the fixture's app for window-binding tests.
+    pub fn add_window(&mut self, bundle_id: &str, window: WindowInfo) {
+        self.apps
+            .iter_mut()
+            .find(|app| app.info.bundle_id == bundle_id)
+            .unwrap()
+            .info
+            .windows
+            .push(window);
+    }
+
     pub fn quit_app(&mut self, bundle_id: &str) {
         if let Some(app) = self
             .apps
@@ -225,7 +236,11 @@ impl FakeDesktop {
         Ok(Observation {
             bundle_id: app.info.bundle_id.clone(),
             app_name: app.info.name.clone(),
-            window: app.info.windows[0].clone(),
+            window: params
+                .window
+                .and_then(|id| app.info.windows.iter().find(|window| window.id == id))
+                .unwrap_or(&app.info.windows[0])
+                .clone(),
             elements,
             omitted,
             no_element_tree: false,
@@ -282,7 +297,14 @@ impl FakeDesktop {
                 .iter()
                 .position(|element| element.id == app.focused),
         };
-        if matches!(params.action, Action::Type { .. } | Action::Key { .. })
+        let enters_text = match &params.action {
+            Action::Type { .. } => true,
+            Action::Key { keys, .. } => crate::keys::parse_combo(keys)
+                .map_err(|message| error(ErrorKind::Failed, message))?
+                .enters_text(),
+            _ => false,
+        };
+        if enters_text
             && element.is_some_and(|index| app.elements[index].secure)
             && !params.secure_approved
         {
@@ -508,5 +530,60 @@ impl DriverLauncher for FakeLauncher {
             stdout: Box::new(stdout),
             child: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn secure_fields_gate_text_keys_but_not_tab() {
+        for (keys, approval_needed) in [
+            (vec!["p"], true),
+            (vec!["cmd", "v"], true),
+            (vec!["tab"], false),
+        ] {
+            let mut desktop = FakeDesktop::with_textedit();
+            let result = desktop.act(ActParams {
+                app: "com.apple.TextEdit".into(),
+                window: None,
+                action: Action::Key {
+                    keys: keys.iter().map(|key| (*key).into()).collect(),
+                    target: Some(Target::Element { element: 14 }),
+                },
+                foreground_fallback: true,
+                observe_after: false,
+                include_screenshot: false,
+                secure_approved: false,
+            });
+            if approval_needed {
+                assert_eq!(result.unwrap_err().kind, ErrorKind::NeedsSecureApproval);
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn observing_window_b_returns_window_b() {
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.add_window(
+            "com.apple.TextEdit",
+            WindowInfo {
+                id: 2,
+                title: "B".into(),
+            },
+        );
+        let observation = desktop
+            .observe(&ObserveParams {
+                app: "com.apple.TextEdit".into(),
+                window: Some(2),
+                query: None,
+                max_elements: 300,
+                include_screenshot: false,
+            })
+            .unwrap();
+        assert_eq!(observation.window.id, 2);
     }
 }
