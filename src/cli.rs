@@ -58,6 +58,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    ComputerUseDriver,
     /// Inspect local configuration, trust, and sandbox readiness without network access.
     Doctor(DoctorArgs),
     /// Inspect disk usage and optionally prune archived sessions.
@@ -970,6 +972,7 @@ pub fn run() -> i32 {
         }
         Some(Command::Trust(args)) => orca_runtime::command::trust::run(args.into()),
         Some(Command::Mcp(args)) => orca_runtime::command::mcp::run(args.into_request()),
+        Some(Command::ComputerUseDriver) => orca_runtime::command::computer_use_driver::run(),
         Some(Command::SubagentWorker(args)) => {
             orca_runtime::command::launch::run_subagent_worker(args.into())
         }

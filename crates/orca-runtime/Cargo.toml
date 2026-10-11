@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+orca-computer-use = { path = "../orca-computer-use" }
 orca-core = { path = "../orca-core" }
 orca-file-search = { path = "../orca-file-search" }
 orca-mcp = { path = "../orca-mcp" }
