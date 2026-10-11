@@ -301,6 +301,31 @@ pub fn add_user_allow_rule(tool: &str) -> io::Result<bool> {
 /// equivalent allow rule already exists, written either way (see
 /// `is_equivalent_allow_rule`).
 pub fn add_user_allow_rule_in(dir: &Path, tool: &str) -> io::Result<bool> {
+    add_user_allow_rule_with_pattern_in(dir, tool, None)
+}
+
+/// Add an allow rule for `tool` on `pattern` to the user-owned config.
+pub fn add_user_allow_rule_for_target(tool: &str, pattern: &str) -> io::Result<bool> {
+    let dir = resolve_config_dir()?;
+    add_user_allow_rule_for_target_in(&dir, tool, pattern)
+}
+
+/// Add a target-specific allow rule under `dir`, preserving the config's
+/// rule format and comments as `add_user_allow_rule_in` does. Returns
+/// `false` when an allow rule with the same tool and pattern already exists.
+pub fn add_user_allow_rule_for_target_in(
+    dir: &Path,
+    tool: &str,
+    pattern: &str,
+) -> io::Result<bool> {
+    add_user_allow_rule_with_pattern_in(dir, tool, Some(pattern))
+}
+
+fn add_user_allow_rule_with_pattern_in(
+    dir: &Path,
+    tool: &str,
+    pattern: Option<&str>,
+) -> io::Result<bool> {
     let path = user_config_path_in(dir);
     let mut appended = false;
     edit_user_config_in(dir, |document| {
@@ -308,12 +333,15 @@ pub fn add_user_allow_rule_in(dir: &Path, tool: &str) -> io::Result<bool> {
         if rules
             .tables()
             .into_iter()
-            .any(|table| is_equivalent_allow_rule(table, tool))
+            .any(|table| is_equivalent_allow_rule(table, tool, pattern))
         {
             return Ok(());
         }
         let mut rule = Table::new();
         rule.insert("tool", toml_edit::value(tool));
+        if let Some(pattern) = pattern {
+            rule.insert("pattern", toml_edit::value(pattern));
+        }
         rule.insert("decision", toml_edit::value("allow"));
         rules.push(rule);
         appended = true;
@@ -327,18 +355,21 @@ pub fn add_user_allow_rule_in(dir: &Path, tool: &str) -> io::Result<bool> {
 /// MCP tool or server, a hand-written `pattern = "*"`. An MCP call's target
 /// is its tool name, which has no `/`, so `*` covers it; for a tool whose
 /// target is a path, `*` stays within one directory and covers less. MCP
-/// names are compared in canonical form, as rules match them.
-fn is_equivalent_allow_rule(table: &dyn TableLike, tool: &str) -> bool {
-    let covers_every_call = match table.get("pattern") {
-        None => true,
-        Some(pattern) => tool.starts_with("mcp__") && pattern.as_str() == Some("*"),
+/// names are compared in canonical form, as rules match them. A target-specific
+/// rule instead requires the same pattern, even if a broader rule exists.
+fn is_equivalent_allow_rule(table: &dyn TableLike, tool: &str, pattern: Option<&str>) -> bool {
+    let covers_requested_calls = match (pattern, table.get("pattern")) {
+        (Some(pattern), Some(written)) => written.as_str() == Some(pattern),
+        (Some(_), None) => false,
+        (None, None) => true,
+        (None, Some(pattern)) => tool.starts_with("mcp__") && pattern.as_str() == Some("*"),
     };
     table
         .get("tool")
         .and_then(Item::as_str)
         .is_some_and(|written| canonical_rule_tool(written) == canonical_rule_tool(tool))
         && table.get("decision").and_then(Item::as_str) == Some("allow")
-        && covers_every_call
+        && covers_requested_calls
 }
 
 /// The permission rules of the user-owned config: its `permissions` table,
@@ -828,6 +859,68 @@ mod tests {
             .to_string();
         assert!(error.contains("TOML syntax error at line 1"), "{error}");
         assert!(!error.contains("SECRET"), "{error}");
+    }
+
+    #[test]
+    fn an_allow_rule_for_a_target_is_written_with_its_pattern() {
+        for seed in [
+            "# keep this comment\n",
+            "# keep this comment\n[permissions]\nrules = []\n",
+            "# keep this comment\npermissions = { rules = [] }\n",
+            "# keep this comment\npermissions.rules = []\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(USER_CONFIG_FILE);
+            std::fs::write(&path, seed).unwrap();
+
+            assert!(
+                add_user_allow_rule_for_target_in(dir.path(), "computer", "com.apple.Safari")
+                    .unwrap()
+            );
+            assert_eq!(
+                user_permission_rules_in(dir.path()).unwrap().rules,
+                vec![PermissionRule::new(
+                    "computer",
+                    "com.apple.Safari",
+                    Decision::Allow
+                )]
+            );
+            let saved = std::fs::read_to_string(&path).unwrap();
+            assert!(saved.contains("# keep this comment\n"), "{saved}");
+            assert!(
+                !add_user_allow_rule_for_target_in(dir.path(), "computer", "com.apple.Safari")
+                    .unwrap()
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        }
+    }
+
+    #[test]
+    fn a_target_allow_rule_keeps_other_patterns_and_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(USER_CONFIG_FILE),
+            concat!(
+                "[[permissions.rules]]\ntool = \"computer\"\ndecision = \"allow\"\n",
+                "[[permissions.rules]]\ntool = \"computer\"\npattern = \"*\"\ndecision = \"allow\"\n",
+                "[[permissions.rules]]\ntool = \"computer\"\npattern = \"com.apple.Safari\"\ndecision = \"deny\"\n",
+                "[[permissions.rules]]\ntool = \"computer\"\npattern = \"com.apple.TextEdit\"\ndecision = \"allow\"\n",
+            ),
+        )
+        .unwrap();
+        assert!(
+            add_user_allow_rule_for_target_in(dir.path(), "computer", "com.apple.Safari").unwrap()
+        );
+        let rules = user_permission_rules_in(dir.path()).unwrap().rules;
+        assert_eq!(rules.len(), 5);
+        assert_eq!(
+            rules.last(),
+            Some(&PermissionRule::new(
+                "computer",
+                "com.apple.Safari",
+                Decision::Allow
+            ))
+        );
     }
 
     #[test]

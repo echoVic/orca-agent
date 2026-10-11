@@ -337,6 +337,9 @@ pub enum ApprovalOption {
     AlwaysTool,
     /// Approve and remember this tool + target for the rest of the session.
     AlwaysTarget,
+    /// Approve, remember this tool + target for the session, and save an
+    /// allow rule with the target as its pattern to the user config.
+    AlwaysTargetSaved,
     /// MCP tools only: approve, remember this tool for the rest of the
     /// session, and save an allow rule to the user config so future
     /// sessions skip the prompt too.
@@ -358,6 +361,7 @@ impl ApprovalOption {
             ApprovalOption::Deny => '4',
             ApprovalOption::AlwaysToolSaved => '5',
             ApprovalOption::AlwaysServerSaved => '6',
+            ApprovalOption::AlwaysTargetSaved => '7',
         }
     }
 
@@ -369,6 +373,7 @@ impl ApprovalOption {
             ApprovalOption::Deny => 'n',
             ApprovalOption::AlwaysToolSaved => '5',
             ApprovalOption::AlwaysServerSaved => '6',
+            ApprovalOption::AlwaysTargetSaved => '7',
         }
     }
 
@@ -383,6 +388,7 @@ impl ApprovalOption {
             ApprovalOption::AlwaysTarget => "always allow this exact call",
             ApprovalOption::AlwaysToolSaved => "always allow this tool (saved)",
             ApprovalOption::AlwaysServerSaved => "always allow this server (saved)",
+            ApprovalOption::AlwaysTargetSaved => "always allow this target (saved)",
             ApprovalOption::Deny => "deny",
         }
     }
@@ -419,10 +425,26 @@ impl ApprovalDialog {
     /// always gets the same five options, in place of `AlwaysTarget`: an MCP
     /// call's target is its own tool name, so remembering it adds nothing to
     /// `AlwaysTool`, and the two saved options, persisted to the user config, take its place.
+    /// Computer approvals offer session and saved grants for the app;
+    /// secure-field typing only offers a single approval or denial.
     /// For every other tool, `AlwaysTarget` is only shown when a target is
     /// present AND the tool is likely to be called again with the same
     /// target (e.g. reading a fixed file path).
     pub fn options_for(tool: &str, target: Option<&str>) -> Vec<ApprovalOption> {
+        if tool == "computer"
+            && let Some(target) = target
+        {
+            return if target.ends_with("#secure") {
+                vec![ApprovalOption::Once, ApprovalOption::Deny]
+            } else {
+                vec![
+                    ApprovalOption::Once,
+                    ApprovalOption::AlwaysTarget,
+                    ApprovalOption::AlwaysTargetSaved,
+                    ApprovalOption::Deny,
+                ]
+            };
+        }
         if orca_core::mcp_types::mcp_tool_server(tool).is_some() {
             return vec![
                 ApprovalOption::Once,

@@ -6398,7 +6398,7 @@ fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog,
     let labels: Vec<String> = dialog
         .options
         .iter()
-        .map(|option| approval_option_label(*option, &dialog.tool))
+        .map(|option| approval_option_label(*option, &dialog.tool, dialog.target.as_deref()))
         .collect();
     let label_width = labels
         .iter()
@@ -6412,7 +6412,7 @@ fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog,
             &option.key().to_string(),
             &labels[index],
             label_width,
-            approval_option_detail(*option),
+            approval_option_detail(*option, &dialog.tool),
             inner_width,
         ));
     }
@@ -6447,11 +6447,23 @@ fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog,
     frame.render_widget(Paragraph::new(content).block(block), popup);
 }
 
-fn approval_option_label(option: ApprovalOption, tool: &str) -> String {
+fn approval_option_label(option: ApprovalOption, tool: &str, target: Option<&str>) -> String {
     match option {
+        ApprovalOption::Once
+            if tool == "computer" && target.is_some_and(|target| target.ends_with("#secure")) =>
+        {
+            "Allow typing this once".to_string()
+        }
         ApprovalOption::Once => "Allow once".to_string(),
         ApprovalOption::AlwaysTool => format!("Allow {tool} this session"),
+        ApprovalOption::AlwaysTarget if tool == "computer" => {
+            "Allow this app this session".to_string()
+        }
         ApprovalOption::AlwaysTarget => "Allow this exact call".to_string(),
+        ApprovalOption::AlwaysTargetSaved if tool == "computer" => {
+            "Always allow this app (saved)".to_string()
+        }
+        ApprovalOption::AlwaysTargetSaved => "Always allow this target (saved)".to_string(),
         ApprovalOption::AlwaysToolSaved => format!("Always allow {tool} (saved)"),
         ApprovalOption::AlwaysServerSaved => match orca_core::mcp_types::mcp_tool_server(tool) {
             Some(server) => format!("Always allow the {server} server (saved)"),
@@ -6461,11 +6473,18 @@ fn approval_option_label(option: ApprovalOption, tool: &str) -> String {
     }
 }
 
-fn approval_option_detail(option: ApprovalOption) -> &'static str {
+fn approval_option_detail(option: ApprovalOption, tool: &str) -> &'static str {
     match option {
         ApprovalOption::Once => "run it now",
         ApprovalOption::AlwaysTool => "skip approval for this tool until you quit",
+        ApprovalOption::AlwaysTarget if tool == "computer" => {
+            "skip approval for this app until you quit"
+        }
         ApprovalOption::AlwaysTarget => "remember only this exact call",
+        ApprovalOption::AlwaysTargetSaved if tool == "computer" => {
+            "save an allow rule for this app"
+        }
+        ApprovalOption::AlwaysTargetSaved => "save an allow rule for this target",
         ApprovalOption::AlwaysToolSaved => "save an allow rule so future sessions skip it too",
         ApprovalOption::AlwaysServerSaved => {
             "save an allow rule covering every tool on this server"
@@ -8978,6 +8997,48 @@ mod tests {
             diff_scroll: 0,
         });
         state
+    }
+
+    #[test]
+    fn a_computer_approval_panel_names_the_app_and_its_warning() {
+        let mut state = approval_state();
+        let dialog = state.approval_dialog.as_mut().unwrap();
+        dialog.tool = "computer".into();
+        dialog.target = Some("com.apple.Safari".into());
+        dialog.options = ApprovalDialog::options_for("computer", Some("com.apple.Safari"));
+        dialog.diff = Some(
+            "observe in Safari (com.apple.Safari)\nwarning: Safari web pages may carry instructions aimed at the agent".into(),
+        );
+
+        let frame = frame_string(&mut state, 140, 35);
+        for text in [
+            "observe in Safari (com.apple.Safari)",
+            "warning: Safari web pages may carry instructions aimed at the agent",
+            "Allow this app this session",
+            "skip approval for this app until you quit",
+            "Always allow this app (saved)",
+            "save an allow rule for this app",
+            "1/2/7/4 pick",
+        ] {
+            assert!(frame.contains(text), "missing {text:?}: {frame}");
+        }
+        assert!(!frame.contains("Allow computer this session"), "{frame}");
+    }
+
+    #[test]
+    fn a_secure_computer_approval_only_offers_typing_once_or_deny() {
+        let mut state = approval_state();
+        let dialog = state.approval_dialog.as_mut().unwrap();
+        dialog.tool = "computer".into();
+        dialog.target = Some("com.apple.Safari#secure".into());
+        dialog.options = ApprovalDialog::options_for("computer", Some("com.apple.Safari#secure"));
+
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(frame.contains("Allow typing this once"), "{frame}");
+        assert!(frame.contains("Deny"), "{frame}");
+        assert!(frame.contains("1/4 pick"), "{frame}");
+        assert!(!frame.contains("this session"), "{frame}");
+        assert!(!frame.contains("(saved)"), "{frame}");
     }
 
     #[test]
@@ -12638,6 +12699,28 @@ mod tests {
         assert_eq!(
             text,
             " ⠋ Running 12s · bash cargo test -p orca-tui · Esc interrupt"
+        );
+    }
+
+    #[test]
+    fn running_activity_line_for_computer_names_the_app() {
+        let mut state = test_state();
+        state.status = AppStatus::Running;
+        state.running_started_at = Some(Instant::now() - Duration::from_secs(3));
+        state.tick = 0;
+        state.push_message(ChatMessage::ToolCall {
+            id: "call-1".into(),
+            name: "computer".into(),
+            target: Some("com.apple.Safari".into()),
+            status: "running".into(),
+            output: None,
+            diff: None,
+            kind: None,
+            expanded: false,
+        });
+        assert_eq!(
+            activity_line(&state, &Theme::named(ThemeName::Dark)).as_deref(),
+            Some(" ⠋ Running 3s · computer com.apple.Safari · Esc interrupt")
         );
     }
 

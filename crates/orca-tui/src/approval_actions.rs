@@ -12,8 +12,8 @@ use crate::types::{AppState, AppStatus, ApprovalOption};
 
 /// Resolve the approval dialog by the chosen option. The "always allow"
 /// options record a session allowlist entry so later matching approvals are
-/// auto-granted by the app event loop; the two "(saved)" options (MCP tools
-/// only) additionally persist an allow rule to the user config so future
+/// auto-granted by the app event loop; the "(saved)" options additionally
+/// persist an allow rule to the user config so future
 /// sessions skip the prompt too — a write failure is reported through the
 /// transcript, but does not undo the session's grant. Tool approvals stay a
 /// simple allow/deny bool; permission requests carry the typed scope so
@@ -50,12 +50,20 @@ pub(crate) fn resolve_approval_option(
                     .insert(AppState::approval_key_target(tool, target));
             }
         }
+        ApprovalOption::AlwaysTargetSaved => {
+            if let (Some(tool), Some(target)) = (&dialog_tool, &dialog_target) {
+                state
+                    .approval_allowlist
+                    .insert(AppState::approval_key_target(tool, target));
+                save_allow_rule(state, tool, Some(target), tool, Some(target));
+            }
+        }
         ApprovalOption::AlwaysToolSaved => {
             if let Some(tool) = &dialog_tool {
                 state
                     .approval_allowlist
                     .insert(AppState::approval_key_tool(tool));
-                save_allow_rule(state, tool, tool, dialog_target.as_deref());
+                save_allow_rule(state, tool, None, tool, dialog_target.as_deref());
             }
         }
         ApprovalOption::AlwaysServerSaved => {
@@ -65,7 +73,7 @@ pub(crate) fn resolve_approval_option(
                 .map(AppState::approval_key_mcp_server);
             if let (Some(rule_tool), Some(tool)) = (rule_tool, &dialog_tool) {
                 state.approval_allowlist.insert(rule_tool.clone());
-                save_allow_rule(state, &rule_tool, tool, dialog_target.as_deref());
+                save_allow_rule(state, &rule_tool, None, tool, dialog_target.as_deref());
             }
         }
         ApprovalOption::Once | ApprovalOption::Deny => {}
@@ -74,13 +82,26 @@ pub(crate) fn resolve_approval_option(
 }
 
 /// Persist a saved-allow rule for `rule_tool` (a bare tool name for
-/// `AlwaysToolSaved`, or `mcp__<server>__*` for `AlwaysServerSaved`) to the
+/// `AlwaysToolSaved`, or `mcp__<server>__*` for `AlwaysServerSaved`), with a
+/// target pattern for `AlwaysTargetSaved`, to the
 /// user config, for the call of `tool` on `target` being approved. The
 /// session grant above already stands either way, so a write failure is
 /// reported to the transcript instead of undoing it. So is a rule of the
 /// user config that still decides that call ahead of the saved one.
-fn save_allow_rule(state: &mut AppState, rule_tool: &str, tool: &str, target: Option<&str>) {
-    let text = match orca_core::config::user_edit::add_user_allow_rule(rule_tool) {
+fn save_allow_rule(
+    state: &mut AppState,
+    rule_tool: &str,
+    pattern: Option<&str>,
+    tool: &str,
+    target: Option<&str>,
+) {
+    let saved = match pattern {
+        Some(pattern) => {
+            orca_core::config::user_edit::add_user_allow_rule_for_target(rule_tool, pattern)
+        }
+        None => orca_core::config::user_edit::add_user_allow_rule(rule_tool),
+    };
+    let text = match saved {
         Err(error) => format!(
             "Allowed for this session, but saving the rule to the user config failed: {error}"
         ),
@@ -168,6 +189,7 @@ fn permission_decision_for(option: ApprovalOption) -> TuiPermissionDecision {
         ApprovalOption::Once => TuiPermissionDecision::AllowOnce,
         ApprovalOption::AlwaysTool
         | ApprovalOption::AlwaysTarget
+        | ApprovalOption::AlwaysTargetSaved
         | ApprovalOption::AlwaysToolSaved
         | ApprovalOption::AlwaysServerSaved => TuiPermissionDecision::AllowSession,
         ApprovalOption::Deny => TuiPermissionDecision::Deny,
@@ -185,6 +207,7 @@ mod tests {
         for option in [
             ApprovalOption::AlwaysTool,
             ApprovalOption::AlwaysTarget,
+            ApprovalOption::AlwaysTargetSaved,
             ApprovalOption::AlwaysToolSaved,
             ApprovalOption::AlwaysServerSaved,
         ] {
@@ -316,6 +339,82 @@ mod tests {
         assert!(permission_decision_for(ApprovalOption::AlwaysToolSaved).is_allow());
         assert!(permission_decision_for(ApprovalOption::AlwaysServerSaved).is_allow());
         assert!(!permission_decision_for(ApprovalOption::Deny).is_allow());
+    }
+
+    #[test]
+    fn saving_an_app_rule_allows_it_this_session_and_writes_the_pattern() {
+        let home = crate::test_support::isolate_orca_home();
+        let mut state = state_awaiting_a_tool_approval();
+        let dialog = state.approval_dialog.as_mut().unwrap();
+        dialog.tool = "computer".into();
+        dialog.target = Some("com.apple.Safari".into());
+        dialog.options =
+            crate::types::ApprovalDialog::options_for("computer", Some("com.apple.Safari"));
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        resolve_approval_option(&mut state, &action_tx, ApprovalOption::AlwaysTargetSaved);
+
+        assert!(state.approval_is_allowlisted("computer", Some("com.apple.Safari")));
+        assert!(!state.approval_is_allowlisted("computer", Some("com.apple.TextEdit")));
+        assert!(!state.approval_is_allowlisted("computer", Some("com.apple.Safari#secure")));
+        assert!(!state.approval_is_allowlisted("computer", None));
+        assert_eq!(state.status, AppStatus::Running);
+        assert!(state.approval_dialog.is_none());
+        assert!(matches!(
+            action_rx.try_recv().unwrap(),
+            UserAction::RespondToInteraction {
+                response: TuiInteractionResponse::Approval(true),
+                ..
+            }
+        ));
+        assert_eq!(
+            orca_core::config::user_edit::user_permission_rules_in(home.path())
+                .unwrap()
+                .rules,
+            vec![orca_core::approval_rules::PermissionRule::new(
+                "computer",
+                "com.apple.Safari",
+                Decision::Allow
+            )]
+        );
+        assert_eq!(
+            permission_decision_for(ApprovalOption::AlwaysTargetSaved),
+            TuiPermissionDecision::AllowSession
+        );
+    }
+
+    #[test]
+    fn saving_a_computer_app_rule_reports_failure_or_a_stricter_rule() {
+        for (seed, notice) in [
+            ("model = [\n", "saving the rule to the user config failed"),
+            (
+                "[[permissions.rules]]\ntool = \"computer\"\npattern = \"com.apple.Safari\"\ndecision = \"deny\"\n",
+                "saved, but a stricter rule in your config still applies to computer",
+            ),
+        ] {
+            let home = crate::test_support::isolate_orca_home();
+            std::fs::write(home.path().join("config.toml"), seed).unwrap();
+            let mut state = state_awaiting_a_tool_approval();
+            let dialog = state.approval_dialog.as_mut().unwrap();
+            dialog.tool = "computer".into();
+            dialog.target = Some("com.apple.Safari".into());
+            dialog.options =
+                crate::types::ApprovalDialog::options_for("computer", Some("com.apple.Safari"));
+            let (action_tx, action_rx) = mpsc::unbounded();
+
+            resolve_approval_option(&mut state, &action_tx, ApprovalOption::AlwaysTargetSaved);
+
+            assert_eq!(state.status, AppStatus::Running);
+            assert!(state.approval_is_allowlisted("computer", Some("com.apple.Safari")));
+            assert!(action_rx.try_recv().is_ok());
+            assert!(
+                matches!(
+                    state.transcript.messages.last(),
+                    Some(ChatMessage::System { text, .. }) if text.contains(notice)
+                ),
+                "expected save notice: {notice}"
+            );
+        }
     }
 
     #[test]
