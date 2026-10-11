@@ -6,7 +6,7 @@ use orca_core::conversation::{Conversation, ImageDetail, ImageInput, ImageSource
 use orca_core::thread_identity::TurnId;
 use orca_core::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE;
 
-use super::assets;
+use super::assets::{self, HydrateImages};
 use super::reader::INDEX_BUDGET;
 use super::retention::{SessionRetentionPolicy, retain_sessions};
 use super::types::{SessionRecord, StoredMessage, StoredSessionHealth};
@@ -86,15 +86,27 @@ fn asset_codec_preserves_surface_payload_and_rejects_corruption() {
     let stored = assets::externalize(&path, original.clone()).unwrap();
     assert_eq!(fs::read_dir(assets::directory(&path)).unwrap().count(), 1);
     assert_eq!(
-        assets::hydrate(&path, stored.clone(), true).unwrap(),
+        assets::hydrate(&path, stored.clone(), HydrateImages::All).unwrap(),
         original
     );
     let mut malicious = stored.clone();
     malicious["assets"][0]["sha256"] = serde_json::json!("../../outside");
-    assert!(assets::hydrate(&path, malicious, true).is_err());
+    for images in [
+        HydrateImages::All,
+        HydrateImages::NotToolMessages,
+        HydrateImages::None,
+    ] {
+        assert!(assets::hydrate(&path, malicious.clone(), images).is_err());
+    }
     let mut malicious = stored.clone();
     malicious["assets"][0]["pointer"] = serde_json::json!("/events/1");
-    assert!(assets::hydrate(&path, malicious, true).is_err());
+    for images in [
+        HydrateImages::All,
+        HydrateImages::NotToolMessages,
+        HydrateImages::None,
+    ] {
+        assert!(assets::hydrate(&path, malicious.clone(), images).is_err());
+    }
     let blob = fs::read_dir(assets::directory(&path))
         .unwrap()
         .next()
@@ -102,11 +114,48 @@ fn asset_codec_preserves_surface_payload_and_rejects_corruption() {
         .unwrap()
         .path();
     fs::write(&blob, [9u8; 4]).unwrap();
-    assert!(assets::hydrate(&path, stored.clone(), true).is_err());
+    assert!(assets::hydrate(&path, stored.clone(), HydrateImages::All).is_err());
     // Catalog reads never allocate or fetch image data.
-    assert!(assets::hydrate(&path, stored.clone(), false).is_ok());
+    assert!(assets::hydrate(&path, stored.clone(), HydrateImages::None).is_ok());
     fs::remove_file(blob).unwrap();
-    assert!(assets::hydrate(&path, stored, true).is_err());
+    assert!(assets::hydrate(&path, stored, HydrateImages::All).is_err());
+}
+
+#[test]
+fn hydration_skips_tool_images_using_the_nearest_role() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("roles.jsonl");
+    let source =
+        |data| serde_json::json!({"type": "base64", "media_type": "image/png", "data": data});
+    let tool = source(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    );
+    let user = source(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg1LD5DwAB+AFlawEwEQAAAABJRU5ErkJggg==",
+    );
+    let original = serde_json::json!({
+        "role": "tool",
+        "message": {"images": [{"source": tool.clone()}]},
+        "messages": [
+            {"role": "user", "images": [{"source": user.clone()}]},
+            {"role": "tool", "images": [{"source": tool}]},
+        ]
+    });
+    let stored = assets::externalize(&path, original.clone()).unwrap();
+    let digest = stored["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|asset| asset["pointer"] == "/message/images/0/source/data")
+        .unwrap()["sha256"]
+        .as_str()
+        .unwrap();
+    let blob = assets::directory(&path).join(digest);
+    fs::remove_file(blob).unwrap();
+    let hydrated = assets::hydrate(&path, stored, HydrateImages::NotToolMessages).unwrap();
+    assert_eq!(hydrated["message"]["images"][0]["source"]["data"], "");
+    assert_eq!(hydrated["messages"][1]["images"][0]["source"]["data"], "");
+    assert_eq!(hydrated["messages"][0]["images"][0]["source"], user);
 }
 
 #[test]
@@ -131,7 +180,10 @@ fn an_externalized_asset_records_the_sha256_of_its_bytes() {
         fs::read(assets::directory(&path).join(ABC_SHA256)).unwrap(),
         b"abc"
     );
-    assert_eq!(assets::hydrate(&path, stored, true).unwrap(), original);
+    assert_eq!(
+        assets::hydrate(&path, stored, HydrateImages::All).unwrap(),
+        original
+    );
 }
 
 #[test]
@@ -404,13 +456,69 @@ fn a_tool_image_is_stored_as_an_asset_not_inline() {
         let raw = fs::read_to_string(writer.path()).unwrap();
         assert!(!raw.contains(data.as_str()));
 
-        // Read back through the reader with images loaded (unbudgeted).
+        // Resume readers leave the tool-image slot empty.
         let tool_message =
             find_stored_tool_message(read_records(writer.path()).unwrap()).expect("tool message");
         let Message::Tool { images, .. } = Message::from(tool_message) else {
             unreachable!("find_stored_tool_message only returns Tool records");
         };
-        assert_eq!(images, vec![image]);
+        assert!(matches!(&images[0].source, ImageSource::Base64 { data, .. } if data.is_empty()));
+
+        // An on-demand hydration still retrieves the original asset.
+        let stored = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .find(assets::is_asset_record)
+            .expect("asset record");
+        let record: SessionRecord = serde_json::from_value(
+            assets::hydrate(writer.path(), stored, HydrateImages::All).unwrap(),
+        )
+        .unwrap();
+        let tool_message = find_stored_tool_message(vec![record]).unwrap();
+        assert_eq!(Message::from(tool_message).images(), &[image]);
+    });
+}
+
+#[test]
+fn resume_does_not_read_tool_image_blobs() {
+    crate::history::with_redirected_orca_home("tool-image-no-read", |home| {
+        let store = JsonlThreadStore::new();
+        let mut writer =
+            SessionWriter::start(home, "mock", None, "resume without tool blobs").unwrap();
+        writer.enter_turn(TurnId::new());
+        let user_message = Message::user_with_images("inspect image".to_string(), vec![orca_core::tool_images::tool_image("image/png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg1LD5DwAB+AFlawEwEQAAAABJRU5ErkJggg==".to_string()).unwrap()]);
+        writer.append_message(&user_message).unwrap();
+        writer
+            .append_message(&Message::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: "screenshot taken".to_string(),
+                images: vec![orca_core::tool_images::tool_image("image/png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string()).unwrap()],
+                terminal: None,
+                pinned: false,
+            })
+            .unwrap();
+        let root = assets::directory(writer.path());
+        let blob = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| fs::metadata(path).unwrap().len() == 68)
+            .expect("tool image blob");
+        fs::remove_file(blob).unwrap();
+
+        let transcript = store.load_session(&writer.session_id().unwrap()).unwrap();
+        assert_eq!(transcript.messages[0].images(), user_message.images());
+        let Message::Tool {
+            images, content, ..
+        } = &transcript.messages[1]
+        else {
+            panic!("expected a tool message");
+        };
+        assert!(images.is_empty());
+        assert!(content.ends_with(orca_core::tool_images::RESUMED_TOOL_IMAGE_NOTE));
+
+        let user_blob = fs::read_dir(root).unwrap().next().unwrap().unwrap().path();
+        fs::remove_file(user_blob).unwrap();
+        assert!(store.load_session(&writer.session_id().unwrap()).is_err());
     });
 }
 
@@ -503,7 +611,22 @@ fn a_compaction_snapshot_keeps_only_the_newest_tool_images() {
         writer.append_message(&older).unwrap();
         writer.append_message(&newer).unwrap();
         let mut conversation = Conversation::new();
-        conversation.messages.extend([older, newer]);
+        for (id, content, result_images) in [
+            ("call_1", "first screenshots", &images[..2]),
+            ("call_2", "second screenshots", &images[2..]),
+        ] {
+            let request = orca_core::tool_types::ToolRequest {
+                id: id.to_string(),
+                name: orca_core::tool_types::ToolName::ReadFile,
+                action: orca_core::approval_types::ActionKind::Read,
+                target: None,
+                raw_arguments: None,
+            };
+            let result =
+                orca_core::tool_types::ToolResult::completed(&request, content.to_string(), false)
+                    .with_images(result_images.to_vec());
+            conversation.add_tool_result_with_terminal(&result, content.to_string());
+        }
         let identity = crate::session::ManualCompactionPersistenceIdentity {
             operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
                 *uuid::Uuid::now_v7().as_bytes(),
@@ -516,18 +639,42 @@ fn a_compaction_snapshot_keeps_only_the_newest_tool_images() {
             .append_manual_compaction_snapshot(&identity, 2, "local_truncation", &conversation)
             .unwrap();
 
-        // The conversation passed in keeps every image and gains no note.
+        // The live conversation already retains only the newest three images.
         let live_images = conversation
             .messages
             .iter()
             .flat_map(|message| message.images().iter().cloned())
             .collect::<Vec<_>>();
-        assert_eq!(live_images, images);
-        assert!(conversation.messages.iter().all(|message| {
-            !matches!(message, Message::Tool { content, .. } if content.contains(SUPERSEDED_TOOL_IMAGE_NOTE))
-        }));
+        assert_eq!(live_images, images[2..]);
+        assert!(
+            matches!(&conversation.messages[0], Message::Tool { content, .. } if content.ends_with(SUPERSEDED_TOOL_IMAGE_NOTE))
+        );
 
-        let records = read_records(writer.path()).unwrap();
+        let resumed_records = read_records(writer.path()).unwrap();
+        for record in resumed_records {
+            let messages = match record {
+                SessionRecord::Message { message, .. } => vec![message],
+                SessionRecord::ManualCompactionSnapshot(snapshot) => snapshot.messages,
+                _ => Vec::new(),
+            };
+            for message in messages {
+                if let StoredMessage::Tool { images, .. } = message {
+                    assert!(images.iter().all(|image| matches!(&image.source, ImageSource::Base64 { data, .. } if data.is_empty())));
+                }
+            }
+        }
+        // Explicit on-demand hydration verifies persisted originals and the snapshot.
+        let records = fs::read_to_string(writer.path())
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let value = serde_json::from_str(line).unwrap();
+                serde_json::from_value::<SessionRecord>(
+                    assets::hydrate(writer.path(), value, HydrateImages::All).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
         // Each tool result's own record still holds its images: all five.
         let recorded_images = records
             .iter()
@@ -592,6 +739,6 @@ fn asset_symlinks_are_never_followed() {
     let outside = root.path().join("outside");
     fs::rename(&blob, &outside).unwrap();
     symlink(&outside, &blob).unwrap();
-    assert!(assets::hydrate(&path, stored, true).is_err());
+    assert!(assets::hydrate(&path, stored, HydrateImages::All).is_err());
     assert_eq!(fs::read(outside).unwrap(), [1, 2, 3]);
 }

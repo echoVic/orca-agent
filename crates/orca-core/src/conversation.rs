@@ -4,6 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::approval_types::ActionKind;
+use crate::tool_images::{MAX_REQUEST_TOOL_IMAGES, keep_newest_tool_images};
 use crate::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminal, ToolTerminalSource};
 
 /// The single conversation attachment target used by interactive surfaces.
@@ -591,6 +592,7 @@ impl Conversation {
             terminal: Some(result.terminal().clone()),
             pinned: false,
         });
+        keep_newest_tool_images(&mut self.messages, MAX_REQUEST_TOOL_IMAGES);
     }
 
     pub fn last_user_message(&self) -> Option<&str> {
@@ -1028,6 +1030,46 @@ mod tests {
     }
 
     #[test]
+    fn the_live_conversation_keeps_only_the_three_newest_tool_images() {
+        let png = crate::tool_images::tool_image("image/png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string()).unwrap();
+        let mut conv = Conversation::new();
+        for index in 0..5 {
+            let request = ToolRequest {
+                id: format!("call_{index}"),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: None,
+            };
+            let result = ToolResult::completed(&request, format!("screenshot {index}"), false)
+                .with_images(vec![png.clone()]);
+            conv.add_tool_result_with_terminal(&result, result.output.clone().unwrap());
+            assert_eq!(result.images, vec![png.clone()]);
+        }
+        for (index, message) in conv.messages.iter().enumerate() {
+            let Message::Tool {
+                images, content, ..
+            } = message
+            else {
+                panic!("expected a tool message");
+            };
+            if index < 2 {
+                assert!(images.is_empty());
+                assert!(content.ends_with(crate::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE));
+                assert_eq!(
+                    content
+                        .matches(crate::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE)
+                        .count(),
+                    1
+                );
+            } else {
+                assert_eq!(images, std::slice::from_ref(&png));
+                assert!(!content.contains(crate::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE));
+            }
+        }
+    }
+
+    #[test]
     fn a_tool_result_keeps_its_images_on_the_tool_message() {
         let request = ToolRequest {
             id: "call_1".to_string(),
@@ -1039,7 +1081,7 @@ mod tests {
         let png = ImageInput {
             source: ImageSource::Base64 {
                 media_type: "image/png".to_string(),
-                data: "aGVsbG8=".to_string(),
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
             },
             detail: ImageDetail::High,
         };

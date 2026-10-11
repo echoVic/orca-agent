@@ -222,7 +222,12 @@ impl Iterator for SessionRecords {
                 if !assets::is_asset_record(&value) {
                     return Err(code);
                 }
-                let value = assets::hydrate(&self.path, value, self.budget.is_none())
+                let images = if self.budget.is_none() {
+                    assets::HydrateImages::NotToolMessages
+                } else {
+                    assets::HydrateImages::None
+                };
+                let value = assets::hydrate(&self.path, value, images)
                     .map_err(|_| "invalid_image_asset")?;
                 let record: SessionRecord =
                     serde_json::from_value(value).map_err(|_| "malformed_asset_record")?;

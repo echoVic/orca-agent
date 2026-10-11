@@ -1186,7 +1186,7 @@ mod tests {
                 ImageInput {
                     source: ImageSource::Base64 {
                         media_type: "image/png".to_string(),
-                        data: "aGVsbG8=".to_string(),
+                        data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
                     },
                     detail: ImageDetail::High,
                 },
@@ -1212,7 +1212,7 @@ mod tests {
         assert_eq!(value[0]["content"][1]["type"], "image_url");
         assert_eq!(
             value[0]["content"][1]["image_url"]["url"],
-            "data:image/png;base64,aGVsbG8="
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
         );
         assert_eq!(value[0]["content"][1]["image_url"]["detail"], "high");
         assert_eq!(
@@ -1243,7 +1243,7 @@ mod tests {
             images: vec![ImageInput {
                 source: ImageSource::Base64 {
                     media_type: "image/png".to_string(),
-                    data: "aGVsbG8=".to_string(),
+                    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
                 },
                 detail: ImageDetail::High,
             }],
@@ -1261,7 +1261,7 @@ mod tests {
         assert_eq!(value[2]["content"][1]["type"], "image_url");
         assert_eq!(
             value[2]["content"][1]["image_url"]["url"],
-            "data:image/png;base64,aGVsbG8="
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
         );
         assert_eq!(value[2]["content"][1]["image_url"]["detail"], "high");
     }
@@ -1272,7 +1272,14 @@ mod tests {
             ImageInput {
                 source: ImageSource::Base64 {
                     media_type: "image/png".to_string(),
-                    data: label.to_string(),
+                    data: match label {
+                    "a" => "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg1LD5DwAB+AFlawEwEQAAAABJRU5ErkJggg==",
+                    "b" => "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg0rD5DwAB/AFmhhuw/QAAAABJRU5ErkJggg==",
+                    "c" => "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg1rD5DwACAAFnApv0PQAAAABJRU5ErkJggg==",
+                    "d" => "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg0bD5DwACBAFo8UwsuQAAAABJRU5ErkJggg==",
+                    "e" => "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg1bD5DwACCAFp0r20RwAAAABJRU5ErkJggg==",
+                    _ => panic!("unknown test image label: {label}"),
+                }.to_string(),
                 },
                 detail: ImageDetail::High,
             }

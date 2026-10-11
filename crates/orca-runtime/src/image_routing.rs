@@ -346,7 +346,7 @@ mod tests {
         ImageInput {
             source: ImageSource::Base64 {
                 media_type: "image/png".to_string(),
-                data: "AA==".to_string(),
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
             },
             detail: ImageDetail::High,
         }

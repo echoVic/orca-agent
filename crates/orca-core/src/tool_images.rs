@@ -11,8 +11,7 @@ use base64::Engine as _;
 
 use crate::conversation::{ImageDetail, ImageInput, ImageSource, Message};
 
-/// Media types a tool result's image may declare. Anything else is rejected
-/// before it becomes an `ImageInput`.
+/// Image types accepted from tool results, detected from their file headers.
 pub const TOOL_IMAGE_MEDIA_TYPES: [&str; 4] =
     ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
@@ -50,6 +49,7 @@ pub enum ToolImageRejected {
     UnsupportedType(String),
     TooLarge { bytes: usize },
     InvalidBase64,
+    NotAnImage,
 }
 
 impl ToolImageRejected {
@@ -69,20 +69,35 @@ impl ToolImageRejected {
                 format!("[image omitted: {mib:.1} MiB is over the {limit_mib} MiB limit]")
             }
             Self::InvalidBase64 => "[image omitted: invalid base64 data]".to_string(),
+            Self::NotAnImage => {
+                "[image omitted: the data is not a PNG, JPEG, GIF or WebP image]".to_string()
+            }
         }
     }
 }
 
-/// Validates a tool-supplied image and, on success, wraps it as the
-/// `ImageInput` a tool result carries.
-///
-/// Rejects any media type outside `TOOL_IMAGE_MEDIA_TYPES` (a missing one
-/// arrives as `""`), base64 that fails to decode or decodes to nothing, and a
-/// decoded payload larger than `MAX_TOOL_IMAGE_BYTES`.
-pub fn tool_image(media_type: &str, base64_data: String) -> Result<ImageInput, ToolImageRejected> {
-    if !TOOL_IMAGE_MEDIA_TYPES.contains(&media_type) {
-        return Err(ToolImageRejected::UnsupportedType(media_type.to_string()));
+/// Detects supported image types from their file headers.
+pub fn sniff_image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp")
+    } else {
+        None
     }
+}
+
+/// Validates a tool-supplied image and wraps it as an `ImageInput`.
+///
+/// Rejects invalid or empty base64 and decoded payloads larger than
+/// `MAX_TOOL_IMAGE_BYTES`. The file header determines the type regardless of
+/// the declaration. Unrecognized bytes produce an unsupported-type note if
+/// the declaration is unsupported, or a not-an-image note otherwise.
+pub fn tool_image(media_type: &str, base64_data: String) -> Result<ImageInput, ToolImageRejected> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(&base64_data)
         .map_err(|_| ToolImageRejected::InvalidBase64)?;
@@ -94,6 +109,13 @@ pub fn tool_image(media_type: &str, base64_data: String) -> Result<ImageInput, T
             bytes: decoded.len(),
         });
     }
+    let media_type = sniff_image_type(&decoded).ok_or_else(|| {
+        if TOOL_IMAGE_MEDIA_TYPES.contains(&media_type) {
+            ToolImageRejected::NotAnImage
+        } else {
+            ToolImageRejected::UnsupportedType(media_type.to_string())
+        }
+    })?;
     Ok(ImageInput {
         source: ImageSource::Base64 {
             media_type: media_type.to_string(),
@@ -137,9 +159,9 @@ pub fn drop_tool_images(messages: &mut [Message], note: &str) -> usize {
 /// image is dropped and its message gets `SUPERSEDED_TOOL_IMAGE_NOTE`
 /// appended once. Returns the number of images dropped.
 ///
-/// The drop is not reversible, so call this only on a copy: the request about
-/// to be sent, or the messages of a compaction snapshot. Never call it on the
-/// live conversation or on a tool result's own history record.
+/// Used on live conversations, requests and compaction snapshots to bound
+/// retained tool images. Each tool result's own history record keeps all of
+/// its images for on-demand reads from disk.
 pub fn keep_newest_tool_images(messages: &mut [Message], keep: usize) -> usize {
     let total: usize = messages
         .iter()
@@ -181,6 +203,67 @@ mod tests {
     /// sample image should define their own constant the same way rather
     /// than reuse this one across modules.
     const BASE64_1X1_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    #[test]
+    fn a_mislabelled_png_is_kept_as_png() {
+        let image = tool_image("image/jpeg", BASE64_1X1_PNG.to_string()).unwrap();
+        assert!(
+            matches!(image.source, ImageSource::Base64 { ref media_type, .. } if media_type == "image/png")
+        );
+    }
+
+    #[test]
+    fn bytes_that_are_no_image_are_dropped_with_a_note() {
+        let rejected = tool_image("image/png", "aGVsbG8=".to_string()).unwrap_err();
+        assert_eq!(
+            rejected.note(),
+            "[image omitted: the data is not a PNG, JPEG, GIF or WebP image]"
+        );
+    }
+
+    #[test]
+    fn a_mislabelled_image_uses_its_signature_even_for_unsupported_declarations() {
+        for (bytes, expected) in [
+            (b"\x89PNG\r\n\x1a\n".as_slice(), "image/png"),
+            (b"\xff\xd8\xff".as_slice(), "image/jpeg"),
+            (b"GIF87a".as_slice(), "image/gif"),
+            (b"GIF89a".as_slice(), "image/gif"),
+            (b"RIFF\x00\x00\x00\x00WEBP".as_slice(), "image/webp"),
+        ] {
+            for declared in ["image/png", "image/svg+xml", ""] {
+                let image = tool_image(
+                    declared,
+                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                )
+                .unwrap();
+                assert!(
+                    matches!(image.source, ImageSource::Base64 { ref media_type, .. } if media_type == expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bytes_that_are_no_image_include_incomplete_or_wrong_signatures() {
+        for bytes in [
+            b"\x89PNG\r\n\x1a".as_slice(),
+            b"\xff\xd8".as_slice(),
+            b"GIF88a".as_slice(),
+            b"RIFF0000WEB".as_slice(),
+            b"RIFF0000WAVE".as_slice(),
+            b"NOPE0000WEBP".as_slice(),
+        ] {
+            let rejected = tool_image(
+                "image/png",
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            )
+            .unwrap_err();
+            assert_eq!(
+                rejected.note(),
+                "[image omitted: the data is not a PNG, JPEG, GIF or WebP image]"
+            );
+        }
+    }
 
     #[test]
     fn tool_image_accepts_supported_types_within_the_limit() {
@@ -228,7 +311,17 @@ mod tests {
         ImageInput {
             source: ImageSource::Base64 {
                 media_type: "image/png".to_string(),
-                data: label.to_string(),
+                data: match label {
+                    "a" => "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg1LD5DwAB+AFlawEwEQAAAABJRU5ErkJggg==",
+                    "b" => "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg0rD5DwAB/AFmhhuw/QAAAABJRU5ErkJggg==",
+                    "c" => "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg1rD5DwACAAFnApv0PQAAAABJRU5ErkJggg==",
+                    "d" => "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg0bD5DwACBAFo8UwsuQAAAABJRU5ErkJggg==",
+                    "e" => "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg1bD5DwACCAFp0r20RwAAAABJRU5ErkJggg==",
+                    "user" => "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg07D5DwACDAFqP6c0qwAAAABJRU5ErkJggg==",
+                    "tool-a" => "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg17D5DwACEAFrAHAPJQAAAABJRU5ErkJggg==",
+                    "tool-b" => "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGPg0LD5DwACFAFsG3lWkgAAAABJRU5ErkJggg==",
+                    _ => panic!("unknown test image label: {label}"),
+                }.to_string(),
             },
             detail: ImageDetail::High,
         }

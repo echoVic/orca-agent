@@ -200,8 +200,30 @@ pub(crate) fn is_asset_record(value: &Value) -> bool {
     value["type"].as_str() == Some(RECORD_TYPE)
 }
 
-/// Bounded index projections deliberately do not load image bytes.
-pub(crate) fn hydrate(path: &Path, value: Value, load_images: bool) -> io::Result<Value> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HydrateImages {
+    /// Load every image (an on-demand read of one record).
+    #[cfg_attr(not(test), allow(dead_code))]
+    All,
+    /// Load user images; leave tool-message images empty (session resume drops them).
+    NotToolMessages,
+    /// Load nothing (bounded index projections).
+    None,
+}
+
+fn belongs_to_tool_message(record: &Value, pointer: &str) -> bool {
+    let mut ancestor = pointer;
+    while let Some((parent, _)) = ancestor.rsplit_once('/') {
+        if let Some(role) = record.pointer(parent).and_then(|value| value.get("role")) {
+            return role.as_str() == Some("tool");
+        }
+        ancestor = parent;
+    }
+    false
+}
+
+/// Validates every manifest entry, hydrating only the requested image slots.
+pub(crate) fn hydrate(path: &Path, value: Value, images: HydrateImages) -> io::Result<Value> {
     if !is_asset_record(&value) {
         return Ok(value);
     }
@@ -225,6 +247,13 @@ pub(crate) fn hydrate(path: &Path, value: Value, load_images: bool) -> io::Resul
         if expanded_bytes >= MAX_SESSION_LINE_BYTES as u64 {
             return Err(invalid("expanded image record exceeds record budget"));
         }
+        let load_image = match images {
+            HydrateImages::All => true,
+            HydrateImages::NotToolMessages => {
+                !belongs_to_tool_message(&envelope.record, &asset.pointer)
+            }
+            HydrateImages::None => false,
+        };
         let data = envelope
             .record
             .pointer_mut(&asset.pointer)
@@ -232,7 +261,7 @@ pub(crate) fn hydrate(path: &Path, value: Value, load_images: bool) -> io::Resul
         if data.as_str() != Some("") {
             return Err(invalid("image asset slot must be empty"));
         }
-        if load_images {
+        if load_image {
             let bytes = read_blob(&directory(path), &asset)?;
             *data = Value::String(base64::engine::general_purpose::STANDARD.encode(bytes));
         }

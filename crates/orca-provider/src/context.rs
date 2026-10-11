@@ -2480,6 +2480,37 @@ mod tests {
     }
 
     #[test]
+    fn compaction_counts_only_the_images_the_conversation_still_holds() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+
+        let png = orca_core::tool_images::tool_image("image/png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string()).unwrap();
+        let mut conversation = Conversation::new();
+        for index in 0..10 {
+            let request = ToolRequest {
+                id: format!("call_{index}"),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: None,
+            };
+            let result = ToolResult::completed(&request, format!("screenshot {index}"), false)
+                .with_images(vec![png.clone()]);
+            conversation.add_tool_result_with_terminal(&result, result.output.clone().unwrap());
+        }
+        let mut without_images = conversation.clone();
+        for message in &mut without_images.messages {
+            if let Message::Tool { images, .. } = message {
+                images.clear();
+            }
+        }
+        assert_eq!(
+            conversation_tokens(&conversation) - conversation_tokens(&without_images),
+            3 * image_tokens(&png)
+        );
+    }
+
+    #[test]
     fn tool_images_count_toward_message_tokens() {
         let without_image = Message::Tool {
             tool_call_id: "call_1".to_string(),
@@ -2494,7 +2525,7 @@ mod tests {
             images: vec![ImageInput {
                 source: ImageSource::Base64 {
                     media_type: "image/png".to_string(),
-                    data: "aGVsbG8=".to_string(),
+                    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
                 },
                 detail: ImageDetail::High,
             }],

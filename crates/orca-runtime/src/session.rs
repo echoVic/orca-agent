@@ -13,6 +13,7 @@ use orca_core::hook_types::HookEvent;
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::TaskStatus;
 use orca_core::thread_item_projection::CompletedModelResponse;
+use orca_core::tool_images::{MAX_REQUEST_TOOL_IMAGES, keep_newest_tool_images};
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult, ToolStatus};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
@@ -101,6 +102,7 @@ pub(crate) fn record_tool_result_for_agent(
         Ok(())
     };
     conversation.messages.push(message);
+    keep_newest_tool_images(&mut conversation.messages, MAX_REQUEST_TOOL_IMAGES);
     history_result?;
     Ok(result_content)
 }
@@ -1159,6 +1161,46 @@ mod tests {
     }
 
     #[test]
+    fn agent_tool_results_keep_only_the_three_newest_images() {
+        let png = orca_core::tool_images::tool_image("image/png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string()).unwrap();
+        let mut conversation = Conversation::new();
+        for index in 0..5 {
+            let request = ToolRequest {
+                id: format!("call_{index}"),
+                name: ToolName::ReadFile,
+                action: orca_core::approval_types::ActionKind::Read,
+                target: None,
+                raw_arguments: None,
+            };
+            let result = ToolResult::completed(&request, format!("screenshot {index}"), false)
+                .with_images(vec![png.clone()]);
+            record_tool_result_for_agent(&mut conversation, None, &result, false).unwrap();
+            assert_eq!(result.images, vec![png.clone()]);
+        }
+        for (index, message) in conversation.messages.iter().enumerate() {
+            let Message::Tool {
+                images, content, ..
+            } = message
+            else {
+                panic!("expected a tool message");
+            };
+            if index < 2 {
+                assert!(images.is_empty());
+                assert!(content.ends_with(orca_core::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE));
+                assert_eq!(
+                    content
+                        .matches(orca_core::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE)
+                        .count(),
+                    1
+                );
+            } else {
+                assert_eq!(images, std::slice::from_ref(&png));
+                assert!(!content.contains(orca_core::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE));
+            }
+        }
+    }
+
+    #[test]
     fn a_tool_results_images_are_recorded_on_its_tool_message() {
         let request = ToolRequest {
             id: "call-screenshot".to_string(),
@@ -1170,7 +1212,7 @@ mod tests {
         let image = orca_core::conversation::ImageInput {
             source: orca_core::conversation::ImageSource::Base64 {
                 media_type: "image/png".to_string(),
-                data: "AA==".to_string(),
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
             },
             detail: orca_core::conversation::ImageDetail::High,
         };
