@@ -358,6 +358,7 @@ impl DriverLauncher for ProcessLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::extension::ExtensionData;
     use orca_computer_use::client::CallError;
     use orca_computer_use::fake::{FakeDesktop, FakeLauncher};
@@ -365,6 +366,62 @@ mod tests {
     use orca_core::config::RunConfig;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn real_macos_driver_observes_the_fixture_from_its_own_process() {
+        let Ok(exe) = std::env::var("ORCA_CU_DRIVER_EXE") else {
+            eprintln!("skipped: ORCA_CU_DRIVER_EXE is unset");
+            return;
+        };
+        let Some(home) = std::env::var_os("ORCA_HOME") else {
+            eprintln!("skipped: set a fresh ORCA_HOME under /tmp for this live test");
+            return;
+        };
+        assert!(
+            Path::new(&home).starts_with("/tmp") || Path::new(&home).starts_with("/private/tmp"),
+            "live driver tests require an isolated ORCA_HOME under /tmp"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let launcher = ProcessLauncher {
+            exe: exe.into(),
+            cwd: directory.path().into(),
+            approval_mode: ApprovalMode::Suggest,
+        };
+        let (client, hello) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        if !hello.permissions.accessibility
+            || !hello.permissions.screen_recording
+            || !hello.permissions.event_tap
+        {
+            eprintln!("skipped: missing permission: {:?}", hello.permissions);
+            return;
+        }
+        assert!(
+            matches!(client.call(Request::ListApps, Duration::from_secs(30)).unwrap(), Reply::Apps { apps } if apps.iter().any(|app| app.bundle_id == "dev.orca.cu-fixture"))
+        );
+        client
+            .call(Request::Turn { active: true }, Duration::from_secs(30))
+            .unwrap();
+        let result = client
+            .call(
+                Request::Observe(orca_computer_use::protocol::ObserveParams {
+                    app: "dev.orca.cu-fixture".into(),
+                    window: None,
+                    query: None,
+                    max_elements: 300,
+                    include_screenshot: true,
+                }),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(
+            matches!(result, Reply::Observed { observation } if observation.screenshot.is_some() && observation.elements.iter().any(|element| element.label.as_deref() == Some("Name")))
+        );
+        client
+            .call(Request::Turn { active: false }, Duration::from_secs(30))
+            .unwrap();
+    }
 
     #[test]
     fn the_service_starts_lazily_and_reuses_the_handshake() {

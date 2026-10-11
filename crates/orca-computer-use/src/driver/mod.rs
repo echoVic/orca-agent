@@ -9,6 +9,13 @@ pub fn run_stdio() -> i32 {
             eprintln!("Could not resolve Orca home for computer-use session lock");
             return 2;
         };
+        // Initialize AppKit and CoreGraphics on the actual main thread before
+        // SCK callbacks construct filters on their concurrent replayd queue.
+        let _workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
+        if objc2_core_graphics::CGEvent::new(None).is_none() {
+            eprintln!("Could not initialize the computer-use graphics connection");
+            return 2;
+        }
         let worker = std::thread::Builder::new()
             .name("computer-use-driver".into())
             .spawn(move || {
