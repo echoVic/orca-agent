@@ -7,9 +7,68 @@
 //! are acceptable, and the two ways a caller trims images back out of a
 //! message list once they are no longer welcome.
 
+use std::sync::{Arc, Mutex};
+
 use base64::Engine as _;
 
 use crate::conversation::{ImageDetail, ImageInput, ImageSource, Message};
+
+/// A bounded read view shared with the owner of a running conversation.
+/// Only conversation retention/adoption updates it; it never reads history.
+#[derive(Clone, Debug, Default)]
+pub struct RetainedToolImages {
+    messages: Arc<Mutex<Vec<RetainedToolMessage>>>,
+}
+
+#[derive(Debug)]
+struct RetainedToolMessage {
+    tool_call_id: String,
+    images: Vec<ImageInput>,
+}
+
+impl RetainedToolImages {
+    pub fn for_call(&self, tool_call_id: &str) -> Option<Vec<ImageInput>> {
+        self.messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|message| message.tool_call_id == tool_call_id)
+            .map(|message| message.images.clone())
+    }
+
+    pub(crate) fn replace(&self, messages: &[Message]) {
+        let mut remaining = MAX_REQUEST_TOOL_IMAGES;
+        let mut retained = Vec::new();
+        for message in messages.iter().rev() {
+            let Message::Tool {
+                tool_call_id,
+                images,
+                ..
+            } = message
+            else {
+                continue;
+            };
+            if images.is_empty() {
+                continue;
+            }
+            let start = images.len().saturating_sub(remaining);
+            let images = images[start..].to_vec();
+            remaining -= images.len();
+            retained.push(RetainedToolMessage {
+                tool_call_id: tool_call_id.clone(),
+                images,
+            });
+            if remaining == 0 {
+                break;
+            }
+        }
+        retained.reverse();
+        *self
+            .messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = retained;
+    }
+}
 
 /// Image types accepted from tool results, detected from their file headers.
 pub const TOOL_IMAGE_MEDIA_TYPES: [&str; 4] =

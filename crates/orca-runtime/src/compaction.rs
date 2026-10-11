@@ -642,7 +642,8 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         };
         match budget_hook {
             Ok(outcome) if !outcome.injected_context.is_empty() => {
-                *conversation = conversation_with_hook_context(conversation, &outcome);
+                let updated = conversation_with_hook_context(conversation, &outcome);
+                conversation.adopt(updated);
             }
             Err(error) if self.turn_context.emit_deltas => {
                 self.sink.emit(
@@ -751,7 +752,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
                 &compaction.conversation,
             )?;
         }
-        *conversation = compaction.conversation;
+        conversation.adopt(compaction.conversation);
         conversation.clear_usage_anchor();
         Ok((
             outcome,

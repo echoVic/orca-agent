@@ -96,17 +96,17 @@ pub(crate) fn read_manual_compaction_snapshot(
             record = Some(snapshot);
         }
     }
-    Ok(record.map(|record| ManualCompactionDurableSnapshot {
-        operation_id: record.operation_id,
-        strategy: record.strategy,
-        before_messages: record.before_messages,
-        conversation: orca_core::conversation::Conversation {
-            messages: record.messages.into_iter().map(Message::from).collect(),
-            internal_context: Default::default(),
-            rolling_summary: record.rolling_summary,
-            summary: record.summary_state,
-            usage_anchor: None,
-        },
+    Ok(record.map(|record| {
+        let mut conversation = orca_core::conversation::Conversation::new();
+        conversation.messages = record.messages.into_iter().map(Message::from).collect();
+        conversation.rolling_summary = record.rolling_summary;
+        conversation.summary = record.summary_state;
+        ManualCompactionDurableSnapshot {
+            operation_id: record.operation_id,
+            strategy: record.strategy,
+            before_messages: record.before_messages,
+            conversation,
+        }
     }))
 }
 

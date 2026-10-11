@@ -13,7 +13,6 @@ use orca_core::hook_types::HookEvent;
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::TaskStatus;
 use orca_core::thread_item_projection::CompletedModelResponse;
-use orca_core::tool_images::{MAX_REQUEST_TOOL_IMAGES, keep_newest_tool_images};
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult, ToolStatus};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
@@ -101,8 +100,7 @@ pub(crate) fn record_tool_result_for_agent(
     } else {
         Ok(())
     };
-    conversation.messages.push(message);
-    keep_newest_tool_images(&mut conversation.messages, MAX_REQUEST_TOOL_IMAGES);
+    conversation.add_tool_result_with_terminal(result, result_content.clone());
     history_result?;
     Ok(result_content)
 }
@@ -833,7 +831,7 @@ impl InteractiveSession {
                 &outcome.after,
             )?;
         }
-        self.conversation = outcome.after.clone();
+        self.conversation.adopt(outcome.after.clone());
         self.last_manual_compaction = Some(outcome.clone());
         let _ = self.hooks.run_with_cancel(
             HookEvent::PostCompact,

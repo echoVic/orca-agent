@@ -14480,6 +14480,7 @@ struct PendingSurfaceBackgroundTransfer {
 
 struct ActiveGeneration {
     context: GenerationContext,
+    tool_images: orca_core::tool_images::RetainedToolImages,
     cancel: CancelToken,
     join: JoinHandle<OperationTaskResult>,
 }
@@ -20990,10 +20991,19 @@ impl ThreadActor {
                     operation_id: active.operation_id,
                 }));
             }
-            ThreadCommand::ReadToolResultImages { reply, .. } => {
-                let _ = reply.send(Ok(ToolResultImageSource::History(
-                    self.prompt_queue_path.clone(),
-                )));
+            ThreadCommand::ReadToolResultImages {
+                tool_call_id,
+                reply,
+            } => {
+                let source = active
+                    .generation
+                    .tool_images
+                    .for_call(&tool_call_id)
+                    .map(ToolResultImageSource::Live)
+                    .unwrap_or_else(|| {
+                        ToolResultImageSource::History(self.prompt_queue_path.clone())
+                    });
+                let _ = reply.send(Ok(source));
             }
             ThreadCommand::ForkEvents { reply } => {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
@@ -21181,12 +21191,17 @@ impl ThreadActor {
 
     fn spawn_generation(
         &self,
-        state: ThreadActorState,
+        mut state: ThreadActorState,
         request: &HostedTurnRequest,
         goal_turn: Option<crate::goal_actor::GoalTurnContext>,
         mut writer: Box<dyn HostedOperationWriter>,
         mut context: GenerationContext,
     ) -> ActiveGeneration {
+        let tool_images = state
+            .thread
+            .session_mut()
+            .conversation_mut()
+            .retained_tool_images();
         let executor = Arc::clone(&self.executor);
         let mut task_request = request.clone();
         task_request.surface_goal_turn = goal_turn;
@@ -21237,6 +21252,7 @@ impl ThreadActor {
         });
         ActiveGeneration {
             context,
+            tool_images,
             cancel,
             join,
         }
@@ -25150,6 +25166,95 @@ mod tests {
         RouteEpoch,
         OperationFence,
         GrantToken,
+    }
+
+    struct HeldToolImageExecutor {
+        recorded: SyncSender<()>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl ThreadOperationExecutor for HeldToolImageExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let image = orca_core::tool_images::tool_image(
+                "image/png",
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
+            ).unwrap();
+            let request = orca_core::tool_types::ToolRequest {
+                id: "running-call".to_string(),
+                name: orca_core::tool_types::ToolName::ReadFile,
+                action: orca_core::approval_types::ActionKind::Read,
+                target: None,
+                raw_arguments: None,
+            };
+            let result = orca_core::tool_types::ToolResult::completed(
+                &request,
+                "[1 image attached]".to_string(),
+                false,
+            )
+            .with_images(vec![image]);
+            assert!(thread.session().surface_commit_path().is_none());
+            crate::session::record_tool_result_for_agent(
+                thread.session_mut().conversation_mut(),
+                None,
+                &result,
+                false,
+            )?;
+            self.recorded.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(SURFACE_TEST_TIMEOUT)
+                .unwrap();
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
+    #[test]
+    fn tool_result_images_are_live_during_an_active_turn_without_history() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (recorded_tx, recorded_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(HeldToolImageExecutor {
+            recorded: recorded_tx,
+            release: Mutex::new(release_rx),
+        }))
+        .unwrap();
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
+                "running screenshot without history",
+            )
+            .unwrap();
+        let operation = thread
+            .start_turn(HostedTurnRequest::new("capture and hold"), io::sink())
+            .unwrap();
+        recorded_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+        assert!(matches!(
+            thread.state().unwrap(),
+            RuntimeThreadState::Running { .. }
+        ));
+        let images = thread.tool_result_images("running-call").unwrap();
+        assert!(matches!(
+            thread.state().unwrap(),
+            RuntimeThreadState::Running { .. }
+        ));
+        release_tx.send(()).unwrap();
+        assert!(operation.wait_timeout(SURFACE_TEST_TIMEOUT).is_some());
+        let expected = orca_core::tool_images::tool_image(
+            "image/png",
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
+        ).unwrap();
+        assert_eq!(images, vec![expected]);
+        host.shutdown().unwrap();
     }
 
     struct ToolImageExecutor;
