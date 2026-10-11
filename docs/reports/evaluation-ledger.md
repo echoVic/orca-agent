@@ -33,11 +33,15 @@ Machine-readable form: [`evaluation-ledger.json`](evaluation-ledger.json).
 # L1 (no network, no API key)
 bash scripts/eval/sweep.sh jobs/eval-sweep/$(date +%Y%m%d)
 
-# TB2 (Harbor + Docker + API key), then turn the run into the committed summary
+# TB2 (Harbor + Docker + API key), then turn the run into the committed summary.
+# Reap before and after the round: environment-start timeouts leave their containers
+# running (#129). A non-zero count goes into the report.
+scripts/eval/reap_harbor.sh
 harbor run -d "terminal-bench/terminal-bench-2" \
   --agent "terminal_bench.orca_agent:OrcaInstalledAgent" \
   -k 1 -n 6 --exclude-task-name "terminal-bench/qemu-startup" \
   --mounts '[{"type":"bind","source":"'"$PWD"'/target/x86_64-unknown-linux-musl/release","target":"/mnt/orca-bin","read_only":true}]'
+scripts/eval/reap_harbor.sh
 python3 scripts/eval/summarize.py jobs/full-88-<version>/<timestamp> \
   --out docs/reports/<date>-tb2-<version>-summary.json --source-commit "$(git rev-parse --short HEAD)"
 ```

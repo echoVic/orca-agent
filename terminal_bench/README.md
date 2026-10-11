@@ -28,6 +28,14 @@ harbor run \
   --mounts '[{"type":"bind","source":"'"$(pwd)"'/target/x86_64-unknown-linux-musl/release","target":"/mnt/orca-bin","read_only":true}]'
 ```
 
+Harbor abandons the containers of a trial whose environment did not start in time, and
+they go on building or downloading while later trials start (issue #129). Remove them,
+and their networks, before and after a run with no Harbor run in progress:
+
+```bash
+scripts/eval/reap_harbor.sh
+```
+
 ## Single Task Smoke Test
 
 ```bash
