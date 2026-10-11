@@ -1,6 +1,8 @@
+mod actions;
 mod apps;
 mod ax;
 mod capture;
+mod events;
 mod permissions;
 mod tree;
 
@@ -225,10 +227,9 @@ impl DriverHandler for MacDriver {
             Request::Observe(params) => Ok(Reply::Observed {
                 observation: self.observe(params)?,
             }),
-            Request::Act(_) => Err(error(
-                ErrorKind::Failed,
-                "This computer-use request is not implemented yet",
-            )),
+            Request::Act(params) => Ok(Reply::Acted {
+                outcome: self.act(params)?,
+            }),
         })
     }
 
@@ -266,6 +267,18 @@ mod tests {
                 include_screenshot: true,
             }),
             Request::ListApps,
+            Request::Act(crate::protocol::ActParams {
+                app: "dev.orca.not-installed".into(),
+                window: None,
+                action: crate::protocol::Action::Type {
+                    text: "abc".into(),
+                    target: None,
+                },
+                foreground_fallback: false,
+                observe_after: false,
+                include_screenshot: false,
+                secure_approved: false,
+            }),
             Request::Turn { active: true },
             Request::LaunchApp {
                 app: "dev.orca.not-installed".into(),

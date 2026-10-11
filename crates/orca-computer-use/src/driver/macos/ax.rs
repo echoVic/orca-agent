@@ -23,12 +23,11 @@ fn check(result: AXError, operation: &str) -> Result<(), DriverError> {
     if result == AXError::Success {
         return Ok(());
     }
+    if result == AXError::InvalidUIElement {
+        return Err(super::actions::stale());
+    }
     Err(error(
-        if result == AXError::InvalidUIElement {
-            ErrorKind::Stale
-        } else {
-            ErrorKind::Failed
-        },
+        ErrorKind::Failed,
         format!("Accessibility {operation} failed: {result:?}"),
     ))
 }
@@ -244,6 +243,18 @@ impl AxElement {
             name,
         )
     }
+    pub(super) fn set_number(&self, name: &str, value: f64) -> Result<(), DriverError> {
+        check(
+            unsafe {
+                self.0.set_attribute_value(
+                    &CFString::from_str(name),
+                    CFNumber::new_f64(value).as_ref(),
+                )
+            },
+            name,
+        )
+    }
+
     #[allow(dead_code)]
     pub(crate) fn set_string(&self, name: &str, value: &str) -> Result<(), DriverError> {
         check(
@@ -273,5 +284,25 @@ impl AxElement {
             )
         })?;
         Self::from_owned(unsafe { CFRetained::from_raw(element) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_elements_require_a_fresh_observation() {
+        let failure = check(AXError::InvalidUIElement, "AXRole").unwrap_err();
+        assert_eq!(failure.kind, ErrorKind::Stale);
+        assert_eq!(
+            failure.message,
+            "the window changed since the last observe; observe again"
+        );
+        assert_eq!(
+            check(AXError::Failure, "AXRole").unwrap_err().kind,
+            ErrorKind::Failed
+        );
+        assert!(check(AXError::Success, "AXRole").is_ok());
     }
 }

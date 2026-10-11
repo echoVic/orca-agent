@@ -17,12 +17,14 @@ extern "C" fn macos_test_main() -> i32 {
         CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.01, true);
     }
     let passed = harness.join().is_ok();
-    record_restoration(frontmost, pointer);
+    let restored =
+        std::panic::catch_unwind(|| run_live_test(|| record_restoration(frontmost, pointer)))
+            .is_ok();
     let failures = RESTORATION_FAILURES.lock().unwrap();
     for failure in failures.iter() {
         eprintln!("GUI restoration failed: {failure}");
     }
-    if passed && failures.is_empty() {
+    if passed && restored && failures.is_empty() {
         0
     } else {
         101
@@ -35,16 +37,116 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 static RESTORATION_FAILURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+// GUI tests are serial even when libtest/nextest requests concurrency. Every
+// retry recreates all locals, so Live records and restores a fresh starting state.
+static LIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
+thread_local! {
+    static ATTEMPT: std::cell::RefCell<Option<LiveAttempt>> = const { std::cell::RefCell::new(None) };
+}
+
+struct LiveAttempt {
+    started: Instant,
+    idle_at_start: f64,
+    last_own_hid: Option<f64>,
+    inconclusive: bool,
+    failures: Vec<String>,
+}
+
+fn hid_idle_seconds() -> f64 {
+    CGEventSource::seconds_since_last_event_type(
+        CGEventSourceStateID::HIDSystemState,
+        CGEventType(u32::MAX), // kCGAnyInputEventType
+    )
+}
+
+// Task 8's helpers must call this at each marked HID post, rather than at the
+// end of a batch: user input after the last test event must remain detectable.
+#[allow(dead_code)]
+fn record_test_hid_event() {
+    ATTEMPT.with(|active| {
+        if let Some(attempt) = active.borrow_mut().as_mut() {
+            attempt.last_own_hid = Some(attempt.started.elapsed().as_secs_f64());
+        }
+    });
+}
+
+fn record_gui_failure(message: String) {
+    ATTEMPT.with(|active| {
+        let mut active = active.borrow_mut();
+        if let Some(attempt) = active.as_mut() {
+            let elapsed = attempt.started.elapsed().as_secs_f64();
+            let idle = hid_idle_seconds();
+            if user_input_since_start(elapsed, idle, attempt.last_own_hid) {
+                attempt.inconclusive = true;
+                eprintln!("inconclusive: {message}; HID idle={idle:.3}s, elapsed={elapsed:.3}s, starting idle={:.3}s", attempt.idle_at_start);
+            } else {
+                attempt.failures.push(message);
+            }
+        } else {
+            RESTORATION_FAILURES.lock().unwrap().push(message);
+        }
+    });
+}
+
+fn run_live_test(body: impl Fn()) {
+    let _serial = LIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for number in 1..=3 {
+        let started = Instant::now();
+        let idle_at_start = hid_idle_seconds();
+        ATTEMPT.with(|active| {
+            *active.borrow_mut() = Some(LiveAttempt {
+                started,
+                idle_at_start,
+                last_own_hid: None,
+                inconclusive: false,
+                failures: vec![],
+            })
+        });
+        let failures_before = RESTORATION_FAILURES.lock().unwrap().len();
+        // Cleanup runs on both normal return and panic. Only recorded GUI-state
+        // failures can be inconclusive; action assertions always fail normally.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&body));
+        let attempt = ATTEMPT.with(|active| active.borrow_mut().take().unwrap());
+        if let Err(failure) = result {
+            std::panic::resume_unwind(failure);
+        }
+        assert!(
+            attempt.failures.is_empty(),
+            "GUI state/restore failed: {:?}",
+            attempt.failures
+        );
+        assert_eq!(
+            RESTORATION_FAILURES.lock().unwrap().len(),
+            failures_before,
+            "test resource cleanup failed"
+        );
+        if !attempt.inconclusive {
+            return;
+        }
+        if number < 3 {
+            eprintln!("rerunning live test after user activity (attempt {number}/3)");
+        }
+    }
+    eprintln!("skipped: user activity during every attempt");
+}
+
 use std::thread;
 use std::time::{Duration, Instant};
 
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
-use objc2_core_graphics::{CGEvent, CGWarpMouseCursorPosition};
+use objc2_core_graphics::{
+    CGEvent, CGEventSource, CGEventSourceStateID, CGEventType, CGWarpMouseCursorPosition,
+};
 use objc2_foundation::NSString;
 use orca_computer_use::client::{DriverClient, HelloInfo};
 use orca_computer_use::driver::macos::MacDriver;
 use orca_computer_use::inprocess::InProcessLauncher;
-use orca_computer_use::protocol::{AppInfo, ErrorKind, Observation, ObserveParams, Reply, Request};
+use orca_computer_use::protocol::{
+    ActOutcome, ActParams, Action, AppInfo, Button, Direction, DriverError, ErrorKind, Observation,
+    ObserveParams, Reply, Request, Target,
+};
 
 fn fixture_app() -> PathBuf {
     let app = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("CUFixture.app");
@@ -84,6 +186,7 @@ struct Live {
     pointer: objc2_core_foundation::CGPoint,
     running: HashSet<i32>,
     launched: HashSet<i32>,
+    background_state: Option<(i32, objc2_core_foundation::CGPoint)>,
 }
 
 impl Live {
@@ -114,6 +217,7 @@ impl Live {
             pointer,
             running,
             launched: HashSet::new(),
+            background_state: None,
         };
         let permissions = live.hello.permissions;
         if !permissions.accessibility || !permissions.screen_recording || !permissions.event_tap {
@@ -162,6 +266,101 @@ impl Live {
         {
             Reply::Observed { observation } => observation,
             other => panic!("unexpected observe reply: {other:?}"),
+        }
+    }
+
+    fn act(&self, action: Action, secure_approved: bool) -> Result<ActOutcome, DriverError> {
+        match self
+            .client
+            .call(
+                Request::Act(ActParams {
+                    app: "dev.orca.cu-fixture".into(),
+                    window: None,
+                    action,
+                    foreground_fallback: false,
+                    observe_after: true,
+                    include_screenshot: false,
+                    secure_approved,
+                }),
+                Duration::from_secs(30),
+            )
+            .map_err(|e| match e {
+                orca_computer_use::client::CallError::Driver(e) => e,
+                other => panic!("driver transport: {other:?}"),
+            })? {
+            Reply::Acted { outcome } => Ok(outcome),
+            other => panic!("unexpected act reply: {other:?}"),
+        }
+    }
+
+    fn make_finder_frontmost(&mut self) {
+        let before = bundle_pids("com.apple.finder");
+        let output = Command::new("osascript")
+            .args(["-e", "tell application \"Finder\" to activate"])
+            .output()
+            .unwrap();
+        register_launch_pids(
+            &mut self.launched,
+            &before,
+            &bundle_pids("com.apple.finder"),
+        );
+        assert!(output.status.success());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(app) = NSWorkspace::sharedWorkspace()
+                .frontmostApplication()
+                .filter(|app| {
+                    app.bundleIdentifier()
+                        .is_some_and(|id| id.to_string() == "com.apple.finder")
+                })
+            {
+                self.background_state = Some((
+                    app.processIdentifier(),
+                    CGEvent::location(Some(&CGEvent::new(None).unwrap())),
+                ));
+                break;
+            }
+            if Instant::now() >= deadline {
+                record_gui_failure("Finder did not become frontmost".into());
+                let pid = bundle_pids("com.apple.finder")
+                    .into_iter()
+                    .next()
+                    .expect("Finder activation succeeded but Finder is not running");
+                self.background_state =
+                    Some((pid, CGEvent::location(Some(&CGEvent::new(None).unwrap()))));
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn assert_log_contains(&self, log: &std::path::Path, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let text = std::fs::read_to_string(log).unwrap();
+            if text.contains(needle) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "missing {needle} in {text}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn assert_frontmost_and_pointer_unchanged(&self) {
+        let (pid, pointer) = self.background_state.expect("record Finder state first");
+        let actual = NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .map(|app| app.processIdentifier());
+        if actual != Some(pid) {
+            record_gui_failure(format!(
+                "frontmost app changed: expected {pid}, actual {actual:?}"
+            ));
+        }
+        let now = CGEvent::location(Some(&CGEvent::new(None).unwrap()));
+        if (now.x, now.y) != (pointer.x, pointer.y) {
+            record_gui_failure(format!(
+                "pointer changed: expected {pointer:?}, actual {now:?}"
+            ));
         }
     }
 
@@ -251,12 +450,11 @@ fn record_restoration(frontmost: Option<i32>, pointer: objc2_core_foundation::CG
     use objc2_application_services::{AXError, AXUIElement};
     use objc2_core_foundation::{CFBoolean, CFString};
     use objc2_core_graphics::CGError;
-    let mut failures = vec![];
     if let Some(pid) = frontmost {
         let app = unsafe { AXUIElement::new_application(pid) };
         let timeout = unsafe { app.set_messaging_timeout(2.0) };
         if timeout != AXError::Success {
-            failures.push(format!("AX timeout for PID {pid}: {timeout:?}"));
+            record_gui_failure(format!("AX timeout for PID {pid}: {timeout:?}"));
         }
         let restored = unsafe {
             app.set_attribute_value(
@@ -265,7 +463,7 @@ fn record_restoration(frontmost: Option<i32>, pointer: objc2_core_foundation::CG
             )
         };
         if restored != AXError::Success {
-            failures.push(format!("frontmost restore for PID {pid}: {restored:?}"));
+            record_gui_failure(format!("frontmost restore for PID {pid}: {restored:?}"));
         } else {
             let deadline = Instant::now() + Duration::from_secs(2);
             while NSWorkspace::sharedWorkspace()
@@ -281,397 +479,414 @@ fn record_restoration(frontmost: Option<i32>, pointer: objc2_core_foundation::CG
                 .map(|app| app.processIdentifier())
                 != Some(pid)
             {
-                failures.push(format!("frontmost PID {pid} was not restored"));
+                record_gui_failure(format!("frontmost PID {pid} was not restored"));
             }
         }
     }
     let warped = CGWarpMouseCursorPosition(pointer);
     if warped != CGError::Success {
-        failures.push(format!("pointer warp failed: {warped:?}"));
+        record_gui_failure(format!("pointer warp failed: {warped:?}"));
     }
     let actual = CGEvent::new(None).map(|event| CGEvent::location(Some(&event)));
     if actual.is_none_or(|actual| {
         (actual.x - pointer.x).abs() > 1.0 || (actual.y - pointer.y).abs() > 1.0
     }) {
-        failures.push(format!(
+        record_gui_failure(format!(
             "pointer not restored: expected {pointer:?}, actual {actual:?}"
         ));
     }
-    RESTORATION_FAILURES.lock().unwrap().extend(failures);
 }
 
 #[test]
 #[ignore]
 fn hello_reports_permissions_the_os_and_the_host_terminal() {
-    let Some(live) = Live::start() else { return };
-    assert!(live.hello.macos_major >= 14);
-    if let Ok(bundle_id) = std::env::var("__CFBundleIdentifier") {
-        assert_eq!(
-            live.hello.host_bundle_id.as_deref(),
-            Some(bundle_id.as_str())
-        );
-    }
+    run_live_test(|| {
+        let Some(live) = Live::start() else { return };
+        assert!(live.hello.macos_major >= 14);
+        if let Ok(bundle_id) = std::env::var("__CFBundleIdentifier") {
+            assert_eq!(
+                live.hello.host_bundle_id.as_deref(),
+                Some(bundle_id.as_str())
+            );
+        }
+    });
 }
 
 #[test]
 #[ignore]
 fn list_and_resolve_find_the_fixture_by_name_and_bundle_id() {
-    let Some(mut live) = Live::start() else {
-        return;
-    };
-    let (pid, _) = live.launch_fixture();
-    let app = live
-        .apps()
-        .into_iter()
-        .find(|app| app.pid == Some(pid))
-        .unwrap();
-    assert_eq!(app.bundle_id, "dev.orca.cu-fixture");
-    assert!(
-        app.windows
-            .iter()
-            .any(|window| window.title == "Orca CU Fixture")
-    );
-    let resolve = |name: &str| {
-        live.client
-            .call(
-                Request::ResolveApp {
-                    app: name.into(),
-                    allow_not_running: false,
-                },
-                Duration::from_secs(30),
-            )
-            .unwrap()
-    };
-    assert_eq!(resolve("CUFixture"), Reply::Resolved { app: app.clone() });
-    assert_eq!(resolve("dev.orca.cu-fixture"), Reply::Resolved { app });
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, _) = live.launch_fixture();
+        let app = live
+            .apps()
+            .into_iter()
+            .find(|app| app.pid == Some(pid))
+            .unwrap();
+        assert_eq!(app.bundle_id, "dev.orca.cu-fixture");
+        assert!(
+            app.windows
+                .iter()
+                .any(|window| window.title == "Orca CU Fixture")
+        );
+        let resolve = |name: &str| {
+            live.client
+                .call(
+                    Request::ResolveApp {
+                        app: name.into(),
+                        allow_not_running: false,
+                    },
+                    Duration::from_secs(30),
+                )
+                .unwrap()
+        };
+        assert_eq!(resolve("CUFixture"), Reply::Resolved { app: app.clone() });
+        assert_eq!(resolve("dev.orca.cu-fixture"), Reply::Resolved { app });
+    });
 }
 
 #[test]
 #[ignore]
 fn a_second_driver_finds_the_session_lock_held() {
-    use orca_computer_use::serve::{DriverHandler, LineWriter};
-    let Some(mut live) = Live::start() else {
-        return;
-    };
-    let (pid, _) = live.launch_fixture();
-    assert!(
-        live.apps().iter().any(|app| app.pid == Some(pid)),
-        "owner can list apps"
-    );
-    let before = bundle_pids("dev.orca.cu-fixture");
-    let launched = live.client.call(
-        Request::LaunchApp {
-            app: "dev.orca.cu-fixture".into(),
-            open: vec![],
-        },
-        Duration::from_secs(60),
-    );
-    register_launch_pids(
-        &mut live.launched,
-        &before,
-        &bundle_pids("dev.orca.cu-fixture"),
-    );
-    let launched = launched.unwrap();
-    assert!(
-        matches!(launched, Reply::Launched { app } if app.pid == Some(pid)),
-        "owner can launch its fixture"
-    );
-    let mut second = MacDriver::new(live.directory.path().join("computer-use.lock"));
-    let output = LineWriter::new(std::io::sink());
-    let requests = || {
-        [
-            Request::ListApps,
+    run_live_test(|| {
+        use orca_computer_use::serve::{DriverHandler, LineWriter};
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, _) = live.launch_fixture();
+        assert!(
+            live.apps().iter().any(|app| app.pid == Some(pid)),
+            "owner can list apps"
+        );
+        let before = bundle_pids("dev.orca.cu-fixture");
+        let launched = live.client.call(
             Request::LaunchApp {
                 app: "dev.orca.cu-fixture".into(),
                 open: vec![],
             },
-        ]
-    };
-    for request in requests() {
-        let before = bundle_pids("dev.orca.cu-fixture");
-        let result = second.handle(request, &output);
+            Duration::from_secs(60),
+        );
         register_launch_pids(
             &mut live.launched,
             &before,
             &bundle_pids("dev.orca.cu-fixture"),
         );
-        let error = result.unwrap_err();
-        assert_eq!(error.kind, ErrorKind::LockHeld);
-        assert_eq!(error.message, "another Orca session is using the computer");
-    }
-    let error = second
-        .handle(Request::Hello { protocol: 1 }, &output)
-        .unwrap_err();
-    assert_eq!(error.kind, ErrorKind::LockHeld);
-    for request in requests() {
-        let before = bundle_pids("dev.orca.cu-fixture");
-        let result = second.handle(request, &output);
-        register_launch_pids(
-            &mut live.launched,
-            &before,
-            &bundle_pids("dev.orca.cu-fixture"),
+        let launched = launched.unwrap();
+        assert!(
+            matches!(launched, Reply::Launched { app } if app.pid == Some(pid)),
+            "owner can launch its fixture"
         );
-        let error = result.unwrap_err();
+        let mut second = MacDriver::new(live.directory.path().join("computer-use.lock"));
+        let output = LineWriter::new(std::io::sink());
+        let requests = || {
+            [
+                Request::ListApps,
+                Request::LaunchApp {
+                    app: "dev.orca.cu-fixture".into(),
+                    open: vec![],
+                },
+            ]
+        };
+        for request in requests() {
+            let before = bundle_pids("dev.orca.cu-fixture");
+            let result = second.handle(request, &output);
+            register_launch_pids(
+                &mut live.launched,
+                &before,
+                &bundle_pids("dev.orca.cu-fixture"),
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::LockHeld);
+            assert_eq!(error.message, "another Orca session is using the computer");
+        }
+        let error = second
+            .handle(Request::Hello { protocol: 1 }, &output)
+            .unwrap_err();
         assert_eq!(error.kind, ErrorKind::LockHeld);
-        assert_eq!(error.message, "another Orca session is using the computer");
-    }
+        for request in requests() {
+            let before = bundle_pids("dev.orca.cu-fixture");
+            let result = second.handle(request, &output);
+            register_launch_pids(
+                &mut live.launched,
+                &before,
+                &bundle_pids("dev.orca.cu-fixture"),
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::LockHeld);
+            assert_eq!(error.message, "another Orca session is using the computer");
+        }
+    });
 }
 
 #[test]
 #[ignore]
 fn launch_app_opens_a_file_in_textedit() {
-    let Some(mut live) = Live::start() else {
-        return;
-    };
-    let file = live.directory.path().join("orca-cu-test.txt");
-    std::fs::write(&file, "Orca computer use fixture document\n").unwrap();
-    let before = bundle_pids("com.apple.TextEdit");
-    let result = live.client.call(
-        Request::LaunchApp {
-            app: "com.apple.TextEdit".into(),
-            open: vec![file.to_string_lossy().into_owned()],
-        },
-        Duration::from_secs(60),
-    );
-    register_launch_pids(
-        &mut live.launched,
-        &before,
-        &bundle_pids("com.apple.TextEdit"),
-    );
-    let Reply::Launched { app } = result.unwrap() else {
-        panic!("expected launched app")
-    };
-    assert_eq!(app.bundle_id, "com.apple.TextEdit");
-    assert!(app.pid.is_some());
-    assert!(
-        !app.windows.is_empty(),
-        "TextEdit opened the temporary file"
-    );
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let file = live.directory.path().join("orca-cu-test.txt");
+        std::fs::write(&file, "Orca computer use fixture document\n").unwrap();
+        let before = bundle_pids("com.apple.TextEdit");
+        let result = live.client.call(
+            Request::LaunchApp {
+                app: "com.apple.TextEdit".into(),
+                open: vec![file.to_string_lossy().into_owned()],
+            },
+            Duration::from_secs(60),
+        );
+        register_launch_pids(
+            &mut live.launched,
+            &before,
+            &bundle_pids("com.apple.TextEdit"),
+        );
+        let Reply::Launched { app } = result.unwrap() else {
+            panic!("expected launched app")
+        };
+        assert_eq!(app.bundle_id, "com.apple.TextEdit");
+        assert!(app.pid.is_some());
+        assert!(
+            !app.windows.is_empty(),
+            "TextEdit opened the temporary file"
+        );
+    });
 }
 
 #[test]
 #[ignore]
 fn opening_a_nonexistent_file_in_already_running_textedit_returns_an_error() {
-    use orca_computer_use::client::CallError;
-    let Some(mut live) = Live::start() else {
-        return;
-    };
-    if !NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str(
-        "com.apple.TextEdit",
-    ))
-    .is_empty()
-    {
-        eprintln!("skipped: TextEdit was already running");
-        return;
-    }
-    let file = live.directory.path().join("native-open-control.txt");
-    std::fs::write(&file, "Native launch completion control\n").unwrap();
-    let before = bundle_pids("com.apple.TextEdit");
-    let result = live.client.call(
-        Request::LaunchApp {
-            app: "com.apple.TextEdit".into(),
-            open: vec![file.to_string_lossy().into_owned()],
-        },
-        Duration::from_secs(60),
-    );
-    register_launch_pids(
-        &mut live.launched,
-        &before,
-        &bundle_pids("com.apple.TextEdit"),
-    );
-    let Reply::Launched { app } = result.unwrap() else {
-        panic!("expected successful launch control")
-    };
-    assert!(
-        !app.windows.is_empty(),
-        "valid file opens in the same TextEdit process"
-    );
-    let missing = live.directory.path().join("does-not-exist.txt");
-    let before = bundle_pids("com.apple.TextEdit");
-    let result = live.client.call(
-        Request::LaunchApp {
-            app: "com.apple.TextEdit".into(),
-            open: vec![missing.to_string_lossy().into_owned()],
-        },
-        Duration::from_secs(60),
-    );
-    register_launch_pids(
-        &mut live.launched,
-        &before,
-        &bundle_pids("com.apple.TextEdit"),
-    );
-    let Err(CallError::Driver(error)) = result else {
-        panic!("native open failure was hidden: {result:?}")
-    };
-    assert_eq!(error.kind, ErrorKind::Failed);
-    assert!(!error.message.is_empty());
+    run_live_test(|| {
+        use orca_computer_use::client::CallError;
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        if !NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str(
+            "com.apple.TextEdit",
+        ))
+        .is_empty()
+        {
+            eprintln!("skipped: TextEdit was already running");
+            return;
+        }
+        let file = live.directory.path().join("native-open-control.txt");
+        std::fs::write(&file, "Native launch completion control\n").unwrap();
+        let before = bundle_pids("com.apple.TextEdit");
+        let result = live.client.call(
+            Request::LaunchApp {
+                app: "com.apple.TextEdit".into(),
+                open: vec![file.to_string_lossy().into_owned()],
+            },
+            Duration::from_secs(60),
+        );
+        register_launch_pids(
+            &mut live.launched,
+            &before,
+            &bundle_pids("com.apple.TextEdit"),
+        );
+        let Reply::Launched { app } = result.unwrap() else {
+            panic!("expected successful launch control")
+        };
+        assert!(
+            !app.windows.is_empty(),
+            "valid file opens in the same TextEdit process"
+        );
+        let missing = live.directory.path().join("does-not-exist.txt");
+        let before = bundle_pids("com.apple.TextEdit");
+        let result = live.client.call(
+            Request::LaunchApp {
+                app: "com.apple.TextEdit".into(),
+                open: vec![missing.to_string_lossy().into_owned()],
+            },
+            Duration::from_secs(60),
+        );
+        register_launch_pids(
+            &mut live.launched,
+            &before,
+            &bundle_pids("com.apple.TextEdit"),
+        );
+        let Err(CallError::Driver(error)) = result else {
+            panic!("native open failure was hidden: {result:?}")
+        };
+        assert_eq!(error.kind, ErrorKind::Failed);
+        assert!(!error.message.is_empty());
+    });
 }
 
 #[test]
 #[ignore]
 fn cleanup_only_selects_explicitly_launched_processes() {
-    let running = HashSet::from([10]);
-    // PID 77 represents an unrelated app that appeared during the test.
-    let launched = HashSet::from([10, 42]);
-    let pids = cleanup_pids(&running, &launched);
-    assert_eq!(pids, vec![42]);
-    assert!(!pids.contains(&77));
+    run_live_test(|| {
+        let running = HashSet::from([10]);
+        // PID 77 represents an unrelated app that appeared during the test.
+        let launched = HashSet::from([10, 42]);
+        let pids = cleanup_pids(&running, &launched);
+        assert_eq!(pids, vec![42]);
+        assert!(!pids.contains(&77));
+    });
 }
 
 #[test]
 #[ignore]
 fn cleanup_preserves_an_app_launched_by_another_live_session() {
-    let Some(mut owner) = Live::start() else {
-        return;
-    };
-    let Some(other) = Live::start() else { return };
-    // The fixture appears after `other` captured its starting process list,
-    // but only `owner` launched it and received its private PID receipt.
-    let (pid, _) = owner.launch_fixture();
-    assert!(
-        owner.apps().iter().any(|app| app.pid == Some(pid)),
-        "fixture is running before cleanup"
-    );
-    drop(other);
-    assert!(
-        owner.apps().iter().any(|app| app.pid == Some(pid)),
-        "cleanup must leave another session's app running"
-    );
+    run_live_test(|| {
+        let Some(mut owner) = Live::start() else {
+            return;
+        };
+        let Some(other) = Live::start() else { return };
+        // The fixture appears after `other` captured its starting process list,
+        // but only `owner` launched it and received its private PID receipt.
+        let (pid, _) = owner.launch_fixture();
+        assert!(
+            owner.apps().iter().any(|app| app.pid == Some(pid)),
+            "fixture is running before cleanup"
+        );
+        drop(other);
+        assert!(
+            owner.apps().iter().any(|app| app.pid == Some(pid)),
+            "cleanup must leave another session's app running"
+        );
+    });
 }
 
 #[test]
 #[ignore]
 fn launch_attribution_registers_only_pids_that_appeared_during_the_request() {
-    let before = HashSet::from([10, 20]);
-    let after = HashSet::from([20, 42, 43]);
-    let mut registered = HashSet::from([7]);
-    register_launch_pids(&mut registered, &before, &after);
-    assert_eq!(registered, HashSet::from([7, 42, 43]));
-    assert!(
-        !registered.contains(&20),
-        "pre-request process is never claimed"
-    );
-    assert!(
-        !registered.contains(&10),
-        "exited pre-request process is never claimed"
-    );
-    register_launch_pids(&mut registered, &after, &after);
-    assert_eq!(
-        registered,
-        HashSet::from([7, 42, 43]),
-        "a request with no new process claims nothing"
-    );
+    run_live_test(|| {
+        let before = HashSet::from([10, 20]);
+        let after = HashSet::from([20, 42, 43]);
+        let mut registered = HashSet::from([7]);
+        register_launch_pids(&mut registered, &before, &after);
+        assert_eq!(registered, HashSet::from([7, 42, 43]));
+        assert!(
+            !registered.contains(&20),
+            "pre-request process is never claimed"
+        );
+        assert!(
+            !registered.contains(&10),
+            "exited pre-request process is never claimed"
+        );
+        register_launch_pids(&mut registered, &after, &after);
+        assert_eq!(
+            registered,
+            HashSet::from([7, 42, 43]),
+            "a request with no new process claims nothing"
+        );
+    });
 }
 
 #[test]
 #[ignore]
 fn observe_lists_the_fixture_controls_in_screenshot_pixels() {
-    let Some(mut live) = Live::start() else {
-        return;
-    };
-    live.launch_fixture();
-    let observation = live.observe("dev.orca.cu-fixture", None);
-    let shot = observation.screenshot.as_ref().expect("screenshot");
-    assert!(shot.width > 0 && shot.height > 0 && shot.width <= 1280 && shot.height <= 1280);
-    use base64::Engine;
-    let png = base64::engine::general_purpose::STANDARD
-        .decode(&shot.png_base64)
-        .unwrap();
-    let decoded = image::load_from_memory(&png).unwrap();
-    assert_eq!(
-        (decoded.width(), decoded.height()),
-        (shot.width, shot.height)
-    );
-    let labels: Vec<_> = observation
-        .elements
-        .iter()
-        .filter_map(|e| e.label.as_deref())
-        .collect();
-    for expected in ["Increment", "Name", "Password", "List"] {
-        assert!(
-            labels.contains(&expected),
-            "{expected} missing from {labels:?}"
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        live.launch_fixture();
+        let observation = live.observe("dev.orca.cu-fixture", None);
+        let shot = observation.screenshot.as_ref().expect("screenshot");
+        assert!(shot.width > 0 && shot.height > 0 && shot.width <= 1280 && shot.height <= 1280);
+        use base64::Engine;
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(&shot.png_base64)
+            .unwrap();
+        let decoded = image::load_from_memory(&png).unwrap();
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (shot.width, shot.height)
         );
-    }
-    let password = observation
-        .elements
-        .iter()
-        .find(|e| e.label.as_deref() == Some("Password"))
-        .unwrap();
-    assert!(password.secure && password.value.is_none());
-    assert!(!observation.no_element_tree);
-    for (index, element) in observation.elements.iter().enumerate() {
-        assert_eq!(element.id as usize, index + 1);
-        let [x, y, w, h] = element.frame;
-        assert!(
-            x >= 0
-                && y >= 0
-                && w >= 0
-                && h >= 0
-                && x + w <= shot.width as i32 + 2
-                && y + h <= shot.height as i32 + 2,
-            "{element:?}"
+        let labels: Vec<_> = observation
+            .elements
+            .iter()
+            .filter_map(|e| e.label.as_deref())
+            .collect();
+        for expected in ["Increment", "Name", "Password", "List"] {
+            assert!(
+                labels.contains(&expected),
+                "{expected} missing from {labels:?}"
+            );
+        }
+        let password = observation
+            .elements
+            .iter()
+            .find(|e| e.label.as_deref() == Some("Password"))
+            .unwrap();
+        assert!(password.secure && password.value.is_none());
+        assert!(!observation.no_element_tree);
+        for (index, element) in observation.elements.iter().enumerate() {
+            assert_eq!(element.id as usize, index + 1);
+            let [x, y, w, h] = element.frame;
+            assert!(
+                x >= 0
+                    && y >= 0
+                    && w >= 0
+                    && h >= 0
+                    && x + w <= shot.width as i32 + 2
+                    && y + h <= shot.height as i32 + 2,
+                "{element:?}"
+            );
+        }
+        let capped = live.observe_window(
+            "dev.orca.cu-fixture",
+            Some(observation.window.id),
+            None,
+            1,
+            false,
         );
-    }
-    let capped = live.observe_window(
-        "dev.orca.cu-fixture",
-        Some(observation.window.id),
-        None,
-        1,
-        false,
-    );
-    assert!(capped.screenshot.is_none());
-    assert_eq!(capped.elements, observation.elements[..1]);
-    assert_eq!(capped.omitted as usize, observation.elements.len() - 1);
+        assert!(capped.screenshot.is_none());
+        assert_eq!(capped.elements, observation.elements[..1]);
+        assert_eq!(capped.omitted as usize, observation.elements.len() - 1);
+    });
 }
 
 #[test]
 #[ignore]
 fn observe_with_a_query_keeps_matches_and_their_ancestors() {
-    let Some(mut live) = Live::start() else {
-        return;
-    };
-    live.launch_fixture();
-    let all = live.observe("dev.orca.cu-fixture", None);
-    let expected = orca_computer_use::observation::filter_elements(&all.elements, "incr");
-    assert!(!expected.is_empty(), "positive match control");
-    let filtered = live.observe("dev.orca.cu-fixture", Some("incr"));
-    let mut expected = expected;
-    for (i, e) in expected.iter_mut().enumerate() {
-        e.id = i as u32 + 1;
-    }
-    assert_eq!(filtered.elements, expected);
-    assert!(
-        filtered
-            .elements
-            .iter()
-            .any(|e| e.label.as_deref() == Some("Increment"))
-    );
-    let descendants = live.observe("dev.orca.cu-fixture", Some("line 1"));
-    assert!(
-        descendants.elements.iter().any(
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        live.launch_fixture();
+        let all = live.observe("dev.orca.cu-fixture", None);
+        let expected = orca_computer_use::observation::filter_elements(&all.elements, "incr");
+        assert!(!expected.is_empty(), "positive match control");
+        let filtered = live.observe("dev.orca.cu-fixture", Some("incr"));
+        let mut expected = expected;
+        for (i, e) in expected.iter_mut().enumerate() {
+            e.id = i as u32 + 1;
+        }
+        assert_eq!(filtered.elements, expected);
+        assert!(
+            filtered
+                .elements
+                .iter()
+                .any(|e| e.label.as_deref() == Some("Increment"))
+        );
+        let descendants = live.observe("dev.orca.cu-fixture", Some("line 1"));
+        assert!(descendants.elements.iter().any(
             |e| e.role == "text area" && e.value.as_ref().is_some_and(|v| v.contains("line 1"))
-        )
-    );
-    assert!(
-        descendants
-            .elements
-            .iter()
-            .any(|e| e.label.as_deref() == Some("List")),
-        "the retained scroll area is an ancestor of matching text"
-    );
-    assert!(
-        !descendants
-            .elements
-            .iter()
-            .any(|e| e.label.as_deref() == Some("Increment")),
-        "an unrelated sibling is excluded"
-    );
-    assert!(
-        live.observe("dev.orca.cu-fixture", Some("no-such-fixture-control-xyz"))
-            .elements
-            .is_empty()
-    );
+        ));
+        assert!(
+            descendants
+                .elements
+                .iter()
+                .any(|e| e.label.as_deref() == Some("List")),
+            "the retained scroll area is an ancestor of matching text"
+        );
+        assert!(
+            !descendants
+                .elements
+                .iter()
+                .any(|e| e.label.as_deref() == Some("Increment")),
+            "an unrelated sibling is excluded"
+        );
+        assert!(
+            live.observe("dev.orca.cu-fixture", Some("no-such-fixture-control-xyz"))
+                .elements
+                .is_empty()
+        );
+    });
 }
 
 struct FinderWindow(i32);
@@ -696,120 +911,450 @@ impl Drop for FinderWindow {
 #[test]
 #[ignore]
 fn observe_captures_a_window_covered_by_another() {
-    let Some(mut live) = Live::start() else {
-        return;
-    };
-    live.launch_fixture();
-    let before = live.observe("dev.orca.cu-fixture", None);
-    let finder_before = bundle_pids("com.apple.finder");
-    let output = Command::new("osascript")
-        .args([
-            "-e",
-            "tell application \"Finder\"
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        live.launch_fixture();
+        let before = live.observe("dev.orca.cu-fixture", None);
+        let finder_before = bundle_pids("com.apple.finder");
+        let output = Command::new("osascript")
+            .args([
+                "-e",
+                "tell application \"Finder\"
 set probe to make new Finder window
 return id of probe
 end tell",
-        ])
-        .output()
-        .unwrap();
-    register_launch_pids(
-        &mut live.launched,
-        &finder_before,
-        &bundle_pids("com.apple.finder"),
-    );
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let window = FinderWindow(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap(),
-    );
-    let output = Command::new("osascript").args(["-e", &format!("tell application \"Finder\"\nset bounds of window id {} to {{100, 100, 1100, 1000}}\nactivate\nend tell", window.0)]).output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if NSWorkspace::new()
-            .frontmostApplication()
-            .and_then(|app| app.bundleIdentifier())
-            .is_some_and(|id| id.to_string() == "com.apple.finder")
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "Finder must actually cover the fixture"
+            ])
+            .output()
+            .unwrap();
+        register_launch_pids(
+            &mut live.launched,
+            &finder_before,
+            &bundle_pids("com.apple.finder"),
         );
-        thread::sleep(Duration::from_millis(20));
-    }
-    let covered = live.observe_window(
-        "dev.orca.cu-fixture",
-        Some(before.window.id),
-        None,
-        300,
-        true,
-    );
-    let before = before.screenshot.unwrap();
-    let covered = covered.screenshot.unwrap();
-    assert_eq!(
-        (covered.width, covered.height),
-        (before.width, before.height)
-    );
-    use base64::Engine;
-    let decode = |s: &str| {
-        image::load_from_memory(&base64::engine::general_purpose::STANDARD.decode(s).unwrap())
-            .unwrap()
-            .to_rgba8()
-    };
-    // The fixture's teal canvas is a stable positive control even when covered.
-    let x = before.width * 3 / 4;
-    let y = before.height / 2;
-    let control = *decode(&before.png_base64).get_pixel(x, y);
-    assert!(
-        control[1] > control[0] && control[2] > control[0],
-        "expected teal canvas: {control:?}"
-    );
-    assert_eq!(*decode(&covered.png_base64).get_pixel(x, y), control);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let window = FinderWindow(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        );
+        let output = Command::new("osascript").args(["-e", &format!("tell application \"Finder\"\nset bounds of window id {} to {{100, 100, 1100, 1000}}\nactivate\nend tell", window.0)]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if NSWorkspace::new()
+                .frontmostApplication()
+                .and_then(|app| app.bundleIdentifier())
+                .is_some_and(|id| id.to_string() == "com.apple.finder")
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                record_gui_failure("Finder must actually cover the fixture".into());
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let covered = live.observe_window(
+            "dev.orca.cu-fixture",
+            Some(before.window.id),
+            None,
+            300,
+            true,
+        );
+        let before = before.screenshot.unwrap();
+        let covered = covered.screenshot.unwrap();
+        assert_eq!(
+            (covered.width, covered.height),
+            (before.width, before.height)
+        );
+        use base64::Engine;
+        let decode = |s: &str| {
+            image::load_from_memory(&base64::engine::general_purpose::STANDARD.decode(s).unwrap())
+                .unwrap()
+                .to_rgba8()
+        };
+        // The fixture's teal canvas is a stable positive control even when covered.
+        let x = before.width * 3 / 4;
+        let y = before.height / 2;
+        let control = *decode(&before.png_base64).get_pixel(x, y);
+        assert!(
+            control[1] > control[0] && control[2] > control[0],
+            "expected teal canvas: {control:?}"
+        );
+        assert_eq!(*decode(&covered.png_base64).get_pixel(x, y), control);
+    });
 }
 
 #[test]
 #[ignore]
 fn observe_of_an_electron_app_waits_for_its_tree() {
-    let Ok(bundle) = std::env::var("ORCA_CU_ELECTRON_APP") else {
-        eprintln!("skipped: ORCA_CU_ELECTRON_APP is unset");
-        return;
-    };
-    let Some(mut live) = Live::start() else {
-        return;
-    };
-    if !bundle_pids(&bundle).is_empty() {
-        eprintln!("skipped: Electron app already running");
-        return;
+    run_live_test(|| {
+        let Ok(bundle) = std::env::var("ORCA_CU_ELECTRON_APP") else {
+            eprintln!("skipped: ORCA_CU_ELECTRON_APP is unset");
+            return;
+        };
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        if !bundle_pids(&bundle).is_empty() {
+            eprintln!("skipped: Electron app already running");
+            return;
+        }
+        let before = bundle_pids(&bundle);
+        let result = live.client.call(
+            Request::LaunchApp {
+                app: bundle.clone(),
+                open: vec![],
+            },
+            Duration::from_secs(60),
+        );
+        register_launch_pids(&mut live.launched, &before, &bundle_pids(&bundle));
+        result.unwrap();
+        let observation = live.observe(&bundle, None);
+        assert!(!observation.no_element_tree);
+        assert!(
+            observation
+                .elements
+                .iter()
+                .any(|e| e.role == "button" || e.role == "text field")
+        );
+    });
+}
+
+fn click_target(target: Target) -> Action {
+    Action::Click {
+        target,
+        button: Button::Left,
+        count: 1,
+        modifiers: vec![],
     }
-    let before = bundle_pids(&bundle);
-    let result = live.client.call(
-        Request::LaunchApp {
-            app: bundle.clone(),
-            open: vec![],
-        },
-        Duration::from_secs(60),
-    );
-    register_launch_pids(&mut live.launched, &before, &bundle_pids(&bundle));
-    result.unwrap();
-    let observation = live.observe(&bundle, None);
-    assert!(!observation.no_element_tree);
-    assert!(
-        observation
+}
+fn element_named(observation: &Observation, name: &str) -> Target {
+    Target::Element {
+        element: observation
             .elements
             .iter()
-            .any(|e| e.role == "button" || e.role == "text field")
-    );
+            .find(|e| e.label.as_deref() == Some(name))
+            .unwrap()
+            .id,
+    }
+}
+fn background_fixture() -> Option<(Live, PathBuf, Observation)> {
+    let mut live = Live::start()?;
+    let (_, log) = live.launch_fixture();
+    live.make_finder_frontmost();
+    let observation = live.observe("dev.orca.cu-fixture", None);
+    Some((live, log, observation))
+}
+#[test]
+#[ignore]
+fn clicking_an_element_presses_it_in_the_background() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let outcome = live
+            .act(click_target(element_named(&obs, "Increment")), false)
+            .unwrap();
+        assert!(!outcome.foreground_used);
+        assert!(outcome.observation.is_some());
+        live.assert_log_contains(&log, r#""type":"click""#);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+#[test]
+#[ignore]
+fn typing_goes_into_the_focused_field_in_the_background() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        live.act(
+            Action::Type {
+                text: "".into(),
+                target: Some(element_named(&obs, "Name")),
+            },
+            false,
+        )
+        .unwrap();
+        live.act(
+            Action::Type {
+                text: "abc".into(),
+                target: None,
+            },
+            false,
+        )
+        .unwrap();
+        live.assert_log_contains(&log, r#""value":"abc""#);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+#[test]
+#[ignore]
+fn typing_into_the_password_field_needs_approval_first() {
+    run_live_test(|| {
+        let Some((live, _, obs)) = background_fixture() else {
+            return;
+        };
+        let action = Action::Type {
+            text: "secret".into(),
+            target: Some(element_named(&obs, "Password")),
+        };
+        assert_eq!(
+            live.act(action.clone(), false).unwrap_err().kind,
+            ErrorKind::NeedsSecureApproval
+        );
+        assert!(!live.act(action, true).unwrap().foreground_used);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+#[test]
+#[ignore]
+fn a_point_on_the_button_presses_it() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let frame = obs
+            .elements
+            .iter()
+            .find(|e| e.label.as_deref() == Some("Increment"))
+            .unwrap()
+            .frame;
+        live.act(
+            click_target(Target::Point {
+                point: [
+                    f64::from(frame[0]) + f64::from(frame[2]) / 2.0,
+                    f64::from(frame[1]) + f64::from(frame[3]) / 2.0,
+                ],
+            }),
+            false,
+        )
+        .unwrap();
+        live.assert_log_contains(&log, r#""count":1"#);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+#[test]
+#[ignore]
+fn a_point_on_the_canvas_needs_the_foreground() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        live.act(click_target(element_named(&obs, "Increment")), false)
+            .unwrap();
+        live.assert_log_contains(&log, r#""type":"click""#);
+        let image = live
+            .observe("dev.orca.cu-fixture", None)
+            .screenshot
+            .unwrap();
+        assert_eq!(
+            live.act(
+                click_target(Target::Point {
+                    point: [f64::from(image.width) * 0.75, f64::from(image.height) * 0.5]
+                }),
+                false
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::NeedsForeground
+        );
+        assert!(
+            !std::fs::read_to_string(log)
+                .unwrap()
+                .contains("canvas_click")
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+#[test]
+#[ignore]
+fn scrolling_the_list_moves_it_in_the_background() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let outcome = live
+            .act(
+                Action::Scroll {
+                    target: element_named(&obs, "List"),
+                    direction: Direction::Down,
+                    amount: 3,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(outcome.scroll_position.unwrap() > 0.0);
+        live.assert_log_contains(&log, r#""type":"scroll""#);
+        assert!(
+            std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .any(|v| v["type"] == "scroll" && v["y"].as_f64().is_some_and(|y| y > 0.0))
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+#[test]
+#[ignore]
+fn an_action_after_the_window_moved_is_stale() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        live.act(click_target(element_named(&obs, "Increment")), false)
+            .unwrap();
+        live.assert_log_contains(&log, r#""type":"click""#);
+        let output = Command::new("osascript").args(["-e", "tell application \"System Events\" to tell process \"CUFixture\" to set position of window 1 to {250, 250}"]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let err = live
+            .act(click_target(element_named(&obs, "Increment")), false)
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Stale);
+        assert_eq!(
+            err.message,
+            "the window changed since the last observe; observe again"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+#[test]
+#[ignore]
+fn cmd_a_reaches_the_focused_field() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        live.act(
+            Action::Type {
+                text: "abc".into(),
+                target: Some(element_named(&obs, "Name")),
+            },
+            false,
+        )
+        .unwrap();
+        live.assert_log_contains(&log, r#""value":"abc""#);
+        live.act(
+            Action::Key {
+                keys: vec!["cmd".into(), "a".into()],
+                target: None,
+            },
+            false,
+        )
+        .unwrap();
+        live.act(
+            Action::Type {
+                text: "x".into(),
+                target: None,
+            },
+            false,
+        )
+        .unwrap();
+        live.assert_log_contains(&log, r#""value":"abcx""#);
+        let observation = live.observe("dev.orca.cu-fixture", None);
+        let value = observation
+            .elements
+            .iter()
+            .find(|e| e.label.as_deref() == Some("Name"))
+            .unwrap()
+            .value
+            .as_deref()
+            .unwrap();
+        // Task 13 owns the decision on routing Cmd combinations to the foreground.
+        assert_eq!(
+            value, "abcx",
+            "Cmd+A did not select the background field in the Task 7 probe"
+        );
+        eprintln!(
+            "Cmd+A reached the background field: {} (value={value:?})",
+            value == "x"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+// Seconds are measured from the start of an attempt. Task 8's marked HID
+// posting helpers will record the time of their last event on the same clock.
+fn user_input_since_start(elapsed: f64, idle: f64, last_own_hid: Option<f64>) -> bool {
+    let last_input = elapsed - idle;
+    last_input > 0.0 && last_own_hid.is_none_or(|own| last_input > own)
+}
+
+#[test]
+fn hid_activity_distinguishes_user_interference_from_a_regression() {
+    assert!(user_input_since_start(10.0, 2.0, None));
+    assert!(!user_input_since_start(10.0, 10.0, None));
+    assert!(!user_input_since_start(10.0, 12.0, None));
+    assert!(!user_input_since_start(10.0, 2.0, Some(8.0)));
+    assert!(!user_input_since_start(10.0, 3.0, Some(8.0)));
+    assert!(user_input_since_start(10.0, 1.0, Some(8.0)));
+}
+
+#[test]
+#[ignore]
+fn a_point_on_a_hidden_button_needs_the_foreground() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let frame = obs
+            .elements
+            .iter()
+            .find(|e| e.label.as_deref() == Some("Increment"))
+            .unwrap()
+            .frame;
+        let action = click_target(Target::Point {
+            point: [
+                f64::from(frame[0]) + f64::from(frame[2]) / 2.0,
+                f64::from(frame[1]) + f64::from(frame[3]) / 2.0,
+            ],
+        });
+        live.act(action.clone(), false).unwrap();
+        live.assert_log_contains(&log, r#""count":1"#);
+        let receipt: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let pid = i32::try_from(receipt["pid"].as_i64().unwrap()).unwrap();
+        let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid).unwrap();
+        let output = Command::new("osascript")
+            .args(["-e", "tell application \"System Events\" to set visible of process \"CUFixture\" to false"])
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app.isHidden() {
+            assert!(Instant::now() < deadline, "fixture did not become hidden");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let error = live.act(action, false).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::NeedsForeground);
+        assert_eq!(error.message, "The app is hidden");
+        live.assert_frontmost_and_pointer_unchanged();
+    });
 }
