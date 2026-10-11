@@ -264,6 +264,60 @@ mod tests {
     const BASE64_1X1_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
     #[test]
+    fn image_free_tool_results_preserve_retained_image_cache() {
+        use crate::approval_types::ActionKind;
+        use crate::conversation::Conversation;
+        use crate::tool_types::{ToolName, ToolRequest, ToolResult};
+
+        let mut conversation = Conversation::new();
+        let retained = conversation.retained_tool_images();
+        let request = ToolRequest {
+            id: "screenshot".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let image = tool_image("image/png", BASE64_1X1_PNG.to_string()).unwrap();
+        let result = ToolResult::completed(&request, "screenshot".to_string(), false)
+            .with_images(vec![image.clone()]);
+        conversation.add_tool_result_with_terminal(&result, "screenshot".to_string());
+        let cached_data_address = || {
+            let messages = retained.messages.lock().unwrap();
+            let ImageSource::Base64 { data, .. } = &messages[0].images[0].source else {
+                panic!("expected cached base64 image");
+            };
+            data.as_ptr() as usize
+        };
+        let original_address = cached_data_address();
+        let text_request = ToolRequest {
+            id: "text-only".to_string(),
+            ..request.clone()
+        };
+        let text_result = ToolResult::completed(&text_request, "text only".to_string(), false);
+
+        conversation.add_tool_result_with_terminal(&text_result, "text only".to_string());
+
+        assert_eq!(retained.for_call("screenshot"), Some(vec![image]));
+        assert_eq!(cached_data_address(), original_address);
+        assert!(retained.for_call("text-only").is_none());
+
+        let next_request = ToolRequest {
+            id: "next-screenshot".to_string(),
+            ..request
+        };
+        let next_result =
+            ToolResult::completed(&next_request, "next screenshot".to_string(), false)
+                .with_images(result.images);
+        conversation.add_tool_result_with_terminal(&next_result, "next screenshot".to_string());
+        assert_ne!(cached_data_address(), original_address);
+        assert_eq!(
+            retained.for_call("next-screenshot"),
+            Some(next_result.images)
+        );
+    }
+
+    #[test]
     fn a_mislabelled_png_is_kept_as_png() {
         let image = tool_image("image/jpeg", BASE64_1X1_PNG.to_string()).unwrap();
         assert!(

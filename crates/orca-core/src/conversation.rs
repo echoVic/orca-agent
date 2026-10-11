@@ -624,6 +624,7 @@ impl Conversation {
     }
 
     pub fn add_tool_result_with_terminal(&mut self, result: &ToolResult, content: String) {
+        let added_images = !result.images.is_empty();
         self.messages.push(Message::Tool {
             tool_call_id: result.id.clone(),
             content,
@@ -631,8 +632,10 @@ impl Conversation {
             terminal: Some(result.terminal().clone()),
             pinned: false,
         });
-        keep_newest_tool_images(&mut self.messages, MAX_REQUEST_TOOL_IMAGES);
-        self.refresh_retained_tool_images();
+        let trimmed_images = keep_newest_tool_images(&mut self.messages, MAX_REQUEST_TOOL_IMAGES);
+        if added_images || trimmed_images != 0 {
+            self.refresh_retained_tool_images();
+        }
     }
 
     pub fn last_user_message(&self) -> Option<&str> {
