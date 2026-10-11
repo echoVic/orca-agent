@@ -1690,13 +1690,19 @@ fn cmd_s_saves_textedit_in_the_background() {
             .expect("own document window")
             .id;
         live.make_finder_frontmost();
-        live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
+        let observed = live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
+        let text_area = observed
+            .elements
+            .iter()
+            .find(|e| e.role == "text area")
+            .expect("observed TextEdit editor")
+            .id;
         live.act_app(
             "com.apple.TextEdit",
             Some(window),
             Action::Type {
                 text: "edited by Orca".into(),
-                target: None,
+                target: Some(Target::Element { element: text_area }),
             },
             false,
             true,
@@ -2650,6 +2656,151 @@ fn foreground_password_focus_requires_approval_after_the_click() {
         );
         live.assert_frontmost_and_pointer_unchanged();
     });
+}
+
+#[test]
+#[ignore]
+fn an_observed_text_area_with_a_failed_description_can_be_targeted_by_id() {
+    run_live_test(|| {
+        use objc2_application_services::{AXError, AXUIElement};
+        use objc2_core_foundation::CFString;
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let pid = bundle_pids("dev.orca.cu-fixture")
+            .into_iter()
+            .next()
+            .unwrap();
+        let app = unsafe { AXUIElement::new_application(pid) };
+        let window = fixture_ax_value(&app, "AXMainWindow")
+            .unwrap()
+            .downcast::<AXUIElement>()
+            .unwrap();
+        let text = fixture_ax_role(&window, "AXTextArea").expect("fixture text view");
+        let mut value = std::ptr::null();
+        let description = unsafe {
+            text.copy_attribute_value(
+                &CFString::from_str("AXDescription"),
+                std::ptr::NonNull::from(&mut value),
+            )
+        };
+        assert_eq!(
+            description,
+            AXError::Failure,
+            "the regression must exercise a real failing optional description read"
+        );
+        assert!(value.is_null());
+        // Same scroll view, with an available label, is the positive control.
+        let control = live
+            .act(
+                Action::Scroll {
+                    target: element_named(&obs, "List"),
+                    direction: Direction::Down,
+                    amount: 1,
+                },
+                false,
+            )
+            .unwrap();
+        let control_position = control.scroll_position.unwrap();
+        assert!(control_position > 0.0);
+        live.assert_log_contains(&log, r#""type":"scroll""#);
+        let fresh = live.observe("dev.orca.cu-fixture", None);
+        let element = fresh
+            .elements
+            .iter()
+            .find(|e| e.role == "text area")
+            .expect("the failing-description element is observable");
+        assert!(element.label.is_none());
+        let outcome = live
+            .act(
+                Action::Scroll {
+                    target: Target::Element {
+                        element: element.id,
+                    },
+                    direction: Direction::Down,
+                    amount: 1,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(!outcome.foreground_used);
+        assert!(outcome.scroll_position.unwrap() > control_position);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn an_action_after_the_element_label_changed_is_stale() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (_, log) = live.launch_fixture_with_flags(&["--rename-button-after-press"]);
+        live.make_finder_frontmost();
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let action = click_target(element_named(&obs, "Increment"));
+        // Keep the observed table while the real app renames the pressed button.
+        let request = Request::Act(ActParams {
+            app: "dev.orca.cu-fixture".into(),
+            window: Some(obs.window.id),
+            action: action.clone(),
+            foreground_fallback: false,
+            observe_after: false,
+            include_screenshot: false,
+            secure_approved: false,
+        });
+        assert!(matches!(
+            live.client
+                .call(request.clone(), Duration::from_secs(30))
+                .unwrap(),
+            Reply::Acted { .. }
+        ));
+        live.assert_log_contains(&log, r#""count":1"#);
+        let error = live
+            .client
+            .call(request, Duration::from_secs(30))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                orca_computer_use::client::CallError::Driver(DriverError {
+                    kind: ErrorKind::Stale,
+                    ..
+                })
+            ),
+            "changed labels require a fresh observation: {error:?}"
+        );
+        let fresh = live.observe("dev.orca.cu-fixture", None);
+        live.act(click_target(element_named(&fresh, "Renamed")), false)
+            .unwrap();
+        live.assert_log_contains(&log, r#""count":2"#);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+fn fixture_ax_role(
+    element: &objc2_application_services::AXUIElement,
+    role: &str,
+) -> Option<objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>> {
+    use objc2_application_services::AXUIElement;
+    use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType};
+    if fixture_ax_value(element, "AXRole")
+        .and_then(|v| v.downcast::<CFString>().ok())
+        .is_some_and(|v| v.to_string() == role)
+    {
+        return Some(unsafe { CFRetained::retain(std::ptr::NonNull::from(element)) });
+    }
+    let children = fixture_ax_value(element, "AXChildren")?;
+    let array = children.downcast_ref::<CFArray>()?;
+    for i in 0..array.len() {
+        let child = unsafe { &*array.value_at_index(i as isize).cast::<CFType>() }
+            .downcast_ref::<AXUIElement>()?;
+        if let Some(found) = fixture_ax_role(child, role) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn pointer_restored(

@@ -233,16 +233,7 @@ pub(super) fn target_element(
             if entry.element.attribute_string("AXRole")?.as_deref() != Some(entry.role.as_str()) {
                 return Err(stale());
             }
-            let mut label = None;
-            for name in ["AXTitle", "AXDescription", "AXPlaceholderValue"] {
-                label = entry
-                    .element
-                    .attribute_string(name)?
-                    .filter(|s| !s.is_empty());
-                if label.is_some() {
-                    break;
-                }
-            }
+            let label = entry.element.label(None)?;
             if label != entry.label {
                 return Err(stale());
             }

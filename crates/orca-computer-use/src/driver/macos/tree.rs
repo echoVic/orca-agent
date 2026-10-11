@@ -94,17 +94,11 @@ impl TreeNode for AxElement {
         } else {
             None
         };
-        let mut label = None;
-        // AXLabel is the description attribute on macOS; don't use localized role descriptions.
-        for name in ["AXTitle", "AXDescription", "AXPlaceholderValue"]
-            .into_iter()
-            .filter(|_| retained_role || role == "AXStaticText" || role == "AXImage")
-        {
-            label = read!(self.optional_attribute_string(name)).filter(|s| !s.is_empty());
-            if label.is_some() {
-                break;
-            }
-        }
+        let label = if retained_role || role == "AXStaticText" || role == "AXImage" {
+            read!(self.label(Some(deadline)))
+        } else {
+            None
+        };
         let value = if !secure && (retained_role || role == "AXStaticText" || role == "AXImage") {
             read!(self.optional_attribute_string("AXValue"))
         } else {

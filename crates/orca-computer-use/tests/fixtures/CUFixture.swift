@@ -31,6 +31,9 @@ final class Controller: NSObject, NSTextFieldDelegate {
     @objc func increment(_ sender: Any?) {
         count += 1
         label.stringValue = "Count: \(count)"
+        if CommandLine.arguments.contains("--rename-button-after-press"), let button = sender as? NSButton {
+            button.title = "Renamed"
+        }
         log(["type": "click", "count": count])
     }
     @objc func resetProbeFocus(_ sender: Any?) {

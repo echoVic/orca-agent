@@ -82,7 +82,7 @@ impl AxElement {
         }))
     }
 
-    // R7: traversal's optional title/description/label/placeholder/value reads
+    // R7: optional title/description/label/placeholder/value reads
     // treat NoValue, AttributeUnsupported and Failure as absent. Required
     // role/position/size/window/children reads and actions must not use this.
     pub(super) fn optional_attribute_string(
@@ -101,6 +101,23 @@ impl AxElement {
                         .map(|n| n.to_string())
                 }
             }))
+    }
+
+    /// Observations and stale checks must use the same optional label reads.
+    /// The traversal budget is checked before every native attribute call.
+    pub(super) fn label(&self, deadline: Option<Instant>) -> Result<Option<String>, DriverError> {
+        for name in ["AXTitle", "AXDescription", "AXPlaceholderValue"] {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(None);
+            }
+            if let Some(label) = self
+                .optional_attribute_string(name)?
+                .filter(|s| !s.is_empty())
+            {
+                return Ok(Some(label));
+            }
+        }
+        Ok(None)
     }
 
     #[allow(dead_code)]
