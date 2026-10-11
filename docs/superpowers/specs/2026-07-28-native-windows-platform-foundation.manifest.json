@@ -30,6 +30,12 @@
   ],
   "foundation_exceptions": [
     [
+      "computer-use-nonblocking-stdin",
+      "crates/orca-computer-use/src/driver_input.rs",
+      "unix_libc_process",
+      3
+    ],
+    [
       "acp-daemon-private-unix-endpoint",
       "crates/orca-runtime/src/acp/daemon.rs",
       "unix_std_api",

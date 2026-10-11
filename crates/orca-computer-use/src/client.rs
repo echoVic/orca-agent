@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -13,13 +13,15 @@ use crate::protocol::{
     RequestLine,
 };
 
+pub use crate::driver_input::DriverInput;
+
 pub trait DriverLauncher: Send + Sync {
     /// Returns stdin, stdout, and (for a real process) the child to reap.
     fn launch(&self) -> io::Result<LaunchedDriver>;
 }
 
 pub struct LaunchedDriver {
-    pub stdin: Box<dyn Write + Send>,
+    pub stdin: Box<dyn DriverInput>,
     pub stdout: Box<dyn Read + Send>,
     pub child: Option<Child>,
 }
@@ -27,8 +29,16 @@ pub struct LaunchedDriver {
 pub type EventCallback = Arc<dyn Fn(DriverEvent) + Send + Sync>;
 type Pending = Arc<Mutex<HashMap<u64, SyncSender<Result<Reply, DriverError>>>>>;
 
+struct Outbound {
+    id: u64,
+    request: Request,
+    started: Instant,
+    timeout: Duration,
+}
+
 pub struct DriverClient {
-    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    outgoing: Option<Sender<Outbound>>,
+    writer: Option<JoinHandle<()>>,
     pending: Pending,
     connected: Arc<AtomicBool>,
     next_id: AtomicU64,
@@ -73,6 +83,28 @@ fn disconnect(pending: &Pending, connected: &AtomicBool) {
     pending.clear();
 }
 
+/// Finish a frame before starting another, even if its caller has timed out.
+/// Drop interrupts retries; it never leaves a blocked worker holding stdin open.
+fn write_request(input: &mut dyn DriverInput, bytes: &[u8], connected: &AtomicBool) -> bool {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if !connected.load(Ordering::SeqCst) {
+            return false;
+        }
+        match input.write(&bytes[offset..]) {
+            Ok(0) => thread::sleep(Duration::from_millis(5)), // A full Windows byte pipe can write zero bytes.
+            Ok(written) => offset += written,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5))
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+    // Native PipeWriter/ChildStdin flushes are unbuffered and do not block.
+    input.flush().is_ok()
+}
+
 impl DriverClient {
     /// Launches exactly once and exchanges protocol versions before returning.
     pub fn start(
@@ -85,13 +117,63 @@ impl DriverClient {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(true));
         let mut client = Self {
-            writer: Mutex::new(Some(launched.stdin)),
+            outgoing: None,
+            writer: None,
             pending: pending.clone(),
             connected: connected.clone(),
             next_id: AtomicU64::new(1),
             reader: None,
             child: launched.child,
         };
+        let mut input = launched.stdin;
+        crate::driver_input::set_nonblocking(&*input)
+            .map_err(|error| failed(format!("Could not configure computer-use stdin: {error}")))?;
+        let (sender, receiver) = mpsc::channel::<Outbound>();
+        let writer_pending = pending.clone();
+        let writer_connected = connected.clone();
+        client.writer = Some(
+            thread::Builder::new()
+                .name("computer-use-driver-writer".into())
+                .spawn(move || {
+                    for outbound in receiver {
+                        if !writer_connected.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if outbound.started.elapsed() >= outbound.timeout {
+                            continue;
+                        }
+                        let encoded = serde_json::to_vec(&RequestLine {
+                            id: outbound.id,
+                            request: outbound.request,
+                        });
+                        let mut bytes = match encoded {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                if let Some(sender) = writer_pending
+                                    .lock()
+                                    .expect("pending replies lock poisoned")
+                                    .remove(&outbound.id)
+                                {
+                                    let _ = sender.send(Err(failed(format!(
+                                        "Could not encode driver request: {error}"
+                                    ))));
+                                }
+                                continue;
+                            }
+                        };
+                        if outbound.started.elapsed() >= outbound.timeout {
+                            continue;
+                        }
+                        bytes.push(b'\n');
+                        if !write_request(&mut *input, &bytes, &writer_connected) {
+                            disconnect(&writer_pending, &writer_connected);
+                            break;
+                        }
+                    }
+                })
+                .map_err(|error| failed(format!("Could not start computer-use writer: {error}")))?,
+        );
+        client.outgoing = Some(sender);
         client.reader = Some(
             thread::Builder::new()
                 .name("computer-use-driver-reader".into())
@@ -167,10 +249,6 @@ impl DriverClient {
     pub fn call(&self, request: Request, timeout: Duration) -> Result<Reply, CallError> {
         let started = Instant::now();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut bytes = serde_json::to_vec(&RequestLine { id, request }).map_err(|error| {
-            CallError::Driver(failed(format!("Could not encode driver request: {error}")))
-        })?;
-        bytes.push(b'\n');
         let (sender, receiver) = mpsc::sync_channel(1);
         {
             let mut pending = self.pending.lock().expect("pending replies lock poisoned");
@@ -179,17 +257,17 @@ impl DriverClient {
             }
             pending.insert(id, sender);
         }
-        let written = {
-            let mut writer = self.writer.lock().expect("driver input lock poisoned");
-            writer
-                .as_mut()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "driver input closed"))
-                .and_then(|writer| {
-                    writer.write_all(&bytes)?;
-                    writer.flush()
-                })
-        };
-        if written.is_err() {
+        let queued = self
+            .outgoing
+            .as_ref()
+            .ok_or(CallError::Disconnected)?
+            .send(Outbound {
+                id,
+                request,
+                started,
+                timeout,
+            });
+        if queued.is_err() {
             disconnect(&self.pending, &self.connected);
             return Err(CallError::Disconnected);
         }
@@ -208,10 +286,13 @@ impl DriverClient {
 
 impl Drop for DriverClient {
     fn drop(&mut self) {
-        self.writer
-            .get_mut()
-            .expect("driver input lock poisoned")
-            .take();
+        disconnect(&self.pending, &self.connected);
+        self.outgoing.take();
+        if let Some(writer) = self.writer.take() {
+            // Nonblocking pipe writes observe connected, so joining closes stdin
+            // before we wait for the child, even when its pipe is full.
+            let _ = writer.join();
+        }
         if let Some(child) = &mut self.child {
             let deadline = Instant::now() + Duration::from_secs(1);
             loop {
@@ -241,6 +322,7 @@ mod tests {
     use super::*;
     use crate::fake::{FakeDesktop, FakeLauncher};
     use crate::protocol::*;
+    use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::thread;
@@ -630,6 +712,140 @@ mod tests {
             panic!("expected action")
         };
         assert!(outcome.observation.unwrap().elements[2].value.is_none());
+    }
+
+    #[test]
+    fn a_full_stdin_pipe_times_out_both_calls_and_drop_closes_the_pipe() {
+        struct TrackedInput {
+            pipe: io::PipeWriter,
+            writing: Arc<AtomicBool>,
+        }
+        impl Write for TrackedInput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.len() > 32 * 1024 {
+                    self.writing.store(true, Ordering::SeqCst);
+                }
+                self.pipe.write(bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.pipe.flush()
+            }
+        }
+        #[cfg(unix)]
+        impl std::os::fd::AsFd for TrackedInput {
+            fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+                self.pipe.as_fd()
+            }
+        }
+        #[cfg(windows)]
+        impl std::os::windows::io::AsHandle for TrackedInput {
+            fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+                self.pipe.as_handle()
+            }
+        }
+        struct StalledLauncher {
+            input: Mutex<Option<io::PipeReader>>,
+            output: Mutex<Option<crate::serve::LineWriter>>,
+            writing: Arc<AtomicBool>,
+        }
+        impl DriverLauncher for StalledLauncher {
+            fn launch(&self) -> io::Result<LaunchedDriver> {
+                let (input, stdin) = io::pipe()?;
+                let (stdout, output) = io::pipe()?;
+                let output = crate::serve::LineWriter::new(output);
+                output.send(&DriverLine::Response(ResponseLine {
+                    id: 1,
+                    result: Ok(Reply::Hello {
+                        protocol: PROTOCOL_VERSION,
+                        macos_major: 26,
+                        host_bundle_id: None,
+                        permissions: Permissions::default(),
+                    }),
+                }))?;
+                *self.input.lock().unwrap() = Some(input);
+                *self.output.lock().unwrap() = Some(output);
+                Ok(LaunchedDriver {
+                    stdin: Box::new(TrackedInput {
+                        pipe: stdin,
+                        writing: self.writing.clone(),
+                    }),
+                    stdout: Box::new(stdout),
+                    child: None,
+                })
+            }
+        }
+        let launcher = StalledLauncher {
+            input: Mutex::new(None),
+            output: Mutex::new(None),
+            writing: Arc::new(AtomicBool::new(false)),
+        };
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        let client = Arc::new(client);
+        let first_timeout = Duration::from_millis(300);
+        let second_timeout = Duration::from_millis(100);
+        let margin = Duration::from_millis(200);
+        let payload = "x".repeat(4 * 1024 * 1024);
+        let first_request = Request::LaunchApp {
+            app: "com.apple.TextEdit".into(),
+            open: vec![payload],
+        };
+        let (first, second) = thread::scope(|scope| {
+            let (first_sender, first_receiver) = mpsc::channel();
+            let (second_sender, second_receiver) = mpsc::channel();
+            let first_client = client.clone();
+            scope.spawn(move || {
+                let started = Instant::now();
+                let _ = first_sender.send((
+                    first_client.call(first_request, first_timeout),
+                    started.elapsed(),
+                ));
+            });
+            wait_until(|| launcher.writing.load(Ordering::SeqCst));
+            let second_client = client.clone();
+            scope.spawn(move || {
+                let started = Instant::now();
+                let _ = second_sender.send((
+                    second_client.call(Request::ListApps, second_timeout),
+                    started.elapsed(),
+                ));
+            });
+            let second = second_receiver.recv_timeout(second_timeout + margin);
+            let first = first_receiver.recv_timeout(first_timeout + margin);
+            // On RED, release the undrained pipe so the failed test cannot hang
+            // while its scoped call threads are joined.
+            if first.is_err() || second.is_err() {
+                launcher.input.lock().unwrap().take();
+            }
+            (first, second)
+        });
+        let (first_result, first_elapsed) =
+            first.expect("first call exceeded its deadline and margin");
+        let (second_result, second_elapsed) =
+            second.expect("second call waited behind a full pipe");
+        assert!(matches!(first_result, Err(CallError::TimedOut)));
+        assert!(matches!(second_result, Err(CallError::TimedOut)));
+        assert!(first_elapsed <= first_timeout + margin);
+        assert!(second_elapsed <= second_timeout + margin);
+        let started = Instant::now();
+        drop(client);
+        assert!(
+            started.elapsed() < margin,
+            "drop waited for the stalled pipe reader"
+        );
+        let mut input = launcher.input.lock().unwrap().take().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            input.read_to_end(&mut bytes).unwrap();
+            sender.send(bytes.len()).unwrap();
+        });
+        let delivered = receiver
+            .recv_timeout(margin)
+            .expect("the writer kept stdin open after Drop");
+        assert!(
+            delivered < 4 * 1024 * 1024,
+            "Drop allowed the blocked request to finish writing"
+        );
     }
 
     struct PipeLauncher(fn(BufReader<io::PipeReader>, crate::serve::LineWriter));
