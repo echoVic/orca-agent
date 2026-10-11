@@ -175,16 +175,36 @@ impl MacDriver {
             outcome.foreground_used = true;
         }
         if params.observe_after {
-            outcome.observation = Some(self.observe(ObserveParams {
+            let observation = self.observe(ObserveParams {
                 app: params.app,
                 window: Some(id),
                 query: None,
                 max_elements: 300,
                 include_screenshot: params.include_screenshot,
-            })?);
+            });
+            match observation {
+                Ok(observation) => outcome.observation = Some(observation),
+                Err(_) if window_gone(&application, &ax_window, pid) => {
+                    let note = outcome.note.get_or_insert_with(String::new);
+                    if !note.is_empty() {
+                        note.push_str("; ");
+                    }
+                    note.push_str("The window closed after the action; observe again.");
+                }
+                Err(failure) => return Err(failure),
+            }
         }
         Ok(outcome)
     }
+}
+
+fn window_gone(application: &AxElement, window: &AxElement, pid: i32) -> bool {
+    if NSRunningApplication::runningApplicationWithProcessIdentifier(pid).is_none() {
+        return true;
+    }
+    application
+        .elements("AXWindows")
+        .is_ok_and(|windows| !windows.iter().any(|candidate| candidate.0 == window.0))
 }
 
 /// Check both the requested target and the actual recipient, after focus/click.

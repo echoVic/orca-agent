@@ -36,6 +36,10 @@ final class Controller: NSObject, NSTextFieldDelegate {
         }
         log(["type": "click", "count": count])
     }
+    @objc func closeProbeWindow(_ sender: Any?) {
+        window.close()
+        log(["type": "closed"])
+    }
     @objc func resetProbeFocus(_ sender: Any?) {
         pendingProbeRaise = true
         window.makeFirstResponder(nil)
@@ -122,6 +126,9 @@ if foregroundPasswordProbe {
     reset.frame = NSRect(x: 20, y: 20, width: 160, height: 30)
     window.contentView!.addSubview(reset)
 }
+let close = NSButton(title: "Close window", target: controller, action: #selector(Controller.closeProbeWindow(_:)))
+close.frame = NSRect(x: 200, y: 20, width: 160, height: 30)
+window.contentView!.addSubview(close)
 window.makeKeyAndOrderFront(nil)
 app.activate()
 if foregroundPasswordProbe {

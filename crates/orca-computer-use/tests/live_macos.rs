@@ -3233,3 +3233,28 @@ fn approved_actions_and_observations_require_the_exact_bundle_id() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
+
+#[test]
+#[ignore]
+fn closing_a_window_preserves_the_successful_action_outcome() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        live.act(click_target(element_named(&obs, "Increment")), false)
+            .unwrap();
+        live.assert_log_contains(&log, r#""count":1"#);
+        let outcome = live
+            .act(click_target(element_named(&obs, "Close window")), false)
+            .unwrap();
+        live.assert_log_contains(&log, r#""type":"closed""#);
+        assert!(outcome.observation.is_none());
+        assert!(
+            outcome
+                .note
+                .unwrap()
+                .contains("The window closed after the action; observe again.")
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}

@@ -76,8 +76,23 @@ impl Restore {
                 format!("Could not restore the pointer: {warped:?}"),
             ))
         };
-        self.restored = app.is_ok() && pointer.is_ok();
-        app.and(pointer)
+        // Explicit finish attempted every restore; Drop is only the unwind guard.
+        self.restored = true;
+        let mut failures = vec![];
+        if let Err(failure) = app {
+            failures.push(format!(
+                "The previous app was not restored: {}",
+                failure.message
+            ));
+        }
+        if let Err(failure) = pointer {
+            failures.push(format!("The pointer was not restored: {}", failure.message));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(error(ErrorKind::Failed, failures.join("; ")))
+        }
     }
 }
 
@@ -279,8 +294,45 @@ pub(super) fn run(
         result
     })();
     let restored = restore.finish();
-    // Restoration failures are material even when the action also failed.
-    restored?;
-    result?;
-    Ok(format!("used the foreground (switched back to {name})"))
+    // Preserve successful delivery, and disclose any restoration failure.
+    finish_foreground(result, restored, &name)
+}
+fn finish_foreground(
+    result: Result<(), DriverError>,
+    restored: Result<(), DriverError>,
+    name: &str,
+) -> Result<String, DriverError> {
+    match result {
+        Ok(()) => match restored {
+            Ok(()) => Ok(format!("used the foreground (switched back to {name})")),
+            Err(failure) => Ok(format!("used the foreground; {}", failure.message)),
+        },
+        Err(mut failure) => {
+            if let Err(restoration) = restored {
+                failure
+                    .message
+                    .push_str(&format!("; {}", restoration.message));
+            }
+            Err(failure)
+        }
+    }
+}
+#[cfg(test)]
+#[test]
+fn successful_actions_keep_success_when_restoration_fails() {
+    for failure in ["previous app was not restored", "pointer was not restored"] {
+        let note =
+            finish_foreground(Ok(()), Err(error(ErrorKind::Failed, failure)), "Finder").unwrap();
+        assert!(note.contains(failure));
+    }
+    let note = finish_foreground(Ok(()), Ok(()), "Finder").unwrap();
+    assert!(note.contains("switched back to Finder"));
+    assert!(
+        finish_foreground(
+            Err(error(ErrorKind::Failed, "action failed")),
+            Ok(()),
+            "Finder"
+        )
+        .is_err()
+    );
 }
