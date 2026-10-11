@@ -15,3 +15,5 @@ pub mod observation;
 pub mod protocol;
 pub mod serve;
 pub mod session_lock;
+
+mod timing;

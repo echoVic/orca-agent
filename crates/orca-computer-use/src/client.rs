@@ -336,7 +336,7 @@ impl Drop for DriverClient {
         self.close();
         self.outgoing.take();
         if let Some(child) = &mut self.child {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + crate::timing::DRIVER_STOP_GRACE;
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
@@ -1196,7 +1196,7 @@ mod tests {
                     }),
                 }))?;
                 let end = if self.ignore_eof {
-                    "exec sleep 30"
+                    "exec sleep 120"
                 } else {
                     "while IFS= read -r line; do :; done; exit 7"
                 };
@@ -1224,9 +1224,9 @@ mod tests {
             let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
             let started = Instant::now();
             drop(client);
-            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(started.elapsed() < Duration::from_secs(40));
             if ignore_eof {
-                assert!(started.elapsed() >= Duration::from_secs(1));
+                assert!(started.elapsed() >= Duration::from_secs(37));
             }
             let pid = launcher.pid.load(Ordering::SeqCst).to_string();
             assert!(
@@ -1240,5 +1240,56 @@ mod tests {
                 "child still exists after drop"
             );
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn stop_allows_a_delayed_eof_cleanup_to_finish_before_killing() {
+        use std::process::{Command, Stdio};
+        struct CleanupLauncher {
+            marker: std::path::PathBuf,
+        }
+        impl DriverLauncher for CleanupLauncher {
+            fn launch(&self) -> io::Result<LaunchedDriver> {
+                let hello = serde_json::to_string(&DriverLine::Response(ResponseLine {
+                    id: 1,
+                    result: Ok(Reply::Hello {
+                        protocol: PROTOCOL_VERSION,
+                        macos_major: 26,
+                        host_bundle_id: None,
+                        permissions: Permissions::default(),
+                    }),
+                }))?;
+                let script = format!(
+                    "IFS= read -r line; printf '%s\\n' '{hello}'; while IFS= read -r line; do :; done; sleep 2; printf cleanup > \"$1\""
+                );
+                let mut child = Command::new("/bin/sh")
+                    .args(["-c", &script, "cleanup-driver"])
+                    .arg(&self.marker)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()?;
+                Ok(LaunchedDriver {
+                    stdin: Box::new(child.stdin.take().unwrap()),
+                    stdout: Box::new(child.stdout.take().unwrap()),
+                    child: Some(child),
+                })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("restored");
+        let (client, _) = DriverClient::start(
+            &CleanupLauncher {
+                marker: marker.clone(),
+            },
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        drop(client);
+        assert_eq!(
+            std::fs::read_to_string(marker).ok().as_deref(),
+            Some("cleanup"),
+            "driver was killed before its EOF restoration completed"
+        );
     }
 }

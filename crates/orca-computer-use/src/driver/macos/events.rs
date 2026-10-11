@@ -120,28 +120,35 @@ pub(super) struct HidEvents<'a> {
     // Retain prebuilt releases before posting each down event. Cleanup cannot
     // fail to allocate the corresponding up, even on an aborted action.
     releases: Vec<CFRetained<CGEvent>>,
+    deadline: std::time::Instant,
 }
 
 impl<'a> HidEvents<'a> {
     pub(super) fn new(pid: i32, aborted: &'a AtomicBool) -> Result<Self, DriverError> {
+        Self::new_until(
+            pid,
+            aborted,
+            std::time::Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT,
+        )
+    }
+    pub(super) fn new_until(
+        pid: i32,
+        aborted: &'a AtomicBool,
+        deadline: std::time::Instant,
+    ) -> Result<Self, DriverError> {
         Ok(Self {
             source: CGEventSource::new(CGEventSourceStateID::Private)
                 .ok_or_else(|| error(ErrorKind::Failed, "Could not create HID event source"))?,
             pid,
             aborted,
             releases: vec![],
+            deadline,
         })
     }
 
     fn post(&self, event: &CGEvent) -> Result<(), DriverError> {
         Self::mark(event);
-        super::foreground::check_abort(self.aborted)?;
-        if super::foreground::frontmost_pid() != Some(self.pid) {
-            return Err(error(
-                ErrorKind::Failed,
-                "The target app is no longer frontmost",
-            ));
-        }
+        check_delivery_ready(self.pid, self.aborted, self.deadline)?;
         post_hid(event);
         // Give AppKit a chance to consume the event before restoring focus.
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -404,4 +411,39 @@ fn check_click_point(pid: i32, point: CGPoint) -> Result<(), DriverError> {
 pub fn test_click_at_point(pid: i32, point: CGPoint) -> Result<(), DriverError> {
     let aborted = AtomicBool::new(false);
     HidEvents::new(pid, &aborted)?.click(point, Button::Left, 1, Modifiers::default())
+}
+
+fn check_delivery_ready(
+    pid: i32,
+    aborted: &AtomicBool,
+    deadline: std::time::Instant,
+) -> Result<(), DriverError> {
+    if std::time::Instant::now() >= deadline {
+        return Err(error(
+            ErrorKind::Failed,
+            "The foreground action timed out; observe again",
+        ));
+    }
+    super::foreground::check_abort(aborted)?;
+    if super::foreground::frontmost_pid() != Some(pid) {
+        return Err(error(
+            ErrorKind::Failed,
+            "The target app is no longer frontmost",
+        ));
+    }
+    Ok(())
+}
+#[cfg(test)]
+#[test]
+fn an_expired_foreground_deadline_refuses_input_before_native_delivery() {
+    let failure = check_delivery_ready(
+        i32::MAX,
+        &AtomicBool::new(false),
+        std::time::Instant::now() - std::time::Duration::from_secs(1),
+    )
+    .unwrap_err();
+    assert_eq!(
+        failure.message,
+        "The foreground action timed out; observe again"
+    );
 }

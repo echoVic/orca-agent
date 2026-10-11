@@ -276,12 +276,20 @@ fn has_element_tree(entries: &[TableEntry]) -> bool {
     entries.iter().any(AxElement::is_content)
 }
 
+pub(super) struct CollectedTree {
+    pub elements: Vec<Element>,
+    pub entries: Vec<TableEntry>,
+    pub omitted: u32,
+    pub no_element_tree: bool,
+    pub truncated: bool,
+}
+
 pub(super) fn collect(
     window: &AxElement,
     geometry: CaptureGeometry,
     query: Option<&str>,
     max_elements: u32,
-) -> Result<(Vec<Element>, Vec<TableEntry>, u32, bool, bool), DriverError> {
+) -> Result<CollectedTree, DriverError> {
     let deadline = Instant::now() + EMPTY_TREE_RETRY_BUDGET;
     let (mut elements, entries, truncated) = poll(
         deadline,
@@ -315,7 +323,13 @@ pub(super) fn collect(
         );
         element.id = index as u32 + 1;
     }
-    Ok((elements, selected, omitted, no_element_tree, truncated))
+    Ok(CollectedTree {
+        elements,
+        entries: selected,
+        omitted,
+        no_element_tree,
+        truncated,
+    })
 }
 
 #[cfg(test)]

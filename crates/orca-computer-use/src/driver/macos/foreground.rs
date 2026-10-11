@@ -28,8 +28,8 @@ pub(super) fn frontmost_pid() -> Option<i32> {
         .map(|app| app.processIdentifier())
 }
 
-fn wait_frontmost(pid: i32) -> Result<(), DriverError> {
-    let deadline = Instant::now() + Duration::from_secs(1);
+fn wait_frontmost(pid: i32, timeout: Duration) -> Result<(), DriverError> {
+    let deadline = Instant::now() + timeout;
     while frontmost_pid() != Some(pid) {
         if Instant::now() >= deadline {
             return Err(error(ErrorKind::Failed, "The app did not become frontmost"));
@@ -39,11 +39,11 @@ fn wait_frontmost(pid: i32) -> Result<(), DriverError> {
     Ok(())
 }
 
-fn activate(application: &NSRunningApplication) -> Result<(), DriverError> {
+fn activate(application: &NSRunningApplication, timeout: Duration) -> Result<(), DriverError> {
     if !application.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows) {
         return Err(error(ErrorKind::Failed, "Could not activate the app"));
     }
-    wait_frontmost(application.processIdentifier())
+    wait_frontmost(application.processIdentifier(), timeout)
 }
 
 struct Restore {
@@ -61,7 +61,7 @@ impl Restore {
             .as_ref()
             .map(|window| window.set_bool("AXMinimized", true))
             .transpose();
-        let app = activate(&self.application);
+        let app = activate(&self.application, crate::timing::RESTORE_ACTIVATION_LIMIT);
         let warped = CGWarpMouseCursorPosition(self.pointer);
         let pointer = if warped == CGError::Success {
             CGEvent::new(None)
@@ -159,7 +159,8 @@ pub(super) fn run(
     params: &ActParams,
     aborted: &AtomicBool,
 ) -> Result<String, DriverError> {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let action_deadline = Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT;
+    let deadline = Instant::now() + crate::timing::IDLE_WAIT_LIMIT;
     loop {
         check_abort(aborted)?;
         if CGEventSource::seconds_since_last_event_type(
@@ -234,16 +235,20 @@ pub(super) fn run(
         if restore.minimized_window.is_some() {
             window.set_bool("AXMinimized", false)?;
         }
-        activate(&target)?;
+        activate(&target, crate::timing::ACTIVATION_WAIT_LIMIT)?;
+        check_abort(aborted)?;
         window.perform("AXRaise")?;
+        check_abort(aborted)?;
         // Activation/raise can precede AppKit's key-window transition.
         // Keep this pause short and check abort again before any HID post.
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(crate::timing::ACTIVATION_SETTLE);
         check_window(window, table)?;
+        check_abort(aborted)?;
         let location = target_location(params)
             .map(|target| point(table, application, target, window))
             .transpose()?;
-        let mut hid = HidEvents::new(pid, aborted)?;
+        check_abort(aborted)?;
+        let mut hid = HidEvents::new_until(pid, aborted, action_deadline)?;
         let result = (|| {
             match &params.action {
                 Action::Click {
@@ -272,19 +277,7 @@ pub(super) fn run(
                     // Activation and the click can change focus after the
                     // preflight check. Inspect the actual keyboard recipient
                     // immediately before delivering any foreground text.
-                    let focus_deadline = Instant::now() + Duration::from_secs(1);
-                    let focused = loop {
-                        check_abort(aborted)?;
-                        if let Some(element) =
-                            application.attribute_element("AXFocusedUIElement")?
-                        {
-                            break element;
-                        }
-                        if Instant::now() >= focus_deadline {
-                            return Err(error(ErrorKind::Failed, "The app has no focused element"));
-                        }
-                        thread::sleep(Duration::from_millis(50));
-                    };
+                    let focused = wait_for_focus(application, aborted)?;
                     actions::check_secure_approval(
                         application,
                         target_element.as_ref(),
@@ -307,6 +300,9 @@ pub(super) fn run(
                     let stroke =
                         parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
                     if stroke.enters_text() {
+                        if !params.secure_approved {
+                            wait_for_focus(application, aborted)?;
+                        }
                         actions::check_secure_approval(
                             application,
                             target_element.as_ref(),
@@ -365,6 +361,19 @@ fn successful_actions_keep_success_when_restoration_fails() {
     );
 }
 
+fn wait_for_focus(application: &AxElement, aborted: &AtomicBool) -> Result<AxElement, DriverError> {
+    let focus_deadline = Instant::now() + crate::timing::FOCUS_WAIT_LIMIT;
+    loop {
+        check_abort(aborted)?;
+        if let Some(element) = application.attribute_element("AXFocusedUIElement")? {
+            return Ok(element);
+        }
+        if Instant::now() >= focus_deadline {
+            return Err(error(ErrorKind::Failed, "The app has no focused element"));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
 fn target_location(params: &ActParams) -> Option<Target> {
     match &params.action {
         Action::Click { target, .. } | Action::Scroll { target, .. } => Some(*target),

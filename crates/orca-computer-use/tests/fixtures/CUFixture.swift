@@ -73,6 +73,7 @@ final class ProbeApplication: NSApplication {
         return super.accessibilityMainWindow()
     }
     override func accessibilityApplicationFocusedUIElement() -> Any? {
+        if CommandLine.arguments.contains("--hide-focused-element") { return nil }
         if foregroundPasswordProbe, let window = windows.first(where: { $0.title == "Orca CU Fixture" }), (window.firstResponder == nil || window.firstResponder === window) { return nil }
         return super.accessibilityApplicationFocusedUIElement()
     }

@@ -126,7 +126,7 @@ pub fn parse_key(name: &str) -> Result<KeyStroke, String> {
         "[" => 33,
         "i" => 34,
         "p" => 35,
-        "return" => 36,
+        "return" | "enter" => 36,
         "l" => 37,
         "j" => 38,
         "'" => 39,
@@ -142,6 +142,7 @@ pub fn parse_key(name: &str) -> Result<KeyStroke, String> {
         "space" => 49,
         "`" => 50,
         "delete" => 51,
+        "forward_delete" => 117,
         "escape" => 53,
         "cmd" => 55,
         "shift" => 56,
@@ -350,7 +351,7 @@ mod tests {
         ] {
             assert!(parse_combo(&keys).is_err(), "{keys:?}");
         }
-        for key in ["", "enter", "command", "unknown", "ab"] {
+        for key in ["", "command", "unknown", "ab"] {
             assert!(parse_key(key).is_err(), "{key}");
         }
     }
@@ -392,5 +393,15 @@ fn text_entry_classification_distinguishes_shortcuts_and_navigation() {
             expected,
             "{keys:?}"
         );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn enter_and_forward_delete_are_non_text_keys() {
+    for (name, code) in [("enter", 36), ("forward_delete", 117)] {
+        let stroke = parse_combo(&[name.into()]).unwrap();
+        assert_eq!(stroke.keycode, code);
+        assert!(!stroke.enters_text());
     }
 }

@@ -64,3 +64,35 @@ pub(crate) fn set_nonblocking(_: &dyn DriverInput) -> io::Result<()> {
         "Computer-use stdin pipes are unsupported on this platform",
     ))
 }
+
+#[cfg(all(unix, any(target_os = "macos", test)))]
+pub(crate) fn peer_closed(input: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut descriptor = libc::pollfd {
+        fd: input.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // HUP is visible even when unread bytes are still buffered in the pipe.
+    let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if descriptor.revents & libc::POLLNVAL != 0 {
+        return Err(io::Error::other("Driver stdin descriptor is invalid"));
+    }
+    Ok(descriptor.revents & (libc::POLLHUP | libc::POLLERR) != 0)
+}
+#[cfg(unix)]
+#[test]
+fn pipe_hangup_is_detected_even_with_unread_request_bytes() {
+    use std::os::fd::AsFd;
+    let (input, mut output) = std::io::pipe().unwrap();
+    output.write_all(b"queued request\n").unwrap();
+    assert!(!peer_closed(input.as_fd()).unwrap());
+    drop(output);
+    assert!(
+        peer_closed(input.as_fd()).unwrap(),
+        "EOF must abort current work before queued bytes are drained"
+    );
+}

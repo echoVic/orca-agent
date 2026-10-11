@@ -3620,3 +3620,39 @@ fn background_type_with_a_target_inserts_after_existing_text() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
+
+#[test]
+#[ignore]
+fn unreported_password_focus_refuses_unapproved_text_keys() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, _) = live
+            .launch_fixture_with_flags(&["--foreground-password-probe", "--hide-focused-element"]);
+        live.fixture_frontmost(pid);
+        live.background_state = Some((pid, CGEvent::location(Some(&CGEvent::new(None).unwrap()))));
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let action = Action::Key {
+            keys: vec!["x".into()],
+            target: Some(live.point_inside(&obs, "Password")),
+        };
+        let result = live.act_with_fallback(action.clone(), false, true);
+        assert_eq!(
+            password_length(pid),
+            0,
+            "missing AX focus must fail closed before text delivery"
+        );
+        let failure = result.unwrap_err();
+        assert_eq!(failure.kind, ErrorKind::Failed);
+        assert!(failure.message.contains("no focused element"));
+        let outcome = live.act_with_fallback(action, true, true).unwrap();
+        assert!(outcome.foreground_used);
+        assert_eq!(
+            password_length(pid),
+            1,
+            "approved same-hidden-focus positive control"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}

@@ -248,6 +248,9 @@ pub(super) fn check_secure_approval(
             ));
         }
     }
+    if focused.is_none() {
+        return Err(error(ErrorKind::Failed, "The app has no focused element"));
+    }
     Ok(())
 }
 

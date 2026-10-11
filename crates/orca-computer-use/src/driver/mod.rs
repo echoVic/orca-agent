@@ -16,10 +16,12 @@ pub fn run_stdio() -> i32 {
             eprintln!("Could not initialize the computer-use graphics connection");
             return 2;
         }
+        let mut driver = macos::MacDriver::new(home.join("computer-use.lock"));
+        driver.watch_stdin(libc::STDIN_FILENO);
+        let stop = driver.stop_signal();
         let worker = std::thread::Builder::new()
             .name("computer-use-driver".into())
             .spawn(move || {
-                let mut driver = macos::MacDriver::new(home.join("computer-use.lock"));
                 match serve(
                     std::io::stdin().lock(),
                     LineWriter::new(std::io::stdout()),
@@ -42,7 +44,15 @@ pub fn run_stdio() -> i32 {
         // NSWorkspace application membership updates on the actual main loop.
         // Its launch completion blocks run separately on a concurrent queue.
         use objc2_core_foundation::{CFRunLoop, kCFRunLoopDefaultMode};
+        let mut stdin_closed = false;
         while !worker.is_finished() {
+            if !stdin_closed {
+                let input = unsafe { std::os::fd::BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
+                if !matches!(crate::driver_input::peer_closed(input), Ok(false)) {
+                    stdin_closed = true;
+                    stop.stop();
+                }
+            }
             CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.01, true);
         }
         worker.join().unwrap_or(2)

@@ -38,11 +38,23 @@ pub struct MacDriver {
     lock: Option<ExclusiveFileLock>,
     esc_tap: Option<esc_tap::EscTap>,
     aborted: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
+    stdin_fd: Option<std::os::fd::RawFd>,
     hello_complete: bool,
     pub(crate) element_tables: HashMap<(i32, u32), ElementTable>,
     accessibility_enabled: HashSet<i32>,
 }
 
+pub(crate) struct StopSignal {
+    stopping: Arc<AtomicBool>,
+    aborted: Arc<AtomicBool>,
+}
+impl StopSignal {
+    pub(crate) fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.aborted.store(true, Ordering::SeqCst);
+    }
+}
 impl MacDriver {
     pub fn new(lock_path: PathBuf) -> Self {
         Self {
@@ -50,12 +62,23 @@ impl MacDriver {
             lock: None,
             esc_tap: None,
             aborted: Arc::new(AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
+            stdin_fd: None,
             hello_complete: false,
             element_tables: HashMap::new(),
             accessibility_enabled: HashSet::new(),
         }
     }
 
+    pub(crate) fn watch_stdin(&mut self, fd: std::os::fd::RawFd) {
+        self.stdin_fd = Some(fd);
+    }
+    pub(crate) fn stop_signal(&self) -> StopSignal {
+        StopSignal {
+            stopping: self.stopping.clone(),
+            aborted: self.aborted.clone(),
+        }
+    }
     fn observe(&mut self, params: ObserveParams) -> Result<Observation, DriverError> {
         capture::check_unlocked()?;
         let app = apps::resolve_approved(&params.app)?;
@@ -93,7 +116,13 @@ impl MacDriver {
             window_size: (window_frame[2], window_frame[3]),
             image_size,
         };
-        let (elements, entries, omitted, no_element_tree, truncated) = tree::collect(
+        let tree::CollectedTree {
+            elements,
+            entries,
+            omitted,
+            no_element_tree,
+            truncated,
+        } = tree::collect(
             &ax_window,
             geometry,
             params.query.as_deref(),
@@ -143,6 +172,18 @@ pub(super) fn error(kind: ErrorKind, message: impl Into<String>) -> DriverError 
 
 impl DriverHandler for MacDriver {
     fn handle(&mut self, request: Request, events: &LineWriter) -> Result<Reply, DriverError> {
+        if let Some(fd) = self.stdin_fd {
+            let input = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            if !matches!(crate::driver_input::peer_closed(input), Ok(false)) {
+                self.stop_signal().stop();
+            }
+        }
+        if self.stopping.load(Ordering::SeqCst) && !matches!(request, Request::Shutdown) {
+            return Err(error(
+                ErrorKind::Failed,
+                "The driver is stopping because stdin closed",
+            ));
+        }
         if !matches!(request, Request::Hello { .. } | Request::Shutdown)
             && (!self.hello_complete || self.lock.is_none())
         {
@@ -228,6 +269,60 @@ fn frames_match(ax: [f64; 4], capture: [f64; 4]) -> bool {
         .all(|(a, b)| (a - b).abs() <= 2.0)
 }
 
+/// Act and observe resolve the same live window, including apps with no main window.
+fn resolve_window<'a>(
+    application: &AxElement,
+    pid: i32,
+    windows: &'a [capture::Window],
+    id: Option<u32>,
+) -> Result<(AxElement, &'a capture::Window), DriverError> {
+    let ax_windows = application.elements("AXWindows")?;
+    let resolved = if let Some(id) = id {
+        let window = windows
+            .iter()
+            .find(|w| w.id == id && w.pid == pid)
+            .ok_or_else(|| error(ErrorKind::WindowNotFound, "Window not found for this app"))?;
+        let mut matching = None;
+        for candidate in ax_windows {
+            if frames_match(candidate.position_size()?, window.frame) {
+                matching = Some(candidate);
+                break;
+            }
+        }
+        (
+            matching.ok_or_else(|| {
+                error(
+                    ErrorKind::WindowNotFound,
+                    "No accessibility window matches the capture window",
+                )
+            })?,
+            window,
+        )
+    } else {
+        let window = application
+            .attribute_element("AXMainWindow")?
+            .or_else(|| ax_windows.into_iter().next())
+            .ok_or_else(|| {
+                error(
+                    ErrorKind::WindowNotFound,
+                    "The app has no accessibility window",
+                )
+            })?;
+        let frame = window.position_size()?;
+        let capture = windows
+            .iter()
+            .find(|w| w.pid == pid && frames_match(frame, w.frame))
+            .ok_or_else(|| {
+                error(
+                    ErrorKind::WindowNotFound,
+                    "No capture window matches the accessibility window",
+                )
+            })?;
+        (window, capture)
+    };
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,56 +388,77 @@ mod tests {
     }
 }
 
-/// Act and observe resolve the same live window, including apps with no main window.
-fn resolve_window<'a>(
-    application: &AxElement,
-    pid: i32,
-    windows: &'a [capture::Window],
-    id: Option<u32>,
-) -> Result<(AxElement, &'a capture::Window), DriverError> {
-    let ax_windows = application.elements("AXWindows")?;
-    let resolved = if let Some(id) = id {
-        let window = windows
-            .iter()
-            .find(|w| w.id == id && w.pid == pid)
-            .ok_or_else(|| error(ErrorKind::WindowNotFound, "Window not found for this app"))?;
-        let mut matching = None;
-        for candidate in ax_windows {
-            if frames_match(candidate.position_size()?, window.frame) {
-                matching = Some(candidate);
-                break;
-            }
-        }
-        (
-            matching.ok_or_else(|| {
-                error(
-                    ErrorKind::WindowNotFound,
-                    "No accessibility window matches the capture window",
-                )
-            })?,
-            window,
+#[cfg(test)]
+#[test]
+fn stdin_stop_rejects_buffered_work_after_a_successful_hello() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut driver = MacDriver::new(directory.path().join("lock"));
+    let output = LineWriter::new(std::io::sink());
+    driver
+        .handle(
+            Request::Hello {
+                protocol: PROTOCOL_VERSION,
+            },
+            &output,
         )
-    } else {
-        let window = application
-            .attribute_element("AXMainWindow")?
-            .or_else(|| ax_windows.into_iter().next())
-            .ok_or_else(|| {
-                error(
-                    ErrorKind::WindowNotFound,
-                    "The app has no accessibility window",
-                )
-            })?;
-        let frame = window.position_size()?;
-        let capture = windows
-            .iter()
-            .find(|w| w.pid == pid && frames_match(frame, w.frame))
-            .ok_or_else(|| {
-                error(
-                    ErrorKind::WindowNotFound,
-                    "No capture window matches the accessibility window",
-                )
-            })?;
-        (window, capture)
-    };
-    Ok(resolved)
+        .unwrap();
+    driver.stop_signal().stop();
+    let failure = driver
+        .handle(
+            Request::Observe(ObserveParams {
+                app: "dev.orca.not-installed".into(),
+                window: None,
+                query: None,
+                max_elements: 300,
+                include_screenshot: false,
+            }),
+            &output,
+        )
+        .unwrap_err();
+    assert_eq!(failure.kind, ErrorKind::Failed);
+    assert_eq!(
+        failure.message,
+        "The driver is stopping because stdin closed"
+    );
+    assert!(
+        driver.aborted.load(Ordering::SeqCst),
+        "in-flight HID delivery must be aborted too"
+    );
+    driver.handle(Request::Shutdown, &output).unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn request_entry_checks_closed_stdin_before_starting_buffered_work() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    let (input, mut sender) = std::io::pipe().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let mut driver = MacDriver::new(directory.path().join("lock"));
+    driver.stdin_fd = Some(input.as_raw_fd());
+    let output = LineWriter::new(std::io::sink());
+    driver
+        .handle(
+            Request::Hello {
+                protocol: PROTOCOL_VERSION,
+            },
+            &output,
+        )
+        .unwrap();
+    sender.write_all(b"buffered request\n").unwrap();
+    drop(sender);
+    let failure = driver
+        .handle(
+            Request::ResolveApp {
+                app: "dev.orca.not-installed".into(),
+                allow_not_running: false,
+            },
+            &output,
+        )
+        .unwrap_err();
+    assert_eq!(
+        failure.message,
+        "The driver is stopping because stdin closed"
+    );
+    assert!(driver.stopping.load(Ordering::SeqCst));
 }
