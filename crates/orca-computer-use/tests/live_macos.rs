@@ -1384,6 +1384,90 @@ fn typing_goes_into_the_focused_field_in_the_background() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
+fn current_keyboard_input_source_id() -> Option<String> {
+    use objc2_core_foundation::{CFRetained, CFString, CFType};
+    #[link(name = "Carbon", kind = "framework")]
+    unsafe extern "C" {
+        fn TISCopyCurrentKeyboardInputSource() -> *mut CFType;
+        fn TISGetInputSourceProperty(
+            source: *const CFType,
+            key: *const CFString,
+        ) -> *mut std::ffi::c_void;
+        static kTISPropertyInputSourceID: *const CFString;
+    }
+    // Copy owns the source; its property follows the borrowed Get rule.
+    let source = unsafe { std::ptr::NonNull::new(TISCopyCurrentKeyboardInputSource())? };
+    let source = unsafe { CFRetained::from_raw(source) };
+    let property = unsafe { TISGetInputSourceProperty(&*source, kTISPropertyInputSourceID) };
+    if property.is_null() {
+        return None;
+    }
+    let property = unsafe { &*property.cast::<CFType>() };
+    Some(property.downcast_ref::<CFString>()?.to_string())
+}
+
+#[test]
+#[ignore]
+fn typing_with_a_chinese_input_method_enters_the_text_exactly() {
+    run_live_test(|| {
+        let source = current_keyboard_input_source_id();
+        eprintln!(
+            "current keyboard input source ID: {}",
+            source.as_deref().unwrap_or("<unavailable>")
+        );
+        let chinese = source.as_deref().is_some_and(|id| {
+            ["com.apple.inputmethod.SCIM", "com.apple.inputmethod.TCIM"]
+                .iter()
+                .any(|prefix| {
+                    id == *prefix
+                        || id
+                            .strip_prefix(prefix)
+                            .is_some_and(|suffix| suffix.starts_with('.'))
+                })
+        });
+        if !chinese {
+            eprintln!(
+                "skipped: requires the user to select a Chinese input method under com.apple.inputmethod.SCIM or com.apple.inputmethod.TCIM; the test does not switch input sources"
+            );
+            return;
+        }
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        live.act(
+            Action::Type {
+                text: "abc 中文".into(),
+                target: Some(element_named(&obs, "Name")),
+            },
+            false,
+        )
+        .unwrap();
+        live.assert_log_contains(&log, r#""value":"abc 中文""#);
+        let events = std::fs::read_to_string(&log).unwrap();
+        let last_value = events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .rfind(|event| event["type"] == "input")
+            .unwrap();
+        assert_eq!(
+            last_value["value"], "abc 中文",
+            "logged input must equal the requested text exactly"
+        );
+        let current = live.observe("dev.orca.cu-fixture", None);
+        assert_eq!(
+            current
+                .elements
+                .iter()
+                .find(|e| e.label.as_deref() == Some("Name"))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("abc 中文")
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
 #[test]
 #[ignore]
 fn typing_into_the_password_field_needs_approval_first() {
