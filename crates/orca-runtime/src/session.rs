@@ -159,19 +159,18 @@ pub(crate) fn bootstrap_agent_conversation_for_loop(
     subagent_depth: u32,
     subagent_type: &SubagentType,
     instructions: &ProjectInstructions,
-    approval_mode: orca_core::approval_types::ApprovalMode,
+    config: &RunConfig,
     memory: &MemoryBlock,
-    delegation: orca_core::subagent_config::DelegationPolicy,
+    allowed_tools: Option<&[String]>,
 ) -> Conversation {
-    let system_prompt = agent_common::build_agent_system_prompt_with_goal(
+    let system_prompt = agent_common::build_agent_system_prompt_for_config(
         cwd,
+        config,
         subagent_depth,
         subagent_type,
         Some(instructions),
-        approval_mode,
         Some(memory),
-        None,
-        delegation,
+        allowed_tools,
     );
     bootstrap_agent_conversation(None, system_prompt, cwd, prompt)
 }
@@ -251,13 +250,14 @@ impl InteractiveSession {
             config.hooks.clone(),
             orca_core::capability::CapabilitySet::for_approval_mode(config.approval_mode),
         );
-        let system_prompt = agent_common::build_agent_system_prompt(
+        let system_prompt = agent_common::build_agent_system_prompt_for_config(
             &cwd,
+            config,
             0,
             &SubagentType::General,
             Some(&instructions),
-            config.approval_mode,
             Some(&memory),
+            None,
         );
         let (conversation, loaded_transcript) = match &config.history_mode {
             HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => {
@@ -962,6 +962,99 @@ mod tests {
     }
 
     #[test]
+    fn headless_main_session_prompt_does_not_advertise_computer() {
+        with_computer_prompt_home(|home| {
+            let mut cfg = config(home.to_path_buf(), HistoryMode::Disabled);
+            let session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+                &cfg,
+                "headless",
+                None,
+                McpRegistry::default(),
+            )
+            .expect("session");
+            let prompt = session.conversation.messages[0].content_str().unwrap();
+            assert!(prompt.contains("### read_file"));
+            assert!(!prompt.contains("### computer"));
+            cfg.computer_use.interactive = true;
+            let session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+                &cfg,
+                "interactive",
+                None,
+                McpRegistry::default(),
+            )
+            .expect("interactive session");
+            let prompt = session.conversation.messages[0].content_str().unwrap();
+            assert_eq!(
+                prompt.contains("### computer"),
+                orca_computer_use::apps::host_supported()
+            );
+        });
+    }
+
+    #[test]
+    fn denied_main_session_prompt_does_not_advertise_computer() {
+        with_computer_prompt_home(|home| {
+            let mut cfg = config(home.to_path_buf(), HistoryMode::Disabled);
+            cfg.computer_use.interactive = true;
+            cfg.permission_rules
+                .rules
+                .push(orca_core::approval_rules::PermissionRule::whole_tool(
+                    "computer",
+                    orca_core::approval_types::Decision::Deny,
+                ));
+            let session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+                &cfg,
+                "denied",
+                None,
+                McpRegistry::default(),
+            )
+            .expect("session");
+            let prompt = session.conversation.messages[0].content_str().unwrap();
+            assert!(prompt.contains("### read_file"));
+            assert!(!prompt.contains("### computer"));
+        });
+    }
+
+    #[test]
+    fn custom_main_session_prompt_does_not_advertise_computer() {
+        with_computer_prompt_home(|home| {
+            let mut cfg = config(home.to_path_buf(), HistoryMode::Disabled);
+            cfg.computer_use.interactive = true;
+            cfg.subagents.effective_definition = Some(
+                orca_core::subagent_types::agent_definition::EffectiveAgentDefinition {
+                    name: "desktop-audit".to_string(),
+                    description: "Audit source".to_string(),
+                    system_prompt: "Report source findings.".to_string(),
+                    allowed_tools: vec!["computer".to_string(), "read_file".to_string()],
+                    model: None,
+                },
+            );
+            let session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+                &cfg,
+                "custom",
+                None,
+                McpRegistry::default(),
+            )
+            .expect("session");
+            let prompt = session.conversation.messages[0].content_str().unwrap();
+            assert!(prompt.contains("### read_file"));
+            assert!(!prompt.contains("### computer"));
+            assert!(!prompt.contains("### bash"));
+            assert!(prompt.contains("Report source findings."));
+        });
+    }
+
+    fn with_computer_prompt_home(f: impl FnOnce(&Path)) {
+        let _env = history::lock_test_env();
+        let home = tempfile::Builder::new()
+            .prefix("orca-cu-prompt-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let _home = history::redirect_test_orca_home(home.path());
+        f(home.path());
+    }
+
+    #[test]
     fn automatic_memory_recovers_the_exact_turn_from_the_durable_ledger() {
         with_orca_home(|home| {
             let mut cfg = config(home.to_path_buf(), HistoryMode::Record);
@@ -1075,9 +1168,9 @@ mod tests {
             1,
             &SubagentType::General,
             &instructions,
-            ApprovalMode::Suggest,
+            &RunConfig::default(),
             &memory,
-            orca_core::subagent_config::DelegationPolicy::default(),
+            None,
         );
 
         assert_eq!(conversation.messages.len(), 2);

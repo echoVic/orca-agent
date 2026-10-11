@@ -871,9 +871,9 @@ mod tests {
             0,
             &subagent_type,
             &instructions,
-            config.approval_mode,
+            &config,
             &memory,
-            orca_core::subagent_config::DelegationPolicy::default(),
+            None,
         );
         let mut background_workflows = Vec::new();
         let mut input = RuntimeTurnLoopInput {
@@ -1085,9 +1085,9 @@ mod tests {
             0,
             &subagent_type,
             &instructions,
-            config.approval_mode,
+            &config,
             &memory,
-            orca_core::subagent_config::DelegationPolicy::default(),
+            None,
         );
         let mut background_workflows = Vec::new();
         let response = ProviderResponse {

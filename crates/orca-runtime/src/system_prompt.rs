@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use chrono::Local;
+use orca_core::config::RunConfig;
 use orca_platform::shell::{ShellKind, ShellResolver, ShellSpec};
 use orca_tools::schema::{ToolPolicy, canonical_tool_definitions};
 
@@ -13,20 +14,35 @@ pub fn build_system_prompt_for_tools(cwd: &Path, allowed_tools: Option<&[String]
     let shell = ShellResolver::for_current_host()
         .resolve_from_environment()
         .ok();
-    build_system_prompt_with_shell_and_tools(cwd, shell.as_ref(), allowed_tools)
+    build_system_prompt_with_shell_and_tools(cwd, shell.as_ref(), allowed_tools, false)
+}
+
+pub(crate) fn build_system_prompt_for_config(
+    cwd: &Path,
+    config: &RunConfig,
+    subagent_depth: u32,
+    allowed_tools: Option<&[String]>,
+) -> String {
+    let shell = ShellResolver::for_current_host()
+        .resolve_from_environment()
+        .ok();
+    let computer_visible = crate::computer_use::visibility::session_visible(config, subagent_depth)
+        && allowed_tools.is_none();
+    build_system_prompt_with_shell_and_tools(cwd, shell.as_ref(), allowed_tools, computer_visible)
 }
 
 #[cfg(test)]
 pub fn build_system_prompt_with_shell(cwd: &Path, shell: Option<&ShellSpec>) -> String {
-    build_system_prompt_with_shell_and_tools(cwd, shell, None)
+    build_system_prompt_with_shell_and_tools(cwd, shell, None, false)
 }
 
 fn build_system_prompt_with_shell_and_tools(
     cwd: &Path,
     shell: Option<&ShellSpec>,
     allowed_tools: Option<&[String]>,
+    computer_visible: bool,
 ) -> String {
-    let tools = render_tool_prompt_section(allowed_tools);
+    let tools = render_tool_prompt_section(allowed_tools, computer_visible);
     let shell_allowed = tool_allowed(allowed_tools, "bash");
     let shell_environment = if shell_allowed {
         render_shell_environment(shell)
@@ -202,12 +218,13 @@ fn tool_allowed(allowed_tools: Option<&[String]>, name: &str) -> bool {
     allowed_tools.is_none_or(|allowed| allowed.iter().any(|tool| tool == name))
 }
 
-fn render_tool_prompt_section(allowed_tools: Option<&[String]>) -> String {
+fn render_tool_prompt_section(allowed_tools: Option<&[String]>, computer_visible: bool) -> String {
     let registry = orca_tools::registry::default_tool_registry();
     let mut output = String::new();
     for tool in canonical_tool_definitions(&ToolPolicy::base(), registry)
         .into_iter()
         .filter(|tool| tool_allowed(allowed_tools, &tool.name))
+        .filter(|tool| tool.name != "computer" || computer_visible)
     {
         output.push_str(&format!("\n### {}\n{}\n", tool.name, tool.description));
     }

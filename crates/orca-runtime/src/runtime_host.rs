@@ -2419,6 +2419,7 @@ impl RuntimeThreadStartRequest {
         self.parent_thread_id.clone_from(&meta.parent_id);
         self.agent_root_thread_id = Some(scope.root_thread_id.clone());
         self.agent_depth = scope.depth;
+        self.config.computer_use.interactive = false;
         self.agent_type = Some(scope.subagent_type.clone());
         self.agent_task_id = Some(scope.task_id.clone());
         self.agent_task_registry = Some(registry);
@@ -2467,6 +2468,7 @@ impl RuntimeThreadStartRequest {
         agent_task_id: String,
         agent_task_registry: TaskRegistry,
     ) -> Self {
+        self.config.computer_use.interactive = false;
         self.parent_thread_id = Some(parent_thread_id.into());
         self.agent_root_thread_id = Some(root_thread_id.into());
         self.agent_depth = depth;
@@ -2484,6 +2486,7 @@ impl RuntimeThreadStartRequest {
         self.config.history_mode = HistoryMode::Disabled;
         self.config.auto_memory = false;
         self.config.approval_mode = ApprovalMode::Plan;
+        self.config.computer_use.interactive = false;
         self.inherited_conversation = Some(conversation);
         self.parent_thread_id = Some(parent_thread_id.into());
         self
@@ -2530,6 +2533,16 @@ impl RuntimeThreadStartRequest {
             self.prepared_runtime_thread_id,
         )?;
         if let Some(mut conversation) = inherited_conversation {
+            if let Some(system_prompt) = thread.session().conversation().messages.first().cloned() {
+                if matches!(
+                    conversation.messages.first(),
+                    Some(Message::System { pinned: false, .. })
+                ) {
+                    conversation.messages[0] = system_prompt;
+                } else {
+                    conversation.messages.insert(0, system_prompt);
+                }
+            }
             conversation.internal_context = Default::default();
             conversation.add_system_pinned(SIDE_CONVERSATION_BOUNDARY.to_string());
             *thread.session_mut().conversation_mut() = conversation;
@@ -23866,6 +23879,119 @@ mod tests {
     // to publish its durable provider outcome, which turned the seed phase into
     // an intermittent failure.
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn attached_side_context_drops_interactive_computer_capability() {
+        let mut config = RunConfig::default();
+        config.computer_use.interactive = true;
+        let main = RuntimeThreadStartRequest::new(config.clone(), "main");
+        assert!(crate::computer_use::visibility::tool_visible(
+            &main.config,
+            0,
+            None,
+            true
+        ));
+        let side = RuntimeThreadStartRequest::new(config, "side")
+            .with_attached_side_context("parent", Conversation::new());
+        assert!(!side.config.computer_use.interactive);
+        let provider = crate::tool_invocation::provider_config_for_agent_loop(
+            &side.config,
+            0,
+            &orca_core::subagent_types::SubagentType::General,
+            crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
+            &McpRegistry::default(),
+        );
+        let tools = provider.tools_override.expect("side schemas");
+        assert!(tools.iter().any(|tool| tool.name == "read_file"));
+        assert!(!tools.iter().any(|tool| tool.name == "computer"));
+    }
+
+    #[test]
+    fn attached_side_prompt_does_not_inherit_the_parents_computer_advertisement() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::Builder::new()
+            .prefix("orca-cu-side-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let mut config = RunConfig::default();
+        config.cwd = Some(home.path().to_path_buf());
+        config.computer_use.interactive = true;
+        let mut inherited = Conversation::new();
+        inherited.add_system("### computer\nParent desktop capability".to_string());
+        inherited.add_user("keep inherited user context".to_string());
+        let mut side = RuntimeThreadStartRequest::new(config, "side")
+            .with_attached_side_context("parent", inherited)
+            .start()
+            .expect("side thread");
+        let conversation = side.session_mut().conversation_mut();
+        let prompt = conversation.messages[0]
+            .content_str()
+            .expect("side system prompt");
+        assert!(prompt.contains("### read_file"));
+        assert!(!prompt.contains("### computer"));
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .any(|message| message.content_str() == Some("keep inherited user context"))
+        );
+    }
+
+    #[test]
+    fn a_hosted_child_start_request_drops_interactive_computer_capability() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::Builder::new()
+            .prefix("orca-cu-child-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let mut config = RunConfig::default();
+        config.computer_use.interactive = true;
+        let child = RuntimeThreadStartRequest::new(config, "child").with_agent_parent(
+            "parent",
+            "root",
+            1,
+            orca_core::subagent_types::SubagentType::General,
+            "task".to_string(),
+            TaskRegistry::new("root".to_string()),
+        );
+        assert!(!child.config.computer_use.interactive);
+    }
+
+    #[test]
+    fn a_restored_child_scope_drops_interactive_computer_capability() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::Builder::new()
+            .prefix("orca-cu-restored-child-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let registry = TaskRegistry::new_for_cwd("parent-task-session".into(), home.path());
+        let task = registry.create_subagent("restored child".into(), Some("general".into()));
+        registry
+            .bind_subagent_thread(&task.id, "child-thread")
+            .unwrap();
+        let mut meta = crate::history::create_meta(home.path(), "mock", None, "restored child");
+        meta.session_id = "child-thread".into();
+        meta.parent_id = Some("parent-thread".into());
+        meta.agent_scope = Some(crate::thread_store::StoredAgentScope {
+            root_thread_id: "root-thread".into(),
+            depth: 2,
+            subagent_type: orca_core::subagent_types::SubagentType::General,
+            task_id: task.id,
+            task_registry_session_id: registry.session_id().to_string(),
+        });
+        let mut config = RunConfig::default();
+        config.cwd = Some(home.path().to_path_buf());
+        config.computer_use.interactive = true;
+        let mut request = RuntimeThreadStartRequest::new(config, "restore child");
+        request
+            .restore_agent_scope_from_meta(&meta)
+            .expect("restored child scope");
+        assert_eq!(request.agent_depth, 2);
+        assert!(!request.config.computer_use.interactive);
+    }
 
     #[test]
     fn subagent_activity_dedupe_cache_evicts_oldest_entry() {

@@ -125,7 +125,9 @@ pub(crate) fn provider_tool_schema_override(
             .into_iter()
             .filter(|definition| {
                 // A policy the model cannot act on must not be advertised.
-                definition.name != "subagent" || tool_policy.delegation().allows_new_children()
+                (definition.name != "subagent" || tool_policy.delegation().allows_new_children())
+                    && (definition.name != "computer"
+                        || (subagent_depth == 0 && tool_policy.allowed_tools().is_none()))
             })
             .map(|definition| ProviderToolDefinition {
                 name: definition.name,
@@ -154,12 +156,9 @@ pub(crate) fn provider_config_for_agent_loop(
     );
     if let Some(tools) = tools_override.as_mut() {
         omit_unavailable_shell_launch_tools(tools, &shell_readiness);
-        if !crate::computer_use::visibility::tool_visible(
-            config,
-            subagent_depth,
-            tool_policy.allowed_tools(),
-            orca_computer_use::apps::host_supported(),
-        ) {
+        if !crate::computer_use::visibility::session_visible(config, subagent_depth)
+            || tool_policy.allowed_tools().is_some()
+        {
             tools.retain(|tool| tool.name != "computer");
         }
     }

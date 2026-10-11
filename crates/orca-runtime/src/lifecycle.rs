@@ -2364,9 +2364,9 @@ mod tests {
             0,
             &SubagentType::General,
             &instructions,
-            config.approval_mode,
+            &config,
             &memory,
-            orca_core::subagent_config::DelegationPolicy::default(),
+            None,
         );
         let conversation = prepared.conversation_mut();
 

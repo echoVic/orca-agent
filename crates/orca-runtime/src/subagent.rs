@@ -123,6 +123,7 @@ pub(crate) fn discover_agents(config: &RunConfig, cwd: &Path, mcp: &McpRegistry)
     );
     let tools = registry
         .model_visible_tools()
+        .filter(|tool| tool.name() != "computer")
         .flat_map(|tool| {
             std::iter::once(tool.name().to_string()).chain(
                 tool.spec()
@@ -283,6 +284,40 @@ mod tests {
     use super::*;
     use orca_core::approval_types::ActionKind;
     use orca_core::tool_types::ToolName;
+
+    #[test]
+    fn custom_agent_discovery_rejects_computer_as_a_known_child_tool() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::Builder::new()
+            .prefix("orca-cu-agents-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let agents = home.path().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        for (name, tools) in [
+            ("desktop-audit", "[computer, read_file]"),
+            ("source-audit", "[read_file]"),
+        ] {
+            std::fs::write(
+                agents.join(format!("{name}.md")),
+                format!("---\nname: {name}\ndescription: Audit source\ntools: {tools}\n---\nInspect source and report findings.\n"),
+            ).unwrap();
+        }
+        let catalog = discover_agents(&RunConfig::default(), home.path(), &McpRegistry::default());
+        assert!(
+            catalog.agents.contains_key("source-audit"),
+            "{:?}",
+            catalog.diagnostics
+        );
+        assert!(!catalog.agents.contains_key("desktop-audit"));
+        assert!(
+            catalog
+                .diagnostics
+                .iter()
+                .any(|entry| entry.message.contains("computer"))
+        );
+    }
 
     #[test]
     fn create_request_with_all_fields() {

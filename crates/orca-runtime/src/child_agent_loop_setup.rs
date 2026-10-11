@@ -205,19 +205,15 @@ fn prepare_child_agent_system_conversation(
     memory: &MemoryBlock,
 ) -> Conversation {
     let mut conversation = Conversation::new();
-    let mut system_prompt = agent_common::build_agent_system_prompt_for_tools(
+    let system_prompt = agent_common::build_agent_system_prompt_for_config(
         cwd,
+        config,
         request.depth,
         &request.subagent_type,
         Some(instructions),
-        config.approval_mode,
         Some(memory),
         request.allowed_tools.as_deref(),
     );
-    if let Some(definition) = &config.subagents.effective_definition {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(&definition.system_prompt);
-    }
     conversation.add_system(system_prompt);
     conversation
 }
@@ -295,4 +291,69 @@ pub fn advance_child_agent_turn_with_limit(
     }
 
     ChildAgentTurnBudget::Continue
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orca_core::subagent_types::SubagentType;
+    use orca_core::subagent_types::agent_definition::EffectiveAgentDefinition;
+
+    fn computer_request() -> (RunConfig, ChildAgentRequest) {
+        let allowed_tools = vec!["computer".to_string(), "read_file".to_string()];
+        let mut config = RunConfig::default();
+        config.computer_use.interactive = true;
+        config.subagents.effective_definition = Some(EffectiveAgentDefinition {
+            name: "desktop-audit".to_string(),
+            description: "Audit source".to_string(),
+            system_prompt: "Report source findings.".to_string(),
+            allowed_tools: allowed_tools.clone(),
+            model: None,
+        });
+        let request = ChildAgentRequest {
+            prompt: "inspect source".to_string(),
+            subagent_type: SubagentType::Custom("desktop-audit".to_string()),
+            model: None,
+            depth: 1,
+            emit_deltas: false,
+            allowed_tools: Some(allowed_tools),
+            tool_policy_label: Some("custom agent desktop-audit".to_string()),
+            workflow_ipc: None,
+            continuation: None,
+        };
+        (config, request)
+    }
+
+    #[test]
+    fn a_sync_custom_child_cannot_offer_computer_even_when_its_definition_lists_it() {
+        let (config, request) = computer_request();
+        let setup = prepare_child_agent_loop(
+            &config,
+            &request,
+            Path::new("/repo"),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+        );
+        let tools = setup.provider_config.tools_override.expect("child schemas");
+        assert!(tools.iter().any(|tool| tool.name == "read_file"));
+        assert!(!tools.iter().any(|tool| tool.name == "computer"));
+    }
+
+    #[test]
+    fn a_sync_custom_child_prompt_does_not_advertise_computer() {
+        let (config, request) = computer_request();
+        let conversation = prepare_child_agent_system_conversation(
+            &config,
+            &request,
+            Path::new("/repo"),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+        );
+        let prompt = conversation.messages[0]
+            .content_str()
+            .expect("system prompt");
+        assert!(prompt.contains("### read_file"));
+        assert!(prompt.contains("Report source findings."));
+        assert!(!prompt.contains("### computer"));
+    }
 }

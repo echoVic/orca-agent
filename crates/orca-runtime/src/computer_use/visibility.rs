@@ -2,6 +2,19 @@ use orca_core::approval_rules::CompiledPermissionRules;
 use orca_core::approval_types::Decision;
 use orca_core::config::RunConfig;
 
+pub(crate) fn session_visible(config: &RunConfig, subagent_depth: u32) -> bool {
+    tool_visible(
+        config,
+        subagent_depth,
+        config
+            .subagents
+            .effective_definition
+            .as_ref()
+            .map(|definition| definition.allowed_tools.as_slice()),
+        orca_computer_use::apps::host_supported(),
+    )
+}
+
 pub(crate) fn tool_visible(
     config: &RunConfig,
     subagent_depth: u32,

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use orca_core::approval_types::{ActionKind, ApprovalMode};
+use orca_core::config::RunConfig;
 use orca_core::goal_types::ThreadGoal;
 use orca_core::subagent_config::DelegationPolicy;
 use orca_core::subagent_types::{SubagentType, builtin_agents};
@@ -71,6 +72,7 @@ pub fn build_agent_system_prompt_for_tools(
         None,
         DelegationPolicy::default(),
         allowed_tools,
+        None,
     )
 }
 
@@ -99,7 +101,49 @@ pub fn build_agent_system_prompt_with_goal(
         active_goal,
         delegation,
         role_tools.as_deref(),
+        None,
     )
+}
+
+pub(crate) fn build_agent_system_prompt_for_config(
+    cwd: &Path,
+    config: &RunConfig,
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+    instructions: Option<&ProjectInstructions>,
+    memory: Option<&MemoryBlock>,
+    allowed_tools: Option<&[String]>,
+) -> String {
+    let role_tools = inferred_role_tools(subagent_depth, subagent_type);
+    let allowed_tools = allowed_tools
+        .or_else(|| {
+            config
+                .subagents
+                .effective_definition
+                .as_ref()
+                .map(|definition| definition.allowed_tools.as_slice())
+        })
+        .or(role_tools.as_deref());
+    let mut prompt = build_agent_system_prompt_with_goal_and_tools(
+        cwd,
+        subagent_depth,
+        subagent_type,
+        instructions,
+        config.approval_mode,
+        memory,
+        None,
+        config
+            .subagents
+            .delegation
+            .for_child(subagent_depth, config.subagents.max_depth),
+        allowed_tools,
+        Some(config),
+    );
+    if let Some(definition) = &config.subagents.effective_definition {
+        prompt.push_str("\n\n");
+        prompt.push_str(&definition.system_prompt);
+    }
+    prompt
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -113,8 +157,18 @@ fn build_agent_system_prompt_with_goal_and_tools(
     active_goal: Option<&ThreadGoal>,
     delegation: DelegationPolicy,
     allowed_tools: Option<&[String]>,
+    config: Option<&RunConfig>,
 ) -> String {
-    let mut prompt = build_base_system_prompt_for_tools(cwd, allowed_tools);
+    let mut prompt = if let Some(config) = config {
+        crate::system_prompt::build_system_prompt_for_config(
+            cwd,
+            config,
+            subagent_depth,
+            allowed_tools,
+        )
+    } else {
+        build_base_system_prompt_for_tools(cwd, allowed_tools)
+    };
     if let Some(block) = memory.and_then(MemoryBlock::to_system_prompt_block) {
         prompt.push_str("\n\n");
         prompt.push_str(&block);
