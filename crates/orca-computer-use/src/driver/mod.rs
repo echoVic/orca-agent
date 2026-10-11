@@ -9,18 +9,36 @@ pub fn run_stdio() -> i32 {
             eprintln!("Could not resolve Orca home for computer-use session lock");
             return 2;
         };
-        let mut driver = macos::MacDriver::new(home.join("computer-use.lock"));
-        match serve(
-            std::io::stdin().lock(),
-            LineWriter::new(std::io::stdout()),
-            &mut driver,
-        ) {
-            Ok(()) => 0,
+        let worker = std::thread::Builder::new()
+            .name("computer-use-driver".into())
+            .spawn(move || {
+                let mut driver = macos::MacDriver::new(home.join("computer-use.lock"));
+                match serve(
+                    std::io::stdin().lock(),
+                    LineWriter::new(std::io::stdout()),
+                    &mut driver,
+                ) {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        eprintln!("Computer-use driver failed: {error}");
+                        2
+                    }
+                }
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
             Err(error) => {
-                eprintln!("Computer-use driver failed: {error}");
-                2
+                eprintln!("Could not start computer-use driver: {error}");
+                return 2;
             }
+        };
+        // NSWorkspace application membership updates on the actual main loop.
+        // Its launch completion blocks run separately on a concurrent queue.
+        use objc2_core_foundation::{CFRunLoop, kCFRunLoopDefaultMode};
+        while !worker.is_finished() {
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.01, true);
         }
+        worker.join().unwrap_or(2)
     }
     #[cfg(not(target_os = "macos"))]
     {

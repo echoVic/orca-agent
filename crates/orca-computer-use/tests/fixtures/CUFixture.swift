@@ -13,6 +13,8 @@ func log(_ event: [String: Any]) {
     }
 }
 
+log(["type": "started", "pid": Int(ProcessInfo.processInfo.processIdentifier)])
+
 final class Canvas: NSView {
     override func isAccessibilityElement() -> Bool { false }
     override func accessibilityChildren() -> [Any]? { [] }

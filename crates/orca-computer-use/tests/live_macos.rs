@@ -1,9 +1,40 @@
 #![cfg(target_os = "macos")]
+#![cfg_attr(target_os = "macos", no_main)]
+#![cfg_attr(target_os = "macos", reexport_test_harness_main = "rust_tests")]
+
+// Keep the standard ignored/serial libtest interface, but let AppKit's actual
+// main thread deliver runningApplications updates while libtest runs tests.
+#[unsafe(export_name = "main")]
+extern "C" fn macos_test_main() -> i32 {
+    use objc2_core_foundation::{CFRunLoop, kCFRunLoopDefaultMode};
+    let workspace = NSWorkspace::sharedWorkspace();
+    let frontmost = workspace
+        .frontmostApplication()
+        .map(|app| app.processIdentifier());
+    let pointer = CGEvent::location(Some(&CGEvent::new(None).expect("read suite pointer")));
+    let harness = std::thread::spawn(rust_tests);
+    while !harness.is_finished() {
+        CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.01, true);
+    }
+    let passed = harness.join().is_ok();
+    record_restoration(frontmost, pointer);
+    let failures = RESTORATION_FAILURES.lock().unwrap();
+    for failure in failures.iter() {
+        eprintln!("GUI restoration failed: {failure}");
+    }
+    if passed && failures.is_empty() {
+        0
+    } else {
+        101
+    }
+}
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+static RESTORATION_FAILURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -104,7 +135,10 @@ impl Live {
     }
 
     fn launch_fixture(&mut self) -> (i32, PathBuf) {
-        let log = self.directory.path().join("fixture.jsonl");
+        let log = self
+            .directory
+            .path()
+            .join(format!("fixture-{}.jsonl", self.launched.len()));
         assert!(
             Command::new("/usr/bin/open")
                 .arg("-n")
@@ -117,17 +151,23 @@ impl Live {
         );
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            if let Some(app) = self.apps().into_iter().find(|app| {
-                app.bundle_id == "dev.orca.cu-fixture"
-                    && app.pid.is_some_and(|pid| !self.running.contains(&pid))
-            }) {
-                let pid = app.pid.unwrap();
+            let pid = std::fs::read_to_string(&log).ok().and_then(|text| {
+                let event: serde_json::Value = serde_json::from_str(text.lines().next()?).ok()?;
+                (event["type"] == "started")
+                    .then(|| event["pid"].as_i64())?
+                    .and_then(|pid| i32::try_from(pid).ok())
+            });
+            if let Some(pid) = pid {
+                // The PID receipt comes from this invocation's private log, so
+                // cleanup remains exact even if app discovery fails afterwards.
                 self.launched.insert(pid);
-                if app
-                    .windows
-                    .iter()
-                    .any(|window| window.title == "Orca CU Fixture")
-                {
+                if self.apps().into_iter().any(|app| {
+                    app.pid == Some(pid)
+                        && app
+                            .windows
+                            .iter()
+                            .any(|window| window.title == "Orca CU Fixture")
+                }) {
                     return (pid, log);
                 }
             }
@@ -139,20 +179,8 @@ impl Live {
 
 impl Drop for Live {
     fn drop(&mut self) {
-        for bundle_id in ["dev.orca.cu-fixture", "com.apple.TextEdit"] {
-            for app in NSRunningApplication::runningApplicationsWithBundleIdentifier(
-                &NSString::from_str(bundle_id),
-            ) {
-                if !self.running.contains(&app.processIdentifier()) {
-                    self.launched.insert(app.processIdentifier());
-                }
-            }
-        }
-        for pid in &self.launched {
-            if !self.running.contains(pid)
-                && let Some(app) =
-                    NSRunningApplication::runningApplicationWithProcessIdentifier(*pid)
-            {
+        for pid in cleanup_pids(&self.running, &self.launched) {
+            if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
                 app.terminate();
                 let deadline = Instant::now() + Duration::from_secs(3);
                 while !app.isTerminated() && Instant::now() < deadline {
@@ -163,24 +191,67 @@ impl Drop for Live {
                 }
             }
         }
-        if let Some(pid) = self.frontmost {
-            restore_frontmost(pid);
-        }
-        CGWarpMouseCursorPosition(self.pointer);
+        record_restoration(self.frontmost, self.pointer);
     }
 }
 
-fn restore_frontmost(pid: i32) {
-    use objc2_application_services::AXUIElement;
+fn cleanup_pids(running: &HashSet<i32>, launched: &HashSet<i32>) -> Vec<i32> {
+    let mut pids: Vec<_> = launched.difference(running).copied().collect();
+    pids.sort_unstable();
+    pids
+}
+
+fn record_restoration(frontmost: Option<i32>, pointer: objc2_core_foundation::CGPoint) {
+    use objc2_application_services::{AXError, AXUIElement};
     use objc2_core_foundation::{CFBoolean, CFString};
-    let app = unsafe { AXUIElement::new_application(pid) };
-    unsafe {
-        app.set_messaging_timeout(2.0);
-        app.set_attribute_value(
-            &CFString::from_str("AXFrontmost"),
-            CFBoolean::new(true).as_ref(),
-        );
+    use objc2_core_graphics::CGError;
+    let mut failures = vec![];
+    if let Some(pid) = frontmost {
+        let app = unsafe { AXUIElement::new_application(pid) };
+        let timeout = unsafe { app.set_messaging_timeout(2.0) };
+        if timeout != AXError::Success {
+            failures.push(format!("AX timeout for PID {pid}: {timeout:?}"));
+        }
+        let restored = unsafe {
+            app.set_attribute_value(
+                &CFString::from_str("AXFrontmost"),
+                CFBoolean::new(true).as_ref(),
+            )
+        };
+        if restored != AXError::Success {
+            failures.push(format!("frontmost restore for PID {pid}: {restored:?}"));
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while NSWorkspace::sharedWorkspace()
+                .frontmostApplication()
+                .map(|app| app.processIdentifier())
+                != Some(pid)
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if NSWorkspace::sharedWorkspace()
+                .frontmostApplication()
+                .map(|app| app.processIdentifier())
+                != Some(pid)
+            {
+                failures.push(format!("frontmost PID {pid} was not restored"));
+            }
+        }
     }
+    let warped = CGWarpMouseCursorPosition(pointer);
+    if warped != CGError::Success {
+        failures.push(format!("pointer warp failed: {warped:?}"));
+    }
+    let actual = CGEvent::new(None).map(|event| CGEvent::location(Some(&event)));
+    if actual.is_none_or(|actual| {
+        (actual.x - pointer.x).abs() > 1.0 || (actual.y - pointer.y).abs() > 1.0
+    }) {
+        failures.push(format!(
+            "pointer not restored: expected {pointer:?}, actual {actual:?}"
+        ));
+    }
+    RESTORATION_FAILURES.lock().unwrap().extend(failures);
 }
 
 #[test]
@@ -232,17 +303,54 @@ fn list_and_resolve_find_the_fixture_by_name_and_bundle_id() {
 #[test]
 #[ignore]
 fn a_second_driver_finds_the_session_lock_held() {
-    let Some(live) = Live::start() else { return };
+    use orca_computer_use::serve::{DriverHandler, LineWriter};
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    let (pid, _) = live.launch_fixture();
     assert!(
-        live.hello.macos_major >= 14,
-        "first driver holds the same lock successfully"
+        live.apps().iter().any(|app| app.pid == Some(pid)),
+        "owner can list apps"
     );
-    let launcher = InProcessLauncher::new(MacDriver::new(
-        live.directory.path().join("computer-use.lock"),
-    ));
-    let error = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap_err();
+    let launched = live
+        .client
+        .call(
+            Request::LaunchApp {
+                app: "dev.orca.cu-fixture".into(),
+                open: vec![],
+            },
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert!(
+        matches!(launched, Reply::Launched { app } if app.pid == Some(pid)),
+        "owner can launch its fixture"
+    );
+    let mut second = MacDriver::new(live.directory.path().join("computer-use.lock"));
+    let output = LineWriter::new(std::io::sink());
+    let requests = || {
+        [
+            Request::ListApps,
+            Request::LaunchApp {
+                app: "dev.orca.cu-fixture".into(),
+                open: vec![],
+            },
+        ]
+    };
+    for request in requests() {
+        let error = second.handle(request, &output).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::LockHeld);
+        assert_eq!(error.message, "another Orca session is using the computer");
+    }
+    let error = second
+        .handle(Request::Hello { protocol: 1 }, &output)
+        .unwrap_err();
     assert_eq!(error.kind, ErrorKind::LockHeld);
-    assert_eq!(error.message, "another Orca session is using the computer");
+    for request in requests() {
+        let error = second.handle(request, &output).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::LockHeld);
+        assert_eq!(error.message, "another Orca session is using the computer");
+    }
 }
 
 #[test]
@@ -253,7 +361,7 @@ fn launch_app_opens_a_file_in_textedit() {
     };
     let file = live.directory.path().join("orca-cu-test.txt");
     std::fs::write(&file, "Orca computer use fixture document\n").unwrap();
-    // Track newly started TextEdit even if the request fails, so Drop still cleans up.
+    // Record the returned PID before assertions; never infer ownership from a process sweep.
     let result = live.client.call(
         Request::LaunchApp {
             app: "com.apple.TextEdit".into(),
@@ -261,14 +369,11 @@ fn launch_app_opens_a_file_in_textedit() {
         },
         Duration::from_secs(60),
     );
-    for app in NSWorkspace::new().runningApplications() {
-        if app
-            .bundleIdentifier()
-            .is_some_and(|id| id.to_string() == "com.apple.TextEdit")
-            && !live.running.contains(&app.processIdentifier())
-        {
-            live.launched.insert(app.processIdentifier());
-        }
+    if let Ok(Reply::Launched { app }) = &result
+        && let Some(pid) = app.pid
+        && !live.running.contains(&pid)
+    {
+        live.launched.insert(pid);
     }
     let Reply::Launched { app } = result.unwrap() else {
         panic!("expected launched app")
@@ -278,5 +383,88 @@ fn launch_app_opens_a_file_in_textedit() {
     assert!(
         !app.windows.is_empty(),
         "TextEdit opened the temporary file"
+    );
+}
+
+#[test]
+#[ignore]
+fn opening_a_nonexistent_file_in_already_running_textedit_returns_an_error() {
+    use orca_computer_use::client::CallError;
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    if !NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str(
+        "com.apple.TextEdit",
+    ))
+    .is_empty()
+    {
+        eprintln!("skipped: TextEdit was already running");
+        return;
+    }
+    let file = live.directory.path().join("native-open-control.txt");
+    std::fs::write(&file, "Native launch completion control\n").unwrap();
+    let result = live.client.call(
+        Request::LaunchApp {
+            app: "com.apple.TextEdit".into(),
+            open: vec![file.to_string_lossy().into_owned()],
+        },
+        Duration::from_secs(60),
+    );
+    if let Ok(Reply::Launched { app }) = &result
+        && let Some(pid) = app.pid
+    {
+        live.launched.insert(pid);
+    }
+    let Reply::Launched { app } = result.unwrap() else {
+        panic!("expected successful launch control")
+    };
+    assert!(
+        !app.windows.is_empty(),
+        "valid file opens in the same TextEdit process"
+    );
+    let missing = live.directory.path().join("does-not-exist.txt");
+    let result = live.client.call(
+        Request::LaunchApp {
+            app: "com.apple.TextEdit".into(),
+            open: vec![missing.to_string_lossy().into_owned()],
+        },
+        Duration::from_secs(60),
+    );
+    let Err(CallError::Driver(error)) = result else {
+        panic!("native open failure was hidden: {result:?}")
+    };
+    assert_eq!(error.kind, ErrorKind::Failed);
+    assert!(!error.message.is_empty());
+}
+
+#[test]
+#[ignore]
+fn cleanup_only_selects_explicitly_launched_processes() {
+    let running = HashSet::from([10]);
+    // PID 77 represents an unrelated app that appeared during the test.
+    let launched = HashSet::from([10, 42]);
+    let pids = cleanup_pids(&running, &launched);
+    assert_eq!(pids, vec![42]);
+    assert!(!pids.contains(&77));
+}
+
+#[test]
+#[ignore]
+fn cleanup_preserves_an_app_launched_by_another_live_session() {
+    let Some(mut owner) = Live::start() else {
+        return;
+    };
+    let Some(other) = Live::start() else { return };
+    // The fixture appears after `other` captured its starting process list,
+    // but only `owner` launched it and received its private PID receipt.
+    let (pid, _) = owner.launch_fixture();
+    assert!(
+        owner.apps().iter().any(|app| app.pid == Some(pid)),
+        "fixture is running before cleanup"
+    );
+    drop(other);
+    assert!(
+        owner.apps().iter().any(|app| app.pid == Some(pid)),
+        "cleanup must leave another session's app running"
     );
 }

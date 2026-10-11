@@ -41,12 +41,7 @@ fn running_info(app: &NSRunningApplication) -> Option<AppInfo> {
     })
 }
 
-struct Desktop {
-    windows: HashMap<i32, Vec<WindowInfo>>,
-    pids: Vec<i32>,
-}
-
-fn windows(timeout: Duration) -> Result<Desktop, DriverError> {
+fn windows(timeout: Duration) -> Result<HashMap<i32, Vec<WindowInfo>>, DriverError> {
     if !CGPreflightScreenCaptureAccess() {
         return Err(error(
             ErrorKind::PermissionMissing,
@@ -83,14 +78,7 @@ fn windows(timeout: Duration) -> Result<Desktop, DriverError> {
                     for values in windows.values_mut() {
                         values.sort_by_key(|window| window.id);
                     }
-                    Ok(Desktop {
-                        windows,
-                        pids: content
-                            .applications()
-                            .iter()
-                            .map(|app| app.processID())
-                            .collect(),
-                    })
+                    Ok(windows)
                 } else {
                     Err(error(
                         ErrorKind::Failed,
@@ -109,36 +97,39 @@ fn windows(timeout: Duration) -> Result<Desktop, DriverError> {
         .map_err(|_| error(ErrorKind::Failed, "Window listing timed out"))?
 }
 
-fn list_with_timeout(timeout: Duration) -> Result<Vec<AppInfo>, DriverError> {
-    let mut desktop = windows(timeout)?;
-    let mut running: HashMap<i32, Retained<NSRunningApplication>> = NSWorkspace::sharedWorkspace()
-        .runningApplications()
-        .iter()
-        .map(|app| (app.processIdentifier(), app))
-        .collect();
-    // NSWorkspace caches its array until the main AppKit loop runs. The stdio
-    // server and libtest are blocking hosts, so use ScreenCaptureKit's fresh
-    // process snapshot to refresh the NSRunningApplication objects by PID.
-    for pid in &desktop.pids {
-        if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(*pid) {
-            running.insert(*pid, app);
-        }
-    }
+fn merge_apps(running: Vec<AppInfo>, mut windows: HashMap<i32, Vec<WindowInfo>>) -> Vec<AppInfo> {
     let mut apps: Vec<_> = running
-        .into_values()
-        .filter(|app| desktop.pids.contains(&app.processIdentifier()))
-        .filter(|app| app.activationPolicy() == NSApplicationActivationPolicy::Regular)
-        .filter_map(|app| {
-            let mut info = running_info(&app)?;
-            info.windows = desktop
-                .windows
-                .remove(&app.processIdentifier())
+        .into_iter()
+        .map(|mut app| {
+            app.windows = app
+                .pid
+                .and_then(|pid| windows.remove(&pid))
                 .unwrap_or_default();
-            Some(info)
+            app
         })
         .collect();
     apps.sort_by(|a, b| a.bundle_id.cmp(&b.bundle_id).then(a.pid.cmp(&b.pid)));
-    Ok(apps)
+    apps
+}
+
+fn list_with_timeout(timeout: Duration) -> Result<Vec<AppInfo>, DriverError> {
+    let windows = windows(timeout)?;
+    let running = NSWorkspace::sharedWorkspace()
+        .runningApplications()
+        .iter()
+        .filter(|app| app.activationPolicy() == NSApplicationActivationPolicy::Regular)
+        .filter_map(|app| running_info(&app))
+        .collect();
+    Ok(merge_apps(running, windows))
+}
+
+fn wait_for_launch(
+    receiver: mpsc::Receiver<Result<i32, DriverError>>,
+    deadline: Instant,
+) -> Result<i32, DriverError> {
+    receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| error(ErrorKind::Failed, "App launch timed out"))?
 }
 
 pub(super) fn list() -> Result<Vec<AppInfo>, DriverError> {
@@ -252,30 +243,78 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
             Some(&completion),
         );
     }
-    // LaunchServices may deliver completion on AppKit's main loop. Poll the
-    // fresh application snapshot as well, so a blocking stdio host can launch.
-    let mut launched_pid = None;
+    let launched_pid = wait_for_launch(receiver, deadline)?;
     loop {
-        match receiver.try_recv() {
-            Ok(Err(error)) => return Err(error),
-            Ok(Ok(pid)) => launched_pid = Some(pid),
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) if launched_pid.is_some() => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Err(error(ErrorKind::Failed, "App launch disconnected"));
-            }
-        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(error(ErrorKind::Failed, "App launch timed out"));
         }
         if let Some(app) = list_with_timeout(remaining)?.into_iter().find(|candidate| {
-            candidate.bundle_id == app.bundle_id
-                && launched_pid.is_none_or(|pid| candidate.pid == Some(pid))
+            candidate.bundle_id == app.bundle_id && candidate.pid == Some(launched_pid)
         }) && (open.is_empty() || !app.windows.is_empty())
         {
             return Ok(app);
         }
         thread::sleep(Duration::from_millis(100).min(remaining));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_regular_app_without_shareable_windows_stays_in_the_list() {
+        let app = AppInfo {
+            bundle_id: "dev.orca.windowless".into(),
+            name: "Windowless".into(),
+            pid: Some(42),
+            category: None,
+            windows: vec![],
+        };
+        let window = WindowInfo {
+            id: 7,
+            title: "Visible".into(),
+        };
+        let mut visible = app.clone();
+        visible.pid = Some(43);
+        let merged = merge_apps(
+            vec![app.clone(), visible],
+            HashMap::from([(43, vec![window.clone()])]),
+        );
+        assert_eq!(merged.iter().find(|info| info.pid == Some(42)), Some(&app));
+        assert_eq!(
+            merged
+                .iter()
+                .find(|info| info.pid == Some(43))
+                .unwrap()
+                .windows,
+            vec![window]
+        );
+    }
+
+    #[test]
+    fn a_delayed_native_launch_error_is_preserved() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let expected = error(ErrorKind::Failed, "The requested file does not exist");
+        let sent = expected.clone();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            sender.send(Err(sent)).unwrap();
+        });
+        assert_eq!(
+            wait_for_launch(receiver, Instant::now() + Duration::from_secs(1)),
+            Err(expected)
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn native_launch_completion_must_arrive_within_the_deadline() {
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        let failure =
+            wait_for_launch(receiver, Instant::now() + Duration::from_millis(10)).unwrap_err();
+        assert_eq!(failure.kind, ErrorKind::Failed);
+        assert_eq!(failure.message, "App launch timed out");
     }
 }
