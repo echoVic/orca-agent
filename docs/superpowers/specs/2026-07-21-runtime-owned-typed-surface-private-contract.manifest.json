@@ -225,6 +225,7 @@
       "ShutdownHost"
     ],
     "current_tui_user_actions": [
+      "OpenToolImages",
       "StartSideConversation",
       "ToggleSideConversation",
       "CloseSideConversation",
@@ -3930,6 +3931,30 @@
     "deletion_gate"
   ],
   "tui_actions": [
+    [
+      "OpenToolImages",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:637",
+        "crates/orca-tui/src/input_event_actions.rs:516",
+        "crates/orca-tui/src/hosted_controller.rs:1056",
+        "crates/orca-tui/src/state_reducer.rs:61"
+      ],
+      "authoritative_read",
+      "UserAction::OpenToolImages{call_id}",
+      "tool_result_images(call_id)",
+      "RuntimeThreadHandle::tool_result_images(call_id)",
+      [
+        "ReadSnapshot"
+      ],
+      [
+        "tool_call_id",
+        "session_attachment"
+      ],
+      "ToolImagesLoaded{call_id,result}",
+      "first image opens the existing viewer; missing images or read/decode failures appear in the transcript",
+      "runtime_owned_live_or_history_image_read"
+    ],
     [
       "StartSideConversation",
       "current",
@@ -7854,7 +7879,7 @@
   ],
   "phase_0a_manifest_invariants": [
     "source_facts has exactly 58 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 54 unique variants matching UserAction at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 55 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",

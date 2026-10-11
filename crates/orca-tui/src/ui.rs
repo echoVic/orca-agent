@@ -1835,10 +1835,58 @@ pub(crate) fn render_live_messages(
                     end.saturating_sub(start) as u16,
                 ),
                 preview_rect,
-                image: image.clone(),
+                target: crate::image_preview::ImageHitTarget::Image(image.clone()),
             })
         })
         .collect();
+
+    for (index, message) in state.transcript.messages.iter().enumerate() {
+        let ChatMessage::ToolCall {
+            id,
+            output: Some(output),
+            ..
+        } = message
+        else {
+            continue;
+        };
+        let markers = output
+            .lines()
+            .filter(|line| is_tool_image_marker(line.trim()))
+            .collect::<Vec<_>>();
+        if markers.is_empty() {
+            continue;
+        }
+        let Some(range) = state.transcript.render_cache.message_row_range(index) else {
+            continue;
+        };
+        for row in range.start.max(visible_start)..range.end.min(visible_end) {
+            if state
+                .transcript
+                .render_cache
+                .row_text_at(row)
+                .is_some_and(|text| {
+                    markers.iter().any(|marker| {
+                        text.trim().strip_prefix("│").unwrap_or(text.trim()).trim() == marker.trim()
+                    })
+                })
+            {
+                state
+                    .image_hit_areas
+                    .push(crate::image_preview::ImageHitArea {
+                        rect: Rect::new(
+                            area.x,
+                            area.y + row.saturating_sub(visible_start) as u16,
+                            area.width,
+                            1,
+                        ),
+                        preview_rect: None,
+                        target: crate::image_preview::ImageHitTarget::ToolResult {
+                            call_id: id.clone(),
+                        },
+                    });
+            }
+        }
+    }
 
     state.collapsible_hit_areas = crate::transcript_hit::collapsible_hit_areas(
         &state.transcript.messages,
@@ -1853,7 +1901,12 @@ pub(crate) fn render_live_messages(
     let native_previews = state
         .image_hit_areas
         .iter()
-        .filter_map(|hit| hit.preview_rect.map(|rect| (rect, hit.image.clone())))
+        .filter_map(|hit| match &hit.target {
+            crate::image_preview::ImageHitTarget::Image(image) => {
+                hit.preview_rect.map(|rect| (rect, image.clone()))
+            }
+            crate::image_preview::ImageHitTarget::ToolResult { .. } => None,
+        })
         .collect::<Vec<_>>();
     for (rect, image) in native_previews {
         state.image_renderer.paint_native(
@@ -4085,6 +4138,19 @@ fn append_diff_lines(
     }
 }
 
+fn is_tool_image_marker(line: &str) -> bool {
+    if line == "[1 image attached]" {
+        return true;
+    }
+    line.strip_prefix('[')
+        .and_then(|line| line.strip_suffix(" images attached]"))
+        .is_some_and(|count| {
+            !count.is_empty()
+                && count.bytes().all(|byte| byte.is_ascii_digit())
+                && count.parse::<usize>().is_ok_and(|count| count > 0)
+        })
+}
+
 fn append_tool_output_lines(
     lines: &mut Vec<Line<'static>>,
     output: &str,
@@ -4126,9 +4192,23 @@ fn append_tool_output_lines(
     if force_expand {
         return;
     }
-    let hidden = total.saturating_sub(shown);
+    // Attachment rows stay reachable even when the surrounding output is folded.
+    let mut attachment_rows = 0;
+    for marker in output
+        .lines()
+        .skip(shown)
+        .filter(|line| is_tool_image_marker(line.trim()))
+    {
+        lines.push(Line::from(vec![
+            rail.clone(),
+            Span::styled(marker.to_string(), theme.muted_style()),
+        ]));
+        attachment_rows += 1;
+    }
+    let hidden = total.saturating_sub(shown).saturating_sub(attachment_rows);
+    let visible = shown.min(total) + attachment_rows;
     let tail = if expanded && hidden > 0 {
-        format!("{shown} of {total} lines shown · ctrl+o to collapse")
+        format!("{visible} of {total} lines shown · ctrl+o to collapse")
     } else if hidden > 0 {
         format!("+{} · ctrl+o to expand", line_count(hidden))
     } else if clipped {

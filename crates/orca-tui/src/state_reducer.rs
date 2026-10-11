@@ -58,6 +58,18 @@ impl AppState {
     pub fn update(&mut self, event: TuiEvent) {
         self.reconcile_message_tracking();
         match event {
+            TuiEvent::ToolImagesLoaded { result, .. } => match result {
+                Ok(images) => match images.into_iter().next() {
+                    Some(image) => match crate::image_preview::open_tool_image(image) {
+                        Ok(viewer) => self.image_viewer = Some(viewer),
+                        Err(error) => self.push_message(ChatMessage::Error(error)),
+                    },
+                    None => self.push_message(ChatMessage::Error(
+                        "That screenshot is no longer available.".to_string(),
+                    )),
+                },
+                Err(error) => self.push_message(ChatMessage::Error(error)),
+            },
             TuiEvent::Attached(_) => {
                 eprintln!("orca: ignored an attached TUI event that bypassed attachment fencing");
             }

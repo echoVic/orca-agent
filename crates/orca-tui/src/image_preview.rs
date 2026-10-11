@@ -253,7 +253,38 @@ impl fmt::Debug for ImageViewerState {
 pub(crate) struct ImageHitArea {
     pub(crate) rect: Rect,
     pub(crate) preview_rect: Option<Rect>,
-    pub(crate) image: TuiImage,
+    pub(crate) target: ImageHitTarget,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ImageHitTarget {
+    Image(TuiImage),
+    ToolResult { call_id: String },
+}
+
+pub(crate) fn open_tool_image(
+    image: orca_core::conversation::ImageInput,
+) -> Result<ImageViewerState, String> {
+    use base64::Engine as _;
+    let orca_core::conversation::ImageSource::Base64 { media_type, data } = image.source else {
+        return Err("this image source has no local preview bytes".to_string());
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|error| error.to_string())?;
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?
+        .into_dimensions()
+        .map_err(|error| error.to_string())?;
+    ImageViewerState::open(TuiImage {
+        label: "[Screenshot]".to_string(),
+        media_type,
+        encoded: Some(Arc::from(bytes)),
+        width,
+        height,
+        source_name: None,
+    })
 }
 
 impl ImageViewerState {
@@ -917,6 +948,188 @@ mod tests {
             (viewer.zoom_percent, viewer.pan_x, viewer.pan_y),
             (100, 0, 0)
         );
+    }
+
+    #[test]
+    fn clicking_a_tool_rows_image_marker_asks_for_its_images() {
+        for (marker, preceding_lines, expanded) in [
+            ("[1 image attached]", 1, false),
+            ("[4 images attached]", 1, false),
+            ("[1 image attached]", 50, false),
+            ("[4 images attached]", 50, true),
+        ] {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let mut state =
+                crate::types::AppState::new(tx, "test".into(), "auto".into(), "/tmp".into());
+            state.push_message(crate::transcript_state::ChatMessage::ToolCall {
+                id: "call-1".into(),
+                name: "computer".into(),
+                target: None,
+                status: "completed".into(),
+                output: Some(format!(
+                    "{}{marker}",
+                    "Observed element.\n".repeat(preceding_lines)
+                )),
+                diff: None,
+                kind: None,
+                expanded,
+            });
+            let theme = Theme::named(orca_core::config::ThemeName::Dark);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+            terminal
+                .draw(|frame| {
+                    crate::ui::render(
+                        frame,
+                        &mut state,
+                        &ratatui_textarea::TextArea::default(),
+                        &theme,
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let row = (0..30)
+                .find(|&y| {
+                    (0..80)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains(marker)
+                })
+                .expect("the tool output must display its image marker");
+            let event = crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 8,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            });
+            crate::input_event_actions::handle_mouse_event(
+                &event,
+                &mut state,
+                &mut ratatui_textarea::TextArea::default(),
+                std::time::Instant::now(),
+            );
+            assert!(
+                matches!(rx.try_recv(), Ok(crate::protocol::UserAction::OpenToolImages { call_id }) if call_id == "call-1")
+            );
+            assert!(state.image_viewer.is_none());
+        }
+    }
+
+    #[test]
+    fn loaded_tool_images_open_the_viewer() {
+        use base64::Engine as _;
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state =
+            crate::types::AppState::new(tx, "test".into(), "auto".into(), "/tmp".into());
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(&[255, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        state.update(crate::protocol::TuiEvent::ToolImagesLoaded {
+            call_id: "call-1".into(),
+            result: Ok(vec![orca_core::conversation::ImageInput {
+                source: orca_core::conversation::ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                },
+                detail: Default::default(),
+            }]),
+        });
+        let viewer = state.image_viewer.as_ref().expect("the screenshot opens");
+        assert_eq!(viewer.image.label, "[Screenshot]");
+        assert_eq!((viewer.image.width, viewer.image.height), (1, 1));
+        assert_eq!(viewer.image.encoded.as_deref(), Some(bytes.as_slice()));
+    }
+
+    #[test]
+    fn loaded_tool_images_report_missing_and_read_errors() {
+        for (result, expected) in [
+            (Ok(Vec::new()), "That screenshot is no longer available."),
+            (
+                Err("history read failed".to_string()),
+                "history read failed",
+            ),
+        ] {
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let mut state =
+                crate::types::AppState::new(tx, "test".into(), "auto".into(), "/tmp".into());
+            state.update(crate::protocol::TuiEvent::ToolImagesLoaded {
+                call_id: "call-1".into(),
+                result,
+            });
+            assert!(state.image_viewer.is_none());
+            assert!(
+                matches!(state.transcript.messages.last(), Some(crate::transcript_state::ChatMessage::Error(text)) if text == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn loaded_tool_images_report_invalid_encoding_headers_and_pixels() {
+        use base64::Engine as _;
+        let png = image().encoded.unwrap();
+        for data in [
+            "invalid base64!".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(b"not an image"),
+            base64::engine::general_purpose::STANDARD.encode(&png[..33]),
+        ] {
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let mut state =
+                crate::types::AppState::new(tx, "test".into(), "auto".into(), "/tmp".into());
+            state.update(crate::protocol::TuiEvent::ToolImagesLoaded {
+                call_id: "call-1".into(),
+                result: Ok(vec![orca_core::conversation::ImageInput {
+                    source: orca_core::conversation::ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data,
+                    },
+                    detail: Default::default(),
+                }]),
+            });
+            assert!(state.image_viewer.is_none());
+            assert!(matches!(
+                state.transcript.messages.last(),
+                Some(crate::transcript_state::ChatMessage::Error(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn loaded_tool_images_use_the_first_image_and_read_jpeg_dimensions() {
+        use base64::Engine as _;
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .write_image(
+                &[255, 0, 0, 0, 255, 0],
+                2,
+                1,
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state =
+            crate::types::AppState::new(tx, "test".into(), "auto".into(), "/tmp".into());
+        state.update(crate::protocol::TuiEvent::ToolImagesLoaded {
+            call_id: "call-1".into(),
+            result: Ok(vec![
+                orca_core::conversation::ImageInput {
+                    source: orca_core::conversation::ImageSource::Base64 {
+                        media_type: "image/jpeg".into(),
+                        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    },
+                    detail: Default::default(),
+                },
+                orca_core::conversation::ImageInput {
+                    source: orca_core::conversation::ImageSource::Url {
+                        url: "https://example.invalid/image".into(),
+                    },
+                    detail: Default::default(),
+                },
+            ]),
+        });
+        let viewer = state.image_viewer.as_ref().unwrap();
+        assert_eq!((viewer.image.width, viewer.image.height), (2, 1));
+        assert_eq!(viewer.image.encoded.as_deref(), Some(bytes.as_slice()));
     }
 
     #[test]

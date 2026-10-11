@@ -2215,6 +2215,7 @@ pub enum RuntimeHostError {
     ThreadStartFailed { message: String },
     WorkflowLaunchFailed { message: String },
     RuntimeStartFailed { message: String },
+    ToolResultImagesReadFailed { message: String },
     ThreadActorPanicked { thread_id: String, message: String },
     ThreadShutdownTimedOut { thread_id: String },
     SupervisorPanicked,
@@ -2243,6 +2244,9 @@ impl fmt::Display for RuntimeHostError {
             }
             Self::RuntimeStartFailed { message } => {
                 write!(formatter, "failed to start runtime host: {message}")
+            }
+            Self::ToolResultImagesReadFailed { message } => {
+                write!(formatter, "failed to read tool result images: {message}")
             }
             Self::ThreadActorPanicked { thread_id, message } => {
                 write!(
@@ -3902,6 +3906,30 @@ impl RuntimeThreadHandle {
         receive_reply(reply_rx, "runtime thread")?
     }
 
+    /// The images of tool call `tool_call_id`: from the live conversation when it still
+    /// holds them, otherwise from the session history; empty when there are none.
+    pub fn tool_result_images(
+        &self,
+        tool_call_id: &str,
+    ) -> Result<Vec<ImageInput>, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::ReadToolResultImages {
+            tool_call_id: tool_call_id.to_string(),
+            reply: reply_tx,
+        })?;
+        match receive_reply(reply_rx, "runtime thread")?? {
+            ToolResultImageSource::Live(images) => Ok(images),
+            ToolResultImageSource::History(Some(path)) => {
+                crate::thread_store::read_tool_message_images(&path, tool_call_id).map_err(
+                    |error| RuntimeHostError::ToolResultImagesReadFailed {
+                        message: error.to_string(),
+                    },
+                )
+            }
+            ToolResultImageSource::History(None) => Ok(Vec::new()),
+        }
+    }
+
     /// An event producer on the thread's own sequence, as its turns publish
     /// on: what it publishes goes on with the session's sequence and into
     /// its history. Only an idle thread has one to share.
@@ -4795,6 +4823,11 @@ type McpPromptExpansionReply = SyncSender<
     >,
 >;
 
+enum ToolResultImageSource {
+    Live(Vec<ImageInput>),
+    History(Option<PathBuf>),
+}
+
 enum ThreadCommand {
     PromptQueue {
         action: crate::prompt_queue::PromptQueueAction,
@@ -5343,6 +5376,10 @@ enum ThreadCommand {
     },
     ReadSnapshot {
         reply: SyncSender<Result<RuntimeThreadSnapshot, RuntimeHostError>>,
+    },
+    ReadToolResultImages {
+        tool_call_id: String,
+        reply: SyncSender<Result<ToolResultImageSource, RuntimeHostError>>,
     },
     ForkEvents {
         reply: SyncSender<Result<EventFactory, RuntimeHostError>>,
@@ -18586,6 +18623,9 @@ impl ThreadActor {
                 ThreadCommand::ReadSnapshot { reply } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
+                ThreadCommand::ReadToolResultImages { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
                 ThreadCommand::RequestRecap { request, reply } => {
                     let _ = reply.send(crate::recap::RecapResult::Skipped {
                         request_id: request.request_id,
@@ -18745,6 +18785,7 @@ impl ThreadActor {
             &command,
             ThreadCommand::ReadState { .. }
                 | ThreadCommand::ReadSnapshot { .. }
+                | ThreadCommand::ReadToolResultImages { .. }
                 | ThreadCommand::SurfaceReadTaskTranscript { .. }
         );
         #[cfg(test)]
@@ -18761,6 +18802,7 @@ impl ThreadActor {
                 | ThreadCommand::SurfaceManualCompact { .. }
                 | ThreadCommand::ReadState { .. }
                 | ThreadCommand::ReadSnapshot { .. }
+                | ThreadCommand::ReadToolResultImages { .. }
                 | ThreadCommand::SurfaceReadTaskTranscript { .. }
         );
         #[cfg(test)]
@@ -19671,6 +19713,37 @@ impl ThreadActor {
                             &state.thread,
                             self.usage_ledger.totals(),
                         )
+                    })
+                    .ok_or(RuntimeHostError::ThreadUnavailable);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::ReadToolResultImages {
+                tool_call_id,
+                reply,
+            } => {
+                let result = self
+                    .state
+                    .as_ref()
+                    .map(|state| {
+                        let images = state
+                            .thread
+                            .session()
+                            .conversation()
+                            .messages
+                            .iter()
+                            .find_map(|message| match message {
+                                Message::Tool {
+                                    tool_call_id: id,
+                                    images,
+                                    ..
+                                } if id == &tool_call_id && !images.is_empty() => {
+                                    Some(images.clone())
+                                }
+                                _ => None,
+                            });
+                        images.map(ToolResultImageSource::Live).unwrap_or_else(|| {
+                            ToolResultImageSource::History(self.prompt_queue_path.clone())
+                        })
                     })
                     .ok_or(RuntimeHostError::ThreadUnavailable);
                 let _ = reply.send(result);
@@ -20916,6 +20989,11 @@ impl ThreadActor {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
                     operation_id: active.operation_id,
                 }));
+            }
+            ThreadCommand::ReadToolResultImages { reply, .. } => {
+                let _ = reply.send(Ok(ToolResultImageSource::History(
+                    self.prompt_queue_path.clone(),
+                )));
             }
             ThreadCommand::ForkEvents { reply } => {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
@@ -25072,6 +25150,113 @@ mod tests {
         RouteEpoch,
         OperationFence,
         GrantToken,
+    }
+
+    struct ToolImageExecutor;
+
+    impl ThreadOperationExecutor for ToolImageExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            thread
+                .session_mut()
+                .writer_mut()
+                .unwrap()
+                .enter_turn(request.turn_id().clone());
+            use base64::Engine as _;
+            for index in 1..=4 {
+                let message = Message::Tool {
+                    tool_call_id: format!("call-{index}"),
+                    content: "[1 image attached]".to_string(),
+                    images: vec![ImageInput {
+                        source: ImageSource::Base64 {
+                            media_type: "image/png".to_string(),
+                            data: base64::engine::general_purpose::STANDARD.encode([index; 32]),
+                        },
+                        detail: ImageDetail::High,
+                    }],
+                    terminal: None,
+                    pinned: false,
+                };
+                thread
+                    .session_mut()
+                    .writer_mut()
+                    .unwrap()
+                    .append_message(&message)?;
+                thread
+                    .session_mut()
+                    .conversation_mut()
+                    .messages
+                    .push(message);
+                orca_core::tool_images::keep_newest_tool_images(
+                    &mut thread.session_mut().conversation_mut().messages,
+                    orca_core::tool_images::MAX_REQUEST_TOOL_IMAGES,
+                );
+            }
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
+    #[test]
+    fn tool_result_images_come_from_the_live_conversation_then_from_history() {
+        use base64::Engine as _;
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(Arc::new(ToolImageExecutor)).unwrap();
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "tool image preview",
+            )
+            .unwrap();
+        thread
+            .start_turn(
+                HostedTurnRequest::new("capture four screenshots"),
+                io::sink(),
+            )
+            .unwrap()
+            .wait();
+        let snapshot = thread.snapshot().unwrap();
+        let first = snapshot.conversation().messages.iter().find(|message| {
+            matches!(message, Message::Tool { tool_call_id, .. } if tool_call_id == "call-1")
+        }).unwrap();
+        assert!(matches!(first, Message::Tool { images, .. } if images.is_empty()));
+        for (call_id, byte) in [("call-4", 4), ("call-1", 1)] {
+            let images = thread.tool_result_images(call_id).unwrap();
+            assert_eq!(images.len(), 1);
+            let ImageSource::Base64 { data, .. } = &images[0].source else {
+                panic!("preview must return the image bytes");
+            };
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .unwrap(),
+                vec![byte; 32]
+            );
+        }
+        assert!(
+            thread
+                .tool_result_images("missing-call")
+                .unwrap()
+                .is_empty()
+        );
+        let path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap()
+            .path;
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"invalid record\n").unwrap();
+        // Recent images must still preview when the history cannot be read.
+        assert_eq!(thread.tool_result_images("call-4").unwrap().len(), 1);
+        assert!(thread.tool_result_images("call-1").is_err());
+        std::fs::write(&path, saved).unwrap();
+        host.shutdown().unwrap();
     }
 
     struct PanicExecutor;

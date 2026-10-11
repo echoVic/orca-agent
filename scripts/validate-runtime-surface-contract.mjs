@@ -966,6 +966,7 @@ const TUI_RUNTIME_MUTATION_APIS = new Map([
 ]);
 
 const TUI_RUNTIME_RECEIVER_METHODS = new Map([
+  ["tool_result_images", [["thread", "thread.tool_result_images"]]],
   [
     "shutdown",
     [
@@ -1103,6 +1104,8 @@ function tuiRuntimeAssociatedMethods() {
 const TUI_RUNTIME_ASSOCIATED_METHODS = tuiRuntimeAssociatedMethods();
 
 const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
+  ["crates/orca-tui/src/input_event_actions.rs:handle_mouse_event:user_action.route", 1],
+  ["crates/orca-tui/src/hosted_controller.rs:hosted_tui_controller_loop:thread.tool_result_images", 1],
   ["crates/orca-tui/src/action_dispatcher.rs:route_action:controller.control", 3],
   ["crates/orca-tui/src/action_dispatcher.rs:drop:controller.control", 1],
   ["crates/orca-tui/src/action_dispatcher.rs:run_dispatcher:controller.control", 1],
@@ -1900,11 +1903,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 54 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 55 unique variants matching UserAction at baseline",
         (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 54,
-          "current_tui_user_actions must contain 54 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 55,
+          "current_tui_user_actions must contain 55 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,

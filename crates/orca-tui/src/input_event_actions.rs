@@ -499,13 +499,21 @@ pub(crate) fn handle_mouse_event(
                         hit.rect
                             .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
                     })
-                    .map(|hit| hit.image.clone())
+                    .map(|hit| hit.target.clone())
             {
                 state.viewport.selection = None;
-                match crate::image_preview::ImageViewerState::open(image) {
-                    Ok(viewer) => state.image_viewer = Some(viewer),
-                    Err(error) => {
-                        state.push_message(crate::transcript_state::ChatMessage::Error(error))
+                match image {
+                    crate::image_preview::ImageHitTarget::Image(image) => {
+                        match crate::image_preview::ImageViewerState::open(image) {
+                            Ok(viewer) => state.image_viewer = Some(viewer),
+                            Err(error) => state
+                                .push_message(crate::transcript_state::ChatMessage::Error(error)),
+                        }
+                    }
+                    crate::image_preview::ImageHitTarget::ToolResult { call_id } => {
+                        let _ = state
+                            .event_tx
+                            .send(crate::protocol::UserAction::OpenToolImages { call_id });
                     }
                 }
                 return MouseFlow::Handled;

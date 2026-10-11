@@ -78,6 +78,30 @@ pub(crate) fn iter_records(path: &Path, images: HydrateImages) -> io::Result<Ses
     SessionRecords::open(path, None, images)
 }
 
+/// Read preview bytes even for tool images omitted by normal session resume.
+pub(crate) fn read_tool_message_images(
+    path: &Path,
+    tool_call_id: &str,
+) -> io::Result<Vec<orca_core::conversation::ImageInput>> {
+    for record in iter_records(path, HydrateImages::All)? {
+        if let SessionRecord::Message {
+            message:
+                super::types::StoredMessage::Tool {
+                    tool_call_id: id,
+                    images,
+                    ..
+                },
+            ..
+        } = record?
+            && id == tool_call_id
+            && !images.is_empty()
+        {
+            return Ok(images);
+        }
+    }
+    Ok(Vec::new())
+}
+
 impl SessionRecords {
     pub fn open(
         path: &Path,
