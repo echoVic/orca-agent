@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-09-19",
+  "updated_at": "2026-10-11",
   "definition": {
     "tb2_mean": "Harbor aggregation over every scheduled trial; a trial without a verifier reward counts as 0",
     "tb2_mean_scored_only": "mean over the trials that produced a verifier reward",
@@ -55,6 +55,45 @@
       "issues_filed": [114, 115],
       "report": "docs/reports/2026-09-19-v0.4.32-evaluation.md",
       "summary": "docs/reports/2026-09-19-tb2-v0432-summary.json"
+    },
+    {
+      "date": "2026-10-11",
+      "source_commit": "55ca547e",
+      "version": "v0.5.10",
+      "tasks": 88,
+      "excluded_tasks": ["terminal-bench/qemu-startup"],
+      "settings": {
+        "attempts": 1,
+        "concurrency": 6,
+        "environment_build_timeout_multiplier": 2.0,
+        "model": "deepseek-flash"
+      },
+      "tb2_mean": 0.7273,
+      "tb2_mean_scored_only": 0.8205,
+      "tb2_passed": 64,
+      "tb2_scored": 78,
+      "tb2_errored": 25,
+      "exceptions": {
+        "AgentTimeoutError": 14,
+        "EnvironmentStartTimeoutError": 6,
+        "VerifierTimeoutError": 4,
+        "NonZeroAgentExitCodeError": 1
+      },
+      "infra_reruns": {
+        "tasks": 10,
+        "verifier_passed": 7,
+        "settings": "one task per job, concurrency 1",
+        "mean_if_counted": 0.8068,
+        "unscorable": ["terminal-bench/pytorch-model-cli", "terminal-bench/pytorch-model-recovery"]
+      },
+      "l1": {
+        "runs": 26,
+        "unique_suites": 25,
+        "failed": 1,
+        "note": "linux_shell_probe.py fails on the pre-0.5.8 contract: debian:bookworm-slim has no CA bundle, so orca exec cannot build an HTTP client at all"
+      },
+      "report": "docs/reports/2026-10-11-v0.5.10-evaluation.md",
+      "summary": "docs/reports/2026-10-11-tb2-v0510-summary.json"
     }
   ]
 }
