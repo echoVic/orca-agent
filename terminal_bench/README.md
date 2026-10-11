@@ -20,13 +20,24 @@ docker run --rm -v "$(pwd):/src" -w /src \
   messense/rust-musl-cross:x86_64-musl \
   cargo build --release --target x86_64-unknown-linux-musl --bin orca
 
+# Remove what earlier runs left behind (see below)
+scripts/eval/reap_harbor.sh
+
 # Run benchmark (2 trials per task)
 harbor run \
   -d "terminal-bench/terminal-bench-2" \
   --agent "terminal_bench.orca_agent:OrcaInstalledAgent" \
   -k 2 \
   --mounts '[{"type":"bind","source":"'"$(pwd)"'/target/x86_64-unknown-linux-musl/release","target":"/mnt/orca-bin","read_only":true}]'
+
+# ... and what this run left behind
+scripts/eval/reap_harbor.sh
 ```
+
+Harbor abandons the containers of a trial whose environment did not start in time, and
+they go on building or downloading while later trials start (issue #129).
+`scripts/eval/reap_harbor.sh` removes them and their networks; run it with no Harbor run
+in progress.
 
 ## Single Task Smoke Test
 

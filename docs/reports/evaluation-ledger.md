@@ -33,11 +33,15 @@ Machine-readable form: [`evaluation-ledger.json`](evaluation-ledger.json).
 # L1 (no network, no API key)
 bash scripts/eval/sweep.sh jobs/eval-sweep/$(date +%Y%m%d)
 
-# TB2 (Harbor + Docker + API key), then turn the run into the committed summary
+# TB2 (Harbor + Docker + API key), then turn the run into the committed summary.
+# Reap before and after the round: environment-start timeouts leave their containers
+# running (#129). A non-zero count goes into the report.
+scripts/eval/reap_harbor.sh
 harbor run -d "terminal-bench/terminal-bench-2" \
   --agent "terminal_bench.orca_agent:OrcaInstalledAgent" \
   -k 1 -n 6 --exclude-task-name "terminal-bench/qemu-startup" \
   --mounts '[{"type":"bind","source":"'"$PWD"'/target/x86_64-unknown-linux-musl/release","target":"/mnt/orca-bin","read_only":true}]'
+scripts/eval/reap_harbor.sh
 python3 scripts/eval/summarize.py jobs/full-88-<version>/<timestamp> \
   --out docs/reports/<date>-tb2-<version>-summary.json --source-commit "$(git rev-parse --short HEAD)"
 ```
@@ -53,3 +57,5 @@ Evaluation only pays off when a finding becomes a permanent check:
 | #81 concurrent `orca trust add/remove` lost decisions | `tests/jsonl_surface_differential.rs`, `scripts/eval/trust_race_probe.py` |
 | #115 a `lifetime: workspace` service is killed at session end | `scripts/eval/workspace_lifetime_probe.py` (in the sweep) |
 | #67 duplicate provider tool-call id aborted the session | `scripts/eval/fault_injection.py` (`duplicate_tool_call_id`), `model_response` unit tests |
+| #126 the instruction in the wrapper shell's argv let a task's `pkill -f` end the trial | `terminal_bench/test_orca_agent.py` (`test_run_keeps_the_instruction_out_of_every_command_line`) |
+| #127 an image without a CA bundle must fail with the documented error and send nothing | `scripts/eval/linux_shell_probe.py` (CA check, in the sweep) |

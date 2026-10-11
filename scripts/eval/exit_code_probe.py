@@ -158,7 +158,6 @@ def main() -> int:
                 "denied action in jsonl → 3 / approval_required",
                 denied.returncode == 3 and denied_status == "approval_required",
                 f"exit={denied.returncode} status={denied_status}",
-                issue="" if denied.returncode == 3 else "blocked by #85",
             )
         else:
             record_skip("denied action in jsonl → 3 / approval_required",
@@ -176,7 +175,6 @@ def main() -> int:
             "budget stop → 4 / stopped",
             budget.returncode == 4 and budget_status in ("stopped", "budget_exhausted"),
             f"exit={budget.returncode} status={budget_status}",
-            issue="" if budget.returncode == 4 else "blocked by #85",
         )
 
         # The contract also promises the resume hint in text mode for a non-success exit.
