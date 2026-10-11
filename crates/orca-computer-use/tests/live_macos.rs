@@ -820,6 +820,7 @@ fn launch_app_opens_a_file_in_textedit() {
         };
         let file = live.directory.path().join("orca-cu-test.txt");
         std::fs::write(&file, "Orca computer use fixture document\n").unwrap();
+        live.make_finder_frontmost();
         let before = bundle_pids("com.apple.TextEdit");
         let result = live.client.call(
             Request::LaunchApp {
@@ -836,6 +837,7 @@ fn launch_app_opens_a_file_in_textedit() {
         let Reply::Launched { app } = result.unwrap() else {
             panic!("expected launched app")
         };
+        live.assert_frontmost_and_pointer_unchanged();
         assert_eq!(app.bundle_id, "com.apple.TextEdit");
         assert!(app.pid.is_some());
         assert!(
@@ -3256,5 +3258,57 @@ fn closing_a_window_preserves_the_successful_action_outcome() {
                 .contains("The window closed after the action; observe again.")
         );
         live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn launching_a_cold_app_does_not_activate_it() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        if !bundle_pids("dev.orca.cu-fixture").is_empty() {
+            eprintln!("skipped: fixture already running");
+            return;
+        }
+        // Register the test bundle once, then stop only our process for a cold launch.
+        let (pid, _) = live.launch_fixture();
+        let old = NSRunningApplication::runningApplicationWithProcessIdentifier(pid).unwrap();
+        assert!(old.terminate());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !old.isTerminated() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(20));
+        }
+        live.make_finder_frontmost();
+        let before = bundle_pids("dev.orca.cu-fixture");
+        let result = live.client.call(
+            Request::LaunchApp {
+                app: "dev.orca.cu-fixture".into(),
+                open: vec![],
+            },
+            Duration::from_secs(60),
+        );
+        register_launch_pids(
+            &mut live.launched,
+            &before,
+            &bundle_pids("dev.orca.cu-fixture"),
+        );
+        let Reply::Launched { app } = result.unwrap() else {
+            panic!("launch reply");
+        };
+        live.assert_frontmost_and_pointer_unchanged();
+        assert!(
+            app.pid.is_some() && !app.windows.is_empty(),
+            "cold launch readiness"
+        );
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        assert!(
+            obs.elements
+                .iter()
+                .any(|e| e.label.as_deref() == Some("Increment")),
+            "ready window positive control"
+        );
     });
 }

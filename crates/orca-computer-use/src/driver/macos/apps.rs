@@ -252,6 +252,7 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
         })
         .ok_or_else(|| error(ErrorKind::AppNotFound, format!("App not found: {name}")))?;
     let configuration = NSWorkspaceOpenConfiguration::configuration();
+    configuration.setActivates(false);
     configuration.setPromptsUserIfNeeded(false);
     configuration.setAddsToRecentItems(false);
     let (sender, receiver) = mpsc::sync_channel(1);

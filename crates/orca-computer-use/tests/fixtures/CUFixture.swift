@@ -130,7 +130,8 @@ let close = NSButton(title: "Close window", target: controller, action: #selecto
 close.frame = NSRect(x: 200, y: 20, width: 160, height: 30)
 window.contentView!.addSubview(close)
 window.makeKeyAndOrderFront(nil)
-app.activate()
+// Direct harness launches activate; NSWorkspace launch tests use its configuration.
+if CommandLine.arguments.count > 1 { app.activate() }
 if foregroundPasswordProbe {
     DispatchQueue.main.async {
         window.makeFirstResponder(nil)
