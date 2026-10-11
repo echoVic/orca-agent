@@ -17,9 +17,10 @@ extern "C" fn macos_test_main() -> i32 {
         CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.01, true);
     }
     let passed = harness.join().is_ok();
-    let restored =
-        std::panic::catch_unwind(|| run_live_test(|| record_restoration(frontmost, pointer)))
-            .is_ok();
+    let restored = restore_suite_if_live(
+        LIVE_TEST_RAN.load(std::sync::atomic::Ordering::SeqCst),
+        || run_live_test(|| record_restoration(frontmost, pointer)),
+    );
     let failures = RESTORATION_FAILURES.lock().unwrap();
     for failure in failures.iter() {
         eprintln!("GUI restoration failed: {failure}");
@@ -39,6 +40,7 @@ use std::sync::{Arc, Mutex};
 static RESTORATION_FAILURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 // GUI tests are serial even when libtest/nextest requests concurrency. Every
 // retry recreates all locals, so Live records and restores a fresh starting state.
+static LIVE_TEST_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
 thread_local! {
     static ATTEMPT: std::cell::RefCell<Option<LiveAttempt>> = const { std::cell::RefCell::new(None) };
@@ -202,6 +204,7 @@ struct Live {
     launched: HashSet<i32>,
     background_state: Option<(i32, objc2_core_foundation::CGPoint)>,
     esc_events: Arc<std::sync::atomic::AtomicUsize>,
+    restore_state: bool,
 }
 
 impl Live {
@@ -232,7 +235,7 @@ impl Live {
             }),
         )
         .unwrap();
-        let live = Self {
+        let mut live = Self {
             client,
             hello,
             directory,
@@ -242,12 +245,15 @@ impl Live {
             launched: HashSet::new(),
             background_state: None,
             esc_events,
+            restore_state: false,
         };
         let permissions = live.hello.permissions;
         if !permissions.accessibility || !permissions.screen_recording || !permissions.event_tap {
             eprintln!("skipped: missing permission: {permissions:?}");
             return None;
         }
+        LIVE_TEST_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+        live.restore_state = true;
         Some(live)
     }
 
@@ -586,6 +592,9 @@ impl Live {
 
 impl Drop for Live {
     fn drop(&mut self) {
+        if !self.restore_state {
+            return;
+        }
         for pid in cleanup_pids(&self.running, &self.launched) {
             if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
                 app.terminate();
@@ -2669,6 +2678,14 @@ impl Drop for HeldInputRecovery {
 #[test]
 #[ignore]
 fn foreground_password_focus_requires_approval_after_the_click() {
+    password_focus_after_click(false);
+}
+#[test]
+#[ignore]
+fn foreground_text_key_checks_password_focus_after_the_click() {
+    password_focus_after_click(true);
+}
+fn password_focus_after_click(key: bool) {
     run_live_test(|| {
         use objc2_application_services::{AXError, AXUIElement};
         use objc2_core_foundation::CFString;
@@ -2744,9 +2761,16 @@ fn foreground_password_focus_requires_approval_after_the_click() {
                 .count()
         };
         assert_eq!(length(), 0);
-        let action = Action::Type {
-            text: "ok".into(),
-            target: Some(target),
+        let action = if key {
+            Action::Key {
+                keys: vec!["x".into()],
+                target: Some(target),
+            }
+        } else {
+            Action::Type {
+                text: "ok".into(),
+                target: Some(target),
+            }
         };
         let error = live
             .act_with_fallback(action.clone(), false, true)
@@ -2772,7 +2796,7 @@ fn foreground_password_focus_requires_approval_after_the_click() {
         assert!(outcome.foreground_used);
         assert_eq!(
             length(),
-            2,
+            if key { 1 } else { 2 },
             "approved foreground text reached the password field"
         );
         live.assert_frontmost_and_pointer_unchanged();
@@ -2940,4 +2964,198 @@ fn warp_precision_accepts_rounding_but_rejects_a_moved_pointer() {
     assert!(pointer_restored(expected, CGPoint::new(1439.0, 992.0)));
     assert!(!pointer_restored(expected, CGPoint::new(1438.0, 992.0)));
     assert!(!pointer_restored(expected, CGPoint::new(1439.0, 990.0)));
+}
+
+fn fixture_ax_named(
+    element: &objc2_application_services::AXUIElement,
+    name: &str,
+) -> Option<objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>> {
+    use objc2_application_services::AXUIElement;
+    use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType};
+    if fixture_ax_value(element, "AXDescription")
+        .and_then(|v| v.downcast::<CFString>().ok())
+        .is_some_and(|v| v.to_string() == name)
+    {
+        return Some(unsafe { CFRetained::retain(std::ptr::NonNull::from(element)) });
+    }
+    let children = fixture_ax_value(element, "AXChildren")?;
+    let array = children.downcast_ref::<CFArray>()?;
+    for i in 0..array.len() {
+        let child = unsafe { &*array.value_at_index(i as isize).cast::<CFType>() }
+            .downcast_ref::<AXUIElement>()?;
+        if let Some(found) = fixture_ax_named(child, name) {
+            return Some(found);
+        }
+    }
+    None
+}
+fn password_length(pid: i32) -> usize {
+    use objc2_application_services::AXUIElement;
+    use objc2_core_foundation::CFString;
+    let app = unsafe { AXUIElement::new_application(pid) };
+    let field = fixture_ax_named(&app, "Password").expect("password field");
+    fixture_ax_value(&field, "AXValue")
+        .unwrap()
+        .downcast::<CFString>()
+        .unwrap()
+        .to_string()
+        .chars()
+        .count()
+}
+
+// Copy all data types into independent items before replacing the clipboard.
+struct TestClipboard(Vec<objc2::rc::Retained<objc2_app_kit::NSPasteboardItem>>);
+impl TestClipboard {
+    fn text(text: &str) -> Self {
+        use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString};
+        let board = NSPasteboard::generalPasteboard();
+        let mut saved = vec![];
+        if let Some(items) = board.pasteboardItems() {
+            for item in items.iter() {
+                let copy = NSPasteboardItem::new();
+                for kind in item.types().iter() {
+                    let data = item.dataForType(&kind).expect("snapshot clipboard data");
+                    assert!(copy.setData_forType(&data, &kind));
+                }
+                saved.push(copy);
+            }
+        }
+        let guard = Self(saved);
+        board.clearContents();
+        assert!(
+            board.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString })
+        );
+        guard
+    }
+}
+impl Drop for TestClipboard {
+    fn drop(&mut self) {
+        use objc2::runtime::ProtocolObject;
+        use objc2_app_kit::{NSPasteboard, NSPasteboardWriting};
+        let board = NSPasteboard::generalPasteboard();
+        board.clearContents();
+        let objects: Vec<_> = self
+            .0
+            .iter()
+            .map(|item| ProtocolObject::<dyn NSPasteboardWriting>::from_ref(&**item))
+            .collect();
+        if !objects.is_empty() {
+            assert!(board.writeObjects(&objc2_foundation::NSArray::from_slice(&objects)));
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn text_keys_into_password_require_approval() {
+    run_live_test(|| {
+        let Some((live, _, obs)) = background_fixture() else {
+            return;
+        };
+        let pid = bundle_pids("dev.orca.cu-fixture")
+            .into_iter()
+            .next()
+            .unwrap();
+        let password = element_named(&obs, "Password");
+        let action = Action::Key {
+            keys: vec!["x".into()],
+            target: Some(password),
+        };
+        let result = live.act(action.clone(), false);
+        assert_eq!(password_length(pid), 0, "unapproved x entered password");
+        assert_eq!(result.unwrap_err().kind, ErrorKind::NeedsSecureApproval);
+        assert!(!live.act(action, true).unwrap().foreground_used);
+        assert_eq!(password_length(pid), 1, "approved x positive control");
+        live.act(
+            Action::Key {
+                keys: vec!["tab".into()],
+                target: Some(password),
+            },
+            false,
+        )
+        .unwrap();
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn paste_into_focused_password_requires_approval() {
+    run_live_test(|| {
+        let Some((live, _, obs)) = background_fixture() else {
+            return;
+        };
+        let pid = bundle_pids("dev.orca.cu-fixture")
+            .into_iter()
+            .next()
+            .unwrap();
+        let _clipboard = TestClipboard::text("paste");
+        live.act(
+            Action::Type {
+                text: "".into(),
+                target: Some(element_named(&obs, "Password")),
+            },
+            true,
+        )
+        .unwrap();
+        let action = Action::Key {
+            keys: vec!["cmd".into(), "v".into()],
+            target: None,
+        };
+        let result = live.act_with_fallback(action.clone(), false, true);
+        assert_eq!(password_length(pid), 0, "unapproved paste entered password");
+        assert_eq!(result.unwrap_err().kind, ErrorKind::NeedsSecureApproval);
+        assert!(
+            live.act_with_fallback(action, true, true)
+                .unwrap()
+                .foreground_used
+        );
+        assert_eq!(password_length(pid), 5, "approved paste positive control");
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn background_type_checks_password_focus_after_a_noop_focus_setter() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, _) = live.launch_fixture_with_flags(&["--sticky-password-focus"]);
+        live.fixture_frontmost(pid);
+        live.background_state = Some((pid, CGEvent::location(Some(&CGEvent::new(None).unwrap()))));
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        assert!(obs.focused_secure);
+        let action = Action::Type {
+            text: "ok".into(),
+            target: Some(element_named(&obs, "Name")),
+        };
+        let result = live.act(action.clone(), false);
+        assert_eq!(
+            password_length(pid),
+            0,
+            "actual password recipient must remain empty"
+        );
+        assert_eq!(result.unwrap_err().kind, ErrorKind::NeedsSecureApproval);
+        live.act(action, true).unwrap();
+        assert_eq!(
+            password_length(pid),
+            2,
+            "approved same-target positive control"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+fn restore_suite_if_live(live_ran: bool, restore: impl FnOnce()) -> bool {
+    !live_ran || std::panic::catch_unwind(std::panic::AssertUnwindSafe(restore)).is_ok()
+}
+#[test]
+fn a_suite_without_live_tests_does_not_restore_the_gui() {
+    let restored = std::cell::Cell::new(0);
+    assert!(restore_suite_if_live(false, || restored.set(restored.get() + 1)));
+    assert_eq!(restored.get(), 0, "ordinary tests must leave the GUI alone");
+    assert!(restore_suite_if_live(true, || restored.set(restored.get() + 1)));
+    assert_eq!(restored.get(), 1, "live-suite restoration positive control");
 }

@@ -76,6 +76,7 @@ let menu = NSMenu()
 let edit = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
 let submenu = NSMenu(title: "Edit")
 submenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+submenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
 edit.submenu = submenu; menu.addItem(edit); app.mainMenu = menu
 let controller = Controller()
 let window = ProbeWindow(contentRect: NSRect(x: 200, y: 200, width: 640, height: 480),
@@ -84,7 +85,13 @@ window.title = "Orca CU Fixture"
 let button = NSButton(title: "Increment", target: controller, action: #selector(Controller.increment(_:)))
 button.frame = NSRect(x: 20, y: 420, width: 120, height: 32)
 controller.label.frame = NSRect(x: 160, y: 426, width: 200, height: 20)
-let field = NSTextField(frame: NSRect(x: 20, y: 380, width: 300, height: 24))
+final class ProbeField: NSTextField {
+    override func setAccessibilityFocused(_ focused: Bool) {
+        if CommandLine.arguments.contains("--sticky-password-focus") { return }
+        super.setAccessibilityFocused(focused)
+    }
+}
+let field = ProbeField(frame: NSRect(x: 20, y: 380, width: 300, height: 24))
 field.setAccessibilityLabel("Name"); field.delegate = controller
 let secure = NSSecureTextField(frame: NSRect(x: 340, y: 380, width: 200, height: 24))
 secure.setAccessibilityLabel("Password")
@@ -118,5 +125,8 @@ if foregroundPasswordProbe {
         window.makeFirstResponder(nil)
         log(["type": "focus_reset"])
     }
+}
+if CommandLine.arguments.contains("--sticky-password-focus") {
+    window.makeFirstResponder(secure)
 }
 app.run()

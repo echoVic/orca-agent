@@ -12,6 +12,20 @@ pub struct KeyStroke {
     pub modifiers: Modifiers,
 }
 
+impl KeyStroke {
+    /// Keys that can insert text, including paste. Navigation and shortcuts
+    /// other than Command+V do not require separate password approval.
+    pub fn enters_text(self) -> bool {
+        if self.modifiers.ctrl {
+            return false;
+        }
+        if self.modifiers.cmd {
+            return self.keycode == 9;
+        }
+        matches!(self.keycode, 0..=50) && !matches!(self.keycode, 36 | 48)
+    }
+}
+
 fn modifier(name: &str) -> Option<Modifiers> {
     let mut modifiers = Modifiers::default();
     match name {
@@ -339,5 +353,44 @@ mod tests {
         for key in ["", "enter", "command", "unknown", "ab"] {
             assert!(parse_key(key).is_err(), "{key}");
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn text_entry_classification_distinguishes_shortcuts_and_navigation() {
+    for (keys, expected) in [
+        (vec!["x"], true),
+        (vec!["9"], true),
+        (vec!["?"], true),
+        (vec!["space"], true),
+        (vec!["shift", "option", "x"], true),
+        (vec!["cmd", "v"], true),
+        (vec!["cmd", "shift", "v"], true),
+        (vec!["ctrl", "x"], false),
+        (vec!["ctrl", "cmd", "v"], false),
+        (vec!["cmd", "a"], false),
+        (vec!["cmd", "s"], false),
+        (vec!["tab"], false),
+        (vec!["return"], false),
+        (vec!["escape"], false),
+        (vec!["delete"], false),
+        (vec!["left"], false),
+        (vec!["right"], false),
+        (vec!["up"], false),
+        (vec!["down"], false),
+        (vec!["home"], false),
+        (vec!["end"], false),
+        (vec!["page_up"], false),
+        (vec!["page_down"], false),
+        (vec!["f1"], false),
+        (vec!["f12"], false),
+    ] {
+        let keys: Vec<_> = keys.into_iter().map(str::to_owned).collect();
+        assert_eq!(
+            parse_combo(&keys).unwrap().enters_text(),
+            expected,
+            "{keys:?}"
+        );
     }
 }

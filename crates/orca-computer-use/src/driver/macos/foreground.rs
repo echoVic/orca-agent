@@ -157,25 +157,31 @@ pub(super) fn run(
     let location = target
         .map(|target| point(table, application, target))
         .transpose()?;
-    // A failed background focus must not bypass the password approval gate.
-    if matches!(params.action, Action::Type { .. }) && !params.secure_approved {
-        let element = if let Some(target) = target {
-            Some(actions::target_element(table, application, target)?)
-        } else {
-            application.attribute_element("AXFocusedUIElement")?
-        };
-        if element
-            .map(|element| element.attribute_string("AXSubrole"))
+    let enters_text = match &params.action {
+        Action::Type { .. } => true,
+        Action::Key { keys, .. } => parse_combo(keys)
+            .map_err(|m| error(ErrorKind::Failed, m))?
+            .enters_text(),
+        _ => false,
+    };
+    let target_element = target
+        .map(|t| actions::target_element(table, application, t))
+        .transpose()?;
+    // A known secure target requires approval before even the focus click.
+    if enters_text
+        && !params.secure_approved
+        && target_element
+            .as_ref()
+            .map(|e| e.attribute_string("AXSubrole"))
             .transpose()?
             .flatten()
             .as_deref()
             == Some("AXSecureTextField")
-        {
-            return Err(error(
-                ErrorKind::NeedsSecureApproval,
-                "Typing into a password field requires approval",
-            ));
-        }
+    {
+        return Err(error(
+            ErrorKind::NeedsSecureApproval,
+            "Entering text into a password field requires approval",
+        ));
     }
     let old = NSWorkspace::new()
         .frontmostApplication()
@@ -243,23 +249,28 @@ pub(super) fn run(
                         }
                         thread::sleep(Duration::from_millis(50));
                     };
-                    let secure = focused.attribute_string("AXSubrole")?.as_deref()
-                        == Some("AXSecureTextField");
-                    if secure && !params.secure_approved {
-                        return Err(error(
-                            ErrorKind::NeedsSecureApproval,
-                            "Typing into a password field requires approval",
-                        ));
-                    }
+                    let _ = focused;
+                    actions::check_secure_approval(
+                        application,
+                        target_element.as_ref(),
+                        params.secure_approved,
+                    )?;
                     hid.text(text)?;
                 }
                 Action::Key { keys, .. } => {
                     if let Some(point) = location {
                         hid.click(point, Button::Left, 1, Default::default())?;
                     }
-                    hid.key(
-                        parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?,
-                    )?;
+                    let stroke =
+                        parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
+                    if stroke.enters_text() {
+                        actions::check_secure_approval(
+                            application,
+                            target_element.as_ref(),
+                            params.secure_approved,
+                        )?;
+                    }
+                    hid.key(stroke)?;
                 }
             }
             Ok(())

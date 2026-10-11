@@ -141,15 +141,7 @@ impl MacDriver {
                 }
                 Action::Type { text, target } => {
                     let element = focus(table, &application, *target)?;
-                    if element.attribute_string("AXSubrole")?.as_deref()
-                        == Some("AXSecureTextField")
-                        && !params.secure_approved
-                    {
-                        return Err(error(
-                            ErrorKind::NeedsSecureApproval,
-                            "Typing into a password field requires approval",
-                        ));
-                    }
+                    check_secure_approval(&application, Some(&element), params.secure_approved)?;
                     events::post_unicode_text(pid, text)?;
                 }
                 Action::Key { keys, target } => {
@@ -157,10 +149,17 @@ impl MacDriver {
                         parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
                     // On the real Mac, process-directed Cmd+A/Cmd+S events
                     // reached the app but did not dispatch its menu shortcut.
+                    let element = focus(table, &application, *target)?;
+                    if stroke.enters_text() {
+                        check_secure_approval(
+                            &application,
+                            Some(&element),
+                            params.secure_approved,
+                        )?;
+                    }
                     if stroke.modifiers.cmd {
                         return Err(foreground("Command shortcuts require the foreground"));
                     }
-                    focus(table, &application, *target)?;
                     events::post_key(pid, stroke)?;
                 }
                 Action::Scroll {
@@ -205,6 +204,27 @@ impl MacDriver {
         }
         Ok(outcome)
     }
+}
+
+/// Check both the requested target and the actual recipient, after focus/click.
+pub(super) fn check_secure_approval(
+    application: &AxElement,
+    target: Option<&AxElement>,
+    approved: bool,
+) -> Result<(), DriverError> {
+    if approved {
+        return Ok(());
+    }
+    let focused = application.attribute_element("AXFocusedUIElement")?;
+    for element in target.into_iter().chain(focused.as_ref()) {
+        if element.attribute_string("AXSubrole")?.as_deref() == Some("AXSecureTextField") {
+            return Err(error(
+                ErrorKind::NeedsSecureApproval,
+                "Entering text into a password field requires approval",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn click_target_element(
