@@ -1211,7 +1211,7 @@ fn observe_of_an_electron_app_waits_for_its_tree() {
         );
         register_launch_pids(&mut live.launched, &before, &bundle_pids(&bundle));
         result.unwrap();
-        let observation = observe_after_launch(&live, &bundle);
+        let observation = live.observe(&bundle, None);
         eprintln!(
             "Electron {bundle}: no_element_tree={}, elements={}, buttons={}, text_fields={}; fixture control has both roles",
             observation.no_element_tree,
@@ -1235,58 +1235,6 @@ fn observe_of_an_electron_app_waits_for_its_tree() {
                 .any(|e| e.role == "button" || e.role == "text field")
         );
     });
-}
-
-// Characterize cold-launch readiness separately from the driver's tree poll.
-// Log every failed observe; a later success does not erase the initial result.
-fn observe_after_launch(live: &Live, app: &str) -> Observation {
-    // Launch completion can precede the first window when no file was opened.
-    let launch_deadline = Instant::now() + Duration::from_secs(60);
-    while !live
-        .apps()
-        .iter()
-        .any(|info| info.bundle_id == app && !info.windows.is_empty())
-    {
-        assert!(
-            Instant::now() < launch_deadline,
-            "{app} did not open a window"
-        );
-        thread::sleep(Duration::from_millis(100));
-    }
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        match live.client.call(
-            Request::Observe(ObserveParams {
-                app: app.into(),
-                window: None,
-                query: None,
-                max_elements: 300,
-                include_screenshot: true,
-            }),
-            Duration::from_secs(30),
-        ) {
-            Ok(Reply::Observed { observation }) => {
-                // A launch animation can expose just the three title-bar buttons.
-                if observation.elements.len() > 3 || Instant::now() >= deadline {
-                    return observation;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(orca_computer_use::client::CallError::Driver(error))
-                if error.kind == ErrorKind::WindowNotFound
-                    || (error.kind == ErrorKind::Failed
-                        && error.message == "Accessibility AXWindows failed: AXError(-25204)") =>
-            {
-                eprintln!("cold-launch observe of {app}: {error:?}");
-                assert!(
-                    Instant::now() < deadline,
-                    "AXWindows never became ready for {app}"
-                );
-                thread::sleep(Duration::from_millis(100));
-            }
-            other => panic!("unexpected launch observation: {other:?}"),
-        }
-    }
 }
 
 #[test]
@@ -1319,7 +1267,6 @@ fn observe_stocks_after_dismissing_its_welcome_page() {
             &bundle_pids("com.apple.stocks"),
         );
         result.unwrap();
-        observe_after_launch(&live, "com.apple.stocks");
         // Stocks' first-run welcome view loads asynchronously after its window.
         thread::sleep(Duration::from_secs(20));
         let mut observation = live.observe("com.apple.stocks", None);
@@ -1701,21 +1648,34 @@ fn cmd_s_saves_textedit_in_the_background() {
             "com.apple.TextEdit",
             Some(window),
             Action::Type {
-                text: "edited by Orca".into(),
+                text: "Edited by Orca".into(),
                 target: Some(Target::Element { element: text_area }),
             },
             false,
             true,
         )
         .unwrap();
-        let edited = live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
-        assert!(
-            edited.elements.iter().any(|e| e
-                .value
-                .as_deref()
-                .is_some_and(|v| v.contains("edited by Orca"))),
-            "positive control: typing dirtied our own document"
-        );
+        let edited_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let edited = live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
+            if edited.elements.iter().any(|e| {
+                e.value
+                    .as_deref()
+                    .is_some_and(|v| v.contains("Edited by Orca"))
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < edited_deadline,
+                "positive control: typing did not dirty our own document: {:?}",
+                edited
+                    .elements
+                    .iter()
+                    .filter(|e| e.role == "text area")
+                    .collect::<Vec<_>>()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         live.assert_frontmost_and_pointer_unchanged();
         let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
         let action = Action::Key {
@@ -1758,7 +1718,7 @@ fn cmd_s_saves_textedit_in_the_background() {
         assert!(
             std::fs::read_to_string(&file)
                 .unwrap()
-                .contains("edited by Orca")
+                .contains("Edited by Orca")
         );
         assert!(saved, "background Cmd+S did not change the file mtime");
         assert!(outcome.foreground_used);

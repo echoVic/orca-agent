@@ -8,11 +8,12 @@ use objc2::rc::Retained;
 use objc2_app_kit::{
     NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration,
 };
+use objc2_application_services::AXError;
 use objc2_core_graphics::CGPreflightScreenCaptureAccess;
 use objc2_foundation::{NSArray, NSBundle, NSError, NSString, NSURL};
 use objc2_screen_capture_kit::SCShareableContent;
 
-use super::error;
+use super::{ax::AxElement, error};
 use crate::protocol::{AppInfo, DriverError, ErrorKind, WindowInfo};
 
 fn info_string(bundle: &NSBundle, key: &str) -> Option<String> {
@@ -182,6 +183,49 @@ pub(super) fn resolve(name: &str, allow_not_running: bool) -> Result<AppInfo, Dr
     ))
 }
 
+fn wait_for_accessibility_window(pid: i32, launch_deadline: Instant) -> bool {
+    let deadline = launch_deadline.min(Instant::now() + Duration::from_secs(10));
+    let Ok(application) = AxElement::application(pid) else {
+        return false;
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+    // Enable the same accessibility support as observe before polling Electron.
+    // This handle belongs only to launch; observe gets its usual 2 s timeout.
+    if unsafe {
+        application
+            .0
+            .set_messaging_timeout(remaining.as_secs_f32().min(2.0))
+    } != AXError::Success
+    {
+        return false;
+    }
+    let _ = application.set_bool("AXManualAccessibility", true);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        // Bound even the final native call by the remaining launch/window budget.
+        if unsafe {
+            application
+                .0
+                .set_messaging_timeout(remaining.as_secs_f32().min(2.0))
+        } == AXError::Success
+            && application
+                .elements("AXWindows")
+                .is_ok_and(|windows| !windows.is_empty())
+        {
+            return true;
+        }
+        thread::sleep(
+            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
 pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let app = resolve(name, true)?;
@@ -251,8 +295,19 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
         }
         if let Some(app) = list_with_timeout(remaining)?.into_iter().find(|candidate| {
             candidate.bundle_id == app.bundle_id && candidate.pid == Some(launched_pid)
-        }) && (open.is_empty() || !app.windows.is_empty())
-        {
+        }) {
+            if wait_for_accessibility_window(launched_pid, deadline) {
+                // The first capture listing can precede the now-readable window.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !remaining.is_zero()
+                    && let Some(refreshed) = list_with_timeout(remaining)?
+                        .into_iter()
+                        .find(|candidate| candidate.pid == Some(launched_pid))
+                {
+                    return Ok(refreshed);
+                }
+            }
+            // Windowless apps still launch successfully after the bounded wait.
             return Ok(app);
         }
         thread::sleep(Duration::from_millis(100).min(remaining));
@@ -262,6 +317,16 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unavailable_ax_window_uses_the_remaining_launch_deadline() {
+        let started = Instant::now();
+        assert!(!wait_for_accessibility_window(
+            i32::MAX,
+            started + Duration::from_millis(100)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn a_regular_app_without_shareable_windows_stays_in_the_list() {

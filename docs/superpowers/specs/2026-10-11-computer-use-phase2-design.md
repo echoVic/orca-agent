@@ -221,3 +221,8 @@
 Step 6 还发现了进程内测试没覆盖的真实驱动进程问题：观察时 CoreGraphics 报 `CGS_REQUIRE_INIT` 并中止进程，崩溃栈位于 ScreenCaptureKit 的 `SCContentFilter` 构造回调。先新增并跑失败的 `real_macos_driver_observes_the_fixture_from_its_own_process`，再在 `run_stdio` 的主线程、启动 worker 前初始化 `NSWorkspace` 和 CoreGraphics（创建一个不投递的 `CGEvent`）。仅初始化 `NSWorkspace` 仍失败；完整修复后，真实驱动进程的夹具观察、截图和 turn 开关测试通过，真实 TUI 的工具调用也成功。进程仍只由 `ExecutionBroker::launch_user_trusted` 启动，stdio 和 stderr 的路由未改变。
 
 Step 7：各代码修复分别提交；本节使用任务简报指定的提交消息记录。提交前执行格式、workspace clippy、两个平台／runtime surface 校验器和修改 crate 的测试。没有推送、切换分支或使用用户的 `~/.orca`、真实 API key。
+
+**修复轮次 1（2026-10-12）**：上表保留初轮的观察记录；以下两项更新生产行为和验证结论。
+
+- 观察和按元素 id 操作的 stale 检查共用一个 label helper，按 `AXTitle`、`AXDescription`、`AXPlaceholderValue` 的顺序读取，并统一使用 R7 的 optional-read 语义。夹具 NSTextView 的 `AXDescription` 返回 Failure 时，按观察中的 id 滚动也成功；TextEdit 的文本区同样可以按 id 输入。角色和位置／大小仍是 required reads，标签变化仍返回 `Stale`。
+- `launch` 在已启动进程出现后启用无障碍支持，等到 `AXWindows` 可读且非空再返回；无窗口的应用最多等 10 秒后仍启动成功，等待受原 60 秒 launch deadline 限制，最后一次 AX 调用的 timeout 也不超过剩余时间。打开文件的路径使用同一就绪检查并刷新返回的窗口信息。Electron 测试已删除 harness 的 capture-window wait 和 3 秒 observe retry；Cherry Studio 现在在 `launch_app` 返回后立即观察成功，仍记录元素及控件数量。
