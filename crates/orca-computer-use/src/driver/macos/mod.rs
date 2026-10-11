@@ -2,12 +2,16 @@ mod actions;
 mod apps;
 mod ax;
 mod capture;
+mod esc_tap;
 mod events;
+mod foreground;
 mod permissions;
 mod tree;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     geometry,
@@ -26,7 +30,8 @@ use crate::serve::{DriverHandler, LineWriter};
 pub struct MacDriver {
     lock_path: PathBuf,
     lock: Option<ExclusiveFileLock>,
-    turn_active: bool,
+    esc_tap: Option<esc_tap::EscTap>,
+    aborted: Arc<AtomicBool>,
     hello_complete: bool,
     pub(crate) element_tables: HashMap<(i32, u32), ElementTable>,
     accessibility_enabled: HashSet<i32>,
@@ -37,7 +42,8 @@ impl MacDriver {
         Self {
             lock_path,
             lock: None,
-            turn_active: false,
+            esc_tap: None,
+            aborted: Arc::new(AtomicBool::new(false)),
             hello_complete: false,
             element_tables: HashMap::new(),
             accessibility_enabled: HashSet::new(),
@@ -172,7 +178,7 @@ pub(super) fn error(kind: ErrorKind, message: impl Into<String>) -> DriverError 
 }
 
 impl DriverHandler for MacDriver {
-    fn handle(&mut self, request: Request, _events: &LineWriter) -> Result<Reply, DriverError> {
+    fn handle(&mut self, request: Request, events: &LineWriter) -> Result<Reply, DriverError> {
         if !matches!(request, Request::Hello { .. } | Request::Shutdown)
             && (!self.hello_complete || self.lock.is_none())
         {
@@ -217,7 +223,16 @@ impl DriverHandler for MacDriver {
                 app: apps::launch(&app, &open)?,
             }),
             Request::Turn { active } => {
-                self.turn_active = active;
+                if active && self.esc_tap.is_none() {
+                    self.aborted.store(false, Ordering::SeqCst);
+                    self.esc_tap = Some(esc_tap::EscTap::start(
+                        events.clone(),
+                        self.aborted.clone(),
+                    )?);
+                } else if !active {
+                    self.esc_tap.take();
+                    self.aborted.store(false, Ordering::SeqCst);
+                }
                 Ok(Reply::Done)
             }
             Request::Shutdown => {
@@ -235,7 +250,8 @@ impl DriverHandler for MacDriver {
 
     fn shutdown(&mut self) {
         self.hello_complete = false;
-        self.turn_active = false;
+        self.esc_tap.take();
+        self.aborted.store(false, Ordering::SeqCst);
         self.lock.take();
         self.element_tables.clear();
         self.accessibility_enabled.clear();

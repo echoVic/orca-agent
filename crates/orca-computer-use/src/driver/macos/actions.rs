@@ -1,7 +1,8 @@
 use objc2_app_kit::NSRunningApplication;
 
 use super::{
-    MacDriver, apps, ax::AxElement, capture, error, events, frames_match, tree::ElementTable,
+    MacDriver, apps, ax::AxElement, capture, error, events, foreground, frames_match,
+    tree::ElementTable,
 };
 use crate::{
     keys::parse_combo,
@@ -58,7 +59,8 @@ impl MacDriver {
                 break;
             }
         }
-        let frame = ax_window.ok_or_else(stale)?.position_size()?;
+        let ax_window = ax_window.ok_or_else(stale)?;
+        let frame = ax_window.position_size()?;
         if !frame
             .into_iter()
             .zip(table.window_frame)
@@ -72,96 +74,120 @@ impl MacDriver {
             scroll_position: None,
             observation: None,
         };
-        match &params.action {
-            Action::Click {
-                target,
-                button,
-                count,
-                modifiers,
-            } => {
-                // A point target only needs the window stale check above.
-                // Unsupported variants must not reach the native hit test.
-                let needs_foreground = *count == 2 || !modifiers.is_empty();
-                let click_message = "Double clicks and modified clicks require the foreground";
-                if matches!(target, Target::Point { .. }) {
+        let background = (|| {
+            match &params.action {
+                Action::Click {
+                    target,
+                    button,
+                    count,
+                    modifiers,
+                } => {
+                    // A point target only needs the window stale check above.
+                    // Unsupported variants must not reach the native hit test.
+                    let needs_foreground = *count == 2 || !modifiers.is_empty();
+                    let click_message = "Double clicks and modified clicks require the foreground";
+                    if matches!(target, Target::Point { .. }) {
+                        if needs_foreground {
+                            return Err(foreground(click_message));
+                        }
+                        if *button == Button::Right {
+                            return Err(foreground("Right point clicks require the foreground"));
+                        }
+                    }
+                    let hidden = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+                        .is_some_and(|app| app.isHidden());
+                    let element = click_target_element(table, &application, *target, hidden)?;
                     if needs_foreground {
                         return Err(foreground(click_message));
                     }
-                    if *button == Button::Right {
-                        return Err(foreground("Right point clicks require the foreground"));
-                    }
-                }
-                let hidden = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
-                    .is_some_and(|app| app.isHidden());
-                let element = click_target_element(table, &application, *target, hidden)?;
-                if needs_foreground {
-                    return Err(foreground(click_message));
-                }
-                match target {
-                    Target::Element { .. } => {
-                        let action = if *button == Button::Left {
-                            "AXPress"
-                        } else {
-                            "AXShowMenu"
-                        };
-                        if !element.actions()?.iter().any(|a| a == action) {
-                            return Err(foreground(format!(
-                                "The element does not support {action}"
-                            )));
-                        }
-                        element.perform(action)?;
-                    }
-                    Target::Point { point } => {
-                        let mut candidate = Some(element);
-                        // The hit element plus at most five ancestors.
-                        let mut pressed = false;
-                        for depth in 0..=5 {
-                            let Some(element) = candidate else { break };
-                            if element.actions()?.iter().any(|a| a == "AXPress") {
-                                element.perform("AXPress")?;
-                                pressed = true;
-                                break;
+                    match target {
+                        Target::Element { .. } => {
+                            let action = if *button == Button::Left {
+                                "AXPress"
+                            } else {
+                                "AXShowMenu"
+                            };
+                            if !element.actions()?.iter().any(|a| a == action) {
+                                return Err(foreground(format!(
+                                    "The element does not support {action}"
+                                )));
                             }
-                            if depth == 5 {
-                                break;
-                            }
-                            candidate = element.attribute_element("AXParent")?;
+                            element.perform(action)?;
                         }
-                        if !pressed {
-                            return Err(foreground(format!(
-                                "no pressable element at ({},{})",
-                                point[0], point[1]
-                            )));
+                        Target::Point { point } => {
+                            let mut candidate = Some(element);
+                            // The hit element plus at most five ancestors.
+                            let mut pressed = false;
+                            for depth in 0..=5 {
+                                let Some(element) = candidate else { break };
+                                if element.actions()?.iter().any(|a| a == "AXPress") {
+                                    element.perform("AXPress")?;
+                                    pressed = true;
+                                    break;
+                                }
+                                if depth == 5 {
+                                    break;
+                                }
+                                candidate = element.attribute_element("AXParent")?;
+                            }
+                            if !pressed {
+                                return Err(foreground(format!(
+                                    "no pressable element at ({},{})",
+                                    point[0], point[1]
+                                )));
+                            }
                         }
                     }
                 }
-            }
-            Action::Type { text, target } => {
-                let element = focus(table, &application, *target)?;
-                if element.attribute_string("AXSubrole")?.as_deref() == Some("AXSecureTextField")
-                    && !params.secure_approved
-                {
-                    return Err(error(
-                        ErrorKind::NeedsSecureApproval,
-                        "Typing into a password field requires approval",
-                    ));
+                Action::Type { text, target } => {
+                    let element = focus(table, &application, *target)?;
+                    if element.attribute_string("AXSubrole")?.as_deref()
+                        == Some("AXSecureTextField")
+                        && !params.secure_approved
+                    {
+                        return Err(error(
+                            ErrorKind::NeedsSecureApproval,
+                            "Typing into a password field requires approval",
+                        ));
+                    }
+                    events::post_unicode_text(pid, text)?;
                 }
-                events::post_unicode_text(pid, text)?;
+                Action::Key { keys, target } => {
+                    focus(table, &application, *target)?;
+                    let stroke =
+                        parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
+                    events::post_key(pid, stroke)?;
+                }
+                Action::Scroll {
+                    target,
+                    direction,
+                    amount,
+                } => {
+                    let element = target_element(table, &application, *target)?;
+                    outcome.scroll_position = scroll(table, element, *direction, *amount)?;
+                }
             }
-            Action::Key { keys, target } => {
-                focus(table, &application, *target)?;
-                let stroke =
-                    parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
-                events::post_key(pid, stroke)?;
+            Ok(())
+        })();
+        if let Err(mut failure) = background {
+            if failure.kind != ErrorKind::NeedsForeground {
+                return Err(failure);
             }
-            Action::Scroll {
-                target,
-                direction,
-                amount,
-            } => {
-                let element = target_element(table, &application, *target)?;
-                outcome.scroll_position = scroll(table, element, *direction, *amount)?;
+            if !params.foreground_fallback {
+                failure
+                    .message
+                    .push_str("; the foreground fallback is turned off");
+                return Err(failure);
             }
+            outcome.note = Some(foreground::run(
+                pid,
+                &application,
+                &ax_window,
+                table,
+                &params,
+                &self.aborted,
+            )?);
+            outcome.foreground_used = true;
         }
         if params.observe_after {
             outcome.observation = Some(self.observe(ObserveParams {
@@ -188,7 +214,7 @@ fn click_target_element(
     target_element(table, application, target)
 }
 
-fn target_element(
+pub(super) fn target_element(
     table: &ElementTable,
     application: &AxElement,
     target: Target,

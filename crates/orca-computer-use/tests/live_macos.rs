@@ -194,6 +194,7 @@ struct Live {
     running: HashSet<i32>,
     launched: HashSet<i32>,
     background_state: Option<(i32, objc2_core_foundation::CGPoint)>,
+    esc_events: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Live {
@@ -215,7 +216,15 @@ impl Live {
         let directory = tempfile::tempdir().unwrap();
         let launcher =
             InProcessLauncher::new(MacDriver::new(directory.path().join("computer-use.lock")));
-        let (client, hello) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        let esc_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received = esc_events.clone();
+        let (client, hello) = DriverClient::start(
+            &launcher,
+            Arc::new(move |_| {
+                received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        )
+        .unwrap();
         let live = Self {
             client,
             hello,
@@ -225,6 +234,7 @@ impl Live {
             running,
             launched: HashSet::new(),
             background_state: None,
+            esc_events,
         };
         let permissions = live.hello.permissions;
         if !permissions.accessibility || !permissions.screen_recording || !permissions.event_tap {
@@ -277,6 +287,15 @@ impl Live {
     }
 
     fn act(&self, action: Action, secure_approved: bool) -> Result<ActOutcome, DriverError> {
+        self.act_with_fallback(action, secure_approved, false)
+    }
+
+    fn act_with_fallback(
+        &self,
+        action: Action,
+        secure_approved: bool,
+        foreground_fallback: bool,
+    ) -> Result<ActOutcome, DriverError> {
         match self
             .client
             .call(
@@ -284,7 +303,7 @@ impl Live {
                     app: "dev.orca.cu-fixture".into(),
                     window: None,
                     action,
-                    foreground_fallback: false,
+                    foreground_fallback,
                     observe_after: true,
                     include_screenshot: false,
                     secure_approved,
@@ -298,6 +317,85 @@ impl Live {
             Reply::Acted { outcome } => Ok(outcome),
             other => panic!("unexpected act reply: {other:?}"),
         }
+    }
+
+    fn point_inside(&self, observation: &Observation, name: &str) -> Target {
+        if name == "canvas" {
+            let image = observation.screenshot.as_ref().unwrap();
+            return Target::Point {
+                point: [f64::from(image.width) * 0.75, f64::from(image.height) * 0.5],
+            };
+        }
+        let frame = observation
+            .elements
+            .iter()
+            .find(|e| e.label.as_deref() == Some(name))
+            .unwrap()
+            .frame;
+        Target::Point {
+            point: [
+                f64::from(frame[0]) + f64::from(frame[2]) / 2.0,
+                f64::from(frame[1]) + f64::from(frame[3]) / 2.0,
+            ],
+        }
+    }
+
+    fn turn(&self, active: bool) {
+        assert_eq!(
+            self.client
+                .call(Request::Turn { active }, Duration::from_secs(5))
+                .unwrap(),
+            Reply::Done
+        );
+    }
+
+    fn esc_count(&self) -> usize {
+        self.esc_events.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn fixture_frontmost(&self, pid: i32) {
+        if NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .map(|app| app.processIdentifier())
+            != Some(pid)
+        {
+            record_restoration(
+                Some(pid),
+                CGEvent::location(Some(&CGEvent::new(None).unwrap())),
+            );
+        }
+        assert_eq!(
+            NSWorkspace::sharedWorkspace()
+                .frontmostApplication()
+                .unwrap()
+                .processIdentifier(),
+            pid,
+            "fixture must be frontmost before HID keyboard input"
+        );
+    }
+
+    fn post_esc(&self, pid: i32, marker: i64) {
+        use objc2_core_graphics::{CGEventField, CGEventTapLocation};
+        let source = CGEventSource::new(CGEventSourceStateID::Private).unwrap();
+        for down in [true, false] {
+            let event = CGEvent::new_keyboard_event(Some(&source), 53, down).unwrap();
+            CGEvent::set_integer_value_field(
+                Some(&event),
+                CGEventField::EventSourceUserData,
+                marker,
+            );
+            assert_eq!(
+                NSWorkspace::sharedWorkspace()
+                    .frontmostApplication()
+                    .unwrap()
+                    .processIdentifier(),
+                pid,
+                "refusing to post HID keyboard input to another app"
+            );
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+            record_test_hid_event();
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 
     fn make_finder_frontmost(&mut self) {
@@ -1404,7 +1502,419 @@ fn a_point_on_a_hidden_button_needs_the_foreground() {
         }
         let error = live.act(action, false).unwrap_err();
         assert_eq!(error.kind, ErrorKind::NeedsForeground);
-        assert_eq!(error.message, "The app is hidden");
+        assert_eq!(
+            error.message,
+            "The app is hidden; the foreground fallback is turned off"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn a_canvas_click_uses_the_foreground_and_restores_it() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let action = click_target(live.point_inside(&obs, "canvas"));
+        let disabled = live.act(action.clone(), false).unwrap_err();
+        assert_eq!(disabled.kind, ErrorKind::NeedsForeground);
+        assert!(
+            disabled
+                .message
+                .ends_with("; the foreground fallback is turned off")
+        );
+        let original_name = NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .unwrap()
+            .localizedName()
+            .unwrap()
+            .to_string();
+        let outcome = live.act_with_fallback(action, false, true).unwrap();
+        assert!(outcome.foreground_used);
+        assert_eq!(
+            outcome.note,
+            Some(format!(
+                "used the foreground (switched back to {original_name})"
+            ))
+        );
+        live.assert_log_contains(&log, r#""type":"canvas_click""#);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+fn esc_fixture() -> Option<(Live, i32, PathBuf)> {
+    let mut live = Live::start()?;
+    let (pid, log) = live.launch_fixture();
+    live.fixture_frontmost(pid);
+    let obs = live.observe("dev.orca.cu-fixture", None);
+    live.act(
+        Action::Type {
+            text: "".into(),
+            target: Some(element_named(&obs, "Name")),
+        },
+        false,
+    )
+    .unwrap();
+    Some((live, pid, log))
+}
+
+fn log_has_esc(log: &std::path::Path) -> bool {
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|event| event["type"] == "keydown" && event["chars"] == "\u{1b}")
+}
+
+#[test]
+#[ignore]
+fn the_esc_listener_swallows_a_user_esc_and_reports_it() {
+    run_live_test(|| {
+        let Some((live, pid, log)) = esc_fixture() else {
+            return;
+        };
+        live.turn(true);
+        live.turn(true); // Installing twice must not duplicate the callback.
+        live.post_esc(pid, 0x4F52_4341);
+        assert!(
+            log_has_esc(&log),
+            "positive control: marked Esc reaches the focused fixture"
+        );
+        std::fs::write(&log, "").unwrap();
+        live.post_esc(pid, 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while live.esc_count() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(live.esc_count(), 1);
+        assert!(!log_has_esc(&log));
+        live.turn(false);
+    });
+}
+
+#[test]
+#[ignore]
+fn the_drivers_own_esc_passes_the_listener() {
+    run_live_test(|| {
+        let Some((live, pid, log)) = esc_fixture() else {
+            return;
+        };
+        live.turn(true);
+        live.post_esc(pid, 0x4F52_4341);
+        assert!(log_has_esc(&log));
+        assert_eq!(live.esc_count(), 0);
+        live.post_esc(pid, 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while live.esc_count() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(live.esc_count(), 1, "positive control: listener is active");
+        live.turn(false);
+    });
+}
+
+#[test]
+#[ignore]
+fn the_listener_is_gone_after_the_turn_ends() {
+    run_live_test(|| {
+        let Some((live, pid, log)) = esc_fixture() else {
+            return;
+        };
+        live.turn(true);
+        live.post_esc(pid, 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while live.esc_count() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(live.esc_count(), 1, "positive control: listener was active");
+        live.turn(false);
+        live.turn(false);
+        live.post_esc(pid, 0);
+        assert!(log_has_esc(&log));
+        assert_eq!(live.esc_count(), 1);
+    });
+}
+
+#[test]
+#[ignore]
+fn a_busy_user_makes_the_fallback_give_up() {
+    run_live_test(|| {
+        use objc2_core_graphics::{CGEventTapLocation, CGMouseButton};
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let action = click_target(live.point_inside(&obs, "canvas"));
+        let source = CGEventSource::new(CGEventSourceStateID::Private).unwrap();
+        let point = CGEvent::location(Some(&CGEvent::new(None).unwrap()));
+        let movement = CGEvent::new_mouse_event(
+            Some(&source),
+            CGEventType::MouseMoved,
+            point,
+            CGMouseButton::Left,
+        )
+        .unwrap();
+        let post = || {
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&movement));
+            record_test_hid_event();
+        };
+        post();
+        thread::sleep(Duration::from_millis(20));
+        // Sustain activity through the three-second wait; one movement alone
+        // becomes idle after 0.5s and is required to permit the fallback.
+        let result = thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let live = &live;
+            let action = action.clone();
+            scope.spawn(move || {
+                send.send(live.act_with_fallback(action, false, true))
+                    .unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(result) = receive.try_recv() {
+                    break result;
+                }
+                assert!(Instant::now() < deadline, "busy fallback did not finish");
+                post();
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::UserActive);
+        assert_eq!(
+            error.message,
+            "the user is typing or moving the mouse; try again in a moment"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("canvas_click")
+        );
+        thread::sleep(Duration::from_millis(550));
+        assert!(
+            live.act_with_fallback(action, false, true)
+                .unwrap()
+                .foreground_used
+        );
+        live.assert_log_contains(&log, r#""type":"canvas_click""#);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn a_double_canvas_click_uses_the_foreground() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let action = Action::Click {
+            target: live.point_inside(&obs, "canvas"),
+            button: Button::Left,
+            count: 2,
+            modifiers: vec!["shift".into()],
+        };
+        assert!(
+            live.act_with_fallback(action, false, true)
+                .unwrap()
+                .foreground_used
+        );
+        live.assert_log_contains(&log, r#""clicks":2"#);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn a_failed_foreground_action_restores_the_app_and_pointer() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let target = live.point_inside(&obs, "canvas");
+        let error = live
+            .act_with_fallback(
+                Action::Click {
+                    target,
+                    button: Button::Left,
+                    count: 1,
+                    modifiers: vec!["invalid".into()],
+                },
+                false,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Failed);
+        assert!(error.message.contains("unknown key"));
+        live.assert_frontmost_and_pointer_unchanged();
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("canvas_click")
+        );
+        assert!(
+            live.act_with_fallback(click_target(target), false, true)
+                .unwrap()
+                .foreground_used
+        );
+        live.assert_log_contains(&log, r#""type":"canvas_click""#);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn esc_stops_a_foreground_action_and_releases_it() {
+    run_live_test(|| {
+        use objc2_core_graphics::CGEventFlags;
+        let Some((mut live, pid, log)) = esc_fixture() else {
+            return;
+        };
+        live.make_finder_frontmost();
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let target = live.point_inside(&obs, "canvas");
+        // Modified double clicks always require the foreground.
+        let shift_before = CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState)
+            .contains(CGEventFlags::MaskShift);
+        live.turn(true);
+        let control = live
+            .act_with_fallback(
+                Action::Click {
+                    target,
+                    button: Button::Left,
+                    count: 2,
+                    modifiers: vec!["shift".into()],
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert!(control.foreground_used);
+        live.assert_log_contains(&log, r#""clicks":2"#);
+        live.assert_frontmost_and_pointer_unchanged();
+        std::fs::write(&log, "").unwrap();
+        let result = thread::scope(|scope| {
+            let driver = &live;
+            let pending = scope.spawn(move || {
+                driver.act_with_fallback(
+                    Action::Click {
+                        target,
+                        button: Button::Left,
+                        count: 2,
+                        modifiers: vec!["shift".into()],
+                    },
+                    false,
+                    true,
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(4);
+            // Wait for actual delivery of the first down, then stop between
+            // events while the driver still owns the button and Shift key.
+            while !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("canvas_click")
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "foreground click was not delivered"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            live.post_esc(pid, 0);
+            pending.join().unwrap()
+        });
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Failed);
+        assert_eq!(error.message, "the turn was stopped by Esc");
+        assert_eq!(live.esc_count(), 1);
+        assert!(!log_has_esc(&log));
+        assert_eq!(
+            CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState)
+                .contains(CGEventFlags::MaskShift),
+            shift_before,
+            "the interrupted Shift modifier was released"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+        live.turn(false);
+        live.turn(true);
+        assert!(
+            live.act_with_fallback(click_target(target), false, true)
+                .unwrap()
+                .foreground_used
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+        live.turn(false);
+    });
+}
+
+#[test]
+#[ignore]
+fn a_window_moved_during_the_foreground_idle_wait_is_stale() {
+    run_live_test(|| {
+        use objc2_core_graphics::{CGEventTapLocation, CGMouseButton};
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let action = click_target(live.point_inside(&obs, "canvas"));
+        let source = CGEventSource::new(CGEventSourceStateID::Private).unwrap();
+        let pointer = CGEvent::location(Some(&CGEvent::new(None).unwrap()));
+        let movement = CGEvent::new_mouse_event(
+            Some(&source),
+            CGEventType::MouseMoved,
+            pointer,
+            CGMouseButton::Left,
+        )
+        .unwrap();
+        let post = || {
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&movement));
+            record_test_hid_event();
+        };
+        post();
+        thread::sleep(Duration::from_millis(20));
+        let result = thread::scope(|scope| {
+            let driver = &live;
+            let pending = scope.spawn(move || driver.act_with_fallback(action, false, true));
+            // Keep the driver in the idle wait while moving its observed window.
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(1) {
+                post();
+                thread::sleep(Duration::from_millis(50));
+            }
+            let output = Command::new("osascript").args(["-e", "tell application \"System Events\" to tell process \"CUFixture\" to set position of window 1 to {250, 250}"]).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            post();
+            pending.join().unwrap()
+        });
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Stale);
+        assert_eq!(
+            error.message,
+            "the window changed since the last observe; observe again"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("canvas_click")
+        );
+        let fresh = live.observe("dev.orca.cu-fixture", None);
+        assert!(
+            live.act_with_fallback(
+                click_target(live.point_inside(&fresh, "canvas")),
+                false,
+                true
+            )
+            .unwrap()
+            .foreground_used
+        );
+        live.assert_log_contains(&log, r#""type":"canvas_click""#);
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
