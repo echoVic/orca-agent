@@ -148,7 +148,7 @@ fn run_live_test(body: impl Fn()) {
 use std::thread;
 use std::time::{Duration, Instant};
 
-use objc2_app_kit::{NSRunningApplication, NSWorkspace};
+use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
 use objc2_core_graphics::{
     CGEvent, CGEventSource, CGEventSourceStateID, CGEventType, CGWarpMouseCursorPosition,
 };
@@ -572,28 +572,16 @@ fn cleanup_pids(running: &HashSet<i32>, launched: &HashSet<i32>) -> Vec<i32> {
 }
 
 fn record_restoration(frontmost: Option<i32>, pointer: objc2_core_foundation::CGPoint) {
-    use objc2_application_services::{AXError, AXUIElement};
-    use objc2_core_foundation::{CFBoolean, CFString};
     use objc2_core_graphics::CGError;
     if let Some(pid) = frontmost {
-        let app = unsafe { AXUIElement::new_application(pid) };
-        let timeout = unsafe { app.set_messaging_timeout(2.0) };
-        if timeout != AXError::Success {
+        let restored = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            .is_some_and(|app| {
+                app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows)
+            });
+        if !restored {
             record_gui_failure(
                 GuiFailureKind::NativeOperation,
-                format!("AX timeout for PID {pid}: {timeout:?}"),
-            );
-        }
-        let restored = unsafe {
-            app.set_attribute_value(
-                &CFString::from_str("AXFrontmost"),
-                CFBoolean::new(true).as_ref(),
-            )
-        };
-        if restored != AXError::Success {
-            record_gui_failure(
-                GuiFailureKind::NativeOperation,
-                format!("frontmost restore for PID {pid}: {restored:?}"),
+                format!("frontmost activation for PID {pid} failed"),
             );
         } else {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -1536,7 +1524,23 @@ fn a_canvas_click_uses_the_foreground_and_restores_it() {
         let Some((live, log, obs)) = background_fixture() else {
             return;
         };
+        // Positive control: the same HID canvas action works while the fixture
+        // is frontmost. The background case below also has to restore Finder.
+        let fixture_pid = bundle_pids("dev.orca.cu-fixture")
+            .into_iter()
+            .next()
+            .unwrap();
+        live.fixture_frontmost(fixture_pid);
         let action = click_target(live.point_inside(&obs, "canvas"));
+        assert!(
+            live.act_with_fallback(action.clone(), false, true)
+                .unwrap()
+                .foreground_used
+        );
+        live.assert_log_contains(&log, r#""type":"canvas_click""#);
+        std::fs::write(&log, "").unwrap();
+        let mut live = live;
+        live.make_finder_frontmost();
         let disabled = live.act(action.clone(), false).unwrap_err();
         assert_eq!(disabled.kind, ErrorKind::NeedsForeground);
         assert!(
@@ -1559,6 +1563,14 @@ fn a_canvas_click_uses_the_foreground_and_restores_it() {
             ))
         );
         live.assert_log_contains(&log, r#""type":"canvas_click""#);
+        live.assert_frontmost_and_pointer_unchanged();
+        // Task 8's restore failure followed a HID click into Password from Finder.
+        let password = click_target(element_named(&obs, "Password"));
+        assert!(
+            live.act_with_fallback(password, false, true)
+                .unwrap()
+                .foreground_used
+        );
         live.assert_frontmost_and_pointer_unchanged();
     });
 }

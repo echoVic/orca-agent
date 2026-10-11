@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use objc2_app_kit::NSWorkspace;
+use objc2::rc::Retained;
+use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
 use objc2_core_foundation::CGPoint;
 use objc2_core_graphics::{
     CGError, CGEvent, CGEventSource, CGEventSourceStateID, CGEventType, CGWarpMouseCursorPosition,
@@ -38,9 +39,15 @@ fn wait_frontmost(pid: i32) -> Result<(), DriverError> {
     Ok(())
 }
 
+fn activate(application: &NSRunningApplication) -> Result<(), DriverError> {
+    if !application.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows) {
+        return Err(error(ErrorKind::Failed, "Could not activate the app"));
+    }
+    wait_frontmost(application.processIdentifier())
+}
+
 struct Restore {
-    application: AxElement,
-    pid: i32,
+    application: Retained<NSRunningApplication>,
     pointer: CGPoint,
     restored: bool,
 }
@@ -48,10 +55,7 @@ struct Restore {
 impl Restore {
     fn finish(&mut self) -> Result<(), DriverError> {
         // Always attempt both native restores, even if activation fails.
-        let app = self
-            .application
-            .set_bool("AXFrontmost", true)
-            .and_then(|()| wait_frontmost(self.pid));
+        let app = activate(&self.application);
         let warped = CGWarpMouseCursorPosition(self.pointer);
         let pointer = if warped == CGError::Success {
             CGEvent::new(None)
@@ -183,17 +187,17 @@ pub(super) fn run(
     let pointer_event =
         CGEvent::new(None).ok_or_else(|| error(ErrorKind::Failed, "Could not read the pointer"))?;
     let mut restore = Restore {
-        application: AxElement::application(old.processIdentifier())?,
-        pid: old.processIdentifier(),
+        application: old,
         pointer: CGEvent::location(Some(&pointer_event)),
         restored: false,
     };
     let result = (|| {
         check_abort(aborted)?;
-        application.set_bool("AXFrontmost", true)?;
+        let target = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
+        activate(&target)?;
         window.perform("AXRaise")?;
-        wait_frontmost(pid)?;
-        // AX activation/raise can precede AppKit's key-window transition.
+        // Activation/raise can precede AppKit's key-window transition.
         // Keep this pause short and check abort again before any HID post.
         thread::sleep(Duration::from_millis(50));
         check_window(window, table)?;
