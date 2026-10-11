@@ -229,6 +229,7 @@ impl FakeDesktop {
             elements,
             omitted,
             no_element_tree: false,
+            truncated: false,
             focused_secure: app
                 .elements
                 .iter()

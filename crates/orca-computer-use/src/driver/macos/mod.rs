@@ -89,7 +89,7 @@ impl MacDriver {
             window_size: (window_frame[2], window_frame[3]),
             image_size,
         };
-        let (elements, entries, omitted, no_element_tree) = tree::collect(
+        let (elements, entries, omitted, no_element_tree, truncated) = tree::collect(
             &ax_window,
             geometry,
             params.query.as_deref(),
@@ -122,6 +122,7 @@ impl MacDriver {
             elements,
             omitted,
             no_element_tree,
+            truncated,
             focused_secure,
             screenshot,
         })

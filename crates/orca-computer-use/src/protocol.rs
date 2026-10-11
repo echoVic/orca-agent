@@ -181,6 +181,8 @@ pub struct Observation {
     pub elements: Vec<Element>,
     pub omitted: u32,
     pub no_element_tree: bool,
+    #[serde(default)]
+    pub truncated: bool,
     pub focused_secure: bool,
     pub screenshot: Option<Screenshot>,
 }
@@ -368,6 +370,7 @@ mod tests {
             }],
             omitted: 3,
             no_element_tree: false,
+            truncated: false,
             focused_secure: true,
             screenshot: Some(Screenshot {
                 png_base64: "abc".into(),

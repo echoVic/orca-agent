@@ -55,6 +55,9 @@ pub fn render_observation(observation: &Observation) -> String {
         )
         .unwrap();
     }
+    if observation.truncated {
+        writeln!(text, "The element tree was cut off after {} elements (time limit); use `query` or target a point on the screenshot.", observation.elements.len()).unwrap();
+    }
     if observation.no_element_tree {
         text.push_str("This app exposes no element tree; use point targets from the screenshot.\n");
     }
@@ -105,7 +108,7 @@ mod tests {
     use super::*;
     use crate::protocol::{Element, Observation, Screenshot, WindowInfo};
 
-    fn sample_observation() -> Observation {
+    pub(super) fn sample_observation() -> Observation {
         Observation {
             bundle_id: "com.apple.TextEdit".into(),
             app_name: "TextEdit".into(),
@@ -144,6 +147,7 @@ mod tests {
             ],
             omitted: 0,
             no_element_tree: false,
+            truncated: false,
             focused_secure: false,
             screenshot: Some(Screenshot {
                 png_base64: "unused".into(),
@@ -230,4 +234,19 @@ mod tests {
         assert!(text.contains(r#"button "Save\n\"file\"""#));
         assert_eq!(text.lines().count(), 5);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn time_truncation_is_rendered_and_old_observations_default_to_complete() {
+    let original = tests::sample_observation();
+    let mut wire = serde_json::to_value(&original).unwrap();
+    wire.as_object_mut().unwrap().remove("truncated");
+    let old: Observation = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&old).unwrap()["truncated"], false);
+    wire["truncated"] = serde_json::json!(true);
+    let truncated: Observation = serde_json::from_value(wire).unwrap();
+    let text = render_observation(&truncated);
+    assert!(text.contains("The element tree was cut off after 3 elements (time limit); use `query` or target a point on the screenshot."));
+    assert!(!render_observation(&old).contains("time limit"));
 }

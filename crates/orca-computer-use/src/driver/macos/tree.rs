@@ -26,6 +26,9 @@ pub(crate) struct TableEntry {
     window_frame_control: bool,
 }
 
+const EMPTY_TREE_RETRY_BUDGET: Duration = Duration::from_secs(3);
+const FULL_TREE_WALK_BUDGET: Duration = Duration::from_secs(10);
+
 const ROLES: &[&str] = &[
     "AXButton",
     "AXCheckBox",
@@ -61,6 +64,7 @@ fn role_words(role: &str) -> String {
 // A narrow traversal seam shares the production recursion with synthetic trees.
 trait TreeNode: Clone {
     type Entry;
+    fn is_content(entry: &Self::Entry) -> bool;
     fn retained(
         &self,
         geometry: CaptureGeometry,
@@ -71,6 +75,9 @@ trait TreeNode: Clone {
 
 impl TreeNode for AxElement {
     type Entry = TableEntry;
+    fn is_content(entry: &TableEntry) -> bool {
+        !entry.window_frame_control
+    }
     fn retained(
         &self,
         geometry: CaptureGeometry,
@@ -160,6 +167,21 @@ struct Depth {
     retained: u16,
 }
 
+struct WalkBudget {
+    deadline: Instant,
+    full_deadline: Instant,
+    truncated: bool,
+}
+impl WalkBudget {
+    fn expired(&mut self) -> bool {
+        if Instant::now() >= self.deadline {
+            self.truncated = true;
+            true
+        } else {
+            false
+        }
+    }
+}
 fn walk<N: TreeNode>(
     element: N,
     depth: Depth,
@@ -167,58 +189,82 @@ fn walk<N: TreeNode>(
     deadline: Instant,
     elements: &mut Vec<Element>,
     entries: &mut Vec<N::Entry>,
+) -> Result<bool, DriverError> {
+    let mut budget = WalkBudget {
+        deadline,
+        full_deadline: Instant::now() + FULL_TREE_WALK_BUDGET,
+        truncated: false,
+    };
+    walk_until(element, depth, geometry, &mut budget, elements, entries)?;
+    Ok(budget.truncated)
+}
+fn walk_until<N: TreeNode>(
+    element: N,
+    depth: Depth,
+    geometry: CaptureGeometry,
+    budget: &mut WalkBudget,
+    elements: &mut Vec<Element>,
+    entries: &mut Vec<N::Entry>,
 ) -> Result<(), DriverError> {
-    if depth.ax > 30 || Instant::now() >= deadline {
+    if depth.ax > 30 || budget.expired() {
         return Ok(());
     }
     let mut child_depth = Depth {
         ax: depth.ax + 1,
         retained: depth.retained,
     };
-    if let Some((mut retained, entry)) = element.retained(geometry, deadline)? {
+    if let Some((mut retained, entry)) = element.retained(geometry, budget.deadline)? {
+        // Once real content appears, complete this walk with its independent budget.
+        if N::is_content(&entry) {
+            budget.deadline = budget.full_deadline;
+        }
         retained.id = elements.len() as u32 + 1;
-        // Omitted structural nodes don't create ancestors in the output tree.
         retained.depth = depth.retained;
         child_depth.retained += 1;
         elements.push(retained);
         entries.push(entry);
     }
-    if depth.ax < 30 && Instant::now() < deadline {
-        for child in element.children_until(deadline)? {
-            if Instant::now() >= deadline {
+    if depth.ax < 30 && !budget.expired() {
+        for child in element.children_until(budget.deadline)? {
+            if budget.expired() {
                 break;
             }
-            walk(child, child_depth, geometry, deadline, elements, entries)?;
+            walk_until(child, child_depth, geometry, budget, elements, entries)?;
         }
+        budget.expired();
     }
     Ok(())
 }
 
 fn poll<E>(
     deadline: Instant,
-    mut traversal: impl FnMut(Instant, &mut Vec<Element>, &mut Vec<E>) -> Result<(), DriverError>,
+    mut traversal: impl FnMut(Instant, &mut Vec<Element>, &mut Vec<E>) -> Result<bool, DriverError>,
     ready: impl Fn(&[E]) -> bool,
-) -> Result<(Vec<Element>, Vec<E>), DriverError> {
+) -> Result<(Vec<Element>, Vec<E>, bool), DriverError> {
     let mut elements = vec![];
     let mut entries = vec![];
+    let mut truncated = false;
     loop {
         // In particular, don't start a retry after the final capped sleep.
         if Instant::now() >= deadline {
-            return Ok((elements, entries));
+            return Ok((elements, entries, truncated));
         }
         // Each retry is a fresh snapshot, not an append to the frame controls
         // from the previous traversal. Keep the last nonempty snapshot if the
         // budget expires before a retry can retain any elements.
         let mut next_elements = vec![];
         let mut next_entries = vec![];
-        traversal(deadline, &mut next_elements, &mut next_entries)?;
+        let next_truncated = traversal(deadline, &mut next_elements, &mut next_entries)?;
         let is_ready = ready(&next_entries);
         if !next_elements.is_empty() {
             elements = next_elements;
             entries = next_entries;
+            truncated = next_truncated;
+        } else {
+            truncated |= next_truncated;
         }
         if is_ready || Instant::now() >= deadline {
-            return Ok((elements, entries));
+            return Ok((elements, entries, truncated));
         }
         thread::sleep(
             Duration::from_millis(250).min(deadline.saturating_duration_since(Instant::now())),
@@ -226,14 +272,18 @@ fn poll<E>(
     }
 }
 
+fn has_element_tree(entries: &[TableEntry]) -> bool {
+    entries.iter().any(AxElement::is_content)
+}
+
 pub(super) fn collect(
     window: &AxElement,
     geometry: CaptureGeometry,
     query: Option<&str>,
     max_elements: u32,
-) -> Result<(Vec<Element>, Vec<TableEntry>, u32, bool), DriverError> {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let (mut elements, entries) = poll(
+) -> Result<(Vec<Element>, Vec<TableEntry>, u32, bool, bool), DriverError> {
+    let deadline = Instant::now() + EMPTY_TREE_RETRY_BUDGET;
+    let (mut elements, entries, truncated) = poll(
         deadline,
         |deadline, elements, entries| {
             walk(
@@ -245,9 +295,9 @@ pub(super) fn collect(
                 entries,
             )
         },
-        |entries| entries.iter().any(|entry| !entry.window_frame_control),
+        has_element_tree,
     )?;
-    let no_element_tree = elements.is_empty();
+    let no_element_tree = !has_element_tree(&entries);
     if let Some(query) = query {
         elements = filter_elements(&elements, query);
     }
@@ -265,7 +315,7 @@ pub(super) fn collect(
         );
         element.id = index as u32 + 1;
     }
-    Ok((elements, selected, omitted, no_element_tree))
+    Ok((elements, selected, omitted, no_element_tree, truncated))
 }
 
 #[cfg(test)]
@@ -298,7 +348,7 @@ mod regression_tests {
     #[test]
     fn frame_buttons_are_retried_until_content_arrives_without_duplicates() {
         let mut calls = 0;
-        let (elements, entries) = poll(
+        let (elements, entries, _) = poll(
             Instant::now() + Duration::from_secs(1),
             |_, elements, entries| {
                 calls += 1;
@@ -308,7 +358,7 @@ mod regression_tests {
                     elements.push(button(2, "Content"));
                     entries.push(false);
                 }
-                Ok(())
+                Ok(false)
             },
             |entries| entries.iter().any(|frame: &bool| !frame),
         )
@@ -329,13 +379,13 @@ mod regression_tests {
         let started = Instant::now();
         let budget = Duration::from_millis(50);
         let mut calls = 0;
-        let (elements, entries) = poll(
+        let (elements, entries, _) = poll(
             started + budget,
             |_, elements, entries| {
                 calls += 1;
                 elements.push(button(1, "Close"));
                 entries.push(true);
-                Ok(())
+                Ok(false)
             },
             |entries| entries.iter().any(|frame: &bool| !frame),
         )
@@ -349,13 +399,13 @@ mod regression_tests {
     #[test]
     fn a_content_button_returns_in_the_first_traversal() {
         let mut calls = 0;
-        let (_, entries) = poll(
+        let (_, entries, _) = poll(
             Instant::now() + Duration::from_secs(3),
             |_, elements, entries| {
                 calls += 1;
                 elements.push(button(1, "Content"));
                 entries.push(false);
-                Ok(())
+                Ok(false)
             },
             |entries| entries.iter().any(|frame: &bool| !frame),
         )
@@ -368,7 +418,7 @@ mod regression_tests {
     fn an_empty_final_traversal_keeps_the_last_frame_snapshot() {
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut calls = 0;
-        let (elements, entries) = poll(
+        let (elements, entries, _) = poll(
             deadline,
             |_, elements, entries| {
                 calls += 1;
@@ -378,7 +428,7 @@ mod regression_tests {
                 } else {
                     thread::sleep(deadline.saturating_duration_since(Instant::now()));
                 }
-                Ok(())
+                Ok(false)
             },
             |entries| entries.iter().any(|frame: &bool| !frame),
         )
@@ -412,6 +462,9 @@ mod regression_tests {
     }
     impl TreeNode for Node {
         type Entry = ();
+        fn is_content(_: &()) -> bool {
+            true
+        }
         fn retained(
             &self,
             _geometry: CaptureGeometry,
@@ -450,7 +503,7 @@ mod regression_tests {
             Node::group(vec![Node::control("Unrelated button")]),
             Node::group(vec![Node::group(vec![Node::control("Wanted field")])]),
         ]);
-        let (elements, _) = poll(
+        let (elements, _, _) = poll(
             Instant::now() + Duration::from_secs(3),
             |deadline, elements, entries| {
                 walk(
@@ -483,7 +536,7 @@ mod regression_tests {
             delay: Duration::ZERO,
             children: vec![Node::group(vec![Node::control("Wanted child")])],
         };
-        let (elements, _) = poll(
+        let (elements, _, _) = poll(
             Instant::now() + Duration::from_secs(3),
             |deadline, elements, entries| {
                 walk(
@@ -522,7 +575,7 @@ mod regression_tests {
         };
         let start = Instant::now();
         let budget = Duration::from_secs(3);
-        let (elements, _) = poll(
+        let (elements, _, _) = poll(
             start + budget,
             |deadline, elements, entries| {
                 walk(
@@ -556,11 +609,102 @@ mod regression_tests {
             |deadline, _, _| {
                 assert!(Instant::now() < deadline, "retry began after the deadline");
                 calls += 1;
-                Ok(())
+                Ok(false)
             },
             |entries| !entries.is_empty(),
         )
         .unwrap();
         assert_eq!(calls, 1);
     }
+
+    #[test]
+    fn full_walk_cutoff_is_reported_without_extending_the_deadline() {
+        let tree = Node {
+            label: Some("Content"),
+            delay: Duration::ZERO,
+            children: vec![
+                Node {
+                    delay: Duration::from_millis(30),
+                    ..Node::control("Slow")
+                },
+                Node::control("Last"),
+            ],
+        };
+        for (budget_ms, expected_cutoff, expected_count) in [(20, true, 2), (100, false, 3)] {
+            let start = Instant::now();
+            let mut budget = WalkBudget {
+                deadline: start + Duration::from_millis(5),
+                full_deadline: start + Duration::from_millis(budget_ms),
+                truncated: false,
+            };
+            let mut elements = vec![];
+            walk_until(
+                tree.clone(),
+                Depth::default(),
+                geometry(),
+                &mut budget,
+                &mut elements,
+                &mut vec![],
+            )
+            .unwrap();
+            assert_eq!(budget.truncated, expected_cutoff);
+            assert_eq!(elements.len(), expected_count);
+        }
+    }
+    #[test]
+    fn a_full_tree_walk_outlives_the_empty_tree_retry_budget() {
+        let tree = Node {
+            label: Some("Content parent"),
+            delay: Duration::ZERO,
+            children: vec![
+                Node {
+                    delay: Duration::from_secs(2),
+                    ..Node::control("First")
+                },
+                Node {
+                    delay: Duration::from_secs(2),
+                    ..Node::control("Second")
+                },
+                Node::control("Last"),
+            ],
+        };
+        let (elements, _, _) = poll(
+            Instant::now() + Duration::from_secs(3),
+            |deadline, elements, entries| {
+                walk(
+                    tree.clone(),
+                    Depth::default(),
+                    geometry(),
+                    deadline,
+                    elements,
+                    entries,
+                )
+            },
+            |entries| !entries.is_empty(),
+        )
+        .unwrap();
+        assert_eq!(
+            elements
+                .iter()
+                .map(|e| e.label.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["Content parent", "First", "Second", "Last"]
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn title_bar_buttons_do_not_count_as_an_element_tree() {
+    let application = AxElement::application(i32::MAX).unwrap();
+    let mut entries = vec![TableEntry {
+        element: application,
+        role: "AXButton".into(),
+        label: None,
+        secure: false,
+        window_frame_control: true,
+    }];
+    assert!(!has_element_tree(&entries));
+    entries[0].window_frame_control = false;
+    assert!(has_element_tree(&entries));
 }
