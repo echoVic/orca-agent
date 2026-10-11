@@ -10,6 +10,7 @@ report; raw trajectories, container logs and `jobs/` output stay out of git.
 | 2026-09-15 | `3aa4efdfa` (v0.4.31) | 89 | `-k 1 -n 3`, build-timeout ×2 | **0.494** (44/89) | — | [report](2026-09-15-terminal-bench-2-v0.4.31.md) |
 | 2026-09-16 | `48fa0a458` (v0.4.31 + evidence fixes) | 88 (`qemu-startup` excluded) | `-k 1 -n 3`, build-timeout ×2 | **0.727** raw · **0.761** infra-corrected | — | [report](2026-09-16-terminal-bench-2-v0.4.31-fixed.md) |
 | 2026-09-19 | `5970b40c` (v0.4.32, 26 merged fixes) | 88 (`qemu-startup` excluded) | `-k 1 -n 6` | **0.7955** (70/88) · scored-only 0.8434 | **26/26 runs green** (24 suites; `sandbox_probe.py` twice) | [report](2026-09-19-v0.4.32-evaluation.md) · [summary](2026-09-19-tb2-v0432-summary.json) |
+| 2026-10-11 | `55ca547e` (v0.5.10) | 88 (`qemu-startup` excluded) | `-k 1 -n 6`, build-timeout ×2, `deepseek-flash` | **0.7273** (64/88) · scored-only 0.8205 · infra-corrected **0.8068** (71/88) | **25/26 runs green** (25 suites; `linux_shell_probe.py` red on the pre-0.5.8 CA contract) | [report](2026-10-11-v0.5.10-evaluation.md) · [summary](2026-10-11-tb2-v0510-summary.json) |
 
 Machine-readable form: [`evaluation-ledger.json`](evaluation-ledger.json).
 
