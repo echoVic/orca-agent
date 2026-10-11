@@ -1,0 +1,802 @@
+use std::collections::HashMap;
+use std::fmt;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::process::Child;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use crate::protocol::{
+    DriverError, DriverEvent, DriverLine, ErrorKind, PROTOCOL_VERSION, Permissions, Reply, Request,
+    RequestLine,
+};
+
+pub trait DriverLauncher: Send + Sync {
+    /// Returns stdin, stdout, and (for a real process) the child to reap.
+    fn launch(&self) -> io::Result<LaunchedDriver>;
+}
+
+pub struct LaunchedDriver {
+    pub stdin: Box<dyn Write + Send>,
+    pub stdout: Box<dyn Read + Send>,
+    pub child: Option<Child>,
+}
+
+pub type EventCallback = Arc<dyn Fn(DriverEvent) + Send + Sync>;
+type Pending = Arc<Mutex<HashMap<u64, SyncSender<Result<Reply, DriverError>>>>>;
+
+pub struct DriverClient {
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    pending: Pending,
+    connected: Arc<AtomicBool>,
+    next_id: AtomicU64,
+    reader: Option<JoinHandle<()>>,
+    child: Option<Child>,
+}
+
+impl fmt::Debug for DriverClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DriverClient")
+            .field("connected", &self.connected)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HelloInfo {
+    pub macos_major: u32,
+    pub host_bundle_id: Option<String>,
+    pub permissions: Permissions,
+}
+
+#[derive(Debug)]
+pub enum CallError {
+    Driver(DriverError),
+    TimedOut,
+    Disconnected,
+}
+
+fn failed(message: impl Into<String>) -> DriverError {
+    DriverError {
+        kind: ErrorKind::Failed,
+        message: message.into(),
+        candidates: vec![],
+    }
+}
+
+fn disconnect(pending: &Pending, connected: &AtomicBool) {
+    let mut pending = pending.lock().expect("pending replies lock poisoned");
+    connected.store(false, Ordering::SeqCst);
+    // Dropping the senders wakes every receiver with Disconnected.
+    pending.clear();
+}
+
+impl DriverClient {
+    /// Launches exactly once and exchanges protocol versions before returning.
+    pub fn start(
+        launcher: &dyn DriverLauncher,
+        on_event: EventCallback,
+    ) -> Result<(Self, HelloInfo), DriverError> {
+        let launched = launcher
+            .launch()
+            .map_err(|error| failed(format!("Could not launch computer-use driver: {error}")))?;
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let connected = Arc::new(AtomicBool::new(true));
+        let mut client = Self {
+            writer: Mutex::new(Some(launched.stdin)),
+            pending: pending.clone(),
+            connected: connected.clone(),
+            next_id: AtomicU64::new(1),
+            reader: None,
+            child: launched.child,
+        };
+        client.reader = Some(
+            thread::Builder::new()
+                .name("computer-use-driver-reader".into())
+                .spawn(move || {
+                    // Also wake pending calls if the callback panics.
+                    struct DisconnectOnExit(Pending, Arc<AtomicBool>);
+                    impl Drop for DisconnectOnExit {
+                        fn drop(&mut self) {
+                            disconnect(&self.0, &self.1);
+                        }
+                    }
+                    let _disconnect = DisconnectOnExit(pending.clone(), connected);
+                    for line in BufReader::new(launched.stdout).lines() {
+                        let Ok(line) = line else {
+                            break;
+                        };
+                        let Ok(line) = serde_json::from_str::<DriverLine>(&line) else {
+                            break;
+                        };
+                        match line {
+                            DriverLine::Event(event) => on_event(event.event),
+                            DriverLine::Response(response) => {
+                                if let Some(sender) = pending
+                                    .lock()
+                                    .expect("pending replies lock poisoned")
+                                    .remove(&response.id)
+                                {
+                                    let _ = sender.send(response.result);
+                                }
+                            }
+                        }
+                    }
+                })
+                .map_err(|error| failed(format!("Could not start computer-use reader: {error}")))?,
+        );
+        match client.call(
+            Request::Hello {
+                protocol: PROTOCOL_VERSION,
+            },
+            Duration::from_secs(30),
+        ) {
+            Ok(Reply::Hello {
+                protocol,
+                macos_major,
+                host_bundle_id,
+                permissions,
+            }) => {
+                if protocol != PROTOCOL_VERSION {
+                    return Err(DriverError {
+                        kind: ErrorKind::VersionMismatch,
+                        message: "Orca was updated; start a new session to use computer use".into(),
+                        candidates: vec![],
+                    });
+                }
+                Ok((
+                    client,
+                    HelloInfo {
+                        macos_major,
+                        host_bundle_id,
+                        permissions,
+                    },
+                ))
+            }
+            Ok(_) => Err(failed("Computer-use driver did not reply to hello")),
+            Err(CallError::Driver(error)) => Err(error),
+            Err(CallError::TimedOut) => Err(failed("Computer-use driver hello timed out")),
+            Err(CallError::Disconnected) => {
+                Err(failed("Computer-use driver disconnected during hello"))
+            }
+        }
+    }
+
+    pub fn call(&self, request: Request, timeout: Duration) -> Result<Reply, CallError> {
+        let started = Instant::now();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut bytes = serde_json::to_vec(&RequestLine { id, request }).map_err(|error| {
+            CallError::Driver(failed(format!("Could not encode driver request: {error}")))
+        })?;
+        bytes.push(b'\n');
+        let (sender, receiver) = mpsc::sync_channel(1);
+        {
+            let mut pending = self.pending.lock().expect("pending replies lock poisoned");
+            if !self.connected.load(Ordering::SeqCst) {
+                return Err(CallError::Disconnected);
+            }
+            pending.insert(id, sender);
+        }
+        let written = {
+            let mut writer = self.writer.lock().expect("driver input lock poisoned");
+            writer
+                .as_mut()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "driver input closed"))
+                .and_then(|writer| {
+                    writer.write_all(&bytes)?;
+                    writer.flush()
+                })
+        };
+        if written.is_err() {
+            disconnect(&self.pending, &self.connected);
+            return Err(CallError::Disconnected);
+        }
+        let result = match receiver.recv_timeout(timeout.saturating_sub(started.elapsed())) {
+            Ok(result) => result.map_err(CallError::Driver),
+            Err(RecvTimeoutError::Timeout) => Err(CallError::TimedOut),
+            Err(RecvTimeoutError::Disconnected) => Err(CallError::Disconnected),
+        };
+        self.pending
+            .lock()
+            .expect("pending replies lock poisoned")
+            .remove(&id);
+        result
+    }
+}
+
+impl Drop for DriverClient {
+    fn drop(&mut self) {
+        self.writer
+            .get_mut()
+            .expect("driver input lock poisoned")
+            .take();
+        if let Some(child) = &mut self.child {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(reader) = self.reader.take()
+            && reader.is_finished()
+        {
+            let _ = reader.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fake::{FakeDesktop, FakeLauncher};
+    use crate::protocol::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "condition did not become true in two seconds"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn click(app: &str, element: u32) -> Request {
+        Request::Act(ActParams {
+            app: app.into(),
+            window: None,
+            action: Action::Click {
+                target: Target::Element { element },
+                button: Button::Left,
+                count: 1,
+                modifiers: vec![],
+            },
+            foreground_fallback: true,
+            observe_after: false,
+            include_screenshot: false,
+            secure_approved: false,
+        })
+    }
+
+    fn call(client: &DriverClient, request: Request) -> Result<Reply, CallError> {
+        client.call(request, Duration::from_secs(5))
+    }
+
+    #[test]
+    fn a_call_gets_its_reply_and_events_reach_the_callback() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        let (client, hello) = DriverClient::start(
+            &launcher,
+            Arc::new(move |event| {
+                assert_eq!(event, DriverEvent::Esc);
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        )
+        .unwrap();
+        assert_eq!(hello.macos_major, 26);
+        assert_eq!(hello.host_bundle_id.as_deref(), Some("com.cmuxterm.app"));
+        assert!(
+            hello.permissions.accessibility
+                && hello.permissions.screen_recording
+                && hello.permissions.event_tap
+        );
+        assert!(matches!(
+            call(&client, Request::ListApps).unwrap(),
+            Reply::Apps { .. }
+        ));
+        launcher.emit_esc();
+        wait_until(|| seen.load(Ordering::SeqCst) == 1);
+    }
+
+    #[test]
+    fn a_slow_driver_times_out() {
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.answer_after = Some(Duration::from_millis(500));
+        let launcher = FakeLauncher::new(desktop);
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        assert!(matches!(
+            client.call(Request::ListApps, Duration::from_millis(50)),
+            Err(CallError::TimedOut)
+        ));
+    }
+
+    #[test]
+    fn a_protocol_mismatch_is_reported_once_without_restarts() {
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.protocol = PROTOCOL_VERSION + 1;
+        let launcher = FakeLauncher::new(desktop);
+        let error = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::VersionMismatch);
+        assert_eq!(
+            error.message,
+            "Orca was updated; start a new session to use computer use"
+        );
+        assert_eq!(launcher.launches(), 1);
+        wait_until(|| launcher.shutdowns() == 1);
+    }
+
+    #[test]
+    fn eof_on_stdin_runs_shutdown_before_exit() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        call(&client, Request::Turn { active: true }).unwrap();
+        drop(client);
+        wait_until(|| launcher.shutdowns() == 1);
+        assert!(!launcher.desktop(|desktop| desktop.turn_active));
+    }
+
+    #[test]
+    fn an_action_on_a_quit_app_fails_without_touching_another() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit_and_calculator());
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        launcher.desktop(|desktop| desktop.quit_app("com.apple.TextEdit"));
+        let error = call(&client, click("com.apple.TextEdit", 1)).unwrap_err();
+        assert!(matches!(
+            error,
+            CallError::Driver(DriverError {
+                kind: ErrorKind::AppNotFound,
+                ..
+            })
+        ));
+        assert_eq!(
+            launcher.desktop(|desktop| desktop.actions_on("com.apple.calculator")),
+            0
+        );
+    }
+
+    #[test]
+    fn shutdown_disconnects_current_and_future_calls() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        assert_eq!(call(&client, Request::Shutdown).unwrap(), Reply::Done);
+        wait_until(|| launcher.shutdowns() == 1);
+        assert!(matches!(
+            call(&client, Request::ListApps),
+            Err(CallError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn late_replies_do_not_get_delivered_to_the_next_call() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        launcher.desktop(|desktop| desktop.answer_after = Some(Duration::from_millis(100)));
+        assert!(matches!(
+            client.call(Request::ListApps, Duration::from_millis(10)),
+            Err(CallError::TimedOut)
+        ));
+        assert_eq!(
+            call(&client, Request::Turn { active: true }).unwrap(),
+            Reply::Done
+        );
+        assert!(client.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_calls_receive_their_own_replies() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        thread::scope(|scope| {
+            let apps = scope.spawn(|| call(&client, Request::ListApps).unwrap());
+            let turn = scope.spawn(|| call(&client, Request::Turn { active: true }).unwrap());
+            assert!(matches!(apps.join().unwrap(), Reply::Apps { .. }));
+            assert_eq!(turn.join().unwrap(), Reply::Done);
+        });
+    }
+
+    #[test]
+    fn events_can_arrive_while_a_reply_is_delayed() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (sender, receiver) = mpsc::channel();
+        let (client, _) = DriverClient::start(
+            &launcher,
+            Arc::new(move |event| {
+                sender.send(event).unwrap();
+            }),
+        )
+        .unwrap();
+        launcher.desktop(|desktop| desktop.answer_after = Some(Duration::from_millis(200)));
+        thread::scope(|scope| {
+            let call = scope.spawn(|| call(&client, Request::ListApps).unwrap());
+            launcher.emit_esc();
+            assert_eq!(
+                receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+                DriverEvent::Esc
+            );
+            assert!(matches!(call.join().unwrap(), Reply::Apps { .. }));
+        });
+    }
+
+    #[test]
+    fn fake_reports_lock_conflicts_and_permissions_through_hello() {
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.lock_held = true;
+        let launcher = FakeLauncher::new(desktop);
+        assert_eq!(
+            DriverClient::start(&launcher, Arc::new(|_| {}))
+                .unwrap_err()
+                .kind,
+            ErrorKind::LockHeld
+        );
+        launcher.desktop(|desktop| {
+            desktop.lock_held = false;
+            desktop.permissions = Permissions::default();
+        });
+        let (_, hello) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        assert_eq!(hello.permissions, Permissions::default());
+    }
+
+    #[test]
+    fn fake_resolution_preserves_ambiguity_and_launches_quit_apps() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_two_apps_named("Code"));
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        let CallError::Driver(error) = call(
+            &client,
+            Request::ResolveApp {
+                app: "Code".into(),
+                allow_not_running: false,
+            },
+        )
+        .unwrap_err() else {
+            panic!("expected driver error")
+        };
+        assert_eq!(error.kind, ErrorKind::AppAmbiguous);
+        assert_eq!(error.candidates.len(), 2);
+        let id = "com.microsoft.VSCode";
+        launcher.desktop(|desktop| desktop.quit_app(id));
+        assert!(matches!(
+            call(
+                &client,
+                Request::ResolveApp {
+                    app: id.into(),
+                    allow_not_running: false
+                }
+            ),
+            Err(CallError::Driver(DriverError {
+                kind: ErrorKind::AppNotFound,
+                ..
+            }))
+        ));
+        let Reply::Resolved { app } = call(
+            &client,
+            Request::ResolveApp {
+                app: id.into(),
+                allow_not_running: true,
+            },
+        )
+        .unwrap() else {
+            panic!("expected resolved")
+        };
+        assert_eq!(app.pid, None);
+        let Reply::Launched { app } = call(
+            &client,
+            Request::LaunchApp {
+                app: id.into(),
+                open: vec![],
+            },
+        )
+        .unwrap() else {
+            panic!("expected launched")
+        };
+        assert!(app.pid.is_some());
+    }
+
+    #[test]
+    fn fake_observations_filter_elements_and_actions_change_values() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        let params = ObserveParams {
+            app: "com.apple.TextEdit".into(),
+            window: None,
+            query: None,
+            max_elements: 300,
+            include_screenshot: true,
+        };
+        let Reply::Observed { observation } =
+            call(&client, Request::Observe(params.clone())).unwrap()
+        else {
+            panic!("expected observation")
+        };
+        assert_eq!(observation.window.title, "probe.rtf");
+        assert_eq!(
+            observation
+                .elements
+                .iter()
+                .map(|element| element.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 14]
+        );
+        assert!(observation.elements[2].secure);
+        assert!(observation.elements[2].value.is_none());
+        let screenshot = observation.screenshot.unwrap();
+        use base64::Engine;
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(&screenshot.png_base64)
+            .unwrap();
+        let image = image::load_from_memory(&png).unwrap();
+        assert_eq!(
+            (image.width(), image.height()),
+            (screenshot.width, screenshot.height)
+        );
+        assert!(image.width().max(image.height()) <= 1280);
+        let mut action = match click("com.apple.TextEdit", 2) {
+            Request::Act(params) => params,
+            _ => unreachable!(),
+        };
+        action.action = Action::Type {
+            text: "hello".into(),
+            target: Some(Target::Element { element: 2 }),
+        };
+        action.observe_after = true;
+        let Reply::Acted { outcome } = call(&client, Request::Act(action)).unwrap() else {
+            panic!("expected action")
+        };
+        assert_eq!(
+            outcome.observation.unwrap().elements[1].value.as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            launcher.desktop(|desktop| desktop.actions_on("com.apple.TextEdit")),
+            1
+        );
+        let filtered = ObserveParams {
+            query: Some("Bold".into()),
+            max_elements: 1,
+            include_screenshot: false,
+            ..params
+        };
+        let Reply::Observed { observation } =
+            call(&client, Request::Observe(filtered.clone())).unwrap()
+        else {
+            panic!("expected filtered observation")
+        };
+        assert_eq!(observation.elements.len(), 1);
+        assert_eq!(observation.elements[0].id, 1);
+        assert_eq!(observation.omitted, 0);
+        assert!(observation.screenshot.is_none());
+        assert_eq!(
+            launcher.desktop(|desktop| desktop.last_observe.clone()),
+            Some(filtered)
+        );
+    }
+
+    #[test]
+    fn fake_fallback_and_secure_approval_errors_do_not_count_as_actions() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        launcher.desktop(|desktop| desktop.background_fails = true);
+        let mut action = match click("com.apple.TextEdit", 1) {
+            Request::Act(params) => params,
+            _ => unreachable!(),
+        };
+        action.foreground_fallback = false;
+        assert!(matches!(
+            call(&client, Request::Act(action.clone())),
+            Err(CallError::Driver(DriverError {
+                kind: ErrorKind::NeedsForeground,
+                ..
+            }))
+        ));
+        action.foreground_fallback = true;
+        launcher.desktop(|desktop| desktop.user_active = true);
+        assert!(matches!(
+            call(&client, Request::Act(action.clone())),
+            Err(CallError::Driver(DriverError {
+                kind: ErrorKind::UserActive,
+                ..
+            }))
+        ));
+        launcher.desktop(|desktop| desktop.user_active = false);
+        let Reply::Acted { outcome } = call(&client, Request::Act(action.clone())).unwrap() else {
+            panic!("expected action")
+        };
+        assert!(outcome.foreground_used);
+        action.action = Action::Type {
+            text: "secret".into(),
+            target: Some(Target::Element { element: 14 }),
+        };
+        assert!(matches!(
+            call(&client, Request::Act(action.clone())),
+            Err(CallError::Driver(DriverError {
+                kind: ErrorKind::NeedsSecureApproval,
+                ..
+            }))
+        ));
+        assert_eq!(
+            launcher.desktop(|desktop| desktop.actions_on("com.apple.TextEdit")),
+            1
+        );
+        action.secure_approved = true;
+        action.observe_after = true;
+        let Reply::Acted { outcome } = call(&client, Request::Act(action)).unwrap() else {
+            panic!("expected action")
+        };
+        assert!(outcome.observation.unwrap().elements[2].value.is_none());
+    }
+
+    struct PipeLauncher(fn(BufReader<io::PipeReader>, crate::serve::LineWriter));
+    impl DriverLauncher for PipeLauncher {
+        fn launch(&self) -> io::Result<LaunchedDriver> {
+            let (input, stdin) = io::pipe()?;
+            let (stdout, output) = io::pipe()?;
+            let run = self.0;
+            thread::spawn(move || {
+                let mut input = BufReader::new(input);
+                let output = crate::serve::LineWriter::new(output);
+                let hello = read_request(&mut input);
+                assert_eq!(hello.id, 1);
+                assert_eq!(
+                    hello.request,
+                    Request::Hello {
+                        protocol: PROTOCOL_VERSION
+                    }
+                );
+                let reply = Reply::Hello {
+                    protocol: PROTOCOL_VERSION,
+                    macos_major: 26,
+                    host_bundle_id: None,
+                    permissions: Permissions::default(),
+                };
+                output
+                    .send(&DriverLine::Response(ResponseLine {
+                        id: hello.id,
+                        result: Ok(reply),
+                    }))
+                    .unwrap();
+                run(input, output);
+            });
+            Ok(LaunchedDriver {
+                stdin: Box::new(stdin),
+                stdout: Box::new(stdout),
+                child: None,
+            })
+        }
+    }
+
+    fn read_request(input: &mut impl BufRead) -> RequestLine {
+        let mut line = String::new();
+        input.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[test]
+    fn responses_are_routed_by_id_even_when_the_driver_reverses_them() {
+        let launcher = PipeLauncher(|mut input, output| {
+            let first = read_request(&mut input);
+            let second = read_request(&mut input);
+            let mut ids = [first.id, second.id];
+            ids.sort_unstable();
+            assert_eq!(ids, [2, 3]);
+            for request in [second, first] {
+                let reply = match request.request {
+                    Request::ListApps => Reply::Apps { apps: vec![] },
+                    Request::Turn { .. } => Reply::Done,
+                    _ => panic!("unexpected request"),
+                };
+                output
+                    .send(&DriverLine::Response(ResponseLine {
+                        id: request.id,
+                        result: Ok(reply),
+                    }))
+                    .unwrap();
+            }
+        });
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        thread::scope(|scope| {
+            let apps = scope.spawn(|| call(&client, Request::ListApps).unwrap());
+            let turn = scope.spawn(|| call(&client, Request::Turn { active: true }).unwrap());
+            assert!(matches!(apps.join().unwrap(), Reply::Apps { .. }));
+            assert_eq!(turn.join().unwrap(), Reply::Done);
+        });
+    }
+
+    #[test]
+    fn stdout_eof_wakes_all_waiting_calls_and_rejects_new_calls() {
+        let launcher = PipeLauncher(|mut input, _output| {
+            read_request(&mut input);
+            read_request(&mut input);
+        });
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        thread::scope(|scope| {
+            let first = scope.spawn(|| call(&client, Request::ListApps));
+            let second = scope.spawn(|| call(&client, Request::Turn { active: true }));
+            assert!(matches!(
+                first.join().unwrap(),
+                Err(CallError::Disconnected)
+            ));
+            assert!(matches!(
+                second.join().unwrap(),
+                Err(CallError::Disconnected)
+            ));
+        });
+        assert!(matches!(
+            call(&client, Request::ListApps),
+            Err(CallError::Disconnected)
+        ));
+        assert!(client.pending.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_reaps_a_child_that_exits_on_eof_and_kills_one_that_ignores_it() {
+        use std::process::{Command, Stdio};
+        struct ProcessLauncher {
+            ignore_eof: bool,
+            pid: AtomicUsize,
+        }
+        impl DriverLauncher for ProcessLauncher {
+            fn launch(&self) -> io::Result<LaunchedDriver> {
+                let hello = serde_json::to_string(&DriverLine::Response(ResponseLine {
+                    id: 1,
+                    result: Ok(Reply::Hello {
+                        protocol: PROTOCOL_VERSION,
+                        macos_major: 26,
+                        host_bundle_id: None,
+                        permissions: Permissions::default(),
+                    }),
+                }))?;
+                let end = if self.ignore_eof {
+                    "exec sleep 30"
+                } else {
+                    "while IFS= read -r line; do :; done; exit 7"
+                };
+                let script = format!("IFS= read -r line; printf '%s\\n' '{hello}'; {end}");
+                let mut child = Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(script)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()?;
+                self.pid.store(child.id() as usize, Ordering::SeqCst);
+                Ok(LaunchedDriver {
+                    stdin: Box::new(child.stdin.take().unwrap()),
+                    stdout: Box::new(child.stdout.take().unwrap()),
+                    child: Some(child),
+                })
+            }
+        }
+        for ignore_eof in [false, true] {
+            let launcher = ProcessLauncher {
+                ignore_eof,
+                pid: AtomicUsize::new(0),
+            };
+            let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+            let started = Instant::now();
+            drop(client);
+            assert!(started.elapsed() < Duration::from_secs(3));
+            if ignore_eof {
+                assert!(started.elapsed() >= Duration::from_secs(1));
+            }
+            let pid = launcher.pid.load(Ordering::SeqCst).to_string();
+            assert!(
+                !Command::new("/bin/kill")
+                    .args(["-0", &pid])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success(),
+                "child still exists after drop"
+            );
+        }
+    }
+}
