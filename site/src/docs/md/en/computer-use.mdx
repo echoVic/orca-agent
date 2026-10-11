@@ -1,0 +1,114 @@
+# Computer Use (macOS)
+
+## What it can do
+
+Orca can see and operate other macOS apps with the `computer` tool: list or
+launch apps, inspect windows, click, type, send keys, and scroll. Use it to
+check a UI you just built or work in an app without a command-line interface;
+prefer file and command-line tools when they can do the job.
+
+## Requirements
+
+Computer use is available on macOS 14 or later, in the main session of the
+interactive TUI. Give the terminal running Orca **Accessibility** and
+**Screen Recording** permissions in **System Settings → Privacy & Security**.
+Restart the terminal after granting Screen Recording if the permission has
+not taken effect.
+
+## App approval
+
+Before Orca first observes or operates an app, it asks for approval unless a
+permission rule already decides the call. The panel offers:
+
+- **Allow once**: run this call; later calls ask again.
+- **Allow this app this session**: skip approval for this app until you quit.
+- **Always allow this app (saved)**: save an allow rule for future sessions.
+- **Deny**: refuse the call and ask Orca for another way.
+
+The saved option writes the app's exact bundle id to the user configuration,
+at `$ORCA_HOME/config.toml` or, when unset, `~/.orca/config.toml`:
+
+~~~toml
+[[permissions.rules]]
+tool = "computer"
+pattern = "com.apple.Safari"
+decision = "allow"
+~~~
+
+Typing into a password field offers only **Allow typing this once** or
+**Deny**, even with an app grant. A matching deny rule still takes precedence
+over an allow rule; see [permission rules](approval-modes.md#permission-rules).
+
+## App risk levels
+
+Keychain Access (`com.apple.keychainaccess`), Passwords (`com.apple.Passwords`),
+apps whose bundle ids start with `com.1password.`, `com.agilebits.`, or
+`com.bitwarden.`, and apps declaring the `public.app-category.finance`
+category are blocked by default. Only an allow rule whose `pattern` exactly
+equals that app's bundle id lifts this default block; a wildcard or whole-tool
+allow does not:
+
+~~~toml
+[[permissions.rules]]
+tool = "computer"
+pattern = "com.apple.Passwords"
+decision = "allow"
+~~~
+
+Orca can never operate its own host terminal, regardless of rules; if the
+host cannot be identified, all listed terminal apps are blocked. Other
+listed terminals (Terminal, iTerm2, Ghostty, Warp, kitty, Alacritty, WezTerm,
+cmux) and IDEs (VS Code, apps under `com.todesktop.` or `com.jetbrains.`,
+Xcode, Zed) warn that they can run commands outside Orca's sandbox;
+Finder warns about file access, System Settings about changing settings,
+and listed browsers (Safari, Chrome, Firefox, Arc, Edge, Brave) about web
+pages carrying instructions aimed at the agent.
+
+## Stop
+
+Press **Esc** at any time to interrupt the active turn, including while
+another app is in the foreground.
+
+## Background and foreground
+
+Orca tries to operate apps in the background. When an action needs the
+foreground, it briefly switches to the app and then restores the previous
+foreground app and pointer; the result says when the foreground was used.
+A `key` action containing Command always uses this switch, because Command
+shortcuts sent to a background app do not reach it.
+
+To turn off the switch, set this in your user configuration (the default is
+`true`; project configuration cannot set it):
+
+~~~toml
+[computer_use]
+foreground_fallback = false
+~~~
+
+Actions that need the foreground, including Command shortcuts, then fail
+instead of switching apps.
+
+## Disable computer use
+
+Add a whole-tool deny rule to your user configuration, without a `pattern`.
+Orca then leaves `computer` out of the tools available to the model:
+
+~~~toml
+[[permissions.rules]]
+tool = "computer"
+decision = "deny"
+~~~
+
+## Privacy
+
+Screenshots can contain private information and are sent to the model
+provider when using `deepseek-flash` (including the legacy names
+`deepseek-v4-flash` and `deepseek-v4-flash-vision-exp`) or `auto`. Other model
+selections receive the accessibility element tree and other text results,
+with a note in place of the screenshot; tool screenshots are not sent to a
+separate vision model.
+
+## Not supported yet
+
+Dragging and directly setting a field's value are not supported. Computer use
+is unavailable to subagents, workflow children, ACP clients, and `orca exec`.

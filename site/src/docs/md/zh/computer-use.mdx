@@ -1,0 +1,100 @@
+# Computer Use（macOS）
+
+## 能做什么
+
+Orca 可以通过 `computer` 工具看见并操作其他 macOS 应用：列出或启动应用、观察窗口、
+点击、输入文字、发送按键和滚动。可以用它检查自己刚写的界面，或在没有命令行接口的
+应用里做事；文件和命令行工具能完成的工作，优先用这些工具。
+
+## 要求
+
+Computer use 只在 macOS 14 及以上、交互式 TUI 的主会话中可用。在
+**系统设置 → 隐私与安全性**中，为运行 Orca 的终端授予**辅助功能**和**屏幕录制**权限。
+授予屏幕录制后，如果权限还没生效，重启终端。
+
+## 应用授权
+
+第一次观察或操作应用前，Orca 会请求授权；已有权限规则决定这次调用时除外。
+面板提供四个选项：
+
+- **Allow once**（仅这一次）：执行当前调用，下次仍会询问。
+- **Allow this app this session**（本会话允许该应用）：退出前不再询问该应用的授权。
+- **Always allow this app (saved)**（总是允许该应用）：保存允许规则，后续会话也生效。
+- **Deny**（拒绝）：拒绝当前调用，让 Orca 寻找其他办法。
+
+保存选项把应用的完整 bundle id 写入用户配置：设置了 `ORCA_HOME` 时是
+`$ORCA_HOME/config.toml`，否则是 `~/.orca/config.toml`：
+
+~~~toml
+[[permissions.rules]]
+tool = "computer"
+pattern = "com.apple.Safari"
+decision = "allow"
+~~~
+
+向密码框输入时，即使已有应用授权，也只有 **Allow typing this once**（仅允许这一次输入）
+和 **Deny** 两个选项。匹配的 deny 规则仍优先于 allow 规则，详见
+[权限规则](approval-modes.md#权限规则)。
+
+## 应用风险分级
+
+钥匙串访问（`com.apple.keychainaccess`）、密码（`com.apple.Passwords`）、bundle id 以
+`com.1password.`、`com.agilebits.` 或 `com.bitwarden.` 开头的应用，以及声明了
+`public.app-category.finance` 类别的应用默认禁止操作。只有 `pattern` 与该应用
+bundle id 完全相等的 allow 规则能解除默认禁止，通配符或整个工具的 allow 规则不行：
+
+~~~toml
+[[permissions.rules]]
+tool = "computer"
+pattern = "com.apple.Passwords"
+decision = "allow"
+~~~
+
+运行 Orca 的宿主终端永远不能操作，任何规则都不能放开；无法识别宿主时，清单中的
+终端应用全部禁止操作。其他清单内的终端（Terminal、iTerm2、Ghostty、Warp、kitty、
+Alacritty、WezTerm、cmux）和 IDE（VS Code、`com.todesktop.` 或 `com.jetbrains.` 下的
+应用、Xcode、Zed）会警告它们能在 Orca 沙箱外执行命令；访达警告文件访问，系统设置警告
+修改系统设置，清单内的浏览器（Safari、Chrome、Firefox、Arc、Edge、Brave）警告网页
+可能携带针对代理的指令。
+
+## 停止
+
+任何时候按 **Esc** 都可以中断当前轮次，包括其他应用在前台时。
+
+## 后台和前台
+
+Orca 优先在后台操作应用。动作需要前台时，会短暂切到该应用，完成后恢复原来的前台应用
+和鼠标位置，结果会注明是否用了前台。带 Command 的 `key` 动作始终使用这次切换，
+因为发给后台应用的 Command 快捷键无法生效。
+
+在用户配置中关闭这次切换（默认是 `true`，项目配置不能设置它）：
+
+~~~toml
+[computer_use]
+foreground_fallback = false
+~~~
+
+关闭后，需要前台的动作会失败，包括 Command 快捷键。
+
+## 关闭 computer use
+
+在用户配置中添加整个工具的 deny 规则，不写 `pattern`。
+Orca 就不会把 `computer` 提供给模型：
+
+~~~toml
+[[permissions.rules]]
+tool = "computer"
+decision = "deny"
+~~~
+
+## 隐私
+
+截图可能包含隐私信息，使用 `deepseek-flash`（也接受旧名称 `deepseek-v4-flash` 和
+`deepseek-v4-flash-vision-exp`）或 `auto` 时会发给模型提供方。
+其他模型选择只收到无障碍元素树和其他文字结果，截图位置会附一条说明；工具截图不会
+另外发给视觉模型解读。
+
+## 现在还不支持
+
+不支持拖拽和直接设置字段值。子代理、工作流子任务、ACP 客户端和 `orca exec`
+不能使用 computer use。

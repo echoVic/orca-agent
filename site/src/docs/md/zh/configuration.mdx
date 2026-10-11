@@ -49,6 +49,20 @@ max_wall_time_ms = 1800000
 `--max-tool-calls`、`--max-cost-usd` 或 `--max-wall-time-secs`。
 配置文件使用整数微美元和毫秒；CLI 分别使用美元和秒。
 
+## Computer use（macOS）
+
+在 macOS 14 及以上，交互式 TUI 的主会话可以操作其他应用。唯一的配置项写在
+用户配置中，项目的 `.orca/config.toml` 不能设置它：
+
+```toml
+[computer_use]
+foreground_fallback = false
+```
+
+`foreground_fallback` 默认是 `true`：需要前台的动作会短暂切到目标应用，再恢复原来的
+应用和鼠标位置。设为 `false` 后，这些动作会被拒绝，包括所有 Command 快捷键。
+系统权限、应用授权和用 deny 规则关闭工具的方法，见 [Computer Use](computer-use.md)。
+
 ## 子代理
 
 子代理执行以根任务树为作用域。直接、嵌套、Workflow、托管、续跑和恢复的子任务

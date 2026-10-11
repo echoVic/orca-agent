@@ -54,6 +54,23 @@ operation-scoped: set `--max-turns`, `--max-tool-calls`, `--max-cost-usd`, or
 stored budget default. The file uses integer microdollars and milliseconds;
 the CLI accepts USD and seconds.
 
+## Computer use (macOS)
+
+The interactive TUI's main session can operate other apps on macOS 14 or
+later. Its only setting belongs in the user configuration; project
+`.orca/config.toml` cannot set it:
+
+```toml
+[computer_use]
+foreground_fallback = false
+```
+
+`foreground_fallback` defaults to `true`: actions that need the foreground
+briefly switch to the target app and then restore the previous app and pointer.
+Set it to `false` to refuse those actions, including all Command shortcuts.
+See [Computer Use](computer-use.md) for permissions, app approval, and disabling
+the tool with a deny rule.
+
 ## Subagents
 
 Subagent execution is scoped to one root task tree. Direct, nested, Workflow,
