@@ -1048,12 +1048,23 @@ impl ToolExecutionActor {
                 let thread_store = extension_stores
                     .map(|stores| stores.thread_store())
                     .unwrap_or(&self.runtime.thread_extensions);
-                let service = crate::computer_use::service(thread_store, cwd, config);
-                crate::computer_use::prepare::prepare_invocation(&mut invocation, config, &service)
-                    .err()
-                    .map(|error| {
-                        tool_types::ToolResult::failed_before_start(tool_request, error, None)
-                    })
+                let existing_service =
+                    thread_store.get::<crate::computer_use::ComputerUseService>();
+                crate::computer_use::prepare::ensure_visible(
+                    config,
+                    subagent_depth,
+                    existing_service.as_deref(),
+                )
+                .and_then(|()| crate::computer_use::service(thread_store, cwd, config))
+                .and_then(|service| {
+                    crate::computer_use::prepare::prepare_invocation(
+                        &mut invocation,
+                        config,
+                        &service,
+                    )
+                })
+                .err()
+                .map(|error| tool_types::ToolResult::failed_before_start(tool_request, error, None))
             }
             Ok(()) => None,
         };
@@ -2175,6 +2186,24 @@ mod tests {
         handler: &(dyn crate::runtime_approval::RuntimeApprovalHandler + Send + Sync),
         arguments: serde_json::Value,
     ) -> (RunStatus, ToolResult, Vec<serde_json::Value>) {
+        execute_computer_with_launcher(
+            config,
+            orca_computer_use::fake::FakeLauncher::new(desktop),
+            use_extension_stores,
+            handler,
+            arguments,
+            0,
+        )
+    }
+
+    fn execute_computer_with_launcher(
+        config: &RunConfig,
+        launcher: orca_computer_use::fake::FakeLauncher,
+        use_extension_stores: bool,
+        handler: &(dyn crate::runtime_approval::RuntimeApprovalHandler + Send + Sync),
+        arguments: serde_json::Value,
+        depth: u32,
+    ) -> (RunStatus, ToolResult, Vec<serde_json::Value>) {
         let cwd = tempfile::tempdir().unwrap();
         let request = ToolRequest {
             id: "computer-1".into(),
@@ -2199,15 +2228,34 @@ mod tests {
         let thread_store = ExtensionData::new("computer-thread");
         let turn_store = ExtensionData::new("computer-turn");
         let mut actor = ToolExecutionActor::new(events.run_id().to_string());
-        let test_service = crate::computer_use::ComputerUseService::new(Arc::new(
-            orca_computer_use::fake::FakeLauncher::new(desktop),
-        ));
+        let test_service =
+            crate::computer_use::ComputerUseService::new_for_test(Arc::new(launcher));
+        if arguments["action"] == "type" || arguments["action"] == "key" {
+            let orca_computer_use::protocol::Reply::Observed { observation } = test_service
+                .call(
+                    orca_computer_use::protocol::Request::Observe(
+                        orca_computer_use::protocol::ObserveParams {
+                            app: "com.apple.TextEdit".into(),
+                            window: None,
+                            query: None,
+                            max_elements: 300,
+                            include_screenshot: false,
+                        },
+                    ),
+                    std::time::Duration::from_secs(30),
+                )
+                .unwrap()
+            else {
+                panic!("observation")
+            };
+            test_service.record_observation(&observation);
+        }
         if use_extension_stores {
             thread_store.insert(test_service);
         } else {
             actor.runtime.thread_extensions.insert(test_service);
         }
-        let mut context = ToolExecutionContext::new(cwd.path(), 0, true, &policy)
+        let mut context = ToolExecutionContext::new(cwd.path(), depth, true, &policy)
             .with_services(&instructions, &memory, &registry, &hooks)
             .with_runtime(
                 &mut cost_tracker,
@@ -2241,6 +2289,130 @@ mod tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         (status, result, emitted)
+    }
+
+    #[test]
+    fn computer_secure_text_keys_ask_through_the_real_approval_path() {
+        for keys in [
+            serde_json::json!(["p"]),
+            serde_json::json!(["cmd", "v"]),
+            serde_json::json!(["tab"]),
+        ] {
+            let handler = ComputerApprovalRecording::default();
+            let (_, _, _) = execute_computer_arguments_for_approval(
+                &computer_config(),
+                orca_computer_use::fake::FakeDesktop::with_textedit(),
+                true,
+                &handler,
+                serde_json::json!({"action":"key", "app":"TextEdit", "keys":keys, "target":{"element":14}}),
+            );
+            let approvals = handler.0.lock().unwrap();
+            assert_eq!(approvals.len(), 1);
+            let expected = if keys == serde_json::json!(["tab"]) {
+                "com.apple.TextEdit"
+            } else {
+                "com.apple.TextEdit#secure"
+            };
+            assert_eq!(approvals[0].target.as_deref(), Some(expected), "{keys}");
+        }
+    }
+
+    #[test]
+    fn computer_password_rules_only_preapprove_with_a_whole_tool_allow() {
+        for pattern in [
+            Some("com.apple.TextEdit"),
+            Some("*"),
+            Some("com.apple.*"),
+            None,
+        ] {
+            let mut config = computer_config();
+            config.permission_rules.rules.push(match pattern {
+                Some(pattern) => orca_core::approval_rules::PermissionRule::new(
+                    "computer",
+                    pattern,
+                    Decision::Allow,
+                ),
+                None => orca_core::approval_rules::PermissionRule::whole_tool(
+                    "computer",
+                    Decision::Allow,
+                ),
+            });
+            let handler = ComputerApprovalRecording::default();
+            let (_, result, _) = execute_computer_arguments_for_approval(
+                &config,
+                orca_computer_use::fake::FakeDesktop::with_textedit(),
+                true,
+                &handler,
+                serde_json::json!({"action":"type", "app":"TextEdit", "text":"secret", "target":{"element":14}}),
+            );
+            let approvals = handler.0.lock().unwrap();
+            if pattern.is_some() {
+                assert_eq!(approvals.len(), 1, "{pattern:?}: {:?}", result.error);
+                assert_eq!(
+                    approvals[0].target.as_deref(),
+                    Some("com.apple.TextEdit#secure")
+                );
+            } else {
+                assert!(approvals.is_empty());
+                assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+            }
+        }
+    }
+
+    #[test]
+    fn computer_hidden_sessions_refuse_list_apps_before_launch_or_approval() {
+        for condition in ["headless", "denied", "child", "custom"] {
+            let mut config = computer_config();
+            let mut depth = 0;
+            match condition {
+                "headless" => config.computer_use.interactive = false,
+                "denied" => config.permission_rules.rules.push(
+                    orca_core::approval_rules::PermissionRule::whole_tool(
+                        "computer",
+                        Decision::Deny,
+                    ),
+                ),
+                "child" => depth = 1,
+                "custom" => {
+                    config.subagents.effective_definition = Some(
+                        orca_core::subagent_types::agent_definition::EffectiveAgentDefinition {
+                            name: "desktop-audit".into(),
+                            description: "Audit".into(),
+                            system_prompt: "Read sources".into(),
+                            allowed_tools: vec!["computer".into()],
+                            model: None,
+                        },
+                    )
+                }
+                _ => unreachable!(),
+            }
+            let launcher = orca_computer_use::fake::FakeLauncher::new(
+                orca_computer_use::fake::FakeDesktop::with_textedit(),
+            );
+            let handler = ComputerApprovalRecording::default();
+            let (_, result, emitted) = execute_computer_with_launcher(
+                &config,
+                launcher.clone(),
+                true,
+                &handler,
+                serde_json::json!({"action":"list_apps"}),
+                depth,
+            );
+            assert_eq!(result.status, ToolStatus::Failed, "{condition}");
+            assert_eq!(
+                result.terminal().started,
+                orca_core::tool_types::ToolInvocationStarted::No
+            );
+            assert_eq!(launcher.launches(), 0, "{condition}");
+            assert!(handler.0.lock().unwrap().is_empty());
+            assert_eq!(
+                emitted
+                    .iter()
+                    .filter(|event| event["type"] == "tool.call.completed")
+                    .count(),
+                1
+            );
+        }
     }
 
     #[derive(Default)]
@@ -2294,7 +2466,7 @@ mod tests {
                     .output
                     .as_deref()
                     .unwrap()
-                    .starts_with("TextEdit \"probe.rtf\": screenshot")
+                    .starts_with("TextEdit \"probe.rtf\" [window 1]: screenshot")
             );
             assert_eq!(result.images.len(), 1);
             assert_eq!(
@@ -2350,7 +2522,9 @@ mod tests {
         );
         assert_eq!(
             result.error.as_deref(),
-            Some("computer use is only available in the interactive TUI on macOS 14 or later")
+            Some(
+                "computer use is only available in the interactive TUI on macOS 14 or later; this session does not expose computer (main session only, no custom agent, and no whole-tool deny rule)"
+            )
         );
         assert!(handler.0.lock().unwrap().is_empty());
         assert_eq!(

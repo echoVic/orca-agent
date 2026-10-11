@@ -22,6 +22,8 @@ pub(crate) mod visibility;
 pub(crate) struct ComputerUseService {
     launcher: Arc<dyn DriverLauncher>,
     state: Arc<Mutex<ServiceState>>,
+    #[cfg(test)]
+    host_supported: bool,
 }
 
 #[derive(Default)]
@@ -92,7 +94,21 @@ impl ComputerUseService {
         Self {
             launcher,
             state: Arc::new(Mutex::new(ServiceState::default())),
+            #[cfg(test)]
+            host_supported: orca_computer_use::apps::host_supported(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(launcher: Arc<dyn DriverLauncher>) -> Self {
+        let mut service = Self::new(launcher);
+        service.host_supported = true;
+        service
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_host_supported(&self) -> bool {
+        self.host_supported
     }
 
     fn event_callback(&self, generation: u64) -> EventCallback {
@@ -221,21 +237,6 @@ impl ComputerUseService {
         result
     }
 
-    /// Disconnects the active call without waiting for a driver reply.
-    #[allow(dead_code)] // Retained for callers cancelling whichever driver is current.
-    pub(crate) fn cancel_in_flight(&self) {
-        let client = self
-            .state
-            .lock()
-            .expect("computer-use service lock poisoned")
-            .driver
-            .as_ref()
-            .map(|(client, _)| Arc::clone(client));
-        if let Some(client) = client {
-            client.close();
-        }
-    }
-
     /// Drops the client and its observations; the next call starts a new driver.
     pub(crate) fn reset(&self) {
         self.state
@@ -266,6 +267,15 @@ impl ComputerUseService {
         );
     }
 
+    pub(crate) fn latest_window(&self, bundle_id: &str) -> Option<u32> {
+        self.state
+            .lock()
+            .expect("computer-use service lock poisoned")
+            .latest_window
+            .get(bundle_id)
+            .copied()
+    }
+
     pub(crate) fn is_secure(&self, bundle_id: &str, window: Option<u32>, id: u32) -> bool {
         self.state
             .lock()
@@ -288,14 +298,28 @@ pub(crate) fn service(
     thread_store: &ExtensionData,
     cwd: &Path,
     config: &RunConfig,
-) -> Arc<ComputerUseService> {
-    thread_store.get_or_init(|| {
+) -> Result<Arc<ComputerUseService>, String> {
+    service_with_exe(thread_store, cwd, config, std::env::current_exe)
+}
+
+fn service_with_exe(
+    thread_store: &ExtensionData,
+    cwd: &Path,
+    config: &RunConfig,
+    current_exe: impl FnOnce() -> io::Result<PathBuf>,
+) -> Result<Arc<ComputerUseService>, String> {
+    if let Some(service) = thread_store.get::<ComputerUseService>() {
+        return Ok(service);
+    }
+    let exe = current_exe()
+        .map_err(|error| format!("Could not locate the computer-use executable: {error}"))?;
+    Ok(thread_store.get_or_init(|| {
         ComputerUseService::new(Arc::new(ProcessLauncher {
-            exe: std::env::current_exe().expect("current executable path"),
+            exe,
             cwd: cwd.to_path_buf(),
             approval_mode: config.approval_mode,
         }))
-    })
+    }))
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -522,11 +546,6 @@ mod tests {
     #[test]
     fn reset_disconnects_a_slow_call_without_waiting_for_its_reply() {
         assert_interrupt_disconnects_a_slow_call(ComputerUseService::reset);
-    }
-
-    #[test]
-    fn cancel_in_flight_disconnects_a_slow_call_without_waiting_for_its_reply() {
-        assert_interrupt_disconnects_a_slow_call(ComputerUseService::cancel_in_flight);
     }
 
     #[test]
@@ -773,8 +792,20 @@ printf '%s\n' "$line"
         let second = ExtensionData::new("second");
         let config = RunConfig::default();
         let cwd = std::path::Path::new(".");
-        let one = service(&first, cwd, &config);
-        assert!(Arc::ptr_eq(&one, &service(&first, cwd, &config)));
-        assert!(!Arc::ptr_eq(&one, &service(&second, cwd, &config)));
+        let one = service(&first, cwd, &config).unwrap();
+        assert!(Arc::ptr_eq(&one, &service(&first, cwd, &config).unwrap()));
+        assert!(!Arc::ptr_eq(&one, &service(&second, cwd, &config).unwrap()));
+    }
+    #[test]
+    fn a_missing_executable_path_is_an_error_and_does_not_cache_a_service() {
+        let store = ExtensionData::new("thread");
+        let result = service_with_exe(&store, Path::new("."), &RunConfig::default(), || {
+            Err(io::Error::other("executable unavailable"))
+        });
+        assert_eq!(
+            result.err().as_deref(),
+            Some("Could not locate the computer-use executable: executable unavailable")
+        );
+        assert!(store.get::<ComputerUseService>().is_none());
     }
 }

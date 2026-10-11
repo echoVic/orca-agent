@@ -45,6 +45,10 @@ fn execute_with_timeout(
     cancel: &CancelToken,
     timeout: Duration,
 ) -> ToolResult {
+    let existing_service = stores.thread_store().get::<ComputerUseService>();
+    if let Err(error) = super::prepare::ensure_visible(config, 0, existing_service.as_deref()) {
+        return ToolResult::failed_before_start(request, error, None);
+    }
     let call = match serde_json::from_str(request.raw_arguments.as_deref().unwrap_or("{}"))
         .map_err(|error| error.to_string())
         .and_then(|args| ComputerCall::parse(&args))
@@ -60,6 +64,13 @@ fn execute_with_timeout(
     }
     if cancel.is_cancelled() {
         return ToolResult::cancelled_before_start(request, "the turn was cancelled");
+    }
+    let service = match service(stores.thread_store(), cwd, config) {
+        Ok(service) => service,
+        Err(error) => return ToolResult::failed_before_start(request, error, None),
+    };
+    if let Err(error) = super::prepare::check_permissions(&service) {
+        return ToolResult::failed_before_start(request, error, None);
     }
     let model = config.model.as_deref().unwrap_or(FLASH_MODEL);
     let include_screenshot = config.model.supports_images(model) && accepts_tool_images(model);
@@ -88,7 +99,7 @@ fn execute_with_timeout(
             ..
         } => Request::Act(ActParams {
             app: app.into(),
-            window: *window,
+            window: service.latest_window(app).or(*window),
             action: action.clone(),
             foreground_fallback: config.computer_use.foreground_fallback,
             observe_after: *observe_after,
@@ -96,7 +107,6 @@ fn execute_with_timeout(
             secure_approved,
         }),
     };
-    let service = service(stores.thread_store(), cwd, config);
     begin_turn(&service, stores.turn_store(), cancel);
     if cancel.is_cancelled() {
         return ToolResult::cancelled_before_start(request, "the turn was cancelled");
@@ -105,6 +115,13 @@ fn execute_with_timeout(
         Ok(reply) => reply,
         Err(error @ (CallError::TimedOut | CallError::Disconnected)) => {
             service.reset();
+            if cancel.is_cancelled() {
+                return ToolResult::cancelled(
+                    request,
+                    "computer use was stopped by the user (Esc)",
+                    None,
+                );
+            }
             let stopped = if matches!(error, CallError::Disconnected) {
                 "stopped"
             } else {
@@ -121,6 +138,13 @@ fn execute_with_timeout(
             );
         }
         Err(CallError::Driver(error)) => {
+            if error.kind == ErrorKind::NeedsSecureApproval {
+                return ToolResult::failed(
+                    request,
+                    "The driver detected text entry into a password field that was not separately approved. Observe the app again, then target the secure field by element number so Orca can ask for separate approval; no text was entered.",
+                    None,
+                );
+            }
             let mut message = error.message;
             if matches!(error.kind, ErrorKind::AppAmbiguous | ErrorKind::AppNotFound) {
                 for app in &error.candidates {
@@ -159,8 +183,11 @@ fn execute_with_timeout(
             };
             let mut text = format!("{} {}: done", call.action_name(), action_target(action));
             if outcome.foreground_used {
+                text.push_str("; used the foreground");
+            }
+            if let Some(note) = outcome.note {
                 text.push_str("; ");
-                text.push_str(outcome.note.as_deref().unwrap_or("used the foreground"));
+                text.push_str(&note);
             }
             if let Some(position) = outcome.scroll_position {
                 text.push_str(&format!("; scrolled to {:.0}%", position * 100.0));
@@ -247,7 +274,7 @@ mod tests {
     use std::time::Instant;
 
     fn insert_service(store: &ExtensionData, launcher: &FakeLauncher) {
-        store.insert(ComputerUseService::new(Arc::new(launcher.clone())));
+        store.insert(ComputerUseService::new_for_test(Arc::new(launcher.clone())));
     }
 
     fn flash_config() -> RunConfig {
@@ -300,7 +327,7 @@ mod tests {
                 .output
                 .as_deref()
                 .unwrap()
-                .starts_with("TextEdit \"probe.rtf\": screenshot"),
+                .starts_with("TextEdit \"probe.rtf\" [window 1]: screenshot"),
             "{:?}",
             result.output
         );
@@ -516,12 +543,10 @@ mod tests {
             .recv_timeout(Duration::from_millis(500))
             .expect("Esc must release the in-flight call without waiting for its reply");
         assert!(cancel.is_cancelled());
-        assert_eq!(output.status, ToolStatus::Failed);
+        assert_eq!(output.status, ToolStatus::Cancelled);
         assert_eq!(
             output.error.as_deref(),
-            Some(
-                "the computer-use driver did not answer in 30 s and stopped; observe again before acting"
-            )
+            Some("computer use was stopped by the user (Esc)")
         );
         call.join().unwrap();
     }
@@ -659,7 +684,9 @@ mod tests {
         let result = execute(&secure, &config, stores, Path::new("/"), &cancel);
         assert_eq!(
             result.error.as_deref(),
-            Some("Typing into a secure field needs separate approval")
+            Some(
+                "The driver detected text entry into a password field that was not separately approved. Observe the app again, then target the secure field by element number so Orca can ask for separate approval; no text was entered."
+            )
         );
     }
     #[test]
@@ -728,5 +755,184 @@ mod tests {
         assert_eq!(result.status, ToolStatus::Completed);
         assert!(!launcher.desktop(|d| d.last_observe.as_ref().unwrap().include_screenshot));
         assert!(result.images.is_empty());
+    }
+    #[test]
+    fn hidden_computer_execution_never_launches_the_driver() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let mut config = flash_config();
+        config
+            .permission_rules
+            .rules
+            .push(orca_core::approval_rules::PermissionRule::whole_tool(
+                "computer",
+                orca_core::approval_types::Decision::Deny,
+            ));
+        let result = execute(
+            &request(json!({"action":"list_apps"}), None),
+            &config,
+            RuntimeExtensionStores::new(&thread_store, &turn_store),
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(launcher.launches(), 0);
+    }
+
+    #[test]
+    fn an_action_uses_the_latest_observed_window_even_if_another_is_requested() {
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.add_window(
+            "com.apple.TextEdit",
+            orca_computer_use::protocol::WindowInfo {
+                id: 2,
+                title: "B".into(),
+            },
+        );
+        let launcher = FakeLauncher::new(desktop);
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let stores = RuntimeExtensionStores::new(&thread_store, &turn_store);
+        let cancel = CancelToken::new();
+        let result = execute(
+            &request(
+                json!({"action":"observe", "app":"TextEdit", "window":2}),
+                Some("com.apple.TextEdit"),
+            ),
+            &flash_config(),
+            stores,
+            Path::new("/"),
+            &cancel,
+        );
+        assert_eq!(result.status, ToolStatus::Completed);
+        let (started, received) = std::sync::mpsc::channel();
+        launcher.desktop(|d| d.request_started = Some(started));
+        let result = execute(
+            &request(
+                json!({"action":"click", "app":"TextEdit", "window":1, "target":{"element":1}, "observe":false}),
+                Some("com.apple.TextEdit"),
+            ),
+            &flash_config(),
+            stores,
+            Path::new("/"),
+            &cancel,
+        );
+        assert_eq!(result.status, ToolStatus::Completed);
+        let Request::Act(params) = received.recv_timeout(Duration::from_secs(2)).unwrap() else {
+            panic!("act")
+        };
+        assert_eq!(params.window, Some(2));
+    }
+
+    #[test]
+    fn successful_action_without_an_observation_keeps_its_note() {
+        struct ClosingDriver(FakeDesktop);
+        impl orca_computer_use::serve::DriverHandler for ClosingDriver {
+            fn handle(
+                &mut self,
+                request: Request,
+                events: &orca_computer_use::serve::LineWriter,
+            ) -> Result<Reply, orca_computer_use::protocol::DriverError> {
+                if matches!(request, Request::Act(_)) {
+                    return Ok(Reply::Acted {
+                        outcome: orca_computer_use::protocol::ActOutcome {
+                            foreground_used: false,
+                            note: Some("The window closed after the action; observe again.".into()),
+                            scroll_position: None,
+                            observation: None,
+                        },
+                    });
+                }
+                self.0.handle(request, events)
+            }
+            fn shutdown(&mut self) {
+                self.0.shutdown();
+            }
+        }
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        thread_store.insert(ComputerUseService::new_for_test(Arc::new(
+            orca_computer_use::inprocess::InProcessLauncher::new(ClosingDriver(
+                FakeDesktop::with_textedit(),
+            )),
+        )));
+        let result = execute(
+            &request(
+                json!({"action":"click", "app":"TextEdit", "target":{"element":1}}),
+                Some("com.apple.TextEdit"),
+            ),
+            &flash_config(),
+            RuntimeExtensionStores::new(&thread_store, &turn_store),
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert!(
+            result
+                .output
+                .as_deref()
+                .unwrap()
+                .contains("The window closed after the action; observe again."),
+            "{:?}",
+            result.output
+        );
+        assert!(result.images.is_empty());
+    }
+
+    #[test]
+    fn a_point_target_needing_secure_approval_gives_a_safe_retry_instruction() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let result = execute(
+            &request(
+                json!({"action":"key", "app":"TextEdit", "keys":["p"], "target":{"point":[30,160]}}),
+                Some("com.apple.TextEdit"),
+            ),
+            &flash_config(),
+            RuntimeExtensionStores::new(&thread_store, &turn_store),
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Observe the app again"),
+            "{:?}",
+            result.error
+        );
+        assert_eq!(launcher.desktop(|d| d.actions_on("com.apple.TextEdit")), 0);
+    }
+
+    #[test]
+    fn runtime_formats_truncated_and_title_bar_only_observations() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let service = ComputerUseService::new_for_test(Arc::new(launcher));
+        let Reply::Observed { mut observation } = service
+            .call(
+                Request::Observe(ObserveParams {
+                    app: "com.apple.TextEdit".into(),
+                    window: None,
+                    query: None,
+                    max_elements: 300,
+                    include_screenshot: false,
+                }),
+                Duration::from_secs(30),
+            )
+            .unwrap()
+        else {
+            panic!("observation")
+        };
+        observation.truncated = true;
+        observation.no_element_tree = true;
+        let mut images = vec![];
+        let text = observation_text(&service, observation, &mut images);
+        assert!(text.contains("[window 1]"));
+        assert!(text.contains("cut off after"));
+        assert!(text.contains("time limit"));
+        assert!(text.contains("no element tree; use point targets"));
     }
 }

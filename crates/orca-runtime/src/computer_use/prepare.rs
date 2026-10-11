@@ -16,11 +16,7 @@ pub(crate) fn prepare_invocation(
     config: &RunConfig,
     service: &ComputerUseService,
 ) -> Result<(), String> {
-    if !config.computer_use.interactive {
-        return Err(
-            "computer use is only available in the interactive TUI on macOS 14 or later".into(),
-        );
-    }
+    ensure_visible(config, 0, Some(service))?;
     let arguments = serde_json::from_str(
         invocation
             .effective
@@ -30,27 +26,15 @@ pub(crate) fn prepare_invocation(
     )
     .map_err(|error| error.to_string())?;
     let call = ComputerCall::parse(&arguments)?;
+    if config.approval_mode == ApprovalMode::Plan
+        && !matches!(call, ComputerCall::ListApps | ComputerCall::Observe { .. })
+    {
+        return Err("plan mode only allows list_apps and observe".into());
+    }
+    let hello = check_permissions(service)?;
     if matches!(call, ComputerCall::ListApps) {
         invocation.action = None;
         return Ok(());
-    }
-    if config.approval_mode == ApprovalMode::Plan && !matches!(call, ComputerCall::Observe { .. }) {
-        return Err("plan mode only allows list_apps and observe".into());
-    }
-    let hello = service.hello().map_err(|error| error.message)?;
-    let mut missing = Vec::new();
-    if !hello.permissions.accessibility || !hello.permissions.event_tap {
-        missing.push("Accessibility");
-    }
-    if !hello.permissions.screen_recording {
-        missing.push("Screen Recording");
-    }
-    if !missing.is_empty() {
-        return Err(format!(
-            "computer use needs {} for the app this terminal runs in ({}). Turn it on in System Settings > Privacy & Security; after granting Screen Recording, restart the terminal.",
-            missing.join(" and "),
-            hello.host_bundle_id.as_deref().unwrap_or("your terminal")
-        ));
     }
     let app_name = call.app().expect("app call");
     let resolved = service.call(
@@ -118,17 +102,26 @@ pub(crate) fn prepare_invocation(
         RiskTier::Normal => None,
     };
     let secure = match &call {
-        ComputerCall::Act {
-            window,
-            action: Action::Type { target, .. },
-            ..
-        } => match target {
-            Some(Target::Element { element }) => {
-                service.is_secure(&app.bundle_id, *window, *element)
+        ComputerCall::Act { window, action, .. } => {
+            let target = match action {
+                Action::Type { target, .. } => Some(target),
+                Action::Key { target, keys }
+                    if orca_computer_use::keys::parse_combo(keys)?.enters_text() =>
+                {
+                    Some(target)
+                }
+                _ => None,
+            };
+            // Element numbers belong to the latest observed window, just as act does.
+            let window = service.latest_window(&app.bundle_id).or(*window);
+            match target {
+                Some(Some(Target::Element { element })) => {
+                    service.is_secure(&app.bundle_id, window, *element)
+                }
+                Some(None) => service.focused_secure(&app.bundle_id, window),
+                _ => false,
             }
-            None => service.focused_secure(&app.bundle_id, *window),
-            Some(Target::Point { .. }) => false,
-        },
+        }
         _ => false,
     };
     invocation.action = Some(ActionKind::Computer);
@@ -138,16 +131,76 @@ pub(crate) fn prepare_invocation(
         app.bundle_id.clone()
     });
     let mut preview = if secure {
-        format!("type into a password field in {}", app.name)
+        format!(
+            "{} into a password field in {}",
+            call.action_name(),
+            app.name
+        )
     } else {
         format!("{} in {} ({})", call.action_name(), app.name, app.bundle_id)
     };
+    if let ComputerCall::LaunchApp { open, .. } = &call {
+        for path in open {
+            preview.push_str("\nopen: ");
+            preview.push_str(&serde_json::to_string(path).expect("string serialization"));
+        }
+    }
     if let Some(warning) = warning {
         preview.push('\n');
         preview.push_str(&warning);
     }
     invocation.approval_preview = Some(preview);
     Ok(())
+}
+
+/// Enforce the provider's availability predicate again at the execution boundary.
+pub(crate) fn ensure_visible(
+    config: &RunConfig,
+    depth: u32,
+    service: Option<&ComputerUseService>,
+) -> Result<(), String> {
+    let host_supported = orca_computer_use::apps::host_supported();
+    #[cfg(test)]
+    let host_supported = service.map_or(host_supported, ComputerUseService::test_host_supported);
+    #[cfg(not(test))]
+    let _ = service;
+    if !super::visibility::tool_visible(
+        config,
+        depth,
+        config
+            .subagents
+            .effective_definition
+            .as_ref()
+            .map(|definition| definition.allowed_tools.as_slice()),
+        host_supported,
+    ) {
+        return Err("computer use is only available in the interactive TUI on macOS 14 or later; this session does not expose computer (main session only, no custom agent, and no whole-tool deny rule)".into());
+    }
+    Ok(())
+}
+
+/// Check before arming the Esc listener, including for list_apps.
+pub(crate) fn check_permissions(
+    service: &ComputerUseService,
+) -> Result<orca_computer_use::client::HelloInfo, String> {
+    let hello = service.hello().map_err(|error| error.message)?;
+    let mut missing = Vec::new();
+    if !hello.permissions.accessibility || !hello.permissions.event_tap {
+        missing.push("Accessibility");
+    }
+    if !hello.permissions.screen_recording {
+        missing.push("Screen Recording");
+    }
+    if !missing.is_empty() {
+        // Release the machine-wide lock and avoid caching a denied handshake.
+        service.reset();
+        return Err(format!(
+            "computer use needs {} for the app this terminal runs in ({}). Turn it on in System Settings > Privacy & Security; after granting Screen Recording, restart the terminal.",
+            missing.join(" and "),
+            hello.host_bundle_id.as_deref().unwrap_or("your terminal")
+        ));
+    }
+    Ok(hello)
 }
 
 #[cfg(test)]
@@ -176,7 +229,7 @@ mod tests {
             raw_arguments: Some(args.to_string()),
         };
         (
-            ComputerUseService::new(Arc::new(FakeLauncher::new(desktop))),
+            ComputerUseService::new_for_test(Arc::new(FakeLauncher::new(desktop))),
             ToolInvocation {
                 requested: request.clone(),
                 effective: request,
@@ -306,8 +359,7 @@ mod tests {
 
     #[test]
     fn list_apps_needs_no_approval() {
-        let mut desktop = FakeDesktop::with_textedit();
-        desktop.permissions.accessibility = false;
+        let desktop = FakeDesktop::with_textedit();
         let (service, mut invocation) = setup(desktop, json!({"action":"list_apps"}));
         prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap();
         assert_eq!(invocation.action, None);
@@ -386,7 +438,7 @@ mod tests {
             setup(FakeDesktop::with_textedit(), json!({"action":"list_apps"}));
         assert_eq!(
             prepare_invocation(&mut invocation, &RunConfig::default(), &service).unwrap_err(),
-            "computer use is only available in the interactive TUI on macOS 14 or later"
+            "computer use is only available in the interactive TUI on macOS 14 or later; this session does not expose computer (main session only, no custom agent, and no whole-tool deny rule)"
         );
     }
 
@@ -453,7 +505,7 @@ mod tests {
     #[test]
     fn argument_errors_are_returned_before_launching_the_driver() {
         let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
-        let service = ComputerUseService::new(Arc::new(launcher.clone()));
+        let service = ComputerUseService::new_for_test(Arc::new(launcher.clone()));
         let (_, mut invocation) = setup(
             FakeDesktop::with_textedit(),
             json!({"action":"click", "app":"TextEdit"}),
@@ -463,5 +515,100 @@ mod tests {
             "click needs \"target\": {\"element\": N} or {\"point\": [x, y]}"
         );
         assert_eq!(launcher.launches(), 0);
+    }
+    #[test]
+    fn list_apps_checks_permissions_and_recovers_after_they_are_granted() {
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.permissions.accessibility = false;
+        let launcher = FakeLauncher::new(desktop);
+        let service = ComputerUseService::new_for_test(Arc::new(launcher.clone()));
+        let (_, mut invocation) =
+            setup(FakeDesktop::with_textedit(), json!({"action":"list_apps"}));
+        let error =
+            prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap_err();
+        assert!(error.contains("Accessibility"), "{error}");
+        assert!(
+            error.contains("System Settings > Privacy & Security"),
+            "{error}"
+        );
+        launcher.desktop(|desktop| desktop.permissions.accessibility = true);
+        prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap();
+        assert_eq!(launcher.launches(), 2);
+        assert_eq!(invocation.action, None);
+    }
+
+    #[test]
+    fn launch_app_preview_includes_paths_and_urls() {
+        let (service, mut invocation) = setup(
+            FakeDesktop::with_textedit(),
+            json!({"action":"launch_app", "app":"TextEdit", "open":["/tmp/report.txt", "https://example.test/private"]}),
+        );
+        prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap();
+        let preview = invocation.approval_preview.unwrap();
+        assert!(preview.contains("/tmp/report.txt"), "{preview}");
+        assert!(
+            preview.contains("https://example.test/private"),
+            "{preview}"
+        );
+    }
+
+    #[test]
+    fn a_whole_tool_deny_refuses_list_apps_without_launching() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let service = ComputerUseService::new_for_test(Arc::new(launcher.clone()));
+        let mut config = interactive_config();
+        config
+            .permission_rules
+            .rules
+            .push(PermissionRule::whole_tool("computer", Decision::Deny));
+        let (_, mut invocation) =
+            setup(FakeDesktop::with_textedit(), json!({"action":"list_apps"}));
+        assert!(prepare_invocation(&mut invocation, &config, &service).is_err());
+        assert_eq!(launcher.launches(), 0);
+    }
+
+    #[test]
+    fn focused_password_fields_gate_text_keys_without_a_target() {
+        for keys in [
+            json!(["p"]),
+            json!(["cmd", "v"]),
+            json!(["shift", "option", "p"]),
+            json!(["space"]),
+            json!(["tab"]),
+            json!(["ctrl", "p"]),
+        ] {
+            let (service, mut invocation) = setup(
+                FakeDesktop::with_textedit(),
+                json!({"action":"key", "app":"TextEdit", "keys":keys}),
+            );
+            let Reply::Observed { mut observation } = service
+                .call(
+                    Request::Observe(ObserveParams {
+                        app: "com.apple.TextEdit".into(),
+                        window: None,
+                        query: None,
+                        max_elements: 300,
+                        include_screenshot: false,
+                    }),
+                    Duration::from_secs(30),
+                )
+                .unwrap()
+            else {
+                panic!("observation")
+            };
+            observation.focused_secure = true;
+            service.record_observation(&observation);
+            prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap();
+            let secure = keys != json!(["tab"]) && keys != json!(["ctrl", "p"]);
+            assert_eq!(
+                invocation.effective.target.as_deref(),
+                Some(if secure {
+                    "com.apple.TextEdit#secure"
+                } else {
+                    "com.apple.TextEdit"
+                }),
+                "{keys}"
+            );
+        }
     }
 }
