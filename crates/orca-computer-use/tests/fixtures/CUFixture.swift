@@ -68,6 +68,12 @@ final class ProbeApplication: NSApplication {
 }
 let app = ProbeApplication.shared
 app.setActivationPolicy(.regular)
+// Standard AppKit shortcut dispatch needs an Edit menu, just like a real app.
+let menu = NSMenu()
+let edit = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+let submenu = NSMenu(title: "Edit")
+submenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+edit.submenu = submenu; menu.addItem(edit); app.mainMenu = menu
 let controller = Controller()
 let window = ProbeWindow(contentRect: NSRect(x: 200, y: 200, width: 640, height: 480),
                       styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)

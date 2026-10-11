@@ -303,12 +303,29 @@ impl Live {
         secure_approved: bool,
         foreground_fallback: bool,
     ) -> Result<ActOutcome, DriverError> {
+        self.act_app(
+            "dev.orca.cu-fixture",
+            None,
+            action,
+            secure_approved,
+            foreground_fallback,
+        )
+    }
+
+    fn act_app(
+        &self,
+        app: &str,
+        window: Option<u32>,
+        action: Action,
+        secure_approved: bool,
+        foreground_fallback: bool,
+    ) -> Result<ActOutcome, DriverError> {
         match self
             .client
             .call(
                 Request::Act(ActParams {
-                    app: "dev.orca.cu-fixture".into(),
-                    window: None,
+                    app: app.into(),
+                    window,
                     action,
                     foreground_fallback,
                     observe_after: true,
@@ -401,6 +418,41 @@ impl Live {
             );
             CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
             record_test_hid_event();
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    fn post_cmd_control(&self, pid: i32, keycode: u16) {
+        use objc2_core_graphics::{CGEventField, CGEventFlags, CGEventTapLocation};
+        let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid).unwrap();
+        assert!(app.bundleIdentifier().is_some_and(|id| matches!(
+            id.to_string().as_str(),
+            "dev.orca.cu-fixture" | "com.apple.TextEdit"
+        )));
+        let source = CGEventSource::new(CGEventSourceStateID::Private).unwrap();
+        for (code, down, flags) in [
+            (55, true, CGEventFlags::MaskCommand),
+            (keycode, true, CGEventFlags::MaskCommand),
+            (keycode, false, CGEventFlags::MaskCommand),
+            (55, false, CGEventFlags::empty()),
+        ] {
+            assert_eq!(
+                NSWorkspace::sharedWorkspace()
+                    .frontmostApplication()
+                    .unwrap()
+                    .processIdentifier(),
+                pid
+            );
+            let event = CGEvent::new_keyboard_event(Some(&source), code, down).unwrap();
+            CGEvent::set_flags(Some(&event), flags);
+            CGEvent::set_integer_value_field(
+                Some(&event),
+                CGEventField::EventSourceUserData,
+                0x4F52_4341,
+            );
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+            record_test_hid_event();
+            thread::sleep(Duration::from_millis(10));
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -1385,14 +1437,16 @@ fn cmd_a_reaches_the_focused_field() {
         )
         .unwrap();
         live.assert_log_contains(&log, r#""value":"abc""#);
-        live.act(
-            Action::Key {
-                keys: vec!["cmd".into(), "a".into()],
-                target: None,
-            },
-            false,
-        )
-        .unwrap();
+        let outcome = live
+            .act_with_fallback(
+                Action::Key {
+                    keys: vec!["cmd".into(), "a".into()],
+                    target: None,
+                },
+                false,
+                true,
+            )
+            .unwrap();
         live.act(
             Action::Type {
                 text: "x".into(),
@@ -1401,7 +1455,7 @@ fn cmd_a_reaches_the_focused_field() {
             false,
         )
         .unwrap();
-        live.assert_log_contains(&log, r#""value":"abcx""#);
+        thread::sleep(Duration::from_millis(100));
         let observation = live.observe("dev.orca.cu-fixture", None);
         let value = observation
             .elements
@@ -1409,18 +1463,136 @@ fn cmd_a_reaches_the_focused_field() {
             .find(|e| e.label.as_deref() == Some("Name"))
             .unwrap()
             .value
-            .as_deref()
+            .clone()
             .unwrap();
-        // Task 13 owns the decision on routing Cmd combinations to the foreground.
+        live.assert_frontmost_and_pointer_unchanged();
+        // Positive control: foreground HID reaches the same focused field.
+        let pid = bundle_pids("dev.orca.cu-fixture")
+            .into_iter()
+            .next()
+            .unwrap();
+        live.fixture_frontmost(pid);
+        live.post_cmd_control(pid, 0); // A
+        live.act(
+            Action::Type {
+                text: "x".into(),
+                target: None,
+            },
+            false,
+        )
+        .unwrap();
+        live.assert_log_contains(&log, r#""value":"x""#);
         assert_eq!(
-            value, "abcx",
-            "Cmd+A did not select the background field in the Task 7 probe"
+            value, "x",
+            "Cmd+A must select the field when called from the background"
         );
-        eprintln!(
-            "Cmd+A reached the background field: {} (value={value:?})",
-            value == "x"
+        assert!(outcome.foreground_used);
+    });
+}
+
+fn file_changed(file: &std::path::Path, before: std::time::SystemTime) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if std::fs::metadata(file).unwrap().modified().unwrap() != before {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore]
+fn cmd_s_saves_textedit_in_the_background() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let file = live.directory.path().join("orca-cu-cmd-s.txt");
+        std::fs::write(&file, "Orca Cmd+S probe\n").unwrap();
+        let before = bundle_pids("com.apple.TextEdit");
+        if !before.is_empty() {
+            eprintln!("skipped: TextEdit already running; do not touch the user's documents");
+            return;
+        }
+        let launched = live.client.call(
+            Request::LaunchApp {
+                app: "com.apple.TextEdit".into(),
+                open: vec![file.to_string_lossy().into_owned()],
+            },
+            Duration::from_secs(60),
+        );
+        register_launch_pids(
+            &mut live.launched,
+            &before,
+            &bundle_pids("com.apple.TextEdit"),
+        );
+        let Reply::Launched { app } = launched.unwrap() else {
+            panic!("expected launched TextEdit");
+        };
+        let window = app
+            .windows
+            .iter()
+            .find(|w| w.title.contains("orca-cu-cmd-s.txt"))
+            .expect("own document window")
+            .id;
+        live.make_finder_frontmost();
+        live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
+        live.act_app(
+            "com.apple.TextEdit",
+            Some(window),
+            Action::Type {
+                text: "edited by Orca".into(),
+                target: None,
+            },
+            false,
+            true,
+        )
+        .unwrap();
+        let edited = live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
+        assert!(
+            edited.elements.iter().any(|e| e
+                .value
+                .as_deref()
+                .is_some_and(|v| v.contains("edited by Orca"))),
+            "positive control: typing dirtied our own document"
         );
         live.assert_frontmost_and_pointer_unchanged();
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let action = Action::Key {
+            keys: vec!["cmd".into(), "s".into()],
+            target: None,
+        };
+        let outcome = live
+            .act_app(
+                "com.apple.TextEdit",
+                Some(window),
+                action.clone(),
+                false,
+                true,
+            )
+            .unwrap();
+        let saved = file_changed(&file, mtime);
+        live.assert_frontmost_and_pointer_unchanged();
+        // Positive control: marked HID Cmd+S saves the same dirty document.
+        record_restoration(
+            app.pid,
+            CGEvent::location(Some(&CGEvent::new(None).unwrap())),
+        );
+        live.post_cmd_control(app.pid.unwrap(), 1); // S
+        assert!(
+            file_changed(&file, mtime),
+            "positive control: frontmost Cmd+S changes the file mtime"
+        );
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("edited by Orca")
+        );
+        assert!(saved, "background Cmd+S did not change the file mtime");
+        assert!(outcome.foreground_used);
     });
 }
 

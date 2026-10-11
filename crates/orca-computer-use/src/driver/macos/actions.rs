@@ -153,9 +153,14 @@ impl MacDriver {
                     events::post_unicode_text(pid, text)?;
                 }
                 Action::Key { keys, target } => {
-                    focus(table, &application, *target)?;
                     let stroke =
                         parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
+                    // On the real Mac, process-directed Cmd+A/Cmd+S events
+                    // reached the app but did not dispatch its menu shortcut.
+                    if stroke.modifiers.cmd {
+                        return Err(foreground("Command shortcuts require the foreground"));
+                    }
+                    focus(table, &application, *target)?;
                     events::post_key(pid, stroke)?;
                 }
                 Action::Scroll {
