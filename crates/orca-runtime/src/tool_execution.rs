@@ -1042,8 +1042,22 @@ impl ToolExecutionActor {
         let permission_overlay = permission_overlay.expect("tool execution permission overlay");
         let mut invocation =
             prepare_tool_invocation(tool_request, subagent_depth, mcp_registry, config);
-        if let Err(error) = validate_tool_invocation(&invocation, mcp_registry, config) {
-            let result = error.into_result();
+        let failure = match validate_tool_invocation(&invocation, mcp_registry, config) {
+            Err(error) => Some(error.into_result()),
+            Ok(()) if invocation.effective.name == tool_types::ToolName::Computer => {
+                let thread_store = extension_stores
+                    .map(|stores| stores.thread_store())
+                    .unwrap_or(&self.runtime.thread_extensions);
+                let service = crate::computer_use::service(thread_store, cwd, config);
+                crate::computer_use::prepare::prepare_invocation(&mut invocation, config, &service)
+                    .err()
+                    .map(|error| {
+                        tool_types::ToolResult::failed_before_start(tool_request, error, None)
+                    })
+            }
+            Ok(()) => None,
+        };
+        if let Some(result) = failure {
             let mut event_error = None;
             if emit_deltas {
                 retain_first_io_error(
@@ -1066,40 +1080,6 @@ impl ToolExecutionActor {
                 (RunStatus::Failed, result),
                 event_error,
             ));
-        }
-
-        if invocation.effective.name == tool_types::ToolName::Computer {
-            let thread_store = extension_stores
-                .map(|stores| stores.thread_store())
-                .unwrap_or(&self.runtime.thread_extensions);
-            let service = crate::computer_use::service(thread_store, cwd, config);
-            if let Err(error) =
-                crate::computer_use::prepare::prepare_invocation(&mut invocation, config, &service)
-            {
-                let result = tool_types::ToolResult::failed_before_start(tool_request, error, None);
-                let mut event_error = None;
-                if emit_deltas {
-                    retain_first_io_error(
-                        &mut event_error,
-                        emit_tool_call_requested(events, sink, tool_request),
-                    );
-                }
-                retain_first_io_error(
-                    &mut event_error,
-                    publish_tool_call_completed(
-                        events,
-                        sink,
-                        tool_request,
-                        &result,
-                        emit_deltas,
-                        provider_response_ingress,
-                    ),
-                );
-                return Ok(ToolExecutionCompletion::from_pair_with_event_error(
-                    (RunStatus::Failed, result),
-                    event_error,
-                ));
-            }
         }
 
         let approval_bound_request = if approval_already_resolved {
@@ -2324,17 +2304,47 @@ mod tests {
             Some("computer use is only available in the interactive TUI on macOS 14 or later")
         );
         assert!(handler.0.lock().unwrap().is_empty());
-        assert!(
+        assert_eq!(
             emitted
                 .iter()
-                .any(|event| event["type"] == "tool.call.requested"),
-            "{emitted:?}"
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["tool.call.requested", "tool.call.completed"]
         );
+    }
+
+    #[test]
+    fn tool_execution_validation_failure_publishes_once_before_preparation() {
+        let mut config = computer_config();
+        config.computer_use.interactive = false;
+        config.external_tools[0].schema = serde_json::json!({
+            "type": "object", "required": ["missing"]
+        });
+        let handler = ComputerApprovalRecording::default();
+        let (status, result, emitted) = execute_computer_for_approval(
+            &config,
+            orca_computer_use::fake::FakeDesktop::with_textedit(),
+            true,
+            &handler,
+        );
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(
+            result.terminal().started,
+            orca_core::tool_types::ToolInvocationStarted::No
+        );
+        let error = result.error.as_deref().unwrap();
         assert!(
+            error.starts_with("tool arguments failed schema validation:"),
+            "{error}"
+        );
+        assert!(error.contains("missing"), "{error}");
+        assert!(handler.0.lock().unwrap().is_empty());
+        assert_eq!(
             emitted
                 .iter()
-                .any(|event| event["type"] == "tool.call.completed"),
-            "{emitted:?}"
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["tool.call.requested", "tool.call.completed"]
         );
     }
 

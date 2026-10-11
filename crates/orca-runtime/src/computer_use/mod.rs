@@ -22,7 +22,8 @@ pub(crate) struct ComputerUseService {
 
 #[derive(Default)]
 struct ServiceState {
-    driver: Option<(DriverClient, HelloInfo)>,
+    driver: Option<(Arc<DriverClient>, HelloInfo)>,
+    generation: u64,
     version_mismatch: Option<DriverError>,
     observations: HashMap<(String, u32), SecureObservation>,
     latest_window: HashMap<String, u32>,
@@ -41,7 +42,13 @@ impl ServiceState {
         if self.driver.is_none() {
             // Task 10 attaches the turn's Esc handling to driver events.
             match DriverClient::start(launcher, Arc::new(|_| {})) {
-                Ok(driver) => self.driver = Some(driver),
+                Ok((client, hello)) => {
+                    self.generation = self
+                        .generation
+                        .checked_add(1)
+                        .expect("driver generation overflow");
+                    self.driver = Some((Arc::new(client), hello));
+                }
                 Err(error) => {
                     if error.kind == ErrorKind::VersionMismatch {
                         self.version_mismatch = Some(error.clone());
@@ -54,6 +61,9 @@ impl ServiceState {
     }
 
     fn reset(&mut self) {
+        if let Some((client, _)) = &self.driver {
+            client.close();
+        }
         self.driver = None;
         self.observations.clear();
         self.latest_window.clear();
@@ -84,21 +94,43 @@ impl ComputerUseService {
     }
 
     pub(crate) fn call(&self, request: Request, timeout: Duration) -> Result<Reply, CallError> {
-        let mut state = self
-            .state
-            .lock()
-            .expect("computer-use service lock poisoned");
-        state.start(&*self.launcher).map_err(CallError::Driver)?;
-        let result = state
-            .driver
-            .as_ref()
-            .expect("started driver")
-            .0
-            .call(request, timeout);
+        let (client, generation) = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("computer-use service lock poisoned");
+            state.start(&*self.launcher).map_err(CallError::Driver)?;
+            (
+                Arc::clone(&state.driver.as_ref().expect("started driver").0),
+                state.generation,
+            )
+        };
+        let result = client.call(request, timeout);
         if matches!(result, Err(CallError::TimedOut | CallError::Disconnected)) {
-            state.reset();
+            let mut state = self
+                .state
+                .lock()
+                .expect("computer-use service lock poisoned");
+            if state.generation == generation {
+                state.reset();
+            }
         }
         result
+    }
+
+    /// Disconnects the active call without waiting for a driver reply.
+    #[allow(dead_code)] // Used by Task 10's Esc path.
+    pub(crate) fn cancel_in_flight(&self) {
+        let client = self
+            .state
+            .lock()
+            .expect("computer-use service lock poisoned")
+            .driver
+            .as_ref()
+            .map(|(client, _)| Arc::clone(client));
+        if let Some(client) = client {
+            client.close();
+        }
     }
 
     /// Drops the client and its observations; the next call starts a new driver.
@@ -282,6 +314,131 @@ mod tests {
         launcher.desktop(|desktop| desktop.lock_held = false);
         service.hello().unwrap();
         assert_eq!(launcher.launches(), 2);
+    }
+
+    fn assert_interrupt_disconnects_a_slow_call(interrupt: fn(&ComputerUseService)) {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let service = Arc::new(ComputerUseService::new(Arc::new(launcher.clone())));
+        service.hello().unwrap();
+        let (started, received) = mpsc::channel();
+        launcher.desktop(|desktop| {
+            desktop.request_started = Some(started);
+            desktop.answer_after = Some(Duration::from_secs(5));
+        });
+        let (finished, result) = mpsc::channel();
+        let calling_service = service.clone();
+        let call = thread::spawn(move || {
+            let _ = finished.send(calling_service.call(
+                Request::LaunchApp {
+                    app: "com.apple.TextEdit".into(),
+                    open: vec![],
+                },
+                Duration::from_secs(60),
+            ));
+        });
+        assert!(matches!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Request::LaunchApp { .. }
+        ));
+        let (reset_done, reset_result) = mpsc::channel();
+        let resetting_service = service.clone();
+        let reset = thread::spawn(move || {
+            interrupt(&resetting_service);
+            let _ = reset_done.send(());
+        });
+        let outcome = result.recv_timeout(Duration::from_millis(500));
+        assert!(
+            matches!(outcome, Ok(Err(CallError::Disconnected))),
+            "interrupt did not disconnect the pending call promptly: {outcome:?}"
+        );
+        reset_result
+            .recv_timeout(Duration::from_millis(500))
+            .expect("interrupt waited for the slow driver");
+        call.join().unwrap();
+        reset.join().unwrap();
+    }
+
+    #[test]
+    fn reset_disconnects_a_slow_call_without_waiting_for_its_reply() {
+        assert_interrupt_disconnects_a_slow_call(ComputerUseService::reset);
+    }
+
+    #[test]
+    fn cancel_in_flight_disconnects_a_slow_call_without_waiting_for_its_reply() {
+        assert_interrupt_disconnects_a_slow_call(ComputerUseService::cancel_in_flight);
+    }
+
+    #[test]
+    fn an_old_disconnected_call_cannot_reset_a_newer_driver() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        use std::thread;
+
+        struct ReplacingLauncher {
+            first: FakeLauncher,
+            replacement: FakeLauncher,
+            launches: AtomicUsize,
+        }
+        impl DriverLauncher for ReplacingLauncher {
+            fn launch(&self) -> io::Result<LaunchedDriver> {
+                if self.launches.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.first.launch()
+                } else {
+                    self.replacement.launch()
+                }
+            }
+        }
+        let first = FakeLauncher::new(FakeDesktop::with_textedit());
+        let launcher = Arc::new(ReplacingLauncher {
+            first: first.clone(),
+            replacement: FakeLauncher::new(FakeDesktop::with_textedit()),
+            launches: AtomicUsize::new(0),
+        });
+        let service = Arc::new(ComputerUseService::new(launcher.clone()));
+        service.hello().unwrap();
+        let (started, received) = mpsc::channel();
+        first.desktop(|desktop| {
+            desktop.request_started = Some(started);
+            desktop.answer_after = Some(Duration::from_secs(5));
+        });
+        let (finished, result) = mpsc::channel();
+        let calling_service = service.clone();
+        let call = thread::spawn(move || {
+            let _ = finished.send(calling_service.call(Request::ListApps, Duration::from_secs(60)));
+        });
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Request::ListApps
+        );
+        {
+            // Hold the normal cleanup lock across replacement: the failed old
+            // request cannot finish its cleanup before the new driver exists.
+            let mut state = service.state.lock().unwrap();
+            state.reset();
+            state.start(&*service.launcher).unwrap();
+        }
+        let outcome = result.recv_timeout(Duration::from_millis(500));
+        assert!(
+            matches!(outcome, Ok(Err(CallError::Disconnected))),
+            "old call did not disconnect: {outcome:?}"
+        );
+        call.join().unwrap();
+        assert!(matches!(
+            service
+                .call(Request::ListApps, Duration::from_secs(30))
+                .unwrap(),
+            Reply::Apps { .. }
+        ));
+        assert_eq!(
+            launcher.launches.load(Ordering::SeqCst),
+            2,
+            "the old call reset the replacement driver"
+        );
     }
 
     #[test]

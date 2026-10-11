@@ -43,7 +43,8 @@ struct Outbound {
 
 pub struct DriverClient {
     outgoing: Option<Sender<Outbound>>,
-    writer: Option<JoinHandle<()>>,
+    writer: Mutex<Option<JoinHandle<()>>>,
+    stop_writer: Sender<()>,
     pending: Pending,
     connected: Arc<AtomicBool>,
     next_id: AtomicU64,
@@ -121,9 +122,11 @@ impl DriverClient {
             .map_err(|error| failed(format!("Could not launch computer-use driver: {error}")))?;
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(true));
+        let (stop_writer, stop_receiver) = crossbeam_channel::bounded::<()>(1);
         let mut client = Self {
             outgoing: None,
-            writer: None,
+            writer: Mutex::new(None),
+            stop_writer,
             pending: pending.clone(),
             connected: connected.clone(),
             next_id: AtomicU64::new(1),
@@ -136,11 +139,18 @@ impl DriverClient {
         let (sender, receiver) = crossbeam_channel::bounded::<Outbound>(OUTBOUND_QUEUE_CAPACITY);
         let writer_pending = pending.clone();
         let writer_connected = connected.clone();
-        client.writer = Some(
+        client.writer = Mutex::new(Some(
             thread::Builder::new()
                 .name("computer-use-driver-writer".into())
                 .spawn(move || {
-                    for outbound in receiver {
+                    loop {
+                        let outbound = crossbeam_channel::select_biased! {
+                            recv(stop_receiver) -> _ => break,
+                            recv(receiver) -> outbound => match outbound {
+                                Ok(outbound) => outbound,
+                                Err(_) => break,
+                            },
+                        };
                         if !writer_connected.load(Ordering::SeqCst) {
                             break;
                         }
@@ -177,7 +187,7 @@ impl DriverClient {
                     }
                 })
                 .map_err(|error| failed(format!("Could not start computer-use writer: {error}")))?,
-        );
+        ));
         client.outgoing = Some(sender);
         client.reader = Some(
             thread::Builder::new()
@@ -251,6 +261,20 @@ impl DriverClient {
         }
     }
 
+    /// Closes stdin and wakes every pending caller, even while another caller
+    /// holds the client alive. Repeated closes are harmless.
+    pub fn close(&self) {
+        disconnect(&self.pending, &self.connected);
+        // Wake an idle writer as well as one delivering a nonblocking frame.
+        let _ = self.stop_writer.try_send(());
+        let mut writer = self.writer.lock().expect("driver writer lock poisoned");
+        if let Some(writer) = writer.take() {
+            // The writer observes connected during pipe backpressure. Joining
+            // ensures stdin is closed before returning, without waiting for a reply.
+            let _ = writer.join();
+        }
+    }
+
     #[cfg(test)]
     fn queued_requests(&self) -> usize {
         self.outgoing.as_ref().map_or(0, Sender::len)
@@ -309,13 +333,8 @@ impl DriverClient {
 
 impl Drop for DriverClient {
     fn drop(&mut self) {
-        disconnect(&self.pending, &self.connected);
+        self.close();
         self.outgoing.take();
-        if let Some(writer) = self.writer.take() {
-            // Nonblocking pipe writes observe connected, so joining closes stdin
-            // before we wait for the child, even when its pipe is full.
-            let _ = writer.join();
-        }
         if let Some(child) = &mut self.child {
             let deadline = Instant::now() + Duration::from_secs(1);
             loop {
@@ -409,6 +428,75 @@ mod tests {
         ));
         launcher.emit_esc();
         wait_until(|| seen.load(Ordering::SeqCst) == 1);
+    }
+
+    #[test]
+    fn close_disconnects_every_pending_call_and_is_idempotent() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        let client = Arc::new(client);
+        launcher.desktop(|desktop| desktop.answer_after = Some(Duration::from_secs(5)));
+        let (finished, results) = mpsc::channel();
+        let calls: Vec<_> = (0..4)
+            .map(|_| {
+                let client = client.clone();
+                let finished = finished.clone();
+                thread::spawn(move || {
+                    let _ = finished.send(client.call(Request::ListApps, Duration::from_secs(60)));
+                })
+            })
+            .collect();
+        wait_until(|| client.pending.lock().unwrap().len() == 4);
+        let (closed, closing) = mpsc::channel();
+        let closing_client = client.clone();
+        let closer = thread::spawn(move || {
+            for _ in 0..3 {
+                closing_client.close();
+            }
+            let _ = closed.send(());
+        });
+        for _ in 0..4 {
+            let outcome = results.recv_timeout(Duration::from_millis(500));
+            assert!(
+                matches!(outcome, Ok(Err(CallError::Disconnected))),
+                "pending call was not disconnected promptly: {outcome:?}"
+            );
+        }
+        closing
+            .recv_timeout(Duration::from_millis(500))
+            .expect("close waited for the driver reply");
+        assert!(matches!(
+            call(&client, Request::ListApps),
+            Err(CallError::Disconnected)
+        ));
+        for call in calls {
+            call.join().unwrap();
+        }
+        closer.join().unwrap();
+    }
+
+    #[test]
+    fn close_closes_idle_stdin_before_the_client_is_dropped() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        let client = Arc::new(client);
+        call(&client, Request::Turn { active: true }).unwrap();
+        let (closed, closing) = mpsc::channel();
+        let closing_client = client.clone();
+        let closer = thread::spawn(move || {
+            closing_client.close();
+            let _ = closed.send(());
+        });
+        closing
+            .recv_timeout(Duration::from_millis(500))
+            .expect("close did not wake the idle writer");
+        wait_until(|| launcher.shutdowns() == 1);
+        assert!(!launcher.desktop(|desktop| desktop.turn_active));
+        assert!(matches!(
+            call(&client, Request::ListApps),
+            Err(CallError::Disconnected)
+        ));
+        closer.join().unwrap();
     }
 
     #[test]
@@ -870,6 +958,74 @@ mod tests {
             delivered < 4 * 1024 * 1024,
             "Drop allowed the blocked request to finish writing"
         );
+    }
+
+    #[test]
+    fn close_interrupts_a_full_stdin_pipe_and_queued_call_admission() {
+        let launcher = StalledLauncher {
+            input: Mutex::new(None),
+            output: Mutex::new(None),
+            writing: Arc::new(AtomicBool::new(false)),
+        };
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        let client = Arc::new(client);
+        let (finished, results) = mpsc::channel();
+        let mut calls = Vec::new();
+        let first_client = client.clone();
+        let first_finished = finished.clone();
+        calls.push(thread::spawn(move || {
+            let _ = first_finished.send(first_client.call(
+                Request::LaunchApp {
+                    app: "com.apple.TextEdit".into(),
+                    open: vec!["x".repeat(4 * 1024 * 1024)],
+                },
+                Duration::from_secs(60),
+            ));
+        }));
+        wait_until(|| launcher.writing.load(Ordering::SeqCst));
+        for _ in 0..12 {
+            let client = client.clone();
+            let finished = finished.clone();
+            calls.push(thread::spawn(move || {
+                let _ = finished.send(client.call(Request::ListApps, Duration::from_secs(60)));
+            }));
+        }
+        wait_until(|| client.pending.lock().unwrap().len() == 13);
+        let (closed, closing) = mpsc::channel();
+        let closing_client = client.clone();
+        let closer = thread::spawn(move || {
+            closing_client.close();
+            let _ = closed.send(());
+        });
+        closing
+            .recv_timeout(Duration::from_millis(500))
+            .expect("close waited for a full stdin pipe");
+        for _ in 0..13 {
+            let outcome = results.recv_timeout(Duration::from_millis(500));
+            assert!(
+                matches!(outcome, Ok(Err(CallError::Disconnected))),
+                "close did not interrupt queued admission: {outcome:?}"
+            );
+        }
+        let mut input = launcher.input.lock().unwrap().take().unwrap();
+        let (eof, delivered) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            input.read_to_end(&mut bytes).unwrap();
+            let _ = eof.send(bytes.len());
+        });
+        let delivered = delivered
+            .recv_timeout(Duration::from_millis(500))
+            .expect("close kept the stalled driver's stdin open");
+        assert!(
+            delivered < 4 * 1024 * 1024,
+            "close allowed the blocked frame to finish"
+        );
+        reader.join().unwrap();
+        for call in calls {
+            call.join().unwrap();
+        }
+        closer.join().unwrap();
     }
 
     #[test]

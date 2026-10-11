@@ -25,6 +25,8 @@ struct FakeApp {
 pub struct FakeDesktop {
     pub protocol: u32,
     pub answer_after: Option<Duration>,
+    /// Signals request receipt before an artificial reply delay.
+    pub request_started: Option<std::sync::mpsc::Sender<Request>>,
     pub background_fails: bool,
     pub user_active: bool,
     pub lock_held: bool,
@@ -96,6 +98,7 @@ impl FakeDesktop {
         Self {
             protocol: PROTOCOL_VERSION,
             answer_after: None,
+            request_started: None,
             background_fails: false,
             user_active: false,
             lock_held: false,
@@ -356,6 +359,9 @@ impl FakeDesktop {
 
 impl DriverHandler for FakeDesktop {
     fn handle(&mut self, request: Request, _events: &LineWriter) -> Result<Reply, DriverError> {
+        if let Some(sender) = &self.request_started {
+            let _ = sender.send(request.clone());
+        }
         if let Some(delay) = self.answer_after {
             thread::sleep(delay);
         }
