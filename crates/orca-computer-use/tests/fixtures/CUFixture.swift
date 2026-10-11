@@ -33,15 +33,43 @@ final class Controller: NSObject, NSTextFieldDelegate {
         label.stringValue = "Count: \(count)"
         log(["type": "click", "count": count])
     }
+    @objc func resetProbeFocus(_ sender: Any?) {
+        pendingProbeRaise = true
+        window.makeFirstResponder(nil)
+        log(["type": "focus_reset"])
+    }
     func controlTextDidChange(_ note: Notification) {
         if let field = note.object as? NSTextField { log(["type": "input", "value": field.stringValue]) }
     }
 }
 
-let app = NSApplication.shared
+// Opt-in regression state: background AX cannot focus the window, while
+// foreground HID can focus the real secure field. Default fixture is unchanged.
+var pendingProbeRaise = true
+let foregroundPasswordProbe = CommandLine.arguments.contains("--foreground-password-probe")
+final class ProbeWindow: NSWindow {
+    override func accessibilityPerformRaise() -> Bool {
+        pendingProbeRaise = false
+        return super.accessibilityPerformRaise()
+    }
+    override func accessibilityHitTest(_ point: NSPoint) -> Any? {
+        if foregroundPasswordProbe && pendingProbeRaise { return self }
+        return super.accessibilityHitTest(point)
+    }
+
+}
+
+@objc(CUProbeApplication)
+final class ProbeApplication: NSApplication {
+    override func accessibilityApplicationFocusedUIElement() -> Any? {
+        if foregroundPasswordProbe, let window = windows.first(where: { $0.title == "Orca CU Fixture" }), (window.firstResponder == nil || window.firstResponder === window) { return nil }
+        return super.accessibilityApplicationFocusedUIElement()
+    }
+}
+let app = ProbeApplication.shared
 app.setActivationPolicy(.regular)
 let controller = Controller()
-let window = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 640, height: 480),
+let window = ProbeWindow(contentRect: NSRect(x: 200, y: 200, width: 640, height: 480),
                       styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
 window.title = "Orca CU Fixture"
 let button = NSButton(title: "Increment", target: controller, action: #selector(Controller.increment(_:)))
@@ -69,6 +97,17 @@ let canvas = Canvas(frame: NSRect(x: 340, y: 140, width: 280, height: 220))
 for view in [button, controller.label, field, secure, scroll, canvas] as [NSView] {
     window.contentView!.addSubview(view)
 }
+if foregroundPasswordProbe {
+    let reset = NSButton(title: "Reset probe focus", target: controller, action: #selector(Controller.resetProbeFocus(_:)))
+    reset.frame = NSRect(x: 20, y: 20, width: 160, height: 30)
+    window.contentView!.addSubview(reset)
+}
 window.makeKeyAndOrderFront(nil)
 app.activate()
+if foregroundPasswordProbe {
+    DispatchQueue.main.async {
+        window.makeFirstResponder(nil)
+        log(["type": "focus_reset"])
+    }
+}
 app.run()

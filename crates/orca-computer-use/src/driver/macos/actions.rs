@@ -262,6 +262,13 @@ fn focus(
 ) -> Result<AxElement, DriverError> {
     if let Some(target) = target {
         let element = target_element(table, application, target)?;
+        if element.attribute_string("AXRole")?.as_deref() == Some("AXWindow")
+            && application
+                .attribute_element("AXFocusedUIElement")?
+                .is_none()
+        {
+            return Err(foreground("The app has no focused element"));
+        }
         if let Err(err) = element.set_bool("AXFocused", true) {
             if err.kind == ErrorKind::Stale {
                 return Err(err);
@@ -270,6 +277,15 @@ fn focus(
                 "Could not focus the target: {}",
                 err.message
             )));
+        }
+        // A successful AX setter on a window can leave no keyboard recipient.
+        // Establish this before sending any text/key event, so fallback cannot
+        // repeat keyboard delivery whose effects are merely unconfirmed.
+        if application
+            .attribute_element("AXFocusedUIElement")?
+            .is_none()
+        {
+            return Err(foreground("The app has no focused element"));
         }
         Ok(element)
     } else {

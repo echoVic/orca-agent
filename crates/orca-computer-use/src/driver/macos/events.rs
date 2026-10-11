@@ -60,6 +60,34 @@ pub(super) fn post_key(pid: i32, stroke: KeyStroke) -> Result<(), DriverError> {
 
 pub(crate) const HID_MARKER: i64 = 0x4F52_4341;
 
+#[cfg(feature = "test-utils")]
+static HID_CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+#[cfg(feature = "test-utils")]
+static LAST_TEST_PROCESS_HID_POST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Most recent driver HID post in this process, on Instant's monotonic clock.
+#[cfg(feature = "test-utils")]
+pub fn last_test_process_hid_post() -> Option<std::time::Instant> {
+    let elapsed = LAST_TEST_PROCESS_HID_POST.load(std::sync::atomic::Ordering::SeqCst);
+    (elapsed != 0).then(|| {
+        *HID_CLOCK
+            .get()
+            .expect("HID clock initialized before recording")
+            + std::time::Duration::from_nanos(elapsed)
+    })
+}
+
+fn post_hid(event: &CGEvent) {
+    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
+    #[cfg(feature = "test-utils")]
+    {
+        let clock = HID_CLOCK.get_or_init(std::time::Instant::now);
+        let elapsed = clock.elapsed().as_nanos().clamp(1, u64::MAX as u128) as u64;
+        LAST_TEST_PROCESS_HID_POST.fetch_max(elapsed, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 use crate::{
     keys::Modifiers,
     protocol::{Button, Direction},
@@ -114,7 +142,7 @@ impl<'a> HidEvents<'a> {
                 "The target app is no longer frontmost",
             ));
         }
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
+        post_hid(event);
         // Give AppKit a chance to consume the event before restoring focus.
         std::thread::sleep(std::time::Duration::from_millis(10));
         Ok(())
@@ -281,13 +309,9 @@ impl<'a> HidEvents<'a> {
     pub(super) fn release(&mut self) {
         while let Some(event) = self.releases.pop() {
             Self::mark(&event);
-            if super::foreground::frontmost_pid() == Some(self.pid) {
-                CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
-            } else {
-                // If the user switched apps mid-action, deliver the release only
-                // to our target; never send HID keyboard input to the new app.
-                CGEvent::post_to_pid(self.pid, Some(&event));
-            }
+            // Downs entered the system HID stream; only HID ups can clear
+            // system-wide state, even if focus changed before cleanup.
+            post_hid(&event);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
@@ -297,4 +321,58 @@ impl Drop for HidEvents<'_> {
     fn drop(&mut self) {
         self.release();
     }
+}
+
+/// Exercise the real driver's held-input cleanup without racing a 10 ms click.
+#[cfg(feature = "test-utils")]
+pub fn with_held_test_input(
+    pid: i32,
+    point: CGPoint,
+    while_held: impl FnOnce(),
+) -> Result<(), DriverError> {
+    let aborted = AtomicBool::new(false);
+    let mut hid = HidEvents::new(pid, &aborted)?;
+    hid.modifiers(Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    })?;
+    let moved = CGEvent::new_mouse_event(
+        Some(&hid.source),
+        CGEventType::MouseMoved,
+        point,
+        CGMouseButton::Left,
+    )
+    .ok_or_else(|| {
+        error(
+            ErrorKind::Failed,
+            "Could not create held-input test movement",
+        )
+    })?;
+    hid.post(&moved)?;
+    let down = CGEvent::new_mouse_event(
+        Some(&hid.source),
+        CGEventType::LeftMouseDown,
+        point,
+        CGMouseButton::Left,
+    )
+    .ok_or_else(|| error(ErrorKind::Failed, "Could not create held-input test down"))?;
+    let up = CGEvent::new_mouse_event(
+        Some(&hid.source),
+        CGEventType::LeftMouseUp,
+        point,
+        CGMouseButton::Left,
+    )
+    .ok_or_else(|| error(ErrorKind::Failed, "Could not create held-input test up"))?;
+    CGEvent::set_flags(
+        Some(&down),
+        flags(Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        }),
+    );
+    hid.releases.push(up);
+    hid.post(&down)?;
+    while_held();
+    hid.release();
+    Ok(())
 }

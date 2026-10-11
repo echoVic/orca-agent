@@ -223,6 +223,30 @@ pub(super) fn run(
                     if let Some(point) = location {
                         hid.click(point, Button::Left, 1, Default::default())?;
                     }
+                    // Activation and the click can change focus after the
+                    // preflight check. Inspect the actual keyboard recipient
+                    // immediately before delivering any foreground text.
+                    let focus_deadline = Instant::now() + Duration::from_secs(1);
+                    let focused = loop {
+                        check_abort(aborted)?;
+                        if let Some(element) =
+                            application.attribute_element("AXFocusedUIElement")?
+                        {
+                            break element;
+                        }
+                        if Instant::now() >= focus_deadline {
+                            return Err(error(ErrorKind::Failed, "The app has no focused element"));
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                    };
+                    let secure = focused.attribute_string("AXSubrole")?.as_deref()
+                        == Some("AXSecureTextField");
+                    if secure && !params.secure_approved {
+                        return Err(error(
+                            ErrorKind::NeedsSecureApproval,
+                            "Typing into a password field requires approval",
+                        ));
+                    }
                     hid.text(text)?;
                 }
                 Action::Key { keys, .. } => {

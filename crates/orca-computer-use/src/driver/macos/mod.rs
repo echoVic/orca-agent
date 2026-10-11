@@ -4,6 +4,8 @@ mod ax;
 mod capture;
 mod esc_tap;
 mod events;
+#[cfg(feature = "test-utils")]
+pub use events::{last_test_process_hid_post, with_held_test_input};
 mod foreground;
 mod permissions;
 mod tree;

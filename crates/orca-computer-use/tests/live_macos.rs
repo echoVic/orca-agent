@@ -76,13 +76,19 @@ enum GuiFailureKind {
     NativeOperation,
 }
 
+fn driver_hid_since(started: Instant) -> Option<f64> {
+    orca_computer_use::driver::macos::last_test_process_hid_post()
+        .and_then(|posted| posted.checked_duration_since(started))
+        .map(|duration| duration.as_secs_f64())
+}
+
 fn record_gui_failure(kind: GuiFailureKind, message: String) {
     ATTEMPT.with(|active| {
         let mut active = active.borrow_mut();
         if let Some(attempt) = active.as_mut() {
             let elapsed = attempt.started.elapsed().as_secs_f64();
             let idle = hid_idle_seconds();
-            if failure_is_inconclusive(kind, elapsed, idle, attempt.last_own_hid) {
+            if failure_is_inconclusive(kind, elapsed, idle, attempt.last_own_hid, driver_hid_since(attempt.started)) {
                 attempt.inconclusive = true;
                 eprintln!("inconclusive: {message}; HID idle={idle:.3}s, elapsed={elapsed:.3}s, starting idle={:.3}s", attempt.idle_at_start);
             } else {
@@ -166,6 +172,7 @@ fn fixture_app() -> PathBuf {
 <key>CFBundleName</key><string>CUFixture</string>
 <key>CFBundleExecutable</key><string>CUFixture</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>NSPrincipalClass</key><string>CUProbeApplication</string>
 </dict></plist>"#).unwrap();
     let output = Command::new("/usr/bin/swiftc")
         .arg("-O")
@@ -466,7 +473,7 @@ impl Live {
             );
         }
         let now = CGEvent::location(Some(&CGEvent::new(None).unwrap()));
-        if (now.x, now.y) != (pointer.x, pointer.y) {
+        if !pointer_restored(pointer, now) {
             record_gui_failure(
                 GuiFailureKind::StateMismatch,
                 format!("pointer changed: expected {pointer:?}, actual {now:?}"),
@@ -475,6 +482,10 @@ impl Live {
     }
 
     fn launch_fixture(&mut self) -> (i32, PathBuf) {
+        self.launch_fixture_with_flags(&[])
+    }
+
+    fn launch_fixture_with_flags(&mut self, flags: &[&str]) -> (i32, PathBuf) {
         let log = self
             .directory
             .path()
@@ -485,6 +496,7 @@ impl Live {
                 .arg(fixture_app())
                 .arg("--args")
                 .arg(&log)
+                .args(flags)
                 .status()
                 .unwrap()
                 .success()
@@ -507,7 +519,10 @@ impl Live {
                             .windows
                             .iter()
                             .any(|window| window.title == "Orca CU Fixture")
-                }) {
+                }) && NSWorkspace::sharedWorkspace()
+                    .frontmostApplication()
+                    .is_some_and(|app| app.processIdentifier() == pid)
+                {
                     return (pid, log);
                 }
             }
@@ -610,9 +625,7 @@ fn record_restoration(frontmost: Option<i32>, pointer: objc2_core_foundation::CG
         );
     }
     match CGEvent::new(None).map(|event| CGEvent::location(Some(&event))) {
-        Some(actual)
-            if (actual.x - pointer.x).abs() > 1.0 || (actual.y - pointer.y).abs() > 1.0 =>
-        {
+        Some(actual) if !pointer_restored(pointer, actual) => {
             record_gui_failure(
                 GuiFailureKind::StateMismatch,
                 format!("pointer not restored: expected {pointer:?}, actual {actual:?}"),
@@ -1430,10 +1443,15 @@ fn failure_is_inconclusive(
     elapsed: f64,
     idle: f64,
     last_own_hid: Option<f64>,
+    driver_hid: Option<f64>,
 ) -> bool {
     if kind == GuiFailureKind::NativeOperation {
         return false;
     }
+    let last_own_hid = last_own_hid
+        .into_iter()
+        .chain(driver_hid)
+        .max_by(f64::total_cmp);
     let last_input = elapsed - idle;
     last_input > 0.0 && last_own_hid.is_none_or(|own| last_input > own)
 }
@@ -1441,17 +1459,18 @@ fn failure_is_inconclusive(
 #[test]
 fn hid_activity_distinguishes_user_interference_from_a_regression() {
     let state = GuiFailureKind::StateMismatch;
-    assert!(failure_is_inconclusive(state, 10.0, 2.0, None));
-    assert!(!failure_is_inconclusive(state, 10.0, 10.0, None));
-    assert!(!failure_is_inconclusive(state, 10.0, 12.0, None));
-    assert!(!failure_is_inconclusive(state, 10.0, 2.0, Some(8.0)));
-    assert!(!failure_is_inconclusive(state, 10.0, 3.0, Some(8.0)));
-    assert!(failure_is_inconclusive(state, 10.0, 1.0, Some(8.0)));
+    assert!(failure_is_inconclusive(state, 10.0, 2.0, None, None));
+    assert!(!failure_is_inconclusive(state, 10.0, 10.0, None, None));
+    assert!(!failure_is_inconclusive(state, 10.0, 12.0, None, None));
+    assert!(!failure_is_inconclusive(state, 10.0, 2.0, Some(8.0), None));
+    assert!(!failure_is_inconclusive(state, 10.0, 3.0, Some(8.0), None));
+    assert!(failure_is_inconclusive(state, 10.0, 1.0, Some(8.0), None));
     // Even user input after the attempt started cannot excuse a native error.
     assert!(!failure_is_inconclusive(
         GuiFailureKind::NativeOperation,
         10.0,
         2.0,
+        None,
         None,
     ));
 }
@@ -1917,4 +1936,354 @@ fn a_window_moved_during_the_foreground_idle_wait_is_stale() {
         live.assert_log_contains(&log, r#""type":"canvas_click""#);
         live.assert_frontmost_and_pointer_unchanged();
     });
+}
+
+#[test]
+fn a_driver_hid_post_is_not_user_interference() {
+    let state = GuiFailureKind::StateMismatch;
+    assert!(!failure_is_inconclusive(state, 10.0, 2.0, None, Some(8.0)));
+    assert!(!failure_is_inconclusive(
+        state,
+        10.0,
+        2.0,
+        Some(7.0),
+        Some(8.0)
+    ));
+    assert!(!failure_is_inconclusive(
+        state,
+        10.0,
+        2.0,
+        Some(8.0),
+        Some(7.0)
+    ));
+    assert!(failure_is_inconclusive(state, 10.0, 1.0, None, Some(8.0)));
+    assert!(!failure_is_inconclusive(
+        GuiFailureKind::NativeOperation,
+        10.0,
+        1.0,
+        None,
+        Some(8.0)
+    ));
+}
+
+fn fixture_ax_value(
+    element: &objc2_application_services::AXUIElement,
+    name: &str,
+) -> Option<objc2_core_foundation::CFRetained<objc2_core_foundation::CFType>> {
+    use objc2_application_services::AXError;
+    use objc2_core_foundation::CFString;
+    use std::ptr::NonNull;
+    assert_eq!(
+        unsafe { element.set_messaging_timeout(2.0) },
+        AXError::Success
+    );
+    let mut value = std::ptr::null();
+    let result = unsafe {
+        element.copy_attribute_value(&CFString::from_str(name), NonNull::from(&mut value))
+    };
+    if result == AXError::NoValue || result == AXError::AttributeUnsupported {
+        return None;
+    }
+    assert_eq!(result, AXError::Success, "read fixture {name}");
+    NonNull::new(value.cast_mut())
+        .map(|pointer| unsafe { objc2_core_foundation::CFRetained::from_raw(pointer) })
+}
+
+fn fixture_screen_point(
+    pid: i32,
+    observation: &Observation,
+    name: &str,
+) -> objc2_core_foundation::CGPoint {
+    use objc2_application_services::{AXUIElement, AXValue, AXValueType};
+    use objc2_core_foundation::{CGPoint, CGSize};
+    let app = unsafe { AXUIElement::new_application(pid) };
+    let window = fixture_ax_value(&app, "AXMainWindow")
+        .unwrap()
+        .downcast::<AXUIElement>()
+        .unwrap();
+    let mut origin = CGPoint::default();
+    let mut size = CGSize::default();
+    let position = fixture_ax_value(&window, "AXPosition")
+        .unwrap()
+        .downcast::<AXValue>()
+        .unwrap();
+    let extent = fixture_ax_value(&window, "AXSize")
+        .unwrap()
+        .downcast::<AXValue>()
+        .unwrap();
+    assert!(unsafe {
+        position.value(
+            AXValueType::CGPoint,
+            std::ptr::NonNull::from(&mut origin).cast(),
+        )
+    });
+    assert!(unsafe {
+        extent.value(
+            AXValueType::CGSize,
+            std::ptr::NonNull::from(&mut size).cast(),
+        )
+    });
+    let frame = observation
+        .elements
+        .iter()
+        .find(|element| element.label.as_deref() == Some(name))
+        .unwrap()
+        .frame;
+    let image = observation.screenshot.as_ref().unwrap();
+    let geometry = orca_computer_use::geometry::CaptureGeometry {
+        window_origin: (origin.x, origin.y),
+        window_size: (size.width, size.height),
+        image_size: (image.width, image.height),
+    };
+    let (x, y) = geometry
+        .to_screen([
+            f64::from(frame[0]) + f64::from(frame[2]) / 2.0,
+            f64::from(frame[1]) + f64::from(frame[3]) / 2.0,
+        ])
+        .unwrap();
+    CGPoint::new(x, y)
+}
+
+#[test]
+#[ignore]
+fn held_input_is_released_through_hid_after_finder_becomes_frontmost() {
+    run_live_test(|| {
+        use objc2_core_graphics::{CGEventFlags, CGMouseButton};
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, _) = live.launch_fixture();
+        live.make_finder_frontmost();
+        let original = live.background_state.unwrap();
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let point = fixture_screen_point(pid, &obs, "Increment");
+        live.fixture_frontmost(pid);
+        let modifiers = CGEventFlags::MaskShift
+            | CGEventFlags::MaskCommand
+            | CGEventFlags::MaskAlternate
+            | CGEventFlags::MaskControl;
+        assert!(
+            (CGEventSource::flags_state(CGEventSourceStateID::HIDSystemState) & modifiers)
+                .is_empty()
+        );
+        let before = orca_computer_use::driver::macos::last_test_process_hid_post();
+        let mut last_down = None;
+        let _recovery = HeldInputRecovery;
+        orca_computer_use::driver::macos::with_held_test_input(pid, point, || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !(CGEventSource::button_state(
+                CGEventSourceStateID::HIDSystemState,
+                CGMouseButton::Left,
+            ) && CGEventSource::flags_state(CGEventSourceStateID::HIDSystemState)
+                .contains(CGEventFlags::MaskShift))
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                CGEventSource::button_state(
+                    CGEventSourceStateID::HIDSystemState,
+                    CGMouseButton::Left
+                ),
+                "positive control: the HID mouse button is held"
+            );
+            assert!(
+                CGEventSource::flags_state(CGEventSourceStateID::HIDSystemState)
+                    .contains(CGEventFlags::MaskShift),
+                "positive control: HID Shift is held"
+            );
+            last_down = orca_computer_use::driver::macos::last_test_process_hid_post();
+            assert!(
+                last_down > before,
+                "driver action posts are recorded immediately"
+            );
+            live.make_finder_frontmost();
+        })
+        .unwrap();
+        assert!(
+            (CGEventSource::flags_state(CGEventSourceStateID::HIDSystemState) & modifiers)
+                .is_empty(),
+            "HID modifiers were released after frontmost changed"
+        );
+        for button in [
+            CGMouseButton::Left,
+            CGMouseButton::Right,
+            CGMouseButton::Center,
+        ] {
+            assert!(
+                !CGEventSource::button_state(CGEventSourceStateID::HIDSystemState, button),
+                "HID mouse button remained down: {button:?}"
+            );
+        }
+        assert!(
+            orca_computer_use::driver::macos::last_test_process_hid_post() > last_down,
+            "cleanup HID posts are recorded separately"
+        );
+        record_restoration(Some(original.0), original.1);
+        live.background_state = Some(original);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+fn release_test_held_input() {
+    use objc2_core_graphics::{CGEventField, CGEventFlags, CGEventTapLocation, CGMouseButton};
+    let source = CGEventSource::new(CGEventSourceStateID::Private).unwrap();
+    let pointer = CGEvent::location(Some(&CGEvent::new(None).unwrap()));
+    let mouse = CGEvent::new_mouse_event(
+        Some(&source),
+        CGEventType::LeftMouseUp,
+        pointer,
+        CGMouseButton::Left,
+    )
+    .unwrap();
+    let shift = CGEvent::new_keyboard_event(Some(&source), 56, false).unwrap();
+    for event in [&mouse, &shift] {
+        CGEvent::set_flags(Some(event), CGEventFlags::empty());
+        CGEvent::set_integer_value_field(
+            Some(event),
+            CGEventField::EventSourceUserData,
+            0x4F52_4341,
+        );
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
+        record_test_hid_event();
+    }
+    thread::sleep(Duration::from_millis(30));
+}
+
+struct HeldInputRecovery;
+impl Drop for HeldInputRecovery {
+    fn drop(&mut self) {
+        release_test_held_input();
+    }
+}
+
+#[test]
+#[ignore]
+fn foreground_password_focus_requires_approval_after_the_click() {
+    run_live_test(|| {
+        use objc2_application_services::{AXError, AXUIElement};
+        use objc2_core_foundation::CFString;
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) = live.launch_fixture_with_flags(&["--foreground-password-probe"]);
+        live.assert_log_contains(&log, r#""type":"focus_reset""#);
+        live.fixture_frontmost(pid);
+        live.background_state = Some((pid, CGEvent::location(Some(&CGEvent::new(None).unwrap()))));
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let app = unsafe { AXUIElement::new_application(pid) };
+        assert!(
+            fixture_ax_value(&app, "AXFocusedUIElement").is_none(),
+            "the probe starts with no focused element"
+        );
+        let target = live.point_inside(&obs, "Password");
+        // Read the real secure field from the tree, bypassing only the probe's
+        // non-focusable hit-test behavior; foreground HID still clicks the real view.
+        let window = fixture_ax_value(&app, "AXMainWindow")
+            .unwrap()
+            .downcast::<AXUIElement>()
+            .unwrap();
+
+        // Read the password field through the AX tree, not an intercepted hit.
+        fn find_secure(
+            element: &AXUIElement,
+        ) -> Option<objc2_core_foundation::CFRetained<AXUIElement>> {
+            use objc2_core_foundation::{CFArray, CFType};
+            if fixture_ax_value(element, "AXSubrole")
+                .and_then(|v| v.downcast::<CFString>().ok())
+                .is_some_and(|v| v.to_string() == "AXSecureTextField")
+            {
+                return Some(unsafe {
+                    objc2_core_foundation::CFRetained::retain(std::ptr::NonNull::from(element))
+                });
+            }
+            let mut raw = std::ptr::null();
+            let code = unsafe {
+                element.copy_attribute_value(
+                    &CFString::from_str("AXChildren"),
+                    std::ptr::NonNull::from(&mut raw),
+                )
+            };
+            if code == AXError::AttributeUnsupported || code == AXError::NoValue {
+                return None;
+            }
+            assert_eq!(code, AXError::Success);
+            let children = unsafe {
+                objc2_core_foundation::CFRetained::from_raw(
+                    std::ptr::NonNull::new(raw.cast_mut()).unwrap(),
+                )
+            };
+            let array = children.downcast_ref::<CFArray>().unwrap();
+            for i in 0..array.len() {
+                let child = unsafe { &*array.value_at_index(i as isize).cast::<CFType>() }
+                    .downcast_ref::<AXUIElement>()
+                    .unwrap();
+                if let Some(found) = find_secure(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let secure = find_secure(&window).expect("real password field exists in the fixture");
+        let length = || {
+            fixture_ax_value(&secure, "AXValue")
+                .unwrap()
+                .downcast::<CFString>()
+                .unwrap()
+                .to_string()
+                .chars()
+                .count()
+        };
+        assert_eq!(length(), 0);
+        let action = Action::Type {
+            text: "ok".into(),
+            target: Some(target),
+        };
+        let error = live
+            .act_with_fallback(action.clone(), false, true)
+            .unwrap_err();
+        assert_eq!(
+            length(),
+            0,
+            "unapproved foreground text did not enter the password field"
+        );
+        assert_eq!(error.kind, ErrorKind::NeedsSecureApproval, "{error:?}");
+        live.assert_frontmost_and_pointer_unchanged();
+        // Reset through the fixture's real AXPress action, so the approved
+        // control also starts without focus and must use the same fallback.
+        let fresh = live.observe("dev.orca.cu-fixture", None);
+        live.act(
+            click_target(element_named(&fresh, "Reset probe focus")),
+            false,
+        )
+        .unwrap();
+        assert!(fixture_ax_value(&app, "AXFocusedUIElement").is_none());
+        // The approved control uses the same fallback click on the real field.
+        let outcome = live.act_with_fallback(action, true, true).unwrap();
+        assert!(outcome.foreground_used);
+        assert_eq!(
+            length(),
+            2,
+            "approved foreground text reached the password field"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+fn pointer_restored(
+    expected: objc2_core_foundation::CGPoint,
+    actual: objc2_core_foundation::CGPoint,
+) -> bool {
+    // CGWarpMouseCursorPosition rounds subpixel trackpad positions to points.
+    // Use the same precision as record_restoration and the production restore.
+    (expected.x - actual.x).abs() <= 1.0 && (expected.y - actual.y).abs() <= 1.0
+}
+
+#[test]
+fn warp_precision_accepts_rounding_but_rejects_a_moved_pointer() {
+    use objc2_core_foundation::CGPoint;
+    let expected = CGPoint::new(1439.8359375, 992.703125);
+    assert!(pointer_restored(expected, CGPoint::new(1439.0, 992.0)));
+    assert!(!pointer_restored(expected, CGPoint::new(1438.0, 992.0)));
+    assert!(!pointer_restored(expected, CGPoint::new(1439.0, 990.0)));
 }
