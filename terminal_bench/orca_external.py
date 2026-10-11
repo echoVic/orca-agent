@@ -57,12 +57,16 @@ class OrcaExternalAgent(BaseAgent):
     ) -> None:
         orca_bin = os.environ.get("ORCA_BIN", "orca")
 
+        # The instruction travels in a variable, not in the command line, where
+        # a task's `pkill -f` could match it and kill the run (issue #126); the
+        # shell unsets it so Orca and its tools do not inherit it.
         cmd = (
-            f"printf '%s' {shlex.quote(instruction)} |"
+            'orca_instruction="$ORCA_INSTRUCTION"; unset ORCA_INSTRUCTION; '
+            "printf '%s' \"$orca_instruction\" |"
             f" DEEPSEEK_API_KEY={shlex.quote(_load_api_key())}"
             f" {shlex.quote(orca_bin)} exec"
             f" --mode full-auto"
             f" --output-format jsonl"
         )
 
-        result = await environment.exec(cmd)
+        result = await environment.exec(cmd, env={"ORCA_INSTRUCTION": instruction})

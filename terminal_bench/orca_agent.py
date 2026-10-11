@@ -45,6 +45,13 @@ PROVIDER_ENV = (
     "ORCA_PROVIDER",
 )
 
+#: The variable that carries the instruction into the container. `pgrep -f`
+#: and `pkill -f` match every process's command line, and quoted into the shell
+#: command Harbor runs, the instruction let a task's own cleanup match a path
+#: from it and kill the trial (issue #126). Harbor's Docker environment sets the
+#: variable with `docker compose exec -e`, on the host, out of the task's reach.
+INSTRUCTION_ENV = "ORCA_INSTRUCTION"
+
 #: Usage counters reported in `execution_metadata.json` for post-mortems.
 USAGE_FIELDS = ("turns", "output_tokens", "input_tokens", "cache_tokens", "cost_usd_micros")
 
@@ -251,6 +258,7 @@ class OrcaInstalledAgent(BaseInstalledAgent):
             "DEEPSEEK_API_KEY": _load_api_key(),
             "ORCA_BASE_URL": os.environ.get("ORCA_BASE_URL", "https://api.deepseek.com"),
             "ORCA_MODEL": os.environ.get("ORCA_MODEL", "deepseek-flash"),
+            INSTRUCTION_ENV: instruction,
         }
         # The provider knobs are only settable through the environment, so a
         # benchmark arm cannot vary them without this forwarding (issue #64).
@@ -270,11 +278,14 @@ class OrcaInstalledAgent(BaseInstalledAgent):
         trajectory_in_container = "/tmp/orca-trajectory.jsonl"
         # Feed the instruction through stdin instead of putting it in Orca's
         # positional argv. A task is allowed to inspect and match process
-        # command lines; keeping its text out of the Orca argv prevents a
-        # cleanup command from matching and killing this session (issue #114).
+        # command lines; keeping its text out of every argv prevents a cleanup
+        # command from matching and killing this session (issues #114, #126).
+        # The shell copies the variable and unsets it, so neither Orca nor the
+        # tools it runs inherit the instruction (the `printf` is a builtin).
         cmd = (
             f"{_ca_bundle_fallback()}"
-            f"printf '%s' {shlex.quote(instruction)} | orca exec"
+            f'orca_instruction="${INSTRUCTION_ENV}"; unset {INSTRUCTION_ENV}; '
+            f"printf '%s' \"$orca_instruction\" | orca exec"
             f" --mode full-auto"
             f" --output-format jsonl"
             f"{''.join(budget_flags)}"

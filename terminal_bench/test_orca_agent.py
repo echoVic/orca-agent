@@ -462,7 +462,7 @@ class OrcaInstalledAgentTests(unittest.TestCase):
             self.assertEqual(metadata["usage"]["output_tokens"], 150970)
             self.assertEqual(metadata["usage"]["cost_usd_micros"], 123456)
 
-    def test_run_pipes_a_hyphen_leading_instruction_via_stdin(self) -> None:
+    def _run_command_and_env(self, instruction: str) -> tuple[str, dict]:
         with tempfile.TemporaryDirectory() as directory:
             agent = orca_agent.OrcaInstalledAgent()
             agent.logs_dir = Path(directory)
@@ -470,29 +470,66 @@ class OrcaInstalledAgentTests(unittest.TestCase):
 
             async def fake_exec(command, env):
                 captured["command"] = command
+                captured["env"] = env
                 return SimpleNamespace(stdout="", stderr="", return_code=0)
 
             environment = SimpleNamespace(exec=fake_exec)
-            # The exact shape of terminal-bench/pytorch-model-recovery's prompt.
-            instruction = "- You are given a PyTorch state dictionary (/app/weights.pt)"
             asyncio.run(
                 agent.run(instruction, environment, orca_agent.AgentContext())
             )
+            return captured["command"], captured["env"]
 
-            command = captured["command"]
-            quoted_instruction = shlex.quote(instruction)
-            self.assertIn(f"printf '%s' {quoted_instruction} | orca exec", command)
-            # The instruction is delivered through stdin, so it must not be the
-            # positional argument after the Orca command.
-            orca_argv = command[command.index("orca exec") :]
-            self.assertNotIn(quoted_instruction, orca_argv)
-            self.assertLess(command.index("printf '%s'"), command.index("orca exec"))
+    def test_run_pipes_a_hyphen_leading_instruction_via_stdin(self) -> None:
+        # The exact shape of terminal-bench/pytorch-model-recovery's prompt.
+        instruction = "- You are given a PyTorch state dictionary (/app/weights.pt)"
+        command, env = self._run_command_and_env(instruction)
+
+        self.assertEqual(env[orca_agent.INSTRUCTION_ENV], instruction)
+        self.assertIn("printf '%s' \"$orca_instruction\" | orca exec", command)
+        self.assertLess(command.index("printf '%s'"), command.index("orca exec"))
+
+    def test_run_keeps_the_instruction_out_of_every_command_line(self) -> None:
+        # install-windows-3-11 lost its trial to `pkill -f "win311.img"`, which
+        # matched the instruction in Harbor's wrapper shell (issue #126).
+        instruction = (
+            "- Run Windows 3.11. Your image is in `/app/isos/win311.img`;\n"
+            "don't expand $HOME, \"quotes\", 100%s or \\n."
+        )
+        command, env = self._run_command_and_env(instruction)
+
+        self.assertNotIn("win311.img", command)
+        self.assertNotIn(shlex.quote(instruction), command)
+        # Run the command as Harbor does, with stand-ins for orca and tee.
+        with tempfile.TemporaryDirectory() as directory:
+            bin_dir = Path(directory) / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "orca").write_text(
+                "#!/bin/sh\n"
+                'cat > "$OUT/stdin"\n'
+                'printf %s "${ORCA_INSTRUCTION-unset}" > "$OUT/inherited"\n'
+            )
+            (bin_dir / "tee").write_text("#!/bin/sh\ncat\n")
+            for tool in bin_dir.iterdir():
+                tool.chmod(0o755)
+            subprocess.run(
+                ["bash", "-c", f"set -o pipefail; {command}"],
+                check=True,
+                env={
+                    "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                    "OUT": directory,
+                    orca_agent.INSTRUCTION_ENV: env[orca_agent.INSTRUCTION_ENV],
+                },
+            )
+            out = Path(directory)
+            self.assertEqual((out / "stdin").read_text(), instruction)
+            self.assertEqual((out / "inherited").read_text(), "unset")
 
     def test_external_run_does_not_extend_context(self) -> None:
         captured = {}
 
-        async def fake_exec(command):
+        async def fake_exec(command, env):
             captured["command"] = command
+            captured["env"] = env
             return SimpleNamespace(stdout="completed\n")
 
         environment = SimpleNamespace(
@@ -508,10 +545,9 @@ class OrcaInstalledAgentTests(unittest.TestCase):
 
         self.assertFalse(hasattr(context, "output"))
         command = captured["command"]
-        quoted_instruction = shlex.quote("finish the task")
-        self.assertIn(f"printf '%s' {quoted_instruction} |", command)
-        orca_argv = command[command.index("orca exec") :]
-        self.assertNotIn(quoted_instruction, orca_argv)
+        self.assertEqual(captured["env"], {"ORCA_INSTRUCTION": "finish the task"})
+        self.assertIn('''printf '%s' "$orca_instruction" |''', command)
+        self.assertNotIn("finish the task", command)
 
     def test_readme_uses_supported_harbor_filters(self) -> None:
         readme = (Path(__file__).parent / "README.md").read_text(encoding="utf-8")
