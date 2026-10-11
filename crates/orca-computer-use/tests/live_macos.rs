@@ -3573,3 +3573,50 @@ fn a_foreground_scroll_moves_the_target_list_and_restores_the_pointer() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
+
+#[test]
+#[ignore]
+fn background_type_with_a_target_inserts_after_existing_text() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (_, log) = live.launch_fixture_with_flags(&["--prefilled-name"]);
+        live.make_finder_frontmost();
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let target = element_named(&obs, "Name");
+        assert_eq!(
+            obs.elements
+                .iter()
+                .find(|e| e.label.as_deref() == Some("Name"))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("a🦀c")
+        );
+        for (text, expected) in [("x", "a🦀cx"), ("y", "a🦀cxy")] {
+            let outcome = live
+                .act(
+                    Action::Type {
+                        text: text.into(),
+                        target: Some(target),
+                    },
+                    false,
+                )
+                .unwrap();
+            assert!(!outcome.foreground_used);
+            let obs = outcome.observation.unwrap();
+            assert_eq!(
+                obs.elements
+                    .iter()
+                    .find(|e| e.label.as_deref() == Some("Name"))
+                    .unwrap()
+                    .value
+                    .as_deref(),
+                Some(expected)
+            );
+            live.assert_log_contains(&log, &format!("\"value\":\"{expected}\""));
+        }
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}

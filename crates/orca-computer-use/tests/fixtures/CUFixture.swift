@@ -101,6 +101,7 @@ final class ProbeField: NSTextField {
 }
 let field = ProbeField(frame: NSRect(x: 20, y: 380, width: 300, height: 24))
 field.setAccessibilityLabel("Name"); field.delegate = controller
+if CommandLine.arguments.contains("--prefilled-name") { field.stringValue = "a🦀c" }
 let secure = NSSecureTextField(frame: NSRect(x: 340, y: 380, width: 200, height: 24))
 secure.setAccessibilityLabel("Password")
 let scroll = NSScrollView(frame: NSRect(x: 20, y: 140, width: 300, height: 220))

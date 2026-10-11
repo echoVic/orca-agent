@@ -123,6 +123,17 @@ impl MacDriver {
                 Action::Type { text, target } => {
                     let element = focus(table, &application, *target)?;
                     check_secure_approval(&application, Some(&element), params.secure_approved)?;
+                    if target.is_some() {
+                        let focused = application
+                            .attribute_element("AXFocusedUIElement")?
+                            .ok_or_else(|| foreground("The app has no focused element"))?;
+                        focused.collapse_selection_to_end()?;
+                        check_secure_approval(
+                            &application,
+                            Some(&element),
+                            params.secure_approved,
+                        )?;
+                    }
                     events::post_unicode_text(pid, text)?;
                 }
                 Action::Key { keys, target } => {

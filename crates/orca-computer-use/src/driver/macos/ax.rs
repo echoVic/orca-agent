@@ -234,6 +234,41 @@ impl AxElement {
         Ok(Some([point.x, point.y, size.width, size.height]))
     }
 
+    /// AXFocused selects the whole NSTextField value on AppKit. A targeted
+    /// type inserts at the end instead; untargeted type preserves selection.
+    pub(super) fn collapse_selection_to_end(&self) -> Result<(), DriverError> {
+        use objc2_core_foundation::CFRange;
+        if !matches!(
+            self.attribute_string("AXRole")?.as_deref(),
+            Some("AXTextField" | "AXTextArea" | "AXComboBox")
+        ) {
+            return Ok(());
+        }
+        let text = self.attribute_string("AXValue")?.ok_or_else(|| {
+            error(
+                ErrorKind::Failed,
+                "Could not read the focused field's text length",
+            )
+        })?;
+        let mut range = CFRange {
+            location: text
+                .encode_utf16()
+                .count()
+                .try_into()
+                .map_err(|_| error(ErrorKind::Failed, "The focused field is too long"))?,
+            length: 0,
+        };
+        let value = unsafe { AXValue::new(AXValueType::CFRange, NonNull::from(&mut range).cast()) }
+            .ok_or_else(|| error(ErrorKind::Failed, "Could not create the insertion range"))?;
+        check(
+            unsafe {
+                self.0
+                    .set_attribute_value(&CFString::from_str("AXSelectedTextRange"), value.as_ref())
+            },
+            "collapse selection",
+        )
+    }
+
     // These native operations are the Task 7 action interface.
     #[allow(dead_code)]
     pub(crate) fn actions(&self) -> Result<Vec<String>, DriverError> {

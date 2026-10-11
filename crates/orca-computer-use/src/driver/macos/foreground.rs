@@ -285,12 +285,19 @@ pub(super) fn run(
                         }
                         thread::sleep(Duration::from_millis(50));
                     };
-                    let _ = focused;
                     actions::check_secure_approval(
                         application,
                         target_element.as_ref(),
                         params.secure_approved,
                     )?;
+                    if target_location(params).is_some() {
+                        focused.collapse_selection_to_end()?;
+                        actions::check_secure_approval(
+                            application,
+                            target_element.as_ref(),
+                            params.secure_approved,
+                        )?;
+                    }
                     hid.text(text)?;
                 }
                 Action::Key { keys, .. } => {
