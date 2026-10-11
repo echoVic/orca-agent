@@ -13,8 +13,8 @@ pub fn screenshot_size(width: u32, height: u32) -> (u32, u32) {
     }
     let scale = f64::from(MAX_SCREENSHOT_SIDE) / f64::from(longest);
     (
-        (f64::from(width) * scale).round() as u32,
-        (f64::from(height) * scale).round() as u32,
+        ((f64::from(width) * scale).round() as u32).max(u32::from(width > 0)),
+        ((f64::from(height) * scale).round() as u32).max(u32::from(height > 0)),
     )
 }
 
@@ -100,6 +100,8 @@ mod tests {
             ((460, 816), (460, 816)),
             ((1280, 1280), (1280, 1280)),
             ((0, 0), (0, 0)),
+            ((1, 4000), (1, 1280)),
+            ((4000, 1), (1280, 1)),
         ] {
             assert_eq!(screenshot_size(input.0, input.1), expected);
         }

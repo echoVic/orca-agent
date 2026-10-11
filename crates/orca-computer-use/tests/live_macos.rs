@@ -44,7 +44,7 @@ use objc2_foundation::NSString;
 use orca_computer_use::client::{DriverClient, HelloInfo};
 use orca_computer_use::driver::macos::MacDriver;
 use orca_computer_use::inprocess::InProcessLauncher;
-use orca_computer_use::protocol::{AppInfo, ErrorKind, Reply, Request};
+use orca_computer_use::protocol::{AppInfo, ErrorKind, Observation, ObserveParams, Reply, Request};
 
 fn fixture_app() -> PathBuf {
     let app = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("CUFixture.app");
@@ -131,6 +131,37 @@ impl Live {
         {
             Reply::Apps { apps } => apps,
             other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    fn observe(&self, app: &str, query: Option<&str>) -> Observation {
+        self.observe_window(app, None, query, 300, true)
+    }
+
+    fn observe_window(
+        &self,
+        app: &str,
+        window: Option<u32>,
+        query: Option<&str>,
+        max_elements: u32,
+        include_screenshot: bool,
+    ) -> Observation {
+        match self
+            .client
+            .call(
+                Request::Observe(ObserveParams {
+                    app: app.into(),
+                    window,
+                    query: query.map(str::to_owned),
+                    max_elements,
+                    include_screenshot,
+                }),
+                Duration::from_secs(30),
+            )
+            .unwrap()
+        {
+            Reply::Observed { observation } => observation,
+            other => panic!("unexpected observe reply: {other:?}"),
         }
     }
 
@@ -529,5 +560,256 @@ fn launch_attribution_registers_only_pids_that_appeared_during_the_request() {
         registered,
         HashSet::from([7, 42, 43]),
         "a request with no new process claims nothing"
+    );
+}
+
+#[test]
+#[ignore]
+fn observe_lists_the_fixture_controls_in_screenshot_pixels() {
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    live.launch_fixture();
+    let observation = live.observe("dev.orca.cu-fixture", None);
+    let shot = observation.screenshot.as_ref().expect("screenshot");
+    assert!(shot.width > 0 && shot.height > 0 && shot.width <= 1280 && shot.height <= 1280);
+    use base64::Engine;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(&shot.png_base64)
+        .unwrap();
+    let decoded = image::load_from_memory(&png).unwrap();
+    assert_eq!(
+        (decoded.width(), decoded.height()),
+        (shot.width, shot.height)
+    );
+    let labels: Vec<_> = observation
+        .elements
+        .iter()
+        .filter_map(|e| e.label.as_deref())
+        .collect();
+    for expected in ["Increment", "Name", "Password", "List"] {
+        assert!(
+            labels.contains(&expected),
+            "{expected} missing from {labels:?}"
+        );
+    }
+    let password = observation
+        .elements
+        .iter()
+        .find(|e| e.label.as_deref() == Some("Password"))
+        .unwrap();
+    assert!(password.secure && password.value.is_none());
+    assert!(!observation.no_element_tree);
+    for (index, element) in observation.elements.iter().enumerate() {
+        assert_eq!(element.id as usize, index + 1);
+        let [x, y, w, h] = element.frame;
+        assert!(
+            x >= 0
+                && y >= 0
+                && w >= 0
+                && h >= 0
+                && x + w <= shot.width as i32 + 2
+                && y + h <= shot.height as i32 + 2,
+            "{element:?}"
+        );
+    }
+    let capped = live.observe_window(
+        "dev.orca.cu-fixture",
+        Some(observation.window.id),
+        None,
+        1,
+        false,
+    );
+    assert!(capped.screenshot.is_none());
+    assert_eq!(capped.elements, observation.elements[..1]);
+    assert_eq!(capped.omitted as usize, observation.elements.len() - 1);
+}
+
+#[test]
+#[ignore]
+fn observe_with_a_query_keeps_matches_and_their_ancestors() {
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    live.launch_fixture();
+    let all = live.observe("dev.orca.cu-fixture", None);
+    let expected = orca_computer_use::observation::filter_elements(&all.elements, "incr");
+    assert!(!expected.is_empty(), "positive match control");
+    let filtered = live.observe("dev.orca.cu-fixture", Some("incr"));
+    let mut expected = expected;
+    for (i, e) in expected.iter_mut().enumerate() {
+        e.id = i as u32 + 1;
+    }
+    assert_eq!(filtered.elements, expected);
+    assert!(
+        filtered
+            .elements
+            .iter()
+            .any(|e| e.label.as_deref() == Some("Increment"))
+    );
+    let descendants = live.observe("dev.orca.cu-fixture", Some("line 1"));
+    assert!(
+        descendants.elements.iter().any(
+            |e| e.role == "text area" && e.value.as_ref().is_some_and(|v| v.contains("line 1"))
+        )
+    );
+    assert!(
+        descendants
+            .elements
+            .iter()
+            .any(|e| e.label.as_deref() == Some("List")),
+        "the retained scroll area is an ancestor of matching text"
+    );
+    assert!(
+        !descendants
+            .elements
+            .iter()
+            .any(|e| e.label.as_deref() == Some("Increment")),
+        "an unrelated sibling is excluded"
+    );
+    assert!(
+        live.observe("dev.orca.cu-fixture", Some("no-such-fixture-control-xyz"))
+            .elements
+            .is_empty()
+    );
+}
+
+struct FinderWindow(i32);
+impl Drop for FinderWindow {
+    fn drop(&mut self) {
+        let output = Command::new("osascript")
+            .args([
+                "-e",
+                &format!("tell application \"Finder\" to close window id {}", self.0),
+            ])
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            RESTORATION_FAILURES.lock().unwrap().push(format!(
+                "close test Finder window: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn observe_captures_a_window_covered_by_another() {
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    live.launch_fixture();
+    let before = live.observe("dev.orca.cu-fixture", None);
+    let finder_before = bundle_pids("com.apple.finder");
+    let output = Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"Finder\"
+set probe to make new Finder window
+return id of probe
+end tell",
+        ])
+        .output()
+        .unwrap();
+    register_launch_pids(
+        &mut live.launched,
+        &finder_before,
+        &bundle_pids("com.apple.finder"),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let window = FinderWindow(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    );
+    let output = Command::new("osascript").args(["-e", &format!("tell application \"Finder\"\nset bounds of window id {} to {{100, 100, 1100, 1000}}\nactivate\nend tell", window.0)]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if NSWorkspace::new()
+            .frontmostApplication()
+            .and_then(|app| app.bundleIdentifier())
+            .is_some_and(|id| id.to_string() == "com.apple.finder")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Finder must actually cover the fixture"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let covered = live.observe_window(
+        "dev.orca.cu-fixture",
+        Some(before.window.id),
+        None,
+        300,
+        true,
+    );
+    let before = before.screenshot.unwrap();
+    let covered = covered.screenshot.unwrap();
+    assert_eq!(
+        (covered.width, covered.height),
+        (before.width, before.height)
+    );
+    use base64::Engine;
+    let decode = |s: &str| {
+        image::load_from_memory(&base64::engine::general_purpose::STANDARD.decode(s).unwrap())
+            .unwrap()
+            .to_rgba8()
+    };
+    // The fixture's teal canvas is a stable positive control even when covered.
+    let x = before.width * 3 / 4;
+    let y = before.height / 2;
+    let control = *decode(&before.png_base64).get_pixel(x, y);
+    assert!(
+        control[1] > control[0] && control[2] > control[0],
+        "expected teal canvas: {control:?}"
+    );
+    assert_eq!(*decode(&covered.png_base64).get_pixel(x, y), control);
+}
+
+#[test]
+#[ignore]
+fn observe_of_an_electron_app_waits_for_its_tree() {
+    let Ok(bundle) = std::env::var("ORCA_CU_ELECTRON_APP") else {
+        eprintln!("skipped: ORCA_CU_ELECTRON_APP is unset");
+        return;
+    };
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    if !bundle_pids(&bundle).is_empty() {
+        eprintln!("skipped: Electron app already running");
+        return;
+    }
+    let before = bundle_pids(&bundle);
+    let result = live.client.call(
+        Request::LaunchApp {
+            app: bundle.clone(),
+            open: vec![],
+        },
+        Duration::from_secs(60),
+    );
+    register_launch_pids(&mut live.launched, &before, &bundle_pids(&bundle));
+    result.unwrap();
+    let observation = live.observe(&bundle, None);
+    assert!(!observation.no_element_tree);
+    assert!(
+        observation
+            .elements
+            .iter()
+            .any(|e| e.role == "button" || e.role == "text field")
     );
 }

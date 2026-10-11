@@ -1,7 +1,18 @@
 mod apps;
+mod ax;
+mod capture;
 mod permissions;
+mod tree;
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
+use crate::{
+    geometry,
+    protocol::{Observation, ObserveParams, WindowInfo},
+};
+use ax::AxElement;
+use tree::ElementTable;
 
 use objc2::rc::autoreleasepool;
 use objc2_foundation::NSProcessInfo;
@@ -15,6 +26,8 @@ pub struct MacDriver {
     lock: Option<ExclusiveFileLock>,
     turn_active: bool,
     hello_complete: bool,
+    pub(crate) element_tables: HashMap<(i32, u32), ElementTable>,
+    accessibility_enabled: HashSet<i32>,
 }
 
 impl MacDriver {
@@ -24,7 +37,127 @@ impl MacDriver {
             lock: None,
             turn_active: false,
             hello_complete: false,
+            element_tables: HashMap::new(),
+            accessibility_enabled: HashSet::new(),
         }
+    }
+
+    fn observe(&mut self, params: ObserveParams) -> Result<Observation, DriverError> {
+        capture::check_unlocked()?;
+        let app = apps::resolve(&params.app, false)?;
+        let pid = app
+            .pid
+            .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
+        let application = AxElement::application(pid)?;
+        if self.accessibility_enabled.insert(pid) {
+            let _ = application.set_bool("AXManualAccessibility", true);
+        }
+        let windows = capture::windows()?;
+        let ax_windows = application.elements("AXWindows")?;
+        let (ax_window, window) = if let Some(id) = params.window {
+            let window = windows
+                .iter()
+                .find(|w| w.id == id && w.pid == pid)
+                .ok_or_else(|| error(ErrorKind::WindowNotFound, "Window not found for this app"))?;
+            let mut matching = None;
+            for candidate in ax_windows {
+                if frames_match(candidate.position_size()?, window.frame) {
+                    matching = Some(candidate);
+                    break;
+                }
+            }
+            (
+                matching.ok_or_else(|| {
+                    error(
+                        ErrorKind::WindowNotFound,
+                        "No accessibility window matches the capture window",
+                    )
+                })?,
+                window,
+            )
+        } else {
+            let window = application
+                .attribute_element("AXMainWindow")?
+                .or_else(|| ax_windows.into_iter().next())
+                .ok_or_else(|| {
+                    error(
+                        ErrorKind::WindowNotFound,
+                        "The app has no accessibility window",
+                    )
+                })?;
+            let frame = window.position_size()?;
+            let capture = windows
+                .iter()
+                .find(|w| w.pid == pid && frames_match(frame, w.frame))
+                .ok_or_else(|| {
+                    error(
+                        ErrorKind::WindowNotFound,
+                        "No capture window matches the accessibility window",
+                    )
+                })?;
+            (window, capture)
+        };
+        let window_frame = ax_window.position_size()?;
+        if window_frame.iter().any(|v| !v.is_finite())
+            || window_frame[2] <= 0.0
+            || window_frame[3] <= 0.0
+        {
+            return Err(error(ErrorKind::Failed, "The window has invalid geometry"));
+        }
+        let screenshot = params
+            .include_screenshot
+            .then(|| capture::screenshot(window))
+            .transpose()?;
+        let image_size = screenshot
+            .as_ref()
+            .map(|s| (s.width, s.height))
+            .unwrap_or_else(|| {
+                geometry::screenshot_size(
+                    (window.frame[2] * window.scale).round().max(1.0) as u32,
+                    (window.frame[3] * window.scale).round().max(1.0) as u32,
+                )
+            });
+        let geometry = geometry::CaptureGeometry {
+            window_origin: (window_frame[0], window_frame[1]),
+            window_size: (window_frame[2], window_frame[3]),
+            image_size,
+        };
+        let (elements, entries, omitted, no_element_tree) = tree::collect(
+            &ax_window,
+            geometry,
+            params.query.as_deref(),
+            params.max_elements,
+        )?;
+        let focused_secure = application
+            .attribute_element("AXFocusedUIElement")?
+            .map(|e| e.attribute_string("AXSubrole"))
+            .transpose()?
+            .flatten()
+            .as_deref()
+            == Some("AXSecureTextField");
+        self.element_tables.insert(
+            (pid, window.id),
+            ElementTable {
+                pid,
+                window_id: window.id,
+                window_frame,
+                geometry,
+                entries,
+            },
+        );
+        Ok(Observation {
+            bundle_id: app.bundle_id,
+            app_name: app.name,
+            window: WindowInfo {
+                id: window.id,
+                title: window.title.clone(),
+            },
+            elements,
+            omitted,
+            no_element_tree,
+            focused_secure,
+            screenshot,
+        })
     }
 }
 
@@ -89,7 +222,10 @@ impl DriverHandler for MacDriver {
                 self.shutdown();
                 Ok(Reply::Done)
             }
-            Request::Observe(_) | Request::Act(_) => Err(error(
+            Request::Observe(params) => Ok(Reply::Observed {
+                observation: self.observe(params)?,
+            }),
+            Request::Act(_) => Err(error(
                 ErrorKind::Failed,
                 "This computer-use request is not implemented yet",
             )),
@@ -100,7 +236,15 @@ impl DriverHandler for MacDriver {
         self.hello_complete = false;
         self.turn_active = false;
         self.lock.take();
+        self.element_tables.clear();
+        self.accessibility_enabled.clear();
     }
+}
+
+fn frames_match(ax: [f64; 4], capture: [f64; 4]) -> bool {
+    ax.into_iter()
+        .zip(capture)
+        .all(|(a, b)| (a - b).abs() <= 2.0)
 }
 
 #[cfg(test)]
@@ -114,6 +258,13 @@ mod tests {
         let mut driver = MacDriver::new(path.clone());
         let output = LineWriter::new(std::io::sink());
         for request in [
+            Request::Observe(ObserveParams {
+                app: "dev.orca.not-installed".into(),
+                window: None,
+                query: None,
+                max_elements: 300,
+                include_screenshot: true,
+            }),
             Request::ListApps,
             Request::Turn { active: true },
             Request::LaunchApp {
