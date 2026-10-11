@@ -1040,7 +1040,7 @@ impl ToolExecutionActor {
         let background_workflows =
             background_workflows.expect("tool execution background workflows");
         let permission_overlay = permission_overlay.expect("tool execution permission overlay");
-        let invocation =
+        let mut invocation =
             prepare_tool_invocation(tool_request, subagent_depth, mcp_registry, config);
         if let Err(error) = validate_tool_invocation(&invocation, mcp_registry, config) {
             let result = error.into_result();
@@ -1066,6 +1066,40 @@ impl ToolExecutionActor {
                 (RunStatus::Failed, result),
                 event_error,
             ));
+        }
+
+        if invocation.effective.name == tool_types::ToolName::Computer {
+            let thread_store = extension_stores
+                .map(|stores| stores.thread_store())
+                .unwrap_or(&self.runtime.thread_extensions);
+            let service = crate::computer_use::service(thread_store, cwd, config);
+            if let Err(error) =
+                crate::computer_use::prepare::prepare_invocation(&mut invocation, config, &service)
+            {
+                let result = tool_types::ToolResult::failed_before_start(tool_request, error, None);
+                let mut event_error = None;
+                if emit_deltas {
+                    retain_first_io_error(
+                        &mut event_error,
+                        emit_tool_call_requested(events, sink, tool_request),
+                    );
+                }
+                retain_first_io_error(
+                    &mut event_error,
+                    publish_tool_call_completed(
+                        events,
+                        sink,
+                        tool_request,
+                        &result,
+                        emit_deltas,
+                        provider_response_ingress,
+                    ),
+                );
+                return Ok(ToolExecutionCompletion::from_pair_with_event_error(
+                    (RunStatus::Failed, result),
+                    event_error,
+                ));
+            }
         }
 
         let approval_bound_request = if approval_already_resolved {
@@ -2129,6 +2163,178 @@ mod tests {
             crate::extension::ToolCallOutcome::Cancelled {
                 started: orca_core::tool_types::ToolInvocationStarted::No
             }
+        );
+    }
+
+    // Task 10 adds the built-in schema. This fixture lets these tests exercise
+    // validation, preparation and approval through the real execution path now.
+    fn computer_config() -> RunConfig {
+        let mut config = config_with_permission_rules(PermissionRules::default());
+        config.approval_mode = ApprovalMode::Suggest;
+        config.computer_use.interactive = true;
+        config
+            .external_tools
+            .push(orca_core::external_config::ExternalToolConfig {
+                name: "computer".into(),
+                description: "Computer-use approval test schema".into(),
+                action_kind: ActionKind::Computer,
+                command: "must never run".into(),
+                schema: serde_json::json!({"type":"object"}),
+            });
+        config
+    }
+
+    fn execute_computer_for_approval(
+        config: &RunConfig,
+        desktop: orca_computer_use::fake::FakeDesktop,
+        use_extension_stores: bool,
+        handler: &(dyn crate::runtime_approval::RuntimeApprovalHandler + Send + Sync),
+    ) -> (RunStatus, ToolResult, Vec<serde_json::Value>) {
+        let cwd = tempfile::tempdir().unwrap();
+        let request = ToolRequest {
+            id: "computer-1".into(),
+            name: ToolName::Computer,
+            action: ActionKind::Computer,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({"action":"observe", "app":"TextEdit"}).to_string(),
+            ),
+        };
+        let policy = policy_for_tool_execution(config);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = orca_core::cancel::CancelToken::new();
+        let task_registry = TaskRegistry::new("computer-approval".into());
+        let mut background_workflows = Vec::new();
+        let mut overlay = TurnPermissionOverlay::default();
+        let mut events = EventFactory::new("computer-approval".into());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let extension_registry = ExtensionRegistryBuilder::new().build();
+        let thread_store = ExtensionData::new("computer-thread");
+        let turn_store = ExtensionData::new("computer-turn");
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string());
+        let test_service = crate::computer_use::ComputerUseService::new(Arc::new(
+            orca_computer_use::fake::FakeLauncher::new(desktop),
+        ));
+        if use_extension_stores {
+            thread_store.insert(test_service);
+        } else {
+            actor.runtime.thread_extensions.insert(test_service);
+        }
+        let mut context = ToolExecutionContext::new(cwd.path(), 0, true, &policy)
+            .with_services(&instructions, &memory, &registry, &hooks)
+            .with_runtime(
+                &mut cost_tracker,
+                &cancel,
+                &task_registry,
+                &mut background_workflows,
+                None,
+            )
+            .with_permission_overlay(&mut overlay)
+            .with_approval_handler(Some(handler));
+        if use_extension_stores {
+            context = context.with_extensions(
+                &extension_registry,
+                RuntimeExtensionStores::new(&thread_store, &turn_store),
+            );
+        }
+        let (status, result) = actor
+            .execute(
+                config,
+                &mut events,
+                &mut sink,
+                &request,
+                context,
+                unused_child_executor,
+                unused_child_executor,
+            )
+            .unwrap();
+        let emitted = String::from_utf8(sink.writer_mut().clone())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (status, result, emitted)
+    }
+
+    #[derive(Default)]
+    struct ComputerApprovalRecording(Mutex<Vec<ApprovalRequest>>);
+
+    impl crate::runtime_approval::RuntimeApprovalHandler for ComputerApprovalRecording {
+        fn resolve_interactive(
+            &self,
+            approval: &ApprovalRequest,
+            _request: &ToolRequest,
+        ) -> io::Result<orca_core::approval_types::ApprovalResolution> {
+            self.0.lock().unwrap().push(approval.clone());
+            Ok(orca_core::approval_types::ApprovalResolution {
+                id: approval.id.clone(),
+                decision: ApprovalDecision::Deny,
+                reason: "denied in test".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_computer_call_asks_with_the_bundle_id_as_its_target() {
+        for use_extension_stores in [false, true] {
+            let handler = ComputerApprovalRecording::default();
+            let (_, result, _) = execute_computer_for_approval(
+                &computer_config(),
+                orca_computer_use::fake::FakeDesktop::with_textedit(),
+                use_extension_stores,
+                &handler,
+            );
+            assert_eq!(
+                result.terminal().started,
+                orca_core::tool_types::ToolInvocationStarted::No
+            );
+            let approvals = handler.0.lock().unwrap();
+            assert_eq!(approvals.len(), 1);
+            assert_eq!(approvals[0].tool.as_deref(), Some("computer"));
+            assert_eq!(approvals[0].target.as_deref(), Some("com.apple.TextEdit"));
+            assert_eq!(
+                approvals[0].preview.as_deref(),
+                Some("observe in TextEdit (com.apple.TextEdit)")
+            );
+        }
+    }
+
+    #[test]
+    fn computer_use_preparation_failure_completes_before_start_without_approval() {
+        let mut config = computer_config();
+        config.computer_use.interactive = false;
+        let handler = ComputerApprovalRecording::default();
+        let (status, result, emitted) = execute_computer_for_approval(
+            &config,
+            orca_computer_use::fake::FakeDesktop::with_textedit(),
+            true,
+            &handler,
+        );
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(
+            result.terminal().started,
+            orca_core::tool_types::ToolInvocationStarted::No
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some("computer use is only available in the interactive TUI on macOS 14 or later")
+        );
+        assert!(handler.0.lock().unwrap().is_empty());
+        assert!(
+            emitted
+                .iter()
+                .any(|event| event["type"] == "tool.call.requested"),
+            "{emitted:?}"
+        );
+        assert!(
+            emitted
+                .iter()
+                .any(|event| event["type"] == "tool.call.completed"),
+            "{emitted:?}"
         );
     }
 
