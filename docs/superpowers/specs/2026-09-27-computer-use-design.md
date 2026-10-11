@@ -1,6 +1,6 @@
 # Orca Computer Use（macOS）设计
 
-> 状态：设计已逐节确认（2026-09-27），待写实施计划。
+> 状态：设计已逐节确认（2026-09-27）。阶段 1 已随 v0.5.6 发布。阶段 2 的设计见 [`2026-10-11-computer-use-phase2-design.md`](2026-10-11-computer-use-phase2-design.md)，它改动的地方在本文标了"阶段 2 修改"。
 > 目标：让 Orca 能看见并操作 macOS 上的其他应用，覆盖三类用途，对标 Claude Code 和 Codex 的 computer-use。
 
 ## 0. 目标与范围
@@ -19,7 +19,7 @@
 | 入口 | 只在交互式 TUI | ACP 客户端（如 Pilion）、无人值守的 `orca exec` |
 | 操作方式 | 后台优先，必要时短暂切到前台再切回 | — |
 | 权限归属 | 运行 Orca 的终端应用持有辅助功能和屏幕录制权限 | 有 Developer ID 后改为独立签名的辅助应用 |
-| 默认状态 | 关闭 | — |
+| 默认状态 | 可用，操作任何应用前都要授权（阶段 2 修改，原为关闭） | — |
 
 非目标：全屏截图、为 Pro 把截图转述成文字、跨应用拖放、私有系统接口（除非第 9 节的实验证明非用不可，届时单独决策）。
 
@@ -63,8 +63,8 @@
 
 ### 2.3 开关
 
-- 配置 `[computer_use] enabled = true`，或会话内执行 `/computer-use on` / `/computer-use off`。
-- 非 macOS 平台不注册 `computer` 工具，模型看不到它。
+- 阶段 2 修改：没有开关，默认可用。要完全关闭，就加一条整个工具的 deny 规则，这时不注册 `computer` 工具。
+- 非 macOS 平台和 macOS 14 以下不注册 `computer` 工具，模型看不到它。
 
 ## 3. `computer` 工具接口
 
@@ -104,6 +104,7 @@
 - 默认最多 300 个元素，`max_elements` 最大 1000；截断时注明省略了多少。
 - `query` 按标签和值做不区分大小写的过滤，保留匹配项的祖先链。
 - 密码框（`AXSecureTextField`）只标 `[secure]`，不读值。
+- 元素位置以截图像素为单位，观察结果的第一行写明截图尺寸（阶段 2 修改）。
 
 **截图**：只截目标窗口，最长边缩到 1280 像素，坐标以这张截图为准。
 
@@ -119,7 +120,7 @@
 
 **后台优先**：
 - 动作默认投递到后台窗口，不移动鼠标、不抢焦点。
-- 需要前台的动作（`drag`，以及后台投递未生效时），驱动会短暂切到前台，完成后恢复原来的前台应用，并在结果里注明。
+- 需要前台的动作（`drag`，以及后台方式明确失败时；阶段 2 修改，原为后台投递未生效时），驱动会短暂切到前台，完成后恢复原来的前台应用，并在结果里注明。
 - 前台回退默认开启，可以用 `[computer_use] foreground_fallback = false` 关闭。关闭后，需要前台的动作直接报告做不到。
 
 ## 4. 图片通道
@@ -156,10 +157,10 @@
 
 ## 5. 安全与授权
 
-### 5.1 开启与系统权限
+### 5.1 默认可用与系统权限
 
-- 默认关闭。
-- 开启后第一次使用时，驱动检查终端应用是否已有辅助功能和屏幕录制权限，缺哪项就在 TUI 里说明去系统设置的哪里打开。授予屏幕录制后通常要重启终端，也要写进提示。
+- 默认可用，没有开关；要完全关闭，就加一条整个工具的 deny 规则（阶段 2 修改，原为默认关闭）。
+- 第一次使用时，驱动检查终端应用是否已有辅助功能和屏幕录制权限，缺哪项就在 TUI 里说明去系统设置的哪里打开。授予屏幕录制后通常要重启终端，也要写进提示。
 
 ### 5.2 按应用授权
 
@@ -174,6 +175,7 @@ pattern = "com.apple.Safari"
 decision = "allow"
 ```
 
+- 密码管理器和金融类应用只认 `pattern` 正好等于其 bundle id 的规则，整个工具的规则和带通配符的规则放不开它们（阶段 2 修改）。
 - 各审批模式（包括 full-auto）都要经过应用授权；授权后，该应用里的动作不再逐个询问。
 - plan 模式只允许 `list_apps` 和 `observe`。
 
@@ -182,13 +184,13 @@ decision = "allow"
 | 级别 | 应用 | 行为 |
 | --- | --- | --- |
 | 禁止（规则也不能放开） | 运行当前 Orca 的终端（由终端设置的 `__CFBundleIdentifier` 环境变量识别） | 拒绝，防止 agent 在自己的 TUI 里输入或替自己批准 |
-| 禁止（可由规则放开） | 密码管理器和钥匙串访问；Info.plist 里 `LSApplicationCategoryType` 为 `public.app-category.finance` 的应用 | 默认拒绝 |
+| 禁止（只能由精确 bundle id 的规则放开，阶段 2 修改） | 密码管理器和钥匙串访问；Info.plist 里 `LSApplicationCategoryType` 为 `public.app-category.finance` 的应用 | 默认拒绝 |
 | 强提示 | 终端、IDE（"相当于绕过沙箱执行任意命令"）；Finder（"能读写任何文件"）；系统设置；浏览器（"网页内容可能夹带针对 agent 的指令"） | 授权面板里显示警告 |
 
 初始清单（实施时可补充）：
 
 - **密码管理器**：`com.apple.keychainaccess`、`com.apple.Passwords`、`com.1password.*`、`com.agilebits.*`、`com.bitwarden.*`
-- **终端**：`com.apple.Terminal`、`com.googlecode.iterm2`、`com.mitchellh.ghostty`、`dev.warp.Warp-Stable`、`net.kovidgoyal.kitty`、`org.alacritty`、`com.github.wez.wezterm`
+- **终端**：`com.apple.Terminal`、`com.googlecode.iterm2`、`com.mitchellh.ghostty`、`dev.warp.Warp-Stable`、`net.kovidgoyal.kitty`、`org.alacritty`、`com.github.wez.wezterm`、`com.cmuxterm.app`（阶段 2 加入）
 - **IDE**：`com.microsoft.VSCode`、`com.todesktop.*`（Cursor）、`com.jetbrains.*`、`com.apple.dt.Xcode`、`dev.zed.Zed`
 - **其他强提示应用**：`com.apple.finder`、`com.apple.systempreferences`
 - **浏览器**：`com.apple.Safari`、`com.google.Chrome`、`org.mozilla.firefox`、`company.thebrowser.Browser`、`com.microsoft.edgemac`、`com.brave.Browser`
@@ -225,7 +227,7 @@ decision = "allow"
 | 驱动卡住或崩溃 | 请求超时（默认 30 秒，`launch_app` 60 秒）后结束驱动，下次调用时重启，返回"驱动已重启，请重新 observe" |
 | 应用未运行、窗口已关闭 | 返回具体错误，模型可 `list_apps` 或 `launch_app` |
 | 观察结果过期 | 不执行，返回"已过期，请重新 observe" |
-| 后台投递未生效 | 驱动通过无障碍接口确认效果，标明"已确认"或"未能确认"。未确认且允许回退时，短暂切到前台重试并注明；否则如实报告 |
+| 后台方式明确失败 | 接口报错、元素不支持该动作或找不到元素时，允许回退就短暂切到前台执行并注明，否则如实报告。效果只是无法确认时不重试，交给模型看动作后的观察（阶段 2 修改，原为未确认就切前台重试） |
 | 用户正在操作 | 切前台前，等用户输入空闲 500 毫秒，最多等 3 秒。仍在输入就放弃这次前台回退并报告，不和用户抢输入 |
 | Esc、本轮结束、退出会话 | 松开所有可能按下的修饰键和鼠标键，尽量恢复原来的前台应用 |
 | 屏幕锁定或休眠 | 返回"屏幕已锁定"，停止操作，不反复重试 |
@@ -261,8 +263,8 @@ decision = "allow"
 每个阶段是一个补丁版本，各自写一份实施计划。第一份计划覆盖第 9 节的实验和阶段 1：
 
 1. **图片通道**（第 4 节）：单独就有价值，Pilion 的截图马上能被模型看到。
-2. **驱动和 `computer` 工具**：`list_apps`、`launch_app`、`observe`、`click`、`type`、`key`、`scroll`，加上按应用授权、Esc 中止、会话锁。仍然默认关闭。
-3. **补齐和打磨**：前台回退、`drag`、`set_value`、风险分级细调、验收任务集和文档。
+2. **驱动和 `computer` 工具**：`list_apps`、`launch_app`、`observe`、`click`、`type`、`key`、`scroll`，加上前台回退、按应用授权、Esc 中止、会话锁，默认可用。详见[阶段 2 设计](2026-10-11-computer-use-phase2-design.md)（阶段 2 修改：前台回退从阶段 3 移来，不再默认关闭）。
+3. **补齐和打磨**：`drag`、`set_value`、风险分级细调、验收任务集和完整文档。
 
 ## 9. 待验证问题
 
