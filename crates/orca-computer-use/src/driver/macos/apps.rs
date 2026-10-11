@@ -137,6 +137,19 @@ pub(super) fn list() -> Result<Vec<AppInfo>, DriverError> {
     list_with_timeout(Duration::from_secs(30))
 }
 
+/// Observe/act receive an already approved bundle ID; names cannot widen it.
+pub(super) fn resolve_approved(bundle_id: &str) -> Result<AppInfo, DriverError> {
+    list()?
+        .into_iter()
+        .find(|app| app.bundle_id == bundle_id)
+        .ok_or_else(|| {
+            error(
+                ErrorKind::AppNotFound,
+                format!("App not found: {bundle_id}"),
+            )
+        })
+}
+
 pub(super) fn resolve(name: &str, allow_not_running: bool) -> Result<AppInfo, DriverError> {
     let apps = list()?;
     if let Some(app) = apps.iter().find(|app| app.bundle_id == name) {

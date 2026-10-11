@@ -8,9 +8,10 @@ fn quoted(text: &str) -> String {
 
 pub fn render_observation(observation: &Observation) -> String {
     let mut text = format!(
-        "{} {}: ",
+        "{} {} [window {}]: ",
         observation.app_name,
-        quoted(&observation.window.title)
+        quoted(&observation.window.title),
+        observation.window.id
     );
     if let Some(screenshot) = &observation.screenshot {
         writeln!(
@@ -158,7 +159,7 @@ mod tests {
         assert_eq!(
             text,
             concat!(
-                "TextEdit \"probe.rtf\": screenshot 1280×902 px, origin top-left; all coordinates refer to this screenshot\n",
+                "TextEdit \"probe.rtf\" [window 1]: screenshot 1280×902 px, origin top-left; all coordinates refer to this screenshot\n",
                 "[12] button \"Save\" (840,52,64,28)\n",
                 "  [13] text field \"Name\" = \"report.txt\" (120,90,300,24)\n",
                 "  [14] text field (120,130,300,24) [secure]\n",
@@ -175,7 +176,7 @@ mod tests {
         observation.no_element_tree = true;
         let text = render_observation(&observation);
         assert!(text.starts_with(
-            "TextEdit \"probe.rtf\": no screenshot (the current model cannot see images)\n"
+            "TextEdit \"probe.rtf\" [window 1]: no screenshot (the current model cannot see images)\n"
         ));
         assert!(text.contains("… 9 more elements omitted; pass \"query\" to narrow\n"));
         assert!(text.contains(

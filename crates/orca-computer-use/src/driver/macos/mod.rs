@@ -54,7 +54,7 @@ impl MacDriver {
 
     fn observe(&mut self, params: ObserveParams) -> Result<Observation, DriverError> {
         capture::check_unlocked()?;
-        let app = apps::resolve(&params.app, false)?;
+        let app = apps::resolve_approved(&params.app)?;
         let pid = app
             .pid
             .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
@@ -63,50 +63,7 @@ impl MacDriver {
             let _ = application.set_bool("AXManualAccessibility", true);
         }
         let windows = capture::windows()?;
-        let ax_windows = application.elements("AXWindows")?;
-        let (ax_window, window) = if let Some(id) = params.window {
-            let window = windows
-                .iter()
-                .find(|w| w.id == id && w.pid == pid)
-                .ok_or_else(|| error(ErrorKind::WindowNotFound, "Window not found for this app"))?;
-            let mut matching = None;
-            for candidate in ax_windows {
-                if frames_match(candidate.position_size()?, window.frame) {
-                    matching = Some(candidate);
-                    break;
-                }
-            }
-            (
-                matching.ok_or_else(|| {
-                    error(
-                        ErrorKind::WindowNotFound,
-                        "No accessibility window matches the capture window",
-                    )
-                })?,
-                window,
-            )
-        } else {
-            let window = application
-                .attribute_element("AXMainWindow")?
-                .or_else(|| ax_windows.into_iter().next())
-                .ok_or_else(|| {
-                    error(
-                        ErrorKind::WindowNotFound,
-                        "The app has no accessibility window",
-                    )
-                })?;
-            let frame = window.position_size()?;
-            let capture = windows
-                .iter()
-                .find(|w| w.pid == pid && frames_match(frame, w.frame))
-                .ok_or_else(|| {
-                    error(
-                        ErrorKind::WindowNotFound,
-                        "No capture window matches the accessibility window",
-                    )
-                })?;
-            (window, capture)
-        };
+        let (ax_window, window) = resolve_window(&application, pid, &windows, params.window)?;
         let window_frame = ax_window.position_size()?;
         if window_frame.iter().any(|v| !v.is_finite())
             || window_frame[2] <= 0.0
@@ -329,4 +286,58 @@ mod tests {
             Reply::Done
         );
     }
+}
+
+/// Act and observe resolve the same live window, including apps with no main window.
+fn resolve_window<'a>(
+    application: &AxElement,
+    pid: i32,
+    windows: &'a [capture::Window],
+    id: Option<u32>,
+) -> Result<(AxElement, &'a capture::Window), DriverError> {
+    let ax_windows = application.elements("AXWindows")?;
+    let resolved = if let Some(id) = id {
+        let window = windows
+            .iter()
+            .find(|w| w.id == id && w.pid == pid)
+            .ok_or_else(|| error(ErrorKind::WindowNotFound, "Window not found for this app"))?;
+        let mut matching = None;
+        for candidate in ax_windows {
+            if frames_match(candidate.position_size()?, window.frame) {
+                matching = Some(candidate);
+                break;
+            }
+        }
+        (
+            matching.ok_or_else(|| {
+                error(
+                    ErrorKind::WindowNotFound,
+                    "No accessibility window matches the capture window",
+                )
+            })?,
+            window,
+        )
+    } else {
+        let window = application
+            .attribute_element("AXMainWindow")?
+            .or_else(|| ax_windows.into_iter().next())
+            .ok_or_else(|| {
+                error(
+                    ErrorKind::WindowNotFound,
+                    "The app has no accessibility window",
+                )
+            })?;
+        let frame = window.position_size()?;
+        let capture = windows
+            .iter()
+            .find(|w| w.pid == pid && frames_match(frame, w.frame))
+            .ok_or_else(|| {
+                error(
+                    ErrorKind::WindowNotFound,
+                    "No capture window matches the accessibility window",
+                )
+            })?;
+        (window, capture)
+    };
+    Ok(resolved)
 }

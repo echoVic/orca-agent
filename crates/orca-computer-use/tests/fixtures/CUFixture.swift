@@ -64,6 +64,10 @@ final class ProbeWindow: NSWindow {
 
 @objc(CUProbeApplication)
 final class ProbeApplication: NSApplication {
+    override func accessibilityMainWindow() -> Any? {
+        if CommandLine.arguments.contains("--no-main-window") { return nil }
+        return super.accessibilityMainWindow()
+    }
     override func accessibilityApplicationFocusedUIElement() -> Any? {
         if foregroundPasswordProbe, let window = windows.first(where: { $0.title == "Orca CU Fixture" }), (window.firstResponder == nil || window.firstResponder === window) { return nil }
         return super.accessibilityApplicationFocusedUIElement()

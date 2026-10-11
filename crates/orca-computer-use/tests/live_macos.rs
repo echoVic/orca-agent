@@ -3159,3 +3159,77 @@ fn a_suite_without_live_tests_does_not_restore_the_gui() {
     assert!(restore_suite_if_live(true, || restored.set(restored.get() + 1)));
     assert_eq!(restored.get(), 1, "live-suite restoration positive control");
 }
+
+#[test]
+#[ignore]
+fn act_and_observe_choose_the_first_window_when_main_is_absent() {
+    run_live_test(|| {
+        use objc2_application_services::AXUIElement;
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) = live.launch_fixture_with_flags(&["--no-main-window"]);
+        let application = unsafe { AXUIElement::new_application(pid) };
+        assert!(fixture_ax_value(&application, "AXMainWindow").is_none());
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let outcome = live
+            .act(click_target(element_named(&obs, "Increment")), false)
+            .unwrap();
+        assert_eq!(outcome.observation.unwrap().window.id, obs.window.id);
+        live.assert_log_contains(&log, r#""count":1"#);
+        let explicit = live
+            .act_app(
+                "dev.orca.cu-fixture",
+                Some(obs.window.id),
+                click_target(element_named(&obs, "Increment")),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(explicit.observation.unwrap().window.id, obs.window.id);
+        live.assert_log_contains(&log, r#""count":2"#);
+    });
+}
+
+#[test]
+#[ignore]
+fn approved_actions_and_observations_require_the_exact_bundle_id() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let result = live.client.call(
+            Request::Observe(ObserveParams {
+                app: "CUFixture".into(),
+                window: None,
+                query: None,
+                max_elements: 300,
+                include_screenshot: false,
+            }),
+            Duration::from_secs(30),
+        );
+        assert!(matches!(
+            result,
+            Err(orca_computer_use::client::CallError::Driver(DriverError {
+                kind: ErrorKind::AppNotFound,
+                ..
+            }))
+        ));
+        assert_eq!(
+            live.act_app(
+                "CUFixture",
+                None,
+                click_target(element_named(&obs, "Increment")),
+                false,
+                false
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::AppNotFound
+        );
+        live.act(click_target(element_named(&obs, "Increment")), false)
+            .unwrap();
+        live.assert_log_contains(&log, r#""count":1"#);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}

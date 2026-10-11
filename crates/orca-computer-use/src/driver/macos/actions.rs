@@ -1,7 +1,7 @@
 use objc2_app_kit::NSRunningApplication;
 
 use super::{
-    MacDriver, apps, ax::AxElement, capture, error, events, foreground, frames_match,
+    MacDriver, apps, ax::AxElement, capture, error, events, foreground, resolve_window,
     tree::ElementTable,
 };
 use crate::{
@@ -25,41 +25,22 @@ fn foreground(message: impl Into<String>) -> DriverError {
 impl MacDriver {
     pub(super) fn act(&mut self, params: ActParams) -> Result<ActOutcome, DriverError> {
         capture::check_unlocked()?;
-        let app = apps::resolve(&params.app, false)?;
+        let app = apps::resolve_approved(&params.app)?;
         let pid = app
             .pid
             .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
         let application = AxElement::application(pid)?;
         let windows = capture::windows()?;
-        let id = match params.window {
-            Some(id) => id,
-            None => {
-                let main = application
-                    .attribute_element("AXMainWindow")?
-                    .ok_or_else(stale)?;
-                let frame = main.position_size()?;
-                windows
-                    .iter()
-                    .find(|w| w.pid == pid && frames_match(frame, w.frame))
-                    .ok_or_else(stale)?
-                    .id
-            }
-        };
+        let (ax_window, window) = resolve_window(&application, pid, &windows, params.window)
+            .map_err(|failure| {
+                if failure.kind == ErrorKind::WindowNotFound {
+                    stale()
+                } else {
+                    failure
+                }
+            })?;
+        let id = window.id;
         let table = self.element_tables.get(&(pid, id)).ok_or_else(stale)?;
-        let window = windows
-            .iter()
-            .find(|w| w.pid == pid && w.id == id)
-            .ok_or_else(stale)?;
-        // Read the live AX window as well as capture geometry: neither a stale
-        // capture record nor a reused element ID authorizes an action.
-        let mut ax_window = None;
-        for candidate in application.elements("AXWindows")? {
-            if frames_match(candidate.position_size()?, window.frame) {
-                ax_window = Some(candidate);
-                break;
-            }
-        }
-        let ax_window = ax_window.ok_or_else(stale)?;
         let frame = ax_window.position_size()?;
         if !frame
             .into_iter()
