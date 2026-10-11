@@ -3,7 +3,7 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::assets;
+use super::assets::{self, HydrateImages};
 use super::types::{SessionRecord, StoredSessionHealth, StoredSessionHealthIssue};
 use super::writer::{
     MAX_SESSION_LINE_BYTES, open_regular_history_file, parse_session_record, read_bounded_line,
@@ -42,8 +42,8 @@ impl SessionRecordSnapshot {
         })
     }
 
-    pub fn records(&self) -> io::Result<SessionRecords> {
-        SessionRecords::from_snapshot(self, None)
+    pub fn records(&self, images: HydrateImages) -> io::Result<SessionRecords> {
+        SessionRecords::from_snapshot(self, None, images)
     }
 }
 
@@ -65,6 +65,7 @@ pub(crate) struct SessionRecords {
     path: PathBuf,
     compressed: bool,
     budget: Option<InspectionBudget>,
+    images: HydrateImages,
     line: Vec<u8>,
     offset: u64,
     pub line_number: u64,
@@ -73,18 +74,23 @@ pub(crate) struct SessionRecords {
     pub issue: Option<StoredSessionHealthIssue>,
 }
 
-pub(crate) fn iter_records(path: &Path) -> io::Result<SessionRecords> {
-    SessionRecords::open(path, None)
+pub(crate) fn iter_records(path: &Path, images: HydrateImages) -> io::Result<SessionRecords> {
+    SessionRecords::open(path, None, images)
 }
 
 impl SessionRecords {
-    pub fn open(path: &Path, budget: Option<InspectionBudget>) -> io::Result<Self> {
-        Self::from_snapshot(&SessionRecordSnapshot::open(path)?, budget)
+    pub fn open(
+        path: &Path,
+        budget: Option<InspectionBudget>,
+        images: HydrateImages,
+    ) -> io::Result<Self> {
+        Self::from_snapshot(&SessionRecordSnapshot::open(path)?, budget, images)
     }
 
     fn from_snapshot(
         snapshot: &SessionRecordSnapshot,
         budget: Option<InspectionBudget>,
+        images: HydrateImages,
     ) -> io::Result<Self> {
         let path = &snapshot.path;
         let file = SnapshotReader {
@@ -104,6 +110,7 @@ impl SessionRecords {
             path: path.to_path_buf(),
             compressed,
             budget,
+            images,
             line: Vec::new(),
             offset: 0,
             line_number: 0,
@@ -222,12 +229,7 @@ impl Iterator for SessionRecords {
                 if !assets::is_asset_record(&value) {
                     return Err(code);
                 }
-                let images = if self.budget.is_none() {
-                    assets::HydrateImages::NotToolMessages
-                } else {
-                    assets::HydrateImages::None
-                };
-                let value = assets::hydrate(&self.path, value, images)
+                let value = assets::hydrate(&self.path, value, self.images)
                     .map_err(|_| "invalid_image_asset")?;
                 let record: SessionRecord =
                     serde_json::from_value(value).map_err(|_| "malformed_asset_record")?;

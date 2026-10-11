@@ -2837,7 +2837,10 @@ impl ChildAgentCoordinator {
         let snapshot = crate::thread_store::SessionRecordSnapshot::open(&transcript.path)
             .map_err(|_| mismatch())?;
         let mut initial_cursor = None;
-        for entry in snapshot.records().map_err(|_| mismatch())? {
+        for entry in snapshot
+            .records(crate::thread_store::HydrateImages::NotToolMessages)
+            .map_err(|_| mismatch())?
+        {
             if let crate::thread_store::SessionRecord::SurfaceCommitPrepared {
                 batch: Some(batch),
                 ..

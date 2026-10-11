@@ -14,6 +14,7 @@ mod writer;
 
 use orca_core::conversation::Conversation;
 
+pub(crate) use assets::HydrateImages;
 pub use live_thread::LiveThread;
 #[cfg(test)]
 pub(crate) use local::find_session_path;

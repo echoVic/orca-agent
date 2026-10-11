@@ -3014,7 +3014,7 @@ impl SurfaceCommitIndex {
         let snapshot =
             SessionRecordSnapshot::open(path).map_err(JsonlSurfaceCommitLedger::io_error)?;
         for record in snapshot
-            .records()
+            .records(crate::thread_store::HydrateImages::NotToolMessages)
             .map_err(JsonlSurfaceCommitLedger::io_error)?
         {
             match record.map_err(JsonlSurfaceCommitLedger::io_error)? {
@@ -4392,7 +4392,7 @@ impl JsonlSurfaceCommitLedger {
                 snapshot
                     .as_ref()
                     .map_err(Clone::clone)?
-                    .records()
+                    .records(crate::thread_store::HydrateImages::NotToolMessages)
                     .map_err(Self::io_error)
             })
             .transpose()?;

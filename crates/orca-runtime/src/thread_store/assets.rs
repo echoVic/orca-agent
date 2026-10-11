@@ -203,7 +203,6 @@ pub(crate) fn is_asset_record(value: &Value) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HydrateImages {
     /// Load every image (an on-demand read of one record).
-    #[cfg_attr(not(test), allow(dead_code))]
     All,
     /// Load user images; leave tool-message images empty (session resume drops them).
     NotToolMessages,

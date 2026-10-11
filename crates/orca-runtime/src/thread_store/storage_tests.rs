@@ -434,6 +434,88 @@ fn find_stored_tool_message(records: Vec<SessionRecord>) -> Option<StoredMessage
     })
 }
 
+fn append_tool_png(writer: &mut SessionWriter) -> ImageInput {
+    let image = orca_core::tool_images::tool_image(
+        "image/png",
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
+    ).unwrap();
+    writer.enter_turn(TurnId::new());
+    writer
+        .append_message(&Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: "screenshot taken".to_string(),
+            images: vec![image.clone()],
+            terminal: None,
+            pinned: false,
+        })
+        .unwrap();
+    image
+}
+
+fn fully_hydrated_tool_images(path: &std::path::Path) -> Vec<ImageInput> {
+    let records = super::reader::iter_records(path, HydrateImages::All)
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    let message = find_stored_tool_message(records).expect("tool message");
+    Message::from(message).images().to_vec()
+}
+
+#[test]
+fn export_keeps_tool_images() {
+    crate::history::with_redirected_orca_home("tool-image-export", |home| {
+        let store = JsonlThreadStore::new();
+        let mut writer = SessionWriter::start(home, "mock", None, "export tool image").unwrap();
+        let image = append_tool_png(&mut writer);
+        let export = home.join("portable.jsonl");
+        store
+            .export_session(&writer.session_id().unwrap(), &export)
+            .unwrap();
+        // Portable exports retain bytes without referring to the source blobs.
+        fs::remove_dir_all(assets::directory(writer.path())).unwrap();
+        assert_eq!(fully_hydrated_tool_images(&export), vec![image]);
+    });
+}
+
+#[test]
+fn rewriting_thread_meta_keeps_tool_images() {
+    use super::{ThreadMetadataPatch, ThreadStore};
+    crate::history::with_redirected_orca_home("tool-image-rewrite", |home| {
+        let store = JsonlThreadStore::new();
+        let mut writer = SessionWriter::start(home, "mock", None, "rewrite tool image").unwrap();
+        let image = append_tool_png(&mut writer);
+        store
+            .update_thread_metadata(
+                &writer.session_id().unwrap(),
+                ThreadMetadataPatch {
+                    title: Some("updated title".to_string()),
+                    ..ThreadMetadataPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            read_session_meta(writer.path()).unwrap().title,
+            "updated title"
+        );
+        assert_eq!(fully_hydrated_tool_images(writer.path()), vec![image]);
+    });
+}
+
+#[test]
+fn compressing_and_restoring_a_session_keeps_tool_images() {
+    crate::history::with_redirected_orca_home("tool-image-compress", |home| {
+        let store = JsonlThreadStore::new();
+        let mut writer = SessionWriter::start(home, "mock", None, "compress tool image").unwrap();
+        let image = append_tool_png(&mut writer);
+        let id = writer.session_id().unwrap();
+        drop(writer);
+        let compressed = store.compress_session(&id).unwrap();
+        assert_eq!(fully_hydrated_tool_images(&compressed), vec![image.clone()]);
+        let restored = SessionWriter::append_to_existing(compressed).unwrap();
+        assert_eq!(fully_hydrated_tool_images(restored.path()), vec![image]);
+    });
+}
+
 #[test]
 fn a_tool_image_is_stored_as_an_asset_not_inline() {
     crate::history::with_redirected_orca_home("tool-image-asset", |home| {
