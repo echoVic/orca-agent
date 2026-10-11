@@ -57,3 +57,5 @@ Evaluation only pays off when a finding becomes a permanent check:
 | #81 concurrent `orca trust add/remove` lost decisions | `tests/jsonl_surface_differential.rs`, `scripts/eval/trust_race_probe.py` |
 | #115 a `lifetime: workspace` service is killed at session end | `scripts/eval/workspace_lifetime_probe.py` (in the sweep) |
 | #67 duplicate provider tool-call id aborted the session | `scripts/eval/fault_injection.py` (`duplicate_tool_call_id`), `model_response` unit tests |
+| #126 the instruction in the wrapper shell's argv let a task's `pkill -f` end the trial | `terminal_bench/test_orca_agent.py` (`test_run_keeps_the_instruction_out_of_every_command_line`) |
+| #127 an image without a CA bundle must fail with the documented error and send nothing | `scripts/eval/linux_shell_probe.py` (CA check, in the sweep) |
