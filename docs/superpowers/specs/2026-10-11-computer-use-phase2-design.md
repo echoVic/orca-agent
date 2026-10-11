@@ -203,3 +203,21 @@
 | 第 5.2、5.3 节"禁止（可由规则放开）" | 只认 `pattern` 正好等于 bundle id 的规则（本文第 4 节） |
 | 第 5.3 节的终端清单 | 加入 cmux |
 | 第 8 节：前台回退在阶段 3 | 前台回退移到阶段 2 |
+
+## 10. 实施时的真机结论
+
+2026-10-12，在 Apple Silicon、macOS 26.6.2（25G83）上执行 Task 13。每次 GUI 检查记录起始前台应用、指针和运行中的应用；检查后退出本次启动的应用并恢复前台与指针。下列结果来自本机，不代表其他 macOS 版本或应用都具有相同表现。
+
+| 项目 | 怎么查及结果 | 因此改动的代码 |
+| --- | --- | --- |
+| Step 1：切到前台和恢复 | 扩展 `a_canvas_click_uses_the_foreground_and_restores_it`，先用前台画布点击作正向对照，再从 Finder 点击画布和 Password。画布成功，但从 Finder 点击 Password 的激活／恢复步骤复现 Task 8 留下的前台超时：`AXFrontmost` 设置成功，1 秒内实际前台 PID 未变为目标，返回 `The app did not become frontmost`。改动后两种点击都能恢复 Finder 与指针。 | 激活和恢复统一使用 `NSRunningApplication::activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows)`；窗口仍执行 `AXRaise`，仍检查实际前台 PID。替换第 2 节写的 `AXFrontmost` 办法。真机测试的恢复也使用该 API。 |
+| Step 2：后台 Cmd 快捷键 | `cmd_a_reaches_the_focused_field` 得到 `abcx`，不是 `x`；新增 `cmd_s_saves_textedit_in_the_background`，在自己的临时 `.txt` 中输入后发 Cmd+S，文件修改时间未改变。同一输入框／文档中的前台 HID 正向对照分别得到 `x` 和文件保存。修复后两条测试都断言 `foreground_used`，并核对选区替换／修改时间和文件内容。 | `actions.rs` 的 `key` 在带 Cmd 时直接返回 `NeedsForeground`，不先投递后台按键；沿用配置控制的前台回退。夹具增加标准 Edit → Select All 菜单，让前台 Cmd+A 正向对照有真实的 AppKit 快捷键处理。 |
+| Step 3：中文输入法 | `pending: run with the user`。按控制器 R2，本任务不切换用户的输入法。 | `type` 未改变。 |
+| Step 4：空闲和驱动事件 | 新增 `two_foreground_actions_in_a_row_do_not_count_as_user_activity`；第一次点击是正向对照，两次画布点击间隔 100 毫秒。日志记录两次点击，第二次约 482 毫秒完成，没有返回 `UserActive`。 | 无须增加“距自己的最后一次 HID 事件不到 0.5 秒则跳过等待”的例外；保留等用户空闲 0.5 秒、最多 3 秒的实现。 |
+| Step 5：Electron | `ORCA_CU_ELECTRON_APP=com.kangfenmao.CherryStudio`，运行 `observe_of_an_electron_app_waits_for_its_tree`。启动后立即观察曾报 `AXWindows` 的 `AXError(-25204)` 或还没有 AX 窗口；测试先等首次捕获窗口，再在 3 秒内重试观察，并记录每次失败。初次就绪观察只有 3 个 button；最终复测通过：`no_element_tree=false`，70 个元素、31 个 button、0 个 text field。记录的是当时界面的可见树，不声称所有 Electron 内容控件都可用。同一驱动观察夹具，button 和 text field 均存在。只观察，未点击或输入 Cherry Studio，结束后退出本次启动的进程。 | 只调整测试的启动就绪检查、增加正向对照和结果记录；没有改 Electron 生产实现。 |
+| Step 5：Catalyst / Stocks | 本机 bundle id 是 `com.apple.stocks`。启动后欢迎界面还会异步加载，等待加载后通过驱动对 Continue／继续执行一次按下，随后只观察。欢迎页已关闭；结果为 `no_element_tree=false`、26 个元素、16 个 button、1 个 text field。同一驱动观察夹具，两种角色均存在。退出本次启动的 Stocks。 | 仅新增真机检查；没有改 Catalyst 生产实现。 |
+| Step 6：真实 TUI Esc | `cargo build --release --locked`，在从当前 shell 启动的独立 tmux server 中运行 `./target/release/orca`。使用 `/tmp` 下的新 `ORCA_HOME`、工作区和本地 mock provider、dummy key；mock 发一个观察夹具的 `computer` 调用，审批面板按 `1` 允许一次，mock 配置为以每秒约两个 token 输出约一分钟，按 Esc 的检查在输出期间进行。tmux 发送 Esc 与夹具前台的无标记 HID Esc 均使 TUI 显示 `Task cancelled [operation.cancelled_by_user]`，操作终态为 `cancelled`、原因 `user`，两次下一条消息都正常完成。HID Esc 在活动轮次未进入夹具日志；无轮次时同样事件的正向对照能进入，结束后也再次进入。 | Esc 两种路径通过，因此不需要 Task 10 的 `ThreadCommand::InterruptActive` 改动。中断轮次后正常开始并完成下一轮，也覆盖 Task 10 留下的生产轮次释放 turn store 的检查。 |
+
+Step 6 还发现了进程内测试没覆盖的真实驱动进程问题：观察时 CoreGraphics 报 `CGS_REQUIRE_INIT` 并中止进程，崩溃栈位于 ScreenCaptureKit 的 `SCContentFilter` 构造回调。先新增并跑失败的 `real_macos_driver_observes_the_fixture_from_its_own_process`，再在 `run_stdio` 的主线程、启动 worker 前初始化 `NSWorkspace` 和 CoreGraphics（创建一个不投递的 `CGEvent`）。仅初始化 `NSWorkspace` 仍失败；完整修复后，真实驱动进程的夹具观察、截图和 turn 开关测试通过，真实 TUI 的工具调用也成功。进程仍只由 `ExecutionBroker::launch_user_trusted` 启动，stdio 和 stderr 的路由未改变。
+
+Step 7：各代码修复分别提交；本节使用任务简报指定的提交消息记录。提交前执行格式、workspace clippy、两个平台／runtime surface 校验器和修改 crate 的测试。没有推送、切换分支或使用用户的 `~/.orca`、真实 API key。

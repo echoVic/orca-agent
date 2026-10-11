@@ -1197,6 +1197,10 @@ fn observe_of_an_electron_app_waits_for_its_tree() {
             eprintln!("skipped: Electron app already running");
             return;
         }
+        live.launch_fixture();
+        let control = live.observe("dev.orca.cu-fixture", None);
+        assert!(control.elements.iter().any(|e| e.role == "button"));
+        assert!(control.elements.iter().any(|e| e.role == "text field"));
         let before = bundle_pids(&bundle);
         let result = live.client.call(
             Request::LaunchApp {
@@ -1207,13 +1211,160 @@ fn observe_of_an_electron_app_waits_for_its_tree() {
         );
         register_launch_pids(&mut live.launched, &before, &bundle_pids(&bundle));
         result.unwrap();
-        let observation = live.observe(&bundle, None);
+        let observation = observe_after_launch(&live, &bundle);
+        eprintln!(
+            "Electron {bundle}: no_element_tree={}, elements={}, buttons={}, text_fields={}; fixture control has both roles",
+            observation.no_element_tree,
+            observation.elements.len(),
+            observation
+                .elements
+                .iter()
+                .filter(|e| e.role == "button")
+                .count(),
+            observation
+                .elements
+                .iter()
+                .filter(|e| e.role == "text field")
+                .count()
+        );
         assert!(!observation.no_element_tree);
         assert!(
             observation
                 .elements
                 .iter()
                 .any(|e| e.role == "button" || e.role == "text field")
+        );
+    });
+}
+
+// Characterize cold-launch readiness separately from the driver's tree poll.
+// Log every failed observe; a later success does not erase the initial result.
+fn observe_after_launch(live: &Live, app: &str) -> Observation {
+    // Launch completion can precede the first window when no file was opened.
+    let launch_deadline = Instant::now() + Duration::from_secs(60);
+    while !live
+        .apps()
+        .iter()
+        .any(|info| info.bundle_id == app && !info.windows.is_empty())
+    {
+        assert!(
+            Instant::now() < launch_deadline,
+            "{app} did not open a window"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match live.client.call(
+            Request::Observe(ObserveParams {
+                app: app.into(),
+                window: None,
+                query: None,
+                max_elements: 300,
+                include_screenshot: true,
+            }),
+            Duration::from_secs(30),
+        ) {
+            Ok(Reply::Observed { observation }) => {
+                // A launch animation can expose just the three title-bar buttons.
+                if observation.elements.len() > 3 || Instant::now() >= deadline {
+                    return observation;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(orca_computer_use::client::CallError::Driver(error))
+                if error.kind == ErrorKind::WindowNotFound
+                    || (error.kind == ErrorKind::Failed
+                        && error.message == "Accessibility AXWindows failed: AXError(-25204)") =>
+            {
+                eprintln!("cold-launch observe of {app}: {error:?}");
+                assert!(
+                    Instant::now() < deadline,
+                    "AXWindows never became ready for {app}"
+                );
+                thread::sleep(Duration::from_millis(100));
+            }
+            other => panic!("unexpected launch observation: {other:?}"),
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn observe_stocks_after_dismissing_its_welcome_page() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        // Positive control for any missing Catalyst roles, on this same driver.
+        live.launch_fixture();
+        let control = live.observe("dev.orca.cu-fixture", None);
+        assert!(control.elements.iter().any(|e| e.role == "button"));
+        assert!(control.elements.iter().any(|e| e.role == "text field"));
+        let before = bundle_pids("com.apple.stocks");
+        if !before.is_empty() {
+            eprintln!("skipped: Stocks already running");
+            return;
+        }
+        let result = live.client.call(
+            Request::LaunchApp {
+                app: "com.apple.stocks".into(),
+                open: vec![],
+            },
+            Duration::from_secs(60),
+        );
+        register_launch_pids(
+            &mut live.launched,
+            &before,
+            &bundle_pids("com.apple.stocks"),
+        );
+        result.unwrap();
+        observe_after_launch(&live, "com.apple.stocks");
+        // Stocks' first-run welcome view loads asynchronously after its window.
+        thread::sleep(Duration::from_secs(20));
+        let mut observation = live.observe("com.apple.stocks", None);
+        use base64::Engine as _;
+        std::fs::write(
+            PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("stocks-before.png"),
+            base64::engine::general_purpose::STANDARD
+                .decode(&observation.screenshot.as_ref().unwrap().png_base64)
+                .unwrap(),
+        )
+        .unwrap();
+        let continued = if let Some(button) = observation.elements.iter().find(|e| {
+            e.role == "button"
+                && e.label
+                    .as_deref()
+                    .is_some_and(|label| label == "Continue" || label == "继续")
+        }) {
+            live.act_app(
+                "com.apple.stocks",
+                Some(observation.window.id),
+                click_target(Target::Element { element: button.id }),
+                false,
+                true,
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(500));
+            observation = live.observe("com.apple.stocks", None);
+            true
+        } else {
+            false
+        };
+        let buttons = observation
+            .elements
+            .iter()
+            .filter(|e| e.role == "button")
+            .count();
+        let fields = observation
+            .elements
+            .iter()
+            .filter(|e| e.role == "text field")
+            .count();
+        eprintln!(
+            "Stocks: dismissed Continue={continued}, no_element_tree={}, elements={}, buttons={buttons}, text_fields={fields}; fixture control has both roles",
+            observation.no_element_tree,
+            observation.elements.len()
         );
     });
 }
@@ -1581,9 +1732,21 @@ fn cmd_s_saves_textedit_in_the_background() {
             app.pid,
             CGEvent::location(Some(&CGEvent::new(None).unwrap())),
         );
+        let control_mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        live.act_app(
+            "com.apple.TextEdit",
+            Some(window),
+            Action::Type {
+                text: " control".into(),
+                target: None,
+            },
+            false,
+            true,
+        )
+        .unwrap();
         live.post_cmd_control(app.pid.unwrap(), 1); // S
         assert!(
-            file_changed(&file, mtime),
+            file_changed(&file, control_mtime),
             "positive control: frontmost Cmd+S changes the file mtime"
         );
         assert!(
@@ -1742,6 +1905,41 @@ fn a_canvas_click_uses_the_foreground_and_restores_it() {
             live.act_with_fallback(password, false, true)
                 .unwrap()
                 .foreground_used
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn two_foreground_actions_in_a_row_do_not_count_as_user_activity() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let action = click_target(live.point_inside(&obs, "canvas"));
+        // Positive control: the first click succeeds from the same Finder state.
+        assert!(
+            live.act_with_fallback(action.clone(), false, true)
+                .unwrap()
+                .foreground_used
+        );
+        live.assert_log_contains(&log, r#""type":"canvas_click""#);
+        live.assert_frontmost_and_pointer_unchanged();
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        let outcome = live.act_with_fallback(action, false, true).unwrap();
+        assert!(outcome.foreground_used);
+        let clicks = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .filter(|e| e["type"] == "canvas_click")
+            .count();
+        assert_eq!(clicks, 2, "both canvas clicks reached the fixture");
+        eprintln!(
+            "second foreground click finished in {:?}; no UserActive",
+            started.elapsed()
         );
         live.assert_frontmost_and_pointer_unchanged();
     });
