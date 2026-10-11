@@ -70,13 +70,19 @@ fn record_test_hid_event() {
     });
 }
 
-fn record_gui_failure(message: String) {
+#[derive(Clone, Copy, PartialEq)]
+enum GuiFailureKind {
+    StateMismatch,
+    NativeOperation,
+}
+
+fn record_gui_failure(kind: GuiFailureKind, message: String) {
     ATTEMPT.with(|active| {
         let mut active = active.borrow_mut();
         if let Some(attempt) = active.as_mut() {
             let elapsed = attempt.started.elapsed().as_secs_f64();
             let idle = hid_idle_seconds();
-            if user_input_since_start(elapsed, idle, attempt.last_own_hid) {
+            if failure_is_inconclusive(kind, elapsed, idle, attempt.last_own_hid) {
                 attempt.inconclusive = true;
                 eprintln!("inconclusive: {message}; HID idle={idle:.3}s, elapsed={elapsed:.3}s, starting idle={:.3}s", attempt.idle_at_start);
             } else {
@@ -105,8 +111,9 @@ fn run_live_test(body: impl Fn()) {
             })
         });
         let failures_before = RESTORATION_FAILURES.lock().unwrap().len();
-        // Cleanup runs on both normal return and panic. Only recorded GUI-state
-        // failures can be inconclusive; action assertions always fail normally.
+        // Cleanup runs on both normal return and panic. Only observed state
+        // mismatches can be inconclusive; native errors and action assertions
+        // always fail normally, even if the same attempt has user activity.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&body));
         let attempt = ATTEMPT.with(|active| active.borrow_mut().take().unwrap());
         if let Err(failure) = result {
@@ -321,7 +328,10 @@ impl Live {
                 break;
             }
             if Instant::now() >= deadline {
-                record_gui_failure("Finder did not become frontmost".into());
+                record_gui_failure(
+                    GuiFailureKind::StateMismatch,
+                    "Finder did not become frontmost".into(),
+                );
                 let pid = bundle_pids("com.apple.finder")
                     .into_iter()
                     .next()
@@ -352,15 +362,17 @@ impl Live {
             .frontmostApplication()
             .map(|app| app.processIdentifier());
         if actual != Some(pid) {
-            record_gui_failure(format!(
-                "frontmost app changed: expected {pid}, actual {actual:?}"
-            ));
+            record_gui_failure(
+                GuiFailureKind::StateMismatch,
+                format!("frontmost app changed: expected {pid}, actual {actual:?}"),
+            );
         }
         let now = CGEvent::location(Some(&CGEvent::new(None).unwrap()));
         if (now.x, now.y) != (pointer.x, pointer.y) {
-            record_gui_failure(format!(
-                "pointer changed: expected {pointer:?}, actual {now:?}"
-            ));
+            record_gui_failure(
+                GuiFailureKind::StateMismatch,
+                format!("pointer changed: expected {pointer:?}, actual {now:?}"),
+            );
         }
     }
 
@@ -454,7 +466,10 @@ fn record_restoration(frontmost: Option<i32>, pointer: objc2_core_foundation::CG
         let app = unsafe { AXUIElement::new_application(pid) };
         let timeout = unsafe { app.set_messaging_timeout(2.0) };
         if timeout != AXError::Success {
-            record_gui_failure(format!("AX timeout for PID {pid}: {timeout:?}"));
+            record_gui_failure(
+                GuiFailureKind::NativeOperation,
+                format!("AX timeout for PID {pid}: {timeout:?}"),
+            );
         }
         let restored = unsafe {
             app.set_attribute_value(
@@ -463,7 +478,10 @@ fn record_restoration(frontmost: Option<i32>, pointer: objc2_core_foundation::CG
             )
         };
         if restored != AXError::Success {
-            record_gui_failure(format!("frontmost restore for PID {pid}: {restored:?}"));
+            record_gui_failure(
+                GuiFailureKind::NativeOperation,
+                format!("frontmost restore for PID {pid}: {restored:?}"),
+            );
         } else {
             let deadline = Instant::now() + Duration::from_secs(2);
             while NSWorkspace::sharedWorkspace()
@@ -479,21 +497,34 @@ fn record_restoration(frontmost: Option<i32>, pointer: objc2_core_foundation::CG
                 .map(|app| app.processIdentifier())
                 != Some(pid)
             {
-                record_gui_failure(format!("frontmost PID {pid} was not restored"));
+                record_gui_failure(
+                    GuiFailureKind::StateMismatch,
+                    format!("frontmost PID {pid} was not restored"),
+                );
             }
         }
     }
     let warped = CGWarpMouseCursorPosition(pointer);
     if warped != CGError::Success {
-        record_gui_failure(format!("pointer warp failed: {warped:?}"));
+        record_gui_failure(
+            GuiFailureKind::NativeOperation,
+            format!("pointer warp failed: {warped:?}"),
+        );
     }
-    let actual = CGEvent::new(None).map(|event| CGEvent::location(Some(&event)));
-    if actual.is_none_or(|actual| {
-        (actual.x - pointer.x).abs() > 1.0 || (actual.y - pointer.y).abs() > 1.0
-    }) {
-        record_gui_failure(format!(
-            "pointer not restored: expected {pointer:?}, actual {actual:?}"
-        ));
+    match CGEvent::new(None).map(|event| CGEvent::location(Some(&event))) {
+        Some(actual)
+            if (actual.x - pointer.x).abs() > 1.0 || (actual.y - pointer.y).abs() > 1.0 =>
+        {
+            record_gui_failure(
+                GuiFailureKind::StateMismatch,
+                format!("pointer not restored: expected {pointer:?}, actual {actual:?}"),
+            );
+        }
+        None => record_gui_failure(
+            GuiFailureKind::NativeOperation,
+            "Could not read the restored pointer position".into(),
+        ),
+        Some(_) => {}
     }
 }
 
@@ -961,7 +992,10 @@ end tell",
                 break;
             }
             if Instant::now() >= deadline {
-                record_gui_failure("Finder must actually cover the fixture".into());
+                record_gui_failure(
+                    GuiFailureKind::StateMismatch,
+                    "Finder must actually cover the fixture".into(),
+                );
                 break;
             }
             thread::sleep(Duration::from_millis(20));
@@ -1293,19 +1327,35 @@ fn cmd_a_reaches_the_focused_field() {
 
 // Seconds are measured from the start of an attempt. Task 8's marked HID
 // posting helpers will record the time of their last event on the same clock.
-fn user_input_since_start(elapsed: f64, idle: f64, last_own_hid: Option<f64>) -> bool {
+fn failure_is_inconclusive(
+    kind: GuiFailureKind,
+    elapsed: f64,
+    idle: f64,
+    last_own_hid: Option<f64>,
+) -> bool {
+    if kind == GuiFailureKind::NativeOperation {
+        return false;
+    }
     let last_input = elapsed - idle;
     last_input > 0.0 && last_own_hid.is_none_or(|own| last_input > own)
 }
 
 #[test]
 fn hid_activity_distinguishes_user_interference_from_a_regression() {
-    assert!(user_input_since_start(10.0, 2.0, None));
-    assert!(!user_input_since_start(10.0, 10.0, None));
-    assert!(!user_input_since_start(10.0, 12.0, None));
-    assert!(!user_input_since_start(10.0, 2.0, Some(8.0)));
-    assert!(!user_input_since_start(10.0, 3.0, Some(8.0)));
-    assert!(user_input_since_start(10.0, 1.0, Some(8.0)));
+    let state = GuiFailureKind::StateMismatch;
+    assert!(failure_is_inconclusive(state, 10.0, 2.0, None));
+    assert!(!failure_is_inconclusive(state, 10.0, 10.0, None));
+    assert!(!failure_is_inconclusive(state, 10.0, 12.0, None));
+    assert!(!failure_is_inconclusive(state, 10.0, 2.0, Some(8.0)));
+    assert!(!failure_is_inconclusive(state, 10.0, 3.0, Some(8.0)));
+    assert!(failure_is_inconclusive(state, 10.0, 1.0, Some(8.0)));
+    // Even user input after the attempt started cannot excuse a native error.
+    assert!(!failure_is_inconclusive(
+        GuiFailureKind::NativeOperation,
+        10.0,
+        2.0,
+        None,
+    ));
 }
 
 #[test]
