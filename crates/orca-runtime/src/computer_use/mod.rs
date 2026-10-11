@@ -33,6 +33,8 @@ struct ServiceState {
     latest_window: HashMap<String, u32>,
     turn_cancel: Option<CancelToken>,
     turn_generation: Option<u64>,
+    #[cfg(test)]
+    before_esc_close: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 struct SecureObservation {
@@ -96,7 +98,6 @@ impl ComputerUseService {
     fn event_callback(&self, generation: u64) -> EventCallback {
         // The client owns this callback; a weak state avoids a service/client cycle.
         let state = Arc::downgrade(&self.state);
-        let launcher = Arc::clone(&self.launcher);
         Arc::new(move |event| {
             if event != orca_computer_use::protocol::DriverEvent::Esc {
                 return;
@@ -104,20 +105,30 @@ impl ComputerUseService {
             let Some(state) = state.upgrade() else {
                 return;
             };
-            let cancel = {
+            let (cancel, client) = {
                 let state = state.lock().expect("computer-use service lock poisoned");
                 if state.generation != generation {
                     return;
                 }
-                state.turn_cancel.clone()
+                (
+                    state.turn_cancel.clone(),
+                    state.driver.as_ref().map(|(client, _)| Arc::clone(client)),
+                )
             };
             if let Some(cancel) = cancel {
-                cancel.cancel();
-                Self {
-                    launcher: Arc::clone(&launcher),
-                    state,
+                #[cfg(test)]
+                {
+                    let hook = state.lock().unwrap().before_esc_close.clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
                 }
-                .cancel_in_flight();
+                cancel.cancel();
+                // A replacement may now be current; close only the client
+                // selected alongside this generation's cancellation token.
+                if let Some(client) = client {
+                    client.close();
+                }
             }
         })
     }
@@ -211,6 +222,7 @@ impl ComputerUseService {
     }
 
     /// Disconnects the active call without waiting for a driver reply.
+    #[allow(dead_code)] // Retained for callers cancelling whichever driver is current.
     pub(crate) fn cancel_in_flight(&self) {
         let client = self
             .state
@@ -458,6 +470,58 @@ mod tests {
     #[test]
     fn cancel_in_flight_disconnects_a_slow_call_without_waiting_for_its_reply() {
         assert_interrupt_disconnects_a_slow_call(ComputerUseService::cancel_in_flight);
+    }
+
+    #[test]
+    fn a_stale_esc_callback_cannot_close_the_replacement_driver() {
+        use orca_computer_use::protocol::DriverEvent;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let service = ComputerUseService::new(Arc::new(launcher.clone()));
+        let old_cancel = CancelToken::new();
+        service.start_turn(&old_cancel);
+        let old_generation = service.state.lock().unwrap().generation;
+        let esc = service.event_callback(old_generation);
+        let (validated, validation) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let resumed = Mutex::new(resumed);
+        service.state.lock().unwrap().before_esc_close = Some(Arc::new(move || {
+            validated.send(()).unwrap();
+            resumed
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+        }));
+        let callback = thread::spawn(move || esc(DriverEvent::Esc));
+        validation
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Esc did not reach the validated snapshot");
+
+        // Replace N with N+1 only after the old callback released the lock,
+        // before it cancels its token and closes a driver.
+        service.reset();
+        let new_cancel = CancelToken::new();
+        service.start_turn(&new_cancel);
+        assert_eq!(service.state.lock().unwrap().generation, old_generation + 1);
+        resume.send(()).unwrap();
+        callback.join().unwrap();
+
+        assert!(old_cancel.is_cancelled());
+        assert!(!new_cancel.is_cancelled());
+        let reply = service.call(Request::ListApps, Duration::from_secs(2));
+        assert!(
+            matches!(reply, Ok(Reply::Apps { .. })),
+            "stale Esc closed the replacement driver: {reply:?}"
+        );
+        assert_eq!(
+            launcher.launches(),
+            2,
+            "the replacement must remain usable without another restart"
+        );
+        service.end_turn();
     }
 
     #[test]
