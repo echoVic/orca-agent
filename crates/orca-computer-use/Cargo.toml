@@ -8,6 +8,7 @@ license = "MIT"
 test-utils = []
 
 [dependencies]
+crossbeam-channel = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 image = { workspace = true, features = ["png"] }

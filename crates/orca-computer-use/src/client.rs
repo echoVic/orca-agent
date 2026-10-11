@@ -3,10 +3,12 @@ use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use crossbeam_channel::{SendTimeoutError, Sender};
 
 use crate::protocol::{
     DriverError, DriverEvent, DriverLine, ErrorKind, PROTOCOL_VERSION, Permissions, Reply, Request,
@@ -27,6 +29,9 @@ pub struct LaunchedDriver {
 }
 
 pub type EventCallback = Arc<dyn Fn(DriverEvent) + Send + Sync>;
+// At most eight queued payloads plus the single frame currently being written.
+const OUTBOUND_QUEUE_CAPACITY: usize = 8;
+
 type Pending = Arc<Mutex<HashMap<u64, SyncSender<Result<Reply, DriverError>>>>>;
 
 struct Outbound {
@@ -128,7 +133,7 @@ impl DriverClient {
         let mut input = launched.stdin;
         crate::driver_input::set_nonblocking(&*input)
             .map_err(|error| failed(format!("Could not configure computer-use stdin: {error}")))?;
-        let (sender, receiver) = mpsc::channel::<Outbound>();
+        let (sender, receiver) = crossbeam_channel::bounded::<Outbound>(OUTBOUND_QUEUE_CAPACITY);
         let writer_pending = pending.clone();
         let writer_connected = connected.clone();
         client.writer = Some(
@@ -246,6 +251,11 @@ impl DriverClient {
         }
     }
 
+    #[cfg(test)]
+    fn queued_requests(&self) -> usize {
+        self.outgoing.as_ref().map_or(0, Sender::len)
+    }
+
     pub fn call(&self, request: Request, timeout: Duration) -> Result<Reply, CallError> {
         let started = Instant::now();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -261,15 +271,28 @@ impl DriverClient {
             .outgoing
             .as_ref()
             .ok_or(CallError::Disconnected)?
-            .send(Outbound {
-                id,
-                request,
-                started,
-                timeout,
-            });
-        if queued.is_err() {
-            disconnect(&self.pending, &self.connected);
-            return Err(CallError::Disconnected);
+            .send_timeout(
+                Outbound {
+                    id,
+                    request,
+                    started,
+                    timeout,
+                },
+                timeout.saturating_sub(started.elapsed()),
+            );
+        match queued {
+            Ok(()) => {}
+            Err(SendTimeoutError::Timeout(_)) => {
+                self.pending
+                    .lock()
+                    .expect("pending replies lock poisoned")
+                    .remove(&id);
+                return Err(CallError::TimedOut);
+            }
+            Err(SendTimeoutError::Disconnected(_)) => {
+                disconnect(&self.pending, &self.connected);
+                return Err(CallError::Disconnected);
+            }
         }
         let result = match receiver.recv_timeout(timeout.saturating_sub(started.elapsed())) {
             Ok(result) => result.map_err(CallError::Driver),
@@ -714,66 +737,67 @@ mod tests {
         assert!(outcome.observation.unwrap().elements[2].value.is_none());
     }
 
+    struct TrackedInput {
+        pipe: io::PipeWriter,
+        writing: Arc<AtomicBool>,
+    }
+    impl Write for TrackedInput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > 32 * 1024 {
+                self.writing.store(true, Ordering::SeqCst);
+            }
+            self.pipe.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.pipe.flush()
+        }
+    }
+    #[cfg(unix)]
+    impl std::os::fd::AsFd for TrackedInput {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.pipe.as_fd()
+        }
+    }
+    #[cfg(windows)]
+    impl std::os::windows::io::AsHandle for TrackedInput {
+        fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+            self.pipe.as_handle()
+        }
+    }
+    struct StalledLauncher {
+        input: Mutex<Option<io::PipeReader>>,
+        output: Mutex<Option<crate::serve::LineWriter>>,
+        writing: Arc<AtomicBool>,
+    }
+    impl DriverLauncher for StalledLauncher {
+        fn launch(&self) -> io::Result<LaunchedDriver> {
+            let (input, stdin) = io::pipe()?;
+            let (stdout, output) = io::pipe()?;
+            let output = crate::serve::LineWriter::new(output);
+            output.send(&DriverLine::Response(ResponseLine {
+                id: 1,
+                result: Ok(Reply::Hello {
+                    protocol: PROTOCOL_VERSION,
+                    macos_major: 26,
+                    host_bundle_id: None,
+                    permissions: Permissions::default(),
+                }),
+            }))?;
+            *self.input.lock().unwrap() = Some(input);
+            *self.output.lock().unwrap() = Some(output);
+            Ok(LaunchedDriver {
+                stdin: Box::new(TrackedInput {
+                    pipe: stdin,
+                    writing: self.writing.clone(),
+                }),
+                stdout: Box::new(stdout),
+                child: None,
+            })
+        }
+    }
+
     #[test]
     fn a_full_stdin_pipe_times_out_both_calls_and_drop_closes_the_pipe() {
-        struct TrackedInput {
-            pipe: io::PipeWriter,
-            writing: Arc<AtomicBool>,
-        }
-        impl Write for TrackedInput {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                if bytes.len() > 32 * 1024 {
-                    self.writing.store(true, Ordering::SeqCst);
-                }
-                self.pipe.write(bytes)
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                self.pipe.flush()
-            }
-        }
-        #[cfg(unix)]
-        impl std::os::fd::AsFd for TrackedInput {
-            fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-                self.pipe.as_fd()
-            }
-        }
-        #[cfg(windows)]
-        impl std::os::windows::io::AsHandle for TrackedInput {
-            fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
-                self.pipe.as_handle()
-            }
-        }
-        struct StalledLauncher {
-            input: Mutex<Option<io::PipeReader>>,
-            output: Mutex<Option<crate::serve::LineWriter>>,
-            writing: Arc<AtomicBool>,
-        }
-        impl DriverLauncher for StalledLauncher {
-            fn launch(&self) -> io::Result<LaunchedDriver> {
-                let (input, stdin) = io::pipe()?;
-                let (stdout, output) = io::pipe()?;
-                let output = crate::serve::LineWriter::new(output);
-                output.send(&DriverLine::Response(ResponseLine {
-                    id: 1,
-                    result: Ok(Reply::Hello {
-                        protocol: PROTOCOL_VERSION,
-                        macos_major: 26,
-                        host_bundle_id: None,
-                        permissions: Permissions::default(),
-                    }),
-                }))?;
-                *self.input.lock().unwrap() = Some(input);
-                *self.output.lock().unwrap() = Some(output);
-                Ok(LaunchedDriver {
-                    stdin: Box::new(TrackedInput {
-                        pipe: stdin,
-                        writing: self.writing.clone(),
-                    }),
-                    stdout: Box::new(stdout),
-                    child: None,
-                })
-            }
-        }
         let launcher = StalledLauncher {
             input: Mutex::new(None),
             output: Mutex::new(None),
@@ -845,6 +869,52 @@ mod tests {
         assert!(
             delivered < 4 * 1024 * 1024,
             "Drop allowed the blocked request to finish writing"
+        );
+    }
+
+    #[test]
+    fn stalled_delivery_retains_only_a_bounded_queue_after_many_timeouts() {
+        let launcher = StalledLauncher {
+            input: Mutex::new(None),
+            output: Mutex::new(None),
+            writing: Arc::new(AtomicBool::new(false)),
+        };
+        let (client, _) = DriverClient::start(&launcher, Arc::new(|_| {})).unwrap();
+        thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                client.call(
+                    Request::LaunchApp {
+                        app: "com.apple.TextEdit".into(),
+                        open: vec!["x".repeat(4 * 1024 * 1024)],
+                    },
+                    Duration::from_millis(300),
+                )
+            });
+            wait_until(|| launcher.writing.load(Ordering::SeqCst));
+            assert!(matches!(first.join().unwrap(), Err(CallError::TimedOut)));
+        });
+        let timeout = Duration::from_millis(20);
+        let margin = Duration::from_millis(200);
+        for _ in 0..50 {
+            let request = Request::LaunchApp {
+                app: "com.apple.TextEdit".into(),
+                open: vec!["x".repeat(128 * 1024)],
+            };
+            let started = Instant::now();
+            assert!(matches!(
+                client.call(request, timeout),
+                Err(CallError::TimedOut)
+            ));
+            assert!(
+                started.elapsed() <= timeout + margin,
+                "queue admission exceeded the call deadline and margin"
+            );
+        }
+        let retained = client.queued_requests();
+        assert!(client.pending.lock().unwrap().is_empty());
+        assert!(
+            retained <= OUTBOUND_QUEUE_CAPACITY,
+            "stalled delivery retained {retained} queued payloads after their callers timed out; bound is {OUTBOUND_QUEUE_CAPACITY}"
         );
     }
 
