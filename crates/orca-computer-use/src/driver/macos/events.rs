@@ -24,28 +24,70 @@ fn unicode_chunk_end(units: &[u16], start: usize) -> usize {
     end
 }
 
-pub(super) fn post_unicode_text(pid: i32, text: &str) -> Result<(), DriverError> {
-    let source = CGEventSource::new(CGEventSourceStateID::Private)
-        .ok_or_else(|| error(ErrorKind::Failed, "Could not create keyboard event source"))?;
+/// Both PID-directed and HID delivery use this splitter and recipient backstop.
+fn deliver_text(
+    text: &str,
+    mut post: impl FnMut(&[u16]) -> Result<(), DriverError>,
+    mut verify_recipient: impl FnMut() -> Result<(), DriverError>,
+) -> Result<(), DriverError> {
+    crate::type_text::validate_controls(text).map_err(|m| error(ErrorKind::Failed, m))?;
+    let text = text.replace("\r\n", "\n");
     let units: Vec<u16> = text.encode_utf16().collect();
     let mut start = 0;
+    let mut typed = 0;
     while start < units.len() {
         let end = unicode_chunk_end(&units, start);
-        for down in [true, false] {
-            let event = CGEvent::new_keyboard_event(Some(&source), 0, down)
-                .ok_or_else(|| error(ErrorKind::Failed, "Could not create keyboard event"))?;
-            unsafe {
-                CGEvent::keyboard_set_unicode_string(
-                    Some(&event),
-                    (end - start) as u64,
-                    units[start..end].as_ptr(),
+        let chunk = &units[start..end];
+        post(chunk).map_err(|failure| error(ErrorKind::Failed, format!(
+            "Typing stopped after {typed} characters (the current chunk may be incomplete): {}", failure.message
+        )))?;
+        typed += String::from_utf16_lossy(chunk).chars().count();
+        if chunk.iter().any(|unit| matches!(unit, 9 | 10 | 13)) {
+            verify_recipient().map_err(|failure| {
+                error(
+                    ErrorKind::Failed,
+                    format!(
+                        "Typing stopped after {typed} characters: {}",
+                        failure.message
+                    ),
                 )
-            };
-            CGEvent::post_to_pid(pid, Some(&event));
+            })?;
         }
         start = end;
     }
     Ok(())
+}
+
+pub(super) fn post_unicode_text(
+    pid: i32,
+    text: &str,
+    verify_recipient: impl FnMut() -> Result<(), DriverError>,
+) -> Result<(), DriverError> {
+    let source = CGEventSource::new(CGEventSourceStateID::Private)
+        .ok_or_else(|| error(ErrorKind::Failed, "Could not create keyboard event source"))?;
+    deliver_text(
+        text,
+        |units| {
+            for down in [true, false] {
+                let event = CGEvent::new_keyboard_event(Some(&source), 0, down)
+                    .ok_or_else(|| error(ErrorKind::Failed, "Could not create keyboard event"))?;
+                unsafe {
+                    CGEvent::keyboard_set_unicode_string(
+                        Some(&event),
+                        units.len() as u64,
+                        units.as_ptr(),
+                    )
+                };
+                CGEvent::post_to_pid(pid, Some(&event));
+            }
+            // Control commands must be consumed before reading focus again.
+            if units.iter().any(|unit| matches!(unit, 9 | 10 | 13)) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(())
+        },
+        verify_recipient,
+    )
 }
 
 pub(super) fn post_key(pid: i32, stroke: KeyStroke) -> Result<(), DriverError> {
@@ -302,29 +344,33 @@ impl<'a> HidEvents<'a> {
         Ok(())
     }
 
-    pub(super) fn text(&mut self, text: &str) -> Result<(), DriverError> {
-        let units: Vec<u16> = text.encode_utf16().collect();
-        let mut start = 0;
-        while start < units.len() {
-            let end = unicode_chunk_end(&units, start);
-            let down = self.keyboard(0, true, Modifiers::default())?;
-            let up = self.keyboard(0, false, Modifiers::default())?;
-            for event in [&down, &up] {
-                unsafe {
-                    CGEvent::keyboard_set_unicode_string(
-                        Some(event),
-                        (end - start) as u64,
-                        units[start..end].as_ptr(),
-                    )
-                };
-            }
-            self.releases.push(up.clone());
-            self.post(&down)?;
-            self.post(&up)?;
-            self.releases.pop();
-            start = end;
-        }
-        Ok(())
+    pub(super) fn text(
+        &mut self,
+        text: &str,
+        verify_recipient: impl FnMut() -> Result<(), DriverError>,
+    ) -> Result<(), DriverError> {
+        deliver_text(
+            text,
+            |units| {
+                let down = self.keyboard(0, true, Modifiers::default())?;
+                let up = self.keyboard(0, false, Modifiers::default())?;
+                for event in [&down, &up] {
+                    unsafe {
+                        CGEvent::keyboard_set_unicode_string(
+                            Some(event),
+                            units.len() as u64,
+                            units.as_ptr(),
+                        )
+                    };
+                }
+                self.releases.push(up.clone());
+                self.post(&down)?;
+                self.post(&up)?;
+                self.releases.pop();
+                Ok(())
+            },
+            verify_recipient,
+        )
     }
 
     pub(super) fn release(&mut self) {
@@ -463,19 +509,60 @@ fn an_expired_foreground_deadline_refuses_input_before_native_delivery() {
 mod unicode_chunk_tests {
     use super::*;
     fn chunks(text: &str) -> Vec<String> {
-        let units: Vec<_> = text.encode_utf16().collect();
-        let mut start = 0;
         let mut result = vec![];
-        while start < units.len() {
-            let end = unicode_chunk_end(&units, start);
-            result.push(
-                String::from_utf16(&units[start..end])
-                    .expect("chunks must preserve surrogate pairs"),
-            );
-            start = end;
-        }
+        deliver_text(
+            text,
+            |units| {
+                result.push(String::from_utf16(units).expect("chunks preserve surrogate pairs"));
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
         result
     }
+    #[test]
+    fn unicode_chunks_treat_crlf_as_one_newline_for_background_and_hid() {
+        assert_eq!(chunks("a\r\nb\t🦀"), ["a", "\n", "b", "\t", "🦀"]);
+    }
+    #[test]
+    fn a_control_chunk_rechecks_focus_and_never_posts_the_remaining_text() {
+        let mut posted = String::new();
+        let failure = deliver_text(
+            "user\tpass",
+            |units| {
+                posted.push_str(&String::from_utf16(units).unwrap());
+                Ok(())
+            },
+            || Err(error(ErrorKind::Failed, "recipient changed")),
+        )
+        .unwrap_err();
+        assert_eq!(posted, "user\t");
+        assert!(failure.message.contains("5 characters"));
+        assert_eq!(
+            failure.kind,
+            ErrorKind::Failed,
+            "a partial type must never replay via fallback"
+        );
+    }
+
+    #[test]
+    fn forbidden_controls_refuse_the_whole_text_before_any_chunk() {
+        let mut posted = false;
+        assert!(
+            deliver_text(
+                "prefix\u{7}suffix",
+                |_| {
+                    posted = true;
+                    Ok(())
+                },
+                || Ok(())
+            )
+            .is_err()
+        );
+        assert!(!posted);
+    }
+
     #[test]
     fn unicode_chunks_isolate_controls_and_keep_surrogate_pairs() {
         assert_eq!(

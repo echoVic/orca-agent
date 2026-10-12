@@ -17,3 +17,5 @@ pub mod serve;
 pub mod session_lock;
 
 mod timing;
+
+mod type_text;

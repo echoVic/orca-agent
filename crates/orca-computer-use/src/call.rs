@@ -100,10 +100,14 @@ impl ComputerCall {
                     modifiers,
                 }
             }
-            "type" => Action::Type {
-                text: required_string(arguments, "text", name)?.to_owned(),
-                target: optional_target(arguments, name)?,
-            },
+            "type" => {
+                let text = required_string(arguments, "text", name)?;
+                crate::type_text::validate_controls(text)?;
+                Action::Type {
+                    text: text.to_owned(),
+                    target: optional_target(arguments, name)?,
+                }
+            }
             "key" => {
                 let keys = string_list(arguments, "keys", name, true)?;
                 keys::parse_combo(&keys)?;
@@ -302,6 +306,20 @@ fn optional_target(arguments: &Value, action: &str) -> Result<Option<Target>, St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn type_refuses_non_text_controls_before_delivery() {
+        for control in (0u8..=31)
+            .filter(|c| !matches!(c, 9 | 10 | 13))
+            .chain([127])
+        {
+            let result = super::ComputerCall::parse(&serde_json::json!({
+                "action":"type", "app":"x", "text":format!("before{}after", char::from(control))
+            }));
+            assert!(result.is_err(), "control U+{control:04X} must point to key");
+            assert!(result.unwrap_err().contains("key"));
+        }
+    }
+
     use super::*;
     use serde_json::json;
 

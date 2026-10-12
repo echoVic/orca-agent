@@ -4923,3 +4923,83 @@ fn absent_subrole_is_ordinary(code: i32) {
         assert_eq!(live.fixture_control_value("Name"), "a🦀cx");
     });
 }
+
+#[test]
+#[ignore]
+fn literal_type_refuses_single_line_controls_and_inserts_tabs_in_text_areas() {
+    run_live_test(|| {
+        use objc2_core_foundation::CFString;
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, _) = live.launch_fixture();
+        live.make_finder_frontmost();
+        let observation = live.observe("dev.orca.cu-fixture", None);
+        let name = element_named(&observation, "Name");
+        for text in ["user\tpass", "user\npass", "user\rpass"] {
+            let failure = live
+                .act(
+                    Action::Type {
+                        text: text.into(),
+                        target: Some(name),
+                    },
+                    false,
+                )
+                .unwrap_err();
+            assert_eq!(failure.kind, ErrorKind::Failed);
+            assert!(failure.message.contains("[\"tab\"]"));
+            assert!(failure.message.contains("[\"return\"]"));
+            assert_eq!(live.fixture_control_value("Name"), "");
+            assert_eq!(
+                password_length(pid),
+                0,
+                "no unapproved text may reach Password"
+            );
+        }
+        // The same single-line recipient accepts ordinary text without approval.
+        live.act(
+            Action::Type {
+                text: "user".into(),
+                target: Some(name),
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(live.fixture_control_value("Name"), "user");
+        assert_eq!(password_length(pid), 0);
+        let window = fixture_window(pid);
+        let editor = fixture_ax_role(&window, "AXTextArea").unwrap();
+        assert_eq!(
+            unsafe {
+                editor.set_attribute_value(
+                    &CFString::from_str("AXValue"),
+                    CFString::from_str("").as_ref(),
+                )
+            },
+            objc2_application_services::AXError::Success
+        );
+        let observation = live.observe("dev.orca.cu-fixture", None);
+        let area = observation
+            .elements
+            .iter()
+            .find(|e| e.role == "text area")
+            .unwrap()
+            .id;
+        let outcome = live
+            .act(
+                Action::Type {
+                    text: "user\tpass".into(),
+                    target: Some(Target::Element { element: area }),
+                },
+                false,
+            )
+            .unwrap();
+        assert!(!outcome.foreground_used);
+        assert_eq!(
+            native_ax_string(&editor, "AXValue").as_deref(),
+            Some("user\tpass")
+        );
+        assert_eq!(password_length(pid), 0);
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}

@@ -198,6 +198,12 @@ pub(super) fn run(
     } else {
         None
     };
+    if let Action::Type { text, .. } = &params.action {
+        crate::type_text::validate_controls(text).map_err(|m| error(ErrorKind::Failed, m))?;
+        if let Some(element) = target_element.as_ref() {
+            actions::check_type_recipient(element, text)?;
+        }
+    }
     // A known secure target requires approval before even the focus click.
     if enters_text
         && !params.secure_approved
@@ -310,7 +316,10 @@ pub(super) fn run(
                             params.secure_approved,
                         )?;
                     }
-                    hid.text(text)?;
+                    actions::check_type_recipient(&focused, text)?;
+                    hid.text(text, || {
+                        actions::verify_type_recipient(application, &focused, true)
+                    })?;
                 }
                 Action::Key { keys, .. } => {
                     if let Some(point) = location {

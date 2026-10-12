@@ -169,6 +169,7 @@ impl MacDriver {
                 }
                 Action::Type { text, target } => {
                     let element = focus(table, &application, *target)?;
+                    check_type_recipient(&element, text)?;
                     check_background_keyboard(pid, &application, &element)?;
                     check_secure_approval(&application, Some(&element), params.secure_approved)?;
                     if target.is_some() {
@@ -182,7 +183,13 @@ impl MacDriver {
                             params.secure_approved,
                         )?;
                     }
-                    events::post_unicode_text(pid, text)?;
+                    let recipient = application
+                        .attribute_element("AXFocusedUIElement")?
+                        .ok_or_else(|| foreground("The app has no focused element"))?;
+                    check_type_recipient(&recipient, text)?;
+                    events::post_unicode_text(pid, text, || {
+                        verify_type_recipient(&application, &recipient, false)
+                    })?;
                 }
                 Action::Key { keys, target } => {
                     let stroke =
@@ -277,6 +284,36 @@ fn window_gone(application: &AxElement, window: &AxElement, pid: i32) -> bool {
     application
         .elements("AXWindows")
         .is_ok_and(|windows| !windows.iter().any(|candidate| candidate.0 == window.0))
+}
+
+pub(super) fn check_type_recipient(element: &AxElement, text: &str) -> Result<(), DriverError> {
+    let role = element.attribute_string("AXRole")?;
+    crate::type_text::validate_recipient(text, role.as_deref())
+        .map_err(|message| error(ErrorKind::Failed, message))
+}
+
+pub(super) fn verify_type_recipient(
+    application: &AxElement,
+    recipient: &AxElement,
+    foreground: bool,
+) -> Result<(), DriverError> {
+    let focused = application.attribute_element("AXFocusedUIElement")?;
+    if focused.as_ref().is_none_or(|focus| focus.0 != recipient.0) {
+        return Err(error(
+            ErrorKind::Failed,
+            "The keyboard recipient changed; observe again",
+        ));
+    }
+    if foreground {
+        let focused = AxElement::system_wide()?.attribute_element("AXFocusedUIElement")?;
+        if focused.as_ref().is_none_or(|focus| focus.0 != recipient.0) {
+            return Err(error(
+                ErrorKind::Failed,
+                "The system keyboard recipient changed; observe again",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Check both the requested target and the actual recipient, after focus/click.
