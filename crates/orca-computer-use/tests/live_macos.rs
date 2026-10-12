@@ -1405,8 +1405,9 @@ fn typing_goes_into_the_focused_field_in_the_background() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
-fn current_keyboard_input_source_id() -> Option<String> {
-    use objc2_core_foundation::{CFRetained, CFString, CFType};
+/// The current keyboard input source's ID and the languages it declares.
+fn current_keyboard_input_source() -> Option<(String, Vec<String>)> {
+    use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType};
     #[link(name = "Carbon", kind = "framework")]
     unsafe extern "C" {
         fn TISCopyCurrentKeyboardInputSource() -> *mut CFType;
@@ -1415,40 +1416,49 @@ fn current_keyboard_input_source_id() -> Option<String> {
             key: *const CFString,
         ) -> *mut std::ffi::c_void;
         static kTISPropertyInputSourceID: *const CFString;
+        static kTISPropertyInputSourceLanguages: *const CFString;
     }
-    // Copy owns the source; its property follows the borrowed Get rule.
+    // Copy owns the source; its properties follow the borrowed Get rule.
     let source = unsafe { std::ptr::NonNull::new(TISCopyCurrentKeyboardInputSource())? };
     let source = unsafe { CFRetained::from_raw(source) };
-    let property = unsafe { TISGetInputSourceProperty(&*source, kTISPropertyInputSourceID) };
-    if property.is_null() {
-        return None;
-    }
-    let property = unsafe { &*property.cast::<CFType>() };
-    Some(property.downcast_ref::<CFString>()?.to_string())
+    let property = |key| {
+        let value = unsafe { TISGetInputSourceProperty(&*source, key) };
+        (!value.is_null()).then(|| unsafe { &*value.cast::<CFType>() })
+    };
+    let id = property(unsafe { kTISPropertyInputSourceID })?
+        .downcast_ref::<CFString>()?
+        .to_string();
+    let languages = property(unsafe { kTISPropertyInputSourceLanguages })
+        .and_then(|value| value.downcast_ref::<CFArray>())
+        .map(|array| {
+            (0..array.len())
+                .filter_map(|i| {
+                    let value = unsafe { &*array.value_at_index(i as isize).cast::<CFType>() };
+                    value.downcast_ref::<CFString>().map(ToString::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((id, languages))
 }
 
 #[test]
 #[ignore]
 fn typing_with_a_chinese_input_method_enters_the_text_exactly() {
     run_live_test(|| {
-        let source = current_keyboard_input_source_id();
-        eprintln!(
-            "current keyboard input source ID: {}",
-            source.as_deref().unwrap_or("<unavailable>")
-        );
-        let chinese = source.as_deref().is_some_and(|id| {
-            ["com.apple.inputmethod.SCIM", "com.apple.inputmethod.TCIM"]
-                .iter()
-                .any(|prefix| {
-                    id == *prefix
-                        || id
-                            .strip_prefix(prefix)
-                            .is_some_and(|suffix| suffix.starts_with('.'))
-                })
+        let source = current_keyboard_input_source();
+        eprintln!("current keyboard input source: {source:?}");
+        // An input method is Chinese when its primary language is (Apple's
+        // SCIM/TCIM and third-party ones such as WeType or Sogou alike).
+        let chinese = source.as_ref().is_some_and(|(id, languages)| {
+            languages
+                .first()
+                .is_some_and(|language| language == "zh" || language.starts_with("zh-"))
+                && !id.starts_with("com.apple.keylayout.")
         });
         if !chinese {
             eprintln!(
-                "skipped: requires the user to select a Chinese input method under com.apple.inputmethod.SCIM or com.apple.inputmethod.TCIM; the test does not switch input sources"
+                "skipped: requires the user to select a Chinese input method; the test does not switch input sources"
             );
             return;
         }
