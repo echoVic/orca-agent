@@ -158,11 +158,17 @@ pub(super) fn run(
     table: &ElementTable,
     params: &ActParams,
     aborted: &AtomicBool,
+    action_deadline: Instant,
 ) -> Result<String, DriverError> {
-    let action_deadline = Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT;
-    let deadline = Instant::now() + crate::timing::IDLE_WAIT_LIMIT;
+    let deadline = (Instant::now() + crate::timing::IDLE_WAIT_LIMIT).min(action_deadline);
     loop {
         check_abort(aborted)?;
+        if Instant::now() >= action_deadline {
+            return Err(error(
+                ErrorKind::Failed,
+                "The foreground action timed out; observe again",
+            ));
+        }
         if CGEventSource::seconds_since_last_event_type(
             CGEventSourceStateID::HIDSystemState,
             CGEventType(u32::MAX),

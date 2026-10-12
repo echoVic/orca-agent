@@ -45,12 +45,9 @@ enum ModalStep<T> {
 fn modal_ancestry<T: Clone + PartialEq>(
     current: T,
     read: impl FnMut(T) -> Result<ModalStep<T>, DriverError>,
+    action_deadline: std::time::Instant,
 ) -> Result<bool, DriverError> {
-    modal_ancestry_until(
-        current,
-        read,
-        std::time::Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT,
-    )
+    modal_ancestry_until(current, read, action_deadline)
 }
 
 fn modal_ancestry_until<T: Clone + PartialEq>(
@@ -127,13 +124,16 @@ fn inspect_modal_window(window: AxElement) -> Result<bool, DriverError> {
     Ok(window.modal_attribute_bool("AXModal")?.unwrap_or(false))
 }
 
-fn in_modal_sheet(element: &AxElement) -> Result<bool, DriverError> {
+fn in_modal_sheet(
+    element: &AxElement,
+    action_deadline: std::time::Instant,
+) -> Result<bool, DriverError> {
     modal_for_recipient(
         || element.modal_attribute_element("AXTopLevelUIElement"),
         inspect_top_level,
         || element.modal_attribute_element("AXWindow"),
         inspect_modal_window,
-        || modal_parent_walk(element),
+        || modal_parent_walk(element, action_deadline),
     )
 }
 
@@ -150,22 +150,29 @@ fn modal_root(
     }
 }
 
-fn modal_parent_walk(element: &AxElement) -> Result<bool, DriverError> {
-    modal_ancestry(element.clone(), |element| {
-        let Some(role) = element.modal_attribute_string("AXRole")? else {
-            return Ok(ModalStep::Unreadable);
-        };
-        if let Some(modal) = modal_root(
-            &role,
-            || inspect_modal_window(element.clone()),
-            || Ok(element.modal_attribute_bool("AXModal")?.unwrap_or(false)),
-        )? {
-            return Ok(ModalStep::Root(modal));
-        }
-        Ok(element
-            .modal_attribute_element("AXParent")?
-            .map_or(ModalStep::Unreadable, ModalStep::Parent))
-    })
+fn modal_parent_walk(
+    element: &AxElement,
+    action_deadline: std::time::Instant,
+) -> Result<bool, DriverError> {
+    modal_ancestry(
+        element.clone(),
+        |element| {
+            let Some(role) = element.modal_attribute_string("AXRole")? else {
+                return Ok(ModalStep::Unreadable);
+            };
+            if let Some(modal) = modal_root(
+                &role,
+                || inspect_modal_window(element.clone()),
+                || Ok(element.modal_attribute_bool("AXModal")?.unwrap_or(false)),
+            )? {
+                return Ok(ModalStep::Root(modal));
+            }
+            Ok(element
+                .modal_attribute_element("AXParent")?
+                .map_or(ModalStep::Unreadable, ModalStep::Parent))
+        },
+        action_deadline,
+    )
 }
 
 fn check_recipient_security(
@@ -187,6 +194,7 @@ fn check_background_keyboard(
     pid: i32,
     application: &AxElement,
     target: &AxElement,
+    action_deadline: std::time::Instant,
 ) -> Result<(), DriverError> {
     let focused = application
         .attribute_element("AXFocusedUIElement")?
@@ -195,11 +203,17 @@ fn check_background_keyboard(
     let focused_pid = focused.pid()?;
     // Reject foreign handles before asking their ancestry any more questions.
     check_keyboard_recipient(pid, target_pid, focused_pid, false)?;
-    check_keyboard_recipient(pid, target_pid, focused_pid, in_modal_sheet(&focused)?)
+    check_keyboard_recipient(
+        pid,
+        target_pid,
+        focused_pid,
+        in_modal_sheet(&focused, action_deadline)?,
+    )
 }
 
 impl MacDriver {
     pub(super) fn act(&mut self, params: ActParams) -> Result<ActOutcome, DriverError> {
+        let action_deadline = std::time::Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT;
         capture::check_unlocked()?;
         let app = apps::resolve_approved(&params.app)?;
         let pid = app
@@ -299,7 +313,7 @@ impl MacDriver {
                 Action::Type { text, target } => {
                     let element = focus(table, &application, *target)?;
                     check_type_recipient(&element, text)?;
-                    check_background_keyboard(pid, &application, &element)?;
+                    check_background_keyboard(pid, &application, &element, action_deadline)?;
                     check_secure_approval(&application, Some(&element), params.secure_approved)?;
                     if target.is_some() {
                         let focused = application
@@ -326,7 +340,7 @@ impl MacDriver {
                     // On the real Mac, process-directed Cmd+A/Cmd+S events
                     // reached the app but did not dispatch its menu shortcut.
                     let element = focus(table, &application, *target)?;
-                    check_background_keyboard(pid, &application, &element)?;
+                    check_background_keyboard(pid, &application, &element, action_deadline)?;
                     if stroke.enters_text() {
                         check_secure_approval(
                             &application,
@@ -367,6 +381,7 @@ impl MacDriver {
                 table,
                 &params,
                 &self.aborted,
+                action_deadline,
             )?);
             outcome.foreground_used = true;
         }
@@ -684,6 +699,41 @@ fn scroll(
 mod tests {
     use super::*;
     use crate::geometry::CaptureGeometry;
+
+    // Default test budget only; production must receive the existing action deadline.
+    fn modal_ancestry<T: Clone + PartialEq>(
+        current: T,
+        read: impl FnMut(T) -> Result<ModalStep<T>, DriverError>,
+    ) -> Result<bool, DriverError> {
+        super::modal_ancestry(
+            current,
+            read,
+            std::time::Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT,
+        )
+    }
+
+    #[test]
+    fn part5_parent_fallback_cannot_refresh_an_expired_action_budget() {
+        let mut read = false;
+        let result = super::modal_ancestry(
+            0,
+            |_| {
+                read = true;
+                Ok(ModalStep::Root(false))
+            },
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        assert_eq!(result.unwrap_err().kind, ErrorKind::Failed);
+        assert!(!read);
+        assert!(
+            !super::modal_ancestry(
+                0,
+                |_| Ok(ModalStep::Root(false)),
+                std::time::Instant::now() + std::time::Duration::from_secs(1)
+            )
+            .unwrap()
+        );
+    }
 
     #[test]
     fn part5_sheet_top_level_prevents_background_delivery_through_its_attachment_window() {
