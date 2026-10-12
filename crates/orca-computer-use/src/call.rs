@@ -167,7 +167,7 @@ impl ComputerCall {
     }
 }
 
-fn validate_action_fields(arguments: &Value, action: &str) -> Result<(), String> {
+fn action_fields(action: &str) -> Result<&'static [&'static str], String> {
     let allowed: &[&str] = match action {
         "list_apps" => &["action"],
         "launch_app" => &["action", "app", "open"],
@@ -195,6 +195,22 @@ fn validate_action_fields(arguments: &Value, action: &str) -> Result<(), String>
         ],
         _ => return Err(format!("unknown computer action {action:?}")),
     };
+    Ok(allowed)
+}
+
+#[cfg(feature = "test-utils")]
+pub fn action_fields_for_test(action: &str) -> Option<&'static [&'static str]> {
+    action_fields(action).ok()
+}
+
+fn validate_action_fields(arguments: &Value, action: &str) -> Result<(), String> {
+    let allowed = action_fields(action)?;
+    if action == "key" && arguments.get("modifiers").is_some() {
+        return Err(
+            "`key` takes its modifiers inside `keys`, for example `[\"cmd\",\"shift\",\"t\"]`"
+                .into(),
+        );
+    }
     for field in arguments
         .as_object()
         .expect("arguments were checked")
@@ -202,12 +218,6 @@ fn validate_action_fields(arguments: &Value, action: &str) -> Result<(), String>
     {
         if allowed.contains(&field.as_str()) {
             continue;
-        }
-        if action == "key" && field == "modifiers" {
-            return Err(
-                "`key` takes its modifiers inside `keys`, for example [\"cmd\",\"shift\",\"t\"]"
-                    .into(),
-            );
         }
         return Err(format!(
             "{action} does not accept {field:?}; remove it. Allowed fields: {}",
@@ -401,13 +411,28 @@ mod tests {
 
     #[test]
     fn key_modifiers_explain_the_correct_keys_array() {
-        assert_eq!(ComputerCall::parse(&json!({"action":"key", "app":"TextEdit", "keys":["t"], "modifiers":["shift","cmd"]})).unwrap_err(), "`key` takes its modifiers inside `keys`, for example [\"cmd\",\"shift\",\"t\"]");
+        assert_eq!(ComputerCall::parse(&json!({"action":"key", "app":"TextEdit", "keys":["t"], "modifiers":["shift","cmd"]})).unwrap_err(), "`key` takes its modifiers inside `keys`, for example `[\"cmd\",\"shift\",\"t\"]`");
         assert!(
             ComputerCall::parse(
                 &json!({"action":"key", "app":"TextEdit", "keys":["cmd","shift","t"]})
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn key_modifier_hint_wins_over_unrelated_fields_in_every_order() {
+        for raw in [
+            r#"{"action":"key","app":"x","button":"left","keys":["t"],"modifiers":["cmd","shift"]}"#,
+            r#"{"modifiers":["cmd","shift"],"keys":["t"],"button":"left","app":"x","action":"key"}"#,
+            r#"{"action":"key","amount":2,"keys":["t"],"modifiers":null}"#,
+        ] {
+            let arguments: Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                ComputerCall::parse(&arguments).unwrap_err(),
+                "`key` takes its modifiers inside `keys`, for example `[\"cmd\",\"shift\",\"t\"]`"
+            );
+        }
     }
 
     #[test]

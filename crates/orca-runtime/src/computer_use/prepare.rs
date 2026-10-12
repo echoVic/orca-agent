@@ -667,6 +667,54 @@ mod tests {
         );
     }
 
+    fn check_computer_schema_fields(schema: &serde_json::Value) -> Result<(), String> {
+        use orca_computer_use::call::action_fields_for_test;
+        use std::collections::BTreeSet;
+        let properties: BTreeSet<_> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut actual = BTreeSet::new();
+        for action in schema["properties"]["action"]["enum"].as_array().unwrap() {
+            let action = action.as_str().unwrap();
+            let fields = action_fields_for_test(action)
+                .ok_or_else(|| format!("schema action {action} has no parser allowlist"))?;
+            for field in fields {
+                actual.insert(*field);
+            }
+        }
+        if actual != properties {
+            return Err(format!(
+                "computer action fields {actual:?} differ from tool schema properties {properties:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn computer_action_field_allowlists_match_the_live_tool_schema_properties() {
+        let registry = orca_tools::registry::default_tool_registry();
+        let schema = &registry.get("computer").unwrap().spec().input_schema;
+        check_computer_schema_fields(schema).unwrap();
+        // Future schema drift must fail this same contract, never quietly reject a new field.
+        let mut changed = schema.clone();
+        changed["properties"]["future_field"] = serde_json::json!({"type":"string"});
+        let error = check_computer_schema_fields(&changed).unwrap_err();
+        assert!(error.contains("future_field"));
+        let mut changed_action = schema.clone();
+        changed_action["properties"]["action"]["enum"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("future_action"));
+        assert!(
+            check_computer_schema_fields(&changed_action)
+                .unwrap_err()
+                .contains("future_action")
+        );
+    }
+
     #[test]
     fn a_key_modifier_field_is_rejected_before_driver_launch() {
         let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
@@ -679,7 +727,7 @@ mod tests {
             prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap_err();
         assert_eq!(
             error,
-            "`key` takes its modifiers inside `keys`, for example [\"cmd\",\"shift\",\"t\"]"
+            "`key` takes its modifiers inside `keys`, for example `[\"cmd\",\"shift\",\"t\"]`"
         );
         assert_eq!(launcher.launches(), 0);
     }
