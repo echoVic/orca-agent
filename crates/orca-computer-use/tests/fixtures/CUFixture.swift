@@ -25,7 +25,7 @@ final class Canvas: NSView {
     override func rightMouseDown(with event: NSEvent) {
         log(["type": "canvas_right_click"])
     }
-    override func draw(_ dirtyRect: NSRect) { NSColor.systemTeal.setFill(); dirtyRect.fill() }
+    override func draw(_ dirtyRect: NSRect) { NSColor.systemTeal.setFill(); dirtyRect.intersection(bounds).fill() }
 }
 
 final class Controller: NSObject, NSTextFieldDelegate {
