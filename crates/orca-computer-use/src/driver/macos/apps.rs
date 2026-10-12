@@ -143,14 +143,24 @@ pub(super) fn resolve_approved(bundle_id: &str) -> Result<AppInfo, DriverError> 
 }
 
 fn resolve_approved_from_apps(bundle_id: &str, apps: Vec<AppInfo>) -> Result<AppInfo, DriverError> {
-    apps.into_iter()
-        .find(|app| app.bundle_id == bundle_id)
-        .ok_or_else(|| {
-            error(
-                ErrorKind::AppNotFound,
-                format!("App not found: {bundle_id}"),
-            )
-        })
+    let candidates: Vec<_> = apps
+        .iter()
+        .filter(|app| app.bundle_id == bundle_id)
+        .collect();
+    select_instance(
+        bundle_id,
+        candidates,
+        NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .map(|app| app.processIdentifier()),
+    )?
+    .cloned()
+    .ok_or_else(|| {
+        error(
+            ErrorKind::AppNotFound,
+            format!("App not found: {bundle_id}"),
+        )
+    })
 }
 
 fn looks_like_bundle_id(name: &str) -> bool {
@@ -300,15 +310,39 @@ fn select_identity<'a>(
     } else {
         exact
     };
-    match candidates.as_slice() {
-        [] => Ok(None),
-        [app] => Ok(Some(*app)),
-        _ => Err(DriverError {
+    select_instance(
+        name,
+        candidates,
+        NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .map(|app| app.processIdentifier()),
+    )
+}
+
+fn select_instance<'a>(
+    name: &str,
+    candidates: Vec<&'a AppInfo>,
+    frontmost: Option<i32>,
+) -> Result<Option<&'a AppInfo>, DriverError> {
+    let Some(first) = candidates.first().copied() else {
+        return Ok(None);
+    };
+    if candidates
+        .iter()
+        .any(|app| app.bundle_id != first.bundle_id)
+    {
+        return Err(DriverError {
             kind: ErrorKind::AppAmbiguous,
-            message: format!("More than one app matches bundle ID {name}; use its exact bundle ID"),
+            message: format!("More than one app matches {name}; use its exact bundle ID"),
             candidates: candidates.into_iter().cloned().collect(),
-        }),
+        });
     }
+    Ok(Some(
+        candidates
+            .into_iter()
+            .find(|app| app.pid.is_some() && app.pid == frontmost)
+            .unwrap_or(first),
+    ))
 }
 
 fn installed_bundles(roots: &[std::path::PathBuf]) -> Vec<(AppInfo, Retained<NSBundle>)> {
@@ -437,16 +471,14 @@ fn resolve_with_apps(
             candidates.push(app);
         }
     }
-    match candidates.as_slice() {
-        [app] => return Ok(app.clone()),
-        [] => {}
-        _ => {
-            return Err(DriverError {
-                kind: ErrorKind::AppAmbiguous,
-                message: format!("More than one app is named {name}; use a bundle ID"),
-                candidates,
-            });
-        }
+    if let Some(app) = select_instance(
+        name,
+        candidates.iter().collect(),
+        NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .map(|app| app.processIdentifier()),
+    )? {
+        return Ok(app.clone());
     }
     if allow_not_running
         && let Some(bundle) = find_installed_bundle(name, roots)?
@@ -644,6 +676,65 @@ mod tests {
             category: None,
             windows: vec![],
         }
+    }
+
+    #[test]
+    fn part5_same_id_instances_choose_frontmost_or_first() {
+        let first = running_fixture("dev.orca.multi", "Multi", 42);
+        let second = running_fixture("dev.orca.multi", "Multi", 43);
+        assert_eq!(
+            select_instance("dev.orca.multi", vec![&first, &second], Some(43)).unwrap(),
+            Some(&second)
+        );
+        assert_eq!(
+            select_instance("dev.orca.multi", vec![&first, &second], Some(99)).unwrap(),
+            Some(&first)
+        );
+        assert_eq!(
+            select_instance("dev.orca.multi", vec![&first, &second], None).unwrap(),
+            Some(&first)
+        );
+        let variant = running_fixture("DEV.ORCA.MULTI", "Variant", 44);
+        assert_eq!(
+            select_instance("Dev.Orca.Multi", vec![&first, &variant], Some(44))
+                .unwrap_err()
+                .kind,
+            ErrorKind::AppAmbiguous
+        );
+    }
+
+    #[test]
+    fn part5_same_id_instances_resolve_as_one_app() {
+        let first = running_fixture("dev.orca.multi", "Multi", 42);
+        let second = running_fixture("dev.orca.multi", "Multi", 43);
+        assert_eq!(
+            resolve_with_apps(
+                "dev.orca.multi",
+                false,
+                vec![first.clone(), second.clone()],
+                &[]
+            )
+            .unwrap()
+            .bundle_id,
+            "dev.orca.multi"
+        );
+        assert_eq!(
+            resolve_with_apps(
+                "DEV.ORCA.MULTI",
+                false,
+                vec![first.clone(), second.clone()],
+                &[]
+            )
+            .unwrap()
+            .bundle_id,
+            "dev.orca.multi"
+        );
+        assert_eq!(
+            resolve_with_apps("Multi", false, vec![first, second], &[])
+                .unwrap()
+                .bundle_id,
+            "dev.orca.multi"
+        );
     }
 
     #[test]
