@@ -160,6 +160,37 @@ mod tests {
     }
 
     #[test]
+    fn an_app_prompt_rule_overrides_whole_computer_approval_for_password_entry() {
+        let policy = ApprovalPolicy::new(ApprovalMode::FullAuto).with_rules(vec![
+            PermissionRule::whole_tool("computer", Decision::Allow),
+            PermissionRule::new("computer", "com.apple.Safari", Decision::Prompt),
+        ]);
+        for target in ["com.apple.Safari", "com.apple.Safari#secure"] {
+            assert_eq!(
+                policy
+                    .resolve_for_tool(
+                        &make_request(ActionKind::Computer),
+                        "computer",
+                        Some(target)
+                    )
+                    .decision,
+                ApprovalDecision::Ask,
+                "{target}"
+            );
+        }
+        assert_eq!(
+            policy
+                .resolve_for_tool(
+                    &make_request(ActionKind::Computer),
+                    "computer",
+                    Some("com.apple.TextEdit#secure")
+                )
+                .decision,
+            ApprovalDecision::Allow
+        );
+    }
+
+    #[test]
     fn an_exact_app_rule_allows_that_app_and_a_whole_tool_deny_still_wins() {
         let policy =
             ApprovalPolicy::new(ApprovalMode::Suggest).with_rules(vec![PermissionRule::new(

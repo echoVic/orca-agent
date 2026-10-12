@@ -128,9 +128,9 @@ impl CompiledPermissionRule {
             && self.pattern.as_ref().is_none_or(|pattern| {
                 let target = target.unwrap_or("");
                 pattern.matches(target)
-                        // A denied app stays denied for its secure-input subtarget.
+                        // App denies and prompts also cover the secure-input subtarget.
                         || (tool == "computer"
-                            && self.decision == Decision::Deny
+                            && matches!(self.decision, Decision::Deny | Decision::Prompt)
                             && target
                                 .strip_suffix("#secure")
                                 .is_some_and(|app| pattern.matches(app)))

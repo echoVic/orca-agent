@@ -2360,6 +2360,38 @@ mod tests {
     }
 
     #[test]
+    fn computer_app_prompt_rules_ask_for_password_entry_despite_whole_tool_allow() {
+        let mut config = computer_config();
+        config.permission_rules.rules.extend([
+            PermissionRule::whole_tool("computer", Decision::Allow),
+            PermissionRule::new("computer", "com.apple.TextEdit", Decision::Prompt),
+        ]);
+        for (arguments, expected_target) in [
+            (
+                serde_json::json!({"action":"observe", "app":"TextEdit"}),
+                "com.apple.TextEdit",
+            ),
+            (
+                serde_json::json!({"action":"type", "app":"TextEdit", "text":"secret", "target":{"element":14}}),
+                "com.apple.TextEdit#secure",
+            ),
+        ] {
+            let handler = ComputerApprovalRecording::default();
+            let (_, result, _) = execute_computer_arguments_for_approval(
+                &config,
+                orca_computer_use::fake::FakeDesktop::with_textedit(),
+                true,
+                &handler,
+                arguments,
+            );
+            let approvals = handler.0.lock().unwrap();
+            assert_eq!(approvals.len(), 1, "{expected_target}: {:?}", result.error);
+            assert_eq!(approvals[0].target.as_deref(), Some(expected_target));
+            assert_eq!(result.status, ToolStatus::Denied);
+        }
+    }
+
+    #[test]
     fn computer_hidden_sessions_refuse_list_apps_before_launch_or_approval() {
         for condition in ["headless", "denied", "child", "custom", "restricted"] {
             let mut config = computer_config();
