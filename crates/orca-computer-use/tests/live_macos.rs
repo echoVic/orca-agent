@@ -4903,9 +4903,27 @@ fn cold_launch_by_name(name: &str, bundle: &str) {
         } else {
             vec![]
         };
+        let Reply::Resolved { app: approved } = live
+            .client
+            .call(
+                Request::ResolveApp {
+                    app: name.into(),
+                    allow_not_running: true,
+                },
+                Duration::from_secs(30),
+            )
+            .unwrap()
+        else {
+            panic!("resolved cold app name");
+        };
+        assert_eq!(approved.bundle_id, bundle);
+        eprintln!(
+            "cold name {name:?} resolved to approved ID {:?}",
+            approved.bundle_id
+        );
         let result = live.client.call(
             Request::LaunchApp {
-                app: name.into(),
+                app: approved.bundle_id,
                 open,
             },
             Duration::from_secs(60),

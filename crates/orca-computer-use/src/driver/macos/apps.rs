@@ -525,37 +525,44 @@ fn wait_for_accessibility_window(pid: i32, launch_deadline: Instant) -> bool {
     }
 }
 
+fn find_exact_launch_bundle(
+    bundle_id: &str,
+    roots: &[std::path::PathBuf],
+) -> Result<Option<Retained<NSBundle>>, DriverError> {
+    if let Some((_, bundle)) = installed_bundles(roots)
+        .into_iter()
+        .find(|(info, _)| info.bundle_id == bundle_id)
+    {
+        return Ok(Some(bundle));
+    }
+    Ok(NSWorkspace::sharedWorkspace()
+        .URLForApplicationWithBundleIdentifier(&NSString::from_str(bundle_id))
+        .and_then(|url| NSBundle::bundleWithURL(&url))
+        .filter(|bundle| {
+            bundle
+                .bundleIdentifier()
+                .is_some_and(|id| id.to_string() == bundle_id)
+        }))
+}
+
 pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError> {
     let deadline = Instant::now() + Duration::from_secs(60);
-    let app = resolve(name, true)?;
+    // This is an approved canonical ID. Resolve names only before approval.
+    let bundle = find_exact_launch_bundle(name, &application_roots())?.ok_or_else(|| {
+        error(
+            ErrorKind::AppNotFound,
+            format!("Approved app not found: {name}"),
+        )
+    })?;
+    let app = installed_info(&bundle, name).ok_or_else(|| {
+        error(
+            ErrorKind::AppNotFound,
+            "The approved application has no bundle identity",
+        )
+    })?;
+    require_bundle_identity(name, &app)?;
+    let url = bundle.bundleURL();
     let workspace = NSWorkspace::sharedWorkspace();
-    let url = app
-        .pid
-        .and_then(NSRunningApplication::runningApplicationWithProcessIdentifier)
-        .and_then(|app| app.bundleURL())
-        .or_else(|| {
-            workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(&app.bundle_id))
-        })
-        .filter(|url| {
-            NSBundle::bundleWithURL(url)
-                .and_then(|bundle| bundle.bundleIdentifier())
-                .is_some_and(|id| id.to_string() == app.bundle_id)
-        });
-    let url = match url {
-        Some(url) => url,
-        None => find_installed_bundle(&app.bundle_id, &application_roots())?
-            .map(|bundle| bundle.bundleURL())
-            .ok_or_else(|| error(ErrorKind::AppNotFound, format!("App not found: {name}")))?,
-    };
-    let bundle = NSBundle::bundleWithURL(&url)
-        .and_then(|bundle| installed_info(&bundle, &app.name))
-        .ok_or_else(|| {
-            error(
-                ErrorKind::AppNotFound,
-                "The resolved application has no bundle identity",
-            )
-        })?;
-    require_bundle_identity(&app.bundle_id, &bundle)?;
     let configuration = NSWorkspaceOpenConfiguration::configuration();
     configuration.setActivates(false);
     configuration.setPromptsUserIfNeeded(false);
@@ -666,6 +673,27 @@ mod tests {
             category: None,
             windows: vec![],
         }
+    }
+
+    #[test]
+    fn part5_launch_binding_refuses_name_and_case_fallbacks() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "TextEdit", "dev.orca.launch");
+        for input in ["TextEdit", "DEV.ORCA.LAUNCH", "dev.orca.missing"] {
+            assert!(
+                find_exact_launch_bundle(input, &[temp.path().into()])
+                    .unwrap()
+                    .is_none(),
+                "launch must not re-resolve {input}"
+            );
+        }
+        let exact = find_exact_launch_bundle("dev.orca.launch", &[temp.path().into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            exact.bundleIdentifier().unwrap().to_string(),
+            "dev.orca.launch"
+        );
     }
 
     #[test]

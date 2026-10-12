@@ -33,6 +33,7 @@ pub struct FakeDesktop {
     pub permissions: Permissions,
     pub turn_active: bool,
     pub last_observe: Option<ObserveParams>,
+    pub launch_reply_override: Option<AppInfo>,
     apps: Vec<FakeApp>,
 }
 
@@ -109,6 +110,7 @@ impl FakeDesktop {
             },
             turn_active: false,
             last_observe: None,
+            launch_reply_override: None,
             apps: vec![FakeApp {
                 info: AppInfo {
                     bundle_id: bundle_id.into(),
@@ -424,7 +426,10 @@ impl DriverHandler for FakeDesktop {
                 let index = self.resolve(&app, true)?;
                 self.apps[index].info.pid = Some(42 + index as i32);
                 Ok(Reply::Launched {
-                    app: self.apps[index].info.clone(),
+                    app: self
+                        .launch_reply_override
+                        .clone()
+                        .unwrap_or_else(|| self.apps[index].info.clone()),
                 })
             }
             Request::Observe(params) => {

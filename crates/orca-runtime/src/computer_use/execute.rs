@@ -181,7 +181,18 @@ fn execute_with_timeout(
             })
             .collect::<Vec<_>>()
             .join("\n"),
-        Reply::Launched { app } => {
+        Reply::Launched { app: launched } => {
+            if !matches!(call, ComputerCall::LaunchApp { .. }) || launched.bundle_id != app {
+                return ToolResult::failed(
+                    request,
+                    format!(
+                        "The launched app's bundle ID {:?} does not match the approved ID {app:?}",
+                        launched.bundle_id
+                    ),
+                    None,
+                );
+            }
+            let app = launched;
             let mut text = format!("launched {} ({})", app.name, app.bundle_id);
             append_windows(&mut text, &app);
             text
@@ -321,6 +332,47 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn part5_launch_binding_rejects_a_reply_for_a_different_approved_id() {
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.launch_reply_override = Some(orca_computer_use::protocol::AppInfo {
+            bundle_id: "com.apple.textedit".into(),
+            name: "Impostor".into(),
+            pid: Some(99),
+            category: None,
+            windows: vec![],
+        });
+        let launcher = FakeLauncher::new(desktop);
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let request = request(
+            json!({"action":"launch_app", "app":"TextEdit"}),
+            Some("com.apple.TextEdit"),
+        );
+        let result = execute(
+            &request,
+            &flash_config(),
+            0,
+            RuntimeExtensionStores::new(&thread_store, &turn_store),
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(result.status, ToolStatus::Failed);
+        let error = result.error.as_deref().unwrap();
+        assert!(error.contains("com.apple.TextEdit"));
+        assert!(error.contains("com.apple.textedit"));
+        launcher.desktop(|desktop| desktop.launch_reply_override = None);
+        let result = execute(
+            &request,
+            &flash_config(),
+            0,
+            RuntimeExtensionStores::new(&thread_store, &turn_store),
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(result.status, ToolStatus::Completed);
     }
 
     #[test]
