@@ -136,7 +136,7 @@
   - `list_apps` 和 `observe` 按读取算，plan 模式可以用（`observe` 仍要应用授权）。
   - 其余动作用新增的 `ActionKind::Computer`，plan 模式直接拒绝。
   - 其他模式下，应用授权是唯一的关卡，不再按动作逐个询问。
-- **密码框**：向 `[secure]` 字段输入时，驱动返回"需要单独批准"；runtime 询问用户后，带着批准重发（总设计第 5.6 节）。
+- **密码框**：未经单独批准就向密码框输入时，驱动在输入文字前拒绝；runtime 告知模型重新观察应用，再按元素编号定位密码框，让新调用经过单独批准。
 
 ## 5. 图片开销
 
@@ -227,6 +227,8 @@ Step 7：各代码修复分别提交；本节使用任务简报指定的提交�
 - 观察和按元素 id 操作的 stale 检查共用一个 label helper，按 `AXTitle`、`AXDescription`、`AXPlaceholderValue` 的顺序读取，并统一使用 R7 的 optional-read 语义。夹具 NSTextView 的 `AXDescription` 返回 Failure 时，按观察中的 id 滚动也成功；TextEdit 的文本区同样可以按 id 输入。角色和位置／大小仍是 required reads，标签变化仍返回 `Stale`。
 - `launch` 在已启动进程出现后启用无障碍支持，等到 `AXWindows` 可读且非空再返回；无窗口的应用最多等 10 秒后仍启动成功，等待受原 60 秒 launch deadline 限制，最后一次 AX 调用的 timeout 也不超过剩余时间。打开文件的路径使用同一就绪检查并刷新返回的窗口信息。Electron 测试已删除 harness 的 capture-window wait 和 3 秒 observe retry；Cherry Studio 现在在 `launch_app` 返回后立即观察成功，仍记录元素及控件数量。
 
-Step 3 的真机测试现在是 `typing_with_a_chinese_input_method_enters_the_text_exactly`：通过 Text Input Sources 的 `TISCopyCurrentKeyboardInputSource`／`kTISPropertyInputSourceID` 读取并打印当前 ID，只接受 `com.apple.inputmethod.SCIM` 或 `com.apple.inputmethod.TCIM` 及其子 ID，否则明确 skip；测试不切换输入法。Chinese 分支用现有 `type` 输入 `abc 中文`，核对最后一条输入日志和 Name 字段当前值均完全相同。本轮在 `com.apple.keylayout.ABC` 上只验证了 skip，`type` 投递实现没有改动；用户切到中文输入法后的实际结果见上表 Step 3。
+Step 3 的真机测试现在是 `typing_with_a_chinese_input_method_enters_the_text_exactly`：通过 Text Input Sources 的 `TISCopyCurrentKeyboardInputSource`／`kTISPropertyInputSourceID` 读取并打印当前 ID，并从 `kTISPropertyInputSourceLanguages` 读取主语言；任何主语言为 `zh` 或 `zh-*` 的输入法都接受，包括系统和第三方输入法，否则明确 skip；测试不切换输入法。Chinese 分支用现有 `type` 输入 `abc 中文`，核对最后一条输入日志和 Name 字段当前值均完全相同。本轮在 `com.apple.keylayout.ABC` 上只验证了 skip，`type` 投递实现没有改动；用户切到中文输入法后的实际结果见上表 Step 3。
 
 **修复轮次 2（2026-10-12）**：元素树的 3 秒 poll 不再把窗口自身的 `AXCloseButton`、`AXMinimizeButton`、`AXZoomButton`、`AXFullScreenButton` 当作内容就绪；这些按钮照常保留在观察里。已有内容控件时第一轮立即返回；只有标题栏按钮时等待同一预算，超时后仍返回它们。每次重试重新构建快照，避免重复元素／id，并保留预算耗尽前最后一个非空快照。Cherry Studio 在 `launch_app` 返回后立即观察的加强回归先只得到 3 个标题栏按钮而失败，修复后得到 70 个元素、31 个按钮，且通过原生 subrole／frame 核对确有非标题栏内容；没有 harness retry。
+
+**残留问题修复（2026-10-12）**：保留不含 `computer` 章节的侧会话 system prompt 缓存前缀；router 复查使用真实子代理深度；应用 `prompt` 规则覆盖密码输入；测试临时目录移出 crate 源目录；前台按点输入保留点击光标，元素输入的选区折叠仅尽力而为并读取字符数；非文字操作不在激活前做应用命中测试；测试专用 HID 构造器不进入普通库构建；密码重试与中文输入法识别说明同步到实际行为。
