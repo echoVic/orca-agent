@@ -91,15 +91,10 @@ fn modal_for_recipient<T>(
             return Ok(true);
         }
         let window = read_window()?;
-        let has_window = window.is_some();
         if window.map(inspect_window).transpose()? == Some(true) {
             return Ok(true);
         }
-        if has_top || has_window {
-            Ok(false)
-        } else {
-            fallback()
-        }
+        if has_top { Ok(false) } else { fallback() }
     })();
     match result {
         Err(failure) if failure.kind == ErrorKind::NeedsForeground => Ok(true),
@@ -916,8 +911,8 @@ mod tests {
     fn part4_window_avoids_ancestry_reads_for_a_deep_nonmodal_field() {
         let mut fallback_read = false;
         let modal = modal_for_recipient(
-            || Ok(None),
-            |_| panic!("no top-level element"),
+            || Ok(Some(1)),
+            |_| Ok(false),
             || Ok(Some(1)),
             |_| Ok(false),
             || {
@@ -934,7 +929,7 @@ mod tests {
         .unwrap();
         assert!(
             !modal,
-            "a known non-modal AXWindow stays background regardless of field depth"
+            "a known non-modal top-level element stays background regardless of field depth"
         );
         assert!(!fallback_read);
     }
@@ -954,18 +949,12 @@ mod tests {
         for (top, window, expected) in [
             (Some(false), Some(false), false),
             (Some(false), Some(true), true),
-            (None, Some(false), false),
+            (None, Some(false), true),
+            (None, Some(true), true),
             (Some(false), None, false),
         ] {
             assert_eq!(
-                modal_for_recipient(
-                    || Ok(top),
-                    Ok,
-                    || Ok(window),
-                    Ok,
-                    || panic!("at least one shortcut is readable")
-                )
-                .unwrap(),
+                modal_for_recipient(|| Ok(top), Ok, || Ok(window), Ok, || Ok(true)).unwrap(),
                 expected
             );
         }
@@ -990,6 +979,32 @@ mod tests {
             } else {
                 assert_eq!(result.unwrap_err(), failure);
             }
+        }
+    }
+
+    #[test]
+    fn part6_missing_top_level_walks_past_a_nonmodal_attachment_window() {
+        for fallback_modal in [true, false] {
+            let mut walked = false;
+            let modal = modal_for_recipient(
+                || Ok(None),
+                |_| panic!("no top-level element"),
+                || Ok(Some(false)),
+                Ok,
+                || {
+                    walked = true;
+                    modal_ancestry(0, |depth| {
+                        Ok(if depth == 40 {
+                            ModalStep::Root(fallback_modal)
+                        } else {
+                            ModalStep::Parent(depth + 1)
+                        })
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(modal, fallback_modal);
+            assert!(walked, "an attachment window cannot rule out a sheet");
         }
     }
 
