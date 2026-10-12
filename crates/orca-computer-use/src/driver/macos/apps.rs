@@ -366,10 +366,11 @@ fn resolve_with_apps(
         return Ok(app.clone());
     }
     // A known installed identity wins before interpreting a dotted input as a name.
-    if allow_not_running && looks_like_bundle_id(name) {
-        if let Some(info) = installed_identity(name, roots)? {
-            return Ok(info);
-        }
+    if allow_not_running
+        && looks_like_bundle_id(name)
+        && let Some(info) = installed_identity(name, roots)?
+    {
+        return Ok(info);
     }
     let mut candidates = vec![];
     for app in apps {
@@ -797,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bundle_id_input_cannot_resolve_another_app_by_folder_or_display_name() {
+    fn a_bundle_id_input_cannot_resolve_a_differently_named_app_by_a_renamed_folder() {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
         application_fixture(temp.path(), "com.real.app", "dev.orca.other-app");
         assert_eq!(

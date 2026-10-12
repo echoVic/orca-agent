@@ -176,12 +176,11 @@ fn fixture_app() -> PathBuf {
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>NSPrincipalClass</key><string>CUProbeApplication</string>
 </dict></plist>"#).unwrap();
+    let module_cache = tempfile::tempdir_in("/tmp").unwrap();
     let output = Command::new("/usr/bin/swiftc")
         .arg("-O")
-        .args([
-            "-module-cache-path",
-            "/tmp/orca-cu-fixes/swift-module-cache",
-        ])
+        .arg("-module-cache-path")
+        .arg(module_cache.path())
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/CUFixture.swift"
@@ -4079,7 +4078,22 @@ fn calculator_observe_survives_failed_subroles_and_digit_press_changes_display()
             unsafe { clear.perform_action(&CFString::from_str("AXPress")) },
             AXError::Success
         );
-        thread::sleep(Duration::from_millis(150));
+        let clear_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let values: Vec<_> = native_ax_nodes(&native_window)
+                .iter()
+                .filter_map(|node| native_ax_string(node, "AXValue"))
+                .map(|value| value.trim_matches(['\u{200e}', '\u{200f}']).to_owned())
+                .collect();
+            if values.iter().any(|value| value == "0") && !values.iter().any(|value| value == "7") {
+                break;
+            }
+            assert!(
+                Instant::now() < clear_deadline,
+                "clear must leave 7 and show zero before testing the driver press: {values:?}"
+            );
+            thread::sleep(Duration::from_millis(30));
+        }
         let observed = live.observe("com.apple.calculator", None);
         let digit = observed
             .elements
@@ -4225,23 +4239,34 @@ fn finder_observe_survives_failed_subroles_and_scrolls_own_300_file_list_to_bott
             );
         }
         let observed = live.observe_window("com.apple.finder", Some(window.id), None, 1000, false);
-        let list = observed
-            .elements
-            .iter()
-            .find(|e| e.role == "scroll area")
-            .expect("observed file list");
-        live.act_app(
-            "com.apple.finder",
-            Some(window.id),
-            Action::Scroll {
-                target: Target::Element { element: list.id },
-                direction: Direction::Down,
-                amount: 10000,
-            },
-            false,
-            true,
-        )
-        .unwrap();
+        assert!(
+            observed.elements.iter().any(|e| e.role == "scroll area"),
+            "observed file list"
+        );
+        for _ in 0..10 {
+            if native_ax_string(&bar, "AXValue").as_deref() == Some("1") {
+                break;
+            }
+            let observed =
+                live.observe_window("com.apple.finder", Some(window.id), None, 1000, false);
+            let list = observed
+                .elements
+                .iter()
+                .find(|e| e.role == "scroll area")
+                .unwrap();
+            live.act_app(
+                "com.apple.finder",
+                Some(window.id),
+                Action::Scroll {
+                    target: Target::Element { element: list.id },
+                    direction: Direction::Down,
+                    amount: 50,
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        }
         assert_eq!(
             native_ax_string(&bar, "AXValue").as_deref(),
             Some("1"),

@@ -124,9 +124,9 @@ impl AxElement {
         }))
     }
 
-    // R7: optional metadata (including subrole) treats NoValue,
+    // R7: optional descriptive metadata treats NoValue,
     // AttributeUnsupported and Failure as absent. Actions and app/window
-    // validation retain required reads; traversal degrades only local elements.
+    // validation retain required reads; subrole() preserves Failure for security.
     pub(super) fn optional_attribute_string(
         &self,
         name: &str,
