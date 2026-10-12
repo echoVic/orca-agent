@@ -326,7 +326,19 @@ fn window_gone(application: &AxElement, window: &AxElement, pid: i32) -> bool {
 }
 
 pub(super) fn check_type_recipient(element: &AxElement, text: &str) -> Result<(), DriverError> {
-    let role = element.attribute_string("AXRole")?;
+    validate_type_with_role(text, || element.attribute_string("AXRole"))
+}
+
+fn validate_type_with_role(
+    text: &str,
+    read_role: impl FnOnce() -> Result<Option<String>, DriverError>,
+) -> Result<(), DriverError> {
+    crate::type_text::validate_controls(text)
+        .map_err(|message| error(ErrorKind::Failed, message))?;
+    if !text.contains(['\t', '\n', '\r']) {
+        return Ok(());
+    }
+    let role = read_role()?;
     crate::type_text::validate_recipient(text, role.as_deref())
         .map_err(|message| error(ErrorKind::Failed, message))
 }
@@ -582,6 +594,48 @@ fn scroll(
 mod tests {
     use super::*;
     use crate::geometry::CaptureGeometry;
+
+    #[test]
+    fn part4_ordinary_type_does_not_require_a_recipient_role_read() {
+        for text in ["", "Hello 🦀", "approved secret"] {
+            let mut read = false;
+            let result = validate_type_with_role(text, || {
+                read = true;
+                Err(stale())
+            });
+            assert!(
+                result.is_ok(),
+                "ordinary typing must not add a required AXRole read: {result:?}"
+            );
+            assert!(!read);
+        }
+    }
+
+    #[test]
+    fn part4_layout_controls_still_require_the_multiline_role() {
+        for text in ["a\tb", "a\nb", "a\rb", "a\r\nb"] {
+            let mut reads = 0;
+            assert!(
+                validate_type_with_role(text, || {
+                    reads += 1;
+                    Ok(Some("AXTextArea".into()))
+                })
+                .is_ok()
+            );
+            assert_eq!(reads, 1);
+            assert!(
+                validate_type_with_role(text, || Ok(Some("AXTextField".into())))
+                    .unwrap_err()
+                    .message
+                    .contains("key")
+            );
+            let failure = stale();
+            assert_eq!(
+                validate_type_with_role(text, || Err(failure.clone())).unwrap_err(),
+                failure
+            );
+        }
+    }
 
     #[test]
     fn part4_modal_stale_is_not_a_foreground_fallback() {
