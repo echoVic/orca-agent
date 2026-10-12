@@ -232,3 +232,31 @@ Step 3 的真机测试现在是 `typing_with_a_chinese_input_method_enters_the_t
 **修复轮次 2（2026-10-12）**：元素树的 3 秒 poll 不再把窗口自身的 `AXCloseButton`、`AXMinimizeButton`、`AXZoomButton`、`AXFullScreenButton` 当作内容就绪；这些按钮照常保留在观察里。已有内容控件时第一轮立即返回；只有标题栏按钮时等待同一预算，超时后仍返回它们。每次重试重新构建快照，避免重复元素／id，并保留预算耗尽前最后一个非空快照。Cherry Studio 在 `launch_app` 返回后立即观察的加强回归先只得到 3 个标题栏按钮而失败，修复后得到 70 个元素、31 个按钮，且通过原生 subrole／frame 核对确有非标题栏内容；没有 harness retry。
 
 **残留问题修复（2026-10-12）**：保留不含 `computer` 章节的侧会话 system prompt 缓存前缀；router 复查使用真实子代理深度；应用 `prompt` 规则覆盖密码输入；测试临时目录移出 crate 源目录；前台按点输入保留点击光标，元素输入的选区折叠仅尽力而为并读取字符数；非文字操作不在激活前做应用命中测试；测试专用 HID 构造器不进入普通库构建；密码重试与中文输入法识别说明同步到实际行为。
+
+**验收（2026-10-12）**：Task 14 Step 3 使用简报指定的 `target/release/orca`（构建来源 `0e5012b2`；验收开始时 HEAD `d9b7d875` 只改根测试），没有重建 release 二进制或修改代码。通过当前 shell 启动独立 tmux server，使用用户正常的 Orca home 和 `--model auto`；运行记录中的实际路由为 `deepseek-flash`。工作区 `/tmp/orca-acceptance` 保持 untrusted，欢迎面板选择 `U` 后按 Enter，没有保存信任或审批规则。
+
+六项中两项通过。调用次数按模型发出的 `computer` 请求计数，包含校验失败、拒绝和中断；“用了前台”只表示结果中出现 `used the foreground`，不等于应用从未被启动到前台。审批次数只计人工回答的面板，不计自动允许的 shell 请求；耗时从提交消息到运行时终态，包含等待审批。失败项停止后继续下一项。
+
+| 任务 | 成功与否 | `computer` 调用次数 | 是否用了前台 | 审批次数 | 耗时 | 遇到的问题 |
+| --- | --- | --- | --- | --- | --- | --- |
+| TextEdit | 失败 | 51 | 是 | 48（47 次 Allow once，1 次误 Deny） | 623.6 秒 | 英文应用名匹配失败；把 `modifiers` 放在 `key` 调用的单独字段中只输入了字母 `t`，改为 `keys` 中包含修饰键后成功；保存面板输入报告 done，字段却不变；一次正文追加丢字；指定原窗口后实际仍操作第二个文档。正文最终保存到 iCloud TextEdit 的 `note.txt`，目标 `/tmp/orca-acceptance/note.txt` 不存在；另有自动保存的临时 RTF 文档。AppleScript／剪贴板备用路径受沙箱限制。中止时 Esc 误触审批 Deny，随后 TUI 显示 `runtime.missing_diagnostic`。 |
+| Calculator | 失败 | 11 | 否（无该标记） | 10 | 180.7 秒 | 5 次观察均报 `Accessibility AXSubrole failed: AXError(-25200)`；输入和 Cmd+Q 各被 stale 检查拒绝。模型尝试的 shell 退出／重启／AppleScript 路径也受限。独立 AX 读取及窗口截图均显示 `0`，没有来自 Calculator 的 `7006652`。 |
+| Finder | 失败 | 5 | 否（无该标记） | 4 | 169.8 秒 | 已打开含 300 个文件的独立窗口；2 次观察报相同 `AXSubrole` 错误。第一次滚动漏传 `target`，补齐坐标后仍被 stale 检查拒绝。独立截图停在 `file-001.txt` 开始的列表顶部；shell 查出的 `file-300.txt` 不算 GUI 滚动通过。 |
+| 网页／Safari | 成功 | 2 | 否（无该标记） | 2 | 48.9 秒 | 文件 530 字节，包含 56px 标题和 `#007aff` 的 Press me 按钮。模型通过 `computer observe` 获得 1280×909 截图并确认可见，独立截图也通过。没有点击页面，因此未覆盖“页面被其他窗口遮挡时拒绝点击”的问题。 |
+| Canvas | 失败 | 7 | 是 | 7（含 2 次临时能力审批） | 445.6 秒 | 窗口标题作为应用名匹配失败，bundle id 成功。截图青色覆盖整个内容区；模型点击截图 `(640,531)`，结果称 done，本次夹具日志却没有 `canvas_click`。模型误读默认的旧日志路径，发生路径越界、授权后仍读失败及旧日志误定位；最后一次辅助窗口观察中断，并带 `No accessibility window matches the capture window`。 |
+| Electron／Cherry Studio（只看） | 成功 | 3 | 否（无该标记） | 2 | 41.0 秒 | 英文应用名匹配失败，改用 bundle id 后启动和观察成功；返回约 70 个元素以及主窗口截图。描述了默认助手、导航和输入区。所有应用操作均为 `launch_app`／`observe`，没有点击、输入、按键或滚动；没有需要拒绝的额外动作。 |
+
+画布另做正向对照，不计入六项结果：仍用同一 Orca 会话和夹具，在截图 `(960,512)` 点击，独立日志记录 `canvas_click(x=140,y=116)`，接近源码中画布的中心 `(140,110)`。对照额外用了 4 次 `computer`、6 次审批；不能用它把原中心任务改记为成功。同一 Calculator／Finder 元素的独立原生读取还确认：`AXRole` 可读时，`AXSubrole` 能返回 `-25200`；TextEdit、Safari 和夹具的 Orca 观察成功，不能把失败归结为整机无权限或应用完全没有元素树。
+
+本轮有验收脚本自身的偏差：读取 Safari 基线的 AppleScript 额外触发了系统授权提示，脚本被终止，没有选择允许或拒绝；最终检查时提示已自行消失。TextEdit 中止时还有上述误 Deny，因此本轮不是无执行偏差的干净验收。正文和临时文档已写到工作区外的 iCloud 目录，未移动或删除。退出本次启动的 TextEdit、Calculator、夹具和 Cherry Studio，关闭本次 Finder 窗口和 Safari 标签页；原 Finder 窗口及 Safari 三个标签页保留。前台 cmux 和指针 `(375,1067)` 已恢复，tmux、Orca 驱动和 caffeinate 已退出，开始／结束通知已发送。
+
+值得修复或复测的问题：
+
+- `AXSubrole` 的 Failure 处理导致 Calculator／Finder 整次观察失败，随后动作进入无法取得有效观察的循环。
+- TextEdit 保存面板的输入交付、正文丢字和目标目录确认；不能从 done 或保存后标题变化推定写到了指定路径。
+- `key` 的无效额外字段被静默忽略，以及动作执行中缓存窗口优先于显式 `window` 的行为。
+- 夹具的绘制范围与实际点击区域不一致；修正可见边界后重新验收自然语言“画布中央”。
+- 临时能力授权与下一轮 shell 的有效范围，以及已知审批拒绝后仍显示 `runtime.missing_diagnostic` 的诊断。
+- 单独补测 Safari 页面遮挡时的点击拒绝；本轮没有这个结果。
+
+完整报告位于 `.superpowers/sdd/2026-10-11-computer-use-phase2/acceptance-report.md`；TUI captures、逐项请求／结果和独立核验位于 `/tmp/orca-acceptance/captures/run-20261012-real/`。
