@@ -81,63 +81,56 @@ fn modal_ancestry_until<T: Clone + PartialEq>(
 }
 
 fn modal_for_recipient<T>(
+    read_top_level: impl FnOnce() -> Result<Option<T>, DriverError>,
+    inspect_top_level: impl FnOnce(T) -> Result<bool, DriverError>,
     read_window: impl FnOnce() -> Result<Option<T>, DriverError>,
     inspect_window: impl FnOnce(T) -> Result<bool, DriverError>,
     fallback: impl FnOnce() -> Result<bool, DriverError>,
 ) -> Result<bool, DriverError> {
-    let result = match read_window() {
-        Ok(Some(window)) => inspect_window(window),
-        Ok(None) => fallback(),
-        Err(failure) => Err(failure),
-    };
+    let result = (|| {
+        let top = read_top_level()?;
+        let has_top = top.is_some();
+        if top.map(inspect_top_level).transpose()? == Some(true) {
+            return Ok(true);
+        }
+        let window = read_window()?;
+        let has_window = window.is_some();
+        if window.map(inspect_window).transpose()? == Some(true) {
+            return Ok(true);
+        }
+        if has_top || has_window {
+            Ok(false)
+        } else {
+            fallback()
+        }
+    })();
     match result {
         Err(failure) if failure.kind == ErrorKind::NeedsForeground => Ok(true),
         other => other,
     }
 }
 
-fn window_metadata_is_modal(
-    role: Option<&str>,
-    subrole: Option<&str>,
-    modal: Option<bool>,
-    parent_role: Option<&str>,
-) -> bool {
-    role.is_none()
-        || role == Some("AXSheet")
-        || subrole == Some("AXSheet")
-        || modal == Some(true)
-        || parent_role == Some("AXSheet")
+fn top_level_is_sheet(role: Option<&str>, subrole: Option<&str>) -> bool {
+    role.is_none() || role == Some("AXSheet") || subrole == Some("AXSheet")
+}
+
+fn inspect_top_level(element: AxElement) -> Result<bool, DriverError> {
+    let role = element.modal_attribute_string("AXRole")?;
+    if role.as_deref() == Some("AXSheet") {
+        return Ok(true);
+    }
+    let subrole = element.modal_attribute_string("AXSubrole")?;
+    Ok(top_level_is_sheet(role.as_deref(), subrole.as_deref()))
 }
 
 fn inspect_modal_window(window: AxElement) -> Result<bool, DriverError> {
-    let role = window.modal_attribute_string("AXRole")?;
-    let subrole = window.modal_attribute_string("AXSubrole")?;
-    if window_metadata_is_modal(role.as_deref(), subrole.as_deref(), None, None) {
-        return Ok(true);
-    }
-    let modal = window.modal_attribute_bool("AXModal")?;
-    if modal == Some(true) {
-        return Ok(true);
-    }
-    let parent_role = if let Some(parent) = window.modal_attribute_element("AXParent")? {
-        Some(
-            parent
-                .modal_attribute_string("AXRole")?
-                .ok_or_else(|| foreground("Unreadable window parent role"))?,
-        )
-    } else {
-        None
-    };
-    Ok(window_metadata_is_modal(
-        role.as_deref(),
-        subrole.as_deref(),
-        modal,
-        parent_role.as_deref(),
-    ))
+    Ok(window.modal_attribute_bool("AXModal")?.unwrap_or(false))
 }
 
 fn in_modal_sheet(element: &AxElement) -> Result<bool, DriverError> {
     modal_for_recipient(
+        || element.modal_attribute_element("AXTopLevelUIElement"),
+        inspect_top_level,
         || element.modal_attribute_element("AXWindow"),
         inspect_modal_window,
         || modal_parent_walk(element),
@@ -693,47 +686,61 @@ mod tests {
     use crate::geometry::CaptureGeometry;
 
     #[test]
-    fn part4_fallback_window_uses_sheet_subroles_and_sheet_parents() {
-        for (subrole, parent) in [
-            (Some("AXSheet"), Some("AXApplication")),
-            (None, Some("AXSheet")),
-        ] {
-            assert_eq!(
-                modal_root(
-                    "AXWindow",
-                    || Ok(window_metadata_is_modal(
-                        Some("AXWindow"),
-                        subrole,
-                        Some(false),
-                        parent
-                    )),
-                    || Ok(false)
-                )
-                .unwrap(),
-                Some(true)
-            );
-        }
+    fn part5_sheet_top_level_prevents_background_delivery_through_its_attachment_window() {
+        // AppKit: field -> AXSplitGroup -> AXSheet -> standard AXWindow.
+        let sheet = ("AXSheet", Some("AXSheet"), false);
+        let standard_window = ("AXWindow", Some("AXStandardWindow"), false);
+        let modal = modal_for_recipient(
+            || Ok(Some(sheet)),
+            |top| Ok(top_level_is_sheet(Some(top.0), top.1)),
+            || Ok(Some(standard_window)),
+            |window| Ok(window.2),
+            || panic!("both shortcuts are readable"),
+        )
+        .unwrap();
+        assert_eq!(
+            check_keyboard_recipient(10, 10, 10, modal)
+                .unwrap_err()
+                .kind,
+            ErrorKind::NeedsForeground
+        );
+    }
+
+    #[test]
+    fn part5_sheet_subrole_on_top_level_also_prevents_background_delivery() {
+        let modal = modal_for_recipient(
+            || Ok(Some(("AXWindow", Some("AXSheet")))),
+            |top| Ok(top_level_is_sheet(Some(top.0), top.1)),
+            || Ok(Some(("AXWindow", Some("AXStandardWindow")))),
+            |_| Ok(false),
+            || panic!("shortcuts are readable"),
+        )
+        .unwrap();
+        assert!(modal);
+    }
+
+    #[test]
+    fn parent_fallback_distinguishes_sheet_window_and_application_roots() {
         assert_eq!(
             modal_root(
-                "AXWindow",
-                || Ok(false),
-                || panic!("a window cannot use the application-only check")
+                "AXSheet",
+                || panic!("not an attachment window"),
+                || panic!("not an application")
             )
             .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            modal_root("AXWindow", || Ok(true), || panic!("not an application")).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            modal_root("AXWindow", || Ok(false), || panic!("not an application")).unwrap(),
             Some(false)
         );
         assert_eq!(
             modal_root("AXApplication", || panic!("not a window"), || Ok(false)).unwrap(),
             Some(false)
-        );
-        assert_eq!(
-            modal_root(
-                "AXSheet",
-                || panic!("already a sheet"),
-                || panic!("already a sheet")
-            )
-            .unwrap(),
-            Some(true)
         );
     }
 
@@ -754,7 +761,7 @@ mod tests {
 
     #[test]
     fn part4_window_unreadable_role_requires_foreground() {
-        assert!(window_metadata_is_modal(None, None, None, None));
+        assert!(top_level_is_sheet(None, None));
     }
 
     #[test]
@@ -772,6 +779,8 @@ mod tests {
     fn part4_window_avoids_ancestry_reads_for_a_deep_nonmodal_field() {
         let mut fallback_read = false;
         let modal = modal_for_recipient(
+            || Ok(None),
+            |_| panic!("no top-level element"),
             || Ok(Some(1)),
             |_| Ok(false),
             || {
@@ -794,32 +803,57 @@ mod tests {
     }
 
     #[test]
-    fn part4_window_detects_sheet_subrole_and_sheet_parent() {
-        assert!(window_metadata_is_modal(
+    fn top_level_sheet_roles_and_ordinary_windows_are_distinct() {
+        assert!(top_level_is_sheet(Some("AXSheet"), None));
+        assert!(top_level_is_sheet(Some("AXWindow"), Some("AXSheet")));
+        assert!(!top_level_is_sheet(
             Some("AXWindow"),
-            Some("AXSheet"),
-            Some(false),
-            Some("AXApplication")
+            Some("AXStandardWindow")
         ));
-        assert!(window_metadata_is_modal(
-            Some("AXWindow"),
-            None,
-            None,
-            Some("AXSheet")
-        ));
-        assert!(window_metadata_is_modal(Some("AXSheet"), None, None, None));
-        assert!(window_metadata_is_modal(
-            Some("AXWindow"),
-            None,
-            Some(true),
-            Some("AXApplication")
-        ));
-        assert!(!window_metadata_is_modal(
-            Some("AXWindow"),
-            Some("AXStandardWindow"),
-            None,
-            Some("AXApplication")
-        ));
+    }
+
+    #[test]
+    fn part5_sheet_shortcuts_cover_modal_windows_and_absence_without_a_depth_walk() {
+        for (top, window, expected) in [
+            (Some(false), Some(false), false),
+            (Some(false), Some(true), true),
+            (None, Some(false), false),
+            (Some(false), None, false),
+        ] {
+            assert_eq!(
+                modal_for_recipient(
+                    || Ok(top),
+                    Ok,
+                    || Ok(window),
+                    Ok,
+                    || panic!("at least one shortcut is readable")
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        assert!(
+            modal_for_recipient::<bool>(|| Ok(None), Ok, || Ok(None), Ok, || Ok(true)).unwrap()
+        );
+        for kind in [
+            ErrorKind::Stale,
+            ErrorKind::Failed,
+            ErrorKind::NeedsForeground,
+        ] {
+            let failure = error(kind, "top-level read failed");
+            let result = modal_for_recipient::<bool>(
+                || Err(failure.clone()),
+                Ok,
+                || panic!("top read failed"),
+                Ok,
+                || panic!("top read failed"),
+            );
+            if kind == ErrorKind::NeedsForeground {
+                assert!(result.unwrap());
+            } else {
+                assert_eq!(result.unwrap_err(), failure);
+            }
+        }
     }
 
     #[test]
@@ -827,6 +861,8 @@ mod tests {
         for kind in [ErrorKind::Stale, ErrorKind::Failed] {
             let failure = error(kind, "required window read failed");
             let result = modal_for_recipient::<u32>(
+                || Ok(None),
+                |_| panic!("no top-level element"),
                 || Err(failure.clone()),
                 |_| panic!("no window"),
                 || Ok(false),
@@ -835,6 +871,8 @@ mod tests {
         }
         assert!(
             modal_for_recipient::<u32>(
+                || Ok(None),
+                |_| panic!("no top-level element"),
                 || Err(error(ErrorKind::NeedsForeground, "AXWindow Failure")),
                 |_| panic!("no window"),
                 || panic!("Failure must require foreground")
@@ -842,11 +880,24 @@ mod tests {
             .unwrap()
         );
         assert!(
-            modal_for_recipient::<u32>(|| Ok(None), |_| panic!("no window"), || Ok(true)).unwrap()
+            modal_for_recipient::<u32>(
+                || Ok(None),
+                |_| panic!("no top-level element"),
+                || Ok(None),
+                |_| panic!("no window"),
+                || Ok(true)
+            )
+            .unwrap()
         );
         assert!(
-            !modal_for_recipient::<u32>(|| Ok(None), |_| panic!("no window"), || Ok(false))
-                .unwrap()
+            !modal_for_recipient::<u32>(
+                || Ok(None),
+                |_| panic!("no top-level element"),
+                || Ok(None),
+                |_| panic!("no window"),
+                || Ok(false)
+            )
+            .unwrap()
         );
     }
 

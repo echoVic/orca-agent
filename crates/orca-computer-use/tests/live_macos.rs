@@ -4560,6 +4560,23 @@ fn textedit_save_panel_uses_foreground_for_typing() {
             "test-owned Save panel native fields: {native_fields:?}; focus owner={} app={pid}",
             native_ax_pid(&name)
         );
+        for attribute in ["AXTopLevelUIElement", "AXWindow"] {
+            let shortcut = native_ax_optional_value(&name, attribute)
+                .and_then(|value| value.downcast::<AXUIElement>().ok());
+            let metadata = shortcut.as_ref().map(|element| {
+                (
+                    native_ax_string(element, "AXRole"),
+                    native_ax_string(element, "AXSubrole"),
+                    native_ax_optional_value(element, "AXModal").and_then(|value| {
+                        value
+                            .downcast_ref::<objc2_core_foundation::CFBoolean>()
+                            .map(|value| value.value())
+                    }),
+                    native_ax_pid(element),
+                )
+            });
+            eprintln!("test-owned Save field {attribute}: {metadata:?}");
+        }
         let mut ancestor = Some(name.clone());
         for depth in 0..12 {
             let Some(node) = ancestor else { break };
