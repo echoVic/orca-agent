@@ -132,9 +132,10 @@ pub(crate) fn prepare_invocation(
     });
     let mut preview = if secure {
         format!(
-            "{} into a password field in {}",
+            "{} into a password field in {} ({})",
             call.action_name(),
-            app.name
+            app.name,
+            app.bundle_id
         )
     } else {
         format!("{} in {} ({})", call.action_name(), app.name, app.bundle_id)
@@ -408,7 +409,7 @@ mod tests {
         );
         assert_eq!(
             invocation.approval_preview.as_deref(),
-            Some("type into a password field in TextEdit")
+            Some("type into a password field in TextEdit (com.apple.TextEdit)")
         );
         assert_eq!(invocation.action, Some(ActionKind::Computer));
         observation.focused_secure = true;
