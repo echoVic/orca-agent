@@ -33,14 +33,9 @@ impl ComputerCall {
             return Err("computer arguments must be an object".into());
         }
         let name = required_string(arguments, "action", "computer")?;
+        validate_action_fields(arguments, name)?;
         if name == "list_apps" {
             return Ok(Self::ListApps);
-        }
-        if !matches!(
-            name,
-            "launch_app" | "observe" | "click" | "type" | "key" | "scroll"
-        ) {
-            return Err(format!("unknown computer action {name:?}"));
         }
         let app = required_string(arguments, "app", name)?.to_owned();
         if name == "launch_app" {
@@ -172,6 +167,56 @@ impl ComputerCall {
     }
 }
 
+fn validate_action_fields(arguments: &Value, action: &str) -> Result<(), String> {
+    let allowed: &[&str] = match action {
+        "list_apps" => &["action"],
+        "launch_app" => &["action", "app", "open"],
+        "observe" => &["action", "app", "window", "query", "max_elements"],
+        "click" => &[
+            "action",
+            "app",
+            "window",
+            "target",
+            "button",
+            "count",
+            "modifiers",
+            "observe",
+        ],
+        "type" => &["action", "app", "window", "target", "text", "observe"],
+        "key" => &["action", "app", "window", "target", "keys", "observe"],
+        "scroll" => &[
+            "action",
+            "app",
+            "window",
+            "target",
+            "direction",
+            "amount",
+            "observe",
+        ],
+        _ => return Err(format!("unknown computer action {action:?}")),
+    };
+    for field in arguments
+        .as_object()
+        .expect("arguments were checked")
+        .keys()
+    {
+        if allowed.contains(&field.as_str()) {
+            continue;
+        }
+        if action == "key" && field == "modifiers" {
+            return Err(
+                "`key` takes its modifiers inside `keys`, for example [\"cmd\",\"shift\",\"t\"]"
+                    .into(),
+            );
+        }
+        return Err(format!(
+            "{action} does not accept {field:?}; remove it. Allowed fields: {}",
+            allowed.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 fn required_string<'a>(arguments: &'a Value, field: &str, action: &str) -> Result<&'a str, String> {
     arguments
         .get(field)
@@ -249,6 +294,121 @@ fn optional_target(arguments: &Value, action: &str) -> Result<Option<Target>, St
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn rejects_unrelated_fields(arguments: Value, allowed: &[&str]) {
+        assert!(
+            ComputerCall::parse(&arguments).is_ok(),
+            "valid control: {arguments}"
+        );
+        // Literal schema fields, independent of the parser's action allowlist.
+        for field in [
+            "app",
+            "window",
+            "open",
+            "query",
+            "max_elements",
+            "target",
+            "button",
+            "count",
+            "modifiers",
+            "text",
+            "keys",
+            "direction",
+            "amount",
+            "observe",
+            "unexpected",
+        ] {
+            if allowed.contains(&field) {
+                continue;
+            }
+            let mut invalid = arguments.clone();
+            invalid[field] = Value::Null;
+            let error = ComputerCall::parse(&invalid).expect_err(&format!(
+                "{} silently accepted {field}",
+                arguments["action"]
+            ));
+            assert!(
+                error.contains(field),
+                "must identify the rejected field: {error}"
+            );
+            assert!(
+                error.contains("remove") || error.contains("inside `keys`"),
+                "must explain how to correct the call: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_apps_rejects_fields_from_other_actions() {
+        rejects_unrelated_fields(json!({"action":"list_apps"}), &[]);
+    }
+
+    #[test]
+    fn launch_app_rejects_fields_from_other_actions() {
+        rejects_unrelated_fields(
+            json!({"action":"launch_app", "app":"TextEdit", "open":["/tmp/probe.txt"]}),
+            &["app", "open"],
+        );
+    }
+
+    #[test]
+    fn observe_rejects_fields_from_other_actions() {
+        rejects_unrelated_fields(
+            json!({"action":"observe", "app":"x", "window":7, "query":"Save", "max_elements":100}),
+            &["app", "window", "query", "max_elements"],
+        );
+    }
+
+    #[test]
+    fn click_rejects_fields_from_other_actions() {
+        rejects_unrelated_fields(
+            json!({"action":"click", "app":"x", "window":7, "target":{"element":1}, "button":"right", "count":2, "modifiers":["cmd"], "observe":false}),
+            &[
+                "app",
+                "window",
+                "target",
+                "button",
+                "count",
+                "modifiers",
+                "observe",
+            ],
+        );
+    }
+
+    #[test]
+    fn type_rejects_fields_from_other_actions() {
+        rejects_unrelated_fields(
+            json!({"action":"type", "app":"x", "window":7, "target":{"element":1}, "text":"hello", "observe":false}),
+            &["app", "window", "target", "text", "observe"],
+        );
+    }
+
+    #[test]
+    fn key_rejects_fields_from_other_actions() {
+        rejects_unrelated_fields(
+            json!({"action":"key", "app":"x", "window":7, "target":{"element":1}, "keys":["cmd","s"], "observe":false}),
+            &["app", "window", "target", "keys", "observe"],
+        );
+    }
+
+    #[test]
+    fn scroll_rejects_fields_from_other_actions() {
+        rejects_unrelated_fields(
+            json!({"action":"scroll", "app":"x", "window":7, "target":{"element":1}, "direction":"down", "amount":4, "observe":false}),
+            &["app", "window", "target", "direction", "amount", "observe"],
+        );
+    }
+
+    #[test]
+    fn key_modifiers_explain_the_correct_keys_array() {
+        assert_eq!(ComputerCall::parse(&json!({"action":"key", "app":"TextEdit", "keys":["t"], "modifiers":["shift","cmd"]})).unwrap_err(), "`key` takes its modifiers inside `keys`, for example [\"cmd\",\"shift\",\"t\"]");
+        assert!(
+            ComputerCall::parse(
+                &json!({"action":"key", "app":"TextEdit", "keys":["cmd","shift","t"]})
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn click_defaults_to_one_left_click_and_observes_after() {

@@ -332,23 +332,26 @@ mod tests {
     fn plan_mode_only_allows_list_apps_and_observe() {
         let mut config = interactive_config();
         config.approval_mode = ApprovalMode::Plan;
-        for action in ["click", "type", "key", "scroll", "launch_app"] {
+        for arguments in [
+            json!({"action":"click", "app":"TextEdit", "target":{"element":1}}),
+            json!({"action":"type", "app":"TextEdit", "text":"test"}),
+            json!({"action":"key", "app":"TextEdit", "keys":["a"]}),
+            json!({"action":"scroll", "app":"TextEdit", "target":{"element":1}, "direction":"up"}),
+            json!({"action":"launch_app", "app":"TextEdit"}),
+        ] {
             let mut desktop = FakeDesktop::with_textedit();
             desktop.permissions.accessibility = false;
-            let (service, mut invocation) = setup(
-                desktop,
-                json!({"action":action, "app":"TextEdit", "target":{"element":1}, "text":"test", "keys":["a"], "direction":"up"}),
-            );
+            let (service, mut invocation) = setup(desktop, arguments);
             assert_eq!(
                 prepare_invocation(&mut invocation, &config, &service).unwrap_err(),
                 "plan mode only allows list_apps and observe"
             );
         }
-        for action in ["observe", "list_apps"] {
-            let (service, mut invocation) = setup(
-                FakeDesktop::with_textedit(),
-                json!({"action":action, "app":"TextEdit"}),
-            );
+        for arguments in [
+            json!({"action":"observe", "app":"TextEdit"}),
+            json!({"action":"list_apps"}),
+        ] {
+            let (service, mut invocation) = setup(FakeDesktop::with_textedit(), arguments);
             prepare_invocation(&mut invocation, &config, &service).unwrap();
         }
     }
@@ -552,6 +555,23 @@ mod tests {
             prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap_err(),
             "no app matches \"TextEdit\"; call list_apps"
         );
+    }
+
+    #[test]
+    fn a_key_modifier_field_is_rejected_before_driver_launch() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let service = ComputerUseService::new_for_test(Arc::new(launcher.clone()));
+        let (_, mut invocation) = setup(
+            FakeDesktop::with_textedit(),
+            json!({"action":"key", "app":"TextEdit", "keys":["t"], "modifiers":["shift","cmd"]}),
+        );
+        let error =
+            prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap_err();
+        assert_eq!(
+            error,
+            "`key` takes its modifiers inside `keys`, for example [\"cmd\",\"shift\",\"t\"]"
+        );
+        assert_eq!(launcher.launches(), 0);
     }
 
     #[test]
