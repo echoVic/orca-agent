@@ -158,7 +158,9 @@ final class ProbeButton: NSButton {
         return super.accessibilityChildren()
     }
 }
-let button = ProbeButton(title: "Increment", target: controller, action: #selector(Controller.increment(_:)))
+let button: NSButton = CommandLine.arguments.contains(where: { $0.hasPrefix("--bad-button-") })
+    ? ProbeButton(title: "Increment", target: controller, action: #selector(Controller.increment(_:)))
+    : NSButton(title: "Increment", target: controller, action: #selector(Controller.increment(_:)))
 button.frame = NSRect(x: 20, y: 420, width: 120, height: 32)
 controller.label.frame = NSRect(x: 160, y: 426, width: 200, height: 20)
 final class ProbeField: NSTextField {

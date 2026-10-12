@@ -1060,8 +1060,15 @@ fn observe_with_a_query_keeps_matches_and_their_ancestors() {
         let Some(mut live) = Live::start() else {
             return;
         };
-        live.launch_fixture();
+        live.launch_fixture_with_flags(&["--rows-probe"]);
         let all = live.observe("dev.orca.cu-fixture", None);
+        eprintln!(
+            "owned query control elements: {:?}",
+            all.elements
+                .iter()
+                .map(|e| (&e.role, &e.label, e.secure))
+                .collect::<Vec<_>>()
+        );
         let expected = orca_computer_use::observation::filter_elements(&all.elements, "incr");
         assert!(!expected.is_empty(), "positive match control");
         let filtered = live.observe("dev.orca.cu-fixture", Some("incr"));
@@ -1076,10 +1083,13 @@ fn observe_with_a_query_keeps_matches_and_their_ancestors() {
                 .iter()
                 .any(|e| e.label.as_deref() == Some("Increment"))
         );
-        let descendants = live.observe("dev.orca.cu-fixture", Some("line 1"));
-        assert!(descendants.elements.iter().any(
-            |e| e.role == "text area" && e.value.as_ref().is_some_and(|v| v.contains("line 1"))
-        ));
+        let descendants = live.observe("dev.orca.cu-fixture", Some("Row 1"));
+        assert!(descendants.elements.iter().any(|e| {
+            e.role == "button"
+                && e.label
+                    .as_deref()
+                    .is_some_and(|label| label.contains("Row 1"))
+        }));
         assert!(
             descendants
                 .elements
@@ -2708,7 +2718,7 @@ fn foreground_text_key_checks_password_focus_after_the_click() {
 }
 fn password_focus_after_click(key: bool) {
     run_live_test(|| {
-        use objc2_application_services::{AXError, AXUIElement};
+        use objc2_application_services::AXUIElement;
         use objc2_core_foundation::CFString;
         let Some(mut live) = Live::start() else {
             return;
@@ -2735,41 +2745,9 @@ fn password_focus_after_click(key: bool) {
         fn find_secure(
             element: &AXUIElement,
         ) -> Option<objc2_core_foundation::CFRetained<AXUIElement>> {
-            use objc2_core_foundation::{CFArray, CFType};
-            if fixture_ax_value(element, "AXSubrole")
-                .and_then(|v| v.downcast::<CFString>().ok())
-                .is_some_and(|v| v.to_string() == "AXSecureTextField")
-            {
-                return Some(unsafe {
-                    objc2_core_foundation::CFRetained::retain(std::ptr::NonNull::from(element))
-                });
-            }
-            let mut raw = std::ptr::null();
-            let code = unsafe {
-                element.copy_attribute_value(
-                    &CFString::from_str("AXChildren"),
-                    std::ptr::NonNull::from(&mut raw),
-                )
-            };
-            if code == AXError::AttributeUnsupported || code == AXError::NoValue {
-                return None;
-            }
-            assert_eq!(code, AXError::Success);
-            let children = unsafe {
-                objc2_core_foundation::CFRetained::from_raw(
-                    std::ptr::NonNull::new(raw.cast_mut()).unwrap(),
-                )
-            };
-            let array = children.downcast_ref::<CFArray>().unwrap();
-            for i in 0..array.len() {
-                let child = unsafe { &*array.value_at_index(i as isize).cast::<CFType>() }
-                    .downcast_ref::<AXUIElement>()
-                    .unwrap();
-                if let Some(found) = find_secure(child) {
-                    return Some(found);
-                }
-            }
-            None
+            native_ax_nodes(element).into_iter().find(|node| {
+                native_ax_string(node, "AXSubrole").as_deref() == Some("AXSecureTextField")
+            })
         }
         let secure = find_secure(&window).expect("real password field exists in the fixture");
         let length = || {
