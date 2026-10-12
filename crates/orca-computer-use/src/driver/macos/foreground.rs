@@ -180,10 +180,6 @@ pub(super) fn run(
     }
     // The user may have moved the window while we waited for idle.
     check_window(window, table)?;
-    let target = match &params.action {
-        Action::Click { target, .. } | Action::Scroll { target, .. } => Some(*target),
-        Action::Type { target, .. } | Action::Key { target, .. } => *target,
-    };
     let enters_text = match &params.action {
         Action::Type { .. } => true,
         Action::Key { keys, .. } => parse_combo(keys)
@@ -191,13 +187,9 @@ pub(super) fn run(
             .enters_text(),
         _ => false,
     };
-    let target_element = if enters_text {
-        target
-            .map(|t| actions::target_element(table, application, t))
-            .transpose()?
-    } else {
-        None
-    };
+    let target_element = keyboard_target(&params.action)
+        .map(|t| actions::target_element(table, application, t))
+        .transpose()?;
     if let Action::Type { text, .. } = &params.action {
         crate::type_text::validate_controls(text).map_err(|m| error(ErrorKind::Failed, m))?;
         if let Some(element) = target_element.as_ref() {
@@ -303,14 +295,14 @@ pub(super) fn run(
                     // preflight check. Inspect the actual keyboard recipient
                     // immediately before delivering any foreground text.
                     let focused = wait_for_focus(application, aborted)?;
-                    actions::check_secure_approval(
+                    actions::check_foreground_secure_approval(
                         application,
                         target_element.as_ref(),
                         params.secure_approved,
                     )?;
                     if matches!(target_location(params), Some(Target::Element { .. })) {
                         focused.collapse_selection_to_end();
-                        actions::check_secure_approval(
+                        actions::check_foreground_secure_approval(
                             application,
                             target_element.as_ref(),
                             params.secure_approved,
@@ -348,7 +340,7 @@ pub(super) fn run(
                         if !params.secure_approved {
                             wait_for_focus(application, aborted)?;
                         }
-                        actions::check_secure_approval(
+                        actions::check_foreground_secure_approval(
                             application,
                             target_element.as_ref(),
                             params.secure_approved,
@@ -419,6 +411,37 @@ fn wait_for_focus(application: &AxElement, aborted: &AtomicBool) -> Result<AxEle
         thread::sleep(Duration::from_millis(50));
     }
 }
+fn keyboard_target(action: &Action) -> Option<Target> {
+    match action {
+        Action::Type { target, .. } => *target,
+        Action::Key { target, .. } => *target,
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn non_text_keyboard_targets_are_retained_for_the_already_focused_check() {
+    let target = Some(Target::Element { element: 1 });
+    for key in ["left", "return", "tab", "space", "a"] {
+        assert_eq!(
+            keyboard_target(&Action::Key {
+                keys: vec![key.into()],
+                target
+            }),
+            target,
+            "{key}"
+        );
+    }
+    assert_eq!(
+        keyboard_target(&Action::Type {
+            text: "text".into(),
+            target
+        }),
+        target
+    );
+}
+
 fn target_location(params: &ActParams) -> Option<Target> {
     match &params.action {
         Action::Click { target, .. } | Action::Scroll { target, .. } => Some(*target),

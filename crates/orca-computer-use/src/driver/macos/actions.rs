@@ -36,22 +36,59 @@ fn check_keyboard_recipient(
     Ok(())
 }
 
-fn in_modal_sheet(element: &AxElement) -> Result<bool, DriverError> {
-    let mut current = Some(element.clone());
+enum ModalStep<T> {
+    Root(bool),
+    Parent(T),
+    Unreadable,
+}
+
+fn modal_ancestry<T>(
+    mut current: T,
+    mut read: impl FnMut(T) -> Result<ModalStep<T>, DriverError>,
+) -> Result<bool, DriverError> {
     for _ in 0..8 {
-        let Some(element) = current else {
-            return Ok(false);
-        };
-        let role = element.optional_attribute_string("AXRole")?;
+        match read(current) {
+            Ok(ModalStep::Root(modal)) => return Ok(modal),
+            Ok(ModalStep::Parent(parent)) => current = parent,
+            Ok(ModalStep::Unreadable) | Err(_) => return Ok(true),
+        }
+    }
+    Ok(true)
+}
+
+fn in_modal_sheet(element: &AxElement) -> Result<bool, DriverError> {
+    modal_ancestry(element.clone(), |element| {
+        let role = element.attribute_string("AXRole")?;
+        if role.is_none() {
+            return Ok(ModalStep::Unreadable);
+        }
         if role.as_deref() == Some("AXSheet") {
-            return Ok(true);
+            return Ok(ModalStep::Root(true));
         }
         if matches!(role.as_deref(), Some("AXWindow" | "AXApplication")) {
-            return Ok(element.attribute_bool("AXModal")?.unwrap_or(false));
+            return Ok(ModalStep::Root(
+                element.attribute_bool("AXModal")?.unwrap_or(false),
+            ));
         }
-        current = element.optional_attribute_element("AXParent")?;
+        Ok(element
+            .attribute_element("AXParent")?
+            .map_or(ModalStep::Unreadable, ModalStep::Parent))
+    })
+}
+
+fn check_recipient_security(
+    approved: bool,
+    target_secure: bool,
+    app_secure: bool,
+    system_secure: bool,
+) -> Result<(), DriverError> {
+    if !approved && (target_secure || app_secure || system_secure) {
+        return Err(error(
+            ErrorKind::NeedsSecureApproval,
+            "Entering text into a password field requires approval",
+        ));
     }
-    Ok(false)
+    Ok(())
 }
 
 fn check_background_keyboard(
@@ -322,18 +359,54 @@ pub(super) fn check_secure_approval(
     target: Option<&AxElement>,
     approved: bool,
 ) -> Result<(), DriverError> {
+    check_secure_recipients(application, target, approved, None)
+}
+
+pub(super) fn check_foreground_secure_approval(
+    application: &AxElement,
+    target: Option<&AxElement>,
+    approved: bool,
+) -> Result<(), DriverError> {
+    if approved {
+        return Ok(());
+    }
+    let system_focus = AxElement::system_wide()?.attribute_element("AXFocusedUIElement")?;
+    check_secure_recipients(application, target, approved, system_focus.as_ref())?;
+    if system_focus.is_none() {
+        return Err(error(
+            ErrorKind::Failed,
+            "The system has no focused element",
+        ));
+    }
+    Ok(())
+}
+
+fn check_secure_recipients(
+    application: &AxElement,
+    target: Option<&AxElement>,
+    approved: bool,
+    system_focus: Option<&AxElement>,
+) -> Result<(), DriverError> {
     if approved {
         return Ok(());
     }
     let focused = application.attribute_element("AXFocusedUIElement")?;
-    for element in target.into_iter().chain(focused.as_ref()) {
-        if element.is_secure()? {
-            return Err(error(
-                ErrorKind::NeedsSecureApproval,
-                "Entering text into a password field requires approval",
-            ));
-        }
-    }
+    check_recipient_security(
+        approved,
+        target
+            .map(AxElement::is_secure)
+            .transpose()?
+            .unwrap_or(false),
+        focused
+            .as_ref()
+            .map(AxElement::is_secure)
+            .transpose()?
+            .unwrap_or(false),
+        system_focus
+            .map(AxElement::is_secure)
+            .transpose()?
+            .unwrap_or(false),
+    )?;
     if focused.is_none() {
         return Err(error(ErrorKind::Failed, "The app has no focused element"));
     }
@@ -507,6 +580,57 @@ fn scroll(
 mod tests {
     use super::*;
     use crate::geometry::CaptureGeometry;
+
+    #[test]
+    fn modal_uncertainty_requires_foreground() {
+        assert!(modal_ancestry(0, |_| Ok(ModalStep::Unreadable)).unwrap());
+    }
+
+    #[test]
+    fn modal_read_failure_requires_foreground() {
+        assert!(modal_ancestry(0, |_| Err(error(ErrorKind::Failed, "AXModal Failure"))).unwrap());
+    }
+
+    #[test]
+    fn modal_deep_ancestry_requires_foreground() {
+        assert!(modal_ancestry(0, |depth| Ok(ModalStep::Parent(depth + 1))).unwrap());
+        assert!(
+            modal_ancestry(0, |depth| Ok(if depth == 8 {
+                ModalStep::Root(false)
+            } else {
+                ModalStep::Parent(depth + 1)
+            }))
+            .unwrap()
+        );
+        assert!(
+            !modal_ancestry(0, |depth| Ok(if depth == 7 {
+                ModalStep::Root(false)
+            } else {
+                ModalStep::Parent(depth + 1)
+            }))
+            .unwrap()
+        );
+        assert!(modal_ancestry(0, |_| Ok(ModalStep::Root(true))).unwrap());
+        assert!(!modal_ancestry(0, |_| Ok(ModalStep::Root(false))).unwrap());
+    }
+
+    #[test]
+    fn foreground_security_checks_both_app_and_system_recipients() {
+        for (target, app, system) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert_eq!(
+                check_recipient_security(false, target, app, system)
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::NeedsSecureApproval
+            );
+            assert!(check_recipient_security(true, target, app, system).is_ok());
+        }
+        assert!(check_recipient_security(false, false, false, false).is_ok());
+    }
 
     #[test]
     fn foreign_or_modal_keyboard_recipients_require_foreground_before_delivery() {
