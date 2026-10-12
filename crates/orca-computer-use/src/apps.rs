@@ -40,11 +40,12 @@ const BROWSERS: &[&str] = &[
 ];
 
 fn listed(bundle_id: &str, patterns: &[&str]) -> bool {
+    let folded = bundle_id.to_ascii_lowercase();
     patterns
         .iter()
         .any(|pattern| match pattern.strip_suffix('*') {
-            Some(prefix) => bundle_id.starts_with(prefix),
-            None => bundle_id == *pattern,
+            Some(prefix) => folded.starts_with(&prefix.to_ascii_lowercase()),
+            None => bundle_id.eq_ignore_ascii_case(pattern),
         })
 }
 
@@ -54,7 +55,9 @@ pub fn risk_tier(
     host_bundle_id: Option<&str>,
 ) -> RiskTier {
     let terminal = listed(bundle_id, TERMINALS);
-    if host_bundle_id == Some(bundle_id) || (host_bundle_id.is_none() && terminal) {
+    if host_bundle_id.is_some_and(|host| host.eq_ignore_ascii_case(bundle_id))
+        || (host_bundle_id.is_none() && terminal)
+    {
         return RiskTier::HostTerminal;
     }
     if listed(bundle_id, PASSWORD_MANAGERS) || category == Some("public.app-category.finance") {
@@ -63,7 +66,7 @@ pub fn risk_tier(
     if terminal || listed(bundle_id, IDES) {
         return RiskTier::Warning("can run any command, outside Orca's sandbox");
     }
-    match bundle_id {
+    match bundle_id.to_ascii_lowercase().as_str() {
         "com.apple.finder" => RiskTier::Warning("can read and write any file"),
         "com.apple.systempreferences" => RiskTier::Warning("changes system settings"),
         _ if listed(bundle_id, BROWSERS) => {
@@ -90,6 +93,55 @@ pub fn host_supported() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn part5_risk_case_variants_cannot_lower_forbidden_tiers() {
+        for id in [
+            "COM.APPLE.PASSWORDS",
+            "com.apple.passwords",
+            "COM.1PASSWORD.AGENT",
+            "COM.BITWARDEN.DESKTOP",
+            "COM.APPLE.KEYCHAINACCESS",
+        ] {
+            assert_eq!(
+                risk_tier(id, None, Some("dev.orca.host")),
+                RiskTier::Forbidden,
+                "{id}"
+            );
+        }
+        assert_eq!(risk_tier("dev.orca.ordinary", None, None), RiskTier::Normal);
+    }
+
+    #[test]
+    fn part5_risk_case_variants_keep_warning_tiers() {
+        for id in [
+            "COM.APPLE.FINDER",
+            "COM.APPLE.SYSTEMPREFERENCES",
+            "COM.MICROSOFT.VSCODE",
+            "COM.GOOGLE.CHROME",
+            "COM.JETBRAINS.IDEA",
+        ] {
+            assert!(
+                matches!(
+                    risk_tier(id, None, Some("dev.orca.host")),
+                    RiskTier::Warning(_)
+                ),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn part5_risk_host_identity_and_terminal_fallback_ignore_case() {
+        assert_eq!(
+            risk_tier("DEV.ORCA.HOST", None, Some("dev.orca.host")),
+            RiskTier::HostTerminal
+        );
+        assert_eq!(
+            risk_tier("COM.APPLE.TERMINAL", None, None),
+            RiskTier::HostTerminal
+        );
+    }
 
     #[test]
     fn the_host_terminal_and_password_managers_are_tiered() {
