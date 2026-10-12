@@ -239,16 +239,18 @@ fn bundle_name_matches(bundle: &NSBundle, name: &str, include_display_name: bool
         .and_then(|value| value.downcast::<NSString>().ok())
         .map(|value| value.to_string());
     let raw_name = raw_name.filter(|raw| !raw.is_empty());
+    let display_name = info_string(bundle, "CFBundleDisplayName").filter(|name| !name.is_empty());
     if raw_name
         .as_ref()
         .is_some_and(|raw| raw.to_lowercase() == name.to_lowercase())
         || (include_display_name
-            && info_string(bundle, "CFBundleDisplayName")
+            && display_name
+                .as_ref()
                 .is_some_and(|display| display.to_lowercase() == name.to_lowercase()))
     {
         return true;
     }
-    if looks_like_bundle_id(name) && raw_name.is_some() {
+    if looks_like_bundle_id(name) && (raw_name.is_some() || display_name.is_some()) {
         return false;
     }
     bundle_folder_matches(bundle, name)
@@ -771,13 +773,17 @@ mod tests {
     }
 
     #[test]
-    fn part5_folder_only_alias_is_allowed_when_no_raw_name_is_declared() {
+    fn folder_only_alias_is_allowed_when_neither_bundle_name_is_declared() {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
         application_fixture(temp.path(), "dev.orca.alias", "dev.orca.running");
         let plist = temp.path().join("dev.orca.alias.app/Contents/Info.plist");
         let body = std::fs::read_to_string(&plist)
             .unwrap()
-            .replace("<key>CFBundleName</key><string>TextEdit</string>", "");
+            .replace("<key>CFBundleName</key><string>TextEdit</string>", "")
+            .replace(
+                "<key>CFBundleDisplayName</key><string>Localized Editor</string>",
+                "",
+            );
         std::fs::write(plist, body).unwrap();
         let running = running_fixture("dev.orca.running", "Localized UI Name", 42);
         assert_eq!(
@@ -797,6 +803,27 @@ mod tests {
                 .bundle_id,
             "dev.orca.running"
         );
+    }
+
+    #[test]
+    fn part6_dotted_folder_alias_cannot_hide_a_declared_display_name() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "dev.orca.alias", "dev.orca.display-name");
+        let plist = temp.path().join("dev.orca.alias.app/Contents/Info.plist");
+        let text = std::fs::read_to_string(&plist)
+            .unwrap()
+            .replace("<key>CFBundleName</key><string>TextEdit</string>", "");
+        std::fs::write(plist, text).unwrap();
+        let running = running_fixture("dev.orca.display-name", "dev.orca.alias", 42);
+        for (allow, apps) in [(true, vec![]), (false, vec![running])] {
+            assert_eq!(
+                resolve_with_apps("dev.orca.alias", allow, apps, &[temp.path().into()])
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::AppNotFound,
+                "a declared CFBundleDisplayName rules out a dotted folder alias"
+            );
+        }
     }
 
     #[test]
