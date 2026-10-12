@@ -528,7 +528,18 @@ fn wait_for_accessibility_window(pid: i32, launch_deadline: Instant) -> bool {
 fn find_exact_launch_bundle(
     bundle_id: &str,
     roots: &[std::path::PathBuf],
+    running_url: Option<Retained<NSURL>>,
 ) -> Result<Option<Retained<NSBundle>>, DriverError> {
+    if let Some(bundle) = running_url
+        .and_then(|url| NSBundle::bundleWithURL(&url))
+        .filter(|bundle| {
+            bundle
+                .bundleIdentifier()
+                .is_some_and(|id| id.to_string() == bundle_id)
+        })
+    {
+        return Ok(Some(bundle));
+    }
     if let Some((_, bundle)) = installed_bundles(roots)
         .into_iter()
         .find(|(info, _)| info.bundle_id == bundle_id)
@@ -548,12 +559,28 @@ fn find_exact_launch_bundle(
 pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError> {
     let deadline = Instant::now() + Duration::from_secs(60);
     // This is an approved canonical ID. Resolve names only before approval.
-    let bundle = find_exact_launch_bundle(name, &application_roots())?.ok_or_else(|| {
-        error(
-            ErrorKind::AppNotFound,
-            format!("Approved app not found: {name}"),
-        )
-    })?;
+    let workspace = NSWorkspace::sharedWorkspace();
+    let is_approved = |app: &NSRunningApplication| {
+        app.bundleIdentifier()
+            .is_some_and(|id| id.to_string() == name)
+    };
+    let running_url = workspace
+        .frontmostApplication()
+        .filter(|app| is_approved(app))
+        .or_else(|| {
+            workspace
+                .runningApplications()
+                .iter()
+                .find(|app| is_approved(app))
+        })
+        .and_then(|app| app.bundleURL());
+    let bundle =
+        find_exact_launch_bundle(name, &application_roots(), running_url)?.ok_or_else(|| {
+            error(
+                ErrorKind::AppNotFound,
+                format!("Approved app not found: {name}"),
+            )
+        })?;
     let app = installed_info(&bundle, name).ok_or_else(|| {
         error(
             ErrorKind::AppNotFound,
@@ -562,7 +589,6 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
     })?;
     require_bundle_identity(name, &app)?;
     let url = bundle.bundleURL();
-    let workspace = NSWorkspace::sharedWorkspace();
     let configuration = NSWorkspaceOpenConfiguration::configuration();
     configuration.setActivates(false);
     configuration.setPromptsUserIfNeeded(false);
@@ -676,18 +702,66 @@ mod tests {
     }
 
     #[test]
+    fn part6_launch_prefers_the_running_instances_own_exact_bundle() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let installed = temp.path().join("Applications");
+        let running = temp.path().join("RunningCopy");
+        application_fixture(&installed, "TextEdit", "dev.orca.launch-copy");
+        application_fixture(&running, "TextEdit", "dev.orca.launch-copy");
+        let running_path = running.join("TextEdit.app");
+        let running_url =
+            NSURL::fileURLWithPath(&NSString::from_str(&running_path.to_string_lossy()));
+        let bundle = find_exact_launch_bundle(
+            "dev.orca.launch-copy",
+            std::slice::from_ref(&installed),
+            Some(running_url.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            bundle.bundleURL().path().unwrap().to_string(),
+            running_path.to_string_lossy(),
+            "an installed second copy must not displace the running bundle"
+        );
+        assert!(
+            find_exact_launch_bundle("dev.orca.launch-copy", &[], Some(running_url))
+                .unwrap()
+                .is_some(),
+            "a running copy need not live in the application roots"
+        );
+        // A running URL with a different canonical ID cannot substitute for approval.
+        application_fixture(temp.path(), "WrongCopy", "DEV.ORCA.LAUNCH-COPY");
+        let wrong_url = NSURL::fileURLWithPath(&NSString::from_str(
+            &temp.path().join("WrongCopy.app").to_string_lossy(),
+        ));
+        for url in [None, Some(wrong_url)] {
+            let bundle = find_exact_launch_bundle(
+                "dev.orca.launch-copy",
+                std::slice::from_ref(&installed),
+                url,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                bundle.bundleURL().path().unwrap().to_string(),
+                installed.join("TextEdit.app").to_string_lossy()
+            );
+        }
+    }
+
+    #[test]
     fn part5_launch_binding_refuses_name_and_case_fallbacks() {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
         application_fixture(temp.path(), "TextEdit", "dev.orca.launch");
         for input in ["TextEdit", "DEV.ORCA.LAUNCH", "dev.orca.missing"] {
             assert!(
-                find_exact_launch_bundle(input, &[temp.path().into()])
+                find_exact_launch_bundle(input, &[temp.path().into()], None)
                     .unwrap()
                     .is_none(),
                 "launch must not re-resolve {input}"
             );
         }
-        let exact = find_exact_launch_bundle("dev.orca.launch", &[temp.path().into()])
+        let exact = find_exact_launch_bundle("dev.orca.launch", &[temp.path().into()], None)
             .unwrap()
             .unwrap();
         assert_eq!(
