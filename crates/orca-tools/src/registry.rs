@@ -1738,7 +1738,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "button": { "type": "string", "enum": ["left", "right"], "description": "The mouse button to click, defaulting to left." },
                     "count": { "type": "integer", "enum": [1, 2], "description": "The number of clicks, either one or two." },
                     "modifiers": { "type": "array", "items": { "type": "string", "enum": ["cmd", "shift", "option", "ctrl"] }, "description": "Modifier keys to hold during a click." },
-                    "text": { "type": "string", "description": "Text to insert at the target or current focus." },
+                    "text": { "type": "string", "description": "Insert text only at the target or current focus; tab, newline and return are inserted only in multi-line text areas, otherwise use key. Other control characters, including macOS function-key characters, are refused." },
                     "keys": { "type": "array", "items": { "type": "string" }, "description": "The key names in the keyboard shortcut to send." },
                     "direction": { "type": "string", "enum": ["up", "down", "left", "right"], "description": "The direction to scroll." },
                     "amount": { "type": "integer", "minimum": 1, "maximum": 50, "description": "The number of approximate scroll steps, defaulting to three." },
@@ -2393,6 +2393,17 @@ pub fn tool_name_from_schema_name(name: &str) -> Option<ToolName> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn computer_type_schema_exposes_literal_input_rules_to_the_model() {
+        let registry = default_tool_registry();
+        let spec = registry.get("computer").expect("computer").spec();
+        let parameters = serde_json::to_value(&spec.input_schema).unwrap();
+        assert_eq!(
+            parameters["properties"]["text"]["description"],
+            "Insert text only at the target or current focus; tab, newline and return are inserted only in multi-line text areas, otherwise use key. Other control characters, including macOS function-key characters, are refused."
+        );
+    }
+
     #[test]
     fn computer_tool_has_the_direct_conservative_contract() {
         let registry = default_tool_registry();
