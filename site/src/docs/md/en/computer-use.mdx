@@ -13,17 +13,19 @@ Computer use is available on macOS 14 or later, in the main session of the
 interactive TUI. Give the terminal running Orca **Accessibility** and
 **Screen Recording** permissions in **System Settings → Privacy & Security**.
 Restart the terminal after granting Screen Recording if the permission has
-not taken effect.
+not taken effect. Also grant **Input Monitoring** if the driver reports
+missing listening access when installing the Esc listener; this does not
+replace Accessibility permission.
 
 ## App approval
 
 Before Orca first observes or operates an app, it asks for approval unless a
 permission rule already decides the call. The panel offers:
 
-- **Allow once**: run this call; later calls ask again.
-- **Allow this app this session**: skip approval for this app until you quit.
-- **Always allow this app (saved)**: save an allow rule for future sessions.
-- **Deny**: refuse the call and ask Orca for another way.
+- `1` **Allow once**: run this call; later calls ask again.
+- `2` **Allow this app this session**: skip approval for this app until you quit.
+- `7` **Always allow this app (saved)**: save an allow rule for future sessions.
+- `4` **Deny**: refuse the call and ask Orca for another way.
 
 The saved option writes the app's exact bundle id to the user configuration,
 at `$ORCA_HOME/config.toml` or, when unset, `~/.orca/config.toml`:
@@ -35,9 +37,22 @@ pattern = "com.apple.Safari"
 decision = "allow"
 ~~~
 
-Typing into a password field offers only **Allow typing this once** or
-**Deny**, even with an app grant. A matching deny rule still takes precedence
-over an allow rule; see [permission rules](approval-modes.md#permission-rules).
+Text entry into a `[secure]` password field asks separately each time, with
+only `1` **Allow typing this once** and `4` **Deny**. This applies to `type`
+and text-entering `key` actions: printable keys alone or with Shift/Option,
+and `Cmd+V` (also with Shift/Option). Navigation and other non-text shortcuts
+do not trigger this separate check.
+
+An app grant does not preapprove password entry. Patterned allow rules,
+including exact app ids, wildcards, and an explicit `#secure` target, also
+leave this check in place. Only a whole-tool allow rule for `computer`,
+without a `pattern`, preapproves it. A matching deny rule still takes
+precedence; see [permission rules](approval-modes.md#permission-rules).
+
+If a point target or a stale observation reveals a password field only
+during delivery, Orca refuses unapproved input and sends no text. The result
+instructs the agent to observe again and target the secure field by its element id
+to request approval on retry.
 
 ## App risk levels
 
@@ -64,16 +79,42 @@ Finder warns about file access, System Settings about changing settings,
 and listed browsers (Safari, Chrome, Firefox, Arc, Edge, Brave) about web
 pages carrying instructions aimed at the agent.
 
+## Approval modes
+
+Plan mode permits only `list_apps` and `observe`; launching, clicking,
+typing, sending keys, and scrolling are refused. `list_apps` needs no app
+approval. `observe` still asks for app approval, as do app calls in
+`full-auto`, unless an applicable rule or app grant already allows them.
+
+## Observations and screenshots
+
+Use element ids from the latest observation when available. If the tree
+lists omitted elements, use `query` to narrow the results by role, label, or
+value. A `truncated` observation means the accessibility walk reached its
+time limit and returned a partial tree; a control missing from that tree
+may still exist. Observe again with `query` or use point targets from the
+latest screenshot, then inspect the result to confirm the action.
+
+Coordinates use screenshot pixels, with the origin at the top left. An app
+with no content element tree may still list its title-bar buttons; use
+point targets for its content.
+
+Click the `[N image(s) attached]` line under the tool result to preview the
+screenshot (for example, `[1 image attached]`). Press `q` to close the preview.
+
 ## Stop
 
-Press **Esc** at any time to interrupt the active turn, including while
-another app is in the foreground.
+From the first `computer` call until the turn ends, Orca captures `Esc`
+system-wide. `Esc` interrupts the running turn, including while another app
+is in the foreground or a screenshot preview is open.
 
 ## Background and foreground
 
 Orca tries to operate apps in the background. When an action needs the
 foreground, it briefly switches to the app and then restores the previous
 foreground app and pointer; the result says when the foreground was used.
+`launch_app` starts an app or opens a URL/file without requesting activation;
+an app may still choose to activate itself.
 A `key` action containing Command always uses this switch, because Command
 shortcuts sent to a background app do not reach it.
 
