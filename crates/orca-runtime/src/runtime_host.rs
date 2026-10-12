@@ -2533,15 +2533,14 @@ impl RuntimeThreadStartRequest {
             self.prepared_runtime_thread_id,
         )?;
         if let Some(mut conversation) = inherited_conversation {
-            if let Some(system_prompt) = thread.session().conversation().messages.first().cloned() {
-                if matches!(
-                    conversation.messages.first(),
-                    Some(Message::System { pinned: false, .. })
-                ) {
-                    conversation.messages[0] = system_prompt;
-                } else {
-                    conversation.messages.insert(0, system_prompt);
-                }
+            // Preserve the inherited provider-cache prefix unless it advertises
+            // a capability that this side conversation cannot use.
+            if matches!(conversation.messages.first(), Some(Message::System { content, .. })
+                if content.lines().any(|line| line == "### computer"))
+                && let Some(system_prompt) =
+                    thread.session().conversation().messages.first().cloned()
+            {
+                conversation.messages[0] = system_prompt;
             }
             conversation.internal_context = Default::default();
             conversation.add_system_pinned(SIDE_CONVERSATION_BOUNDARY.to_string());
@@ -23936,6 +23935,113 @@ mod tests {
                 .iter()
                 .any(|message| message.content_str() == Some("keep inherited user context"))
         );
+    }
+
+    #[test]
+    fn attached_side_first_request_preserves_the_parent_prompt_without_computer() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        for condition in [
+            "headless",
+            "whole-tool-deny",
+            "no-advertisement",
+            "advertised",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let captured = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let body = loop {
+                    let mut chunk = [0_u8; 4096];
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0, "provider request ended early");
+                    bytes.extend_from_slice(&chunk[..read]);
+                    let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break serde_json::from_slice::<serde_json::Value>(
+                            &bytes[end + 4..end + 4 + length],
+                        )
+                        .unwrap();
+                    }
+                };
+                let response = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+                body
+            });
+            let mut config = surface_test_config(home.path().to_path_buf(), HistoryMode::Disabled);
+            config.provider = ProviderKind::DeepSeek;
+            config.api_key = Some("test-only".into());
+            config.base_url = Some(base_url);
+            config.computer_use.interactive = condition != "headless";
+            if condition == "whole-tool-deny" {
+                config.permission_rules.rules.push(
+                    orca_core::approval_rules::PermissionRule::whole_tool(
+                        "computer",
+                        orca_core::approval_types::Decision::Deny,
+                    ),
+                );
+            }
+            let parent_prompt = if condition == "advertised" {
+                "Parent instructions: exact whitespace.  \n### computer\nParent desktop capability\n"
+            } else {
+                "Parent instructions: exact whitespace.  \n### read_file\nCached parent prefix\n"
+            };
+            let mut inherited = Conversation::new();
+            inherited.add_system(parent_prompt.to_string());
+            inherited.add_user("inherited context".to_string());
+            let request = RuntimeThreadStartRequest::new(config, "side")
+                .with_attached_side_context("parent", inherited);
+            let side_config = request.config.clone();
+            let mut side = request.start().unwrap();
+            assert_eq!(
+                side.run_turn_to_writer(
+                    &side_config,
+                    "reply",
+                    io::sink(),
+                    crate::controller::ControllerRunOptions::default(),
+                )
+                .unwrap(),
+                RunStatus::Success
+            );
+            let body = captured.join().unwrap();
+            assert_eq!(body["messages"][0]["role"], "system");
+            let actual = body["messages"][0]["content"].as_str().unwrap();
+            if condition == "advertised" {
+                assert!(!actual.contains("### computer"));
+                assert!(actual.contains("### read_file"));
+            } else {
+                assert!(
+                    actual.as_bytes() == parent_prompt.as_bytes(),
+                    "{condition}: first provider request changed the inherited prompt bytes"
+                );
+            }
+            assert!(
+                body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["content"] == "inherited context")
+            );
+        }
     }
 
     #[test]

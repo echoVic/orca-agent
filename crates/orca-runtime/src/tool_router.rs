@@ -182,6 +182,7 @@ impl<'a> RuntimeToolRouter<'a> {
                 Ok(crate::computer_use::execute::execute(
                     execution_request,
                     config,
+                    subagent_depth,
                     stores,
                     cwd,
                     cancel,
@@ -468,4 +469,103 @@ fn task_stop_id(request: &tool_types::ToolRequest) -> Option<String> {
         .or_else(|| args.get("shell_id").and_then(serde_json::Value::as_str))
         .filter(|task_id| !task_id.trim().is_empty())
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extension::ExtensionData;
+    use orca_computer_use::fake::{FakeDesktop, FakeLauncher};
+    use orca_core::approval_types::ActionKind;
+    use orca_core::config::OutputFormat;
+    use orca_core::tool_types::{ToolInvocationStarted, ToolName, ToolStatus};
+
+    fn unused_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        _request: &crate::agent_child::ChildAgentRequest,
+        _runtime: &mut crate::agent_child::ChildAgentRuntime<'_, W>,
+        _cost: &mut CostTracker,
+    ) -> io::Result<crate::agent_child::ChildAgentResult> {
+        panic!("computer dispatch must not execute a child agent")
+    }
+
+    #[test]
+    fn computer_dispatch_checks_the_routers_subagent_depth_before_launch() {
+        let cwd = tempfile::tempdir().unwrap();
+        for depth in [1, 0] {
+            let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+            let thread_store = ExtensionData::new("router-thread");
+            let turn_store = ExtensionData::new("router-turn");
+            thread_store.insert(crate::computer_use::ComputerUseService::new_for_test(
+                Arc::new(launcher.clone()),
+            ));
+            let mut config = RunConfig::default();
+            config.computer_use.interactive = true;
+            let request = tool_types::ToolRequest {
+                id: "router-computer".into(),
+                name: ToolName::Computer,
+                action: ActionKind::Computer,
+                target: None,
+                raw_arguments: Some(r#"{"action":"list_apps"}"#.into()),
+            };
+            let mut runtime = RuntimeToolActorContext::new("router-depth");
+            let mut events = EventFactory::new("router-depth".into());
+            let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+            let instructions = ProjectInstructions::default();
+            let memory = MemoryBlock::default();
+            let registry = McpRegistry::default();
+            let hooks = HookRunner::default();
+            let mut cost = CostTracker::new(None);
+            let cancel = CancelToken::new();
+            let tasks = TaskRegistry::new("router-depth".into());
+            let mut workflows = Vec::new();
+            let mut overlay = TurnPermissionOverlay::default();
+            let mut event_error = None;
+            let result = RuntimeToolRouter::new(&mut runtime)
+                .dispatch(RuntimeToolInvocationContext {
+                    config: &config,
+                    cwd: cwd.path(),
+                    events: &mut events,
+                    sink: &mut sink,
+                    execution_request: &request,
+                    goal_mode: false,
+                    subagent_depth: depth,
+                    instructions: &instructions,
+                    memory: &memory,
+                    mcp_registry: &registry,
+                    hooks: &hooks,
+                    emit_deltas: false,
+                    cost_tracker: &mut cost,
+                    cancel: &cancel,
+                    task_registry: &tasks,
+                    background_workflows: &mut workflows,
+                    workflow_ipc: None,
+                    permission_overlay: &mut overlay,
+                    permission_handler: None,
+                    permission_handler_owned: None,
+                    user_input_handler: None,
+                    mcp_elicitation_handler: None,
+                    extension_stores: Some(RuntimeExtensionStores::new(&thread_store, &turn_store)),
+                    goal_runtime: None,
+                    goal_turn: None,
+                    event_error: &mut event_error,
+                    subagent_child_executor: unused_child_executor,
+                    workflow_child_executor: unused_child_executor,
+                    workflow_lifecycle_ingress: None,
+                    wait_for_background_workflows: false,
+                    root_task_id: None,
+                    child_budget: None,
+                })
+                .unwrap()
+                .result;
+            if depth == 1 {
+                assert_eq!(result.status, ToolStatus::Failed);
+                assert_eq!(result.terminal().started, ToolInvocationStarted::No);
+                assert_eq!(launcher.launches(), 0);
+            } else {
+                assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+                assert_eq!(launcher.launches(), 1);
+            }
+        }
+    }
 }

@@ -20,6 +20,7 @@ use crate::extension::RuntimeExtensionStores;
 pub(crate) fn execute(
     request: &ToolRequest,
     config: &RunConfig,
+    subagent_depth: u32,
     stores: RuntimeExtensionStores<'_>,
     cwd: &Path,
     cancel: &CancelToken,
@@ -34,19 +35,30 @@ pub(crate) fn execute(
     } else {
         Duration::from_secs(30)
     };
-    execute_with_timeout(request, config, stores, cwd, cancel, timeout)
+    execute_with_timeout(
+        request,
+        config,
+        subagent_depth,
+        stores,
+        cwd,
+        cancel,
+        timeout,
+    )
 }
 
 fn execute_with_timeout(
     request: &ToolRequest,
     config: &RunConfig,
+    subagent_depth: u32,
     stores: RuntimeExtensionStores<'_>,
     cwd: &Path,
     cancel: &CancelToken,
     timeout: Duration,
 ) -> ToolResult {
     let existing_service = stores.thread_store().get::<ComputerUseService>();
-    if let Err(error) = super::prepare::ensure_visible(config, 0, existing_service.as_deref()) {
+    if let Err(error) =
+        super::prepare::ensure_visible(config, subagent_depth, existing_service.as_deref())
+    {
         return ToolResult::failed_before_start(request, error, None);
     }
     let call = match serde_json::from_str(request.raw_arguments.as_deref().unwrap_or("{}"))
@@ -319,6 +331,7 @@ mod tests {
         let result = execute(
             &observe_request("com.apple.TextEdit"),
             &flash_config(),
+            0,
             RuntimeExtensionStores::new(&thread_store, &turn_store),
             Path::new("/"),
             &CancelToken::new(),
@@ -365,6 +378,7 @@ mod tests {
         let result = execute(
             &observe_request("com.apple.TextEdit"),
             &config,
+            0,
             RuntimeExtensionStores::new(&thread_store, &turn_store),
             Path::new("/"),
             &CancelToken::new(),
@@ -387,6 +401,7 @@ mod tests {
                 Some("com.apple.TextEdit"),
             ),
             &flash_config(),
+            0,
             RuntimeExtensionStores::new(&thread_store, &turn_store),
             Path::new("/"),
             &CancelToken::new(),
@@ -422,6 +437,7 @@ mod tests {
         let result = execute_with_timeout(
             &observe_request("com.apple.TextEdit"),
             &flash_config(),
+            0,
             stores,
             Path::new("/"),
             &cancel,
@@ -443,6 +459,7 @@ mod tests {
         let result = execute(
             &observe_request("com.apple.TextEdit"),
             &flash_config(),
+            0,
             stores,
             Path::new("/"),
             &cancel,
@@ -464,6 +481,7 @@ mod tests {
         let _ = execute(
             &observe_request("com.apple.TextEdit"),
             &flash_config(),
+            0,
             RuntimeExtensionStores::new(&thread_store, &turn_store),
             Path::new("/"),
             &cancel,
@@ -492,6 +510,7 @@ mod tests {
         let result = execute(
             &observe_request("com.apple.TextEdit"),
             &flash_config(),
+            0,
             RuntimeExtensionStores::new(&thread_store, &next_turn),
             Path::new("/"),
             &next_cancel,
@@ -512,6 +531,7 @@ mod tests {
             execute(
                 &observe_request("com.apple.TextEdit"),
                 &flash_config(),
+                0,
                 stores,
                 Path::new("/"),
                 &cancel
@@ -530,6 +550,7 @@ mod tests {
             let output = execute(
                 &observe_request("com.apple.TextEdit"),
                 &flash_config(),
+                0,
                 RuntimeExtensionStores::new(&thread_store, &turn_store),
                 Path::new("/"),
                 &calling_cancel,
@@ -565,6 +586,7 @@ mod tests {
                 Some("com.apple.TextEdit#secure"),
             ),
             &flash_config(),
+            0,
             stores,
             Path::new("/"),
             &CancelToken::new(),
@@ -599,6 +621,7 @@ mod tests {
         let result = execute(
             &observe_request("com.apple.TextEdit"),
             &config,
+            0,
             stores,
             Path::new("/"),
             &cancel,
@@ -653,6 +676,7 @@ mod tests {
             let result = execute(
                 &request(args, target),
                 &config,
+                0,
                 stores,
                 Path::new("/"),
                 &cancel,
@@ -667,14 +691,14 @@ mod tests {
             Some("com.apple.TextEdit"),
         );
         config.computer_use.foreground_fallback = false;
-        let result = execute(&click, &config, stores, Path::new("/"), &cancel);
+        let result = execute(&click, &config, 0, stores, Path::new("/"), &cancel);
         assert_eq!(
             result.error.as_deref(),
             Some("Background delivery failed; foreground fallback is disabled")
         );
         config.computer_use.foreground_fallback = true;
         launcher.desktop(|d| d.user_active = true);
-        let result = execute(&click, &config, stores, Path::new("/"), &cancel);
+        let result = execute(&click, &config, 0, stores, Path::new("/"), &cancel);
         assert_eq!(
             result.error.as_deref(),
             Some("The user is active; foreground fallback was abandoned")
@@ -683,7 +707,7 @@ mod tests {
             json!({"action":"type", "app":"TextEdit", "target":{"element":14}, "text":"secret"}),
             Some("com.apple.TextEdit"),
         );
-        let result = execute(&secure, &config, stores, Path::new("/"), &cancel);
+        let result = execute(&secure, &config, 0, stores, Path::new("/"), &cancel);
         assert_eq!(
             result.error.as_deref(),
             Some(
@@ -713,6 +737,7 @@ mod tests {
             execute(
                 &observe_request("com.apple.TextEdit"),
                 &flash_config(),
+                0,
                 RuntimeExtensionStores::new(&thread_store, &turn_store),
                 Path::new("/"),
                 &executing_cancel,
@@ -750,6 +775,7 @@ mod tests {
         let result = execute(
             &observe_request("com.apple.TextEdit"),
             &config,
+            0,
             RuntimeExtensionStores::new(&thread_store, &turn_store),
             Path::new("/"),
             &CancelToken::new(),
@@ -774,6 +800,7 @@ mod tests {
         let result = execute(
             &request(json!({"action":"list_apps"}), None),
             &config,
+            0,
             RuntimeExtensionStores::new(&thread_store, &turn_store),
             Path::new("/"),
             &CancelToken::new(),
@@ -803,6 +830,7 @@ mod tests {
                 Some("com.apple.TextEdit"),
             ),
             &flash_config(),
+            0,
             stores,
             Path::new("/"),
             &cancel,
@@ -816,6 +844,7 @@ mod tests {
                 Some("com.apple.TextEdit"),
             ),
             &flash_config(),
+            0,
             stores,
             Path::new("/"),
             &cancel,
@@ -864,6 +893,7 @@ mod tests {
                 Some("com.apple.TextEdit"),
             ),
             &flash_config(),
+            0,
             RuntimeExtensionStores::new(&thread_store, &turn_store),
             Path::new("/"),
             &CancelToken::new(),
@@ -892,6 +922,7 @@ mod tests {
                 Some("com.apple.TextEdit"),
             ),
             &flash_config(),
+            0,
             RuntimeExtensionStores::new(&thread_store, &turn_store),
             Path::new("/"),
             &CancelToken::new(),
@@ -978,6 +1009,7 @@ mod tests {
                 Some("com.apple.TextEdit"),
             ),
             &flash_config(),
+            0,
             RuntimeExtensionStores::new(&thread_store, &turn_store),
             Path::new("/"),
             &cancel,
