@@ -1,9 +1,10 @@
 //! Validation for literal text insertion, shared by the parser and native delivery.
 pub(crate) fn validate_controls(text: &str) -> Result<(), String> {
-    if let Some(control) = text
-        .chars()
-        .find(|c| ((*c as u32) < 32 && !matches!(c, '\t' | '\n' | '\r')) || *c == '\u{7f}')
-    {
+    if let Some(control) = text.chars().find(|c| {
+        ((*c as u32) < 32 && !matches!(c, '\t' | '\n' | '\r'))
+            || *c == '\u{7f}'
+            || ('\u{f700}'..='\u{f8ff}').contains(c)
+    }) {
         return Err(format!(
             "type cannot insert control U+{:04X}; use key for keyboard commands",
             control as u32

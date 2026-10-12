@@ -521,6 +521,31 @@ mod unicode_chunk_tests {
         .unwrap();
         result
     }
+
+    #[test]
+    fn part4_function_key_characters_refuse_all_chunks_before_background_or_hid_delivery() {
+        for code in 0xf700..=0xf8ff {
+            let text = format!(
+                "{}{}suffix",
+                "AbC/".repeat(12),
+                char::from_u32(code).unwrap()
+            );
+            let mut posted = false;
+            let failure = deliver_text(
+                &text,
+                |_| {
+                    posted = true;
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .unwrap_err();
+            assert_eq!(failure.kind, ErrorKind::Failed);
+            assert!(failure.message.contains("key"));
+            assert!(!posted, "no prefix may be posted for U+{code:04X}");
+        }
+        assert_eq!(chunks("\u{f6ff}\u{f900}🦀").concat(), "\u{f6ff}\u{f900}🦀");
+    }
     #[test]
     fn unicode_chunks_treat_crlf_as_one_newline_for_background_and_hid() {
         assert_eq!(chunks("a\r\nb\t🦀"), ["a", "\n", "b", "\t", "🦀"]);

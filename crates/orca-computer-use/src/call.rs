@@ -309,6 +309,24 @@ fn optional_target(arguments: &Value, action: &str) -> Result<Option<Target>, St
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn part4_function_key_characters_are_refused_by_the_parser() {
+        for code in 0xf700..=0xf8ff {
+            let text = format!("prefix/{}suffix", char::from_u32(code).unwrap());
+            let failure = super::ComputerCall::parse(
+                &serde_json::json!({"action":"type", "app":"x", "text":text}),
+            )
+            .unwrap_err();
+            assert!(failure.contains("key"));
+        }
+        assert!(
+            super::ComputerCall::parse(
+                &serde_json::json!({"action":"type", "app":"x", "text":"\u{f6ff}\u{f900}🦀"})
+            )
+            .is_ok()
+        );
+    }
     #[test]
     fn scroll_amount_obeys_the_schema_range() {
         for amount in [51, 10000, 0] {

@@ -448,12 +448,11 @@ fn resolve_with_apps(
             });
         }
     }
-    if allow_not_running {
-        if let Some(bundle) = find_installed_bundle(name, roots)?
-            && let Some(info) = installed_info(&bundle, name)
-        {
-            return Ok(info); // The bundle's own name was checked by the finder.
-        }
+    if allow_not_running
+        && let Some(bundle) = find_installed_bundle(name, roots)?
+        && let Some(info) = installed_info(&bundle, name)
+    {
+        return Ok(info); // The bundle's own name was checked by the finder.
     }
     Err(error(
         ErrorKind::AppNotFound,
