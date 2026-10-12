@@ -32,6 +32,34 @@ fn check(result: AXError, operation: &str) -> Result<(), DriverError> {
     ))
 }
 
+#[derive(Clone, Copy)]
+enum FailurePolicy {
+    Required,
+    Absent,
+    Foreground,
+}
+
+fn attribute_result(
+    result: AXError,
+    name: &str,
+    policy: FailurePolicy,
+) -> Result<bool, DriverError> {
+    if result == AXError::AttributeUnsupported || result == AXError::NoValue {
+        return Ok(false);
+    }
+    if result == AXError::Failure && matches!(policy, FailurePolicy::Absent) {
+        return Ok(false);
+    }
+    if result == AXError::Failure && matches!(policy, FailurePolicy::Foreground) {
+        return Err(error(
+            ErrorKind::NeedsForeground,
+            format!("Accessibility {name} failed; cannot determine modality"),
+        ));
+    }
+    check(result, name)?;
+    Ok(true)
+}
+
 #[derive(Debug, PartialEq)]
 pub(super) enum SubroleRead {
     Value(String),
@@ -96,17 +124,28 @@ impl AxElement {
         name: &str,
         optional: bool,
     ) -> Result<Option<CFRetained<CFType>>, DriverError> {
+        self.attribute_with_policy(
+            name,
+            if optional {
+                FailurePolicy::Absent
+            } else {
+                FailurePolicy::Required
+            },
+        )
+    }
+
+    fn attribute_with_policy(
+        &self,
+        name: &str,
+        policy: FailurePolicy,
+    ) -> Result<Option<CFRetained<CFType>>, DriverError> {
         let mut value = std::ptr::null();
         let result = unsafe {
             self.0
                 .copy_attribute_value(&CFString::from_str(name), NonNull::from(&mut value))
         };
-        if result == AXError::AttributeUnsupported || result == AXError::NoValue {
+        if !attribute_result(result, name, policy)? {
             return Ok(None);
-        }
-        match check(result, name) {
-            Err(_) if optional && result == AXError::Failure => return Ok(None),
-            result => result?,
         }
         Ok(NonNull::new(value.cast_mut()).map(|value| unsafe { CFRetained::from_raw(value) }))
     }
@@ -143,6 +182,52 @@ impl AxElement {
                         .map(|n| n.to_string())
                 }
             }))
+    }
+
+    pub(super) fn modal_attribute_string(&self, name: &str) -> Result<Option<String>, DriverError> {
+        self.attribute_with_policy(name, FailurePolicy::Foreground)?
+            .map(|value| {
+                value
+                    .downcast_ref::<CFString>()
+                    .map(|text| text.to_string())
+                    .ok_or_else(|| {
+                        error(
+                            ErrorKind::NeedsForeground,
+                            format!("Unreadable {name} metadata"),
+                        )
+                    })
+            })
+            .transpose()
+    }
+
+    pub(super) fn modal_attribute_bool(&self, name: &str) -> Result<Option<bool>, DriverError> {
+        self.attribute_with_policy(name, FailurePolicy::Foreground)?
+            .map(|value| {
+                value
+                    .downcast_ref::<CFBoolean>()
+                    .map(|boolean| boolean.value())
+                    .ok_or_else(|| {
+                        error(
+                            ErrorKind::NeedsForeground,
+                            format!("Unreadable {name} metadata"),
+                        )
+                    })
+            })
+            .transpose()
+    }
+
+    pub(super) fn modal_attribute_element(&self, name: &str) -> Result<Option<Self>, DriverError> {
+        self.attribute_with_policy(name, FailurePolicy::Foreground)?
+            .map(|value| {
+                let element = value.downcast::<AXUIElement>().map_err(|_| {
+                    error(
+                        ErrorKind::NeedsForeground,
+                        format!("Unreadable {name} metadata"),
+                    )
+                })?;
+                Self::from_owned(element)
+            })
+            .transpose()
     }
 
     /// Security must distinguish a failed read from a field with no subrole.
@@ -430,6 +515,40 @@ impl AxElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn part4_modal_native_errors_preserve_failure_stale_and_timeout() {
+        assert_eq!(
+            attribute_result(AXError::Failure, "AXModal", FailurePolicy::Foreground)
+                .unwrap_err()
+                .kind,
+            ErrorKind::NeedsForeground
+        );
+        assert_eq!(
+            attribute_result(
+                AXError::InvalidUIElement,
+                "AXModal",
+                FailurePolicy::Foreground
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::Stale
+        );
+        assert_eq!(
+            attribute_result(
+                AXError::CannotComplete,
+                "AXModal",
+                FailurePolicy::Foreground
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::Failed
+        );
+        for result in [AXError::NoValue, AXError::AttributeUnsupported] {
+            assert!(!attribute_result(result, "AXModal", FailurePolicy::Foreground).unwrap());
+        }
+        assert!(attribute_result(AXError::Success, "AXModal", FailurePolicy::Foreground).unwrap());
+    }
 
     #[test]
     fn unreadable_text_roles_are_secure_but_absent_subroles_are_ordinary() {

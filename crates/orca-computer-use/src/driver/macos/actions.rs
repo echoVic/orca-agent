@@ -50,7 +50,9 @@ fn modal_ancestry<T>(
         match read(current) {
             Ok(ModalStep::Root(modal)) => return Ok(modal),
             Ok(ModalStep::Parent(parent)) => current = parent,
-            Ok(ModalStep::Unreadable) | Err(_) => return Ok(true),
+            Ok(ModalStep::Unreadable) => return Ok(true),
+            Err(failure) if failure.kind == ErrorKind::NeedsForeground => return Ok(true),
+            Err(failure) => return Err(failure),
         }
     }
     Ok(true)
@@ -58,7 +60,7 @@ fn modal_ancestry<T>(
 
 fn in_modal_sheet(element: &AxElement) -> Result<bool, DriverError> {
     modal_ancestry(element.clone(), |element| {
-        let role = element.attribute_string("AXRole")?;
+        let role = element.modal_attribute_string("AXRole")?;
         if role.is_none() {
             return Ok(ModalStep::Unreadable);
         }
@@ -67,11 +69,11 @@ fn in_modal_sheet(element: &AxElement) -> Result<bool, DriverError> {
         }
         if matches!(role.as_deref(), Some("AXWindow" | "AXApplication")) {
             return Ok(ModalStep::Root(
-                element.attribute_bool("AXModal")?.unwrap_or(false),
+                element.modal_attribute_bool("AXModal")?.unwrap_or(false),
             ));
         }
         Ok(element
-            .attribute_element("AXParent")?
+            .modal_attribute_element("AXParent")?
             .map_or(ModalStep::Unreadable, ModalStep::Parent))
     })
 }
@@ -582,13 +584,37 @@ mod tests {
     use crate::geometry::CaptureGeometry;
 
     #[test]
+    fn part4_modal_stale_is_not_a_foreground_fallback() {
+        let failure = stale();
+        assert_eq!(
+            modal_ancestry(0, |_| Err(failure.clone())).unwrap_err(),
+            failure
+        );
+    }
+
+    #[test]
+    fn part4_modal_timeout_is_not_a_foreground_fallback() {
+        let failure = error(ErrorKind::Failed, "Accessibility AXParent timed out");
+        assert_eq!(
+            modal_ancestry(0, |_| Err(failure.clone())).unwrap_err(),
+            failure
+        );
+    }
+
+    #[test]
     fn modal_uncertainty_requires_foreground() {
         assert!(modal_ancestry(0, |_| Ok(ModalStep::Unreadable)).unwrap());
     }
 
     #[test]
     fn modal_read_failure_requires_foreground() {
-        assert!(modal_ancestry(0, |_| Err(error(ErrorKind::Failed, "AXModal Failure"))).unwrap());
+        assert!(
+            modal_ancestry(0, |_| Err(error(
+                ErrorKind::NeedsForeground,
+                "AXModal Failure"
+            )))
+            .unwrap()
+        );
     }
 
     #[test]
