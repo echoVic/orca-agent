@@ -124,6 +124,7 @@ pub(super) struct HidEvents<'a> {
 }
 
 impl<'a> HidEvents<'a> {
+    #[cfg(any(test, feature = "test-utils"))]
     pub(super) fn new(pid: i32, aborted: &'a AtomicBool) -> Result<Self, DriverError> {
         Self::new_until(
             pid,
