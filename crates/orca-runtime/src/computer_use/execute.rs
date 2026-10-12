@@ -111,7 +111,7 @@ fn execute_with_timeout(
             ..
         } => Request::Act(ActParams {
             app: app.into(),
-            window: service.latest_window(app).or(*window),
+            window: window.or_else(|| service.latest_window(app)),
             action: action.clone(),
             foreground_fallback: config.computer_use.foreground_fallback,
             observe_after: *observe_after,
@@ -810,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn an_action_uses_the_latest_observed_window_even_if_another_is_requested() {
+    fn an_explicit_action_window_wins_over_the_latest_observed_window() {
         let mut desktop = FakeDesktop::with_textedit();
         desktop.add_window(
             "com.apple.TextEdit",
@@ -841,6 +841,23 @@ mod tests {
         let result = execute(
             &request(
                 json!({"action":"click", "app":"TextEdit", "window":1, "target":{"element":1}, "observe":false}),
+                Some("com.apple.TextEdit"),
+            ),
+            &flash_config(),
+            0,
+            stores,
+            Path::new("/"),
+            &cancel,
+        );
+        assert_eq!(result.status, ToolStatus::Completed);
+        let Request::Act(params) = received.recv_timeout(Duration::from_secs(2)).unwrap() else {
+            panic!("act")
+        };
+        assert_eq!(params.window, Some(1));
+        // Omitting window still uses the last successfully observed window B.
+        let result = execute(
+            &request(
+                json!({"action":"click", "app":"TextEdit", "target":{"element":1}, "observe":false}),
                 Some("com.apple.TextEdit"),
             ),
             &flash_config(),

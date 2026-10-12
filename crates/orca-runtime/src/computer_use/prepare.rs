@@ -112,8 +112,8 @@ pub(crate) fn prepare_invocation(
                 }
                 _ => None,
             };
-            // Element numbers belong to the latest observed window, just as act does.
-            let window = service.latest_window(&app.bundle_id).or(*window);
+            // Match execution: explicit windows win, otherwise use the latest observation.
+            let window = window.or_else(|| service.latest_window(&app.bundle_id));
             match target {
                 Some(Some(Target::Element { element })) => {
                     service.is_secure(&app.bundle_id, window, *element)
@@ -419,6 +419,62 @@ mod tests {
         );
         invocation.effective.raw_arguments = Some(
             json!({"action":"type", "app":"TextEdit", "text":"test", "target":{"element":2}})
+                .to_string(),
+        );
+        prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap();
+        assert_eq!(
+            invocation.effective.target.as_deref(),
+            Some("com.apple.TextEdit")
+        );
+    }
+
+    #[test]
+    fn an_explicit_window_checks_its_own_secure_elements_before_approval() {
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.add_window(
+            "com.apple.TextEdit",
+            orca_computer_use::protocol::WindowInfo {
+                id: 2,
+                title: "B".into(),
+            },
+        );
+        let (service, mut invocation) = setup(
+            desktop,
+            json!({"action":"type", "app":"TextEdit", "window":1, "target":{"element":14}, "text":"secret"}),
+        );
+        for window in [1, 2] {
+            let Reply::Observed { mut observation } = service
+                .call(
+                    Request::Observe(ObserveParams {
+                        app: "com.apple.TextEdit".into(),
+                        window: Some(window),
+                        query: None,
+                        max_elements: 300,
+                        include_screenshot: false,
+                    }),
+                    Duration::from_secs(30),
+                )
+                .unwrap()
+            else {
+                panic!("observation")
+            };
+            if window == 2 {
+                observation
+                    .elements
+                    .iter_mut()
+                    .find(|e| e.id == 14)
+                    .unwrap()
+                    .secure = false;
+            }
+            service.record_observation(&observation);
+        }
+        prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap();
+        assert_eq!(
+            invocation.effective.target.as_deref(),
+            Some("com.apple.TextEdit#secure")
+        );
+        invocation.effective.raw_arguments = Some(
+            json!({"action":"type", "app":"TextEdit", "target":{"element":14}, "text":"secret"})
                 .to_string(),
         );
         prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap();
