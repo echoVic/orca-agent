@@ -4458,3 +4458,225 @@ fn native_window_named(
         })
         .expect("only the named test-owned window")
 }
+
+fn native_ax_pid(element: &objc2_application_services::AXUIElement) -> i32 {
+    let mut pid = 0;
+    assert_eq!(
+        unsafe { element.pid(std::ptr::NonNull::from(&mut pid)) },
+        objc2_application_services::AXError::Success
+    );
+    pid
+}
+
+#[test]
+#[ignore]
+fn textedit_save_panel_uses_foreground_for_typing() {
+    run_live_test(|| {
+        use objc2_application_services::AXUIElement;
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        if !bundle_pids("com.apple.TextEdit").is_empty() {
+            eprintln!("skipped: TextEdit already running; preserve user documents");
+            return;
+        }
+        let file = live.directory.path().join("orca-cu-save-panel.txt");
+        std::fs::write(&file, "Seed.").unwrap();
+        let app = launch_test_app(
+            &mut live,
+            "com.apple.TextEdit",
+            vec![file.to_string_lossy().into_owned()],
+        );
+        let pid = app.pid.unwrap();
+        let window = app
+            .windows
+            .iter()
+            .find(|w| w.title.contains("orca-cu-save-panel.txt"))
+            .unwrap()
+            .id;
+        let native_window = native_window_named(pid, "orca-cu-save-panel.txt");
+        let editor = native_ax_nodes(&native_window)
+            .into_iter()
+            .find(|e| native_ax_string(e, "AXRole").as_deref() == Some("AXTextArea"))
+            .unwrap();
+        live.make_finder_frontmost();
+        let observed = live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
+        let area = observed
+            .elements
+            .iter()
+            .find(|e| e.role == "text area")
+            .unwrap();
+        let control = live
+            .act_app(
+                "com.apple.TextEdit",
+                Some(window),
+                Action::Type {
+                    text: "Background control".into(),
+                    target: Some(Target::Element { element: area.id }),
+                },
+                true,
+                false,
+            )
+            .unwrap();
+        assert!(!control.foreground_used);
+        assert_eq!(
+            native_ax_string(&editor, "AXValue").as_deref(),
+            Some("Seed.Background control"),
+            "main-editor background positive control"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+        live.act_app(
+            "com.apple.TextEdit",
+            Some(window),
+            Action::Key {
+                keys: vec!["cmd".into(), "shift".into(), "option".into(), "s".into()],
+                target: None,
+            },
+            true,
+            true,
+        )
+        .unwrap();
+        let application = unsafe { AXUIElement::new_application(pid) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let name = loop {
+            if let Some(focus) = native_ax_optional_value(&application, "AXFocusedUIElement")
+                .and_then(|v| v.downcast::<AXUIElement>().ok())
+                && native_ax_string(&focus, "AXValue")
+                    .is_some_and(|v| v.contains("orca-cu-save-panel"))
+            {
+                break focus;
+            }
+            assert!(Instant::now() < deadline, "Save As name field not focused");
+            thread::sleep(Duration::from_millis(30));
+        };
+        let native_fields: Vec<_> = native_ax_nodes(&native_window)
+            .into_iter()
+            .filter(|e| {
+                native_ax_string(e, "AXRole")
+                    .as_deref()
+                    .is_some_and(|r| r == "AXTextField" || r == "AXComboBox")
+            })
+            .map(|e| {
+                (
+                    native_ax_string(&e, "AXDescription"),
+                    native_ax_string(&e, "AXValue"),
+                    native_ax_pid(&e),
+                )
+            })
+            .collect();
+        eprintln!(
+            "test-owned Save panel native fields: {native_fields:?}; focus owner={} app={pid}",
+            native_ax_pid(&name)
+        );
+        let mut ancestor = Some(name.clone());
+        for depth in 0..12 {
+            let Some(node) = ancestor else { break };
+            let modal = native_ax_optional_value(&node, "AXModal").and_then(|v| {
+                v.downcast_ref::<objc2_core_foundation::CFBoolean>()
+                    .map(|b| b.value())
+            });
+            eprintln!(
+                "own panel ancestor {depth}: role={:?}, subrole={:?}, modal={modal:?}, owner={}",
+                native_ax_string(&node, "AXRole"),
+                native_ax_string(&node, "AXSubrole"),
+                native_ax_pid(&node)
+            );
+            ancestor = native_ax_optional_value(&node, "AXParent")
+                .and_then(|v| v.downcast::<AXUIElement>().ok());
+        }
+        let before = native_ax_string(&name, "AXValue").unwrap();
+        let observed = live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
+        eprintln!(
+            "Save panel name label: {:?}, native role={:?}, owner={}, app={pid}, observed fields={:?}",
+            native_ax_string(&name, "AXDescription"),
+            native_ax_string(&name, "AXRole"),
+            native_ax_pid(&name),
+            observed
+                .elements
+                .iter()
+                .filter(|e| e.role == "text field" || e.role == "combo box")
+                .map(|e| (&e.label, e.frame))
+                .collect::<Vec<_>>()
+        );
+        let outcome = live
+            .act_app(
+                "com.apple.TextEdit",
+                Some(window),
+                Action::Type {
+                    text: "orca-panel-name".into(),
+                    target: None,
+                },
+                true,
+                true,
+            )
+            .unwrap();
+        let after = native_ax_string(&name, "AXValue").unwrap();
+        assert_ne!(after, before, "reported done but Save name did not change");
+        assert!(
+            after.contains("orca-panel-name"),
+            "native filename receipt: {after:?}"
+        );
+        assert!(
+            outcome.foreground_used,
+            "Save panel recipient must use HID fallback"
+        );
+        eprintln!("panel input source: {:?}", current_keyboard_input_source());
+        let current = live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
+        let field = current
+            .elements
+            .iter()
+            .find(|e| e.role == "text field" && e.label.is_none())
+            .expect("observed test-owned filename field");
+        let outcome = live
+            .act_app(
+                "com.apple.TextEdit",
+                Some(window),
+                Action::Type {
+                    text: "-target".into(),
+                    target: Some(Target::Element { element: field.id }),
+                },
+                true,
+                true,
+            )
+            .unwrap();
+        assert!(outcome.foreground_used);
+        let targeted_value = native_ax_string(&name, "AXValue").unwrap();
+        eprintln!("element-targeted panel receipt: {targeted_value:?}");
+        assert!(
+            targeted_value.ends_with("-target"),
+            "element-targeted panel receipt: {targeted_value:?}"
+        );
+        let before_key = native_ax_string(&name, "AXValue").unwrap();
+        let outcome = live
+            .act_app(
+                "com.apple.TextEdit",
+                Some(window),
+                Action::Key {
+                    keys: vec!["space".into()],
+                    target: None,
+                },
+                true,
+                true,
+            )
+            .unwrap();
+        assert!(outcome.foreground_used);
+        assert_ne!(
+            native_ax_string(&name, "AXValue").unwrap(),
+            before_key,
+            "text-key panel receipt"
+        );
+        // Cancel only our Save As panel; never save or browse outside the temporary document.
+        live.act_app(
+            "com.apple.TextEdit",
+            Some(window),
+            Action::Key {
+                keys: vec!["escape".into()],
+                target: None,
+            },
+            true,
+            true,
+        )
+        .unwrap();
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}

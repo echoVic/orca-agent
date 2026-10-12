@@ -274,7 +274,24 @@ pub(super) fn run(
                 } => hid.scroll(location.unwrap(), *direction, *amount)?,
                 Action::Type { text, .. } => {
                     if let Some(point) = location {
-                        hid.click(point, Button::Left, 1, Default::default())?;
+                        // AX may already have focused a sheet field whose system hit
+                        // test is owned by its view service. Deliver to that exact
+                        // keyboard recipient without an unnecessary pointer click.
+                        let already_focused =
+                            if matches!(target_location(params), Some(Target::Element { .. })) {
+                                let focused =
+                                    application.attribute_element("AXFocusedUIElement")?;
+                                target_element.as_ref().is_some_and(|target| {
+                                    focused
+                                        .as_ref()
+                                        .is_some_and(|focused| focused.0 == target.0)
+                                })
+                            } else {
+                                false
+                            };
+                        if !already_focused {
+                            hid.click(point, Button::Left, 1, Default::default())?;
+                        }
                     }
                     // Activation and the click can change focus after the
                     // preflight check. Inspect the actual keyboard recipient
@@ -297,7 +314,24 @@ pub(super) fn run(
                 }
                 Action::Key { keys, .. } => {
                     if let Some(point) = location {
-                        hid.click(point, Button::Left, 1, Default::default())?;
+                        // AX may already have focused a sheet field whose system hit
+                        // test is owned by its view service. Deliver to that exact
+                        // keyboard recipient without an unnecessary pointer click.
+                        let already_focused =
+                            if matches!(target_location(params), Some(Target::Element { .. })) {
+                                let focused =
+                                    application.attribute_element("AXFocusedUIElement")?;
+                                target_element.as_ref().is_some_and(|target| {
+                                    focused
+                                        .as_ref()
+                                        .is_some_and(|focused| focused.0 == target.0)
+                                })
+                            } else {
+                                false
+                            };
+                        if !already_focused {
+                            hid.click(point, Button::Left, 1, Default::default())?;
+                        }
                     }
                     let stroke =
                         parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;

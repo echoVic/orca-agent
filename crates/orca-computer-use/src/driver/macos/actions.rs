@@ -22,6 +22,53 @@ fn foreground(message: impl Into<String>) -> DriverError {
     error(ErrorKind::NeedsForeground, message)
 }
 
+fn check_keyboard_recipient(
+    app_pid: i32,
+    target_pid: i32,
+    focused_pid: i32,
+    modal: bool,
+) -> Result<(), DriverError> {
+    if target_pid != app_pid || focused_pid != app_pid || modal {
+        return Err(foreground(
+            "Foreign keyboard recipients and modal sheets require the foreground",
+        ));
+    }
+    Ok(())
+}
+
+fn in_modal_sheet(element: &AxElement) -> Result<bool, DriverError> {
+    let mut current = Some(element.clone());
+    for _ in 0..8 {
+        let Some(element) = current else {
+            return Ok(false);
+        };
+        let role = element.optional_attribute_string("AXRole")?;
+        if role.as_deref() == Some("AXSheet") {
+            return Ok(true);
+        }
+        if matches!(role.as_deref(), Some("AXWindow" | "AXApplication")) {
+            return Ok(element.attribute_bool("AXModal")?.unwrap_or(false));
+        }
+        current = element.optional_attribute_element("AXParent")?;
+    }
+    Ok(false)
+}
+
+fn check_background_keyboard(
+    pid: i32,
+    application: &AxElement,
+    target: &AxElement,
+) -> Result<(), DriverError> {
+    let focused = application
+        .attribute_element("AXFocusedUIElement")?
+        .ok_or_else(|| foreground("The app has no focused element"))?;
+    let target_pid = target.pid()?;
+    let focused_pid = focused.pid()?;
+    // Reject foreign handles before asking their ancestry any more questions.
+    check_keyboard_recipient(pid, target_pid, focused_pid, false)?;
+    check_keyboard_recipient(pid, target_pid, focused_pid, in_modal_sheet(&focused)?)
+}
+
 impl MacDriver {
     pub(super) fn act(&mut self, params: ActParams) -> Result<ActOutcome, DriverError> {
         capture::check_unlocked()?;
@@ -122,6 +169,7 @@ impl MacDriver {
                 }
                 Action::Type { text, target } => {
                     let element = focus(table, &application, *target)?;
+                    check_background_keyboard(pid, &application, &element)?;
                     check_secure_approval(&application, Some(&element), params.secure_approved)?;
                     if target.is_some() {
                         let focused = application
@@ -142,6 +190,7 @@ impl MacDriver {
                     // On the real Mac, process-directed Cmd+A/Cmd+S events
                     // reached the app but did not dispatch its menu shortcut.
                     let element = focus(table, &application, *target)?;
+                    check_background_keyboard(pid, &application, &element)?;
                     if stroke.enters_text() {
                         check_secure_approval(
                             &application,
@@ -421,6 +470,24 @@ fn scroll(
 mod tests {
     use super::*;
     use crate::geometry::CaptureGeometry;
+
+    #[test]
+    fn foreign_or_modal_keyboard_recipients_require_foreground_before_delivery() {
+        assert!(check_keyboard_recipient(10, 10, 10, false).is_ok());
+        for (target, focused, modal) in [
+            (20, 10, false),
+            (10, 20, false),
+            (20, 20, false),
+            (10, 10, true),
+        ] {
+            assert_eq!(
+                check_keyboard_recipient(10, target, focused, modal)
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::NeedsForeground
+            );
+        }
+    }
 
     #[test]
     fn hidden_point_clicks_do_not_attempt_native_hit_testing() {
