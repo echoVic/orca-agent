@@ -127,7 +127,7 @@ impl MacDriver {
                         let focused = application
                             .attribute_element("AXFocusedUIElement")?
                             .ok_or_else(|| foreground("The app has no focused element"))?;
-                        focused.collapse_selection_to_end()?;
+                        focused.collapse_selection_to_end();
                         check_secure_approval(
                             &application,
                             Some(&element),

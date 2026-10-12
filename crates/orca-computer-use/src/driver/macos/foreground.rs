@@ -191,9 +191,13 @@ pub(super) fn run(
             .enters_text(),
         _ => false,
     };
-    let target_element = target
-        .map(|t| actions::target_element(table, application, t))
-        .transpose()?;
+    let target_element = if enters_text {
+        target
+            .map(|t| actions::target_element(table, application, t))
+            .transpose()?
+    } else {
+        None
+    };
     // A known secure target requires approval before even the focus click.
     if enters_text
         && !params.secure_approved
@@ -283,8 +287,8 @@ pub(super) fn run(
                         target_element.as_ref(),
                         params.secure_approved,
                     )?;
-                    if target_location(params).is_some() {
-                        focused.collapse_selection_to_end()?;
+                    if matches!(target_location(params), Some(Target::Element { .. })) {
+                        focused.collapse_selection_to_end();
                         actions::check_secure_approval(
                             application,
                             target_element.as_ref(),

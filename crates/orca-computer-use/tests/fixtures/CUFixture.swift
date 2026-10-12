@@ -22,6 +22,9 @@ final class Canvas: NSView {
         let point = convert(event.locationInWindow, from: nil)
         log(["type": "canvas_click", "x": point.x, "y": point.y, "clicks": event.clickCount])
     }
+    override func rightMouseDown(with event: NSEvent) {
+        log(["type": "canvas_right_click"])
+    }
     override func draw(_ dirtyRect: NSRect) { NSColor.systemTeal.setFill(); dirtyRect.fill() }
 }
 
@@ -54,26 +57,72 @@ final class Controller: NSObject, NSTextFieldDelegate {
 // foreground HID can focus the real secure field. Default fixture is unchanged.
 var pendingProbeRaise = true
 let foregroundPasswordProbe = CommandLine.arguments.contains("--foreground-password-probe")
+let foregroundTypeProbe = CommandLine.arguments.contains("--foreground-type-probe")
+let rejectEarlyHit = CommandLine.arguments.contains("--reject-hit-before-raise")
 final class ProbeWindow: NSWindow {
     override func accessibilityPerformRaise() -> Bool {
         pendingProbeRaise = false
         return super.accessibilityPerformRaise()
     }
     override func accessibilityHitTest(_ point: NSPoint) -> Any? {
-        if foregroundPasswordProbe && pendingProbeRaise { return self }
+        if rejectEarlyHit && pendingProbeRaise {
+            log(["type": "early_hit"])
+            return nil
+        }
+        if (foregroundPasswordProbe || foregroundTypeProbe) && pendingProbeRaise { return self }
         return super.accessibilityHitTest(point)
     }
 
 }
 
+// Native AX elements are weakly held by the server. Expire this focus handle
+// between the length read and range write; the real Name field remains editable.
+final class ExpiringSelectionFocus: NSAccessibilityElement {
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityIdentifier() -> String? { "expiring-name-focus" }
+    override func accessibilityRole() -> NSAccessibility.Role? { .textField }
+    override func accessibilityParent() -> Any? { field }
+    override func accessibilityFrame() -> NSRect { field.accessibilityFrame() }
+    override func accessibilityValue() -> Any? {
+        if CommandLine.arguments.contains("--no-name-length") { return nil }
+        let value = field.stringValue
+        expiringSelectionFocus = nil
+        log(["type": "selection_focus_expired"])
+        return value
+    }
+    override func accessibilityNumberOfCharacters() -> Int {
+        if CommandLine.arguments.contains("--no-name-length") {
+            log(["type": "length_unavailable"])
+            NSException(name: NSExceptionName("NSAccessibilityException"),
+                        reason: "The fixture length is unavailable",
+                        userInfo: [NSAccessibility.ErrorCodeExceptionInfo: NSNumber(value: -25212)]).raise()
+            return 0
+        }
+        let length = field.stringValue.utf16.count
+        expiringSelectionFocus = nil
+        log(["type": "selection_focus_expired"])
+        return length
+    }
+}
+var expiringSelectionFocus: ExpiringSelectionFocus? = ExpiringSelectionFocus()
+
 @objc(CUProbeApplication)
 final class ProbeApplication: NSApplication {
+    override func accessibilityHitTest(_ point: NSPoint) -> Any? {
+        if rejectEarlyHit && pendingProbeRaise {
+            log(["type": "early_hit"])
+            return nil
+        }
+        return super.accessibilityHitTest(point)
+    }
     override func accessibilityMainWindow() -> Any? {
         if CommandLine.arguments.contains("--no-main-window") { return nil }
         return super.accessibilityMainWindow()
     }
     override func accessibilityApplicationFocusedUIElement() -> Any? {
         if CommandLine.arguments.contains("--hide-focused-element") { return nil }
+        if foregroundTypeProbe && pendingProbeRaise { return nil }
+        if (CommandLine.arguments.contains("--expire-selection-focus") || CommandLine.arguments.contains("--no-name-length")), let focus = expiringSelectionFocus { return focus }
         if foregroundPasswordProbe, let window = windows.first(where: { $0.title == "Orca CU Fixture" }), (window.firstResponder == nil || window.firstResponder === window) { return nil }
         return super.accessibilityApplicationFocusedUIElement()
     }
@@ -96,13 +145,21 @@ button.frame = NSRect(x: 20, y: 420, width: 120, height: 32)
 controller.label.frame = NSRect(x: 160, y: 426, width: 200, height: 20)
 final class ProbeField: NSTextField {
     override func setAccessibilityFocused(_ focused: Bool) {
-        if CommandLine.arguments.contains("--sticky-password-focus") { return }
+        if CommandLine.arguments.contains("--sticky-password-focus") || (foregroundTypeProbe && pendingProbeRaise) { return }
         super.setAccessibilityFocused(focused)
+    }
+    override func accessibilityValue() -> String? {
+        if CommandLine.arguments.contains("--no-name-value") { return nil }
+        return super.accessibilityValue()
+    }
+    override func accessibilityNumberOfCharacters() -> Int {
+        return stringValue.utf16.count
     }
 }
 let field = ProbeField(frame: NSRect(x: 20, y: 380, width: 300, height: 24))
 field.setAccessibilityLabel("Name"); field.delegate = controller
 if CommandLine.arguments.contains("--prefilled-name") { field.stringValue = "a🦀c" }
+if foregroundTypeProbe { field.font = NSFont.monospacedSystemFont(ofSize: 16, weight: .regular) }
 let secure = NSSecureTextField(frame: NSRect(x: 340, y: 380, width: 200, height: 24))
 secure.setAccessibilityLabel("Password")
 let scroll = NSScrollView(frame: NSRect(x: 20, y: 140, width: 300, height: 220))
@@ -125,6 +182,17 @@ NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotificati
                                        object: scroll.contentView, queue: nil) { _ in
     log(["type": "scroll", "y": scroll.contentView.bounds.origin.y])
 }
+NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+    if field.bounds.contains(field.convert(event.locationInWindow, from: nil)) {
+        DispatchQueue.main.async {
+            if let editor = field.currentEditor() as? NSTextView {
+                if CommandLine.arguments.contains("--select-name-on-click") { editor.selectAll(nil) }
+                log(["type": "name_click", "location": editor.selectedRange().location, "length": editor.selectedRange().length])
+            }
+        }
+    }
+    return event
+}
 NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
     log(["type": "keydown", "chars": event.charactersIgnoringModifiers ?? "",
          "cmd": event.modifierFlags.contains(.command)])
@@ -134,7 +202,7 @@ let canvas = Canvas(frame: NSRect(x: 340, y: 140, width: 280, height: 220))
 for view in [button, controller.label, field, secure, scroll, canvas] as [NSView] {
     window.contentView!.addSubview(view)
 }
-if foregroundPasswordProbe {
+if foregroundPasswordProbe || rejectEarlyHit {
     let reset = NSButton(title: "Reset probe focus", target: controller, action: #selector(Controller.resetProbeFocus(_:)))
     reset.frame = NSRect(x: 20, y: 20, width: 160, height: 30)
     window.contentView!.addSubview(reset)
@@ -145,6 +213,12 @@ window.contentView!.addSubview(close)
 window.makeKeyAndOrderFront(nil)
 // Direct harness launches activate; NSWorkspace launch tests use its configuration.
 if CommandLine.arguments.count > 1 { app.activate() }
+if CommandLine.arguments.contains("--prefilled-name") {
+    window.makeFirstResponder(field)
+    if let editor = field.currentEditor() as? NSTextView {
+        editor.setSelectedRange(NSRange(location: field.stringValue.utf16.count, length: 0))
+    }
+}
 if foregroundPasswordProbe {
     DispatchQueue.main.async {
         window.makeFirstResponder(nil)

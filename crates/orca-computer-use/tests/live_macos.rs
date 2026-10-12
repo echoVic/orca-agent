@@ -217,12 +217,15 @@ impl Live {
         let frontmost = workspace
             .frontmostApplication()
             .map(|app| app.processIdentifier());
-        let running = workspace
+        let running: HashSet<i32> = workspace
             .runningApplications()
             .iter()
             .map(|app| app.processIdentifier())
             .collect();
         let pointer = CGEvent::location(Some(&CGEvent::new(None).expect("read pointer position")));
+        eprintln!(
+            "live starting state: frontmost={frontmost:?}, pointer={pointer:?}, running={running:?}"
+        );
         let directory = tempfile::tempdir().unwrap();
         let launcher =
             InProcessLauncher::new(MacDriver::new(directory.path().join("computer-use.lock")));
@@ -3665,4 +3668,282 @@ fn unreported_password_focus_refuses_unapproved_text_keys() {
         );
         live.assert_frontmost_and_pointer_unchanged();
     });
+}
+
+#[test]
+#[ignore]
+fn foreground_type_at_a_point_keeps_the_clicked_caret() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) =
+            live.launch_fixture_with_flags(&["--prefilled-name", "--foreground-type-probe"]);
+        live.fixture_frontmost(pid);
+        live.background_state = Some((pid, CGEvent::location(Some(&CGEvent::new(None).unwrap()))));
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let frame = obs
+            .elements
+            .iter()
+            .find(|e| e.label.as_deref() == Some("Name"))
+            .unwrap()
+            .frame;
+        let target = Target::Point {
+            point: [
+                f64::from(frame[0]) + 24.0,
+                f64::from(frame[1]) + f64::from(frame[3]) / 2.0,
+            ],
+        };
+        let outcome = live
+            .act_with_fallback(
+                Action::Type {
+                    text: "x".into(),
+                    target: Some(target),
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert!(outcome.foreground_used);
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let click = events
+            .iter()
+            .find(|e| e["type"] == "name_click")
+            .expect("native caret receipt");
+        eprintln!("native click receipt: {click}");
+        assert_eq!(click["length"], 0);
+        let expected = match click["location"].as_u64().unwrap() {
+            1 => "ax🦀c",
+            3 => "a🦀xc",
+            other => panic!("click must put the caret in the middle of a🦀c, got {other}"),
+        };
+        assert_eq!(
+            events.iter().rev().find(|e| e["type"] == "input").unwrap()["value"],
+            expected,
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn foreground_type_with_an_element_target_inserts_after_existing_text() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) = live.launch_fixture_with_flags(&[
+            "--prefilled-name",
+            "--foreground-type-probe",
+            "--select-name-on-click",
+        ]);
+        live.fixture_frontmost(pid);
+        live.background_state = Some((pid, CGEvent::location(Some(&CGEvent::new(None).unwrap()))));
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let outcome = live
+            .act_with_fallback(
+                Action::Type {
+                    text: "x".into(),
+                    target: Some(element_named(&obs, "Name")),
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert!(outcome.foreground_used);
+        live.assert_log_contains(&log, "\"value\":\"a🦀cx\"");
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+fn type_with_optional_selection(flags: &[&str], expected: &str) {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let mut options = vec!["--prefilled-name"];
+        options.extend_from_slice(flags);
+        let (_, log) = live.launch_fixture_with_flags(&options);
+        live.make_finder_frontmost();
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        // Same-field positive control: text delivery itself works without the optional collapse.
+        let control = live
+            .act(
+                Action::Type {
+                    text: "u".into(),
+                    target: None,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(!control.foreground_used);
+        live.assert_log_contains(&log, "\"value\":\"a🦀cu\"");
+        if flags.contains(&"--expire-selection-focus") || flags.contains(&"--no-name-length") {
+            let app = unsafe {
+                objc2_application_services::AXUIElement::new_application(
+                    live.apps()
+                        .into_iter()
+                        .find(|a| a.bundle_id == "dev.orca.cu-fixture")
+                        .unwrap()
+                        .pid
+                        .unwrap(),
+                )
+            };
+            let focused = fixture_ax_value(&app, "AXFocusedUIElement")
+                .unwrap()
+                .downcast::<objc2_application_services::AXUIElement>()
+                .unwrap();
+            assert_eq!(
+                fixture_ax_value(&focused, "AXIdentifier")
+                    .unwrap()
+                    .downcast::<objc2_core_foundation::CFString>()
+                    .unwrap()
+                    .to_string(),
+                "expiring-name-focus"
+            );
+            if flags.contains(&"--no-name-length") {
+                assert!(
+                    fixture_ax_value(&focused, "AXNumberOfCharacters").is_none(),
+                    "the native length read must be unavailable"
+                );
+            }
+        }
+        let result = live
+            .act(
+                Action::Type {
+                    text: "x".into(),
+                    target: Some(element_named(&obs, "Name")),
+                },
+                false,
+            )
+            .unwrap();
+        assert!(!result.foreground_used);
+        live.assert_log_contains(&log, &format!("\"value\":\"{expected}\""));
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn targeted_type_without_ax_value_uses_the_character_count() {
+    type_with_optional_selection(&["--no-name-value"], "a🦀cux");
+}
+
+#[test]
+#[ignore]
+fn targeted_type_without_a_readable_length_still_delivers_text() {
+    type_with_optional_selection(&["--no-name-value", "--no-name-length"], "a🦀cux");
+}
+
+#[test]
+#[ignore]
+fn targeted_type_with_an_unwritable_selection_still_delivers_text() {
+    type_with_optional_selection(&["--expire-selection-focus"], "a🦀cux");
+}
+
+fn foreground_point_click_without_early_hit(variant: &str) {
+    run_live_test(|| {
+        use objc2_application_services::{AXError, AXUIElement};
+        use objc2_core_foundation::CFString;
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) = live.launch_fixture_with_flags(&["--reject-hit-before-raise"]);
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let target = live.point_inside(
+            &obs,
+            if variant == "hidden" {
+                "Increment"
+            } else {
+                "canvas"
+            },
+        );
+        let action = Action::Click {
+            target,
+            button: if variant == "right" {
+                Button::Right
+            } else {
+                Button::Left
+            },
+            count: if variant == "double" { 2 } else { 1 },
+            modifiers: if variant == "modified" {
+                vec!["shift".into()]
+            } else {
+                vec![]
+            },
+        };
+        let app = unsafe { AXUIElement::new_application(pid) };
+        let window = fixture_ax_value(&app, "AXMainWindow")
+            .unwrap()
+            .downcast::<AXUIElement>()
+            .unwrap();
+        assert_eq!(
+            unsafe { window.perform_action(&CFString::from_str("AXRaise")) },
+            AXError::Success
+        );
+        live.make_finder_frontmost();
+        // Same native target/action control with a readable hit test, before resetting the probe.
+        live.act_with_fallback(action.clone(), false, true).unwrap();
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        live.act(
+            click_target(element_named(&obs, "Reset probe focus")),
+            false,
+        )
+        .unwrap();
+        live.assert_log_contains(&log, "\"type\":\"focus_reset\"");
+        if variant == "hidden" {
+            let application =
+                NSRunningApplication::runningApplicationWithProcessIdentifier(pid).unwrap();
+            let output = Command::new("osascript")
+                .args(["-e", "tell application \"System Events\" to set visible of process \"CUFixture\" to false"])
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !application.isHidden() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let outcome = live.act_with_fallback(action, false, true).unwrap();
+        assert!(outcome.foreground_used, "{variant}");
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("\"type\":\"early_hit\""),
+            "{variant}: must not hit test before raising the fixture"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn foreground_point_click_double_skips_the_pre_activation_hit_test() {
+    foreground_point_click_without_early_hit("double");
+}
+
+#[test]
+#[ignore]
+fn foreground_point_click_right_skips_the_pre_activation_hit_test() {
+    foreground_point_click_without_early_hit("right");
+}
+
+#[test]
+#[ignore]
+fn foreground_point_click_modified_skips_the_pre_activation_hit_test() {
+    foreground_point_click_without_early_hit("modified");
+}
+
+#[test]
+#[ignore]
+fn foreground_point_click_hidden_skips_the_pre_activation_hit_test() {
+    foreground_point_click_without_early_hit("hidden");
 }
