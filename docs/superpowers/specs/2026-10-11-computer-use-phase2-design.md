@@ -248,7 +248,7 @@ Step 3 的真机测试现在是 `typing_with_a_chinese_input_method_enters_the_t
 
 画布另做正向对照，不计入六项结果：仍用同一 Orca 会话和夹具，在截图 `(960,512)` 点击，独立日志记录 `canvas_click(x=140,y=116)`，接近源码中画布的中心 `(140,110)`。对照额外用了 4 次 `computer`、6 次审批；不能用它把原中心任务改记为成功。同一 Calculator／Finder 元素的独立原生读取还确认：`AXRole` 可读时，`AXSubrole` 能返回 `-25200`；TextEdit、Safari 和夹具的 Orca 观察成功，不能把失败归结为整机无权限或应用完全没有元素树。
 
-本轮有验收脚本自身的偏差：读取 Safari 基线的 AppleScript 额外触发了系统授权提示，脚本被终止，没有选择允许或拒绝；最终检查时提示已自行消失。TextEdit 中止时还有上述误 Deny，因此本轮不是无执行偏差的干净验收。正文和临时文档已写到工作区外的 iCloud 目录，未移动或删除。退出本次启动的 TextEdit、Calculator、夹具和 Cherry Studio，关闭本次 Finder 窗口和 Safari 标签页；原 Finder 窗口及 Safari 三个标签页保留。前台 cmux 和指针 `(375,1067)` 已恢复，tmux、Orca 驱动和 caffeinate 已退出，开始／结束通知已发送。
+本轮有验收脚本自身的偏差：读取 Safari 基线的 AppleScript 额外触发了系统授权提示，脚本被终止，没有选择允许或拒绝；最终 AX 与 System Events 检查均已无该提示窗口，未判断其消失原因。TextEdit 中止时还有上述误 Deny，因此本轮不是无执行偏差的干净验收。正文和临时文档已写到工作区外的 iCloud 目录，未移动或删除。退出本次启动的 TextEdit、Calculator、夹具和 Cherry Studio，关闭本次 Finder 窗口和 Safari 标签页；原 Finder 窗口及 Safari 三个标签页保留。前台 cmux 和指针 `(375,1067)` 已恢复，tmux、Orca 驱动和 caffeinate 已退出，开始／结束通知已发送。
 
 值得修复或复测的问题：
 
