@@ -42,11 +42,34 @@ enum ModalStep<T> {
     Unreadable,
 }
 
-fn modal_ancestry<T>(
+fn modal_ancestry<T: Clone + PartialEq>(
+    current: T,
+    read: impl FnMut(T) -> Result<ModalStep<T>, DriverError>,
+) -> Result<bool, DriverError> {
+    modal_ancestry_until(
+        current,
+        read,
+        std::time::Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT,
+    )
+}
+
+fn modal_ancestry_until<T: Clone + PartialEq>(
     mut current: T,
     mut read: impl FnMut(T) -> Result<ModalStep<T>, DriverError>,
+    deadline: std::time::Instant,
 ) -> Result<bool, DriverError> {
-    for _ in 0..8 {
+    let mut visited = Vec::new();
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(error(
+                ErrorKind::Failed,
+                "The modal check timed out; observe again",
+            ));
+        }
+        if visited.contains(&current) {
+            return Ok(true);
+        }
+        visited.push(current.clone());
         match read(current) {
             Ok(ModalStep::Root(modal)) => return Ok(modal),
             Ok(ModalStep::Parent(parent)) => current = parent,
@@ -55,10 +78,73 @@ fn modal_ancestry<T>(
             Err(failure) => return Err(failure),
         }
     }
-    Ok(true)
+}
+
+fn modal_for_recipient<T>(
+    read_window: impl FnOnce() -> Result<Option<T>, DriverError>,
+    inspect_window: impl FnOnce(T) -> Result<bool, DriverError>,
+    fallback: impl FnOnce() -> Result<bool, DriverError>,
+) -> Result<bool, DriverError> {
+    let result = match read_window() {
+        Ok(Some(window)) => inspect_window(window),
+        Ok(None) => fallback(),
+        Err(failure) => Err(failure),
+    };
+    match result {
+        Err(failure) if failure.kind == ErrorKind::NeedsForeground => Ok(true),
+        other => other,
+    }
+}
+
+fn window_metadata_is_modal(
+    role: Option<&str>,
+    subrole: Option<&str>,
+    modal: Option<bool>,
+    parent_role: Option<&str>,
+) -> bool {
+    role.is_none()
+        || role == Some("AXSheet")
+        || subrole == Some("AXSheet")
+        || modal == Some(true)
+        || parent_role == Some("AXSheet")
+}
+
+fn inspect_modal_window(window: AxElement) -> Result<bool, DriverError> {
+    let role = window.modal_attribute_string("AXRole")?;
+    let subrole = window.modal_attribute_string("AXSubrole")?;
+    if window_metadata_is_modal(role.as_deref(), subrole.as_deref(), None, None) {
+        return Ok(true);
+    }
+    let modal = window.modal_attribute_bool("AXModal")?;
+    if modal == Some(true) {
+        return Ok(true);
+    }
+    let parent_role = if let Some(parent) = window.modal_attribute_element("AXParent")? {
+        Some(
+            parent
+                .modal_attribute_string("AXRole")?
+                .ok_or_else(|| foreground("Unreadable window parent role"))?,
+        )
+    } else {
+        None
+    };
+    Ok(window_metadata_is_modal(
+        role.as_deref(),
+        subrole.as_deref(),
+        modal,
+        parent_role.as_deref(),
+    ))
 }
 
 fn in_modal_sheet(element: &AxElement) -> Result<bool, DriverError> {
+    modal_for_recipient(
+        || element.modal_attribute_element("AXWindow"),
+        inspect_modal_window,
+        || modal_parent_walk(element),
+    )
+}
+
+fn modal_parent_walk(element: &AxElement) -> Result<bool, DriverError> {
     modal_ancestry(element.clone(), |element| {
         let role = element.modal_attribute_string("AXRole")?;
         if role.is_none() {
@@ -596,6 +682,116 @@ mod tests {
     use crate::geometry::CaptureGeometry;
 
     #[test]
+    fn part4_window_unreadable_role_requires_foreground() {
+        assert!(window_metadata_is_modal(None, None, None, None));
+    }
+
+    #[test]
+    fn part4_window_fallback_timeout_stays_failed_without_reading() {
+        let failure = modal_ancestry_until(
+            0,
+            |_| panic!("expired checks cannot read AX"),
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(failure.kind, ErrorKind::Failed);
+    }
+
+    #[test]
+    fn part4_window_avoids_ancestry_reads_for_a_deep_nonmodal_field() {
+        let mut fallback_read = false;
+        let modal = modal_for_recipient(
+            || Ok(Some(1)),
+            |_| Ok(false),
+            || {
+                fallback_read = true;
+                modal_ancestry(0, |depth| {
+                    Ok(if depth == 40 {
+                        ModalStep::Root(false)
+                    } else {
+                        ModalStep::Parent(depth + 1)
+                    })
+                })
+            },
+        )
+        .unwrap();
+        assert!(
+            !modal,
+            "a known non-modal AXWindow stays background regardless of field depth"
+        );
+        assert!(!fallback_read);
+    }
+
+    #[test]
+    fn part4_window_detects_sheet_subrole_and_sheet_parent() {
+        assert!(window_metadata_is_modal(
+            Some("AXWindow"),
+            Some("AXSheet"),
+            Some(false),
+            Some("AXApplication")
+        ));
+        assert!(window_metadata_is_modal(
+            Some("AXWindow"),
+            None,
+            None,
+            Some("AXSheet")
+        ));
+        assert!(window_metadata_is_modal(Some("AXSheet"), None, None, None));
+        assert!(window_metadata_is_modal(
+            Some("AXWindow"),
+            None,
+            Some(true),
+            Some("AXApplication")
+        ));
+        assert!(!window_metadata_is_modal(
+            Some("AXWindow"),
+            Some("AXStandardWindow"),
+            None,
+            Some("AXApplication")
+        ));
+    }
+
+    #[test]
+    fn part4_window_preserves_errors_and_only_falls_back_for_absence() {
+        for kind in [ErrorKind::Stale, ErrorKind::Failed] {
+            let failure = error(kind, "required window read failed");
+            let result = modal_for_recipient::<u32>(
+                || Err(failure.clone()),
+                |_| panic!("no window"),
+                || Ok(false),
+            );
+            assert_eq!(result.unwrap_err(), failure);
+        }
+        assert!(
+            modal_for_recipient::<u32>(
+                || Err(error(ErrorKind::NeedsForeground, "AXWindow Failure")),
+                |_| panic!("no window"),
+                || panic!("Failure must require foreground")
+            )
+            .unwrap()
+        );
+        assert!(
+            modal_for_recipient::<u32>(|| Ok(None), |_| panic!("no window"), || Ok(true)).unwrap()
+        );
+        assert!(
+            !modal_for_recipient::<u32>(|| Ok(None), |_| panic!("no window"), || Ok(false))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn part4_window_fallback_has_no_eight_level_cutoff() {
+        assert!(
+            !modal_ancestry(0, |depth| Ok(if depth == 40 {
+                ModalStep::Root(false)
+            } else {
+                ModalStep::Parent(depth + 1)
+            }))
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn part4_ordinary_type_does_not_require_a_recipient_role_read() {
         for text in ["", "Hello 🦀", "approved secret"] {
             let mut read = false;
@@ -672,24 +868,8 @@ mod tests {
     }
 
     #[test]
-    fn modal_deep_ancestry_requires_foreground() {
-        assert!(modal_ancestry(0, |depth| Ok(ModalStep::Parent(depth + 1))).unwrap());
-        assert!(
-            modal_ancestry(0, |depth| Ok(if depth == 8 {
-                ModalStep::Root(false)
-            } else {
-                ModalStep::Parent(depth + 1)
-            }))
-            .unwrap()
-        );
-        assert!(
-            !modal_ancestry(0, |depth| Ok(if depth == 7 {
-                ModalStep::Root(false)
-            } else {
-                ModalStep::Parent(depth + 1)
-            }))
-            .unwrap()
-        );
+    fn modal_fallback_cycles_are_unreadable_but_known_roots_remain_nonmodal() {
+        assert!(modal_ancestry(0, |node| Ok(ModalStep::Parent(1 - node))).unwrap());
         assert!(modal_ancestry(0, |_| Ok(ModalStep::Root(true))).unwrap());
         assert!(!modal_ancestry(0, |_| Ok(ModalStep::Root(false))).unwrap());
     }

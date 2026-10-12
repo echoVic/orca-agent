@@ -11,7 +11,7 @@ use objc2_core_foundation::{
 use super::error;
 use crate::protocol::{DriverError, ErrorKind};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct AxElement(pub(crate) CFRetained<AXUIElement>);
 
 // AX handles identify remote UI objects and have no AppKit thread affinity.
