@@ -139,9 +139,12 @@ pub(super) fn list() -> Result<Vec<AppInfo>, DriverError> {
 
 /// Observe/act receive an already approved bundle ID; names cannot widen it.
 pub(super) fn resolve_approved(bundle_id: &str) -> Result<AppInfo, DriverError> {
-    list()?
-        .into_iter()
-        .find(|app| app.bundle_id.eq_ignore_ascii_case(bundle_id))
+    resolve_approved_from_apps(bundle_id, list()?)
+}
+
+fn resolve_approved_from_apps(bundle_id: &str, apps: Vec<AppInfo>) -> Result<AppInfo, DriverError> {
+    apps.into_iter()
+        .find(|app| app.bundle_id == bundle_id)
         .ok_or_else(|| {
             error(
                 ErrorKind::AppNotFound,
@@ -161,7 +164,7 @@ fn looks_like_bundle_id(name: &str) -> bool {
 }
 
 fn require_bundle_identity(input: &str, app: &AppInfo) -> Result<(), DriverError> {
-    if looks_like_bundle_id(input) && !input.eq_ignore_ascii_case(&app.bundle_id) {
+    if input != app.bundle_id {
         return Err(error(
             ErrorKind::AppNotFound,
             format!(
@@ -264,10 +267,36 @@ fn installed_info(bundle: &NSBundle, fallback_name: &str) -> Option<AppInfo> {
     })
 }
 
-fn find_installed_bundle(
+/// Resolve exact IDs before folded IDs; folded variants are distinct identities.
+fn select_identity<'a>(
     name: &str,
-    roots: &[std::path::PathBuf],
-) -> Result<Option<Retained<NSBundle>>, DriverError> {
+    apps: impl IntoIterator<Item = &'a AppInfo>,
+) -> Result<Option<&'a AppInfo>, DriverError> {
+    let apps: Vec<_> = apps.into_iter().collect();
+    let exact: Vec<_> = apps
+        .iter()
+        .copied()
+        .filter(|app| app.bundle_id == name)
+        .collect();
+    let candidates = if exact.is_empty() {
+        apps.into_iter()
+            .filter(|app| app.bundle_id.eq_ignore_ascii_case(name))
+            .collect()
+    } else {
+        exact
+    };
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [app] => Ok(Some(*app)),
+        _ => Err(DriverError {
+            kind: ErrorKind::AppAmbiguous,
+            message: format!("More than one app matches bundle ID {name}; use its exact bundle ID"),
+            candidates: candidates.into_iter().cloned().collect(),
+        }),
+    }
+}
+
+fn installed_bundles(roots: &[std::path::PathBuf]) -> Vec<(AppInfo, Retained<NSBundle>)> {
     let mut candidates = vec![];
     for root in roots {
         let Ok(entries) = std::fs::read_dir(root) else {
@@ -293,20 +322,27 @@ fn find_installed_bundle(
             let Some(info) = installed_info(&bundle, stem) else {
                 continue;
             };
-            if info.bundle_id.eq_ignore_ascii_case(name) || bundle_name_matches(&bundle, name) {
-                candidates.push((info, bundle));
-            }
+            candidates.push((info, bundle));
         }
     }
-    // Explicit identities win over a bundle folder that happens to have that name.
-    if candidates
-        .iter()
-        .any(|(app, _)| app.bundle_id.eq_ignore_ascii_case(name))
-    {
-        candidates.retain(|(app, _)| app.bundle_id.eq_ignore_ascii_case(name));
+    candidates.sort_by(|(a, _), (b, _)| a.bundle_id.cmp(&b.bundle_id));
+    candidates.dedup_by(|a, b| a.0.bundle_id == b.0.bundle_id);
+    candidates
+}
+
+fn find_installed_bundle(
+    name: &str,
+    roots: &[std::path::PathBuf],
+) -> Result<Option<Retained<NSBundle>>, DriverError> {
+    let mut candidates = installed_bundles(roots);
+    if let Some(identity) = select_identity(name, candidates.iter().map(|(app, _)| app))? {
+        let id = identity.bundle_id.clone();
+        return Ok(candidates
+            .into_iter()
+            .find(|(app, _)| app.bundle_id == id)
+            .map(|(_, bundle)| bundle));
     }
-    candidates.sort_by_key(|(app, _)| app.bundle_id.to_ascii_lowercase());
-    candidates.dedup_by(|a, b| a.0.bundle_id.eq_ignore_ascii_case(&b.0.bundle_id));
+    candidates.retain(|(_, bundle)| bundle_name_matches(bundle, name));
     if candidates.len() > 1 {
         return Err(DriverError {
             kind: ErrorKind::AppAmbiguous,
@@ -331,26 +367,24 @@ pub(super) fn resolve(name: &str, allow_not_running: bool) -> Result<AppInfo, Dr
     resolve_with_apps(name, allow_not_running, list()?, &application_roots())
 }
 
-fn installed_identity(
-    name: &str,
-    roots: &[std::path::PathBuf],
-) -> Result<Option<AppInfo>, DriverError> {
-    let workspace = NSWorkspace::sharedWorkspace();
-    if let Some(url) = workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(name))
+fn installed_identities(name: &str, roots: &[std::path::PathBuf]) -> Vec<AppInfo> {
+    let mut candidates: Vec<_> = installed_bundles(roots)
+        .into_iter()
+        .map(|(info, _)| info)
+        .filter(|info| info.bundle_id.eq_ignore_ascii_case(name))
+        .collect();
+    if let Some(url) = NSWorkspace::sharedWorkspace()
+        .URLForApplicationWithBundleIdentifier(&NSString::from_str(name))
         && let Some(bundle) = NSBundle::bundleWithURL(&url)
         && let Some(info) = installed_info(&bundle, name)
         && info.bundle_id.eq_ignore_ascii_case(name)
+        && !candidates
+            .iter()
+            .any(|candidate| candidate.bundle_id == info.bundle_id)
     {
-        require_bundle_identity(name, &info)?;
-        return Ok(Some(info));
+        candidates.push(info);
     }
-    if let Some(bundle) = find_installed_bundle(name, roots)?
-        && let Some(info) = installed_info(&bundle, name)
-        && info.bundle_id.eq_ignore_ascii_case(name)
-    {
-        return Ok(Some(info));
-    }
-    Ok(None)
+    candidates
 }
 
 fn resolve_with_apps(
@@ -359,18 +393,28 @@ fn resolve_with_apps(
     apps: Vec<AppInfo>,
     roots: &[std::path::PathBuf],
 ) -> Result<AppInfo, DriverError> {
-    if let Some(app) = apps
-        .iter()
-        .find(|app| app.bundle_id.eq_ignore_ascii_case(name))
-    {
+    if let Some(app) = select_identity(name, apps.iter().filter(|app| app.bundle_id == name))? {
         return Ok(app.clone());
     }
-    // A known installed identity wins before interpreting a dotted input as a name.
-    if allow_not_running
-        && looks_like_bundle_id(name)
-        && let Some(info) = installed_identity(name, roots)?
-    {
-        return Ok(info);
+    // Installed exact identities must win over a case-folded running impostor,
+    // including resolve(..., false): a quit installed app cannot become another app.
+    let mut identities = apps.clone();
+    for installed in installed_identities(name, roots) {
+        if !identities
+            .iter()
+            .any(|app| app.bundle_id == installed.bundle_id)
+        {
+            identities.push(installed);
+        }
+    }
+    if let Some(app) = select_identity(name, &identities)? {
+        if app.pid.is_some() || allow_not_running {
+            return Ok(app.clone());
+        }
+        return Err(error(
+            ErrorKind::AppNotFound,
+            format!("App is installed but not running: {}", app.bundle_id),
+        ));
     }
     let mut candidates = vec![];
     for app in apps {
@@ -390,9 +434,6 @@ fn resolve_with_apps(
         }
     }
     if allow_not_running {
-        if let Some(info) = installed_identity(name, roots)? {
-            return Ok(info);
-        }
         if let Some(bundle) = find_installed_bundle(name, roots)?
             && let Some(info) = installed_info(&bundle, name)
         {
@@ -458,6 +499,11 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
         .and_then(|app| app.bundleURL())
         .or_else(|| {
             workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(&app.bundle_id))
+        })
+        .filter(|url| {
+            NSBundle::bundleWithURL(url)
+                .and_then(|bundle| bundle.bundleIdentifier())
+                .is_some_and(|id| id.to_string() == app.bundle_id)
         });
     let url = match url {
         Some(url) => url,
@@ -531,16 +577,17 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
             return Err(error(ErrorKind::Failed, "App launch timed out"));
         }
         if let Some(app) = list_with_timeout(remaining)?.into_iter().find(|candidate| {
-            candidate.bundle_id.eq_ignore_ascii_case(&app.bundle_id)
-                && candidate.pid == Some(launched_pid)
+            candidate.bundle_id == app.bundle_id && candidate.pid == Some(launched_pid)
         }) {
             if wait_for_accessibility_window(launched_pid, deadline) {
                 // The first capture listing can precede the now-readable window.
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if !remaining.is_zero()
-                    && let Some(refreshed) = list_with_timeout(remaining)?
-                        .into_iter()
-                        .find(|candidate| candidate.pid == Some(launched_pid))
+                    && let Some(refreshed) =
+                        list_with_timeout(remaining)?.into_iter().find(|candidate| {
+                            candidate.pid == Some(launched_pid)
+                                && candidate.bundle_id == app.bundle_id
+                        })
                 {
                     return Ok(refreshed);
                 }
@@ -575,6 +622,133 @@ mod tests {
         .unwrap();
     }
 
+    fn running_fixture(id: &str, name: &str, pid: i32) -> AppInfo {
+        AppInfo {
+            bundle_id: id.into(),
+            name: name.into(),
+            pid: Some(pid),
+            category: None,
+            windows: vec![],
+        }
+    }
+
+    #[test]
+    fn part4_identity_launch_guard_keeps_the_selected_canonical_id() {
+        let impostor = running_fixture("com.apple.passwords", "Passwords", 42);
+        assert_eq!(
+            require_bundle_identity("com.apple.Passwords", &impostor)
+                .unwrap_err()
+                .kind,
+            ErrorKind::AppNotFound
+        );
+        let canonical = running_fixture("com.apple.Passwords", "Passwords", 43);
+        assert!(require_bundle_identity("com.apple.Passwords", &canonical).is_ok());
+    }
+
+    #[test]
+    fn part4_identity_running_exact_match_precedes_case_folded_match() {
+        let impostor = running_fixture("com.apple.passwords", "Passwords", 42);
+        let canonical = running_fixture("com.apple.Passwords", "Passwords", 43);
+        assert_eq!(
+            resolve_with_apps(
+                "com.apple.Passwords",
+                false,
+                vec![impostor, canonical.clone()],
+                &[]
+            )
+            .unwrap(),
+            canonical
+        );
+    }
+
+    #[test]
+    fn part4_identity_approved_id_never_accepts_a_case_variant() {
+        let impostor = running_fixture("com.apple.passwords", "Passwords", 42);
+        assert_eq!(
+            resolve_approved_from_apps("com.apple.Passwords", vec![impostor])
+                .unwrap_err()
+                .kind,
+            ErrorKind::AppNotFound
+        );
+        let canonical = running_fixture("com.apple.Passwords", "Passwords", 43);
+        assert_eq!(
+            resolve_approved_from_apps("com.apple.Passwords", vec![canonical.clone()]).unwrap(),
+            canonical
+        );
+    }
+
+    #[test]
+    fn part4_identity_installed_canonical_passwords_cannot_be_lowered_by_a_running_impostor() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "Passwords", "com.apple.Passwords");
+        let impostor = running_fixture("com.apple.passwords", "Passwords", 42);
+        let resolved = resolve_with_apps(
+            "com.apple.Passwords",
+            true,
+            vec![impostor.clone()],
+            &[temp.path().into()],
+        )
+        .unwrap();
+        assert_eq!(resolved.bundle_id, "com.apple.Passwords");
+        assert_eq!(
+            crate::apps::risk_tier(&resolved.bundle_id, resolved.category.as_deref(), None),
+            crate::apps::RiskTier::Forbidden
+        );
+        assert_eq!(
+            resolve_with_apps(
+                "com.apple.Passwords",
+                false,
+                vec![impostor],
+                &[temp.path().into()]
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::AppNotFound
+        );
+    }
+
+    #[test]
+    fn part4_identity_running_case_variants_are_ambiguous_without_an_exact_match() {
+        let lower = running_fixture("dev.orca.case-app", "Lower", 42);
+        let upper = running_fixture("dev.orca.Case-App", "Upper", 43);
+        assert_eq!(
+            resolve_with_apps(
+                "DEV.ORCA.CASE-APP",
+                false,
+                vec![lower.clone(), upper.clone()],
+                &[]
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::AppAmbiguous
+        );
+        assert_eq!(
+            resolve_with_apps("dev.orca.Case-App", false, vec![lower, upper.clone()], &[]).unwrap(),
+            upper
+        );
+    }
+
+    #[test]
+    fn part4_identity_installed_case_variants_are_ambiguous_without_an_exact_match() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "Lower", "dev.orca.case-app");
+        application_fixture(temp.path(), "Upper", "dev.orca.Case-App");
+        assert_eq!(
+            resolve_with_apps("DEV.ORCA.CASE-APP", true, vec![], &[temp.path().into()])
+                .unwrap_err()
+                .kind,
+            ErrorKind::AppAmbiguous
+        );
+        for id in ["dev.orca.case-app", "dev.orca.Case-App"] {
+            assert_eq!(
+                resolve_with_apps(id, true, vec![], &[temp.path().into()])
+                    .unwrap()
+                    .bundle_id,
+                id
+            );
+        }
+    }
+
     #[test]
     fn bundle_id_resolution_is_case_insensitive_and_retains_canonical_identity() {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
@@ -596,7 +770,7 @@ mod tests {
                 .bundle_id,
             "dev.orca.case-app"
         );
-        assert!(require_bundle_identity("DEV.ORCA.CASE-APP", &running).is_ok());
+        assert!(require_bundle_identity(&running.bundle_id, &running).is_ok());
     }
 
     #[test]
