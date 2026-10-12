@@ -144,19 +144,30 @@ fn in_modal_sheet(element: &AxElement) -> Result<bool, DriverError> {
     )
 }
 
+fn modal_root(
+    role: &str,
+    inspect_window: impl FnOnce() -> Result<bool, DriverError>,
+    read_application_modal: impl FnOnce() -> Result<bool, DriverError>,
+) -> Result<Option<bool>, DriverError> {
+    match role {
+        "AXSheet" => Ok(Some(true)),
+        "AXWindow" => inspect_window().map(Some),
+        "AXApplication" => read_application_modal().map(Some),
+        _ => Ok(None),
+    }
+}
+
 fn modal_parent_walk(element: &AxElement) -> Result<bool, DriverError> {
     modal_ancestry(element.clone(), |element| {
-        let role = element.modal_attribute_string("AXRole")?;
-        if role.is_none() {
+        let Some(role) = element.modal_attribute_string("AXRole")? else {
             return Ok(ModalStep::Unreadable);
-        }
-        if role.as_deref() == Some("AXSheet") {
-            return Ok(ModalStep::Root(true));
-        }
-        if matches!(role.as_deref(), Some("AXWindow" | "AXApplication")) {
-            return Ok(ModalStep::Root(
-                element.modal_attribute_bool("AXModal")?.unwrap_or(false),
-            ));
+        };
+        if let Some(modal) = modal_root(
+            &role,
+            || inspect_modal_window(element.clone()),
+            || Ok(element.modal_attribute_bool("AXModal")?.unwrap_or(false)),
+        )? {
+            return Ok(ModalStep::Root(modal));
         }
         Ok(element
             .modal_attribute_element("AXParent")?
@@ -680,6 +691,66 @@ fn scroll(
 mod tests {
     use super::*;
     use crate::geometry::CaptureGeometry;
+
+    #[test]
+    fn part4_fallback_window_uses_sheet_subroles_and_sheet_parents() {
+        for (subrole, parent) in [
+            (Some("AXSheet"), Some("AXApplication")),
+            (None, Some("AXSheet")),
+        ] {
+            assert_eq!(
+                modal_root(
+                    "AXWindow",
+                    || Ok(window_metadata_is_modal(
+                        Some("AXWindow"),
+                        subrole,
+                        Some(false),
+                        parent
+                    )),
+                    || Ok(false)
+                )
+                .unwrap(),
+                Some(true)
+            );
+        }
+        assert_eq!(
+            modal_root(
+                "AXWindow",
+                || Ok(false),
+                || panic!("a window cannot use the application-only check")
+            )
+            .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            modal_root("AXApplication", || panic!("not a window"), || Ok(false)).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            modal_root(
+                "AXSheet",
+                || panic!("already a sheet"),
+                || panic!("already a sheet")
+            )
+            .unwrap(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn part4_fallback_window_preserves_inspection_errors() {
+        for kind in [
+            ErrorKind::Stale,
+            ErrorKind::Failed,
+            ErrorKind::NeedsForeground,
+        ] {
+            let failure = error(kind, "window inspection failed");
+            assert_eq!(
+                modal_root("AXWindow", || Err(failure.clone()), || Ok(false)).unwrap_err(),
+                failure
+            );
+        }
+    }
 
     #[test]
     fn part4_window_unreadable_role_requires_foreground() {
