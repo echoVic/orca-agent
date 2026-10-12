@@ -18,7 +18,7 @@ orca-platform = { path = "../orca-platform" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSEnumerator", "NSBundle", "NSError", "NSObject", "NSProcessInfo", "NSString", "NSURL"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSEnumerator", "NSBundle", "NSError", "NSObject", "NSProcessInfo", "NSString", "NSURL"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSRunningApplication", "block2", "libc"] }
 objc2-application-services = { version = "0.3.2", default-features = false, features = ["std", "AXUIElement", "AXValue", "AXError", "AXAttributeConstants", "AXActionConstants", "AXRoleConstants", "HIServices", "Processes", "libc"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGEvent", "CGEventTypes", "CGEventSource", "CGRemoteOperation", "CGImage", "CGBitmapContext", "CGContext", "CGColorSpace", "CGDataProvider", "CGWindow", "CGError", "CGSession", "libc"] }

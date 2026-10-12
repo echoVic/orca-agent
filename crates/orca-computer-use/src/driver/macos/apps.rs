@@ -150,6 +150,77 @@ pub(super) fn resolve_approved(bundle_id: &str) -> Result<AppInfo, DriverError> 
         })
 }
 
+fn looks_like_bundle_id(name: &str) -> bool {
+    name.contains('.')
+        && name.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+}
+
+fn require_bundle_identity(input: &str, app: &AppInfo) -> Result<(), DriverError> {
+    if looks_like_bundle_id(input) && input != app.bundle_id {
+        return Err(error(
+            ErrorKind::AppNotFound,
+            format!(
+                "Requested bundle ID {input:?} resolved to {:?}; refusing a different app",
+                app.bundle_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn running_name_matches(
+    app: &AppInfo,
+    name: &str,
+    roots: &[std::path::PathBuf],
+) -> Result<bool, DriverError> {
+    if app.name.to_lowercase() == name.to_lowercase() {
+        return Ok(true);
+    }
+    let url = app
+        .pid
+        .and_then(NSRunningApplication::runningApplicationWithProcessIdentifier)
+        .and_then(|running| running.bundleURL())
+        .or_else(|| {
+            NSWorkspace::sharedWorkspace()
+                .URLForApplicationWithBundleIdentifier(&NSString::from_str(&app.bundle_id))
+        });
+    let bundle = match url.and_then(|url| NSBundle::bundleWithURL(&url)) {
+        Some(bundle) => Some(bundle),
+        None => find_installed_bundle(&app.bundle_id, roots)?,
+    };
+    let Some(bundle) = bundle else {
+        return Ok(false);
+    };
+    if bundle
+        .bundleIdentifier()
+        .is_none_or(|id| id.to_string() != app.bundle_id)
+    {
+        return Ok(false);
+    }
+    // infoDictionary is intentionally non-localized, unlike objectForInfoDictionaryKey.
+    let raw_name = bundle
+        .infoDictionary()
+        .and_then(|info| info.objectForKey(&NSString::from_str("CFBundleName")))
+        .and_then(|value| value.downcast::<NSString>().ok())
+        .map(|value| value.to_string());
+    let folder_name = bundle.bundleURL().path().and_then(|path| {
+        std::path::Path::new(&path.to_string())
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_owned)
+    });
+    let wanted = name.to_lowercase();
+    Ok(raw_name
+        .into_iter()
+        .chain(folder_name)
+        .any(|alias| alias.to_lowercase() == wanted))
+}
+
 fn application_roots() -> Vec<std::path::PathBuf> {
     let mut roots = vec![
         "/Applications".into(),
@@ -208,7 +279,9 @@ fn find_installed_bundle(
             let Some(info) = installed_info(&bundle, stem) else {
                 continue;
             };
-            if info.bundle_id == name || stem.to_lowercase() == wanted {
+            if info.bundle_id == name
+                || (!looks_like_bundle_id(name) && stem.to_lowercase() == wanted)
+            {
                 candidates.push((info, bundle));
             }
         }
@@ -252,10 +325,14 @@ fn resolve_with_apps(
     if let Some(app) = apps.iter().find(|app| app.bundle_id == name) {
         return Ok(app.clone());
     }
-    let candidates: Vec<_> = apps
-        .into_iter()
-        .filter(|app| app.name.to_lowercase() == name.to_lowercase())
-        .collect();
+    let mut candidates = vec![];
+    if !looks_like_bundle_id(name) {
+        for app in apps {
+            if running_name_matches(&app, name, roots)? {
+                candidates.push(app);
+            }
+        }
+    }
     match candidates.as_slice() {
         [app] => return Ok(app.clone()),
         [] => {}
@@ -274,11 +351,13 @@ fn resolve_with_apps(
             && let Some(bundle) = NSBundle::bundleWithURL(&url)
             && let Some(info) = installed_info(&bundle, name)
         {
+            require_bundle_identity(name, &info)?;
             return Ok(info);
         }
         if let Some(bundle) = find_installed_bundle(name, roots)?
             && let Some(info) = installed_info(&bundle, name)
         {
+            require_bundle_identity(name, &info)?;
             return Ok(info);
         }
     }
@@ -334,6 +413,7 @@ fn wait_for_accessibility_window(pid: i32, launch_deadline: Instant) -> bool {
 pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let app = resolve(name, true)?;
+    require_bundle_identity(name, &app)?;
     let workspace = NSWorkspace::sharedWorkspace();
     let url = app
         .pid
@@ -555,6 +635,67 @@ mod tests {
         let by_id =
             resolve_with_apps("dev.orca.test.second.textedit", true, vec![], &roots).unwrap();
         assert_eq!(by_id.bundle_id, "dev.orca.test.second.textedit");
+    }
+
+    #[test]
+    fn a_bundle_id_input_cannot_resolve_another_app_by_folder_or_display_name() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "com.real.app", "dev.orca.other-app");
+        assert_eq!(
+            resolve_with_apps("com.real.app", true, vec![], &[temp.path().into()])
+                .unwrap_err()
+                .kind,
+            ErrorKind::AppNotFound
+        );
+        let impostor = AppInfo {
+            bundle_id: "dev.orca.other-app".into(),
+            name: "com.real.app".into(),
+            pid: Some(42),
+            category: None,
+            windows: vec![],
+        };
+        assert_eq!(
+            resolve_with_apps("com.real.app", false, vec![impostor], &[])
+                .unwrap_err()
+                .kind,
+            ErrorKind::AppNotFound
+        );
+        let real = AppInfo {
+            bundle_id: "com.real.app".into(),
+            name: "Real".into(),
+            pid: Some(43),
+            category: None,
+            windows: vec![],
+        };
+        assert_eq!(
+            resolve_with_apps("com.real.app", false, vec![real.clone()], &[]).unwrap(),
+            real
+        );
+    }
+
+    #[test]
+    fn running_app_names_accept_raw_bundle_and_folder_names_as_well_as_localized_name() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "EditorFolder", "dev.orca.localized-editor");
+        let app = AppInfo {
+            bundle_id: "dev.orca.localized-editor".into(),
+            name: "文本编辑".into(),
+            pid: Some(42),
+            category: None,
+            windows: vec![],
+        };
+        for name in [
+            "TextEdit",
+            "textedit",
+            "EditorFolder",
+            "editorfolder",
+            "文本编辑",
+        ] {
+            assert_eq!(
+                resolve_with_apps(name, false, vec![app.clone()], &[temp.path().into()]).unwrap(),
+                app
+            );
+        }
     }
 
     #[test]

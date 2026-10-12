@@ -4825,3 +4825,107 @@ fn background_type_300_characters_roundtrips_in_textedit_document() {
         background_300_roundtrip(&live, "com.apple.TextEdit", window, &editor, None);
     });
 }
+
+#[test]
+#[ignore]
+fn a_running_localized_textedit_resolves_by_its_english_name_for_observe() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        if !bundle_pids("com.apple.TextEdit").is_empty() {
+            eprintln!("skipped: TextEdit already running");
+            return;
+        }
+        let file = live.directory.path().join("orca-cu-english-name.txt");
+        std::fs::write(&file, "Own temporary English-name observe control").unwrap();
+        let app = launch_test_app(
+            &mut live,
+            "com.apple.TextEdit",
+            vec![file.to_string_lossy().into_owned()],
+        );
+        let window = app
+            .windows
+            .iter()
+            .find(|w| w.title.contains("orca-cu-english-name.txt"))
+            .unwrap()
+            .id;
+        // The bundle-ID observe of that same owned window is the positive control.
+        let control = live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
+        assert!(control.elements.iter().any(|e| e.role == "text area"));
+        eprintln!(
+            "running TextEdit localized name: {:?}, pid={:?}",
+            app.name, app.pid
+        );
+        let reply = live
+            .client
+            .call(
+                Request::ResolveApp {
+                    app: "TextEdit".into(),
+                    allow_not_running: false,
+                },
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let Reply::Resolved { app: resolved } = reply else {
+            panic!("resolved app")
+        };
+        assert_eq!(resolved.bundle_id, "com.apple.TextEdit");
+        assert_eq!(resolved.pid, app.pid);
+        let observed = live.observe_window(&resolved.bundle_id, Some(window), None, 300, false);
+        assert!(observed.elements.iter().any(|e| e.role == "text area"));
+    });
+}
+
+fn cold_launch_by_name(name: &str, bundle: &str) {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let before = bundle_pids(bundle);
+        if !before.is_empty() {
+            eprintln!("skipped: {name} already running");
+            return;
+        }
+        let open = if bundle == "com.apple.TextEdit" {
+            let file = live.directory.path().join("orca-cu-cold-name.txt");
+            std::fs::write(&file, "Own cold-launch document").unwrap();
+            vec![file.to_string_lossy().into_owned()]
+        } else {
+            vec![]
+        };
+        let result = live.client.call(
+            Request::LaunchApp {
+                app: name.into(),
+                open,
+            },
+            Duration::from_secs(60),
+        );
+        register_launch_pids(&mut live.launched, &before, &bundle_pids(bundle));
+        let Reply::Launched { app } = result.unwrap() else {
+            panic!("launched app")
+        };
+        assert_eq!(app.bundle_id, bundle);
+        assert!(app.pid.is_some() && !app.windows.is_empty());
+        if bundle == "com.apple.TextEdit" {
+            let window = app
+                .windows
+                .iter()
+                .find(|w| w.title.contains("orca-cu-cold-name.txt"))
+                .unwrap()
+                .id;
+            let observed = live.observe_window(bundle, Some(window), None, 300, false);
+            assert!(observed.elements.iter().any(|e| e.role == "text area"));
+        }
+    });
+}
+#[test]
+#[ignore]
+fn cold_textedit_launches_by_english_name() {
+    cold_launch_by_name("TextEdit", "com.apple.TextEdit");
+}
+#[test]
+#[ignore]
+fn cold_calculator_launches_by_english_name() {
+    cold_launch_by_name("Calculator", "com.apple.calculator");
+}
