@@ -124,6 +124,42 @@ fn inspect_modal_window(window: AxElement) -> Result<bool, DriverError> {
     Ok(window.modal_attribute_bool("AXModal")?.unwrap_or(false))
 }
 
+fn window_metadata_is_modal(
+    role: Option<&str>,
+    subrole: Option<&str>,
+    modal: Option<bool>,
+    parent_role: Option<&str>,
+) -> bool {
+    top_level_is_sheet(role, subrole) || modal == Some(true) || parent_role == Some("AXSheet")
+}
+
+fn inspect_fallback_window(window: AxElement) -> Result<bool, DriverError> {
+    let role = window.modal_attribute_string("AXRole")?;
+    let subrole = window.modal_attribute_string("AXSubrole")?;
+    if window_metadata_is_modal(role.as_deref(), subrole.as_deref(), None, None) {
+        return Ok(true);
+    }
+    let modal = window.modal_attribute_bool("AXModal")?;
+    if modal == Some(true) {
+        return Ok(true);
+    }
+    let parent_role = if let Some(parent) = window.modal_attribute_element("AXParent")? {
+        Some(
+            parent
+                .modal_attribute_string("AXRole")?
+                .ok_or_else(|| foreground("Unreadable window parent role"))?,
+        )
+    } else {
+        None
+    };
+    Ok(window_metadata_is_modal(
+        role.as_deref(),
+        subrole.as_deref(),
+        modal,
+        parent_role.as_deref(),
+    ))
+}
+
 fn in_modal_sheet(
     element: &AxElement,
     action_deadline: std::time::Instant,
@@ -162,7 +198,7 @@ fn modal_parent_walk(
             };
             if let Some(modal) = modal_root(
                 &role,
-                || inspect_modal_window(element.clone()),
+                || inspect_fallback_window(element.clone()),
                 || Ok(element.modal_attribute_bool("AXModal")?.unwrap_or(false)),
             )? {
                 return Ok(ModalStep::Root(modal));
@@ -792,6 +828,57 @@ mod tests {
             modal_root("AXApplication", || panic!("not a window"), || Ok(false)).unwrap(),
             Some(false)
         );
+    }
+
+    #[test]
+    fn part6_fallback_window_uses_sheet_subroles_and_sheet_parents() {
+        for (role, subrole, modal, parent_role, expected) in [
+            (
+                "AXWindow",
+                Some("AXSheet"),
+                Some(false),
+                Some("AXApplication"),
+                true,
+            ),
+            (
+                "AXWindow",
+                Some("AXStandardWindow"),
+                Some(false),
+                Some("AXSheet"),
+                true,
+            ),
+            ("AXSheet", None, Some(false), Some("AXWindow"), true),
+            ("AXWindow", None, Some(true), Some("AXApplication"), true),
+            (
+                "AXWindow",
+                Some("AXStandardWindow"),
+                Some(false),
+                Some("AXApplication"),
+                false,
+            ),
+        ] {
+            let result = modal_ancestry(0, |_| {
+                let modal = modal_root(
+                    role,
+                    || {
+                        Ok(window_metadata_is_modal(
+                            Some(role),
+                            subrole,
+                            modal,
+                            parent_role,
+                        ))
+                    },
+                    || panic!("not an application root"),
+                )?
+                .expect("a sheet or window root ends the walk");
+                Ok(ModalStep::Root(modal))
+            })
+            .unwrap();
+            assert_eq!(
+                result, expected,
+                "{role} {subrole:?}, parent {parent_role:?}"
+            );
+        }
     }
 
     #[test]
