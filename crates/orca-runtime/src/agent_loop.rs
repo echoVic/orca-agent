@@ -348,7 +348,7 @@ mod tests {
         let _env = crate::history::lock_test_env();
         let home = tempfile::Builder::new()
             .prefix("orca-cu-owned-loop-")
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .tempdir()
             .unwrap();
         let _home = crate::history::redirect_test_orca_home(home.path());
         let mut config = RunConfig::default();

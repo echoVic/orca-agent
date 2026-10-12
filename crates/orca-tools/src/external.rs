@@ -403,7 +403,7 @@ schema = { env = { type = "string", description = "environment" } }
 
     #[test]
     fn external_tool_directory_omits_computer_declarations_and_loads_shell_tools() {
-        let directory = tempfile::TempDir::new_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let directory = tempfile::TempDir::new().unwrap();
         let config = |action| {
             format!(
                 "name = \"script\"\ndescription = \"External script\"\naction_kind = \"{action}\"\ncommand = \"echo\"\n"

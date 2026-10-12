@@ -340,7 +340,7 @@ mod tests {
     fn preview_reads_only_the_matching_records_image_assets() {
         for user_image in [false, true] {
             for corrupt in [false, true] {
-                let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+                let directory = tempfile::tempdir().unwrap();
                 let path = directory.path().join("preview.jsonl");
                 let unrelated_image = image("AQIDBA==");
                 let unrelated_message = if user_image {
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn preview_still_rejects_corrupt_matching_image_assets() {
-        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("preview.jsonl");
         let expected = image("AQIDBA==");
         let record = stored_image(&path, &tool_message("target", expected.clone()));
@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn preview_still_rejects_invalid_unrelated_asset_manifests() {
-        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("preview.jsonl");
         let mut unrelated = stored_image(&path, &tool_message("earlier-tool", image("AQIDBA==")));
         let target = stored_image(&path, &tool_message("target", image("BQYHCA==")));
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn preview_reads_inline_images_and_skips_image_free_matching_messages() {
-        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("preview.jsonl");
         let expected = image("AQIDBA==");
         let empty = SessionRecord::Message {

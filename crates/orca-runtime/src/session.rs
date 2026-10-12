@@ -1045,13 +1045,7 @@ mod tests {
     }
 
     fn with_computer_prompt_home(f: impl FnOnce(&Path)) {
-        let _env = history::lock_test_env();
-        let home = tempfile::Builder::new()
-            .prefix("orca-cu-prompt-")
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
-            .unwrap();
-        let _home = history::redirect_test_orca_home(home.path());
-        f(home.path());
+        with_orca_home(f);
     }
 
     #[test]
