@@ -1849,6 +1849,14 @@ pub(crate) fn render_live_messages(
         else {
             continue;
         };
+        let Some(range) = state.transcript.render_cache.message_row_range(index) else {
+            continue;
+        };
+        let start = range.start.max(visible_start);
+        let end = range.end.min(visible_end);
+        if start >= end {
+            continue;
+        }
         let markers = output
             .lines()
             .filter(|line| is_tool_image_marker(line.trim()))
@@ -1856,10 +1864,7 @@ pub(crate) fn render_live_messages(
         if markers.is_empty() {
             continue;
         }
-        let Some(range) = state.transcript.render_cache.message_row_range(index) else {
-            continue;
-        };
-        for row in range.start.max(visible_start)..range.end.min(visible_end) {
+        for row in start..end {
             if state
                 .transcript
                 .render_cache
@@ -4139,6 +4144,8 @@ fn append_diff_lines(
 }
 
 fn is_tool_image_marker(line: &str) -> bool {
+    #[cfg(test)]
+    tests::TOOL_IMAGE_MARKER_CHECKS.with(|checks| checks.set(checks.get() + 1));
     if line == "[1 image attached]" {
         return true;
     }
@@ -7397,6 +7404,13 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    std::thread_local! {
+        // Count actual marker classification work, without elapsed-time thresholds.
+        pub(super) static TOOL_IMAGE_MARKER_CHECKS: std::cell::Cell<usize> = const {
+            std::cell::Cell::new(0)
+        };
+    }
 
     fn set_surface_metrics(
         state: &mut AppState,
@@ -11757,6 +11771,68 @@ mod tests {
 
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("Mentions"));
+    }
+
+    #[test]
+    fn cached_frames_do_not_scan_offscreen_tool_outputs_for_image_markers() {
+        let theme = Theme::named(ThemeName::Dark);
+        let tool = ChatMessage::ToolCall {
+            id: "computer-image".into(),
+            name: "computer".into(),
+            target: Some("com.apple.Safari".into()),
+            status: "completed".into(),
+            output: Some(format!("{}[1 image attached]", "element\n".repeat(256))),
+            diff: None,
+            kind: None,
+            expanded: false,
+        };
+        let mut state = test_state();
+        state.push_message(ChatMessage::Assistant("older\n".repeat(20)));
+        state.push_message(tool.clone());
+        state.push_message(ChatMessage::Assistant("newer\n".repeat(20)));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 6))
+            .expect("test backend");
+
+        for follow_tail in [true, false] {
+            state.viewport.auto_scroll = follow_tail;
+            state.viewport.scroll_offset = 0;
+            // Warm the real render cache before measuring the per-frame hit-area scan.
+            terminal
+                .draw(|frame| render_live_messages(frame, frame.area(), &mut state, &theme))
+                .expect("warm frame");
+            TOOL_IMAGE_MARKER_CHECKS.with(|checks| checks.set(0));
+            terminal
+                .draw(|frame| render_live_messages(frame, frame.area(), &mut state, &theme))
+                .expect("cached frame");
+
+            let range = state.transcript.render_cache.message_row_range(1).unwrap();
+            let visible_start = state.viewport.viewport_base_row;
+            let visible_end = visible_start + state.viewport.visible_height;
+            assert!(range.end <= visible_start || range.start >= visible_end);
+            assert!(state.image_hit_areas.is_empty());
+            assert_eq!(
+                TOOL_IMAGE_MARKER_CHECKS.with(std::cell::Cell::get),
+                0,
+                "an offscreen tool output must not be scanned on a cached frame"
+            );
+        }
+
+        // The same folded output still exposes its image marker when visible.
+        let mut visible = test_state();
+        visible.push_message(tool);
+        terminal
+            .draw(|frame| render_live_messages(frame, frame.area(), &mut visible, &theme))
+            .expect("visible frame");
+        let hit = visible
+            .image_hit_areas
+            .first()
+            .expect("image marker hit area");
+        assert!(matches!(
+            &hit.target,
+            crate::image_preview::ImageHitTarget::ToolResult { call_id }
+                if call_id == "computer-image"
+        ));
+        assert!(terminal.backend().buffer()[(hit.rect.x + 6, hit.rect.y)].symbol() == "[");
     }
 
     #[test]

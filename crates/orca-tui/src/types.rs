@@ -426,15 +426,13 @@ impl ApprovalDialog {
     /// call's target is its own tool name, so remembering it adds nothing to
     /// `AlwaysTool`, and the two saved options, persisted to the user config, take its place.
     /// Computer approvals offer session and saved grants for the app;
-    /// secure-field typing only offers a single approval or denial.
+    /// missing app targets and secure-field input only offer a single approval or denial.
     /// For every other tool, `AlwaysTarget` is only shown when a target is
     /// present AND the tool is likely to be called again with the same
     /// target (e.g. reading a fixed file path).
     pub fn options_for(tool: &str, target: Option<&str>) -> Vec<ApprovalOption> {
-        if tool == "computer"
-            && let Some(target) = target
-        {
-            return if target.ends_with("#secure") {
+        if tool == "computer" {
+            return if target.is_none_or(|target| target.ends_with("#secure")) {
                 vec![ApprovalOption::Once, ApprovalOption::Deny]
             } else {
                 vec![

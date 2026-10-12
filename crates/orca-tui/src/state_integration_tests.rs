@@ -919,6 +919,36 @@ fn approval_dialog_resolves_numeric_and_legacy_keys_by_visible_options() {
 }
 
 #[test]
+fn a_computer_approval_without_an_app_cannot_grant_session_access() {
+    let dialog = ApprovalDialog {
+        id: "computer-no-app".into(),
+        interaction: None,
+        tool: "computer".into(),
+        target: None,
+        permission_kind: None,
+        background_task_id: None,
+        selected: 0,
+        options: ApprovalDialog::options_for("computer", None),
+        diff: None,
+        diff_scroll: 0,
+    };
+
+    assert_eq!(
+        dialog.options,
+        vec![ApprovalOption::Once, ApprovalOption::Deny]
+    );
+    for key in ['2', '3', '5', '6', '7', 'a', 'A'] {
+        assert_eq!(
+            dialog.option_for_key(key),
+            None,
+            "unexpected grant on {key}"
+        );
+    }
+    assert_eq!(dialog.option_for_key('1'), Some(ApprovalOption::Once));
+    assert_eq!(dialog.option_for_key('4'), Some(ApprovalOption::Deny));
+}
+
+#[test]
 fn a_computer_approval_offers_this_app_once_for_the_session_or_saved() {
     assert_eq!(
         ApprovalDialog::options_for("computer", Some("com.apple.Safari")),
