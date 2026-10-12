@@ -181,7 +181,7 @@ fn running_name_matches(
     name: &str,
     roots: &[std::path::PathBuf],
 ) -> Result<bool, DriverError> {
-    if app.name.to_lowercase() == name.to_lowercase() {
+    if !looks_like_bundle_id(name) && app.name.to_lowercase() == name.to_lowercase() {
         return Ok(true);
     }
     let url = app
@@ -201,11 +201,31 @@ fn running_name_matches(
     };
     if bundle
         .bundleIdentifier()
-        .is_none_or(|id| !id.to_string().eq_ignore_ascii_case(&app.bundle_id))
+        .is_none_or(|id| id.to_string() != app.bundle_id)
     {
         return Ok(false);
     }
+    if looks_like_bundle_id(name) {
+        let raw_name = bundle
+            .infoDictionary()
+            .and_then(|info| info.objectForKey(&NSString::from_str("CFBundleName")))
+            .and_then(|value| value.downcast::<NSString>().ok())
+            .map(|value| value.to_string());
+        return Ok(
+            raw_name.is_some_and(|raw| raw.to_lowercase() == name.to_lowercase())
+                || bundle_folder_matches(&bundle, name),
+        );
+    }
     Ok(bundle_name_matches(&bundle, name))
+}
+
+fn bundle_folder_matches(bundle: &NSBundle, name: &str) -> bool {
+    bundle.bundleURL().path().is_some_and(|path| {
+        std::path::Path::new(&path.to_string())
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.to_lowercase() == name.to_lowercase())
+    })
 }
 
 fn bundle_name_matches(bundle: &NSBundle, name: &str) -> bool {
@@ -231,12 +251,7 @@ fn bundle_name_matches(bundle: &NSBundle, name: &str) -> bool {
     if looks_like_bundle_id(name) && !declared_names.is_empty() {
         return false;
     }
-    bundle.bundleURL().path().is_some_and(|path| {
-        std::path::Path::new(&path.to_string())
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| stem.to_lowercase() == name.to_lowercase())
-    })
+    bundle_folder_matches(bundle, name)
 }
 
 fn application_roots() -> Vec<std::path::PathBuf> {
@@ -646,6 +661,103 @@ mod tests {
     }
 
     #[test]
+    fn part4_dotted_inputs_cannot_use_a_running_localized_name_alone() {
+        let impostor = running_fixture("dev.orca.impostor", "dev.orca.wanted", 42);
+        assert_eq!(
+            resolve_with_apps("dev.orca.wanted", false, vec![impostor.clone()], &[])
+                .unwrap_err()
+                .kind,
+            ErrorKind::AppNotFound
+        );
+        assert_eq!(
+            resolve_with_apps("dev.orca.wanted", true, vec![impostor], &[])
+                .unwrap_err()
+                .kind,
+            ErrorKind::AppNotFound
+        );
+    }
+
+    #[test]
+    fn part4_dotted_display_name_is_not_a_declared_running_alias() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "OtherFolder", "dev.orca.impostor");
+        let plist = temp.path().join("OtherFolder.app/Contents/Info.plist");
+        std::fs::write(
+            &plist,
+            std::fs::read_to_string(&plist)
+                .unwrap()
+                .replace("Localized Editor", "dev.orca.wanted"),
+        )
+        .unwrap();
+        let impostor = running_fixture("dev.orca.impostor", "Localized UI Name", 42);
+        assert_eq!(
+            resolve_with_apps(
+                "dev.orca.wanted",
+                false,
+                vec![impostor],
+                &[temp.path().into()]
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::AppNotFound
+        );
+    }
+
+    #[test]
+    fn part4_dotted_running_folder_alias_belongs_to_the_exact_same_bundle() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "dev.orca.alias", "dev.orca.running");
+        let declared = running_fixture("dev.orca.running", "Localized UI Name", 42);
+        assert_eq!(
+            resolve_with_apps(
+                "dev.orca.alias",
+                false,
+                vec![declared.clone()],
+                &[temp.path().into()]
+            )
+            .unwrap(),
+            declared
+        );
+        let variant = running_fixture("DEV.ORCA.RUNNING", "dev.orca.alias", 43);
+        assert_eq!(
+            resolve_with_apps(
+                "dev.orca.alias",
+                false,
+                vec![variant],
+                &[temp.path().into()]
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::AppNotFound
+        );
+    }
+
+    #[test]
+    fn part4_dotted_installed_id_never_aliases_a_different_running_app() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "Installed", "dev.orca.wanted");
+        application_fixture(temp.path(), "dev.orca.wanted", "dev.orca.other");
+        let other = running_fixture("dev.orca.other", "dev.orca.wanted", 42);
+        assert_eq!(
+            resolve_with_apps(
+                "dev.orca.wanted",
+                false,
+                vec![other.clone()],
+                &[temp.path().into()]
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::AppNotFound
+        );
+        assert_eq!(
+            resolve_with_apps("dev.orca.wanted", true, vec![other], &[temp.path().into()])
+                .unwrap()
+                .bundle_id,
+            "dev.orca.wanted"
+        );
+    }
+
+    #[test]
     fn part4_identity_running_exact_match_precedes_case_folded_match() {
         let impostor = running_fixture("com.apple.passwords", "Passwords", 42);
         let canonical = running_fixture("com.apple.Passwords", "Passwords", 43);
@@ -784,10 +896,13 @@ mod tests {
         std::fs::write(&plist, text).unwrap();
         application_fixture(temp.path(), "OtherFolder", "dev.orca.draw");
         let plist = temp.path().join("OtherFolder.app/Contents/Info.plist");
-        let text = std::fs::read_to_string(&plist).unwrap().replace(
-            "<string>Localized Editor</string>",
-            "<string>draw.io</string>",
-        );
+        let text = std::fs::read_to_string(&plist)
+            .unwrap()
+            .replace(
+                "<string>Localized Editor</string>",
+                "<string>draw.io</string>",
+            )
+            .replace("<string>TextEdit</string>", "<string>draw.io</string>");
         std::fs::write(&plist, text).unwrap();
         for (name, id) in [("zoom.us", "dev.orca.zoom"), ("draw.io", "dev.orca.draw")] {
             assert_eq!(
@@ -804,7 +919,8 @@ mod tests {
                 windows: vec![],
             };
             assert_eq!(
-                resolve_with_apps(name, false, vec![running.clone()], &[]).unwrap(),
+                resolve_with_apps(name, false, vec![running.clone()], &[temp.path().into()])
+                    .unwrap(),
                 running
             );
         }
@@ -983,7 +1099,7 @@ mod tests {
         );
         let impostor = AppInfo {
             bundle_id: "dev.orca.other-app".into(),
-            name: "Other App".into(),
+            name: "com.real.app".into(),
             pid: Some(42),
             category: None,
             windows: vec![],
