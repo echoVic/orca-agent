@@ -48,8 +48,10 @@ fn computer_use_examples_grant_only_the_named_app_and_disable_foreground_or_the_
     let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("site/src/docs/md");
     for locale in ["en", "zh"] {
         let page = docs.join(locale).join("computer-use.mdx");
+        // A Windows checkout may have CRLF line endings.
         let source = fs::read_to_string(&page)
-            .unwrap_or_else(|error| panic!("{} must be readable: {error}", page.display()));
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", page.display()))
+            .replace("\r\n", "\n");
         let examples = source
             .split("~~~toml\n")
             .skip(1)
