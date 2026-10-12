@@ -215,18 +215,11 @@ fn running_name_matches(
     {
         return Ok(false);
     }
-    if looks_like_bundle_id(name) {
-        let raw_name = bundle
-            .infoDictionary()
-            .and_then(|info| info.objectForKey(&NSString::from_str("CFBundleName")))
-            .and_then(|value| value.downcast::<NSString>().ok())
-            .map(|value| value.to_string());
-        return Ok(
-            raw_name.is_some_and(|raw| raw.to_lowercase() == name.to_lowercase())
-                || bundle_folder_matches(&bundle, name),
-        );
-    }
-    Ok(bundle_name_matches(&bundle, name))
+    Ok(bundle_name_matches(
+        &bundle,
+        name,
+        !looks_like_bundle_id(name),
+    ))
 }
 
 fn bundle_folder_matches(bundle: &NSBundle, name: &str) -> bool {
@@ -238,27 +231,24 @@ fn bundle_folder_matches(bundle: &NSBundle, name: &str) -> bool {
     })
 }
 
-fn bundle_name_matches(bundle: &NSBundle, name: &str) -> bool {
+fn bundle_name_matches(bundle: &NSBundle, name: &str, include_display_name: bool) -> bool {
     // infoDictionary is intentionally non-localized.
     let raw_name = bundle
         .infoDictionary()
         .and_then(|info| info.objectForKey(&NSString::from_str("CFBundleName")))
         .and_then(|value| value.downcast::<NSString>().ok())
         .map(|value| value.to_string());
-    let display_name = info_string(bundle, "CFBundleDisplayName");
-    let declared_names: Vec<_> = raw_name
-        .into_iter()
-        .chain(display_name)
-        .filter(|name| !name.is_empty())
-        .collect();
-    if declared_names
-        .iter()
-        .any(|alias| alias.to_lowercase() == name.to_lowercase())
+    let raw_name = raw_name.filter(|raw| !raw.is_empty());
+    if raw_name
+        .as_ref()
+        .is_some_and(|raw| raw.to_lowercase() == name.to_lowercase())
+        || (include_display_name
+            && info_string(bundle, "CFBundleDisplayName")
+                .is_some_and(|display| display.to_lowercase() == name.to_lowercase()))
     {
         return true;
     }
-    // A folder renamed to an ID cannot impersonate a differently named app.
-    if looks_like_bundle_id(name) && !declared_names.is_empty() {
+    if looks_like_bundle_id(name) && raw_name.is_some() {
         return false;
     }
     bundle_folder_matches(bundle, name)
@@ -391,7 +381,7 @@ fn find_installed_bundle(
             .find(|(app, _)| app.bundle_id == id)
             .map(|(_, bundle)| bundle));
     }
-    candidates.retain(|(_, bundle)| bundle_name_matches(bundle, name));
+    candidates.retain(|(_, bundle)| bundle_name_matches(bundle, name, true));
     if candidates.len() > 1 {
         return Err(DriverError {
             kind: ErrorKind::AppAmbiguous,
@@ -679,6 +669,50 @@ mod tests {
     }
 
     #[test]
+    fn part5_folder_only_alias_is_allowed_when_no_raw_name_is_declared() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "dev.orca.alias", "dev.orca.running");
+        let plist = temp.path().join("dev.orca.alias.app/Contents/Info.plist");
+        let body = std::fs::read_to_string(&plist)
+            .unwrap()
+            .replace("<key>CFBundleName</key><string>TextEdit</string>", "");
+        std::fs::write(plist, body).unwrap();
+        let running = running_fixture("dev.orca.running", "Localized UI Name", 42);
+        assert_eq!(
+            resolve_with_apps(
+                "dev.orca.alias",
+                false,
+                vec![running],
+                &[temp.path().into()]
+            )
+            .unwrap()
+            .bundle_id,
+            "dev.orca.running"
+        );
+        assert_eq!(
+            resolve_with_apps("dev.orca.alias", true, vec![], &[temp.path().into()])
+                .unwrap()
+                .bundle_id,
+            "dev.orca.running"
+        );
+    }
+
+    #[test]
+    fn part5_renamed_folder_alias_is_rejected_on_both_running_and_installed_paths() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "dev.orca.alias", "dev.orca.running");
+        let running = running_fixture("dev.orca.running", "dev.orca.alias", 42);
+        for (allow, apps) in [(false, vec![running]), (true, vec![])] {
+            assert_eq!(
+                resolve_with_apps("dev.orca.alias", allow, apps, &[temp.path().into()])
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::AppNotFound
+            );
+        }
+    }
+
+    #[test]
     fn part5_same_id_instances_choose_frontmost_or_first() {
         let first = running_fixture("dev.orca.multi", "Multi", 42);
         let second = running_fixture("dev.orca.multi", "Multi", 43);
@@ -802,11 +836,12 @@ mod tests {
             resolve_with_apps(
                 "dev.orca.alias",
                 false,
-                vec![declared.clone()],
+                vec![declared],
                 &[temp.path().into()]
             )
-            .unwrap(),
-            declared
+            .unwrap_err()
+            .kind,
+            ErrorKind::AppNotFound
         );
         let variant = running_fixture("DEV.ORCA.RUNNING", "dev.orca.alias", 43);
         assert_eq!(
