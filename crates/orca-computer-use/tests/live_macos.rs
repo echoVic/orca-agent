@@ -178,6 +178,10 @@ fn fixture_app() -> PathBuf {
 </dict></plist>"#).unwrap();
     let output = Command::new("/usr/bin/swiftc")
         .arg("-O")
+        .args([
+            "-module-cache-path",
+            "/tmp/orca-cu-fixes/swift-module-cache",
+        ])
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/CUFixture.swift"
@@ -226,7 +230,7 @@ impl Live {
         eprintln!(
             "live starting state: frontmost={frontmost:?}, pointer={pointer:?}, running={running:?}"
         );
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let launcher =
             InProcessLauncher::new(MacDriver::new(directory.path().join("computer-use.lock")));
         let esc_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -371,6 +375,19 @@ impl Live {
                 f64::from(frame[1]) + f64::from(frame[3]) / 2.0,
             ],
         }
+    }
+
+    fn fixture_control_value(&self, label: &str) -> String {
+        let pid = bundle_pids("dev.orca.cu-fixture")
+            .into_iter()
+            .find(|pid| self.launched.contains(pid))
+            .expect("test-owned fixture PID");
+        let window = fixture_window(pid);
+        let element = native_ax_nodes(&window)
+            .into_iter()
+            .find(|e| native_ax_string(e, "AXDescription").as_deref() == Some(label))
+            .expect("test-owned control");
+        native_ax_string(&element, "AXValue").expect("native test value")
     }
 
     fn turn(&self, active: bool) {
@@ -1393,7 +1410,7 @@ fn typing_goes_into_the_focused_field_in_the_background() {
                 text: "".into(),
                 target: Some(element_named(&obs, "Name")),
             },
-            false,
+            true,
         )
         .unwrap();
         live.act(
@@ -1401,7 +1418,7 @@ fn typing_goes_into_the_focused_field_in_the_background() {
                 text: "abc".into(),
                 target: None,
             },
-            false,
+            true,
         )
         .unwrap();
         live.assert_log_contains(&log, r#""value":"abc""#);
@@ -1473,7 +1490,7 @@ fn typing_with_a_chinese_input_method_enters_the_text_exactly() {
                 text: "abc 中文".into(),
                 target: Some(element_named(&obs, "Name")),
             },
-            false,
+            true,
         )
         .unwrap();
         live.assert_log_contains(&log, r#""value":"abc 中文""#);
@@ -1487,17 +1504,7 @@ fn typing_with_a_chinese_input_method_enters_the_text_exactly() {
             last_value["value"], "abc 中文",
             "logged input must equal the requested text exactly"
         );
-        let current = live.observe("dev.orca.cu-fixture", None);
-        assert_eq!(
-            current
-                .elements
-                .iter()
-                .find(|e| e.label.as_deref() == Some("Name"))
-                .unwrap()
-                .value
-                .as_deref(),
-            Some("abc 中文")
-        );
+        assert_eq!(live.fixture_control_value("Name"), "abc 中文");
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
@@ -1649,7 +1656,7 @@ fn cmd_a_reaches_the_focused_field() {
                 text: "abc".into(),
                 target: Some(element_named(&obs, "Name")),
             },
-            false,
+            true,
         )
         .unwrap();
         live.assert_log_contains(&log, r#""value":"abc""#);
@@ -1668,19 +1675,18 @@ fn cmd_a_reaches_the_focused_field() {
                 text: "x".into(),
                 target: None,
             },
-            false,
+            true,
         )
         .unwrap();
         thread::sleep(Duration::from_millis(100));
         let observation = live.observe("dev.orca.cu-fixture", None);
-        let value = observation
-            .elements
-            .iter()
-            .find(|e| e.label.as_deref() == Some("Name"))
-            .unwrap()
-            .value
-            .clone()
-            .unwrap();
+        assert!(
+            observation
+                .elements
+                .iter()
+                .any(|e| e.label.as_deref() == Some("Name"))
+        );
+        let value = live.fixture_control_value("Name");
         live.assert_frontmost_and_pointer_unchanged();
         // Positive control: foreground HID reaches the same focused field.
         let pid = bundle_pids("dev.orca.cu-fixture")
@@ -1694,7 +1700,7 @@ fn cmd_a_reaches_the_focused_field() {
                 text: "x".into(),
                 target: None,
             },
-            false,
+            true,
         )
         .unwrap();
         live.assert_log_contains(&log, r#""value":"x""#);
@@ -1769,28 +1775,25 @@ fn cmd_s_saves_textedit_in_the_background() {
                 text: "Edited by Orca".into(),
                 target: Some(Target::Element { element: text_area }),
             },
-            false,
+            true,
             true,
         )
         .unwrap();
+        let native_window = native_window_named(app.pid.unwrap(), "orca-cu-cmd-s.txt");
+        let native_text = native_ax_nodes(&native_window)
+            .into_iter()
+            .find(|e| native_ax_string(e, "AXRole").as_deref() == Some("AXTextArea"))
+            .unwrap();
         let edited_deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let edited = live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
-            if edited.elements.iter().any(|e| {
-                e.value
-                    .as_deref()
-                    .is_some_and(|v| v.contains("Edited by Orca"))
-            }) {
+            if native_ax_string(&native_text, "AXValue")
+                .is_some_and(|v| v.contains("Edited by Orca"))
+            {
                 break;
             }
             assert!(
                 Instant::now() < edited_deadline,
-                "positive control: typing did not dirty our own document: {:?}",
-                edited
-                    .elements
-                    .iter()
-                    .filter(|e| e.role == "text area")
-                    .collect::<Vec<_>>()
+                "native typing positive control did not dirty our own document"
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -1824,7 +1827,7 @@ fn cmd_s_saves_textedit_in_the_background() {
                 text: " control".into(),
                 target: None,
             },
-            false,
+            true,
             true,
         )
         .unwrap();
@@ -2039,7 +2042,7 @@ fn esc_fixture() -> Option<(Live, i32, PathBuf)> {
             text: "".into(),
             target: Some(element_named(&obs, "Name")),
         },
-        false,
+        true,
     )
     .unwrap();
     Some((live, pid, log))
@@ -2946,24 +2949,9 @@ fn fixture_ax_role(
     element: &objc2_application_services::AXUIElement,
     role: &str,
 ) -> Option<objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>> {
-    use objc2_application_services::AXUIElement;
-    use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType};
-    if fixture_ax_value(element, "AXRole")
-        .and_then(|v| v.downcast::<CFString>().ok())
-        .is_some_and(|v| v.to_string() == role)
-    {
-        return Some(unsafe { CFRetained::retain(std::ptr::NonNull::from(element)) });
-    }
-    let children = fixture_ax_value(element, "AXChildren")?;
-    let array = children.downcast_ref::<CFArray>()?;
-    for i in 0..array.len() {
-        let child = unsafe { &*array.value_at_index(i as isize).cast::<CFType>() }
-            .downcast_ref::<AXUIElement>()?;
-        if let Some(found) = fixture_ax_role(child, role) {
-            return Some(found);
-        }
-    }
-    None
+    native_ax_nodes(element)
+        .into_iter()
+        .find(|node| native_ax_string(node, "AXRole").as_deref() == Some(role))
 }
 
 fn pointer_restored(
@@ -2988,25 +2976,11 @@ fn fixture_ax_named(
     element: &objc2_application_services::AXUIElement,
     name: &str,
 ) -> Option<objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>> {
-    use objc2_application_services::AXUIElement;
-    use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType};
-    if fixture_ax_value(element, "AXDescription")
-        .and_then(|v| v.downcast::<CFString>().ok())
-        .is_some_and(|v| v.to_string() == name)
-    {
-        return Some(unsafe { CFRetained::retain(std::ptr::NonNull::from(element)) });
-    }
-    let children = fixture_ax_value(element, "AXChildren")?;
-    let array = children.downcast_ref::<CFArray>()?;
-    for i in 0..array.len() {
-        let child = unsafe { &*array.value_at_index(i as isize).cast::<CFType>() }
-            .downcast_ref::<AXUIElement>()?;
-        if let Some(found) = fixture_ax_named(child, name) {
-            return Some(found);
-        }
-    }
-    None
+    native_ax_nodes(element)
+        .into_iter()
+        .find(|node| native_ax_string(node, "AXDescription").as_deref() == Some(name))
 }
+
 fn password_length(pid: i32) -> usize {
     use objc2_application_services::AXUIElement;
     use objc2_core_foundation::CFString;
@@ -3598,15 +3572,7 @@ fn background_type_with_a_target_inserts_after_existing_text() {
         live.make_finder_frontmost();
         let obs = live.observe("dev.orca.cu-fixture", None);
         let target = element_named(&obs, "Name");
-        assert_eq!(
-            obs.elements
-                .iter()
-                .find(|e| e.label.as_deref() == Some("Name"))
-                .unwrap()
-                .value
-                .as_deref(),
-            Some("a🦀c")
-        );
+        assert_eq!(live.fixture_control_value("Name"), "a🦀c");
         for (text, expected) in [("x", "a🦀cx"), ("y", "a🦀cxy")] {
             let outcome = live
                 .act(
@@ -3614,20 +3580,20 @@ fn background_type_with_a_target_inserts_after_existing_text() {
                         text: text.into(),
                         target: Some(target),
                     },
-                    false,
+                    true,
                 )
                 .unwrap();
             assert!(!outcome.foreground_used);
             let obs = outcome.observation.unwrap();
-            assert_eq!(
-                obs.elements
-                    .iter()
-                    .find(|e| e.label.as_deref() == Some("Name"))
-                    .unwrap()
-                    .value
-                    .as_deref(),
-                Some(expected)
-            );
+            let field = obs
+                .elements
+                .iter()
+                .find(|e| e.label.as_deref() == Some("Name"))
+                .unwrap();
+            if field.secure {
+                assert!(field.value.is_none());
+            }
+            assert_eq!(live.fixture_control_value("Name"), expected);
             live.assert_log_contains(&log, &format!("\"value\":\"{expected}\""));
         }
         live.assert_frontmost_and_pointer_unchanged();
@@ -3700,7 +3666,7 @@ fn foreground_type_at_a_point_keeps_the_clicked_caret() {
                     text: "x".into(),
                     target: Some(target),
                 },
-                false,
+                true,
                 true,
             )
             .unwrap();
@@ -3750,7 +3716,7 @@ fn foreground_type_with_an_element_target_inserts_after_existing_text() {
                     text: "x".into(),
                     target: Some(element_named(&obs, "Name")),
                 },
-                false,
+                true,
                 true,
             )
             .unwrap();
@@ -3777,7 +3743,7 @@ fn type_with_optional_selection(flags: &[&str], expected: &str) {
                     text: "u".into(),
                     target: None,
                 },
-                false,
+                true,
             )
             .unwrap();
         assert!(!control.foreground_used);
@@ -3818,7 +3784,7 @@ fn type_with_optional_selection(flags: &[&str], expected: &str) {
                     text: "x".into(),
                     target: Some(element_named(&obs, "Name")),
                 },
-                false,
+                true,
             )
             .unwrap();
         assert!(!result.foreground_used);
@@ -3946,4 +3912,549 @@ fn foreground_point_click_modified_skips_the_pre_activation_hit_test() {
 #[ignore]
 fn foreground_point_click_hidden_skips_the_pre_activation_hit_test() {
     foreground_point_click_without_early_hit("hidden");
+}
+
+fn native_ax_optional_value(
+    element: &objc2_application_services::AXUIElement,
+    name: &str,
+) -> Option<objc2_core_foundation::CFRetained<objc2_core_foundation::CFType>> {
+    use objc2_application_services::AXError;
+    use objc2_core_foundation::CFString;
+    let mut value = std::ptr::null();
+    let result = unsafe {
+        element.copy_attribute_value(
+            &CFString::from_str(name),
+            std::ptr::NonNull::from(&mut value),
+        )
+    };
+    if matches!(
+        result,
+        AXError::Failure | AXError::NoValue | AXError::AttributeUnsupported
+    ) {
+        return None;
+    }
+    assert_eq!(result, AXError::Success, "independent native read {name}");
+    std::ptr::NonNull::new(value.cast_mut())
+        .map(|p| unsafe { objc2_core_foundation::CFRetained::from_raw(p) })
+}
+
+// Native controls read only the test's own app/window, independently of Orca's tree.
+fn native_ax_nodes(
+    root: &objc2_application_services::AXUIElement,
+) -> Vec<objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>> {
+    use objc2_application_services::AXUIElement;
+    use objc2_core_foundation::{CFArray, CFRetained, CFType};
+    let mut nodes = vec![unsafe { CFRetained::retain(std::ptr::NonNull::from(root)) }];
+    let mut index = 0;
+    while index < nodes.len() && index < 5000 {
+        if let Some(children) = native_ax_optional_value(&nodes[index], "AXChildren")
+            && let Some(array) = children.downcast_ref::<CFArray>()
+        {
+            for i in 0..array.len() {
+                let child = unsafe { &*array.value_at_index(i as isize).cast::<CFType>() };
+                if let Some(child) = child.downcast_ref::<AXUIElement>()
+                    && !nodes.iter().any(|seen| &**seen == child)
+                {
+                    nodes.push(unsafe { CFRetained::retain(std::ptr::NonNull::from(child)) });
+                }
+            }
+        }
+        index += 1;
+    }
+    nodes
+}
+
+fn native_ax_string(
+    element: &objc2_application_services::AXUIElement,
+    name: &str,
+) -> Option<String> {
+    use objc2_core_foundation::{CFNumber, CFString};
+    native_ax_optional_value(element, name).and_then(|value| {
+        value
+            .downcast_ref::<CFString>()
+            .map(ToString::to_string)
+            .or_else(|| {
+                value
+                    .downcast_ref::<CFNumber>()
+                    .and_then(|n| n.as_f64())
+                    .map(|n| n.to_string())
+            })
+    })
+}
+
+fn launch_test_app(live: &mut Live, bundle: &str, open: Vec<String>) -> AppInfo {
+    let before = bundle_pids(bundle);
+    let result = live.client.call(
+        Request::LaunchApp {
+            app: bundle.into(),
+            open,
+        },
+        Duration::from_secs(60),
+    );
+    register_launch_pids(&mut live.launched, &before, &bundle_pids(bundle));
+    let Reply::Launched { app } = result.unwrap() else {
+        panic!("expected launched {bundle}")
+    };
+    app
+}
+
+#[test]
+#[ignore]
+fn calculator_observe_survives_failed_subroles_and_digit_press_changes_display() {
+    run_live_test(|| {
+        use objc2_application_services::{AXError, AXUIElement};
+        use objc2_core_foundation::CFString;
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        if !bundle_pids("com.apple.calculator").is_empty() {
+            eprintln!("skipped: Calculator already running");
+            return;
+        }
+        let app = launch_test_app(&mut live, "com.apple.calculator", vec![]);
+        let application = unsafe { AXUIElement::new_application(app.pid.unwrap()) };
+        live.fixture_frontmost(app.pid.unwrap());
+        let native_window = fixture_ax_value(&application, "AXMainWindow")
+            .unwrap()
+            .downcast::<AXUIElement>()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let nodes = loop {
+            let nodes = native_ax_nodes(&native_window);
+            if nodes
+                .iter()
+                .any(|node| native_ax_string(node, "AXRole").as_deref() == Some("AXButton"))
+            {
+                break nodes;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native Calculator controls not ready"
+            );
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            nodes
+                .iter()
+                .any(|node| native_ax_string(node, "AXRole").as_deref() == Some("AXButton")),
+            "native button positive control"
+        );
+        let has_failed_subrole = nodes.iter().any(|node| {
+            let mut value = std::ptr::null();
+            let result = unsafe {
+                node.copy_attribute_value(
+                    &CFString::from_str("AXSubrole"),
+                    std::ptr::NonNull::from(&mut value),
+                )
+            };
+            if let Some(pointer) = std::ptr::NonNull::new(value.cast_mut()) {
+                drop(unsafe { objc2_core_foundation::CFRetained::from_raw(pointer) });
+            }
+            result == AXError::Failure
+        });
+        assert!(
+            has_failed_subrole,
+            "same-app native AXSubrole Failure control"
+        );
+        let clear = nodes
+            .iter()
+            .find(|node| {
+                native_ax_string(node, "AXRole").as_deref() == Some("AXButton")
+                    && ["AXTitle", "AXDescription"].iter().any(|name| {
+                        native_ax_string(node, name).as_deref().is_some_and(|s| {
+                            s.to_lowercase().contains("clear")
+                                || s.contains("清除")
+                                || s == "C"
+                                || s == "AC"
+                        })
+                    })
+            })
+            .expect("native clear control");
+        assert_eq!(
+            unsafe { clear.perform_action(&CFString::from_str("AXPress")) },
+            AXError::Success
+        );
+        thread::sleep(Duration::from_millis(150));
+        let native_digit = nodes
+            .iter()
+            .find(|node| {
+                native_ax_string(node, "AXRole").as_deref() == Some("AXButton")
+                    && ["AXTitle", "AXDescription"].iter().any(|name| {
+                        native_ax_string(node, name)
+                            .as_deref()
+                            .is_some_and(|s| s == "7" || s.eq_ignore_ascii_case("seven"))
+                    })
+            })
+            .expect("native digit 7");
+        assert_eq!(
+            unsafe { native_digit.perform_action(&CFString::from_str("AXPress")) },
+            AXError::Success
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let values: Vec<_> = native_ax_nodes(&native_window)
+                .iter()
+                .filter_map(|node| native_ax_string(node, "AXValue"))
+                .collect();
+            if values
+                .iter()
+                .any(|value| value.trim_matches(['\u{200e}', '\u{200f}']) == "7")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native same-digit display positive control: {values:?}"
+            );
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(
+            unsafe { clear.perform_action(&CFString::from_str("AXPress")) },
+            AXError::Success
+        );
+        thread::sleep(Duration::from_millis(150));
+        let observed = live.observe("com.apple.calculator", None);
+        let digit = observed
+            .elements
+            .iter()
+            .find(|e| {
+                e.role == "button"
+                    && e.label
+                        .as_deref()
+                        .is_some_and(|s| s == "7" || s.eq_ignore_ascii_case("seven"))
+            })
+            .expect("digit 7");
+        live.act_app(
+            "com.apple.calculator",
+            Some(observed.window.id),
+            click_target(Target::Element { element: digit.id }),
+            false,
+            true,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let values: Vec<_> = native_ax_nodes(&native_window)
+                .iter()
+                .filter_map(|node| native_ax_string(node, "AXValue"))
+                .collect();
+            if values
+                .iter()
+                .any(|value| value.trim_matches(['\u{200e}', '\u{200f}']) == "7")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pressing observed digit must change native display to 7: {values:?}"
+            );
+            thread::sleep(Duration::from_millis(30));
+        }
+    });
+}
+
+#[test]
+#[ignore]
+fn finder_observe_survives_failed_subroles_and_scrolls_own_300_file_list_to_bottom() {
+    run_live_test(|| {
+        use objc2_application_services::AXUIElement;
+        let Some(live) = Live::start() else {
+            return;
+        };
+        let folder = live.directory.path().join("orca-cu-300-files");
+        std::fs::create_dir(&folder).unwrap();
+        for i in 1..=300 {
+            std::fs::write(folder.join(format!("file-{i:03}.txt")), "").unwrap();
+        }
+        let script = format!(
+            "tell application \"Finder\"\nset probe to make new Finder window to POSIX file \"{}\"\nset current view of probe to list view\nactivate\nreturn id of probe\nend tell",
+            folder.display()
+        );
+        let output = Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _owned_window = FinderWindow(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        );
+        let app = live
+            .apps()
+            .into_iter()
+            .find(|a| a.bundle_id == "com.apple.finder")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let window = loop {
+            if let Some(w) = live
+                .apps()
+                .into_iter()
+                .find(|a| a.bundle_id == "com.apple.finder")
+                .unwrap()
+                .windows
+                .into_iter()
+                .find(|w| w.title == "orca-cu-300-files")
+            {
+                break w;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(50));
+        };
+        let application = unsafe { AXUIElement::new_application(app.pid.unwrap()) };
+        let windows = fixture_ax_value(&application, "AXWindows").unwrap();
+        let windows = windows
+            .downcast_ref::<objc2_core_foundation::CFArray>()
+            .unwrap();
+        let native_window = (0..windows.len())
+            .find_map(|i| {
+                let value = unsafe {
+                    &*windows
+                        .value_at_index(i as isize)
+                        .cast::<objc2_core_foundation::CFType>()
+                };
+                let w = value.downcast_ref::<AXUIElement>()?;
+                (native_ax_string(w, "AXTitle").as_deref() == Some("orca-cu-300-files")).then(
+                    || unsafe {
+                        objc2_core_foundation::CFRetained::retain(std::ptr::NonNull::from(w))
+                    },
+                )
+            })
+            .expect("only our scratch Finder window");
+        let nodes = native_ax_nodes(&native_window);
+        let scroll = nodes
+            .iter()
+            .find(|n| native_ax_string(n, "AXRole").as_deref() == Some("AXScrollArea"))
+            .expect("native list control");
+        let bar = fixture_ax_value(scroll, "AXVerticalScrollBar")
+            .unwrap()
+            .downcast::<AXUIElement>()
+            .unwrap();
+        assert_eq!(
+            native_ax_string(&bar, "AXValue").as_deref(),
+            Some("0"),
+            "native list starts at top"
+        );
+        for position in [1.0, 0.0] {
+            assert_eq!(
+                unsafe {
+                    bar.set_attribute_value(
+                        &objc2_core_foundation::CFString::from_str("AXValue"),
+                        objc2_core_foundation::CFNumber::new_f64(position).as_ref(),
+                    )
+                },
+                objc2_application_services::AXError::Success
+            );
+            assert_eq!(
+                native_ax_string(&bar, "AXValue").as_deref(),
+                Some(if position == 1.0 { "1" } else { "0" }),
+                "native same-list scroll positive control"
+            );
+        }
+        let observed = live.observe_window("com.apple.finder", Some(window.id), None, 1000, false);
+        let list = observed
+            .elements
+            .iter()
+            .find(|e| e.role == "scroll area")
+            .expect("observed file list");
+        live.act_app(
+            "com.apple.finder",
+            Some(window.id),
+            Action::Scroll {
+                target: Target::Element { element: list.id },
+                direction: Direction::Down,
+                amount: 10000,
+            },
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            native_ax_string(&bar, "AXValue").as_deref(),
+            Some("1"),
+            "native list reaches bottom"
+        );
+    });
+}
+
+fn unreadable_subrole_requires_approval(code: i32) {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let option = format!("--subrole-error={code}");
+        let (pid, _) = live.launch_fixture_with_flags(&["--prefilled-name", &option]);
+        let window = fixture_window(pid);
+        let name = native_ax_nodes(&window)
+            .into_iter()
+            .find(|e| native_ax_string(e, "AXDescription").as_deref() == Some("Name"))
+            .unwrap();
+        // Even Failure has a same-field native read/write control before observe.
+        let initial = native_ax_string(&name, "AXValue").unwrap();
+        assert_eq!(
+            unsafe {
+                name.set_attribute_value(
+                    &objc2_core_foundation::CFString::from_str("AXValue"),
+                    objc2_core_foundation::CFString::from_str(&initial).as_ref(),
+                )
+            },
+            objc2_application_services::AXError::Success
+        );
+        assert_eq!(
+            native_ax_string(&name, "AXValue").as_deref(),
+            Some(initial.as_str())
+        );
+        let observed = live.observe("dev.orca.cu-fixture", None);
+        let target = element_named(&observed, "Name");
+        live.act(
+            Action::Type {
+                text: "u".into(),
+                target: Some(target),
+            },
+            true,
+        )
+        .unwrap();
+        let control = native_ax_string(&name, "AXValue").unwrap();
+        assert!(
+            control.ends_with('u'),
+            "approved same-field positive control: {control}"
+        );
+        let result = live.act(
+            Action::Type {
+                text: "x".into(),
+                target: Some(target),
+            },
+            false,
+        );
+        assert_eq!(
+            native_ax_string(&name, "AXValue").as_deref(),
+            Some(control.as_str()),
+            "unapproved unreadable-subrole text must not be delivered"
+        );
+        assert_eq!(result.unwrap_err().kind, ErrorKind::NeedsSecureApproval);
+        let observed = live.observe("dev.orca.cu-fixture", None);
+        let field = observed
+            .elements
+            .iter()
+            .find(|e| e.label.as_deref() == Some("Name"))
+            .unwrap();
+        assert!(field.secure, "unknown text subrole must be marked secure");
+        assert!(
+            field.value.is_none(),
+            "unknown secure value must be redacted"
+        );
+    });
+}
+
+#[test]
+#[ignore]
+fn a_failed_text_subrole_is_secure_and_needs_approval() {
+    unreadable_subrole_requires_approval(-25200);
+}
+#[test]
+#[ignore]
+fn a_missing_text_subrole_is_secure_and_needs_approval() {
+    unreadable_subrole_requires_approval(-25212);
+}
+#[test]
+#[ignore]
+fn an_unsupported_text_subrole_is_secure_and_needs_approval() {
+    unreadable_subrole_requires_approval(-25205);
+}
+
+fn one_bad_button_preserves_the_tree(flag: &str) {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, _) = live.launch_fixture_with_flags(&[flag, "--prefilled-name"]);
+        let window = fixture_window(pid);
+        let name = if flag == "--bad-button-children" {
+            let application =
+                unsafe { objc2_application_services::AXUIElement::new_application(pid) };
+            fixture_ax_value(&application, "AXFocusedUIElement")
+                .unwrap()
+                .downcast::<objc2_application_services::AXUIElement>()
+                .unwrap()
+        } else {
+            native_ax_nodes(&window)
+                .into_iter()
+                .find(|e| native_ax_string(e, "AXDescription").as_deref() == Some("Name"))
+                .unwrap()
+        };
+        assert_eq!(
+            unsafe {
+                name.set_attribute_value(
+                    &objc2_core_foundation::CFString::from_str("AXValue"),
+                    objc2_core_foundation::CFString::from_str("native control").as_ref(),
+                )
+            },
+            objc2_application_services::AXError::Success
+        );
+        assert_eq!(
+            native_ax_string(&name, "AXValue").as_deref(),
+            Some("native control"),
+            "same-app healthy sibling positive control"
+        );
+        let observed = live.observe("dev.orca.cu-fixture", None);
+        assert!(
+            observed.screenshot.is_some(),
+            "a failed local child read must not cost the window observation"
+        );
+        if flag != "--bad-button-children" {
+            assert!(
+                observed
+                    .elements
+                    .iter()
+                    .any(|e| e.label.as_deref() == Some("Name"))
+            );
+            assert!(
+                observed
+                    .elements
+                    .iter()
+                    .any(|e| e.label.as_deref() == Some("Password"))
+            );
+        }
+    });
+}
+#[test]
+#[ignore]
+fn one_failed_role_does_not_abort_observation() {
+    one_bad_button_preserves_the_tree("--bad-button-role");
+}
+#[test]
+#[ignore]
+fn one_failed_frame_does_not_abort_observation() {
+    one_bad_button_preserves_the_tree("--bad-button-frame");
+}
+#[test]
+#[ignore]
+fn one_failed_children_read_does_not_abort_observation() {
+    one_bad_button_preserves_the_tree("--bad-button-children");
+}
+
+fn native_window_named(
+    pid: i32,
+    title: &str,
+) -> objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement> {
+    use objc2_application_services::AXUIElement;
+    use objc2_core_foundation::{CFArray, CFRetained, CFType};
+    let app = unsafe { AXUIElement::new_application(pid) };
+    let windows = fixture_ax_value(&app, "AXWindows").unwrap();
+    let windows = windows.downcast_ref::<CFArray>().unwrap();
+    (0..windows.len())
+        .find_map(|i| {
+            let value = unsafe { &*windows.value_at_index(i as isize).cast::<CFType>() };
+            let window = value.downcast_ref::<AXUIElement>()?;
+            native_ax_string(window, "AXTitle")
+                .filter(|t| t.contains(title))
+                .map(|_| unsafe { CFRetained::retain(std::ptr::NonNull::from(window)) })
+        })
+        .expect("only the named test-owned window")
 }

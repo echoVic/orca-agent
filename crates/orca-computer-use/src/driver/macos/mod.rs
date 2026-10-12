@@ -130,13 +130,13 @@ impl MacDriver {
             params.query.as_deref(),
             params.max_elements,
         )?;
-        let focused_secure = application
-            .attribute_element("AXFocusedUIElement")?
-            .map(|e| e.attribute_string("AXSubrole"))
-            .transpose()?
-            .flatten()
-            .as_deref()
-            == Some("AXSecureTextField");
+        let focused_secure = match application.optional_attribute_element("AXFocusedUIElement")? {
+            Some(element) => match element.is_secure() {
+                Err(failure) if failure.kind == ErrorKind::Stale => true,
+                result => result?,
+            },
+            None => false,
+        };
         self.element_tables.insert(
             (pid, window.id),
             ElementTable {

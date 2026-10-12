@@ -1,5 +1,5 @@
-//! Owned accessibility handles. Unsupported optional attributes are absent;
-//! native failures (including invalid handles) remain typed driver errors.
+//! Owned accessibility handles. Optional local metadata degrades to absence;
+//! timeouts and required app/window/action reads retain typed errors.
 use std::ptr::NonNull;
 use std::time::Instant;
 
@@ -30,6 +30,11 @@ fn check(result: AXError, operation: &str) -> Result<(), DriverError> {
         ErrorKind::Failed,
         format!("Accessibility {operation} failed: {result:?}"),
     ))
+}
+
+pub(super) fn secure_text_role(role: &str, subrole: Option<&str>) -> bool {
+    subrole == Some("AXSecureTextField")
+        || (subrole.is_none() && matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox"))
 }
 
 impl AxElement {
@@ -90,9 +95,9 @@ impl AxElement {
         }))
     }
 
-    // R7: optional title/description/label/placeholder/value reads
-    // treat NoValue, AttributeUnsupported and Failure as absent. Required
-    // role/position/size/window/children reads and actions must not use this.
+    // R7: optional metadata (including subrole) treats NoValue,
+    // AttributeUnsupported and Failure as absent. Actions and app/window
+    // validation retain required reads; traversal degrades only local elements.
     pub(super) fn optional_attribute_string(
         &self,
         name: &str,
@@ -109,6 +114,24 @@ impl AxElement {
                         .map(|n| n.to_string())
                 }
             }))
+    }
+
+    pub(super) fn is_secure(&self) -> Result<bool, DriverError> {
+        let Some(role) = self.optional_attribute_string("AXRole")? else {
+            return Ok(true); // An unclassifiable keyboard recipient fails closed.
+        };
+        let subrole = self.optional_attribute_string("AXSubrole")?;
+        Ok(secure_text_role(&role, subrole.as_deref()))
+    }
+
+    pub(super) fn optional_attribute_element(
+        &self,
+        name: &str,
+    ) -> Result<Option<Self>, DriverError> {
+        self.attribute_with_optional_absence(name, true)?
+            .and_then(|v| v.downcast::<AXUIElement>().ok())
+            .map(Self::from_owned)
+            .transpose()
     }
 
     /// Observations and stale checks must use the same optional label reads.
@@ -154,7 +177,7 @@ impl AxElement {
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(vec![]);
         }
-        let Some(value) = self.attribute(name)? else {
+        let Some(value) = self.attribute_with_optional_absence(name, deadline.is_some())? else {
             return Ok(vec![]);
         };
         let Some(array) = value.downcast_ref::<CFArray>() else {
@@ -169,7 +192,10 @@ impl AxElement {
                     .downcast_ref::<AXUIElement>()
                     .map(|v| unsafe { CFRetained::retain(NonNull::from(v)) })
             })
-            .map(Self::from_owned)
+            .filter_map(|element| match Self::from_owned(element) {
+                Err(failure) if deadline.is_some() && failure.kind == ErrorKind::Stale => None,
+                result => Some(result),
+            })
             .collect()
     }
 
@@ -215,19 +241,29 @@ impl AxElement {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(None);
             }
-            let value = self.attribute(name)?.ok_or_else(|| {
-                error(
+            let Some(value) = self.attribute_with_optional_absence(name, deadline.is_some())?
+            else {
+                if deadline.is_some() {
+                    return Ok(None);
+                }
+                return Err(error(
                     ErrorKind::Failed,
                     format!("Accessibility {name} is missing"),
-                )
-            })?;
-            let value = value.downcast_ref::<AXValue>().ok_or_else(|| {
-                error(
+                ));
+            };
+            let Some(value) = value.downcast_ref::<AXValue>() else {
+                if deadline.is_some() {
+                    return Ok(None);
+                }
+                return Err(error(
                     ErrorKind::Failed,
                     format!("Accessibility {name} has an invalid type"),
-                )
-            })?;
+                ));
+            };
             if !unsafe { value.value(kind, pointer) } {
+                if deadline.is_some() {
+                    return Ok(None);
+                }
                 return Err(error(ErrorKind::Failed, format!("Could not decode {name}")));
             }
         }
@@ -346,6 +382,21 @@ impl AxElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_text_roles_are_secure_but_non_text_roles_are_not() {
+        for role in ["AXTextField", "AXTextArea", "AXComboBox"] {
+            assert!(secure_text_role(role, None), "{role}");
+            assert!(
+                !secure_text_role(role, Some("AXUnknown")),
+                "readable nonsecure control: {role}"
+            );
+            assert!(secure_text_role(role, Some("AXSecureTextField")));
+        }
+        for role in ["AXButton", "AXScrollArea", "AXRow", "AXWindow"] {
+            assert!(!secure_text_role(role, None), "{role}");
+        }
+    }
 
     #[test]
     fn invalid_elements_require_a_fresh_observation() {

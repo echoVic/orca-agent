@@ -241,7 +241,7 @@ pub(super) fn check_secure_approval(
     }
     let focused = application.attribute_element("AXFocusedUIElement")?;
     for element in target.into_iter().chain(focused.as_ref()) {
-        if element.attribute_string("AXSubrole")?.as_deref() == Some("AXSecureTextField") {
+        if element.is_secure()? {
             return Err(error(
                 ErrorKind::NeedsSecureApproval,
                 "Entering text into a password field requires approval",

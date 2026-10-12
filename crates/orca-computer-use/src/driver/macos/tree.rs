@@ -93,10 +93,10 @@ impl TreeNode for AxElement {
                 $operation?
             }};
         }
-        let role = read!(self.attribute_string("AXRole")).unwrap_or_default();
+        let role = read!(self.optional_attribute_string("AXRole")).unwrap_or_default();
         let retained_role = ROLES.contains(&role.as_str());
-        let subrole = read!(self.attribute_string("AXSubrole"));
-        let secure = subrole.as_deref() == Some("AXSecureTextField");
+        let subrole = read!(self.optional_attribute_string("AXSubrole"));
+        let secure = super::ax::secure_text_role(&role, subrole.as_deref());
         let window_frame_control = role == "AXButton"
             && matches!(
                 subrole.as_deref(),
@@ -213,7 +213,13 @@ fn walk_until<N: TreeNode>(
         ax: depth.ax + 1,
         retained: depth.retained,
     };
-    if let Some((mut retained, entry)) = element.retained(geometry, budget.deadline)? {
+    let retained = match element.retained(geometry, budget.deadline) {
+        Err(failure) if depth.ax > 0 && failure.kind == crate::protocol::ErrorKind::Stale => {
+            return Ok(());
+        }
+        result => result?,
+    };
+    if let Some((mut retained, entry)) = retained {
         // Once real content appears, complete this walk with its independent budget.
         if N::is_content(&entry) {
             budget.deadline = budget.full_deadline;
@@ -225,7 +231,13 @@ fn walk_until<N: TreeNode>(
         entries.push(entry);
     }
     if depth.ax < 30 && !budget.expired() {
-        for child in element.children_until(budget.deadline)? {
+        let children = match element.children_until(budget.deadline) {
+            Err(failure) if depth.ax > 0 && failure.kind == crate::protocol::ErrorKind::Stale => {
+                return Ok(());
+            }
+            result => result?,
+        };
+        for child in children {
             if budget.expired() {
                 break;
             }
@@ -511,6 +523,105 @@ mod regression_tests {
             image_size: (100, 100),
         }
     }
+    #[derive(Clone)]
+    struct FaultNode {
+        node: Node,
+        kind: crate::protocol::ErrorKind,
+        on_children: bool,
+    }
+    impl TreeNode for FaultNode {
+        type Entry = ();
+        fn is_content(_: &()) -> bool {
+            true
+        }
+        fn retained(
+            &self,
+            geometry: CaptureGeometry,
+            deadline: Instant,
+        ) -> Result<Option<(Element, ())>, DriverError> {
+            if self.node.label == Some("Bad") && !self.on_children {
+                return Err(super::super::error(self.kind, "unavailable node"));
+            }
+            self.node.retained(geometry, deadline)
+        }
+        fn children_until(&self, deadline: Instant) -> Result<Vec<Self>, DriverError> {
+            if self.node.label == Some("Bad") && self.on_children {
+                return Err(super::super::error(self.kind, "unavailable children"));
+            }
+            Ok(self
+                .node
+                .children_until(deadline)?
+                .into_iter()
+                .map(|node| Self {
+                    node,
+                    kind: self.kind,
+                    on_children: self.on_children,
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn a_stale_child_does_not_hide_good_siblings_but_root_and_timeout_errors_fail() {
+        use crate::protocol::ErrorKind;
+        for on_children in [false, true] {
+            let tree = FaultNode {
+                node: Node::group(vec![
+                    Node::control("First"),
+                    Node::control("Bad"),
+                    Node::control("Last"),
+                ]),
+                kind: ErrorKind::Stale,
+                on_children,
+            };
+            let mut elements = vec![];
+            walk(
+                tree.clone(),
+                Depth::default(),
+                geometry(),
+                Instant::now() + Duration::from_secs(1),
+                &mut elements,
+                &mut vec![],
+            )
+            .unwrap();
+            assert!(elements.iter().any(|e| e.label.as_deref() == Some("First")));
+            assert!(elements.iter().any(|e| e.label.as_deref() == Some("Last")));
+            assert_eq!(
+                walk(
+                    FaultNode {
+                        node: Node::control("Bad"),
+                        ..tree.clone()
+                    },
+                    Depth::default(),
+                    geometry(),
+                    Instant::now() + Duration::from_secs(1),
+                    &mut vec![],
+                    &mut vec![]
+                )
+                .unwrap_err()
+                .kind,
+                ErrorKind::Stale
+            );
+            assert_eq!(
+                walk(
+                    FaultNode {
+                        kind: ErrorKind::Failed,
+                        ..tree
+                    },
+                    Depth::default(),
+                    geometry(),
+                    Instant::now() + Duration::from_secs(1),
+                    &mut vec![],
+                    &mut vec![]
+                )
+                .unwrap_err()
+                .kind,
+                ErrorKind::Failed,
+                "timeouts must remain fatal"
+            );
+        }
+    }
+
     #[test]
     fn omitted_branches_do_not_invent_query_ancestors() {
         let tree = Node::group(vec![

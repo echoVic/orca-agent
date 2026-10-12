@@ -203,11 +203,9 @@ pub(super) fn run(
         && !params.secure_approved
         && target_element
             .as_ref()
-            .map(|e| e.attribute_string("AXSubrole"))
+            .map(AxElement::is_secure)
             .transpose()?
-            .flatten()
-            .as_deref()
-            == Some("AXSecureTextField")
+            .unwrap_or(false)
     {
         return Err(error(
             ErrorKind::NeedsSecureApproval,

@@ -140,10 +140,34 @@ let controller = Controller()
 let window = ProbeWindow(contentRect: NSRect(x: 200, y: 200, width: 640, height: 480),
                       styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
 window.title = "Orca CU Fixture"
-let button = NSButton(title: "Increment", target: controller, action: #selector(Controller.increment(_:)))
+func failAX(_ code: Int) {
+    NSException(name: NSExceptionName("NSAccessibilityException"), reason: "Intentional fixture attribute failure",
+                userInfo: [NSAccessibility.ErrorCodeExceptionInfo: NSNumber(value: code)]).raise()
+}
+final class ProbeButton: NSButton {
+    override func accessibilityRole() -> NSAccessibility.Role? {
+        if CommandLine.arguments.contains("--bad-button-role") { failAX(-25200); return nil }
+        return super.accessibilityRole()
+    }
+    override func accessibilityFrame() -> NSRect {
+        if CommandLine.arguments.contains("--bad-button-frame") { failAX(-25200); return .zero }
+        return super.accessibilityFrame()
+    }
+    override func accessibilityChildren() -> [Any]? {
+        if CommandLine.arguments.contains("--bad-button-children") { failAX(-25200); return nil }
+        return super.accessibilityChildren()
+    }
+}
+let button = ProbeButton(title: "Increment", target: controller, action: #selector(Controller.increment(_:)))
 button.frame = NSRect(x: 20, y: 420, width: 120, height: 32)
 controller.label.frame = NSRect(x: 160, y: 426, width: 200, height: 20)
 final class ProbeField: NSTextField {
+    override func accessibilitySubrole() -> NSAccessibility.Subrole? {
+        // This probe must isolate the actual recipient check, not unknown-target gating.
+        if CommandLine.arguments.contains("--sticky-password-focus") { return NSAccessibility.Subrole(rawValue: "AXUnknown") }
+        if let value = CommandLine.arguments.first(where: { $0.hasPrefix("--subrole-error=") }), let code = Int(value.dropFirst("--subrole-error=".count)) { failAX(code); return nil }
+        return super.accessibilitySubrole()
+    }
     override func setAccessibilityFocused(_ focused: Bool) {
         if CommandLine.arguments.contains("--sticky-password-focus") || (foregroundTypeProbe && pendingProbeRaise) { return }
         super.setAccessibilityFocused(focused)
