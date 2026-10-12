@@ -150,8 +150,105 @@ pub(super) fn resolve_approved(bundle_id: &str) -> Result<AppInfo, DriverError> 
         })
 }
 
+fn application_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = vec![
+        "/Applications".into(),
+        "/System/Applications".into(),
+        "/System/Applications/Utilities".into(),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(std::path::PathBuf::from(home).join("Applications"));
+    }
+    roots
+}
+
+fn installed_info(bundle: &NSBundle, fallback_name: &str) -> Option<AppInfo> {
+    let bundle_id = bundle.bundleIdentifier()?.to_string();
+    if bundle_id.is_empty() {
+        return None;
+    }
+    Some(AppInfo {
+        bundle_id,
+        name: info_string(bundle, "CFBundleDisplayName")
+            .or_else(|| info_string(bundle, "CFBundleName"))
+            .unwrap_or_else(|| fallback_name.into()),
+        pid: None,
+        category: info_string(bundle, "LSApplicationCategoryType"),
+        windows: vec![],
+    })
+}
+
+fn find_installed_bundle(
+    name: &str,
+    roots: &[std::path::PathBuf],
+) -> Result<Option<Retained<NSBundle>>, DriverError> {
+    let wanted = name.to_lowercase();
+    let mut candidates = vec![];
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir()
+                || !path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("app"))
+            {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+            let Some(bundle) = NSBundle::bundleWithURL(&url) else {
+                continue;
+            };
+            let Some(info) = installed_info(&bundle, stem) else {
+                continue;
+            };
+            if info.bundle_id == name || stem.to_lowercase() == wanted {
+                candidates.push((info, bundle));
+            }
+        }
+    }
+    // Explicit identities win over a bundle folder that happens to have that name.
+    if candidates.iter().any(|(app, _)| app.bundle_id == name) {
+        candidates.retain(|(app, _)| app.bundle_id == name);
+    }
+    candidates.sort_by(|(a, _), (b, _)| a.bundle_id.cmp(&b.bundle_id));
+    candidates.dedup_by(|a, b| a.0.bundle_id == b.0.bundle_id);
+    if candidates.len() > 1 {
+        return Err(DriverError {
+            kind: ErrorKind::AppAmbiguous,
+            message: format!("More than one app is named {name}; use a bundle ID"),
+            candidates: candidates.into_iter().map(|(info, _)| info).collect(),
+        });
+    }
+    Ok(candidates.pop().map(|(_, bundle)| bundle))
+}
+
+/// Read-only native resolver seam: no app listing, launch, AX or HID delivery.
+#[cfg(feature = "test-utils")]
+pub fn test_resolve_app_from_roots(
+    name: &str,
+    allow_not_running: bool,
+    roots: &[std::path::PathBuf],
+) -> Result<AppInfo, DriverError> {
+    resolve_with_apps(name, allow_not_running, vec![], roots)
+}
+
 pub(super) fn resolve(name: &str, allow_not_running: bool) -> Result<AppInfo, DriverError> {
-    let apps = list()?;
+    resolve_with_apps(name, allow_not_running, list()?, &application_roots())
+}
+
+fn resolve_with_apps(
+    name: &str,
+    allow_not_running: bool,
+    apps: Vec<AppInfo>,
+    roots: &[std::path::PathBuf],
+) -> Result<AppInfo, DriverError> {
     if let Some(app) = apps.iter().find(|app| app.bundle_id == name) {
         return Ok(app.clone());
     }
@@ -175,19 +272,14 @@ pub(super) fn resolve(name: &str, allow_not_running: bool) -> Result<AppInfo, Dr
         if let Some(url) =
             workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(name))
             && let Some(bundle) = NSBundle::bundleWithURL(&url)
+            && let Some(info) = installed_info(&bundle, name)
         {
-            return Ok(AppInfo {
-                bundle_id: bundle
-                    .bundleIdentifier()
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| name.into()),
-                name: info_string(&bundle, "CFBundleDisplayName")
-                    .or_else(|| info_string(&bundle, "CFBundleName"))
-                    .unwrap_or_else(|| name.into()),
-                pid: None,
-                category: info_string(&bundle, "LSApplicationCategoryType"),
-                windows: vec![],
-            });
+            return Ok(info);
+        }
+        if let Some(bundle) = find_installed_bundle(name, roots)?
+            && let Some(info) = installed_info(&bundle, name)
+        {
+            return Ok(info);
         }
     }
     Err(error(
@@ -249,8 +341,13 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
         .and_then(|app| app.bundleURL())
         .or_else(|| {
             workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(&app.bundle_id))
-        })
-        .ok_or_else(|| error(ErrorKind::AppNotFound, format!("App not found: {name}")))?;
+        });
+    let url = match url {
+        Some(url) => url,
+        None => find_installed_bundle(&app.bundle_id, &application_roots())?
+            .map(|bundle| bundle.bundleURL())
+            .ok_or_else(|| error(ErrorKind::AppNotFound, format!("App not found: {name}")))?,
+    };
     let configuration = NSWorkspaceOpenConfiguration::configuration();
     configuration.setActivates(false);
     configuration.setPromptsUserIfNeeded(false);
@@ -331,6 +428,134 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn application_fixture(root: &std::path::Path, folder: &str, id: &str) {
+        let contents = root.join(format!("{folder}.app/Contents"));
+        std::fs::create_dir_all(&contents).unwrap();
+        std::fs::write(
+            contents.join("Info.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>{id}</string>
+<key>CFBundleName</key><string>TextEdit</string>
+<key>CFBundleDisplayName</key><string>Localized Editor</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+</dict></plist>"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn installed_name_resolution_reads_case_insensitive_bundles_in_each_application_root() {
+        for folder in [
+            "Applications",
+            "System/Applications",
+            "System/Applications/Utilities",
+            "Home/Applications",
+        ] {
+            let temp = tempfile::tempdir_in("/tmp").unwrap();
+            let root = temp.path().join(folder);
+            application_fixture(&root, "TeXtEdIt", "dev.orca.test.installed.textedit");
+            let roots = [temp.path().join("missing"), root];
+            for name in [
+                "TextEdit",
+                "textedit",
+                "TEXTEDIT",
+                "dev.orca.test.installed.textedit",
+            ] {
+                let resolved = resolve_with_apps(name, true, vec![], &roots).unwrap();
+                assert_eq!(resolved.bundle_id, "dev.orca.test.installed.textedit");
+                assert_eq!(resolved.name, "Localized Editor");
+                assert_eq!(
+                    resolved.category.as_deref(),
+                    Some("public.app-category.productivity")
+                );
+                assert_eq!(resolved.pid, None);
+                assert!(resolved.windows.is_empty());
+            }
+            assert_eq!(
+                resolve_with_apps("TextEdit", false, vec![], &roots)
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::AppNotFound
+            );
+        }
+    }
+
+    #[test]
+    fn installed_name_resolution_preserves_running_bundle_id_and_name_precedence() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "TextEdit", "dev.orca.test.installed.textedit");
+        let running = AppInfo {
+            bundle_id: "dev.orca.test.running.textedit".into(),
+            name: "TextEdit".into(),
+            pid: Some(42),
+            category: None,
+            windows: vec![],
+        };
+        for name in ["textedit", "dev.orca.test.running.textedit"] {
+            assert_eq!(
+                resolve_with_apps(name, true, vec![running.clone()], &[temp.path().into()])
+                    .unwrap(),
+                running
+            );
+        }
+    }
+
+    #[test]
+    fn installed_name_resolution_does_not_invent_ids_for_invalid_or_missing_bundles() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        for (name, plist) in [
+            (
+                "NoId",
+                "<plist version=\"1.0\"><dict><key>CFBundleName</key><string>NoId</string></dict></plist>",
+            ),
+            ("Invalid", "invalid plist"),
+        ] {
+            let contents = temp.path().join(format!("{name}.app/Contents"));
+            std::fs::create_dir_all(&contents).unwrap();
+            std::fs::write(contents.join("Info.plist"), plist).unwrap();
+        }
+        std::fs::create_dir(temp.path().join("MissingInfo.app")).unwrap();
+        for name in ["NoId", "Invalid", "MissingInfo", "Absent", "../NoId"] {
+            assert_eq!(
+                resolve_with_apps(name, true, vec![], &[temp.path().into()])
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::AppNotFound
+            );
+        }
+    }
+
+    #[test]
+    fn installed_name_resolution_reports_duplicate_names_instead_of_choosing_an_identity() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let roots = [
+            temp.path().join("Applications"),
+            temp.path().join("Home/Applications"),
+        ];
+        application_fixture(&roots[0], "TextEdit", "dev.orca.test.first.textedit");
+        application_fixture(&roots[1], "textedit", "dev.orca.test.second.textedit");
+        let error = resolve_with_apps("TEXTEDIT", true, vec![], &roots).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::AppAmbiguous);
+        assert_eq!(
+            error
+                .candidates
+                .iter()
+                .map(|a| a.bundle_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "dev.orca.test.first.textedit",
+                "dev.orca.test.second.textedit"
+            ]
+        );
+        let by_id =
+            resolve_with_apps("dev.orca.test.second.textedit", true, vec![], &roots).unwrap();
+        assert_eq!(by_id.bundle_id, "dev.orca.test.second.textedit");
+    }
 
     #[test]
     fn an_unavailable_ax_window_uses_the_remaining_launch_deadline() {

@@ -519,6 +519,116 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepare_and_execution_share_the_driver_installed_name_resolution() {
+        use crate::extension::{ExtensionData, RuntimeExtensionStores};
+        use orca_computer_use::driver::macos::test_resolve_app_from_roots;
+        use orca_computer_use::inprocess::InProcessLauncher;
+        use orca_computer_use::protocol::DriverError;
+        use orca_computer_use::serve::{DriverHandler, LineWriter};
+        use orca_core::cancel::CancelToken;
+        use orca_core::tool_types::ToolStatus;
+        use std::sync::Mutex;
+
+        struct FileTreeDriver {
+            roots: Vec<std::path::PathBuf>,
+            desktop: FakeDesktop,
+            requests: Arc<Mutex<Vec<Request>>>,
+        }
+        impl DriverHandler for FileTreeDriver {
+            fn handle(
+                &mut self,
+                request: Request,
+                events: &LineWriter,
+            ) -> Result<Reply, DriverError> {
+                self.requests.lock().unwrap().push(request.clone());
+                match &request {
+                    Request::ResolveApp {
+                        app,
+                        allow_not_running,
+                    } => {
+                        return Ok(Reply::Resolved {
+                            app: test_resolve_app_from_roots(app, *allow_not_running, &self.roots)?,
+                        });
+                    }
+                    Request::LaunchApp { app, .. } => {
+                        // Launch uses the same native resolver with the approved ID.
+                        let resolved = test_resolve_app_from_roots(app, true, &self.roots)?;
+                        assert_eq!(&resolved.bundle_id, app);
+                    }
+                    _ => {}
+                }
+                self.desktop.handle(request, events)
+            }
+            fn shutdown(&mut self) {
+                self.desktop.shutdown();
+            }
+        }
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let contents = temp.path().join("Applications/TeXtEdIt.app/Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        std::fs::write(
+            contents.join("Info.plist"),
+            r#"<?xml version="1.0"?><plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>dev.orca.test.approved.textedit</string>
+<key>CFBundleName</key><string>TextEdit</string>
+<key>CFBundleDisplayName</key><string>Localized Editor</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+        let mut desktop =
+            FakeDesktop::with_app("dev.orca.test.approved.textedit", "Localized Editor");
+        desktop.quit_app("dev.orca.test.approved.textedit");
+        let requests = Arc::new(Mutex::new(vec![]));
+        let service =
+            ComputerUseService::new_for_test(Arc::new(InProcessLauncher::new(FileTreeDriver {
+                roots: vec![temp.path().join("Applications")],
+                desktop,
+                requests: requests.clone(),
+            })));
+        let (_, mut invocation) = setup(
+            FakeDesktop::with_textedit(),
+            json!({"action":"launch_app", "app":"textedit", "open":["/tmp/owned.txt"]}),
+        );
+        let config = interactive_config();
+        prepare_invocation(&mut invocation, &config, &service).unwrap();
+        assert_eq!(
+            invocation.effective.target.as_deref(),
+            Some("dev.orca.test.approved.textedit")
+        );
+        assert!(
+            invocation
+                .approval_preview
+                .as_deref()
+                .unwrap()
+                .contains("Localized Editor (dev.orca.test.approved.textedit)")
+        );
+        assert!(requests.lock().unwrap().iter().any(|r| matches!(r, Request::ResolveApp { app, allow_not_running: true } if app == "textedit")));
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| matches!(r, Request::LaunchApp { .. })),
+            "prepare must resolve without launching"
+        );
+        let thread_store = ExtensionData::new("thread");
+        let turn_store = ExtensionData::new("turn");
+        thread_store.insert(service);
+        let result = crate::computer_use::execute::execute(
+            &invocation.effective,
+            &config,
+            0,
+            RuntimeExtensionStores::new(&thread_store, &turn_store),
+            temp.path(),
+            &CancelToken::new(),
+        );
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        assert!(requests.lock().unwrap().iter().any(|r| matches!(r, Request::LaunchApp { app, open } if app == "dev.orca.test.approved.textedit" && open == &["/tmp/owned.txt"])));
+    }
+
     #[test]
     fn a_missing_app_says_to_list_apps() {
         let (service, mut invocation) = setup(
