@@ -141,7 +141,7 @@ pub(super) fn list() -> Result<Vec<AppInfo>, DriverError> {
 pub(super) fn resolve_approved(bundle_id: &str) -> Result<AppInfo, DriverError> {
     list()?
         .into_iter()
-        .find(|app| app.bundle_id == bundle_id)
+        .find(|app| app.bundle_id.eq_ignore_ascii_case(bundle_id))
         .ok_or_else(|| {
             error(
                 ErrorKind::AppNotFound,
@@ -161,7 +161,7 @@ fn looks_like_bundle_id(name: &str) -> bool {
 }
 
 fn require_bundle_identity(input: &str, app: &AppInfo) -> Result<(), DriverError> {
-    if looks_like_bundle_id(input) && input != app.bundle_id {
+    if looks_like_bundle_id(input) && !input.eq_ignore_ascii_case(&app.bundle_id) {
         return Err(error(
             ErrorKind::AppNotFound,
             format!(
@@ -198,27 +198,42 @@ fn running_name_matches(
     };
     if bundle
         .bundleIdentifier()
-        .is_none_or(|id| id.to_string() != app.bundle_id)
+        .is_none_or(|id| !id.to_string().eq_ignore_ascii_case(&app.bundle_id))
     {
         return Ok(false);
     }
-    // infoDictionary is intentionally non-localized, unlike objectForInfoDictionaryKey.
+    Ok(bundle_name_matches(&bundle, name))
+}
+
+fn bundle_name_matches(bundle: &NSBundle, name: &str) -> bool {
+    // infoDictionary is intentionally non-localized.
     let raw_name = bundle
         .infoDictionary()
         .and_then(|info| info.objectForKey(&NSString::from_str("CFBundleName")))
         .and_then(|value| value.downcast::<NSString>().ok())
         .map(|value| value.to_string());
-    let folder_name = bundle.bundleURL().path().and_then(|path| {
+    let display_name = info_string(bundle, "CFBundleDisplayName");
+    let declared_names: Vec<_> = raw_name
+        .into_iter()
+        .chain(display_name)
+        .filter(|name| !name.is_empty())
+        .collect();
+    if declared_names
+        .iter()
+        .any(|alias| alias.to_lowercase() == name.to_lowercase())
+    {
+        return true;
+    }
+    // A folder renamed to an ID cannot impersonate a differently named app.
+    if looks_like_bundle_id(name) && !declared_names.is_empty() {
+        return false;
+    }
+    bundle.bundleURL().path().is_some_and(|path| {
         std::path::Path::new(&path.to_string())
             .file_stem()
-            .and_then(|s| s.to_str())
-            .map(str::to_owned)
-    });
-    let wanted = name.to_lowercase();
-    Ok(raw_name
-        .into_iter()
-        .chain(folder_name)
-        .any(|alias| alias.to_lowercase() == wanted))
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.to_lowercase() == name.to_lowercase())
+    })
 }
 
 fn application_roots() -> Vec<std::path::PathBuf> {
@@ -253,7 +268,6 @@ fn find_installed_bundle(
     name: &str,
     roots: &[std::path::PathBuf],
 ) -> Result<Option<Retained<NSBundle>>, DriverError> {
-    let wanted = name.to_lowercase();
     let mut candidates = vec![];
     for root in roots {
         let Ok(entries) = std::fs::read_dir(root) else {
@@ -279,19 +293,20 @@ fn find_installed_bundle(
             let Some(info) = installed_info(&bundle, stem) else {
                 continue;
             };
-            if info.bundle_id == name
-                || (!looks_like_bundle_id(name) && stem.to_lowercase() == wanted)
-            {
+            if info.bundle_id.eq_ignore_ascii_case(name) || bundle_name_matches(&bundle, name) {
                 candidates.push((info, bundle));
             }
         }
     }
     // Explicit identities win over a bundle folder that happens to have that name.
-    if candidates.iter().any(|(app, _)| app.bundle_id == name) {
-        candidates.retain(|(app, _)| app.bundle_id == name);
+    if candidates
+        .iter()
+        .any(|(app, _)| app.bundle_id.eq_ignore_ascii_case(name))
+    {
+        candidates.retain(|(app, _)| app.bundle_id.eq_ignore_ascii_case(name));
     }
-    candidates.sort_by(|(a, _), (b, _)| a.bundle_id.cmp(&b.bundle_id));
-    candidates.dedup_by(|a, b| a.0.bundle_id == b.0.bundle_id);
+    candidates.sort_by_key(|(app, _)| app.bundle_id.to_ascii_lowercase());
+    candidates.dedup_by(|a, b| a.0.bundle_id.eq_ignore_ascii_case(&b.0.bundle_id));
     if candidates.len() > 1 {
         return Err(DriverError {
             kind: ErrorKind::AppAmbiguous,
@@ -316,21 +331,50 @@ pub(super) fn resolve(name: &str, allow_not_running: bool) -> Result<AppInfo, Dr
     resolve_with_apps(name, allow_not_running, list()?, &application_roots())
 }
 
+fn installed_identity(
+    name: &str,
+    roots: &[std::path::PathBuf],
+) -> Result<Option<AppInfo>, DriverError> {
+    let workspace = NSWorkspace::sharedWorkspace();
+    if let Some(url) = workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(name))
+        && let Some(bundle) = NSBundle::bundleWithURL(&url)
+        && let Some(info) = installed_info(&bundle, name)
+        && info.bundle_id.eq_ignore_ascii_case(name)
+    {
+        require_bundle_identity(name, &info)?;
+        return Ok(Some(info));
+    }
+    if let Some(bundle) = find_installed_bundle(name, roots)?
+        && let Some(info) = installed_info(&bundle, name)
+        && info.bundle_id.eq_ignore_ascii_case(name)
+    {
+        return Ok(Some(info));
+    }
+    Ok(None)
+}
+
 fn resolve_with_apps(
     name: &str,
     allow_not_running: bool,
     apps: Vec<AppInfo>,
     roots: &[std::path::PathBuf],
 ) -> Result<AppInfo, DriverError> {
-    if let Some(app) = apps.iter().find(|app| app.bundle_id == name) {
+    if let Some(app) = apps
+        .iter()
+        .find(|app| app.bundle_id.eq_ignore_ascii_case(name))
+    {
         return Ok(app.clone());
     }
+    // A known installed identity wins before interpreting a dotted input as a name.
+    if allow_not_running && looks_like_bundle_id(name) {
+        if let Some(info) = installed_identity(name, roots)? {
+            return Ok(info);
+        }
+    }
     let mut candidates = vec![];
-    if !looks_like_bundle_id(name) {
-        for app in apps {
-            if running_name_matches(&app, name, roots)? {
-                candidates.push(app);
-            }
+    for app in apps {
+        if running_name_matches(&app, name, roots)? {
+            candidates.push(app);
         }
     }
     match candidates.as_slice() {
@@ -345,20 +389,13 @@ fn resolve_with_apps(
         }
     }
     if allow_not_running {
-        let workspace = NSWorkspace::sharedWorkspace();
-        if let Some(url) =
-            workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(name))
-            && let Some(bundle) = NSBundle::bundleWithURL(&url)
-            && let Some(info) = installed_info(&bundle, name)
-        {
-            require_bundle_identity(name, &info)?;
+        if let Some(info) = installed_identity(name, roots)? {
             return Ok(info);
         }
         if let Some(bundle) = find_installed_bundle(name, roots)?
             && let Some(info) = installed_info(&bundle, name)
         {
-            require_bundle_identity(name, &info)?;
-            return Ok(info);
+            return Ok(info); // The bundle's own name was checked by the finder.
         }
     }
     Err(error(
@@ -413,7 +450,6 @@ fn wait_for_accessibility_window(pid: i32, launch_deadline: Instant) -> bool {
 pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let app = resolve(name, true)?;
-    require_bundle_identity(name, &app)?;
     let workspace = NSWorkspace::sharedWorkspace();
     let url = app
         .pid
@@ -428,6 +464,15 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
             .map(|bundle| bundle.bundleURL())
             .ok_or_else(|| error(ErrorKind::AppNotFound, format!("App not found: {name}")))?,
     };
+    let bundle = NSBundle::bundleWithURL(&url)
+        .and_then(|bundle| installed_info(&bundle, &app.name))
+        .ok_or_else(|| {
+            error(
+                ErrorKind::AppNotFound,
+                "The resolved application has no bundle identity",
+            )
+        })?;
+    require_bundle_identity(&app.bundle_id, &bundle)?;
     let configuration = NSWorkspaceOpenConfiguration::configuration();
     configuration.setActivates(false);
     configuration.setPromptsUserIfNeeded(false);
@@ -485,7 +530,8 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
             return Err(error(ErrorKind::Failed, "App launch timed out"));
         }
         if let Some(app) = list_with_timeout(remaining)?.into_iter().find(|candidate| {
-            candidate.bundle_id == app.bundle_id && candidate.pid == Some(launched_pid)
+            candidate.bundle_id.eq_ignore_ascii_case(&app.bundle_id)
+                && candidate.pid == Some(launched_pid)
         }) {
             if wait_for_accessibility_window(launched_pid, deadline) {
                 // The first capture listing can precede the now-readable window.
@@ -526,6 +572,119 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn bundle_id_resolution_is_case_insensitive_and_retains_canonical_identity() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "CaseApp", "dev.orca.case-app");
+        let running = AppInfo {
+            bundle_id: "dev.orca.case-app".into(),
+            name: "CaseApp".into(),
+            pid: Some(42),
+            category: None,
+            windows: vec![],
+        };
+        assert_eq!(
+            resolve_with_apps("DEV.ORCA.CASE-APP", false, vec![running.clone()], &[]).unwrap(),
+            running
+        );
+        assert_eq!(
+            resolve_with_apps("DEV.ORCA.CASE-APP", true, vec![], &[temp.path().into()])
+                .unwrap()
+                .bundle_id,
+            "dev.orca.case-app"
+        );
+        assert!(require_bundle_identity("DEV.ORCA.CASE-APP", &running).is_ok());
+    }
+
+    #[test]
+    fn dotted_app_names_resolve_only_when_the_bundle_owns_the_name() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        application_fixture(temp.path(), "zoom.us", "dev.orca.zoom");
+        let plist = temp.path().join("zoom.us.app/Contents/Info.plist");
+        let text = std::fs::read_to_string(&plist)
+            .unwrap()
+            .replace("<string>TextEdit</string>", "<string>zoom.us</string>");
+        std::fs::write(&plist, text).unwrap();
+        application_fixture(temp.path(), "OtherFolder", "dev.orca.draw");
+        let plist = temp.path().join("OtherFolder.app/Contents/Info.plist");
+        let text = std::fs::read_to_string(&plist).unwrap().replace(
+            "<string>Localized Editor</string>",
+            "<string>draw.io</string>",
+        );
+        std::fs::write(&plist, text).unwrap();
+        for (name, id) in [("zoom.us", "dev.orca.zoom"), ("draw.io", "dev.orca.draw")] {
+            assert_eq!(
+                resolve_with_apps(name, true, vec![], &[temp.path().into()])
+                    .unwrap()
+                    .bundle_id,
+                id
+            );
+            let running = AppInfo {
+                bundle_id: id.into(),
+                name: name.into(),
+                pid: Some(42),
+                category: None,
+                windows: vec![],
+            };
+            assert_eq!(
+                resolve_with_apps(name, false, vec![running.clone()], &[]).unwrap(),
+                running
+            );
+        }
+        let localized = AppInfo {
+            bundle_id: "dev.orca.zoom".into(),
+            name: "本地名称".into(),
+            pid: Some(42),
+            category: None,
+            windows: vec![],
+        };
+        assert_eq!(
+            resolve_with_apps(
+                "zoom.us",
+                false,
+                vec![localized.clone()],
+                &[temp.path().into()]
+            )
+            .unwrap(),
+            localized
+        );
+        application_fixture(temp.path(), "folder.only", "dev.orca.folder");
+        let plist = temp.path().join("folder.only.app/Contents/Info.plist");
+        let text = std::fs::read_to_string(&plist)
+            .unwrap()
+            .replace("<key>CFBundleName</key><string>TextEdit</string>", "")
+            .replace(
+                "<key>CFBundleDisplayName</key><string>Localized Editor</string>",
+                "",
+            );
+        std::fs::write(&plist, text).unwrap();
+        assert_eq!(
+            resolve_with_apps("folder.only", true, vec![], &[temp.path().into()])
+                .unwrap()
+                .bundle_id,
+            "dev.orca.folder"
+        );
+        // Exact IDs still win over another app which owns that display name.
+        let real = AppInfo {
+            bundle_id: "zoom.us".into(),
+            name: "Real identity".into(),
+            pid: Some(43),
+            category: None,
+            windows: vec![],
+        };
+        let named = AppInfo {
+            bundle_id: "dev.orca.zoom".into(),
+            name: "zoom.us".into(),
+            pid: Some(42),
+            category: None,
+            windows: vec![],
+        };
+        assert_eq!(
+            resolve_with_apps("zoom.us", false, vec![named, real.clone()], &[]).unwrap(),
+            real
+        );
     }
 
     #[test]
@@ -649,7 +808,7 @@ mod tests {
         );
         let impostor = AppInfo {
             bundle_id: "dev.orca.other-app".into(),
-            name: "com.real.app".into(),
+            name: "Other App".into(),
             pid: Some(42),
             category: None,
             windows: vec![],
