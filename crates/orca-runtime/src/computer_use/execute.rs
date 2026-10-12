@@ -113,15 +113,17 @@ fn execute_with_timeout(
     }
     let reply = match service.call(driver_request, timeout) {
         Ok(reply) => reply,
+        Err(error) if cancel.is_cancelled() => {
+            service.reset();
+            let mut message = "computer use was stopped by the user (Esc)".to_string();
+            if let CallError::Driver(error) = error {
+                message.push_str("; ");
+                message.push_str(&error.message);
+            }
+            return ToolResult::cancelled(request, message, None);
+        }
         Err(error @ (CallError::TimedOut | CallError::Disconnected)) => {
             service.reset();
-            if cancel.is_cancelled() {
-                return ToolResult::cancelled(
-                    request,
-                    "computer use was stopped by the user (Esc)",
-                    None,
-                );
-            }
             let stopped = if matches!(error, CallError::Disconnected) {
                 "stopped"
             } else {
@@ -934,5 +936,63 @@ mod tests {
         assert!(text.contains("cut off after"));
         assert!(text.contains("time limit"));
         assert!(text.contains("no element tree; use point targets"));
+    }
+    #[test]
+    fn a_driver_error_after_turn_cancellation_is_reported_as_cancelled() {
+        struct CancellingDriver {
+            desktop: FakeDesktop,
+            cancel: CancelToken,
+        }
+        impl orca_computer_use::serve::DriverHandler for CancellingDriver {
+            fn handle(
+                &mut self,
+                request: Request,
+                events: &orca_computer_use::serve::LineWriter,
+            ) -> Result<Reply, orca_computer_use::protocol::DriverError> {
+                if matches!(request, Request::Act(_)) {
+                    self.cancel.cancel();
+                    return Err(orca_computer_use::protocol::DriverError {
+                        kind: ErrorKind::Failed,
+                        message: "The driver stopped the action; could not restore the pointer"
+                            .into(),
+                        candidates: vec![],
+                    });
+                }
+                self.desktop.handle(request, events)
+            }
+            fn shutdown(&mut self) {
+                self.desktop.shutdown();
+            }
+        }
+        let cancel = CancelToken::new();
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        thread_store.insert(ComputerUseService::new_for_test(Arc::new(
+            orca_computer_use::inprocess::InProcessLauncher::new(CancellingDriver {
+                desktop: FakeDesktop::with_textedit(),
+                cancel: cancel.clone(),
+            }),
+        )));
+        let result = execute(
+            &request(
+                json!({"action":"click", "app":"TextEdit", "target":{"element":1}}),
+                Some("com.apple.TextEdit"),
+            ),
+            &flash_config(),
+            RuntimeExtensionStores::new(&thread_store, &turn_store),
+            Path::new("/"),
+            &cancel,
+        );
+        assert!(cancel.is_cancelled());
+        assert_eq!(result.status, ToolStatus::Cancelled, "{:?}", result.error);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                "computer use was stopped by the user (Esc); The driver stopped the action; could not restore the pointer"
+            )
+        );
+        assert_eq!(
+            result.terminal().started,
+            orca_core::tool_types::ToolInvocationStarted::Yes
+        );
     }
 }

@@ -167,11 +167,7 @@ pub(crate) fn ensure_visible(
     if !super::visibility::tool_visible(
         config,
         depth,
-        config
-            .subagents
-            .effective_definition
-            .as_ref()
-            .map(|definition| definition.allowed_tools.as_slice()),
+        super::visibility::configured_tools(config),
         host_supported,
     ) {
         return Err("computer use is only available in the interactive TUI on macOS 14 or later; this session does not expose computer (main session only, no custom agent, and no whole-tool deny rule)".into());

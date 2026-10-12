@@ -2361,7 +2361,7 @@ mod tests {
 
     #[test]
     fn computer_hidden_sessions_refuse_list_apps_before_launch_or_approval() {
-        for condition in ["headless", "denied", "child", "custom"] {
+        for condition in ["headless", "denied", "child", "custom", "restricted"] {
             let mut config = computer_config();
             let mut depth = 0;
             match condition {
@@ -2373,6 +2373,10 @@ mod tests {
                     ),
                 ),
                 "child" => depth = 1,
+                "restricted" => {
+                    config.subagents.inherited_tools =
+                        Some(vec!["read_file".into(), "computer".into()])
+                }
                 "custom" => {
                     config.subagents.effective_definition = Some(
                         orca_core::subagent_types::agent_definition::EffectiveAgentDefinition {
