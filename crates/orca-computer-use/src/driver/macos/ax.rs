@@ -32,9 +32,38 @@ fn check(result: AXError, operation: &str) -> Result<(), DriverError> {
     ))
 }
 
-pub(super) fn secure_text_role(role: &str, subrole: Option<&str>) -> bool {
-    subrole == Some("AXSecureTextField")
-        || (subrole.is_none() && matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox"))
+#[derive(Debug, PartialEq)]
+pub(super) enum SubroleRead {
+    Value(String),
+    Absent,
+    Failure,
+}
+
+impl SubroleRead {
+    pub(super) fn as_deref(&self) -> Option<&str> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Absent | Self::Failure => None,
+        }
+    }
+}
+
+fn classify_subrole(result: AXError, value: Option<String>) -> Result<SubroleRead, DriverError> {
+    match result {
+        AXError::Failure => Ok(SubroleRead::Failure),
+        AXError::NoValue | AXError::AttributeUnsupported => Ok(SubroleRead::Absent),
+        _ => {
+            check(result, "AXSubrole")?;
+            Ok(value.map_or(SubroleRead::Absent, SubroleRead::Value))
+        }
+    }
+}
+
+pub(super) fn secure_text_role(role: &str, subrole: &SubroleRead) -> bool {
+    role.is_empty()
+        || subrole.as_deref() == Some("AXSecureTextField")
+        || (matches!(subrole, SubroleRead::Failure)
+            && matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox"))
 }
 
 impl AxElement {
@@ -116,12 +145,31 @@ impl AxElement {
             }))
     }
 
+    /// Security must distinguish a failed read from a field with no subrole.
+    pub(super) fn subrole(&self) -> Result<SubroleRead, DriverError> {
+        let mut value = std::ptr::null();
+        let result = unsafe {
+            self.0
+                .copy_attribute_value(&CFString::from_str("AXSubrole"), NonNull::from(&mut value))
+        };
+        let value =
+            NonNull::new(value.cast_mut()).map(|value| unsafe { CFRetained::from_raw(value) });
+        classify_subrole(
+            result,
+            value.and_then(|value| {
+                value
+                    .downcast_ref::<CFString>()
+                    .map(|text| text.to_string())
+            }),
+        )
+    }
+
     pub(super) fn is_secure(&self) -> Result<bool, DriverError> {
         let Some(role) = self.optional_attribute_string("AXRole")? else {
             return Ok(true); // An unclassifiable keyboard recipient fails closed.
         };
-        let subrole = self.optional_attribute_string("AXSubrole")?;
-        Ok(secure_text_role(&role, subrole.as_deref()))
+        let subrole = self.subrole()?;
+        Ok(secure_text_role(&role, &subrole))
     }
 
     pub(super) fn optional_attribute_element(
@@ -384,18 +432,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unreadable_text_roles_are_secure_but_non_text_roles_are_not() {
+    fn unreadable_text_roles_are_secure_but_absent_subroles_are_ordinary() {
         for role in ["AXTextField", "AXTextArea", "AXComboBox"] {
-            assert!(secure_text_role(role, None), "{role}");
-            assert!(
-                !secure_text_role(role, Some("AXUnknown")),
-                "readable nonsecure control: {role}"
-            );
-            assert!(secure_text_role(role, Some("AXSecureTextField")));
+            for result in [
+                AXError::NoValue,
+                AXError::AttributeUnsupported,
+                AXError::Success,
+            ] {
+                let subrole = classify_subrole(result, None).unwrap();
+                assert_eq!(subrole, SubroleRead::Absent);
+                assert!(!secure_text_role(role, &subrole), "{role}: {result:?}");
+            }
+            let failed = classify_subrole(AXError::Failure, None).unwrap();
+            assert_eq!(failed, SubroleRead::Failure);
+            assert!(secure_text_role(role, &failed));
+            assert!(!secure_text_role(
+                role,
+                &SubroleRead::Value("AXUnknown".into())
+            ));
+            assert!(secure_text_role(
+                role,
+                &SubroleRead::Value("AXSecureTextField".into())
+            ));
         }
         for role in ["AXButton", "AXScrollArea", "AXRow", "AXWindow"] {
-            assert!(!secure_text_role(role, None), "{role}");
+            assert!(!secure_text_role(role, &SubroleRead::Failure));
+            assert!(!secure_text_role(role, &SubroleRead::Absent));
         }
+        assert!(secure_text_role("", &SubroleRead::Absent));
+        assert!(classify_subrole(AXError::CannotComplete, None).is_err());
+        assert_eq!(
+            classify_subrole(AXError::InvalidUIElement, None)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Stale
+        );
     }
 
     #[test]

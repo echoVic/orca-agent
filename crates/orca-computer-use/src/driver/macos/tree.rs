@@ -95,8 +95,8 @@ impl TreeNode for AxElement {
         }
         let role = read!(self.optional_attribute_string("AXRole")).unwrap_or_default();
         let retained_role = ROLES.contains(&role.as_str());
-        let subrole = read!(self.optional_attribute_string("AXSubrole"));
-        let secure = super::ax::secure_text_role(&role, subrole.as_deref());
+        let subrole = read!(self.subrole());
+        let secure = super::ax::secure_text_role(&role, &subrole);
         let window_frame_control = role == "AXButton"
             && matches!(
                 subrole.as_deref(),

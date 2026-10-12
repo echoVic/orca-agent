@@ -1060,15 +1060,8 @@ fn observe_with_a_query_keeps_matches_and_their_ancestors() {
         let Some(mut live) = Live::start() else {
             return;
         };
-        live.launch_fixture_with_flags(&["--rows-probe"]);
+        live.launch_fixture();
         let all = live.observe("dev.orca.cu-fixture", None);
-        eprintln!(
-            "owned query control elements: {:?}",
-            all.elements
-                .iter()
-                .map(|e| (&e.role, &e.label, e.secure))
-                .collect::<Vec<_>>()
-        );
         let expected = orca_computer_use::observation::filter_elements(&all.elements, "incr");
         assert!(!expected.is_empty(), "positive match control");
         let filtered = live.observe("dev.orca.cu-fixture", Some("incr"));
@@ -1083,13 +1076,10 @@ fn observe_with_a_query_keeps_matches_and_their_ancestors() {
                 .iter()
                 .any(|e| e.label.as_deref() == Some("Increment"))
         );
-        let descendants = live.observe("dev.orca.cu-fixture", Some("Row 1"));
-        assert!(descendants.elements.iter().any(|e| {
-            e.role == "button"
-                && e.label
-                    .as_deref()
-                    .is_some_and(|label| label.contains("Row 1"))
-        }));
+        let descendants = live.observe("dev.orca.cu-fixture", Some("line 1"));
+        assert!(descendants.elements.iter().any(
+            |e| e.role == "text area" && e.value.as_ref().is_some_and(|v| v.contains("line 1"))
+        ));
         assert!(
             descendants
                 .elements
@@ -1420,7 +1410,7 @@ fn typing_goes_into_the_focused_field_in_the_background() {
                 text: "".into(),
                 target: Some(element_named(&obs, "Name")),
             },
-            true,
+            false,
         )
         .unwrap();
         live.act(
@@ -1428,7 +1418,7 @@ fn typing_goes_into_the_focused_field_in_the_background() {
                 text: "abc".into(),
                 target: None,
             },
-            true,
+            false,
         )
         .unwrap();
         live.assert_log_contains(&log, r#""value":"abc""#);
@@ -1500,7 +1490,7 @@ fn typing_with_a_chinese_input_method_enters_the_text_exactly() {
                 text: "abc 中文".into(),
                 target: Some(element_named(&obs, "Name")),
             },
-            true,
+            false,
         )
         .unwrap();
         live.assert_log_contains(&log, r#""value":"abc 中文""#);
@@ -1666,7 +1656,7 @@ fn cmd_a_reaches_the_focused_field() {
                 text: "abc".into(),
                 target: Some(element_named(&obs, "Name")),
             },
-            true,
+            false,
         )
         .unwrap();
         live.assert_log_contains(&log, r#""value":"abc""#);
@@ -1685,7 +1675,7 @@ fn cmd_a_reaches_the_focused_field() {
                 text: "x".into(),
                 target: None,
             },
-            true,
+            false,
         )
         .unwrap();
         thread::sleep(Duration::from_millis(100));
@@ -1710,7 +1700,7 @@ fn cmd_a_reaches_the_focused_field() {
                 text: "x".into(),
                 target: None,
             },
-            true,
+            false,
         )
         .unwrap();
         live.assert_log_contains(&log, r#""value":"x""#);
@@ -1785,7 +1775,7 @@ fn cmd_s_saves_textedit_in_the_background() {
                 text: "Edited by Orca".into(),
                 target: Some(Target::Element { element: text_area }),
             },
-            true,
+            false,
             true,
         )
         .unwrap();
@@ -1837,7 +1827,7 @@ fn cmd_s_saves_textedit_in_the_background() {
                 text: " control".into(),
                 target: None,
             },
-            true,
+            false,
             true,
         )
         .unwrap();
@@ -2052,7 +2042,7 @@ fn esc_fixture() -> Option<(Live, i32, PathBuf)> {
             text: "".into(),
             target: Some(element_named(&obs, "Name")),
         },
-        true,
+        false,
     )
     .unwrap();
     Some((live, pid, log))
@@ -3558,7 +3548,7 @@ fn background_type_with_a_target_inserts_after_existing_text() {
                         text: text.into(),
                         target: Some(target),
                     },
-                    true,
+                    false,
                 )
                 .unwrap();
             assert!(!outcome.foreground_used);
@@ -3568,9 +3558,8 @@ fn background_type_with_a_target_inserts_after_existing_text() {
                 .iter()
                 .find(|e| e.label.as_deref() == Some("Name"))
                 .unwrap();
-            if field.secure {
-                assert!(field.value.is_none());
-            }
+            assert!(!field.secure);
+            assert_eq!(field.value.as_deref(), Some(expected));
             assert_eq!(live.fixture_control_value("Name"), expected);
             live.assert_log_contains(&log, &format!("\"value\":\"{expected}\""));
         }
@@ -3644,7 +3633,7 @@ fn foreground_type_at_a_point_keeps_the_clicked_caret() {
                     text: "x".into(),
                     target: Some(target),
                 },
-                true,
+                false,
                 true,
             )
             .unwrap();
@@ -3694,7 +3683,7 @@ fn foreground_type_with_an_element_target_inserts_after_existing_text() {
                     text: "x".into(),
                     target: Some(element_named(&obs, "Name")),
                 },
-                true,
+                false,
                 true,
             )
             .unwrap();
@@ -3721,7 +3710,7 @@ fn type_with_optional_selection(flags: &[&str], expected: &str) {
                     text: "u".into(),
                     target: None,
                 },
-                true,
+                false,
             )
             .unwrap();
         assert!(!control.foreground_used);
@@ -3762,7 +3751,7 @@ fn type_with_optional_selection(flags: &[&str], expected: &str) {
                     text: "x".into(),
                     target: Some(element_named(&obs, "Name")),
                 },
-                true,
+                false,
             )
             .unwrap();
         assert!(!result.foreground_used);
@@ -4337,13 +4326,13 @@ fn a_failed_text_subrole_is_secure_and_needs_approval() {
 }
 #[test]
 #[ignore]
-fn a_missing_text_subrole_is_secure_and_needs_approval() {
-    unreadable_subrole_requires_approval(-25212);
+fn a_missing_text_subrole_is_ordinary() {
+    absent_subrole_is_ordinary(-25212);
 }
 #[test]
 #[ignore]
-fn an_unsupported_text_subrole_is_secure_and_needs_approval() {
-    unreadable_subrole_requires_approval(-25205);
+fn an_unsupported_text_subrole_is_ordinary() {
+    absent_subrole_is_ordinary(-25205);
 }
 
 fn one_bad_button_preserves_the_tree(flag: &str) {
@@ -4492,7 +4481,7 @@ fn textedit_save_panel_uses_foreground_for_typing() {
                     text: "Background control".into(),
                     target: Some(Target::Element { element: area.id }),
                 },
-                true,
+                false,
                 false,
             )
             .unwrap();
@@ -4510,7 +4499,7 @@ fn textedit_save_panel_uses_foreground_for_typing() {
                 keys: vec!["cmd".into(), "shift".into(), "option".into(), "s".into()],
                 target: None,
             },
-            true,
+            false,
             true,
         )
         .unwrap();
@@ -4584,7 +4573,7 @@ fn textedit_save_panel_uses_foreground_for_typing() {
                     text: "orca-panel-name".into(),
                     target: None,
                 },
-                true,
+                false,
                 true,
             )
             .unwrap();
@@ -4613,7 +4602,7 @@ fn textedit_save_panel_uses_foreground_for_typing() {
                     text: "-target".into(),
                     target: Some(Target::Element { element: field.id }),
                 },
-                true,
+                false,
                 true,
             )
             .unwrap();
@@ -4633,7 +4622,7 @@ fn textedit_save_panel_uses_foreground_for_typing() {
                     keys: vec!["space".into()],
                     target: None,
                 },
-                true,
+                false,
                 true,
             )
             .unwrap();
@@ -4651,7 +4640,7 @@ fn textedit_save_panel_uses_foreground_for_typing() {
                 keys: vec!["escape".into()],
                 target: None,
             },
-            true,
+            false,
             true,
         )
         .unwrap();
@@ -4682,7 +4671,7 @@ fn background_300_roundtrip(
                 text: "AbC/9".into(),
                 target: Some(Target::Element { element }),
             },
-            true,
+            false,
             false,
         )
         .unwrap();
@@ -4723,7 +4712,7 @@ fn background_300_roundtrip(
                 text: text.clone(),
                 target: Some(Target::Element { element }),
             },
-            true,
+            false,
             false,
         )
         .unwrap();
@@ -4906,4 +4895,31 @@ fn cold_textedit_launches_by_english_name() {
 #[ignore]
 fn cold_calculator_launches_by_english_name() {
     cold_launch_by_name("Calculator", "com.apple.calculator");
+}
+
+fn absent_subrole_is_ordinary(code: i32) {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let option = format!("--subrole-error={code}");
+        live.launch_fixture_with_flags(&["--prefilled-name", &option]);
+        let observation = live.observe("dev.orca.cu-fixture", None);
+        let field = observation
+            .elements
+            .iter()
+            .find(|e| e.label.as_deref() == Some("Name"))
+            .unwrap();
+        assert!(!field.secure);
+        assert_eq!(field.value.as_deref(), Some("a🦀c"));
+        live.act(
+            Action::Type {
+                text: "x".into(),
+                target: Some(element_named(&observation, "Name")),
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(live.fixture_control_value("Name"), "a🦀cx");
+    });
 }
