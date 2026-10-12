@@ -7,17 +7,30 @@ use crate::{
     protocol::{DriverError, ErrorKind},
 };
 
+fn unicode_chunk_end(units: &[u16], start: usize) -> usize {
+    // AppKit interprets a leading newline/tab as a command and ignores
+    // the rest of that event's Unicode string. Isolate control characters.
+    let control = |unit: u16| matches!(unit, 9 | 10 | 13);
+    if control(units[start]) {
+        return start + 1;
+    }
+    let mut end = (start + 20).min(units.len());
+    if let Some(offset) = units[start..end].iter().position(|unit| control(*unit)) {
+        end = start + offset;
+    }
+    if end < units.len() && (0xD800..=0xDBFF).contains(&units[end - 1]) {
+        end -= 1;
+    }
+    end
+}
+
 pub(super) fn post_unicode_text(pid: i32, text: &str) -> Result<(), DriverError> {
     let source = CGEventSource::new(CGEventSourceStateID::Private)
         .ok_or_else(|| error(ErrorKind::Failed, "Could not create keyboard event source"))?;
     let units: Vec<u16> = text.encode_utf16().collect();
     let mut start = 0;
     while start < units.len() {
-        let mut end = (start + 20).min(units.len());
-        // Keep a surrogate pair together across the 20-unit boundary.
-        if end < units.len() && (0xD800..=0xDBFF).contains(&units[end - 1]) {
-            end -= 1;
-        }
+        let end = unicode_chunk_end(&units, start);
         for down in [true, false] {
             let event = CGEvent::new_keyboard_event(Some(&source), 0, down)
                 .ok_or_else(|| error(ErrorKind::Failed, "Could not create keyboard event"))?;
@@ -293,10 +306,7 @@ impl<'a> HidEvents<'a> {
         let units: Vec<u16> = text.encode_utf16().collect();
         let mut start = 0;
         while start < units.len() {
-            let mut end = (start + 20).min(units.len());
-            if end < units.len() && (0xD800..=0xDBFF).contains(&units[end - 1]) {
-                end -= 1;
-            }
+            let end = unicode_chunk_end(&units, start);
             let down = self.keyboard(0, true, Modifiers::default())?;
             let up = self.keyboard(0, false, Modifiers::default())?;
             for event in [&down, &up] {
@@ -447,4 +457,33 @@ fn an_expired_foreground_deadline_refuses_input_before_native_delivery() {
         failure.message,
         "The foreground action timed out; observe again"
     );
+}
+
+#[cfg(test)]
+mod unicode_chunk_tests {
+    use super::*;
+    fn chunks(text: &str) -> Vec<String> {
+        let units: Vec<_> = text.encode_utf16().collect();
+        let mut start = 0;
+        let mut result = vec![];
+        while start < units.len() {
+            let end = unicode_chunk_end(&units, start);
+            result.push(
+                String::from_utf16(&units[start..end])
+                    .expect("chunks must preserve surrogate pairs"),
+            );
+            start = end;
+        }
+        result
+    }
+    #[test]
+    fn unicode_chunks_isolate_controls_and_keep_surrogate_pairs() {
+        assert_eq!(
+            chunks("AbC\n/xyZ\tEnd\r🦀"),
+            ["AbC", "\n", "/xyZ", "\t", "End", "\r", "🦀"]
+        );
+        let text = format!("{}🦀Z", "x".repeat(19));
+        assert_eq!(chunks(&text), ["x".repeat(19), "🦀Z".into()]);
+        assert_eq!(chunks(&text).concat(), text);
+    }
 }

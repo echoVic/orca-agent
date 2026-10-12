@@ -4680,3 +4680,148 @@ fn textedit_save_panel_uses_foreground_for_typing() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
+
+fn background_300_roundtrip(
+    live: &Live,
+    app: &str,
+    window: u32,
+    editor: &objc2_application_services::AXUIElement,
+    log: Option<&std::path::Path>,
+) {
+    let observed = live.observe_window(app, Some(window), None, 300, false);
+    let element = observed
+        .elements
+        .iter()
+        .find(|e| e.role == "text area")
+        .unwrap()
+        .id;
+    let initial = native_ax_string(editor, "AXValue").unwrap();
+    let control = live
+        .act_app(
+            app,
+            Some(window),
+            Action::Type {
+                text: "AbC/9".into(),
+                target: Some(Target::Element { element }),
+            },
+            true,
+            false,
+        )
+        .unwrap();
+    assert!(!control.foreground_used);
+    assert_eq!(
+        native_ax_string(editor, "AXValue").unwrap(),
+        format!("{initial}AbC/9"),
+        "same-editor short background positive control"
+    );
+    assert_eq!(
+        unsafe {
+            editor.set_attribute_value(
+                &objc2_core_foundation::CFString::from_str("AXValue"),
+                objc2_core_foundation::CFString::from_str("").as_ref(),
+            )
+        },
+        objc2_application_services::AXError::Success
+    );
+    assert_eq!(native_ax_string(editor, "AXValue").as_deref(), Some(""));
+    let text: String = "\nAbC/tmp/OrCa🦀/xyZ\n"
+        .repeat(20)
+        .chars()
+        .take(300)
+        .collect();
+    assert_eq!(text.chars().count(), 300);
+    let observed = live.observe_window(app, Some(window), None, 300, false);
+    let element = observed
+        .elements
+        .iter()
+        .find(|e| e.role == "text area")
+        .unwrap()
+        .id;
+    let result = live
+        .act_app(
+            app,
+            Some(window),
+            Action::Type {
+                text: text.clone(),
+                target: Some(Target::Element { element }),
+            },
+            true,
+            false,
+        )
+        .unwrap();
+    assert!(!result.foreground_used, "long input must remain background");
+    thread::sleep(Duration::from_millis(200));
+    let actual = native_ax_string(editor, "AXValue").unwrap();
+    if let Some(log) = log {
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter(|e: &serde_json::Value| e["type"] == "keydown")
+            .collect();
+        eprintln!("test-owned keydown receipts: {events:?}");
+    }
+    eprintln!(
+        "300-character native receipt: expected_chars={}, actual_chars={}, actual={actual:?}",
+        text.chars().count(),
+        actual.chars().count()
+    );
+    assert_eq!(
+        actual, text,
+        "background type must preserve every character, newline, slash, case and emoji"
+    );
+    live.assert_frontmost_and_pointer_unchanged();
+}
+
+#[test]
+#[ignore]
+fn background_type_300_characters_roundtrips_in_fixture_text_area() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) = live.launch_fixture();
+        let window = fixture_window(pid);
+        let editor = fixture_ax_role(&window, "AXTextArea").unwrap();
+        live.make_finder_frontmost();
+        let observed = live.observe("dev.orca.cu-fixture", None);
+        background_300_roundtrip(
+            &live,
+            "dev.orca.cu-fixture",
+            observed.window.id,
+            &editor,
+            Some(&log),
+        );
+    });
+}
+
+#[test]
+#[ignore]
+fn background_type_300_characters_roundtrips_in_textedit_document() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        if !bundle_pids("com.apple.TextEdit").is_empty() {
+            eprintln!("skipped: TextEdit already running");
+            return;
+        }
+        let file = live.directory.path().join("orca-cu-300.txt");
+        std::fs::write(&file, "").unwrap();
+        let app = launch_test_app(
+            &mut live,
+            "com.apple.TextEdit",
+            vec![file.to_string_lossy().into_owned()],
+        );
+        let window = app
+            .windows
+            .iter()
+            .find(|w| w.title.contains("orca-cu-300.txt"))
+            .unwrap()
+            .id;
+        let native = native_window_named(app.pid.unwrap(), "orca-cu-300.txt");
+        let editor = fixture_ax_role(&native, "AXTextArea").unwrap();
+        live.make_finder_frontmost();
+        background_300_roundtrip(&live, "com.apple.TextEdit", window, &editor, None);
+    });
+}
