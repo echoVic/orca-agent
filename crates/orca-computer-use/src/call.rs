@@ -131,6 +131,9 @@ impl ComputerCall {
                     None => 3,
                     Some(value) => parse_u32(value, "amount")?,
                 };
+                if !(1..=50).contains(&amount) {
+                    return Err("\"amount\" must be between 1 and 50".into());
+                }
                 Action::Scroll {
                     target,
                     direction,
@@ -306,6 +309,22 @@ fn optional_target(arguments: &Value, action: &str) -> Result<Option<Target>, St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scroll_amount_obeys_the_schema_range() {
+        for amount in [51, 10000, 0] {
+            let failure = super::ComputerCall::parse(&serde_json::json!({
+                "action":"scroll", "app":"x", "target":{"element":1}, "direction":"down", "amount":amount
+            })).unwrap_err();
+            assert!(failure.contains("amount"));
+            assert!(failure.contains("50"));
+        }
+        for amount in [1, 50] {
+            assert!(super::ComputerCall::parse(&serde_json::json!({
+                "action":"scroll", "app":"x", "target":{"element":1}, "direction":"down", "amount":amount
+            })).is_ok());
+        }
+    }
+
     #[test]
     fn type_refuses_non_text_controls_before_delivery() {
         for control in (0u8..=31)
