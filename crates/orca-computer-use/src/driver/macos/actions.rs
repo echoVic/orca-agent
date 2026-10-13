@@ -241,9 +241,22 @@ fn check_background_keyboard(
     )
 }
 
+#[cfg(feature = "test-utils")]
+static LAST_ACTION_DEADLINE: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+#[cfg(feature = "test-utils")]
+pub fn test_last_action_deadline() -> Option<std::time::Instant> {
+    *LAST_ACTION_DEADLINE.lock().unwrap()
+}
+
 impl MacDriver {
     pub(super) fn act(&mut self, params: ActParams) -> Result<ActOutcome, DriverError> {
         let action_deadline = std::time::Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT;
+        #[cfg(feature = "test-utils")]
+        {
+            *LAST_ACTION_DEADLINE.lock().unwrap() = Some(action_deadline);
+        }
+
         capture::check_unlocked()?;
         let app = apps::resolve_approved(&params.app)?;
         let pid = app
@@ -1279,4 +1292,37 @@ mod tests {
         assert_eq!(failure.kind, ErrorKind::NeedsForeground);
         assert_eq!(failure.message, "The app is hidden");
     }
+}
+
+#[cfg(feature = "test-utils")]
+pub fn test_native_modality(
+    element: objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>,
+    remaining: std::time::Duration,
+) -> Result<bool, DriverError> {
+    in_modal_sheet(
+        &AxElement::from_owned(element)?,
+        std::time::Instant::now() + remaining,
+    )
+}
+
+#[cfg(feature = "test-utils")]
+pub fn test_native_type_role(
+    element: objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>,
+    text: &str,
+) -> Result<(), DriverError> {
+    check_type_recipient(&AxElement::from_owned(element)?, text)
+}
+
+#[cfg(feature = "test-utils")]
+pub fn test_native_keyboard_recipient(
+    pid: i32,
+    target: objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>,
+) -> Result<(), DriverError> {
+    let application = AxElement::application(pid)?;
+    check_background_keyboard(
+        pid,
+        &application,
+        &AxElement::from_owned(target)?,
+        std::time::Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT,
+    )
 }

@@ -139,7 +139,32 @@ pub fn last_test_process_hid_post() -> Option<std::time::Instant> {
     })
 }
 
+#[cfg(feature = "test-utils")]
+static LAST_KEY_DOWN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+#[cfg(feature = "test-utils")]
+static MOUSE_DOWNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "test-utils")]
+pub fn last_test_key_down() -> Option<std::time::Instant> {
+    *LAST_KEY_DOWN.lock().unwrap()
+}
+#[cfg(feature = "test-utils")]
+pub fn test_mouse_down_count() -> u64 {
+    MOUSE_DOWNS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn post_hid(event: &CGEvent) {
+    #[cfg(feature = "test-utils")]
+    {
+        match CGEvent::r#type(Some(event)) {
+            CGEventType::KeyDown => {
+                *LAST_KEY_DOWN.lock().unwrap() = Some(std::time::Instant::now())
+            }
+            CGEventType::LeftMouseDown | CGEventType::RightMouseDown => {
+                MOUSE_DOWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            _ => {}
+        }
+    }
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
     #[cfg(feature = "test-utils")]
     {
@@ -633,4 +658,21 @@ mod unicode_chunk_tests {
         assert_eq!(chunks(&text), ["x".repeat(19), "🦀Z".into()]);
         assert_eq!(chunks(&text).concat(), text);
     }
+}
+
+#[cfg(feature = "test-utils")]
+pub fn test_foreground_text(pid: i32, text: &str) -> Result<(), DriverError> {
+    let application = super::ax::AxElement::application(pid)?;
+    let recipient = application
+        .attribute_element("AXFocusedUIElement")?
+        .ok_or_else(|| error(ErrorKind::Failed, "No test recipient"))?;
+    super::actions::check_type_recipient(&recipient, text)?;
+    super::actions::check_foreground_secure_approval(&application, Some(&recipient), false)?;
+    let aborted = AtomicBool::new(false);
+    let mut hid = HidEvents::new(pid, &aborted)?;
+    let result = hid.text(text, || {
+        super::actions::verify_type_recipient(&application, &recipient, true)
+    });
+    hid.release();
+    result
 }

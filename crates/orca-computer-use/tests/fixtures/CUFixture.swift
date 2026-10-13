@@ -60,6 +60,11 @@ let foregroundPasswordProbe = CommandLine.arguments.contains("--foreground-passw
 let foregroundTypeProbe = CommandLine.arguments.contains("--foreground-type-probe")
 let rejectEarlyHit = CommandLine.arguments.contains("--reject-hit-before-raise")
 final class ProbeWindow: NSWindow {
+    override func isAccessibilityModal() -> Bool {
+        if let flag = CommandLine.arguments.first(where: { $0.hasPrefix("--window-modal-error=") }), let code = Int(flag.dropFirst("--window-modal-error=".count)) { failAX(code); return false }
+        if CommandLine.arguments.contains("--modal-window") { return true }
+        return super.isAccessibilityModal()
+    }
     override func accessibilityPerformRaise() -> Bool {
         pendingProbeRaise = false
         return super.accessibilityPerformRaise()
@@ -163,7 +168,43 @@ let button: NSButton = CommandLine.arguments.contains(where: { $0.hasPrefix("--b
     : NSButton(title: "Increment", target: controller, action: #selector(Controller.increment(_:)))
 button.frame = NSRect(x: 20, y: 420, width: 120, height: 32)
 controller.label.frame = NSRect(x: 160, y: 426, width: 200, height: 20)
+final class ModalAncestor: NSAccessibilityElement {
+    let index: Int
+    var successor: Any?
+    init(_ index: Int) { self.index = index; super.init() }
+    override func accessibilityRole() -> NSAccessibility.Role? {
+        if CommandLine.arguments.contains("--slow-modal-walk") {
+            Thread.sleep(forTimeInterval: 0.84)
+            log(["type": "slow_modal_read", "index": index])
+            if index == 33 { return .sheet }
+        }
+        return .group
+    }
+    override func accessibilityParent() -> Any? { successor }
+    override func accessibilityFrame() -> NSRect { field.accessibilityFrame() }
+}
+var modalAncestors: [ModalAncestor] = []
+
 final class ProbeField: NSTextField {
+    override func accessibilityRole() -> NSAccessibility.Role? {
+        if CommandLine.arguments.contains("--name-role-failure") { failAX(-25200); return nil }
+        return .textField
+    }
+    override func accessibilityTopLevelUIElement() -> Any? {
+        if let flag = CommandLine.arguments.first(where: { $0.hasPrefix("--modal-error=") }), let code = Int(flag.dropFirst("--modal-error=".count)) { failAX(code); return nil }
+        if !modalAncestors.isEmpty { failAX(-25212); return nil }
+        if CommandLine.arguments.contains("--modal-window") || CommandLine.arguments.contains("--name-role-failure") || CommandLine.arguments.contains(where: { $0.hasPrefix("--window-modal-error=") }) { return window }
+        return window
+    }
+    override func accessibilityWindow() -> Any? {
+        if !modalAncestors.isEmpty || CommandLine.arguments.contains("--modal-window") || CommandLine.arguments.contains(where: { $0.hasPrefix("--window-modal-error=") }) { return window }
+        return window
+    }
+    override func accessibilityParent() -> Any? {
+        if let first = modalAncestors.first { return first }
+        return superview
+    }
+
     override func accessibilitySubrole() -> NSAccessibility.Subrole? {
         // This probe must isolate the actual recipient check, not unknown-target gating.
         if CommandLine.arguments.contains("--sticky-password-focus") { return NSAccessibility.Subrole(rawValue: "AXUnknown") }
@@ -186,6 +227,13 @@ let field: NSTextField = CommandLine.arguments.contains(where: { $0.hasPrefix("-
     ? ProbeField(frame: NSRect(x: 20, y: 380, width: 300, height: 24))
     : NSTextField(frame: NSRect(x: 20, y: 380, width: 300, height: 24))
 field.setAccessibilityLabel("Name"); field.delegate = controller
+if CommandLine.arguments.contains("--deep-modal-walk") || CommandLine.arguments.contains("--slow-modal-walk") || CommandLine.arguments.contains("--cyclic-modal-walk") {
+    let count = CommandLine.arguments.contains("--slow-modal-walk") ? 34 : (CommandLine.arguments.contains("--cyclic-modal-walk") ? 1 : 40)
+    modalAncestors = (0..<count).map { ModalAncestor($0) }
+    for index in 0..<(count-1) { modalAncestors[index].successor = modalAncestors[index+1] }
+    modalAncestors[count-1].successor = CommandLine.arguments.contains("--cyclic-modal-walk") ? modalAncestors[0] : window
+}
+
 if CommandLine.arguments.contains("--prefilled-name") { field.stringValue = "a🦀c" }
 if foregroundTypeProbe { field.font = NSFont.monospacedSystemFont(ofSize: 16, weight: .regular) }
 let secure = NSSecureTextField(frame: NSRect(x: 340, y: 380, width: 200, height: 24))
@@ -250,7 +298,7 @@ let canvas = Canvas(frame: NSRect(x: 340, y: 140, width: 280, height: 220))
 for view in [button, controller.label, field, secure, scroll, canvas] as [NSView] {
     window.contentView!.addSubview(view)
 }
-if foregroundPasswordProbe || rejectEarlyHit {
+if foregroundPasswordProbe || foregroundTypeProbe || rejectEarlyHit {
     let reset = NSButton(title: "Reset probe focus", target: controller, action: #selector(Controller.resetProbeFocus(_:)))
     reset.frame = NSRect(x: 20, y: 20, width: 160, height: 30)
     window.contentView!.addSubview(reset)

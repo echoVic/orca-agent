@@ -1467,3 +1467,13 @@ mod tests {
         assert_eq!(failure.message, "App launch timed out");
     }
 }
+
+/// Native acceptance uses real running processes with owned application roots.
+#[cfg(feature = "test-utils")]
+pub fn test_resolve_with_running_from_roots(
+    name: &str,
+    allow_not_running: bool,
+    roots: &[std::path::PathBuf],
+) -> Result<AppInfo, DriverError> {
+    resolve_with_apps(name, allow_not_running, list()?, roots)
+}

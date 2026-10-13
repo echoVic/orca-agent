@@ -217,6 +217,120 @@ mod tests {
     use crate::computer_use::ComputerUseService;
     use crate::tool_invocation::ToolInvocation;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn native_secure_preview_tiers_and_provider_type_schema() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let home = std::env::var_os("ORCA_HOME").expect("isolated native ORCA_HOME");
+        assert!(std::path::Path::new(&home).starts_with("/tmp"));
+        let service =
+            ComputerUseService::new_for_test(Arc::new(crate::computer_use::ProcessLauncher {
+                exe: std::env::var_os("ORCA_CU_DRIVER_EXE")
+                    .expect("native driver executable")
+                    .into(),
+                cwd: directory.path().into(),
+                approval_mode: ApprovalMode::Suggest,
+            }));
+        let registry = orca_tools::registry::default_tool_registry();
+        let spec = registry.get("computer").unwrap().spec();
+        let wire = orca_provider::tool_schema::deepseek_tools_schema(&[
+            orca_provider::tool_schema::ProviderToolDefinition {
+                name: "computer".into(),
+                description: spec.description.to_string(),
+                input_schema: spec.input_schema.clone(),
+                strict_capable: false,
+            },
+        ]);
+        let description = wire[0]["function"]["parameters"]["properties"]["text"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            description.contains("text only")
+                && description.contains("multi-line")
+                && description.contains("key")
+                && description.contains("refused"),
+            "{description}"
+        );
+        eprintln!("model-facing provider schema BEFORE approval: {description}");
+        let Reply::Resolved { app } = service
+            .call(
+                Request::ResolveApp {
+                    app: "dev.orca.cu-fixture".into(),
+                    allow_not_running: false,
+                },
+                Duration::from_secs(30),
+            )
+            .unwrap()
+        else {
+            panic!("real app resolution")
+        };
+        let Reply::Observed { observation } = service
+            .call(
+                Request::Observe(ObserveParams {
+                    app: app.bundle_id.clone(),
+                    window: None,
+                    query: None,
+                    max_elements: 300,
+                    include_screenshot: false,
+                }),
+                Duration::from_secs(30),
+            )
+            .unwrap()
+        else {
+            panic!("real observation")
+        };
+        assert!(
+            observation
+                .elements
+                .iter()
+                .any(|e| e.secure && e.label.as_deref() == Some("Password"))
+        );
+        let element = observation
+            .elements
+            .iter()
+            .find(|e| e.secure && e.label.as_deref() == Some("Password"))
+            .unwrap()
+            .id;
+        service.record_observation(&observation);
+        let (_, mut invocation) = setup(
+            FakeDesktop::with_textedit(),
+            json!({"action":"type","app":app.bundle_id,"text":"preview-only","target":{"element":element}}),
+        );
+        prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap();
+        assert_eq!(
+            invocation.effective.target.as_deref(),
+            Some("dev.orca.cu-fixture#secure")
+        );
+        let preview = invocation.approval_preview.unwrap();
+        assert!(
+            preview.contains(&format!("{} ({})", app.name, app.bundle_id)),
+            "{preview}"
+        );
+        eprintln!(
+            "native secure-entry approval preview: {preview}; canonical target={:?}; no act was executed",
+            invocation.effective.target
+        );
+        for (bundle, blocked) in [("COM.APPLE.FINDER", false), ("COM.APPLE.PASSWORDS", true)] {
+            let (_, mut invocation) = setup(
+                FakeDesktop::with_textedit(),
+                json!({"action":"observe","app":bundle}),
+            );
+            let result = prepare_invocation(&mut invocation, &interactive_config(), &service);
+            if blocked {
+                let error = result.unwrap_err();
+                assert!(error.contains("blocked by default"), "{error}");
+                eprintln!("native case-variant forbidden tier: {bundle}, {error}");
+            } else {
+                result.unwrap();
+                let preview = invocation.approval_preview.unwrap();
+                assert!(preview.contains("warning:"), "{preview}");
+                assert!(preview.contains(bundle));
+                eprintln!("native case-variant warning tier and canonical preview: {preview}");
+            }
+        }
+    }
+
     fn setup(desktop: FakeDesktop, args: Value) -> (ComputerUseService, ToolInvocation) {
         let request = ToolRequest {
             id: "computer-1".into(),

@@ -656,13 +656,42 @@ fn cleanup_pids(running: &HashSet<i32>, launched: &HashSet<i32>) -> Vec<i32> {
     pids
 }
 
+fn restore_app_if_needed(
+    expected: i32,
+    current: Option<i32>,
+    activate: impl FnOnce() -> bool,
+) -> bool {
+    current == Some(expected) || activate()
+}
+
+#[test]
+fn an_already_restored_frontmost_app_needs_no_activation() {
+    assert!(restore_app_if_needed(42, Some(42), || false));
+    let mut called = false;
+    assert!(restore_app_if_needed(42, Some(7), || {
+        called = true;
+        true
+    }));
+    assert!(called);
+    assert!(!restore_app_if_needed(42, None, || false));
+}
+
 fn record_restoration(frontmost: Option<i32>, pointer: objc2_core_foundation::CGPoint) {
     use objc2_core_graphics::CGError;
     if let Some(pid) = frontmost {
-        let restored = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
-            .is_some_and(|app| {
-                app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows)
-            });
+        let restored = restore_app_if_needed(
+            pid,
+            NSWorkspace::sharedWorkspace()
+                .frontmostApplication()
+                .map(|app| app.processIdentifier()),
+            || {
+                NSRunningApplication::runningApplicationWithProcessIdentifier(pid).is_some_and(
+                    |app| {
+                        app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows)
+                    },
+                )
+            },
+        );
         if !restored {
             record_gui_failure(
                 GuiFailureKind::NativeOperation,
@@ -3648,7 +3677,7 @@ fn a_foreground_scroll_moves_the_target_list_and_restores_the_pointer() {
                 Action::Scroll {
                     target: element_named(&obs, "List"),
                     direction: Direction::Down,
-                    amount: 5,
+                    amount: 50,
                 },
                 false,
                 true,
@@ -3670,6 +3699,7 @@ fn a_foreground_scroll_moves_the_target_list_and_restores_the_pointer() {
                 .any(|e| e["type"] == "scroll" && e["y"].as_f64().is_some_and(|y| y > 0.0)),
             "foreground wheel must move the list while the pointer started away"
         );
+        eprintln!("native foreground wheel amount=50, list moved, pointer/frontmost restored");
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
@@ -4825,6 +4855,50 @@ fn textedit_save_panel_uses_foreground_for_typing() {
             before_key,
             "text-key panel receipt"
         );
+        let fresh = live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
+        let field = fresh
+            .elements
+            .iter()
+            .find(|e| e.role == "text field" && e.label.is_none())
+            .unwrap();
+        let mouse_before = orca_computer_use::driver::macos::test_mouse_down_count();
+        let key = live
+            .act_app(
+                "com.apple.TextEdit",
+                Some(window),
+                Action::Key {
+                    keys: vec!["left".into()],
+                    target: Some(Target::Element { element: field.id }),
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert!(key.foreground_used);
+        assert_eq!(
+            orca_computer_use::driver::macos::test_mouse_down_count(),
+            mouse_before,
+            "already-focused Save field navigation must not click first"
+        );
+        let source = live.background_state.unwrap();
+        live.fixture_frontmost(pid);
+        let point = orca_computer_use::driver::macos::test_element_click_point(
+            name.clone(),
+            native_window.clone(),
+        )
+        .unwrap();
+        let blocked =
+            orca_computer_use::driver::macos::test_click_at_point(pid, point).unwrap_err();
+        assert!(blocked.message.contains("covers the target point"));
+        assert_eq!(
+            orca_computer_use::driver::macos::test_mouse_down_count(),
+            mouse_before,
+            "refused click must not post mouse-down"
+        );
+        record_restoration(Some(source.0), source.1);
+        eprintln!(
+            "already-focused Save-field non-text key succeeds without mouse-down; same-field direct click is refused by ownership guard"
+        );
         // Cancel only our Save As panel; never save or browse outside the temporary document.
         live.act_app(
             "com.apple.TextEdit",
@@ -5219,11 +5293,21 @@ fn literal_type_refuses_single_line_controls_and_inserts_tabs_in_text_areas() {
 #[ignore]
 fn native_control_chunks_stop_when_the_recipient_moves_or_becomes_secure() {
     run_live_test(|| {
-        for flag in ["--move-focus-after-control", "--secure-after-control"] {
+        for (flag, foreground) in [
+            ("--move-focus-after-control", false),
+            ("--secure-after-control", false),
+            ("--move-focus-after-control", true),
+            ("--secure-after-control", true),
+        ] {
             let Some(mut live) = Live::start() else {
                 return;
             };
-            let (pid, log) = live.launch_fixture_with_flags(&[flag]);
+            let options = if foreground {
+                vec![flag, "--foreground-type-probe"]
+            } else {
+                vec![flag]
+            };
+            let (pid, log) = live.launch_fixture_with_flags(&options);
             let window = fixture_window(pid);
             let editor = fixture_ax_role(&window, "AXTextArea").unwrap();
             assert_eq!(
@@ -5243,12 +5327,13 @@ fn native_control_chunks_stop_when_the_recipient_moves_or_becomes_secure() {
                 .find(|e| e.role == "text area")
                 .unwrap()
                 .id;
-            let result = live.act(
+            let result = live.act_with_fallback(
                 Action::Type {
                     text: "user\tpass".into(),
                     target: Some(Target::Element { element: area }),
                 },
                 false,
+                foreground,
             );
             eprintln!(
                 "{flag}: result={:?}, native value={:?}, password length={}",
@@ -5277,6 +5362,156 @@ fn native_control_chunks_stop_when_the_recipient_moves_or_becomes_secure() {
     });
 }
 
+#[test]
+#[ignore]
+fn native_modality_errors_depth_and_ordinary_role_reads_have_distinct_outcomes() {
+    run_live_test(|| {
+        for (flag, expected) in [
+            ("--modal-error=-25200", Ok(true)),
+            ("--window-modal-error=-25200", Ok(true)),
+            ("--modal-error=-25202", Err(ErrorKind::Stale)),
+            ("--modal-error=-25204", Err(ErrorKind::Failed)),
+            ("--cyclic-modal-walk", Ok(true)),
+            ("--deep-modal-walk", Ok(false)),
+            ("--modal-window", Ok(true)),
+        ] {
+            let Some(mut live) = Live::start() else {
+                return;
+            };
+            let (pid, _) = live.launch_fixture_with_flags(&[flag]);
+            let node = fixture_ax_named(&fixture_window(pid), "Name").unwrap();
+            assert_eq!(
+                unsafe {
+                    node.set_attribute_value(
+                        &objc2_core_foundation::CFString::from_str("AXValue"),
+                        objc2_core_foundation::CFString::from_str("same-field control").as_ref(),
+                    )
+                },
+                objc2_application_services::AXError::Success
+            );
+            let outcome = orca_computer_use::driver::macos::test_native_modality(
+                node.clone(),
+                Duration::from_secs(30),
+            );
+            let actual = outcome.map_err(|error| error.kind);
+            eprintln!(
+                "native modality {flag}: {actual:?}, same-field value={:?}",
+                native_ax_string(&node, "AXValue")
+            );
+            assert_eq!(actual, expected);
+            if flag == "--deep-modal-walk"
+                || flag == "--modal-window"
+                || flag.starts_with("--window-modal-error=")
+            {
+                live.make_finder_frontmost();
+                live.observe("dev.orca.cu-fixture", None);
+                assert_eq!(
+                    unsafe {
+                        node.set_attribute_value(
+                            &objc2_core_foundation::CFString::from_str("AXValue"),
+                            objc2_core_foundation::CFString::from_str("").as_ref(),
+                        )
+                    },
+                    objc2_application_services::AXError::Success
+                );
+                set_fixture_ax_bool(&node, "AXFocused", true);
+                let outcome = live
+                    .act_with_fallback(
+                        Action::Type {
+                            text: "-typed".into(),
+                            target: None,
+                        },
+                        false,
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!(outcome.foreground_used, flag != "--deep-modal-walk");
+                assert_eq!(
+                    native_ax_string(&node, "AXValue").as_deref(),
+                    Some("-typed")
+                );
+                live.assert_frontmost_and_pointer_unchanged();
+            }
+        }
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, _) = live.launch_fixture_with_flags(&["--name-role-failure"]);
+        let node = fixture_ax_named(&fixture_window(pid), "Name").unwrap();
+        let ordinary =
+            orca_computer_use::driver::macos::test_native_type_role(node.clone(), "ordinary");
+        let controls = orca_computer_use::driver::macos::test_native_type_role(node, "user\tpass");
+        eprintln!(
+            "real AXRole Failure: ordinary checker={ordinary:?}, control checker={controls:?}"
+        );
+        assert!(ordinary.is_ok());
+        assert_eq!(controls.unwrap_err().kind, ErrorKind::Failed);
+    });
+}
+
+#[test]
+#[ignore]
+fn native_slow_ancestry_and_foreground_delivery_share_one_action_deadline() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) = live.launch_fixture_with_flags(&["--slow-modal-walk"]);
+        live.make_finder_frontmost();
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let node = fixture_ax_named(&fixture_window(pid), "Name").unwrap();
+        set_fixture_ax_bool(&node, "AXFocused", true);
+        let start = Instant::now();
+
+        let result = live.client.call(
+            Request::Act(ActParams {
+                app: "dev.orca.cu-fixture".into(),
+                window: Some(obs.window.id),
+                action: Action::Type {
+                    text: "x".repeat(4000),
+                    target: None,
+                },
+                foreground_fallback: true,
+                observe_after: false,
+                include_screenshot: false,
+                secure_approved: false,
+            }),
+            Duration::from_secs(36),
+        );
+        eprintln!(
+            "slow native action elapsed={:?}, result={result:?}, typed_chars={}",
+            start.elapsed(),
+            live.fixture_control_value("Name").chars().count()
+        );
+        let orca_computer_use::client::CallError::Driver(error) = result.unwrap_err() else {
+            panic!("native deadline error must reach the caller")
+        };
+        assert_eq!(error.kind, ErrorKind::Failed);
+        assert!(error.message.contains("timed out"), "{error:?}");
+        assert!(start.elapsed() < Duration::from_secs(35));
+        let entries: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["type"] == "slow_modal_read" && e["index"] == 33)
+        );
+        let deadline = orca_computer_use::driver::macos::test_last_action_deadline().unwrap();
+        if let Some(posted) = orca_computer_use::driver::macos::last_test_key_down() {
+            eprintln!(
+                "last HID keydown posted {:?} before the action deadline",
+                deadline.checked_duration_since(posted)
+            );
+            assert!(posted <= deadline, "late keydown posting");
+        }
+        assert!(bundle_pids("dev.orca.cu-fixture").contains(&pid));
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
 fn assert_native_text(element: &objc2_application_services::AXUIElement, expected: &str) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -5290,4 +5525,637 @@ fn assert_native_text(element: &objc2_application_services::AXUIElement, expecte
         );
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn ordinary_native_actions(
+    live: &Live,
+    app: &str,
+    window: u32,
+    node: &objc2_application_services::AXUIElement,
+    role: &str,
+) {
+    let observed = live.observe_window(app, Some(window), None, 300, false);
+    let element = observed
+        .elements
+        .iter()
+        .find(|e| e.role == role && (role != "text field" || e.label.as_deref() == Some("Name")))
+        .unwrap();
+    assert!(!element.secure);
+    let outcome = live
+        .act_app(
+            app,
+            Some(window),
+            Action::Type {
+                text: "Ordinary/AbC".into(),
+                target: Some(Target::Element {
+                    element: element.id,
+                }),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+    assert!(!outcome.foreground_used);
+    assert_native_text(node, "Ordinary/AbC");
+    let filtered = live.observe_window(app, Some(window), Some("Ordinary/AbC"), 300, false);
+    assert!(
+        filtered
+            .elements
+            .iter()
+            .any(|e| !e.secure && e.value.as_deref() == Some("Ordinary/AbC")),
+        "ordinary value must be queryable"
+    );
+    live.observe_window(app, Some(window), None, 300, false);
+    let key = live
+        .act_app(
+            app,
+            Some(window),
+            Action::Key {
+                keys: vec!["space".into()],
+                target: None,
+            },
+            false,
+            false,
+        )
+        .unwrap();
+    assert!(!key.foreground_used);
+    assert_native_text(node, "Ordinary/AbC ");
+    let _clipboard = TestClipboard::text("Paste/9");
+    let paste = live
+        .act_app(
+            app,
+            Some(window),
+            Action::Key {
+                keys: vec!["cmd".into(), "v".into()],
+                target: None,
+            },
+            false,
+            true,
+        )
+        .unwrap();
+    assert!(paste.foreground_used);
+    assert_native_text(node, "Ordinary/AbC Paste/9");
+    eprintln!(
+        "ordinary native type/key/paste without approval in {app}: value visible and query matched; final={:?}",
+        native_ax_string(node, "AXValue")
+    );
+    live.assert_frontmost_and_pointer_unchanged();
+}
+
+#[test]
+#[ignore]
+fn ordinary_fixture_name_and_textedit_body_type_key_and_paste_without_approval() {
+    run_live_test(|| {
+        {
+            let Some(mut live) = Live::start() else {
+                return;
+            };
+            let (pid, _) = live.launch_fixture();
+            let node = fixture_ax_named(&fixture_window(pid), "Name").unwrap();
+            live.make_finder_frontmost();
+            let obs = live.observe("dev.orca.cu-fixture", None);
+            ordinary_native_actions(
+                &live,
+                "dev.orca.cu-fixture",
+                obs.window.id,
+                &node,
+                "text field",
+            );
+        }
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        if !bundle_pids("com.apple.TextEdit").is_empty() {
+            eprintln!("skipped: TextEdit already running; preserve user documents");
+            return;
+        }
+        let file = live.directory.path().join("ordinary-body.txt");
+        std::fs::write(&file, "").unwrap();
+        let app = launch_test_app(
+            &mut live,
+            "com.apple.TextEdit",
+            vec![file.to_string_lossy().into_owned()],
+        );
+        let window = app
+            .windows
+            .iter()
+            .find(|w| w.title.contains("ordinary-body"))
+            .unwrap()
+            .id;
+        let node = fixture_ax_role(
+            &native_window_named(app.pid.unwrap(), "ordinary-body"),
+            "AXTextArea",
+        )
+        .unwrap();
+        live.make_finder_frontmost();
+        ordinary_native_actions(&live, "com.apple.TextEdit", window, &node, "text area");
+    });
+}
+
+#[test]
+#[ignore]
+fn native_type_control_validation_and_foreground_300_character_receipts() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, _) = live.launch_fixture_with_flags(&["--foreground-type-probe"]);
+        let node = fixture_ax_role(&fixture_window(pid), "AXTextArea").unwrap();
+        live.make_finder_frontmost();
+        for payload in [
+            "prefix\u{7}suffix",
+            "prefix\u{7f}suffix",
+            "prefix\u{f700}suffix",
+            "prefix\u{f8ff}suffix",
+        ] {
+            let observed = live.observe("dev.orca.cu-fixture", None);
+            let area = observed
+                .elements
+                .iter()
+                .find(|e| e.role == "text area")
+                .unwrap()
+                .id;
+            let before = native_ax_string(&node, "AXValue").unwrap();
+            let failure = live
+                .act_with_fallback(
+                    Action::Type {
+                        text: payload.into(),
+                        target: Some(Target::Element { element: area }),
+                    },
+                    false,
+                    true,
+                )
+                .unwrap_err();
+            assert_eq!(failure.kind, ErrorKind::Failed);
+            assert!(failure.message.contains("key"));
+            assert_eq!(native_ax_string(&node, "AXValue").unwrap(), before);
+            assert_eq!(password_length(pid), 0);
+        }
+        for (payload, expected) in [("user\tpass", "user\tpass"), ("a\r\nb", "a\nb")] {
+            let reset = live.observe("dev.orca.cu-fixture", None);
+            live.act(
+                click_target(element_named(&reset, "Reset probe focus")),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                unsafe {
+                    node.set_attribute_value(
+                        &objc2_core_foundation::CFString::from_str("AXValue"),
+                        objc2_core_foundation::CFString::from_str("").as_ref(),
+                    )
+                },
+                objc2_application_services::AXError::Success
+            );
+            let observed = live.observe("dev.orca.cu-fixture", None);
+            let area = observed
+                .elements
+                .iter()
+                .find(|e| e.role == "text area")
+                .unwrap()
+                .id;
+            let outcome = live
+                .act_with_fallback(
+                    Action::Type {
+                        text: payload.into(),
+                        target: Some(Target::Element { element: area }),
+                    },
+                    false,
+                    true,
+                )
+                .unwrap();
+            assert!(outcome.foreground_used);
+            assert_native_text(&node, expected);
+        }
+        let text: String = "\nAbC/tmp/OrCa🦀/xyZ\n"
+            .repeat(20)
+            .chars()
+            .take(300)
+            .collect();
+        let reset = live.observe("dev.orca.cu-fixture", None);
+        live.act(
+            click_target(element_named(&reset, "Reset probe focus")),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe {
+                node.set_attribute_value(
+                    &objc2_core_foundation::CFString::from_str("AXValue"),
+                    objc2_core_foundation::CFString::from_str("").as_ref(),
+                )
+            },
+            objc2_application_services::AXError::Success
+        );
+        let observed = live.observe("dev.orca.cu-fixture", None);
+        let area = observed
+            .elements
+            .iter()
+            .find(|e| e.role == "text area")
+            .unwrap()
+            .id;
+        let outcome = live
+            .act_with_fallback(
+                Action::Type {
+                    text: text.clone(),
+                    target: Some(Target::Element { element: area }),
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert!(outcome.foreground_used);
+        assert_native_text(&node, &text);
+        eprintln!(
+            "fixture HID receipt: exactly {} characters, CRLF once, rejected controls posted no prefix",
+            text.chars().count()
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
+fn textedit_300_characters_roundtrip_through_the_real_hid_splitter() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        if !bundle_pids("com.apple.TextEdit").is_empty() {
+            eprintln!("skipped: TextEdit already running; preserve user documents");
+            return;
+        }
+        let file = live.directory.path().join("hid-300.txt");
+        std::fs::write(&file, "").unwrap();
+        let app = launch_test_app(
+            &mut live,
+            "com.apple.TextEdit",
+            vec![file.to_string_lossy().into_owned()],
+        );
+        let pid = app.pid.unwrap();
+        let editor = fixture_ax_role(&native_window_named(pid, "hid-300"), "AXTextArea").unwrap();
+        live.fixture_frontmost(pid);
+        set_fixture_ax_bool(&editor, "AXFocused", true);
+        let text: String = "\nAbC/tmp/OrCa🦀/xyZ\n"
+            .repeat(20)
+            .chars()
+            .take(300)
+            .collect();
+        orca_computer_use::driver::macos::test_foreground_text(pid, &text).unwrap();
+        assert_native_text(&editor, &text);
+        eprintln!(
+            "TextEdit real-HID receipt: exactly 300 characters, no secure approval, native AXValue equals payload"
+        );
+    });
+}
+
+#[test]
+#[ignore]
+fn real_foreign_pid_keyboard_recipients_require_foreground() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (first, _) = live.launch_fixture();
+        let a = fixture_ax_named(&fixture_window(first), "Name").unwrap();
+        set_fixture_ax_bool(&a, "AXFocused", true);
+        let (second, _) = live.launch_fixture();
+        let b = fixture_ax_named(&fixture_window(second), "Name").unwrap();
+        assert_ne!(native_ax_pid(&a), native_ax_pid(&b));
+        let same =
+            orca_computer_use::driver::macos::test_native_keyboard_recipient(first, a.clone());
+        assert!(
+            same.is_ok(),
+            "same-process background positive control {same:?}"
+        );
+        let other =
+            orca_computer_use::driver::macos::test_native_keyboard_recipient(first, b.clone())
+                .unwrap_err();
+        assert_eq!(other.kind, ErrorKind::NeedsForeground);
+        assert_eq!(native_ax_string(&b, "AXValue").as_deref(), Some(""));
+        assert_eq!(
+            unsafe {
+                b.set_attribute_value(
+                    &objc2_core_foundation::CFString::from_str("AXValue"),
+                    objc2_core_foundation::CFString::from_str("foreign-control").as_ref(),
+                )
+            },
+            objc2_application_services::AXError::Success
+        );
+        assert_native_text(&b, "foreign-control");
+        eprintln!(
+            "real AX recipients: app={first}, same owner={}, foreign owner={second}; NeedsForeground before background input; same foreign field native write control succeeded",
+            native_ax_pid(&a)
+        );
+    });
+}
+
+fn owned_fixture_copy(
+    live: &mut Live,
+    folder: &str,
+    id: &str,
+    name: &str,
+    display: &str,
+) -> (i32, PathBuf) {
+    let bundle = live.directory.path().join(format!("{folder}.app"));
+    std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+    let original = fixture_app();
+    std::fs::copy(
+        original.join("Contents/MacOS/CUFixture"),
+        bundle.join("Contents/MacOS/CUFixture"),
+    )
+    .unwrap();
+    let mut plist=std::fs::read_to_string(original.join("Contents/Info.plist")).unwrap().replace("<string>dev.orca.cu-fixture</string>",&format!("<string>{id}</string>")).replace("<string>CUFixture</string>\n<key>CFBundleExecutable",&format!("<string>{name}</string>\n<key>CFBundleDisplayName</key><string>{display}</string>\n<key>CFBundleExecutable"));
+    if !plist.contains("CFBundleDisplayName") {
+        plist=plist.replace("<key>NSPrincipalClass</key>",&format!("<key>CFBundleDisplayName</key><string>{display}</string>\n<key>NSPrincipalClass</key>"));
+    }
+    std::fs::write(bundle.join("Contents/Info.plist"), plist).unwrap();
+    let log = live.directory.path().join(format!("owned-{folder}.jsonl"));
+    assert!(
+        Command::new("/usr/bin/open")
+            .arg("-n")
+            .arg(&bundle)
+            .arg("--args")
+            .arg(&log)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid = loop {
+        if let Ok(contents) = std::fs::read_to_string(&log)
+            && let Some(line) = contents.lines().next()
+        {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(pid) = value["pid"].as_i64() {
+                break pid as i32;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "owned identity fixture not running"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    live.launched.insert(pid);
+    thread::sleep(Duration::from_millis(200));
+    (pid, bundle)
+}
+
+fn native_resolve(
+    live: &Live,
+    input: &str,
+) -> Result<AppInfo, orca_computer_use::client::CallError> {
+    let reply = live.client.call(
+        Request::ResolveApp {
+            app: input.into(),
+            allow_not_running: false,
+        },
+        Duration::from_secs(30),
+    )?;
+    let Reply::Resolved { app } = reply else {
+        panic!("resolved app")
+    };
+    Ok(app)
+}
+
+#[test]
+#[ignore]
+fn real_app_identities_keep_exact_ids_instances_and_declared_folder_names() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (first, _) = live.launch_fixture();
+        let actual = NSRunningApplication::runningApplicationWithProcessIdentifier(first)
+            .unwrap()
+            .bundleURL()
+            .unwrap();
+        let ls = NSWorkspace::sharedWorkspace()
+            .URLForApplicationWithBundleIdentifier(&NSString::from_str("dev.orca.cu-fixture"))
+            .unwrap();
+        eprintln!(
+            "running fixture pid={first}, ownURL={:?}, LaunchServicesURL={:?}",
+            actual.path(),
+            ls.path()
+        );
+        let launched = launch_test_app(&mut live, "dev.orca.cu-fixture", vec![]);
+        assert_eq!(
+            launched.pid,
+            Some(first),
+            "an already-running app must not gain a second copy"
+        );
+        let (second, _) = live.launch_fixture();
+        assert_ne!(first, second);
+        live.fixture_frontmost(second);
+        assert_eq!(
+            native_resolve(&live, "dev.orca.cu-fixture").unwrap().pid,
+            Some(second)
+        );
+        live.make_finder_frontmost();
+        let earliest = live
+            .apps()
+            .iter()
+            .find(|a| a.bundle_id == "dev.orca.cu-fixture")
+            .unwrap()
+            .pid;
+        assert_eq!(
+            native_resolve(&live, "dev.orca.cu-fixture").unwrap().pid,
+            earliest
+        );
+        let (lower, _) = owned_fixture_copy(
+            &mut live,
+            "CaseLower",
+            "dev.orca.cu-case",
+            "CUFixture",
+            "CUFixture",
+        );
+        let (upper, _) = owned_fixture_copy(
+            &mut live,
+            "CaseUpper",
+            "DEV.ORCA.CU-CASE",
+            "CUFixture",
+            "CUFixture",
+        );
+        assert_eq!(
+            native_resolve(&live, "dev.orca.cu-case").unwrap().pid,
+            Some(lower)
+        );
+        assert_eq!(
+            native_resolve(&live, "DEV.ORCA.CU-CASE").unwrap().pid,
+            Some(upper)
+        );
+        let orca_computer_use::client::CallError::Driver(error) =
+            native_resolve(&live, "Dev.Orca.Cu-Case").unwrap_err()
+        else {
+            panic!("identity ambiguity")
+        };
+        assert_eq!(error.kind, ErrorKind::AppAmbiguous);
+        let (_, alias) = owned_fixture_copy(
+            &mut live,
+            "dev.orca.renamed",
+            "dev.orca.folder-owner",
+            "Different declared name",
+            "Different display name",
+        );
+        let orca_computer_use::client::CallError::Driver(error) =
+            native_resolve(&live, "dev.orca.renamed").unwrap_err()
+        else {
+            panic!("folder alias refusal")
+        };
+        assert_eq!(error.kind, ErrorKind::AppNotFound);
+        let installed = orca_computer_use::driver::macos::test_resolve_app_from_roots(
+            "dev.orca.renamed",
+            true,
+            &[alias.parent().unwrap().to_owned()],
+        )
+        .unwrap_err();
+        assert_eq!(installed.kind, ErrorKind::AppNotFound);
+        let (stopped, installed_bundle) = owned_fixture_copy(
+            &mut live,
+            "StoppedIdentity",
+            "dev.orca.installed-stopped",
+            "CUFixture",
+            "CUFixture",
+        );
+        let process =
+            NSRunningApplication::runningApplicationWithProcessIdentifier(stopped).unwrap();
+        process.terminate();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process.isTerminated() {
+            assert!(
+                Instant::now() < deadline,
+                "owned stopped fixture did not quit"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        owned_fixture_copy(
+            &mut live,
+            "NameImpostor",
+            "dev.orca.name-impostor",
+            "dev.orca.installed-stopped",
+            "dev.orca.installed-stopped",
+        );
+        let error = orca_computer_use::driver::macos::test_resolve_with_running_from_roots(
+            "dev.orca.installed-stopped",
+            false,
+            &[installed_bundle.parent().unwrap().to_owned()],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::AppNotFound);
+        eprintln!(
+            "native installed-but-quit canonical ID rejects a running declared-name impostor"
+        );
+        eprintln!(
+            "native canonical identity receipts: same-ID instances choose frontmost/first; exact lower/upper resolve to own PIDs; folded variants ambiguous; renamed folder rejected running/installed"
+        );
+    });
+}
+
+#[test]
+#[ignore]
+fn native_runtime_preview_and_provider_schema_use_canonical_ids_before_approval() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        live.launch_fixture_with_flags(&["--sticky-password-focus"]);
+        owned_fixture_copy(
+            &mut live,
+            "WarningTier",
+            "COM.APPLE.FINDER",
+            "CUFixture",
+            "CUFixture",
+        );
+        owned_fixture_copy(
+            &mut live,
+            "ForbiddenTier",
+            "COM.APPLE.PASSWORDS",
+            "CUFixture",
+            "CUFixture",
+        );
+        let fixture = live
+            .apps()
+            .into_iter()
+            .find(|a| a.bundle_id == "dev.orca.cu-fixture")
+            .unwrap()
+            .pid
+            .unwrap();
+        live.fixture_frontmost(fixture);
+        let result = Command::new("cargo")
+            .args([
+                "test",
+                "-p",
+                "orca-runtime",
+                "--lib",
+                "native_secure_preview_tiers_and_provider_type_schema",
+                "--locked",
+                "--",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env_remove("NODE_OPTIONS")
+            .env("ORCA_HOME", live.directory.path().join("native-orca-home"))
+            .env(
+                "ORCA_CU_DRIVER_EXE",
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/orca"),
+            )
+            .output()
+            .unwrap();
+        eprintln!(
+            "native runtime preview/schema receipt:\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            result.status.success(),
+            "native approval preview/provider-schema test failed"
+        );
+    });
+}
+
+#[test]
+#[ignore]
+fn canvas_colour_is_bounded_and_its_middle_receives_the_click() {
+    run_live_test(|| {
+        let Some((live, log, obs)) = background_fixture() else {
+            return;
+        };
+        let image = obs.screenshot.as_ref().unwrap();
+        let bitmap = image::load_from_memory(
+            &base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &image.png_base64,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .to_rgba8();
+        let inside = *bitmap.get_pixel(image.width * 3 / 4, image.height / 2);
+        let outside = *bitmap.get_pixel(image.width / 2 + 16, image.height / 2);
+        eprintln!("canvas pixels: inside={inside:?}, outside real frame={outside:?}");
+        assert!(
+            inside[1] > inside[0] + 20 && inside[2] > inside[0] + 20,
+            "inside canvas is teal"
+        );
+        assert_ne!(inside, outside, "canvas fill must not spill across content");
+        let outcome = live
+            .act_with_fallback(click_target(live.point_inside(&obs, "canvas")), false, true)
+            .unwrap();
+        assert!(outcome.foreground_used);
+        live.assert_log_contains(&log, "canvas_click");
+        let entries: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let click = entries
+            .iter()
+            .find(|e| e["type"] == "canvas_click")
+            .unwrap();
+        let (x, y) = (click["x"].as_f64().unwrap(), click["y"].as_f64().unwrap());
+        assert!((0.0..=280.0).contains(&x) && (0.0..=220.0).contains(&y));
+        live.assert_frontmost_and_pointer_unchanged();
+    });
 }

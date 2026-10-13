@@ -1,14 +1,20 @@
 mod actions;
+#[cfg(feature = "test-utils")]
+pub use actions::{
+    test_last_action_deadline, test_native_keyboard_recipient, test_native_modality,
+    test_native_type_role,
+};
 mod apps;
 mod ax;
 mod capture;
 mod esc_tap;
 mod events;
 #[cfg(feature = "test-utils")]
-pub use apps::test_resolve_app_from_roots;
+pub use apps::{test_resolve_app_from_roots, test_resolve_with_running_from_roots};
 #[cfg(feature = "test-utils")]
 pub use events::{
-    last_test_process_hid_post, test_check_click_point, test_click_at_point, with_held_test_input,
+    last_test_key_down, last_test_process_hid_post, test_check_click_point, test_click_at_point,
+    test_foreground_text, test_mouse_down_count, with_held_test_input,
 };
 #[cfg(feature = "test-utils")]
 pub use foreground::test_element_click_point;
