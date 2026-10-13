@@ -4593,6 +4593,7 @@ fn textedit_save_panel_uses_foreground_for_typing() {
             ancestor = native_ax_optional_value(&node, "AXParent")
                 .and_then(|v| v.downcast::<AXUIElement>().ok());
         }
+        eprintln!("Save input source: {:?}", current_keyboard_input_source());
         let before = native_ax_string(&name, "AXValue").unwrap();
         let observed = live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
         eprintln!(
@@ -4619,6 +4620,10 @@ fn textedit_save_panel_uses_foreground_for_typing() {
                 true,
             )
             .unwrap();
+        eprintln!(
+            "Save type foreground={}, note={:?}",
+            outcome.foreground_used, outcome.note
+        );
         let after = native_ax_string(&name, "AXValue").unwrap();
         assert_ne!(after, before, "reported done but Save name did not change");
         assert!(

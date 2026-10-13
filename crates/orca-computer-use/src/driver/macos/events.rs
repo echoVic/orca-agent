@@ -7,19 +7,23 @@ use crate::{
     protocol::{DriverError, ErrorKind},
 };
 
-fn unicode_chunk_end(units: &[u16], start: usize) -> usize {
+fn unicode_chunk_end(units: &[u16], start: usize, limit: usize) -> usize {
     // AppKit interprets a leading newline/tab as a command and ignores
     // the rest of that event's Unicode string. Isolate control characters.
     let control = |unit: u16| matches!(unit, 9 | 10 | 13);
     if control(units[start]) {
         return start + 1;
     }
-    let mut end = (start + 20).min(units.len());
+    let mut end = (start + limit).min(units.len());
     if let Some(offset) = units[start..end].iter().position(|unit| control(*unit)) {
         end = start + offset;
     }
     if end < units.len() && (0xD800..=0xDBFF).contains(&units[end - 1]) {
-        end -= 1;
+        if end == start + 1 {
+            end += 1;
+        } else {
+            end -= 1;
+        }
     }
     end
 }
@@ -27,6 +31,7 @@ fn unicode_chunk_end(units: &[u16], start: usize) -> usize {
 /// Both PID-directed and HID delivery use this splitter and recipient backstop.
 fn deliver_text(
     text: &str,
+    chunk_limit: usize,
     mut post: impl FnMut(&[u16]) -> Result<(), DriverError>,
     mut verify_recipient: impl FnMut() -> Result<(), DriverError>,
 ) -> Result<(), DriverError> {
@@ -36,7 +41,7 @@ fn deliver_text(
     let mut start = 0;
     let mut typed = 0;
     while start < units.len() {
-        let end = unicode_chunk_end(&units, start);
+        let end = unicode_chunk_end(&units, start, chunk_limit);
         let chunk = &units[start..end];
         post(chunk).map_err(|failure| error(ErrorKind::Failed, format!(
             "Typing stopped after {typed} characters (the current chunk may be incomplete): {}", failure.message
@@ -67,6 +72,7 @@ pub(super) fn post_unicode_text(
         .ok_or_else(|| error(ErrorKind::Failed, "Could not create keyboard event source"))?;
     deliver_text(
         text,
+        20,
         |units| {
             for down in [true, false] {
                 let event = CGEvent::new_keyboard_event(Some(&source), 0, down)
@@ -341,6 +347,14 @@ impl<'a> HidEvents<'a> {
         self.post(&down)?;
         self.post(&up)?;
         self.releases.pop();
+        // Input methods may forward an ordinary key after its HID up arrives.
+        // Let that forwarding finish while the recipient is still frontmost.
+        std::thread::sleep(
+            std::time::Duration::from_millis(100).min(
+                self.deadline
+                    .saturating_duration_since(std::time::Instant::now()),
+            ),
+        );
         Ok(())
     }
 
@@ -351,6 +365,7 @@ impl<'a> HidEvents<'a> {
     ) -> Result<(), DriverError> {
         deliver_text(
             text,
+            1,
             |units| {
                 let down = self.keyboard(0, true, Modifiers::default())?;
                 let up = self.keyboard(0, false, Modifiers::default())?;
@@ -512,6 +527,7 @@ mod unicode_chunk_tests {
         let mut result = vec![];
         deliver_text(
             text,
+            20,
             |units| {
                 result.push(String::from_utf16(units).expect("chunks preserve surrogate pairs"));
                 Ok(())
@@ -520,6 +536,22 @@ mod unicode_chunk_tests {
         )
         .unwrap();
         result
+    }
+
+    #[test]
+    fn hid_unicode_events_carry_one_scalar_even_with_controls_and_surrogate_pairs() {
+        let mut posted = vec![];
+        deliver_text(
+            "Ab\tC\r\n🦀/Z",
+            1,
+            |units| {
+                posted.push(String::from_utf16(units).unwrap());
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(posted, ["A", "b", "\t", "C", "\n", "🦀", "/", "Z"]);
     }
 
     #[test]
@@ -533,6 +565,7 @@ mod unicode_chunk_tests {
             let mut posted = false;
             let failure = deliver_text(
                 &text,
+                20,
                 |_| {
                     posted = true;
                     Ok(())
@@ -555,6 +588,7 @@ mod unicode_chunk_tests {
         let mut posted = String::new();
         let failure = deliver_text(
             "user\tpass",
+            20,
             |units| {
                 posted.push_str(&String::from_utf16(units).unwrap());
                 Ok(())
@@ -577,6 +611,7 @@ mod unicode_chunk_tests {
         assert!(
             deliver_text(
                 "prefix\u{7}suffix",
+                20,
                 |_| {
                     posted = true;
                     Ok(())
