@@ -186,6 +186,10 @@ final class ModalAncestor: NSAccessibilityElement {
 var modalAncestors: [ModalAncestor] = []
 
 final class ProbeField: NSTextField {
+    override func isAccessibilityFocused() -> Bool {
+        if foregroundTypeProbe && pendingProbeRaise { return false }
+        return window?.firstResponder === self || (currentEditor() != nil && window?.firstResponder === currentEditor())
+    }
     override func accessibilityRole() -> NSAccessibility.Role? {
         if CommandLine.arguments.contains("--name-role-failure") { failAX(-25200); return nil }
         return .textField
@@ -236,11 +240,23 @@ if CommandLine.arguments.contains("--deep-modal-walk") || CommandLine.arguments.
 
 if CommandLine.arguments.contains("--prefilled-name") { field.stringValue = "a🦀c" }
 if foregroundTypeProbe { field.font = NSFont.monospacedSystemFont(ofSize: 16, weight: .regular) }
-let secure = NSSecureTextField(frame: NSRect(x: 340, y: 380, width: 200, height: 24))
+final class ProbeSecureField: NSSecureTextField {
+    override func isAccessibilityFocused() -> Bool {
+        if CommandLine.arguments.contains("--hide-focused-element") { return false }
+        return super.isAccessibilityFocused()
+    }
+}
+let secure: NSSecureTextField = CommandLine.arguments.contains("--hide-focused-element")
+    ? ProbeSecureField(frame: NSRect(x: 340, y: 380, width: 200, height: 24))
+    : NSSecureTextField(frame: NSRect(x: 340, y: 380, width: 200, height: 24))
 secure.setAccessibilityLabel("Password")
 let scroll = NSScrollView(frame: NSRect(x: 20, y: 140, width: 300, height: 220))
 final class ProbeTextView: NSTextView {
     var becameSecure = false
+    override func isAccessibilityFocused() -> Bool {
+        if foregroundTypeProbe && pendingProbeRaise { return false }
+        return window?.firstResponder === self
+    }
     override func accessibilitySubrole() -> NSAccessibility.Subrole? {
         if becameSecure { return NSAccessibility.Subrole(rawValue: "AXSecureTextField") }
         return NSAccessibility.Subrole(rawValue: "AXUnknown")
@@ -258,7 +274,7 @@ final class ProbeTextView: NSTextView {
     override func insertTab(_ sender: Any?) { super.insertTab(sender); afterControl() }
     override func insertNewline(_ sender: Any?) { super.insertNewline(sender); afterControl() }
 }
-let text: NSTextView = CommandLine.arguments.contains("--move-focus-after-control") || CommandLine.arguments.contains("--secure-after-control")
+let text: NSTextView = foregroundTypeProbe || CommandLine.arguments.contains("--move-focus-after-control") || CommandLine.arguments.contains("--secure-after-control")
     ? ProbeTextView(frame: scroll.bounds) : NSTextView(frame: scroll.bounds)
 text.string = (1...200).map { "line \($0)" }.joined(separator: "\n")
 scroll.documentView = text; scroll.hasVerticalScroller = !CommandLine.arguments.contains("--foreground-scroll-probe");
