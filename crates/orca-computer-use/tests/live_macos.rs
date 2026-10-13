@@ -176,7 +176,12 @@ fn fixture_app() -> PathBuf {
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>NSPrincipalClass</key><string>CUProbeApplication</string>
 </dict></plist>"#).unwrap();
-    let module_cache = tempfile::tempdir_in("/tmp").unwrap();
+    static MODULE_CACHE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let module_cache = MODULE_CACHE.get_or_init(|| tempfile::tempdir_in("/tmp").unwrap());
+    eprintln!(
+        "Swift module cache (temporary, per test process): {}",
+        module_cache.path().display()
+    );
     let output = Command::new("/usr/bin/swiftc")
         .arg("-O")
         .arg("-module-cache-path")
@@ -5120,9 +5125,7 @@ fn native_control_chunks_stop_when_the_recipient_moves_or_becomes_secure() {
             assert_eq!(password_length(pid), 0);
             live.assert_log_contains(
                 &log,
-                if flag.contains("moves") {
-                    "control_focus_changed"
-                } else if flag.contains("move-") {
+                if flag == "--move-focus-after-control" {
                     "control_focus_changed"
                 } else {
                     "control_recipient_secure"

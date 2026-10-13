@@ -168,7 +168,7 @@ final class ProbeField: NSTextField {
         // This probe must isolate the actual recipient check, not unknown-target gating.
         if CommandLine.arguments.contains("--sticky-password-focus") { return NSAccessibility.Subrole(rawValue: "AXUnknown") }
         if let value = CommandLine.arguments.first(where: { $0.hasPrefix("--subrole-error=") }), let code = Int(value.dropFirst("--subrole-error=".count)) { failAX(code); return nil }
-        return super.accessibilitySubrole()
+        return NSAccessibility.Subrole(rawValue: "AXUnknown")
     }
     override func setAccessibilityFocused(_ focused: Bool) {
         if CommandLine.arguments.contains("--sticky-password-focus") || (foregroundTypeProbe && pendingProbeRaise) { return }
@@ -182,7 +182,9 @@ final class ProbeField: NSTextField {
         return stringValue.utf16.count
     }
 }
-let field = ProbeField(frame: NSRect(x: 20, y: 380, width: 300, height: 24))
+let field: NSTextField = CommandLine.arguments.contains(where: { $0.hasPrefix("--") })
+    ? ProbeField(frame: NSRect(x: 20, y: 380, width: 300, height: 24))
+    : NSTextField(frame: NSRect(x: 20, y: 380, width: 300, height: 24))
 field.setAccessibilityLabel("Name"); field.delegate = controller
 if CommandLine.arguments.contains("--prefilled-name") { field.stringValue = "a🦀c" }
 if foregroundTypeProbe { field.font = NSFont.monospacedSystemFont(ofSize: 16, weight: .regular) }
