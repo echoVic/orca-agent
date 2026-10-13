@@ -260,3 +260,24 @@ Step 3 的真机测试现在是 `typing_with_a_chinese_input_method_enters_the_t
 - 单独补测 Safari 页面遮挡时的点击拒绝；本轮没有这个结果。
 
 完整报告位于 `.superpowers/sdd/2026-10-11-computer-use-phase2/acceptance-report.md`；TUI captures、逐项请求／结果和独立核验位于 `/tmp/orca-acceptance/captures/run-20261012-real/`。
+
+**验收复跑（2026-10-13）**：在 `feat/computer-use-phase2`、HEAD `b28452ab` 上，用简报指定的已有 `target/release/orca --model auto` 完整重跑六项真实模型任务，没有重建二进制或修改源码。Orca 在当前 shell 创建的 `tmux -L orca-accept` 中运行，使用用户正常的 Orca home，实际路由为 `deepseek-flash`。工作区仍为 untrusted；本次没有弹出欢迎信任面板，未按 `T`。六项均通过独立实际效果核验，首轮为两项通过。
+
+下表沿用首轮口径：调用包含参数校验失败；前台列只按结果中的 `used the foreground` 标记；审批只计人工回答的面板；耗时从提交消息到本项运行时终态，含审批等待。共 57 次 `computer`、52 次审批，全部选择 Allow once，没有保存规则或 Deny。
+
+| 任务 | 首轮结果／调用次数 | 成功与否 | `computer` 调用次数 | 是否用了前台 | 审批次数 | 耗时 | 遇到的问题 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| TextEdit | 失败／51 | 成功 | 28 | 是 | 26 | 215.6 秒 | 一次 stale；错误 key.modifiers 被拒绝后修正；Cmd+A 后按元素 type 在路径／名称字段追加，改为清空路径、不指定 target 输入名称后成功。目标纯文本 242 字节，段落完整。 |
+| Calculator | 失败／11 | 成功 | 13 | 否（无标记） | 13 | 53.9 秒 | 无工具错误。通过计算器按钮输入算式；独立 AX 和截图确认 7,006,652。 |
+| Finder | 失败／5 | 成功 | 6 | 否（无标记） | 5 | 98.4 秒 | shell 的 open／AppleScript 路径失败；附加 echo 的 shell 请求显示成功但内部失败。第一次 scroll 漏 target；补齐后滚至 34%、68%、100%，截图确认 file-300.txt。 |
+| 网页／Safari | 成功／2 | 成功 | 3 | 否（无标记） | 3 | 23.1 秒 | shell open 找不到 Safari；模型称首次截图空白，第二次确认可见，独立截图通过。没有页面 click，未覆盖遮挡点击问题。 |
+| Canvas | 失败／7 | 成功 | 4 | 是 | 3 | 36.7 秒 | 无工具错误。点击截图 (959,524)，本次独立日志记录 canvas_click(139.5,110)，画布中心为 (140,110)。 |
+| Electron／Cherry Studio（只看） | 成功／3 | 成功 | 3 | 否（无标记） | 2 | 19.4 秒 | 无工具错误。动作仅 list_apps、launch_app、observe；没有额外输入动作或 Deny。 |
+
+值得修复或继续核验的问题：
+
+- TextEdit 在 Cmd+A 后按元素 `type` 会追加；同一个保存名称字段改用不指定 target 的 `type` 后成功替换。应明确元素输入是否保留既有选区，以及输入前重新定位的行为。本轮没有正文丢字、错窗口或工作区外保存文件。
+- 模型仍会把 `key` 修饰键放在独立字段、遗漏 `scroll.target`；工具这次明确拒绝，正确参数的后续调用成功。Finder／Safari 的 shell 打开失败后，模型仍花了多轮尝试；部分 shell 命令以 echo 掩盖内部失败，TUI 显示成功，不能用该状态证明应用已打开。
+- 模型把 Safari 第一次观察描述为空白，第二次确认渲染；独立截图确认最终可见，没有独立留存首次空白的视觉核验。六项中没有 Safari 页面点击，遮挡拒绝的开放问题仍未覆盖。
+
+锁屏检查未返回 Yes，起始前台为 cmux，指针 `(953,1037)`；开始／结束通知均发送，tmux 内的 caffeinate 在每项前确认仍运行。核验和清理只用原生 AX／截图，没有对应用使用 AppleScript。TextEdit、Calculator、夹具和 Cherry Studio 已退出；只关闭本次 Finder 窗口和 Safari 标签页，原 Safari 三个标签页保留。cmux 与指针已恢复，tmux、Orca 和本轮 caffeinate 已结束，工作区仍 untrusted。完整报告为 `.superpowers/sdd/2026-10-11-computer-use-phase2/acceptance-rerun-report.md`，证据位于 `/tmp/orca-acceptance/captures/run-20261013-real/`。
