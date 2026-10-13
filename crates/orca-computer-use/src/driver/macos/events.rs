@@ -72,7 +72,7 @@ pub(super) fn post_unicode_text(
         .ok_or_else(|| error(ErrorKind::Failed, "Could not create keyboard event source"))?;
     deliver_text(
         text,
-        20,
+        1,
         |units| {
             for down in [true, false] {
                 let event = CGEvent::new_keyboard_event(Some(&source), 0, down)

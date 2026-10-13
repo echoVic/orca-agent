@@ -1237,6 +1237,30 @@ fn observe_of_an_electron_app_waits_for_its_tree() {
         assert!(control.elements.iter().any(|e| e.role == "button"));
         assert!(control.elements.iter().any(|e| e.role == "text field"));
         let before = bundle_pids(&bundle);
+        if bundle == "com.kangfenmao.CherryStudio" {
+            let isolated = std::env::var("ORCA_CU_ELECTRON_ISOLATED_APP")
+                .expect("prepare an owned isolated Electron bundle; never open the user profile");
+            assert!(
+                Command::new("/usr/bin/open")
+                    .args(["-n", &isolated])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let pids = bundle_pids(&bundle);
+                register_launch_pids(&mut live.launched, &before, &pids);
+                if pids.difference(&before).next().is_some() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "isolated Electron process did not launch"
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
         let result = live.client.call(
             Request::LaunchApp {
                 app: bundle.clone(),
@@ -1271,6 +1295,123 @@ fn observe_of_an_electron_app_waits_for_its_tree() {
                 .iter()
                 .any(|element| element.role != "button" || !frame_buttons.contains(&element.frame)),
             "Electron observation must contain content beyond the window's title-bar buttons"
+        );
+        if bundle == "com.kangfenmao.CherryStudio" {
+            if let Some(skip) = observation
+                .elements
+                .iter()
+                .find(|e| e.label.as_deref() == Some("跳过引导"))
+            {
+                live.act_app(
+                    &bundle,
+                    Some(observation.window.id),
+                    click_target(Target::Element { element: skip.id }),
+                    false,
+                    true,
+                )
+                .unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let editor_observation = loop {
+                let obs =
+                    live.observe_window(&bundle, Some(observation.window.id), None, 1000, false);
+                if obs.elements.iter().any(|e| e.role == "text area") {
+                    break obs;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "owned Cherry message editor not ready: {:?}",
+                    obs.elements
+                        .iter()
+                        .map(|e| (&e.role, &e.label))
+                        .collect::<Vec<_>>()
+                );
+                thread::sleep(Duration::from_millis(100));
+            };
+            let area = editor_observation
+                .elements
+                .iter()
+                .find(|e| e.role == "text area")
+                .unwrap();
+            let native = native_ax_nodes(&native_window_named(app.pid.unwrap(), ""))
+                .into_iter()
+                .find(|e| native_ax_string(e, "AXRole").as_deref() == Some("AXTextArea"))
+                .unwrap();
+            let mut ancestor = Some(native.clone());
+            let mut depth = 0;
+            while let Some(node) = ancestor {
+                if native_ax_string(&node, "AXRole").as_deref() == Some("AXWindow") {
+                    break;
+                }
+                depth += 1;
+                assert!(depth < 100);
+                ancestor = native_ax_optional_value(&node, "AXParent")
+                    .and_then(|v| v.downcast::<objc2_application_services::AXUIElement>().ok());
+            }
+            assert!(
+                depth > 8,
+                "deep web field positive control: {depth} ancestors"
+            );
+            live.act_app(
+                &bundle,
+                Some(editor_observation.window.id),
+                Action::Click {
+                    target: Target::Element { element: area.id },
+                    button: Button::Left,
+                    count: 1,
+                    modifiers: vec!["shift".into()],
+                },
+                false,
+                true,
+            )
+            .unwrap();
+            for phase in ["foreground", "background"] {
+                if phase == "background" {
+                    live.make_finder_frontmost();
+                }
+                let application = unsafe {
+                    objc2_application_services::AXUIElement::new_application(app.pid.unwrap())
+                };
+                let focus = native_ax_optional_value(&application, "AXFocusedUIElement")
+                    .and_then(|v| v.downcast::<objc2_application_services::AXUIElement>().ok());
+                let focused_flag = native_ax_optional_value(&native, "AXFocused").and_then(|v| {
+                    v.downcast_ref::<objc2_core_foundation::CFBoolean>()
+                        .map(|v| v.value())
+                });
+                eprintln!(
+                    "owned Chrome {phase}: app focus={:?}, editor AXFocused={focused_flag:?}, owner={}, depth={depth}",
+                    focus
+                        .as_ref()
+                        .map(|e| (native_ax_string(e, "AXRole"), native_ax_pid(e))),
+                    native_ax_pid(&native)
+                );
+            }
+            let outcome = live
+                .act_app(
+                    &bundle,
+                    Some(editor_observation.window.id),
+                    Action::Type {
+                        text: "orca-background-control".into(),
+                        target: Some(Target::Element { element: area.id }),
+                    },
+                    false,
+                    false,
+                )
+                .unwrap();
+            assert!(!outcome.foreground_used);
+            assert_native_text(&native, "orca-background-control");
+            eprintln!(
+                "owned Cherry deep web editor: {depth} ancestors, exact value receipt, stayed background; profile under /tmp"
+            );
+            live.assert_frontmost_and_pointer_unchanged();
+        }
+        eprintln!(
+            "owned Electron content labels: {:?}",
+            observation
+                .elements
+                .iter()
+                .map(|e| (&e.role, &e.label, &e.value))
+                .collect::<Vec<_>>()
         );
         assert!(!observation.no_element_tree);
         assert!(
@@ -5134,4 +5275,19 @@ fn native_control_chunks_stop_when_the_recipient_moves_or_becomes_secure() {
             live.assert_frontmost_and_pointer_unchanged();
         }
     });
+}
+
+fn assert_native_text(element: &objc2_application_services::AXUIElement, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let actual = native_ax_string(element, "AXValue").unwrap();
+        if actual == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native value: expected {expected:?}, got {actual:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }

@@ -227,8 +227,7 @@ fn check_background_keyboard(
     target: &AxElement,
     action_deadline: std::time::Instant,
 ) -> Result<(), DriverError> {
-    let focused = application
-        .attribute_element("AXFocusedUIElement")?
+    let focused = keyboard_recipient(application, Some(target))?
         .ok_or_else(|| foreground("The app has no focused element"))?;
     let target_pid = target.pid()?;
     let focused_pid = focused.pid()?;
@@ -347,8 +346,7 @@ impl MacDriver {
                     check_background_keyboard(pid, &application, &element, action_deadline)?;
                     check_secure_approval(&application, Some(&element), params.secure_approved)?;
                     if target.is_some() {
-                        let focused = application
-                            .attribute_element("AXFocusedUIElement")?
+                        let focused = keyboard_recipient(&application, Some(&element))?
                             .ok_or_else(|| foreground("The app has no focused element"))?;
                         focused.collapse_selection_to_end();
                         check_secure_approval(
@@ -357,8 +355,7 @@ impl MacDriver {
                             params.secure_approved,
                         )?;
                     }
-                    let recipient = application
-                        .attribute_element("AXFocusedUIElement")?
+                    let recipient = keyboard_recipient(&application, Some(&element))?
                         .ok_or_else(|| foreground("The app has no focused element"))?;
                     check_type_recipient(&recipient, text)?;
                     events::post_unicode_text(pid, text, || {
@@ -484,7 +481,7 @@ pub(super) fn verify_type_recipient(
     recipient: &AxElement,
     foreground: bool,
 ) -> Result<(), DriverError> {
-    let focused = application.attribute_element("AXFocusedUIElement")?;
+    let focused = keyboard_recipient(application, Some(recipient))?;
     if focused.as_ref().is_none_or(|focus| focus.0 != recipient.0) {
         return Err(error(
             ErrorKind::Failed,
@@ -546,7 +543,7 @@ fn check_secure_recipients(
     if approved {
         return Ok(());
     }
-    let focused = application.attribute_element("AXFocusedUIElement")?;
+    let focused = keyboard_recipient(application, target)?;
     check_recipient_security(
         approved,
         target
@@ -613,6 +610,33 @@ pub(super) fn target_element(
         }
     }
 }
+fn focused_or_verified_target<T: Clone>(
+    focused: Option<T>,
+    target: Option<&T>,
+    read: impl FnOnce(&T) -> Result<Option<bool>, DriverError>,
+) -> Result<Option<T>, DriverError> {
+    if focused.is_some() {
+        return Ok(focused);
+    }
+    if let Some(target) = target
+        && read(target)? == Some(true)
+    {
+        return Ok(Some(target.clone()));
+    }
+    Ok(None)
+}
+
+fn keyboard_recipient(
+    application: &AxElement,
+    target: Option<&AxElement>,
+) -> Result<Option<AxElement>, DriverError> {
+    focused_or_verified_target(
+        application.attribute_element("AXFocusedUIElement")?,
+        target,
+        |element| element.attribute_bool("AXFocused"),
+    )
+}
+
 fn focus(
     table: &ElementTable,
     application: &AxElement,
@@ -639,10 +663,7 @@ fn focus(
         // A successful AX setter on a window can leave no keyboard recipient.
         // Establish this before sending any text/key event, so fallback cannot
         // repeat keyboard delivery whose effects are merely unconfirmed.
-        if application
-            .attribute_element("AXFocusedUIElement")?
-            .is_none()
-        {
+        if keyboard_recipient(application, Some(&element))?.is_none() {
             return Err(foreground("The app has no focused element"));
         }
         Ok(element)
@@ -747,6 +768,34 @@ mod tests {
             read,
             std::time::Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT,
         )
+    }
+
+    #[test]
+    fn background_focus_uses_only_a_verified_target_when_the_app_omits_focus() {
+        assert_eq!(
+            focused_or_verified_target(None, Some(&42), |_| Ok(Some(true))).unwrap(),
+            Some(42)
+        );
+        for flag in [None, Some(false)] {
+            assert_eq!(
+                focused_or_verified_target(None, Some(&42), |_| Ok(flag)).unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            focused_or_verified_target(Some(7), Some(&42), |_| panic!("the real focus wins"))
+                .unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            focused_or_verified_target::<u32>(None, None, |_| panic!("no target")).unwrap(),
+            None
+        );
+        let error = stale();
+        assert_eq!(
+            focused_or_verified_target(None, Some(&42), |_| Err(error.clone())).unwrap_err(),
+            error
+        );
     }
 
     #[test]
