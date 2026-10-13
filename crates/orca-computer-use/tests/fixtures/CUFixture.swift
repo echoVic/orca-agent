@@ -189,7 +189,27 @@ if foregroundTypeProbe { field.font = NSFont.monospacedSystemFont(ofSize: 16, we
 let secure = NSSecureTextField(frame: NSRect(x: 340, y: 380, width: 200, height: 24))
 secure.setAccessibilityLabel("Password")
 let scroll = NSScrollView(frame: NSRect(x: 20, y: 140, width: 300, height: 220))
-let text = NSTextView(frame: scroll.bounds)
+final class ProbeTextView: NSTextView {
+    var becameSecure = false
+    override func accessibilitySubrole() -> NSAccessibility.Subrole? {
+        if becameSecure { return NSAccessibility.Subrole(rawValue: "AXSecureTextField") }
+        return NSAccessibility.Subrole(rawValue: "AXUnknown")
+    }
+    private func afterControl() {
+        if CommandLine.arguments.contains("--move-focus-after-control") {
+            window?.makeFirstResponder(secure)
+            log(["type": "control_focus_changed"])
+        }
+        if CommandLine.arguments.contains("--secure-after-control") {
+            becameSecure = true
+            log(["type": "control_recipient_secure"])
+        }
+    }
+    override func insertTab(_ sender: Any?) { super.insertTab(sender); afterControl() }
+    override func insertNewline(_ sender: Any?) { super.insertNewline(sender); afterControl() }
+}
+let text: NSTextView = CommandLine.arguments.contains("--move-focus-after-control") || CommandLine.arguments.contains("--secure-after-control")
+    ? ProbeTextView(frame: scroll.bounds) : NSTextView(frame: scroll.bounds)
 text.string = (1...200).map { "line \($0)" }.joined(separator: "\n")
 scroll.documentView = text; scroll.hasVerticalScroller = !CommandLine.arguments.contains("--foreground-scroll-probe");
 if CommandLine.arguments.contains("--rows-probe") {

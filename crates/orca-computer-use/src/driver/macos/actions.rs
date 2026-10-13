@@ -491,6 +491,12 @@ pub(super) fn verify_type_recipient(
             "The keyboard recipient changed; observe again",
         ));
     }
+    if recipient.is_secure()? {
+        return Err(error(
+            ErrorKind::Failed,
+            "The keyboard recipient became secure; observe again",
+        ));
+    }
     if foreground {
         let focused = AxElement::system_wide()?.attribute_element("AXFocusedUIElement")?;
         if focused.as_ref().is_none_or(|focus| focus.0 != recipient.0) {

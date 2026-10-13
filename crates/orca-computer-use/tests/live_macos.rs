@@ -5068,3 +5068,67 @@ fn literal_type_refuses_single_line_controls_and_inserts_tabs_in_text_areas() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
+
+#[test]
+#[ignore]
+fn native_control_chunks_stop_when_the_recipient_moves_or_becomes_secure() {
+    run_live_test(|| {
+        for flag in ["--move-focus-after-control", "--secure-after-control"] {
+            let Some(mut live) = Live::start() else {
+                return;
+            };
+            let (pid, log) = live.launch_fixture_with_flags(&[flag]);
+            let window = fixture_window(pid);
+            let editor = fixture_ax_role(&window, "AXTextArea").unwrap();
+            assert_eq!(
+                unsafe {
+                    editor.set_attribute_value(
+                        &objc2_core_foundation::CFString::from_str("AXValue"),
+                        objc2_core_foundation::CFString::from_str("").as_ref(),
+                    )
+                },
+                objc2_application_services::AXError::Success
+            );
+            live.make_finder_frontmost();
+            let observed = live.observe("dev.orca.cu-fixture", None);
+            let area = observed
+                .elements
+                .iter()
+                .find(|e| e.role == "text area")
+                .unwrap()
+                .id;
+            let result = live.act(
+                Action::Type {
+                    text: "user\tpass".into(),
+                    target: Some(Target::Element { element: area }),
+                },
+                false,
+            );
+            eprintln!(
+                "{flag}: result={:?}, native value={:?}, password length={}",
+                result.as_ref().map(|v| v.foreground_used),
+                native_ax_string(&editor, "AXValue"),
+                password_length(pid)
+            );
+            let failure = result.unwrap_err();
+            assert_eq!(failure.kind, ErrorKind::Failed);
+            assert!(failure.message.contains("5 characters"), "{failure:?}");
+            assert_eq!(
+                native_ax_string(&editor, "AXValue").as_deref(),
+                Some("user\t")
+            );
+            assert_eq!(password_length(pid), 0);
+            live.assert_log_contains(
+                &log,
+                if flag.contains("moves") {
+                    "control_focus_changed"
+                } else if flag.contains("move-") {
+                    "control_focus_changed"
+                } else {
+                    "control_recipient_secure"
+                },
+            );
+            live.assert_frontmost_and_pointer_unchanged();
+        }
+    });
+}
