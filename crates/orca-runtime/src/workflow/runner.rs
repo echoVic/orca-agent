@@ -3454,6 +3454,7 @@ mod tests {
 
     #[test]
     fn resumed_background_workflow_reports_prior_token_spend() {
+        let _guard = crate::history::lock_test_env();
         let temp = tempdir().unwrap();
         let script_path = temp.path().join("resume-budget.js");
         fs::write(
