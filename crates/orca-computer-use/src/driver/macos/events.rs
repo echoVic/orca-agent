@@ -524,7 +524,10 @@ fn check_click_point(pid: i32, point: CGPoint) -> Result<(), DriverError> {
     let hit_pid = super::ax::AxElement::system_wide()
         .and_then(|system| system.element_at_position(point.x as f32, point.y as f32))
         .and_then(|element| element.pid());
-    if hit_pid.is_ok_and(|owner| owner == pid) {
+    if hit_pid.is_ok_and(|owner| {
+        owner == pid
+            || super::occlusion::target_under_remote_overlay(pid, owner, point) == Some(true)
+    }) {
         Ok(())
     } else {
         Err(error(

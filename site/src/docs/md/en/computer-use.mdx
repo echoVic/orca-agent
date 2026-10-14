@@ -110,7 +110,7 @@ apply, and apps blocked by default stay blocked.
 Use element ids from the latest observation when available. If the tree
 lists omitted elements, use `query` to narrow the results by role, label, or
 value. A `truncated` observation means the accessibility walk reached its
-time or depth limit, or skipped a stale subtree, and returned a partial tree;
+time limit or depth limit, or skipped a stale subtree, and returned a partial tree;
 a control missing from that tree may still exist. Observe again with `query`
 or use point targets from the latest screenshot, then inspect the result to
 confirm the action.
@@ -174,6 +174,7 @@ separate vision model.
 Dragging and directly setting a field's value are not supported. Computer use
 is unavailable to subagents, workflow children, ACP clients, and `orca exec`.
 
-While a remote-control app (for example UU Remote) draws its overlay over the
-screen, actions that need the foreground are refused because another window
-covers the target. Disconnect the remote session to use them.
+UU Remote's full-screen overlay is recognized, so foreground actions can reach
+the target app when no other window covers it. Other remote-control apps'
+overlays may still block foreground actions until the remote session is
+disconnected.
