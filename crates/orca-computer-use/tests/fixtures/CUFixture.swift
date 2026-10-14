@@ -225,12 +225,21 @@ final class ProbeField: NSTextField {
     override func setAccessibilityFocused(_ focused: Bool) {
         if CommandLine.arguments.contains("--sticky-password-focus") || (foregroundTypeProbe && pendingProbeRaise) { return }
         super.setAccessibilityFocused(focused)
+        if focused && CommandLine.arguments.contains("--select-name-on-focus"),
+           let editor = currentEditor() as? NSTextView {
+            editor.setSelectedRange(NSRange(location: 1, length: 2))
+            let selection = editor.selectedRange()
+            log(["type": "name_selection", "location": selection.location, "length": selection.length])
+        }
     }
     override func accessibilityValue() -> String? {
         if CommandLine.arguments.contains("--no-name-value") { return nil }
         return super.accessibilityValue()
     }
     override func accessibilityNumberOfCharacters() -> Int {
+        if CommandLine.arguments.contains("--select-name-on-focus") {
+            log(["type": "name_length", "length": stringValue.utf16.count])
+        }
         return stringValue.utf16.count
     }
 }

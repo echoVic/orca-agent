@@ -4587,7 +4587,68 @@ fn type_with_optional_selection(flags: &[&str], expected: &str) {
 #[test]
 #[ignore]
 fn targeted_type_without_ax_value_uses_the_character_count() {
-    type_with_optional_selection(&["--no-name-value"], "a🦀cux");
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) = live.launch_fixture_with_flags(&[
+            "--prefilled-name",
+            "--no-name-value",
+            "--select-name-on-focus",
+        ]);
+        let window = fixture_window(pid);
+        let field = fixture_ax_named(&window, "Name").unwrap();
+        let editor = fixture_ax_role(&window, "AXTextArea").unwrap();
+        set_fixture_ax_bool(&editor, "AXFocused", true);
+        live.make_finder_frontmost();
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let application = NativeAxElement::application(pid);
+        assert_ne!(
+            fixture_ax_element(&application, "AXFocusedUIElement")
+                .unwrap()
+                .element,
+            field.element,
+            "targeted type must change focus to exercise selection collapse"
+        );
+        assert!(fixture_ax_value(&field, "AXValue").is_none());
+        let outcome = live
+            .act(
+                Action::Type {
+                    text: "x".into(),
+                    target: Some(element_named(&obs, "Name")),
+                },
+                false,
+            )
+            .unwrap();
+        assert!(!outcome.foreground_used);
+        live.assert_log_contains(&log, "\"type\":\"input\"");
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let selection = events
+            .iter()
+            .find(|event| event["type"] == "name_selection")
+            .expect("focusing Name must select the crab's two UTF-16 code units");
+        assert_eq!(selection["location"], 1);
+        assert_eq!(selection["length"], 2);
+        let length = events
+            .iter()
+            .find(|event| event["type"] == "name_length")
+            .expect("selection collapse must read AXNumberOfCharacters without AXValue");
+        assert_eq!(length["length"], 4);
+        // Without collapse, the newly focused field replaces the selected crab with x.
+        assert_eq!(
+            events
+                .iter()
+                .rev()
+                .find(|event| event["type"] == "input")
+                .expect("text delivery receipt")["value"],
+            "a🦀cx",
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
 }
 
 #[test]
