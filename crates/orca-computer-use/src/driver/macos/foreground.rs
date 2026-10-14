@@ -10,7 +10,13 @@ use objc2_core_graphics::{
     CGError, CGEvent, CGEventSource, CGEventSourceStateID, CGEventType, CGWarpMouseCursorPosition,
 };
 
-use super::{actions, ax::AxElement, error, events::HidEvents, tree::ElementTable};
+use super::{
+    actions,
+    ax::AxElement,
+    error,
+    events::HidEvents,
+    tree::{self, ElementTable, SecurityScan},
+};
 use crate::keys::parse_combo;
 use crate::protocol::{ActParams, Action, Button, DriverError, ErrorKind, Target};
 
@@ -368,9 +374,7 @@ pub(super) fn run(
                             if !allows_unfocused_key(
                                 app_focus.is_some(),
                                 system_focus.is_some(),
-                                true,
-                                table.has_secure_elements,
-                                table.truncated,
+                                tree::scan_security(Some(window), action_deadline),
                             ) {
                                 return Err(error(
                                     ErrorKind::Failed,
@@ -465,32 +469,32 @@ fn wait_for_focus(
 fn allows_unfocused_key(
     app_focus_present: bool,
     system_focus_present: bool,
-    window_observed: bool,
-    secure_elements_present: bool,
-    truncated: bool,
+    scan: SecurityScan,
 ) -> bool {
-    !app_focus_present
-        && !system_focus_present
-        && window_observed
-        && !secure_elements_present
-        && !truncated
+    !app_focus_present && !system_focus_present && scan == SecurityScan::Clean
 }
 
 #[cfg(test)]
 #[test]
-fn unfocused_keys_require_both_focuses_absent_and_a_complete_safe_observation() {
-    for state in 0..32 {
-        assert_eq!(
-            allows_unfocused_key(
-                state & 16 != 0,
-                state & 8 != 0,
-                state & 4 != 0,
-                state & 2 != 0,
-                state & 1 != 0,
-            ),
-            state == 4,
-            "app focus, system focus, observed, secure, truncated: {state:05b}"
-        );
+fn unfocused_keys_require_both_focuses_absent_and_a_fresh_clean_scan() {
+    for app_focus in [false, true] {
+        for system_focus in [false, true] {
+            for (scan, safe) in [
+                (SecurityScan::Clean, true),
+                (SecurityScan::SecurePresent, false),
+                (SecurityScan::Incomplete, false),
+            ] {
+                let expected = match (app_focus, system_focus) {
+                    (false, false) => safe,
+                    _ => false,
+                };
+                assert_eq!(
+                    allows_unfocused_key(app_focus, system_focus, scan),
+                    expected,
+                    "app focus: {app_focus}, system focus: {system_focus}, scan: {scan:?}"
+                );
+            }
+        }
     }
 }
 fn keyboard_target(action: &Action) -> Option<Target> {

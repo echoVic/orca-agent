@@ -131,7 +131,6 @@ impl MacDriver {
             omitted,
             no_element_tree,
             truncated,
-            has_secure_elements,
         } = tree::collect(
             &ax_window,
             geometry,
@@ -153,8 +152,6 @@ impl MacDriver {
                 window_frame,
                 geometry,
                 entries,
-                has_secure_elements,
-                truncated,
             },
         );
         Ok(Observation {
