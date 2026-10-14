@@ -93,13 +93,20 @@ For `computer` calls with an app target, the choices are `1` Allow once,
 `2` Allow this app this session, `3` Allow all apps this session, `7` Always
 allow this app (saved), `5` Always allow all apps (saved), and `4` Deny. A computer approval with no resolved app target offers only `1` and `4`.
 
+Outside `full-auto`, terminals and IDEs need approval for that app itself:
+`1`, `2`, or `7`, or an allow rule whose `pattern` is the exact bundle id.
+**Allow all apps this session**, `pattern = "*"` or another wildcard, and a
+whole-tool allow rule do not cover them. Their approval panel does not offer
+the two all-app options.
+
 Password text entry also offers only `1` and `4`, with **Allow typing this
 once** as the approval label. It asks separately for each `type` or
 text-entering `key` call, including printable keys alone or with Shift/Option
 and `Cmd+V`. App grants, grants for all apps, `full-auto`, and patterned allow
 rules, including `*` and one naming an explicit `#secure` target, do not
 preapprove these calls. Only a whole-tool allow rule
-for `computer` without a `pattern` does; matching deny rules still win. See
+for `computer` without a `pattern` does for apps that do not run commands;
+matching deny rules still win. See
 [Computer use](computer-use.md#app-approval).
 
 If the driver detects a password field only during a point action or from a

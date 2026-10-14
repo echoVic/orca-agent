@@ -9134,6 +9134,30 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_approval_panel_never_offers_grants_for_every_app() {
+        let mut state = approval_state();
+        let dialog = state.approval_dialog.as_mut().unwrap();
+        dialog.tool = "computer".into();
+        dialog.target = Some("com.apple.Terminal".into());
+        dialog.options = ApprovalDialog::options_for("computer", Some("com.apple.Terminal"));
+
+        let frame = frame_string(&mut state, 140, 35);
+        for text in [
+            "Allow this app this session",
+            "Always allow this app (saved)",
+            "1/2/7/4 pick",
+        ] {
+            assert!(frame.contains(text), "missing {text:?}: {frame}");
+        }
+        for text in [
+            "Allow all apps this session",
+            "Always allow all apps (saved)",
+        ] {
+            assert!(!frame.contains(text), "unexpected {text:?}: {frame}");
+        }
+    }
+
+    #[test]
     fn a_secure_computer_approval_only_offers_typing_once_or_deny() {
         let mut state = approval_state();
         let dialog = state.approval_dialog.as_mut().unwrap();

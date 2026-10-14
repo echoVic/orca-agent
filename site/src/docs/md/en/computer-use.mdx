@@ -30,6 +30,12 @@ permission rule already decides the call or the session is in `full-auto` (see
 - `5` **Always allow all apps (saved)**: save an allow rule for every app for future sessions.
 - `4` **Deny**: refuse the call and ask Orca for another way.
 
+Outside `full-auto`, terminals and IDEs need approval for that app itself:
+`1`, `2`, or `7`, or an allow rule whose `pattern` is the exact bundle id.
+**Allow all apps this session**, `pattern = "*"` or another wildcard, and a
+whole-tool allow rule do not cover them. Their approval panel does not offer
+the two all-app options.
+
 The saved options write to the user configuration, at `$ORCA_HOME/config.toml`
 or, when unset, `~/.orca/config.toml`. `7` saves the app's exact bundle id as
 the rule's `pattern`, and `5` saves `pattern = "*"`:
@@ -51,7 +57,7 @@ App grants, including those for all apps, do not preapprove password entry,
 and neither does `full-auto`. Patterned allow rules, including exact app ids,
 wildcards such as `*`, and an explicit `#secure` target, also leave this check
 in place. Only a whole-tool allow rule for `computer`,
-without a `pattern`, preapproves it. A matching deny rule still takes
+without a `pattern`, preapproves it for apps that do not run commands. A matching deny rule still takes
 precedence; see [permission rules](approval-modes.md#permission-rules).
 
 If a point target or a stale observation reveals a password field only
@@ -79,7 +85,8 @@ Orca can never operate its own host terminal, regardless of rules; if the
 host cannot be identified, all listed terminal apps are blocked. Other
 listed terminals (Terminal, iTerm2, Ghostty, Warp, kitty, Alacritty, WezTerm,
 cmux) and IDEs (VS Code, apps under `com.todesktop.` or `com.jetbrains.`,
-Xcode, Zed) warn that they can run commands outside Orca's sandbox;
+Xcode, Zed) warn that they can run commands outside Orca's sandbox. Outside
+`full-auto`, these apps require their own approval as described above.
 Finder warns about file access, System Settings about changing settings,
 and listed browsers (Safari, Chrome, Firefox, Arc, Edge, Brave) about web
 pages carrying instructions aimed at the agent. The warning appears in the

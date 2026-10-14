@@ -185,6 +185,52 @@ mod tests {
     }
 
     #[test]
+    fn command_running_apps_ask_unless_the_allow_names_that_app_or_mode_is_full_auto() {
+        let request = make_request(ActionKind::Computer);
+        for mode in [
+            ApprovalMode::Plan,
+            ApprovalMode::Suggest,
+            ApprovalMode::AutoEdit,
+        ] {
+            let policy = ApprovalPolicy::new(mode).with_rules(vec![PermissionRule::new(
+                "computer",
+                "*",
+                Decision::Allow,
+            )]);
+            for (target, decision) in [
+                ("com.apple.Terminal", ApprovalDecision::Ask),
+                ("com.apple.TextEdit", ApprovalDecision::Allow),
+            ] {
+                assert_eq!(
+                    policy
+                        .resolve_for_tool(&request, "computer", Some(target))
+                        .decision,
+                    decision,
+                    "{mode:?}: {target}"
+                );
+            }
+        }
+        let exact =
+            ApprovalPolicy::new(ApprovalMode::Suggest).with_rules(vec![PermissionRule::new(
+                "computer",
+                "com.apple.Terminal",
+                Decision::Allow,
+            )]);
+        assert_eq!(
+            exact
+                .resolve_for_tool(&request, "computer", Some("com.apple.Terminal"))
+                .decision,
+            ApprovalDecision::Allow
+        );
+        assert_eq!(
+            ApprovalPolicy::new(ApprovalMode::FullAuto)
+                .resolve_for_tool(&request, "computer", Some("com.apple.Terminal"))
+                .decision,
+            ApprovalDecision::Allow
+        );
+    }
+
+    #[test]
     fn app_rules_still_decide_computer_calls_in_full_auto() {
         let policy = ApprovalPolicy::new(ApprovalMode::FullAuto).with_rules(vec![
             PermissionRule::new("computer", "com.apple.Safari", Decision::Prompt),

@@ -426,9 +426,10 @@ impl ApprovalDialog {
     /// always gets the same five options, in place of `AlwaysTarget`: an MCP
     /// call's target is its own tool name, so remembering it adds nothing to
     /// `AlwaysTool`, and the two saved options, persisted to the user config, take its place.
-    /// Computer approvals offer session and saved grants for the app or for
-    /// every app; missing app targets and secure-field input only offer a
-    /// single approval or denial.
+    /// Computer approvals offer session and saved grants for the app; grants
+    /// for every app are only offered when the app cannot run commands.
+    /// Missing app targets and secure-field input only offer a single approval
+    /// or denial.
     /// For every other tool, `AlwaysTarget` is only shown when a target is
     /// present AND the tool is likely to be called again with the same
     /// target (e.g. reading a fixed file path).
@@ -436,6 +437,13 @@ impl ApprovalDialog {
         if tool == "computer" {
             return if target.is_none_or(|target| target.ends_with("#secure")) {
                 vec![ApprovalOption::Once, ApprovalOption::Deny]
+            } else if target.is_some_and(orca_core::computer_apps::runs_commands) {
+                vec![
+                    ApprovalOption::Once,
+                    ApprovalOption::AlwaysTarget,
+                    ApprovalOption::AlwaysTargetSaved,
+                    ApprovalOption::Deny,
+                ]
             } else {
                 vec![
                     ApprovalOption::Once,
@@ -1925,10 +1933,13 @@ impl AppState {
     /// True if a pending approval for this tool/target was already granted an
     /// "always allow" this session, whether by tool, by target, or (for an
     /// MCP tool) by its whole server. A grant for every app never covers
-    /// password entry or a computer call without an app.
+    /// command-running apps, password entry, or a computer call without an app;
+    /// command-running apps can still be granted by their exact target.
     pub fn approval_is_allowlisted(&self, tool: &str, target: Option<&str>) -> bool {
-        let tool_grant_applies =
-            tool != "computer" || target.is_some_and(|target| !target.ends_with("#secure"));
+        let tool_grant_applies = tool != "computer"
+            || target.is_some_and(|target| {
+                !target.ends_with("#secure") && !orca_core::computer_apps::runs_commands(target)
+            });
         if tool_grant_applies
             && self
                 .approval_allowlist

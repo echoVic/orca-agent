@@ -76,10 +76,15 @@ MCP 工具的调用里，选项 `5`、`6` 取代 `2` 的位置：MCP 工具调�
 all apps (saved) 和 `4` Deny。没有解析出应用目标的 computer 审批
 只有 `1` 和 `4`。
 
+在 `full-auto` 之外，终端和 IDE 需要针对该应用本身的授权：`1`、`2` 或 `7`，
+或者 `pattern` 为精确 bundle id 的 allow 规则。**Allow all apps this session**、
+`pattern = "*"` 或其他通配符，以及整个工具的 allow 规则都不覆盖它们。
+它们的授权面板不提供两个“所有应用”选项。
+
 密码文字输入也只有 `1` 和 `4`，允许选项显示为 **Allow typing this once**。每次 `type`
 或能输入文字的 `key` 调用都会单独询问，包括单独或配合 Shift/Option 的可打印键和
 `Cmd+V`。应用授权、所有应用的授权、`full-auto` 和带 `pattern` 的 allow 规则都不能
-预先批准，包括 `*` 和显式写了 `#secure` 目标的规则。只有整个工具的 allow 规则，即为 `computer` 设置 allow 且不写
+预先批准，包括 `*` 和显式写了 `#secure` 目标的规则。对不能执行命令的应用，只有整个工具的 allow 规则，即为 `computer` 设置 allow 且不写
 `pattern`，能预先批准；匹配的 deny 规则仍优先。详见[Computer use](computer-use.md#应用授权)。
 
 驱动因坐标操作或过期观察，在投递时才发现密码框时，会拒绝未批准的输入。

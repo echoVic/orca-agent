@@ -1,3 +1,5 @@
+use orca_core::computer_apps::{is_terminal, listed, runs_commands};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RiskTier {
     HostTerminal,
@@ -13,23 +15,6 @@ const PASSWORD_MANAGERS: &[&str] = &[
     "com.agilebits.*",
     "com.bitwarden.*",
 ];
-const TERMINALS: &[&str] = &[
-    "com.apple.Terminal",
-    "com.googlecode.iterm2",
-    "com.mitchellh.ghostty",
-    "dev.warp.Warp-Stable",
-    "net.kovidgoyal.kitty",
-    "org.alacritty",
-    "com.github.wez.wezterm",
-    "com.cmuxterm.app",
-];
-const IDES: &[&str] = &[
-    "com.microsoft.VSCode",
-    "com.todesktop.*",
-    "com.jetbrains.*",
-    "com.apple.dt.Xcode",
-    "dev.zed.Zed",
-];
 const BROWSERS: &[&str] = &[
     "com.apple.Safari",
     "com.google.Chrome",
@@ -39,22 +24,12 @@ const BROWSERS: &[&str] = &[
     "com.brave.Browser",
 ];
 
-fn listed(bundle_id: &str, patterns: &[&str]) -> bool {
-    let folded = bundle_id.to_ascii_lowercase();
-    patterns
-        .iter()
-        .any(|pattern| match pattern.strip_suffix('*') {
-            Some(prefix) => folded.starts_with(&prefix.to_ascii_lowercase()),
-            None => bundle_id.eq_ignore_ascii_case(pattern),
-        })
-}
-
 pub fn risk_tier(
     bundle_id: &str,
     category: Option<&str>,
     host_bundle_id: Option<&str>,
 ) -> RiskTier {
-    let terminal = listed(bundle_id, TERMINALS);
+    let terminal = is_terminal(bundle_id);
     if host_bundle_id.is_some_and(|host| host.eq_ignore_ascii_case(bundle_id))
         || (host_bundle_id.is_none() && terminal)
     {
@@ -63,7 +38,7 @@ pub fn risk_tier(
     if listed(bundle_id, PASSWORD_MANAGERS) || category == Some("public.app-category.finance") {
         return RiskTier::Forbidden;
     }
-    if terminal || listed(bundle_id, IDES) {
+    if runs_commands(bundle_id) {
         return RiskTier::Warning("can run any command, outside Orca's sandbox");
     }
     match bundle_id.to_ascii_lowercase().as_str() {

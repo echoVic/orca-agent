@@ -402,6 +402,17 @@ mod tests {
 
         assert!(state.approval_is_allowlisted("computer", Some("com.apple.Safari")));
         assert!(state.approval_is_allowlisted("computer", Some("com.apple.TextEdit")));
+        for app in [
+            "com.apple.Terminal",
+            "com.microsoft.VSCode",
+            "COM.JETBRAINS.INTELLIJ",
+            "com.todesktop.cursor",
+        ] {
+            assert!(
+                !state.approval_is_allowlisted("computer", Some(app)),
+                "{app}"
+            );
+        }
         assert!(!state.approval_is_allowlisted("computer", Some("com.apple.TextEdit#secure")));
         assert!(!state.approval_is_allowlisted("computer", None));
         assert!(matches!(
@@ -412,6 +423,24 @@ mod tests {
             }
         ));
         assert!(!home.path().join("config.toml").exists());
+    }
+
+    #[test]
+    fn allowing_a_terminal_this_session_covers_only_that_app() {
+        let mut state = state_awaiting_a_tool_approval();
+        let dialog = state.approval_dialog.as_mut().unwrap();
+        dialog.tool = "computer".into();
+        dialog.target = Some("com.apple.Terminal".into());
+        dialog.options =
+            crate::types::ApprovalDialog::options_for("computer", Some("com.apple.Terminal"));
+        let (action_tx, _action_rx) = mpsc::unbounded();
+
+        resolve_approval_option(&mut state, &action_tx, ApprovalOption::AlwaysTarget);
+
+        assert!(state.approval_is_allowlisted("computer", Some("com.apple.Terminal")));
+        assert!(!state.approval_is_allowlisted("computer", Some("com.apple.Terminal#secure")));
+        assert!(!state.approval_is_allowlisted("computer", Some("com.microsoft.VSCode")));
+        assert!(!state.approval_is_allowlisted("computer", Some("com.apple.TextEdit")));
     }
 
     #[test]

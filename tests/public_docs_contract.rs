@@ -146,9 +146,39 @@ fn computer_use_docs_cover_grants_for_every_app_and_full_auto() {
                 "Password entry still asks each time",
                 "the app's first result in each session",
             ],
-            _ => ["应用调用不再请求应用授权", "仍然每次询问", "第一次操作该应用的 结果里"],
+            _ => [
+                "应用调用不再请求应用授权",
+                "仍然每次询问",
+                "第一次操作该应用的 结果里",
+            ],
         };
         require_fragments(&source, &scope, locale);
+    }
+}
+
+#[test]
+fn computer_use_and_approval_docs_require_app_specific_grants_for_terminals_and_ides() {
+    for locale in ["en", "zh"] {
+        for page in ["computer-use", "approval-modes"] {
+            let source = public_page(locale, page);
+            let fragments: &[&str] = match locale {
+                "en" => &[
+                    "Outside `full-auto`, terminals and IDEs need approval for that app itself",
+                    "`1`, `2`, or `7`",
+                    "an allow rule whose `pattern` is the exact bundle id",
+                    "**Allow all apps this session**, `pattern = \"*\"` or another wildcard, and a whole-tool allow rule do not cover them",
+                    "Their approval panel does not offer the two all-app options",
+                ],
+                _ => &[
+                    "在 `full-auto` 之外，终端和 IDE 需要针对该应用本身的授权",
+                    "`1`、`2` 或 `7`",
+                    "`pattern` 为精确 bundle id 的 allow 规则",
+                    "**Allow all apps this session**、 `pattern = \"*\"` 或其他通配符，以及整个工具的 allow 规则都不覆盖它们",
+                    "它们的授权面板不提供两个“所有应用”选项",
+                ],
+            };
+            require_fragments(&source, fragments, &format!("{locale}/{page}"));
+        }
     }
 }
 
@@ -272,10 +302,7 @@ fn computer_use_and_approval_docs_explain_plan_and_full_auto_app_approval() {
                 &format!("{locale}/{page}"),
             );
             let scope = match locale {
-                "en" => [
-                    "only `list_apps` and `observe`",
-                    "without app approval",
-                ],
+                "en" => ["only `list_apps` and `observe`", "without app approval"],
                 _ => ["只允许 `list_apps` 和 `observe`", "不再请求应用授权"],
             };
             require_fragments(&source, &scope, &format!("{locale}/{page}"));
