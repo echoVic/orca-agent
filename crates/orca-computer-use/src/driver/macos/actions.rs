@@ -400,7 +400,8 @@ impl MacDriver {
                     amount,
                 } => {
                     let element = target_element(table, &application, *target)?;
-                    outcome.scroll_position = scroll(table, element, *direction, *amount)?;
+                    outcome.scroll_position =
+                        scroll(table, element, *direction, *amount, action_deadline)?;
                 }
             }
             Ok(())
@@ -687,13 +688,67 @@ fn focus(
     }
 }
 
+// Share the candidate scan with fake accessibility reads in unit tests.
+fn nearest_offscreen_scroll_target<T: Clone + PartialEq>(
+    entries: impl IntoIterator<Item = T>,
+    scroll_area: &T,
+    deadline: std::time::Instant,
+    mut distance: impl FnMut(&T) -> Result<f64, DriverError>,
+    mut read_parent: impl FnMut(&T) -> Result<Option<T>, DriverError>,
+    mut supports_scroll: impl FnMut(&T) -> Result<bool, DriverError>,
+) -> Result<T, DriverError> {
+    let mut nearest: Option<(f64, T)> = None;
+    'entries: for entry in entries {
+        check_scroll_deadline(deadline)?;
+        let Ok(distance) = distance(&entry) else {
+            continue;
+        };
+        check_scroll_deadline(deadline)?;
+        if distance < 0.0 || nearest.as_ref().is_some_and(|(d, _)| *d <= distance) {
+            continue;
+        }
+        let Ok(mut parent) = read_parent(&entry) else {
+            continue;
+        };
+        while let Some(node) = parent {
+            check_scroll_deadline(deadline)?;
+            if &node == scroll_area {
+                if supports_scroll(&entry).unwrap_or(false) {
+                    nearest = Some((distance, entry.clone()));
+                }
+                break;
+            }
+            parent = match read_parent(&node) {
+                Ok(parent) => parent,
+                Err(_) => continue 'entries,
+            };
+        }
+    }
+    check_scroll_deadline(deadline)?;
+    nearest.map(|(_, target)| target).ok_or_else(|| {
+        foreground("No scroll bar or offscreen element supports background scrolling")
+    })
+}
+
+fn check_scroll_deadline(deadline: std::time::Instant) -> Result<(), DriverError> {
+    if std::time::Instant::now() >= deadline {
+        return Err(error(
+            ErrorKind::Failed,
+            "The background scroll timed out; observe again",
+        ));
+    }
+    Ok(())
+}
+
 fn scroll(
     table: &ElementTable,
     mut element: AxElement,
     direction: Direction,
     amount: u32,
+    deadline: std::time::Instant,
 ) -> Result<Option<f64>, DriverError> {
     loop {
+        check_scroll_deadline(deadline)?;
         if element.attribute_string("AXRole")?.as_deref() == Some("AXScrollArea") {
             break;
         }
@@ -732,36 +787,21 @@ fn scroll(
     }
     let area = element.position_size()?;
     let axis = if vertical { 1 } else { 0 };
-    let mut nearest: Option<(f64, AxElement)> = None;
-    for entry in &table.entries {
-        let frame = entry.element.position_size()?;
-        let distance = if sign > 0.0 {
-            frame[axis] - area[axis] - area[axis + 2]
-        } else {
-            area[axis] - frame[axis] - frame[axis + 2]
-        };
-        if distance < 0.0 || nearest.as_ref().is_some_and(|(d, _)| *d <= distance) {
-            continue;
-        }
-        let mut parent = entry.element.attribute_element("AXParent")?;
-        while let Some(node) = parent {
-            if node.0 == element.0 {
-                if entry
-                    .element
-                    .actions()?
-                    .iter()
-                    .any(|a| a == "AXScrollToVisible")
-                {
-                    nearest = Some((distance, entry.element.clone()));
-                }
-                break;
-            }
-            parent = node.attribute_element("AXParent")?;
-        }
-    }
-    let (_, target) = nearest.ok_or_else(|| {
-        foreground("No scroll bar or offscreen element supports background scrolling")
-    })?;
+    let target = nearest_offscreen_scroll_target(
+        table.entries.iter().map(|entry| entry.element.clone()),
+        &element,
+        deadline,
+        |entry| {
+            let frame = entry.position_size()?;
+            Ok(if sign > 0.0 {
+                frame[axis] - area[axis] - area[axis + 2]
+            } else {
+                area[axis] - frame[axis] - frame[axis + 2]
+            })
+        },
+        |entry| entry.attribute_element("AXParent"),
+        |entry| Ok(entry.actions()?.iter().any(|a| a == "AXScrollToVisible")),
+    )?;
     target.perform("AXScrollToVisible")?;
     Ok(None)
 }
@@ -770,6 +810,88 @@ fn scroll(
 mod tests {
     use super::*;
     use crate::geometry::CaptureGeometry;
+
+    fn offscreen_target_with_stale_read(stage: &str) -> Result<u32, DriverError> {
+        nearest_offscreen_scroll_target(
+            [1, 2],
+            &9,
+            std::time::Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT,
+            |entry| {
+                if *entry == 1 && stage == "frame" {
+                    Err(stale())
+                } else {
+                    Ok(f64::from(*entry))
+                }
+            },
+            |entry| match (*entry, stage) {
+                (1, "parent") | (5, "ancestor") => Err(stale()),
+                (1, "ancestor") => Ok(Some(5)),
+                _ => Ok(Some(9)),
+            },
+            |_| Ok(true),
+        )
+    }
+
+    #[test]
+    fn offscreen_scroll_skips_stale_position_and_size() {
+        assert_eq!(offscreen_target_with_stale_read("frame").unwrap(), 2);
+    }
+
+    #[test]
+    fn offscreen_scroll_skips_stale_parent() {
+        assert_eq!(offscreen_target_with_stale_read("parent").unwrap(), 2);
+    }
+
+    #[test]
+    fn offscreen_scroll_skips_stale_ancestor() {
+        assert_eq!(offscreen_target_with_stale_read("ancestor").unwrap(), 2);
+    }
+
+    #[test]
+    fn offscreen_scroll_expired_deadline_prevents_all_reads() {
+        let mut reads = 0;
+        let result = nearest_offscreen_scroll_target(
+            [1],
+            &9,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+            |_| {
+                reads += 1;
+                Ok(1.0)
+            },
+            |_| Ok(Some(9)),
+            |_| Ok(true),
+        );
+        assert_eq!(
+            result
+                .expect_err("an expired action must refuse the scan")
+                .kind,
+            ErrorKind::Failed
+        );
+        assert_eq!(reads, 0);
+    }
+
+    #[test]
+    fn offscreen_scroll_parent_walk_uses_the_existing_deadline() {
+        let mut action_reads = 0;
+        let result = nearest_offscreen_scroll_target(
+            [1],
+            &9,
+            std::time::Instant::now() + std::time::Duration::from_millis(1),
+            |_| Ok(1.0),
+            |_| {
+                std::thread::sleep(std::time::Duration::from_millis(3));
+                Ok(Some(9))
+            },
+            |_| {
+                action_reads += 1;
+                Ok(true)
+            },
+        );
+        let failure = result.expect_err("parent reads must not refresh the action budget");
+        assert_eq!(failure.kind, ErrorKind::Failed);
+        assert!(failure.message.contains("timed out"));
+        assert_eq!(action_reads, 0);
+    }
 
     // Default test budget only; production must receive the existing action deadline.
     fn modal_ancestry<T: Clone + PartialEq>(
