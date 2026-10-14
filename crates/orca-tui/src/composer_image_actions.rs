@@ -42,6 +42,7 @@ pub(crate) fn handle_image_viewer_key(key: KeyEvent, state: &mut AppState) -> bo
         return false;
     }
     if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        state.pending_tool_image_call_id = None;
         state.image_viewer = None;
         return true;
     }
@@ -82,6 +83,7 @@ pub(crate) fn handle_composer_image_preview_key(
     else {
         return false;
     };
+    state.pending_tool_image_call_id = None;
     match ImageViewerState::open(image) {
         Ok(viewer) => state.image_viewer = Some(viewer),
         Err(error) => state.push_message(ChatMessage::Error(error)),

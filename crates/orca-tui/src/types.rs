@@ -555,6 +555,7 @@ pub struct AppState {
     pub(crate) conversation_target: ConversationTarget,
     pub(crate) transcript: TranscriptState,
     pub(crate) image_viewer: Option<ImageViewerState>,
+    pub(crate) pending_tool_image_call_id: Option<String>,
     pub(crate) image_renderer: ImageRenderState,
     pub(crate) image_hit_areas: Vec<ImageHitArea>,
     pub(crate) collapsible_hit_areas: Vec<CollapsibleHitArea>,
@@ -1027,6 +1028,7 @@ impl AppState {
         Self {
             transcript: TranscriptState::new(),
             image_viewer: None,
+            pending_tool_image_call_id: None,
             image_renderer: ImageRenderState::default(),
             image_hit_areas: Vec::new(),
             collapsible_hit_areas: Vec::new(),
@@ -1450,6 +1452,7 @@ impl AppState {
     }
 
     pub(crate) fn reset_session_projection(&mut self) {
+        self.pending_tool_image_call_id = None;
         self.surface_session.reset();
         self.task_transcript = None;
         self.clear_messages();

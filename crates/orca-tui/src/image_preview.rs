@@ -1025,6 +1025,7 @@ mod tests {
         image::codecs::png::PngEncoder::new(&mut bytes)
             .write_image(&[255, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
             .unwrap();
+        state.pending_tool_image_call_id = Some("call-1".into());
         state.update(crate::protocol::TuiEvent::ToolImagesLoaded {
             call_id: "call-1".into(),
             result: Ok(vec![orca_core::conversation::ImageInput {
@@ -1041,6 +1042,128 @@ mod tests {
         assert_eq!(viewer.image.encoded.as_deref(), Some(bytes.as_slice()));
     }
 
+    fn click_preview(state: &mut crate::types::AppState, target: ImageHitTarget) {
+        state.image_hit_areas = vec![ImageHitArea {
+            rect: Rect::new(1, 1, 4, 1),
+            preview_rect: None,
+            target,
+        }];
+        let event = crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        crate::input_event_actions::handle_mouse_event(
+            &event,
+            state,
+            &mut ratatui_textarea::TextArea::default(),
+            std::time::Instant::now(),
+        );
+    }
+
+    fn loaded_screenshot(call_id: &str, width: u32) -> crate::protocol::TuiEvent {
+        use base64::Engine as _;
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(
+                &vec![255; width as usize * 4],
+                width,
+                1,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        crate::protocol::TuiEvent::ToolImagesLoaded {
+            call_id: call_id.into(),
+            result: Ok(vec![orca_core::conversation::ImageInput {
+                source: orca_core::conversation::ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                },
+                detail: Default::default(),
+            }]),
+        }
+    }
+
+    fn click_two_tool_markers(
+        state: &mut crate::types::AppState,
+        rx: &crossbeam_channel::Receiver<crate::protocol::UserAction>,
+    ) {
+        for call_id in ["older", "newer"] {
+            click_preview(
+                state,
+                ImageHitTarget::ToolResult {
+                    call_id: call_id.into(),
+                },
+            );
+            assert!(
+                matches!(rx.try_recv(), Ok(crate::protocol::UserAction::OpenToolImages { call_id: actual }) if actual == call_id)
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_tool_image_load_cannot_replace_the_newer_selection() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state =
+            crate::types::AppState::new(tx, "test".into(), "auto".into(), "/tmp".into());
+        click_two_tool_markers(&mut state, &rx);
+        state.update(loaded_screenshot("newer", 2));
+        assert_eq!(state.image_viewer.as_ref().unwrap().image.width, 2);
+        state.update(loaded_screenshot("older", 1));
+        assert_eq!(
+            state.image_viewer.as_ref().unwrap().image.width,
+            2,
+            "the older load must not replace the latest screenshot"
+        );
+        let messages = state.transcript.messages.len();
+        state.update(crate::protocol::TuiEvent::ToolImagesLoaded {
+            call_id: "older".into(),
+            result: Err("stale read error".into()),
+        });
+        assert_eq!(
+            state.transcript.messages.len(),
+            messages,
+            "stale errors must be ignored too"
+        );
+    }
+
+    #[test]
+    fn a_late_tool_image_load_is_ignored_while_the_newer_selection_is_pending() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state =
+            crate::types::AppState::new(tx, "test".into(), "auto".into(), "/tmp".into());
+        click_two_tool_markers(&mut state, &rx);
+        state.update(loaded_screenshot("older", 1));
+        assert!(
+            state.image_viewer.is_none(),
+            "the old load must not open while the newer screenshot is pending"
+        );
+        state.update(loaded_screenshot("newer", 2));
+        assert_eq!(state.image_viewer.as_ref().unwrap().image.width, 2);
+    }
+
+    #[test]
+    fn a_late_tool_image_load_cannot_replace_a_newer_inline_image() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state =
+            crate::types::AppState::new(tx, "test".into(), "auto".into(), "/tmp".into());
+        click_preview(
+            &mut state,
+            ImageHitTarget::ToolResult {
+                call_id: "older".into(),
+            },
+        );
+        click_preview(&mut state, ImageHitTarget::Image(image()));
+        assert_eq!(state.image_viewer.as_ref().unwrap().image.width, 2);
+        state.update(loaded_screenshot("older", 1));
+        assert_eq!(
+            state.image_viewer.as_ref().unwrap().image.width,
+            2,
+            "an inline selection supersedes the pending screenshot"
+        );
+    }
+
     #[test]
     fn loaded_tool_images_report_missing_and_read_errors() {
         for (result, expected) in [
@@ -1053,6 +1176,7 @@ mod tests {
             let (tx, _rx) = crossbeam_channel::unbounded();
             let mut state =
                 crate::types::AppState::new(tx, "test".into(), "auto".into(), "/tmp".into());
+            state.pending_tool_image_call_id = Some("call-1".into());
             state.update(crate::protocol::TuiEvent::ToolImagesLoaded {
                 call_id: "call-1".into(),
                 result,
@@ -1076,6 +1200,7 @@ mod tests {
             let (tx, _rx) = crossbeam_channel::unbounded();
             let mut state =
                 crate::types::AppState::new(tx, "test".into(), "auto".into(), "/tmp".into());
+            state.pending_tool_image_call_id = Some("call-1".into());
             state.update(crate::protocol::TuiEvent::ToolImagesLoaded {
                 call_id: "call-1".into(),
                 result: Ok(vec![orca_core::conversation::ImageInput {
@@ -1109,6 +1234,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state =
             crate::types::AppState::new(tx, "test".into(), "auto".into(), "/tmp".into());
+        state.pending_tool_image_call_id = Some("call-1".into());
         state.update(crate::protocol::TuiEvent::ToolImagesLoaded {
             call_id: "call-1".into(),
             result: Ok(vec![

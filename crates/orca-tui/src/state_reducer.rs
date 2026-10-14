@@ -58,18 +58,24 @@ impl AppState {
     pub fn update(&mut self, event: TuiEvent) {
         self.reconcile_message_tracking();
         match event {
-            TuiEvent::ToolImagesLoaded { result, .. } => match result {
-                Ok(images) => match images.into_iter().next() {
-                    Some(image) => match crate::image_preview::open_tool_image(image) {
-                        Ok(viewer) => self.image_viewer = Some(viewer),
-                        Err(error) => self.push_message(ChatMessage::Error(error)),
+            TuiEvent::ToolImagesLoaded { call_id, result } => {
+                if self.pending_tool_image_call_id.as_deref() != Some(call_id.as_str()) {
+                    return;
+                }
+                self.pending_tool_image_call_id = None;
+                match result {
+                    Ok(images) => match images.into_iter().next() {
+                        Some(image) => match crate::image_preview::open_tool_image(image) {
+                            Ok(viewer) => self.image_viewer = Some(viewer),
+                            Err(error) => self.push_message(ChatMessage::Error(error)),
+                        },
+                        None => self.push_message(ChatMessage::Error(
+                            "That screenshot is no longer available.".to_string(),
+                        )),
                     },
-                    None => self.push_message(ChatMessage::Error(
-                        "That screenshot is no longer available.".to_string(),
-                    )),
-                },
-                Err(error) => self.push_message(ChatMessage::Error(error)),
-            },
+                    Err(error) => self.push_message(ChatMessage::Error(error)),
+                }
+            }
             TuiEvent::Attached(_) => {
                 eprintln!("orca: ignored an attached TUI event that bypassed attachment fencing");
             }
@@ -101,6 +107,7 @@ impl AppState {
                 }
             }
             TuiEvent::ChildFocusChanged { task_id } => {
+                self.pending_tool_image_call_id = None;
                 self.invalidate_recap();
                 // Only snapshot the current workflow task list when transitioning
                 // from Main into a child. For sibling switches (Child -> Child)
@@ -122,6 +129,7 @@ impl AppState {
                 self.apply_surface_projection_state(*projection);
             }
             TuiEvent::NewSessionStarted => {
+                self.pending_tool_image_call_id = None;
                 self.invalidate_recap();
                 self.task_transcript = None;
                 self.agent_dock_selected_task_id = None;
