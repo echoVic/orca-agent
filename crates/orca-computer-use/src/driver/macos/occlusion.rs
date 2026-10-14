@@ -1,13 +1,78 @@
 //! Window-stack backstop for known remote-control overlays.
 
-use objc2_core_foundation::{CFDictionary, CFNumber, CFString, CFType, CGPoint};
+use std::ptr::NonNull;
+
+use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint};
 use objc2_core_graphics::{
     CGDisplayBounds, CGError, CGGetDisplaysWithPoint, CGWindowListCopyWindowInfo,
     CGWindowListOption, kCGNullWindowID, kCGWindowAlpha, kCGWindowBounds, kCGWindowLayer,
     kCGWindowOwnerName, kCGWindowOwnerPID,
 };
 
-const REMOTE_OVERLAY_OWNERS: &[&str] = &["UURemoteServer"];
+struct RemoteOverlayOwner {
+    name: &'static str,
+    signing_identifier: &'static str,
+    team: &'static str,
+}
+
+const REMOTE_OVERLAY_OWNERS: &[RemoteOverlayOwner] = &[RemoteOverlayOwner {
+    name: "UURemoteServer",
+    signing_identifier: "com.netease.uuremote.server",
+    team: "PU9BNSBJW7",
+}];
+
+// SecCode and SecRequirement are owned CF objects, released through CFRetained.
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    static kSecGuestAttributePid: &'static CFString;
+    fn SecRequirementCreateWithString(
+        text: *const CFString,
+        flags: u32,
+        requirement: *mut *const CFType,
+    ) -> i32;
+    fn SecCodeCopyGuestWithAttributes(
+        host: *const CFType,
+        attributes: *const CFDictionary,
+        flags: u32,
+        guest: *mut *const CFType,
+    ) -> i32;
+    fn SecCodeCheckValidity(code: *const CFType, flags: u32, requirement: *const CFType) -> i32;
+}
+
+fn overlay_requirement(owner: &RemoteOverlayOwner) -> Option<CFRetained<CFType>> {
+    let text = CFString::from_str(&format!(
+        r#"anchor apple generic and identifier "{}" and certificate leaf[subject.OU] = "{}""#,
+        owner.signing_identifier, owner.team,
+    ));
+    let mut requirement = std::ptr::null();
+    if unsafe { SecRequirementCreateWithString(&*text, 0, &mut requirement) } != 0 {
+        return None;
+    }
+    NonNull::new(requirement.cast_mut()).map(|value| unsafe { CFRetained::from_raw(value) })
+}
+
+fn authenticated_overlay(pid: i32, owner: &RemoteOverlayOwner) -> bool {
+    let Some(requirement) = overlay_requirement(owner) else {
+        return false;
+    };
+    let attributes = CFDictionary::<CFString, CFNumber>::from_slices(
+        &[unsafe { kSecGuestAttributePid }],
+        &[CFNumber::new_i32(pid).as_ref()],
+    );
+    let mut code = std::ptr::null();
+    if unsafe {
+        SecCodeCopyGuestWithAttributes(std::ptr::null(), attributes.as_opaque(), 0, &mut code)
+    } != 0
+    {
+        return false;
+    }
+    let Some(code) = NonNull::new(code.cast_mut()) else {
+        return false;
+    };
+    let code = unsafe { CFRetained::from_raw(code) };
+    unsafe { SecCodeCheckValidity(&*code, 0, &*requirement) == 0 }
+}
+
 const MAX_WINDOWS: usize = 4096;
 
 #[derive(Clone, Debug)]
@@ -25,6 +90,7 @@ fn point_is_uncovered(
     display_bounds: [f64; 4],
     target_pid: i32,
     hit_pid: i32,
+    authenticated: impl Fn(i32, &RemoteOverlayOwner) -> bool,
 ) -> bool {
     if hit_pid == target_pid {
         return true;
@@ -37,13 +103,15 @@ fn point_is_uncovered(
         return false;
     }
     let is_overlay = |window: &WindowRecord| {
-        REMOTE_OVERLAY_OWNERS.contains(&window.owner_name.as_str())
-            && window.layer >= 1000
+        window.layer >= 1000
             && contains(window.bounds, point)
             && window.bounds[0] <= display_bounds[0]
             && window.bounds[1] <= display_bounds[1]
             && window.bounds[0] + window.bounds[2] >= display_bounds[0] + display_bounds[2]
             && window.bounds[1] + window.bounds[3] >= display_bounds[1] + display_bounds[3]
+            && REMOTE_OVERLAY_OWNERS.iter().any(|owner| {
+                owner.name == window.owner_name && authenticated(window.owner_pid, owner)
+            })
     };
     windows
         .iter()
@@ -152,6 +220,7 @@ pub(super) fn target_under_remote_overlay(
         ],
         target_pid,
         hit_pid,
+        authenticated_overlay,
     ))
 }
 
@@ -185,7 +254,59 @@ mod tests {
     }
 
     fn uncovered(windows: &[WindowRecord], hit_pid: i32) -> bool {
-        point_is_uncovered(windows, POINT, DISPLAY, TARGET, hit_pid)
+        point_is_uncovered(windows, POINT, DISPLAY, TARGET, hit_pid, |_, _| true)
+    }
+
+    #[test]
+    fn an_unauthenticated_owner_with_the_uu_name_and_geometry_is_refused() {
+        assert!(!point_is_uncovered(
+            &[overlay(), window(TARGET)],
+            POINT,
+            DISPLAY,
+            TARGET,
+            UU,
+            |_, _| false,
+        ));
+    }
+
+    #[test]
+    fn the_uu_requirement_parses() {
+        for owner in REMOTE_OVERLAY_OWNERS {
+            assert!(overlay_requirement(owner).is_some());
+        }
+    }
+
+    #[test]
+    fn the_test_process_does_not_authenticate_as_the_uu_helper() {
+        for owner in REMOTE_OVERLAY_OWNERS {
+            assert!(!authenticated_overlay(std::process::id() as i32, owner));
+        }
+    }
+
+    #[test]
+    fn authentication_only_runs_after_the_owner_and_geometry_match() {
+        let mut wrong_name = overlay();
+        wrong_name.owner_name = "OtherRemoteServer".into();
+        let mut wrong_geometry = overlay();
+        wrong_geometry.bounds = [0.0, 0.0, 100.0, 100.0];
+        for window in [wrong_name, wrong_geometry] {
+            assert!(!point_is_uncovered(
+                &[window, self::window(TARGET)],
+                POINT,
+                DISPLAY,
+                TARGET,
+                UU,
+                |_, _| panic!("non-overlay windows must not trigger signature checks"),
+            ));
+        }
+        assert!(point_is_uncovered(
+            &[],
+            POINT,
+            DISPLAY,
+            TARGET,
+            TARGET,
+            |_, _| panic!("matching AX hits must not trigger signature checks")
+        ));
     }
 
     #[test]
@@ -250,7 +371,7 @@ mod tests {
         off_point.bounds = [900.0, 100.0, 200.0, 200.0];
         assert!(uncovered(
             &[transparent, overlay(), off_point, window(TARGET)],
-            UU
+            UU,
         ));
     }
 
@@ -289,21 +410,24 @@ mod tests {
             point,
             display,
             TARGET,
-            UU
+            UU,
+            |_, _| true,
         ));
         assert!(!point_is_uncovered(
             &[overlay(), target],
             point,
             display,
             TARGET,
-            UU
+            UU,
+            |_, _| true,
         ));
         assert!(!point_is_uncovered(
             &[overlay(), window(TARGET)],
             POINT,
             display,
             TARGET,
-            UU
+            UU,
+            |_, _| true,
         ));
     }
 }
