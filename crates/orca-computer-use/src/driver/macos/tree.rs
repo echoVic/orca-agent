@@ -16,6 +16,8 @@ pub(crate) struct ElementTable {
     pub window_frame: [f64; 4],
     pub geometry: CaptureGeometry,
     pub entries: Vec<TableEntry>,
+    pub has_secure_elements: bool,
+    pub truncated: bool,
 }
 #[allow(dead_code)]
 pub(crate) struct TableEntry {
@@ -206,6 +208,9 @@ fn walk_until<N: TreeNode>(
     elements: &mut Vec<Element>,
     entries: &mut Vec<N::Entry>,
 ) -> Result<(), DriverError> {
+    if depth.ax >= 30 {
+        budget.truncated = true;
+    }
     if depth.ax > 30 || budget.expired() {
         return Ok(());
     }
@@ -215,6 +220,7 @@ fn walk_until<N: TreeNode>(
     };
     let retained = match element.retained(geometry, budget.deadline) {
         Err(failure) if depth.ax > 0 && failure.kind == crate::protocol::ErrorKind::Stale => {
+            budget.truncated = true;
             return Ok(());
         }
         result => result?,
@@ -233,6 +239,7 @@ fn walk_until<N: TreeNode>(
     if depth.ax < 30 && !budget.expired() {
         let children = match element.children_until(budget.deadline) {
             Err(failure) if depth.ax > 0 && failure.kind == crate::protocol::ErrorKind::Stale => {
+                budget.truncated = true;
                 return Ok(());
             }
             result => result?,
@@ -294,6 +301,7 @@ pub(super) struct CollectedTree {
     pub omitted: u32,
     pub no_element_tree: bool,
     pub truncated: bool,
+    pub has_secure_elements: bool,
 }
 
 pub(super) fn collect(
@@ -318,6 +326,8 @@ pub(super) fn collect(
         has_element_tree,
     )?;
     let no_element_tree = !has_element_tree(&entries);
+    // Query/element limits must not hide a secure control from keyboard checks.
+    let has_secure_elements = entries.iter().any(|entry| entry.secure);
     if let Some(query) = query {
         elements = filter_elements(&elements, query);
     }
@@ -341,6 +351,7 @@ pub(super) fn collect(
         omitted,
         no_element_tree,
         truncated,
+        has_secure_elements,
     })
 }
 
@@ -575,7 +586,7 @@ mod regression_tests {
                 on_children,
             };
             let mut elements = vec![];
-            walk(
+            let truncated = walk(
                 tree.clone(),
                 Depth::default(),
                 geometry(),
@@ -584,6 +595,7 @@ mod regression_tests {
                 &mut vec![],
             )
             .unwrap();
+            assert!(truncated, "a skipped stale subtree is incomplete");
             assert!(elements.iter().any(|e| e.label.as_deref() == Some("First")));
             assert!(elements.iter().any(|e| e.label.as_deref() == Some("Last")));
             assert_eq!(
@@ -620,6 +632,26 @@ mod regression_tests {
                 "timeouts must remain fatal"
             );
         }
+    }
+
+    #[test]
+    fn a_depth_limited_tree_does_not_certify_unseen_descendants() {
+        let mut tree = Node::control("Password");
+        for _ in 0..31 {
+            tree = Node::group(vec![tree]);
+        }
+        let mut elements = vec![];
+        let truncated = walk(
+            tree,
+            Depth::default(),
+            geometry(),
+            Instant::now() + Duration::from_secs(1),
+            &mut elements,
+            &mut vec![],
+        )
+        .unwrap();
+        assert!(elements.is_empty());
+        assert!(truncated, "a skipped deep subtree is incomplete");
     }
 
     #[test]

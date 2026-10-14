@@ -16,11 +16,17 @@ func log(_ event: [String: Any]) {
 log(["type": "started", "pid": Int(ProcessInfo.processInfo.processIdentifier)])
 
 final class Canvas: NSView {
+    override var acceptsFirstResponder: Bool { true }
     override func isAccessibilityElement() -> Bool { false }
+    override func isAccessibilityFocused() -> Bool { false }
     override func accessibilityChildren() -> [Any]? { [] }
     override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
         log(["type": "canvas_click", "x": point.x, "y": point.y, "clicks": event.clickCount])
+    }
+    override func keyDown(with event: NSEvent) {
+        log(["type": "canvas_key", "characters": event.characters ?? ""])
     }
     override func rightMouseDown(with event: NSEvent) {
         log(["type": "canvas_right_click"])
@@ -125,6 +131,7 @@ final class ProbeApplication: NSApplication {
         return super.accessibilityMainWindow()
     }
     override func accessibilityApplicationFocusedUIElement() -> Any? {
+        if windows.contains(where: { $0.firstResponder is Canvas }) { return nil }
         if CommandLine.arguments.contains("--hide-focused-element") { return nil }
         if foregroundTypeProbe && pendingProbeRaise { return nil }
         if (CommandLine.arguments.contains("--expire-selection-focus") || CommandLine.arguments.contains("--no-name-length")), let focus = expiringSelectionFocus { return focus }
@@ -311,7 +318,9 @@ NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
     return event
 }
 let canvas = Canvas(frame: NSRect(x: 340, y: 140, width: 280, height: 220))
-for view in [button, controller.label, field, secure, scroll, canvas] as [NSView] {
+let views: [NSView] = CommandLine.arguments.contains("--canvas-only")
+    ? [canvas] : [button, controller.label, field, secure, scroll, canvas]
+for view in views {
     window.contentView!.addSubview(view)
 }
 if foregroundPasswordProbe || foregroundTypeProbe || rejectEarlyHit {

@@ -1426,6 +1426,8 @@ mod tests {
                 image_size: (200, 200),
             },
             entries: vec![],
+            has_secure_elements: false,
+            truncated: false,
         };
         let control = click_target_element(
             &table,

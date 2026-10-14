@@ -2103,6 +2103,45 @@ fn a_point_on_a_hidden_button_needs_the_foreground() {
 
 #[test]
 #[ignore]
+fn a_canvas_with_no_focused_element_receives_an_untargeted_text_key() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) = live.launch_fixture_with_flags(&["--canvas-only"]);
+        live.fixture_frontmost(pid);
+        live.background_state = Some((pid, CGEvent::location(Some(&CGEvent::new(None).unwrap()))));
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        assert!(!obs.truncated);
+        assert!(obs.elements.iter().all(|element| !element.secure));
+        live.act_with_fallback(click_target(live.point_inside(&obs, "canvas")), false, true)
+            .unwrap();
+        live.assert_log_contains(&log, r#""type":"canvas_click""#);
+        let application = NativeAxElement::application(pid);
+        assert!(fixture_ax_value(&application, "AXFocusedUIElement").is_none());
+        let outcome = live
+            .act_with_fallback(
+                Action::Key {
+                    keys: vec!["a".into()],
+                    target: None,
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert!(outcome.foreground_used);
+        assert!(outcome.note.unwrap().contains("reports no focused element"));
+        live.assert_log_contains(&log, r#""type":"canvas_key""#);
+        assert!(std::fs::read_to_string(&log).unwrap().lines().any(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            event["type"] == "canvas_key" && event["characters"] == "a"
+        }));
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
 fn a_canvas_click_uses_the_foreground_and_restores_it() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {

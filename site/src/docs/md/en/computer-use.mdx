@@ -110,9 +110,10 @@ apply, and apps blocked by default stay blocked.
 Use element ids from the latest observation when available. If the tree
 lists omitted elements, use `query` to narrow the results by role, label, or
 value. A `truncated` observation means the accessibility walk reached its
-time limit and returned a partial tree; a control missing from that tree
-may still exist. Observe again with `query` or use point targets from the
-latest screenshot, then inspect the result to confirm the action.
+time or depth limit, or skipped a stale subtree, and returned a partial tree;
+a control missing from that tree may still exist. Observe again with `query`
+or use point targets from the latest screenshot, then inspect the result to
+confirm the action.
 
 Coordinates use screenshot pixels, with the origin at the top left. An app
 with no content element tree may still list its title-bar buttons; use
