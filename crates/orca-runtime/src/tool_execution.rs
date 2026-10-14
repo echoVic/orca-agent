@@ -2184,6 +2184,96 @@ mod tests {
         config
     }
 
+    #[test]
+    fn full_auto_runs_computer_app_calls_without_asking_but_asks_for_password_entry() {
+        use orca_computer_use::fake::{FakeDesktop, FakeLauncher};
+        use orca_computer_use::protocol::{ObserveParams, Reply, Request};
+
+        #[derive(Default)]
+        struct Record(Mutex<Vec<Option<String>>>);
+        impl crate::runtime_approval::RuntimeApprovalHandler for Record {
+            fn resolve_interactive(
+                &self,
+                approval: &ApprovalRequest,
+                _: &ToolRequest,
+            ) -> io::Result<orca_core::approval_types::ApprovalResolution> {
+                self.0.lock().unwrap().push(approval.target.clone());
+                Ok(orca_core::approval_types::ApprovalResolution {
+                    id: approval.id.clone(),
+                    decision: ApprovalDecision::Allow,
+                    reason: "approved in test".into(),
+                })
+            }
+        }
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = computer_config();
+        config.approval_mode = ApprovalMode::FullAuto;
+        let service = crate::computer_use::ComputerUseService::new_for_test(Arc::new(
+            FakeLauncher::new(FakeDesktop::with_textedit()),
+        ));
+        let Reply::Observed { observation } = service
+            .call(
+                Request::Observe(ObserveParams {
+                    app: "com.apple.TextEdit".into(),
+                    window: None,
+                    query: None,
+                    max_elements: 300,
+                    include_screenshot: false,
+                }),
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap()
+        else {
+            panic!("observation")
+        };
+        service.record_observation(&observation);
+        let registry = McpRegistry::default();
+        let policy = policy_for_tool_execution(&config);
+        let handler = Record::default();
+        for args in [
+            serde_json::json!({"action":"observe", "app":"TextEdit"}),
+            serde_json::json!({"action":"type", "app":"TextEdit", "text":"secret", "target":{"element":14}}),
+        ] {
+            let request = ToolRequest {
+                id: "computer-full-auto".into(),
+                name: ToolName::Computer,
+                action: ActionKind::Computer,
+                target: None,
+                raw_arguments: Some(args.to_string()),
+            };
+            let mut invocation =
+                crate::tool_invocation::prepare_tool_invocation(&request, 0, &registry, &config);
+            crate::computer_use::prepare::prepare_invocation(&mut invocation, &config, &service)
+                .unwrap();
+            let mut overlay = TurnPermissionOverlay::default();
+            let cancel = orca_core::cancel::CancelToken::new();
+            let mut events = EventFactory::new("computer-full-auto".into());
+            let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+            let mut actor = ToolExecutionActor::new(events.run_id().to_string());
+            let gate = actor.handle_approval(ToolApprovalGateContext {
+                config: &config,
+                cwd: cwd.path(),
+                events: &mut events,
+                sink: &mut sink,
+                tool_request: &request,
+                invocation: &invocation,
+                policy: &policy,
+                permission_overlay: &mut overlay,
+                approval_handler: Some(&handler),
+                cancel: &cancel,
+                emit_deltas: true,
+                provider_response_ingress: None,
+            });
+            assert!(gate.outcome.is_none(), "{args}");
+        }
+        // The observation ran without asking; only password entry reached the handler.
+        assert_eq!(
+            *handler.0.lock().unwrap(),
+            vec![Some("com.apple.TextEdit#secure".to_string())]
+        );
+    }
+
     fn computer_approval_continuation(change: &str) {
         use crate::runtime_surface as surface;
         use orca_computer_use::fake::{FakeDesktop, FakeLauncher};

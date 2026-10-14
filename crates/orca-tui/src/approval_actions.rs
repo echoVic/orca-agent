@@ -63,7 +63,10 @@ pub(crate) fn resolve_approval_option(
                 state
                     .approval_allowlist
                     .insert(AppState::approval_key_tool(tool));
-                save_allow_rule(state, tool, None, tool, dialog_target.as_deref());
+                // Every app, as a pattern: a patterned computer allow never
+                // preapproves password entry, which keeps its own approval.
+                let pattern = (tool == "computer").then_some("*");
+                save_allow_rule(state, tool, pattern, tool, dialog_target.as_deref());
             }
         }
         ApprovalOption::AlwaysServerSaved => {
@@ -83,7 +86,8 @@ pub(crate) fn resolve_approval_option(
 
 /// Persist a saved-allow rule for `rule_tool` (a bare tool name for
 /// `AlwaysToolSaved`, or `mcp__<server>__*` for `AlwaysServerSaved`), with a
-/// target pattern for `AlwaysTargetSaved`, to the
+/// target pattern for `AlwaysTargetSaved` (and `*` for computer's
+/// `AlwaysToolSaved`), to the
 /// user config, for the call of `tool` on `target` being approved. The
 /// session grant above already stands either way, so a write failure is
 /// reported to the transcript instead of undoing it. So is a rule of the
@@ -380,6 +384,68 @@ mod tests {
         assert_eq!(
             permission_decision_for(ApprovalOption::AlwaysTargetSaved),
             TuiPermissionDecision::AllowSession
+        );
+    }
+
+    #[test]
+    fn allowing_every_app_this_session_leaves_password_entry_to_ask() {
+        let home = crate::test_support::isolate_orca_home();
+        let mut state = state_awaiting_a_tool_approval();
+        let dialog = state.approval_dialog.as_mut().unwrap();
+        dialog.tool = "computer".into();
+        dialog.target = Some("com.apple.Safari".into());
+        dialog.options =
+            crate::types::ApprovalDialog::options_for("computer", Some("com.apple.Safari"));
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        resolve_approval_option(&mut state, &action_tx, ApprovalOption::AlwaysTool);
+
+        assert!(state.approval_is_allowlisted("computer", Some("com.apple.Safari")));
+        assert!(state.approval_is_allowlisted("computer", Some("com.apple.TextEdit")));
+        assert!(!state.approval_is_allowlisted("computer", Some("com.apple.TextEdit#secure")));
+        assert!(!state.approval_is_allowlisted("computer", None));
+        assert!(matches!(
+            action_rx.try_recv().unwrap(),
+            UserAction::RespondToInteraction {
+                response: TuiInteractionResponse::Approval(true),
+                ..
+            }
+        ));
+        assert!(!home.path().join("config.toml").exists());
+    }
+
+    #[test]
+    fn saving_every_app_writes_a_star_pattern_that_leaves_password_entry_to_ask() {
+        let home = crate::test_support::isolate_orca_home();
+        let mut state = state_awaiting_a_tool_approval();
+        let dialog = state.approval_dialog.as_mut().unwrap();
+        dialog.tool = "computer".into();
+        dialog.target = Some("com.apple.Safari".into());
+        dialog.options =
+            crate::types::ApprovalDialog::options_for("computer", Some("com.apple.Safari"));
+        let (action_tx, _action_rx) = mpsc::unbounded();
+
+        resolve_approval_option(&mut state, &action_tx, ApprovalOption::AlwaysToolSaved);
+
+        assert!(state.approval_is_allowlisted("computer", Some("com.apple.TextEdit")));
+        assert!(!state.approval_is_allowlisted("computer", Some("com.apple.Safari#secure")));
+        let rules = orca_core::config::user_edit::user_permission_rules_in(home.path()).unwrap();
+        assert_eq!(
+            rules.rules,
+            vec![orca_core::approval_rules::PermissionRule::new(
+                "computer",
+                "*",
+                Decision::Allow
+            )]
+        );
+        let compiled = CompiledPermissionRules::from_rules(rules);
+        assert_eq!(
+            compiled.matching_decision("computer", Some("com.apple.TextEdit")),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            compiled.matching_decision("computer", Some("com.apple.TextEdit#secure")),
+            None
         );
     }
 

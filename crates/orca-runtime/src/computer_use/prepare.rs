@@ -147,6 +147,7 @@ pub(crate) fn prepare_invocation(
         }
     }
     if let Some(warning) = warning {
+        service.note_risk_warning(&app.bundle_id, &warning);
         preview.push('\n');
         preview.push_str(&warning);
     }

@@ -231,6 +231,12 @@ fn execute_with_timeout(
             );
         }
     };
+    // An app's first result this session carries its risk warning, so calls
+    // approved without a panel (full-auto, rules, session grants) show it too.
+    let output = match service.take_risk_warning(app) {
+        Some(warning) => format!("{warning}\n{output}"),
+        None => output,
+    };
     ToolResult::completed(request, output, false).with_images(images)
 }
 
@@ -373,6 +379,46 @@ mod tests {
             &CancelToken::new(),
         );
         assert_eq!(result.status, ToolStatus::Completed);
+    }
+
+    #[test]
+    fn a_warned_apps_first_result_this_session_carries_its_warning() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_app("com.apple.finder", "Finder"));
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let service = thread_store.get::<ComputerUseService>().unwrap();
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let call = request(json!({"action":"observe", "app":"Finder"}), None);
+            let mut invocation = crate::tool_invocation::ToolInvocation {
+                requested: call.clone(),
+                effective: call,
+                action: Some(ActionKind::Computer),
+                approval_preview: None,
+            };
+            crate::computer_use::prepare::prepare_invocation(
+                &mut invocation,
+                &flash_config(),
+                &service,
+            )
+            .unwrap();
+            let result = execute(
+                &invocation.effective,
+                &flash_config(),
+                0,
+                RuntimeExtensionStores::new(&thread_store, &turn_store),
+                Path::new("/"),
+                &CancelToken::new(),
+            );
+            assert_eq!(result.status, ToolStatus::Completed);
+            outputs.push(result.output.unwrap());
+        }
+        assert!(
+            outputs[0].starts_with("warning: Finder can read and write any file\nFinder "),
+            "{}",
+            outputs[0]
+        );
+        assert!(!outputs[1].contains("warning:"), "{}", outputs[1]);
     }
 
     #[test]

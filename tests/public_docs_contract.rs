@@ -127,6 +127,32 @@ fn computer_use_docs_cover_secure_text_keys_and_the_whole_tool_rule_exception() 
 }
 
 #[test]
+fn computer_use_docs_cover_grants_for_every_app_and_full_auto() {
+    for locale in ["en", "zh"] {
+        let source = public_page(locale, "computer-use");
+        require_fragments(
+            &source,
+            &[
+                "`3` **Allow all apps this session**",
+                "`5` **Always allow all apps (saved)**",
+                "`pattern = \"*\"`",
+                "`full-auto`",
+            ],
+            locale,
+        );
+        let scope = match locale {
+            "en" => [
+                "app calls run there without app approval",
+                "Password entry still asks each time",
+                "the app's first result in each session",
+            ],
+            _ => ["应用调用不再请求应用授权", "仍然每次询问", "第一次操作该应用的 结果里"],
+        };
+        require_fragments(&source, &scope, locale);
+    }
+}
+
+#[test]
 fn computer_use_docs_explain_live_password_detection_without_sending_input() {
     for locale in ["en", "zh"] {
         let source = public_page(locale, "computer-use");
@@ -248,9 +274,9 @@ fn computer_use_and_approval_docs_explain_plan_and_full_auto_app_approval() {
             let scope = match locale {
                 "en" => [
                     "only `list_apps` and `observe`",
-                    "still asks for app approval",
+                    "without app approval",
                 ],
-                _ => ["只允许 `list_apps` 和 `observe`", "仍会请求应用授权"],
+                _ => ["只允许 `list_apps` 和 `observe`", "不再请求应用授权"],
             };
             require_fragments(&source, &scope, &format!("{locale}/{page}"));
         }
@@ -265,7 +291,9 @@ fn approval_docs_describe_computer_app_keys_and_call_only_approvals() {
             &source,
             &[
                 "`2` Allow this app this session",
+                "`3` Allow all apps this session",
                 "`7` Always allow this app (saved)",
+                "`5` Always allow all apps (saved)",
                 "**Allow typing this once**",
                 "`#secure`",
             ],

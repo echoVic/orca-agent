@@ -340,9 +340,10 @@ pub enum ApprovalOption {
     /// Approve, remember this tool + target for the session, and save an
     /// allow rule with the target as its pattern to the user config.
     AlwaysTargetSaved,
-    /// MCP tools only: approve, remember this tool for the rest of the
-    /// session, and save an allow rule to the user config so future
-    /// sessions skip the prompt too.
+    /// MCP and computer tools: approve, remember this tool for the rest of
+    /// the session, and save an allow rule to the user config so future
+    /// sessions skip the prompt too. The computer rule covers every app
+    /// with the pattern `*`, so password entry keeps its own approval.
     AlwaysToolSaved,
     /// MCP tools only: approve, remember every tool on this server for the
     /// rest of the session, and save a server-wide allow rule to the user
@@ -425,8 +426,9 @@ impl ApprovalDialog {
     /// always gets the same five options, in place of `AlwaysTarget`: an MCP
     /// call's target is its own tool name, so remembering it adds nothing to
     /// `AlwaysTool`, and the two saved options, persisted to the user config, take its place.
-    /// Computer approvals offer session and saved grants for the app;
-    /// missing app targets and secure-field input only offer a single approval or denial.
+    /// Computer approvals offer session and saved grants for the app or for
+    /// every app; missing app targets and secure-field input only offer a
+    /// single approval or denial.
     /// For every other tool, `AlwaysTarget` is only shown when a target is
     /// present AND the tool is likely to be called again with the same
     /// target (e.g. reading a fixed file path).
@@ -438,7 +440,9 @@ impl ApprovalDialog {
                 vec![
                     ApprovalOption::Once,
                     ApprovalOption::AlwaysTarget,
+                    ApprovalOption::AlwaysTool,
                     ApprovalOption::AlwaysTargetSaved,
+                    ApprovalOption::AlwaysToolSaved,
                     ApprovalOption::Deny,
                 ]
             };
@@ -1920,11 +1924,15 @@ impl AppState {
 
     /// True if a pending approval for this tool/target was already granted an
     /// "always allow" this session, whether by tool, by target, or (for an
-    /// MCP tool) by its whole server.
+    /// MCP tool) by its whole server. A grant for every app never covers
+    /// password entry or a computer call without an app.
     pub fn approval_is_allowlisted(&self, tool: &str, target: Option<&str>) -> bool {
-        if self
-            .approval_allowlist
-            .contains(&Self::approval_key_tool(tool))
+        let tool_grant_applies =
+            tool != "computer" || target.is_some_and(|target| !target.ends_with("#secure"));
+        if tool_grant_applies
+            && self
+                .approval_allowlist
+                .contains(&Self::approval_key_tool(tool))
         {
             return true;
         }

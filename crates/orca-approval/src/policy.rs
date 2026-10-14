@@ -99,6 +99,14 @@ impl ApprovalPolicy {
                 ApprovalMode::AutoEdit,
                 ActionKind::Network | ActionKind::Agent | ActionKind::Shell,
             ) => ApprovalDecision::Allow,
+            // Full-auto already runs commands on the host, so an app needs no
+            // approval there. Password entry and a call without an app target
+            // still ask.
+            (ApprovalMode::FullAuto, ActionKind::Computer)
+                if target.is_some_and(|target| !target.ends_with("#secure")) =>
+            {
+                ApprovalDecision::Allow
+            }
             (_, ActionKind::Computer) => ApprovalDecision::Ask,
             (ApprovalMode::FullAuto, _) => ApprovalDecision::Allow,
         };
@@ -143,19 +151,77 @@ mod tests {
     }
 
     #[test]
-    fn computer_actions_ask_in_every_mode() {
+    fn computer_app_calls_ask_except_in_full_auto() {
+        let request = make_request(ActionKind::Computer);
         for mode in [
             ApprovalMode::Plan,
             ApprovalMode::Suggest,
             ApprovalMode::AutoEdit,
-            ApprovalMode::FullAuto,
         ] {
             let resolution = ApprovalPolicy::new(mode).resolve_for_tool(
-                &make_request(ActionKind::Computer),
+                &request,
                 "computer",
                 Some("com.apple.Safari"),
             );
             assert_eq!(resolution.decision, ApprovalDecision::Ask, "{mode:?}");
+        }
+        let full_auto = ApprovalPolicy::new(ApprovalMode::FullAuto);
+        assert_eq!(
+            full_auto
+                .resolve_for_tool(&request, "computer", Some("com.apple.Safari"))
+                .decision,
+            ApprovalDecision::Allow
+        );
+        // Password entry and a call without an app target still ask.
+        for target in [Some("com.apple.Safari#secure"), None] {
+            assert_eq!(
+                full_auto
+                    .resolve_for_tool(&request, "computer", target)
+                    .decision,
+                ApprovalDecision::Ask,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_rules_still_decide_computer_calls_in_full_auto() {
+        let policy = ApprovalPolicy::new(ApprovalMode::FullAuto).with_rules(vec![
+            PermissionRule::new("computer", "com.apple.Safari", Decision::Prompt),
+            PermissionRule::new("computer", "com.apple.Terminal", Decision::Deny),
+        ]);
+        let request = make_request(ActionKind::Computer);
+        for (target, decision) in [
+            ("com.apple.Safari", ApprovalDecision::Ask),
+            ("com.apple.Terminal", ApprovalDecision::Deny),
+            ("com.apple.TextEdit", ApprovalDecision::Allow),
+        ] {
+            assert_eq!(
+                policy
+                    .resolve_for_tool(&request, "computer", Some(target))
+                    .decision,
+                decision,
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_allow_rule_for_every_app_still_asks_for_password_entry() {
+        let policy = ApprovalPolicy::new(ApprovalMode::Suggest)
+            .with_rules(vec![PermissionRule::new("computer", "*", Decision::Allow)]);
+        let request = make_request(ActionKind::Computer);
+        for (target, decision) in [
+            ("com.apple.Safari", ApprovalDecision::Allow),
+            ("com.apple.Safari#secure", ApprovalDecision::Ask),
+        ] {
+            assert_eq!(
+                policy
+                    .resolve_for_tool(&request, "computer", Some(target))
+                    .decision,
+                decision,
+                "{target}"
+            );
         }
     }
 

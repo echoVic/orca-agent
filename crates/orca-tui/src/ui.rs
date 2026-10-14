@@ -6542,6 +6542,9 @@ fn approval_option_label(option: ApprovalOption, tool: &str, target: Option<&str
             "Allow typing this once".to_string()
         }
         ApprovalOption::Once => "Allow once".to_string(),
+        ApprovalOption::AlwaysTool if tool == "computer" => {
+            "Allow all apps this session".to_string()
+        }
         ApprovalOption::AlwaysTool => format!("Allow {tool} this session"),
         ApprovalOption::AlwaysTarget if tool == "computer" => {
             "Allow this app this session".to_string()
@@ -6551,6 +6554,9 @@ fn approval_option_label(option: ApprovalOption, tool: &str, target: Option<&str
             "Always allow this app (saved)".to_string()
         }
         ApprovalOption::AlwaysTargetSaved => "Always allow this target (saved)".to_string(),
+        ApprovalOption::AlwaysToolSaved if tool == "computer" => {
+            "Always allow all apps (saved)".to_string()
+        }
         ApprovalOption::AlwaysToolSaved => format!("Always allow {tool} (saved)"),
         ApprovalOption::AlwaysServerSaved => match orca_core::mcp_types::mcp_tool_server(tool) {
             Some(server) => format!("Always allow the {server} server (saved)"),
@@ -6563,6 +6569,9 @@ fn approval_option_label(option: ApprovalOption, tool: &str, target: Option<&str
 fn approval_option_detail(option: ApprovalOption, tool: &str) -> &'static str {
     match option {
         ApprovalOption::Once => "run it now",
+        ApprovalOption::AlwaysTool if tool == "computer" => {
+            "skip approval for every app until you quit"
+        }
         ApprovalOption::AlwaysTool => "skip approval for this tool until you quit",
         ApprovalOption::AlwaysTarget if tool == "computer" => {
             "skip approval for this app until you quit"
@@ -6572,6 +6581,7 @@ fn approval_option_detail(option: ApprovalOption, tool: &str) -> &'static str {
             "save an allow rule for this app"
         }
         ApprovalOption::AlwaysTargetSaved => "save an allow rule for this target",
+        ApprovalOption::AlwaysToolSaved if tool == "computer" => "save an allow rule for every app",
         ApprovalOption::AlwaysToolSaved => "save an allow rule so future sessions skip it too",
         ApprovalOption::AlwaysServerSaved => {
             "save an allow rule covering every tool on this server"
@@ -9110,9 +9120,13 @@ mod tests {
             "warning: Safari web pages may carry instructions aimed at the agent",
             "Allow this app this session",
             "skip approval for this app until you quit",
+            "Allow all apps this session",
+            "skip approval for every app until you quit",
             "Always allow this app (saved)",
             "save an allow rule for this app",
-            "1/2/7/4 pick",
+            "Always allow all apps (saved)",
+            "save an allow rule for every app",
+            "1/2/3/7/5/4 pick",
         ] {
             assert!(frame.contains(text), "missing {text:?}: {frame}");
         }

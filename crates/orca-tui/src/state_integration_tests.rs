@@ -949,13 +949,15 @@ fn a_computer_approval_without_an_app_cannot_grant_session_access() {
 }
 
 #[test]
-fn a_computer_approval_offers_this_app_once_for_the_session_or_saved() {
+fn a_computer_approval_offers_this_app_or_every_app_for_the_session_or_saved() {
     assert_eq!(
         ApprovalDialog::options_for("computer", Some("com.apple.Safari")),
         vec![
             ApprovalOption::Once,
             ApprovalOption::AlwaysTarget,
+            ApprovalOption::AlwaysTool,
             ApprovalOption::AlwaysTargetSaved,
+            ApprovalOption::AlwaysToolSaved,
             ApprovalOption::Deny,
         ]
     );
@@ -985,8 +987,12 @@ fn a_computer_approval_offers_this_app_once_for_the_session_or_saved() {
         ApprovalOption::AlwaysTargetSaved.label(),
         "always allow this target (saved)"
     );
-    assert_eq!(dialog.option_for_key('3'), None);
-    assert_eq!(dialog.option_for_key('5'), None);
+    assert_eq!(dialog.option_for_key('3'), Some(ApprovalOption::AlwaysTool));
+    assert_eq!(
+        dialog.option_for_key('5'),
+        Some(ApprovalOption::AlwaysToolSaved)
+    );
+    assert_eq!(dialog.option_for_key('6'), None);
 }
 
 #[test]
