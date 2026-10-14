@@ -743,6 +743,10 @@ pub(crate) struct ToolInvocationIntent {
     request: SurfaceToolRequest,
     authority: AuthorityFingerprint,
     checkpoint: ToolInvocationCheckpoint,
+    /// The provider request has no resolved app or secure-field state. Keep
+    /// the prepared approval in the private restart checkpoint instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    computer_approval: Option<orca_core::approval_types::ApprovalRequest>,
 }
 
 impl ToolInvocationIntent {
@@ -754,7 +758,22 @@ impl ToolInvocationIntent {
             request,
             authority,
             checkpoint: ToolInvocationCheckpoint::BeforeInvocation,
+            computer_approval: None,
         }
+    }
+
+    pub(crate) fn with_computer_approval(
+        mut self,
+        approval: orca_core::approval_types::ApprovalRequest,
+    ) -> Self {
+        if self.request.name.as_str() == "computer" {
+            self.computer_approval = Some(approval);
+        }
+        self
+    }
+
+    pub(crate) fn computer_approval(&self) -> Option<&orca_core::approval_types::ApprovalRequest> {
+        self.computer_approval.as_ref()
     }
 
     pub fn invocation_id(&self) -> &SurfaceToolCallId {

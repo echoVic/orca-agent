@@ -94,6 +94,7 @@ pub(crate) struct ToolExecutionContext<'a> {
     workflow_ipc: Option<&'a WorkflowIpcContext>,
     permission_overlay: Option<&'a mut TurnPermissionOverlay>,
     approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
+    resolved_computer_approval: Option<&'a orca_core::approval_types::ApprovalRequest>,
     permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     permission_handler_owned: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
@@ -329,6 +330,7 @@ impl<'a> ToolExecutionContext<'a> {
             workflow_ipc: None,
             permission_overlay: None,
             approval_handler: None,
+            resolved_computer_approval: None,
             permission_handler: None,
             permission_handler_owned: None,
             user_input_handler: None,
@@ -614,12 +616,14 @@ where
         Ok(())
     };
     let mut actor = ToolExecutionActor::new(events.run_id().to_string());
+    let mut context = dependencies.into_context();
+    context.resolved_computer_approval = intent.computer_approval();
     let mut completion = actor.execute_with_event_error(
         config,
         events,
         sink,
         &tool_request,
-        dependencies.into_context(),
+        context,
         subagent_child_executor,
         workflow_child_executor,
         true,
@@ -629,7 +633,11 @@ where
     let authority = historical_authority.as_ref().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "recovered tool dispatch completed without durable start authority",
+            completion
+                .result
+                .error
+                .as_deref()
+                .unwrap_or("recovered tool dispatch completed without durable start authority"),
         )
     })?;
     completion.result.record_invocation_started();
@@ -1016,6 +1024,7 @@ impl ToolExecutionActor {
             workflow_ipc,
             permission_overlay,
             approval_handler,
+            resolved_computer_approval,
             permission_handler,
             permission_handler_owned,
             user_input_handler,
@@ -1062,6 +1071,17 @@ impl ToolExecutionActor {
                         config,
                         &service,
                     )
+                })
+                .and_then(|()| {
+                    if approval_already_resolved
+                        && !resolved_computer_approval.is_some_and(|approved| {
+                            Some(approved.action) == invocation.action
+                                && approved.target == invocation.effective.target
+                        })
+                    {
+                        return Err("The computer app or field changed since approval; try again to request a new approval.".into());
+                    }
+                    Ok(())
                 })
                 .err()
                 .map(|error| tool_types::ToolResult::failed_before_start(tool_request, error, None))
@@ -2162,6 +2182,295 @@ mod tests {
         config.approval_mode = ApprovalMode::Suggest;
         config.computer_use.interactive = true;
         config
+    }
+
+    fn computer_approval_continuation(change: &str) {
+        use crate::runtime_surface as surface;
+        use orca_computer_use::fake::{FakeDesktop, FakeLauncher};
+        use orca_computer_use::protocol::{
+            ActParams, Action, ObserveParams, Reply, Request, Target,
+        };
+
+        #[derive(Default)]
+        struct Allow(Mutex<Option<ApprovalRequest>>);
+        impl crate::runtime_approval::RuntimeApprovalHandler for Allow {
+            fn resolve_interactive(
+                &self,
+                approval: &ApprovalRequest,
+                _: &ToolRequest,
+            ) -> io::Result<orca_core::approval_types::ApprovalResolution> {
+                *self.0.lock().unwrap() = Some(approval.clone());
+                Ok(orca_core::approval_types::ApprovalResolution {
+                    id: approval.id.clone(),
+                    decision: ApprovalDecision::Allow,
+                    reason: "approved in test".into(),
+                })
+            }
+        }
+        #[derive(Default)]
+        struct Committer {
+            starts: usize,
+            results: usize,
+        }
+        impl super::RecoveredToolInvocationCommitter for Committer {
+            type HistoricalCommitAuthority = ();
+            fn commit_tool_invocation_started(
+                &mut self,
+                _: &surface::SurfaceOperationFence,
+                _: &surface::ToolInvocationIntent,
+            ) -> io::Result<()> {
+                self.starts += 1;
+                Ok(())
+            }
+            fn commit_historical_tool_result(&mut self, _: &(), _: &ToolResult) -> io::Result<()> {
+                self.results += 1;
+                Ok(())
+            }
+        }
+
+        let cwd = tempfile::tempdir().unwrap();
+        let config = computer_config();
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let service =
+            crate::computer_use::ComputerUseService::new_for_test(Arc::new(launcher.clone()));
+        let observe = || {
+            let Reply::Observed { observation } = service
+                .call(
+                    Request::Observe(ObserveParams {
+                        app: "com.apple.TextEdit".into(),
+                        window: None,
+                        query: None,
+                        max_elements: 300,
+                        include_screenshot: false,
+                    }),
+                    std::time::Duration::from_secs(5),
+                )
+                .unwrap()
+            else {
+                panic!("observation")
+            };
+            service.record_observation(&observation);
+        };
+        observe();
+        let request = ToolRequest {
+            id: "computer-continuation".into(),
+            name: ToolName::Computer,
+            action: ActionKind::Computer,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({"action":"type", "app":"TextEdit", "text":"approved"})
+                    .to_string(),
+            ),
+        };
+        let registry = McpRegistry::default();
+        let mut invocation =
+            crate::tool_invocation::prepare_tool_invocation(&request, 0, &registry, &config);
+        crate::computer_use::prepare::prepare_invocation(&mut invocation, &config, &service)
+            .unwrap();
+        let handler = Allow::default();
+        let policy = policy_for_tool_execution(&config);
+        let mut overlay = TurnPermissionOverlay::default();
+        let cancel = orca_core::cancel::CancelToken::new();
+        let mut events = EventFactory::new("computer-continuation".into());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string());
+        let approved = actor.handle_approval(ToolApprovalGateContext {
+            config: &config,
+            cwd: cwd.path(),
+            events: &mut events,
+            sink: &mut sink,
+            tool_request: &request,
+            invocation: &invocation,
+            policy: &policy,
+            permission_overlay: &mut overlay,
+            approval_handler: Some(&handler),
+            cancel: &cancel,
+            emit_deltas: true,
+            provider_response_ingress: None,
+        });
+        assert!(approved.outcome.is_none());
+        assert!(approved.event_error.is_none());
+        let approval = handler.0.lock().unwrap().clone().unwrap();
+        assert_eq!(approval.target.as_deref(), Some("com.apple.TextEdit"));
+
+        let uuid = || *uuid::Uuid::now_v7().as_bytes();
+        let fence = surface::SurfaceOperationFence {
+            thread_id: surface::SurfaceThreadId::try_from_bytes(uuid()).unwrap(),
+            thread_owner_epoch: surface::ThreadOwnerEpoch::new(1),
+            operation_id: surface::SurfaceOperationId::try_from_bytes(uuid()).unwrap(),
+            generation_id: surface::SurfaceGenerationId::new(0),
+        };
+        let digest = surface::Sha256Digest::new([1; 32]);
+        let authority = surface::AuthorityFingerprint::new(
+            fence.operation_id.clone(),
+            digest,
+            digest,
+            surface::CanonicalPath::try_new(cwd.path().to_path_buf()).unwrap(),
+            digest,
+            surface::PolicyEpoch::try_new(1).unwrap(),
+            digest,
+            digest,
+            digest,
+        );
+        let raw = request.raw_arguments.clone().unwrap();
+        let tool = surface::SurfaceToolRequest {
+            tool_call_id: surface::SurfaceToolCallId::try_new(request.id.clone()).unwrap(),
+            source_response_id: None,
+            turn_id: surface::SurfaceTurnId::new(),
+            name: surface::NonEmptyText::try_new("computer").unwrap(),
+            action: surface::SurfaceToolAction::Shell,
+            target: None,
+            raw_arguments: surface::DisplayText::new(raw.clone()),
+            arguments_digest: surface::Sha256Digest::digest(&raw),
+        };
+        // Exercise a persisted approval record through the real recovered dispatcher.
+        let encoded = serde_json::to_value(
+            surface::ToolInvocationIntent::before_invocation(tool, authority)
+                .with_computer_approval(approval.clone()),
+        )
+        .unwrap();
+        let intent: surface::ToolInvocationIntent = serde_json::from_value(encoded).unwrap();
+        assert_eq!(intent.computer_approval(), Some(&approval));
+        let receipt = surface::SurfaceInteractionResolutionReceipt {
+            response_id: surface::SurfaceResponseId::try_from_bytes(uuid()).unwrap(),
+            receipt_id: surface::SurfaceResponseReceiptId::try_from_bytes(uuid()).unwrap(),
+            kind: surface::SurfaceInteractionKind::ToolApproval,
+            safe_projection: surface::SurfaceInteractionSafeProjection::ToolApproval {
+                allowed: true,
+            },
+        };
+        if change == "bundle" {
+            launcher.desktop(|desktop| {
+                *desktop = FakeDesktop::with_app("com.example.changed", "TextEdit")
+            });
+        } else if change == "secure" {
+            service
+                .call(
+                    Request::Act(ActParams {
+                        app: "com.apple.TextEdit".into(),
+                        window: None,
+                        action: Action::Click {
+                            target: Target::Element { element: 14 },
+                            button: orca_computer_use::protocol::Button::Left,
+                            count: 1,
+                            modifiers: Default::default(),
+                        },
+                        foreground_fallback: false,
+                        observe_after: false,
+                        include_screenshot: false,
+                        secure_approved: false,
+                    }),
+                    std::time::Duration::from_secs(5),
+                )
+                .unwrap();
+            observe();
+        }
+        let bundle = if change == "bundle" {
+            "com.example.changed"
+        } else {
+            "com.apple.TextEdit"
+        };
+        let actions_before = launcher.desktop(|desktop| desktop.actions_on(bundle));
+        let thread_store = ExtensionData::new("computer-continuation-thread");
+        thread_store.insert(service);
+        let turn_store = ExtensionData::new("computer-continuation-turn");
+        let extensions = ExtensionRegistryBuilder::new().build();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let hooks = HookRunner::default();
+        let mut cost = CostTracker::new(None);
+        let tasks = TaskRegistry::new("computer-continuation".into());
+        let mut workflows = Vec::new();
+        let mut committer = Committer::default();
+        let result = super::execute_recovered_tool_intent(
+            &config,
+            &mut events,
+            &mut sink,
+            &intent,
+            super::RecoveredToolInvocationAuthorization {
+                fence: &fence,
+                expected_execution_context_fingerprint: &digest,
+                observed_execution_context_fingerprint: &digest,
+                approval_receipt: &receipt,
+                existing_started_receipt: None,
+            },
+            super::RecoveredToolExecutionDependencies {
+                cwd: cwd.path(),
+                subagent_depth: 0,
+                goal_mode: false,
+                policy: &policy,
+                instructions: &instructions,
+                memory: &memory,
+                mcp_registry: &registry,
+                hooks: &hooks,
+                cost_tracker: &mut cost,
+                cancel: &cancel,
+                task_registry: &tasks,
+                background_workflows: &mut workflows,
+                workflow_ipc: None,
+                permission_overlay: &mut overlay,
+                permission_handler: None,
+                user_input_handler: None,
+                mcp_elicitation_handler: None,
+                workflow_lifecycle_ingress: None,
+                wait_for_background_workflows: false,
+                extension_registry: Some(&extensions),
+                extension_stores: Some(RuntimeExtensionStores::new(&thread_store, &turn_store)),
+                goal_runtime_binding: None,
+                root_task_id: None,
+                child_budget: None,
+            },
+            unused_child_executor,
+            unused_child_executor,
+            &mut committer,
+        );
+        if change == "unchanged" {
+            let completion = result.unwrap();
+            assert_eq!(
+                completion.result.status,
+                ToolStatus::Completed,
+                "{:?}",
+                completion.result.error
+            );
+            assert_eq!((committer.starts, committer.results), (1, 1));
+            assert_eq!(
+                launcher.desktop(|desktop| desktop.actions_on(bundle)),
+                actions_before + 1
+            );
+        } else {
+            assert_eq!(
+                committer.starts, 0,
+                "changed approval must fail before durable start"
+            );
+            assert_eq!(committer.results, 0);
+            assert_eq!(
+                launcher.desktop(|desktop| desktop.actions_on(bundle)),
+                actions_before,
+                "no driver action may run under stale approval"
+            );
+            let message = result
+                .err()
+                .expect("changed approval must fail")
+                .to_string();
+            assert!(
+                message.contains("app or field changed since approval"),
+                "{message}"
+            );
+            assert!(message.contains("try again"), "{message}");
+        }
+    }
+
+    #[test]
+    fn computer_approval_continuation_rejects_changed_bundle() {
+        computer_approval_continuation("bundle");
+    }
+    #[test]
+    fn computer_approval_continuation_rejects_new_secure_field() {
+        computer_approval_continuation("secure");
+    }
+    #[test]
+    fn computer_approval_continuation_runs_unchanged_request() {
+        computer_approval_continuation("unchanged");
     }
 
     fn execute_computer_for_approval(
