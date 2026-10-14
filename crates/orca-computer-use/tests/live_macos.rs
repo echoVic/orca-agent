@@ -5461,6 +5461,7 @@ fn native_slow_ancestry_and_foreground_delivery_share_one_action_deadline() {
         let obs = live.observe("dev.orca.cu-fixture", None);
         let node = fixture_ax_named(&fixture_window(pid), "Name").unwrap();
         set_fixture_ax_bool(&node, "AXFocused", true);
+        let before = live.fixture_control_value("Name");
         let start = Instant::now();
 
         let result = live.client.call(
@@ -5487,7 +5488,15 @@ fn native_slow_ancestry_and_foreground_delivery_share_one_action_deadline() {
             panic!("native deadline error must reach the caller")
         };
         assert_eq!(error.kind, ErrorKind::Failed);
-        assert!(error.message.contains("timed out"), "{error:?}");
+        // The slow walk leaves too little of the shared deadline for 4000
+        // characters, so delivery is refused before anything is typed.
+        assert!(
+            error
+                .message
+                .contains("cannot fit in the remaining foreground action time"),
+            "{error:?}"
+        );
+        assert_eq!(live.fixture_control_value("Name"), before);
         assert!(start.elapsed() < Duration::from_secs(35));
         let entries: Vec<serde_json::Value> = std::fs::read_to_string(&log)
             .unwrap()
