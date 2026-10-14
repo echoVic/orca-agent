@@ -277,6 +277,7 @@ pub(super) fn run(
                     direction, amount, ..
                 } => hid.scroll(location.unwrap(), *direction, *amount)?,
                 Action::Type { text, .. } => {
+                    super::events::check_foreground_text_budget(text, action_deadline)?;
                     if let Some(point) = location {
                         // AX may already have focused a sheet field whose system hit
                         // test is owned by its view service. Deliver to that exact

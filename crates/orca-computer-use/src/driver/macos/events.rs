@@ -7,6 +7,8 @@ use crate::{
     protocol::{DriverError, ErrorKind},
 };
 
+const HID_EVENT_DELIVERY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
 fn unicode_chunk_end(units: &[u16], start: usize, limit: usize) -> usize {
     // AppKit interprets a leading newline/tab as a command and ignores
     // the rest of that event's Unicode string. Isolate control characters.
@@ -61,6 +63,36 @@ fn deliver_text(
         start = end;
     }
     Ok(())
+}
+
+pub(super) fn check_foreground_text_budget(
+    text: &str,
+    deadline: std::time::Instant,
+) -> Result<(), DriverError> {
+    // HID delivery posts a down/up pair for each scalar, with the same
+    // CRLF normalization and surrogate-pair preservation as deliver_text.
+    let characters = u32::try_from(text.replace("\r\n", "\n").chars().count()).unwrap_or(u32::MAX);
+    let estimated = HID_EVENT_DELIVERY_DELAY
+        .saturating_mul(2)
+        .saturating_mul(characters);
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if estimated > remaining {
+        return Err(error(
+            ErrorKind::Failed,
+            "The text cannot fit in the remaining foreground action time; split the text into smaller `type` calls.",
+        ));
+    }
+    Ok(())
+}
+
+fn deliver_foreground_text(
+    text: &str,
+    deadline: std::time::Instant,
+    post: impl FnMut(&[u16]) -> Result<(), DriverError>,
+    verify_recipient: impl FnMut() -> Result<(), DriverError>,
+) -> Result<(), DriverError> {
+    check_foreground_text_budget(text, deadline)?;
+    deliver_text(text, 1, post, verify_recipient)
 }
 
 pub(super) fn post_unicode_text(
@@ -238,7 +270,7 @@ impl<'a> HidEvents<'a> {
         check_delivery_ready(self.pid, self.aborted, self.deadline)?;
         post_hid(event);
         // Give AppKit a chance to consume the event before restoring focus.
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(HID_EVENT_DELIVERY_DELAY);
         Ok(())
     }
 
@@ -388,9 +420,9 @@ impl<'a> HidEvents<'a> {
         text: &str,
         verify_recipient: impl FnMut() -> Result<(), DriverError>,
     ) -> Result<(), DriverError> {
-        deliver_text(
+        deliver_foreground_text(
             text,
-            1,
+            self.deadline,
             |units| {
                 let down = self.keyboard(0, true, Modifiers::default())?;
                 let up = self.keyboard(0, false, Modifiers::default())?;
@@ -419,7 +451,7 @@ impl<'a> HidEvents<'a> {
             // Downs entered the system HID stream; only HID ups can clear
             // system-wide state, even if focus changed before cleanup.
             post_hid(&event);
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(HID_EVENT_DELIVERY_DELAY);
         }
     }
 }
@@ -548,6 +580,82 @@ fn an_expired_foreground_deadline_refuses_input_before_native_delivery() {
 #[cfg(test)]
 mod unicode_chunk_tests {
     use super::*;
+
+    #[test]
+    fn oversized_foreground_text_posts_nothing() {
+        let mut posts = 0;
+        let result = deliver_foreground_text(
+            &"🦀".repeat(1600),
+            std::time::Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT,
+            |_| {
+                posts += 1;
+                Ok(())
+            },
+            || Ok(()),
+        );
+        assert_eq!(
+            posts, 0,
+            "over-budget foreground typing must not post a prefix"
+        );
+        let failure = result.unwrap_err();
+        assert_eq!(failure.kind, ErrorKind::Failed);
+        assert!(failure.message.contains("split the text"));
+        assert!(failure.message.contains("type"));
+    }
+
+    #[test]
+    fn foreground_text_uses_the_remaining_budget() {
+        let mut posts = 0;
+        let result = deliver_foreground_text(
+            "ab",
+            std::time::Instant::now() + std::time::Duration::from_millis(30),
+            |_| {
+                posts += 1;
+                Ok(())
+            },
+            || Ok(()),
+        );
+        assert_eq!(
+            posts, 0,
+            "40 ms of typing cannot fit in the remaining 30 ms"
+        );
+        assert_eq!(result.unwrap_err().kind, ErrorKind::Failed);
+    }
+
+    #[test]
+    fn foreground_text_budget_counts_scalars_and_normalized_crlf() {
+        for text in ["🦀", "\r\n"] {
+            let mut posted = vec![];
+            deliver_foreground_text(
+                text,
+                std::time::Instant::now() + std::time::Duration::from_millis(30),
+                |units| {
+                    posted.push(String::from_utf16(units).unwrap());
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .unwrap();
+            assert_eq!(posted, [if text == "🦀" { "🦀" } else { "\n" }]);
+        }
+    }
+
+    #[test]
+    fn foreground_text_that_fits_is_delivered_completely() {
+        let mut posted = String::new();
+        deliver_foreground_text(
+            "Hello\t🦀!",
+            std::time::Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT,
+            |units| {
+                posted.push_str(&String::from_utf16(units).unwrap());
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(posted, "Hello\t🦀!");
+    }
+
     fn chunks(text: &str) -> Vec<String> {
         let mut result = vec![];
         deliver_text(
