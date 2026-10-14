@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.10";
+export const releaseVersion = "v0.5.11";
 
 export const releases = [
+  {
+    version: "v0.5.11",
+    date: "2026-10-14",
+    title: "Computer use on macOS",
+    body: "On macOS 14 or later, the TUI's main session can see and operate other apps: list and launch them, observe a window's screenshot and accessibility elements, click, type, send keys and scroll. Every app asks for your approval, typing into a password field asks each time, and Esc stops the turn from anywhere. Actions run in the background where they can and otherwise switch to the app briefly and back; launch_app finds apps by their English or display name and opens them without taking focus. Live conversations keep only the newest three tool images, and resuming a session no longer reloads tool image data. The Terminal-Bench adapter keeps the task instruction out of command lines.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.11",
+  },
   {
     version: "v0.5.10",
     date: "2026-10-11",
