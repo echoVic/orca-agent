@@ -301,6 +301,7 @@ pub(crate) mod test_support {
             additional_working_directories: Vec::new(),
             budget: Default::default(),
             subagents: Default::default(),
+            computer_use: orca_core::config::ComputerUseConfig::default(),
             tools: ToolConfig {
                 shell_enforcement_decision: Some(
                     orca_core::capability::SandboxEnforcementDecision::new(

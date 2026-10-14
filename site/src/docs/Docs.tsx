@@ -117,6 +117,7 @@ const navEn: NavGroup[] = [
     items: [
       { id: "skills-plugins", title: "Skills & Plugins", file: "skills-plugins" },
       { id: "mcp-integration", title: "MCP Integration", file: "mcp-integration" },
+      { id: "computer-use", title: "Computer Use (macOS)", file: "computer-use" },
     ],
   },
 ];
@@ -166,6 +167,7 @@ const navZh: NavGroup[] = [
     items: [
       { id: "skills-plugins", title: "Skills 与插件", file: "skills-plugins" },
       { id: "mcp-integration", title: "MCP 集成", file: "mcp-integration" },
+      { id: "computer-use", title: "Computer Use（macOS）", file: "computer-use" },
     ],
   },
 ];

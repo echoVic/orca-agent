@@ -234,6 +234,10 @@ pub struct AcpMetricsSnapshot {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TuiEvent {
+    ToolImagesLoaded {
+        call_id: String,
+        result: Result<Vec<orca_core::conversation::ImageInput>, String>,
+    },
     #[doc(hidden)]
     Attached(Box<AttachedTuiEvent>),
     #[doc(hidden)]
@@ -630,6 +634,9 @@ impl SubmitToken {
 
 #[derive(Debug, Clone)]
 pub enum UserAction {
+    OpenToolImages {
+        call_id: String,
+    },
     StartSideConversation {
         prompt: Option<String>,
     },

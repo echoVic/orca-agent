@@ -73,6 +73,11 @@ fn read_external_tool(path: &Path, content: &str) -> Result<ExternalToolConfig, 
     let tool = toml::Value::Table(table)
         .try_into::<ExternalToolConfig>()
         .map_err(|error| failed(data_error_text(&error)))?;
+    if tool.action_kind == orca_core::approval_types::ActionKind::Computer {
+        return Err(failed(
+            "`action_kind = \"computer\"` is reserved for the built-in computer tool".to_string(),
+        ));
+    }
     if !is_valid_tool_name(&tool.name) {
         return Err(format!(
             "ignoring external tool with invalid name '{}'",
@@ -182,7 +187,8 @@ pub fn execute_external_tool_with_policy_or_cancel_with_profile(
             orca_core::capability::CapabilitySet::read_only()
         }
         orca_core::approval_types::ActionKind::Write
-        | orca_core::approval_types::ActionKind::Shell => {
+        | orca_core::approval_types::ActionKind::Shell
+        | orca_core::approval_types::ActionKind::Computer => {
             orca_core::capability::CapabilitySet::workspace_write()
         }
         orca_core::approval_types::ActionKind::Network => orca_core::capability::CapabilitySet {
@@ -380,6 +386,38 @@ schema = { env = { type = "string", description = "environment" } }
         );
     }
 
+    #[test]
+    fn external_tools_cannot_declare_the_builtin_computer_action_kind() {
+        let content = concat!(
+            "name = \"desktop_script\"\n",
+            "description = \"Run an external command\"\n",
+            "action_kind = \"computer\"\n",
+            "command = \"echo abc-SECRET\"\n",
+        );
+        let warning = read_external_tool(Path::new("desktop_script.toml"), content)
+            .expect_err("the computer action kind belongs to the built-in tool");
+        assert!(warning.contains("action_kind"), "{warning}");
+        assert!(warning.contains("computer"), "{warning}");
+        assert!(!warning.contains("abc-SECRET"), "{warning}");
+    }
+
+    #[test]
+    fn external_tool_directory_omits_computer_declarations_and_loads_shell_tools() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let config = |action| {
+            format!(
+                "name = \"script\"\ndescription = \"External script\"\naction_kind = \"{action}\"\ncommand = \"echo\"\n"
+            )
+        };
+        fs::write(directory.path().join("desktop.toml"), config("computer")).unwrap();
+        fs::write(directory.path().join("shell.toml"), config("shell")).unwrap();
+
+        let loaded = load_external_tools_dir(directory.path());
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].action_kind, ActionKind::Shell);
+    }
+
     /// What is wrong with an external tool file is said by line and column,
     /// or by key, and never by what the file holds: the warning lands in
     /// logs and bug reports, and a tool's command can hold a token.
@@ -401,7 +439,7 @@ schema = { env = { type = "string", description = "environment" } }
             ),
             (
                 format!("{head}action_kind = \"abc-SECRET\"\ncommand = \"echo\"\n"),
-                "unknown variant in `action_kind`, expected one of `read`, `write`, `network`, `agent`, `shell`",
+                "unknown variant in `action_kind`, expected one of `read`, `write`, `network`, `agent`, `shell`, `computer`",
                 "abc-SECRET",
             ),
             (

@@ -25,7 +25,7 @@ use sha2::Digest;
 
 use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 
-use super::assets;
+use super::assets::{self, HydrateImages};
 use super::reader::{INDEX_BUDGET, SessionRecords, iter_records};
 #[cfg(not(test))]
 use super::session_index;
@@ -89,24 +89,24 @@ pub(crate) fn read_manual_compaction_snapshot(
     operation_id: &crate::runtime_surface::SurfaceOperationId,
 ) -> io::Result<Option<ManualCompactionDurableSnapshot>> {
     let mut record = None;
-    for candidate in iter_records(path)? {
+    for candidate in iter_records(path, HydrateImages::NotToolMessages)? {
         if let SessionRecord::ManualCompactionSnapshot(snapshot) = candidate?
             && snapshot.operation_id == *operation_id
         {
             record = Some(snapshot);
         }
     }
-    Ok(record.map(|record| ManualCompactionDurableSnapshot {
-        operation_id: record.operation_id,
-        strategy: record.strategy,
-        before_messages: record.before_messages,
-        conversation: orca_core::conversation::Conversation {
-            messages: record.messages.into_iter().map(Message::from).collect(),
-            internal_context: Default::default(),
-            rolling_summary: record.rolling_summary,
-            summary: record.summary_state,
-            usage_anchor: None,
-        },
+    Ok(record.map(|record| {
+        let mut conversation = orca_core::conversation::Conversation::new();
+        conversation.messages = record.messages.into_iter().map(Message::from).collect();
+        conversation.rolling_summary = record.rolling_summary;
+        conversation.summary = record.summary_state;
+        ManualCompactionDurableSnapshot {
+            operation_id: record.operation_id,
+            strategy: record.strategy,
+            before_messages: record.before_messages,
+            conversation,
+        }
     }))
 }
 
@@ -114,7 +114,7 @@ pub(crate) fn read_prompt_queue_snapshot(
     path: &Path,
 ) -> io::Result<crate::prompt_queue::PromptQueueSnapshot> {
     let mut latest = None;
-    for record in iter_records(path)? {
+    for record in iter_records(path, HydrateImages::NotToolMessages)? {
         if let SessionRecord::PromptQueueSnapshot(snapshot) = record? {
             latest = Some(snapshot);
         }
@@ -298,7 +298,7 @@ fn bounded_json_line(value: &impl serde::Serialize) -> io::Result<Vec<u8>> {
 
 #[cfg(test)]
 pub(crate) fn read_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
-    iter_records(path)?.collect()
+    iter_records(path, HydrateImages::NotToolMessages)?.collect()
 }
 
 pub(crate) fn conversation_record_from_semantic_event(
@@ -379,7 +379,7 @@ fn scan_session_with_lines(path: &Path) -> io::Result<SessionScan> {
 }
 
 fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionScan> {
-    let mut reader = match SessionRecords::open(path, Some(INDEX_BUDGET)) {
+    let mut reader = match SessionRecords::open(path, Some(INDEX_BUDGET), HydrateImages::None) {
         Ok(reader) => reader,
         Err(error) => {
             let metadata = fs::symlink_metadata(path).ok();
@@ -608,7 +608,7 @@ pub(crate) fn open_history_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
 
 pub(crate) fn read_session_meta(path: &Path) -> io::Result<SessionMeta> {
     let mut meta = None;
-    for record in iter_records(path)? {
+    for record in iter_records(path, HydrateImages::NotToolMessages)? {
         if let SessionRecord::Meta(value) = record? {
             meta = Some(value);
             break;
@@ -624,7 +624,7 @@ pub(crate) fn read_session_meta(path: &Path) -> io::Result<SessionMeta> {
 }
 
 pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
-    transcript_from_records(path, iter_records(path)?)
+    transcript_from_records(path, iter_records(path, HydrateImages::NotToolMessages)?)
 }
 
 /// Read a transcript but restore only the message log up to the persisted
@@ -635,7 +635,7 @@ pub(crate) fn read_transcript_until(
     boundary_message_id: &str,
 ) -> io::Result<SessionTranscript> {
     let mut boundary = None;
-    for (index, record) in iter_records(path)?.enumerate() {
+    for (index, record) in iter_records(path, HydrateImages::NotToolMessages)?.enumerate() {
         if let SessionRecord::Message { id: Some(id), .. } = record?
             && id.as_str() == boundary_message_id
         {
@@ -648,7 +648,10 @@ pub(crate) fn read_transcript_until(
             format!("no saved message matches '{boundary_message_id}'"),
         )
     })?;
-    transcript_from_records(path, iter_records(path)?.take(count))
+    transcript_from_records(
+        path,
+        iter_records(path, HydrateImages::NotToolMessages)?.take(count),
+    )
 }
 
 /// Apply a message boundary to an already-loaded transcript by re-reading the
@@ -799,7 +802,7 @@ pub(crate) fn transcript_from_records(
 pub(crate) fn read_latest_context_tokens(path: &Path) -> io::Result<Option<u64>> {
     let mut previous_input_tokens = 0;
     let mut latest_context_tokens = None;
-    for record in iter_records(path)? {
+    for record in iter_records(path, HydrateImages::NotToolMessages)? {
         match record? {
             SessionRecord::Usage(usage) => {
                 latest_context_tokens = Some(
@@ -1256,7 +1259,7 @@ impl SessionWriter {
         // Classify the original bytes before any resume path can restore a
         // compressed file or repair a recoverable plaintext tail. A bounded
         // catalog inspection does not replace this complete validation.
-        for record in iter_records(&path)? {
+        for record in iter_records(&path, HydrateImages::NotToolMessages)? {
             record?;
         }
         // Appends write plaintext JSONL; raw bytes after a zstd frame would
@@ -1272,7 +1275,7 @@ impl SessionWriter {
         let event_sequence_cursor = read_transcript(&path)?.next_event_seq;
         let mut conversation_records = Vec::new();
         let mut session_id = None;
-        for record in iter_records(&path)? {
+        for record in iter_records(&path, HydrateImages::NotToolMessages)? {
             match record? {
                 SessionRecord::Meta(meta) => session_id = Some(meta.session_id),
                 SessionRecord::Message {
@@ -1352,7 +1355,7 @@ impl SessionWriter {
         repair_incomplete_final_record(&mut file)?;
         // Re-read while holding the transcript lock: independently reopened
         // writers must deduplicate against disk, not their cached ledgers.
-        for record in iter_records(&self.path)? {
+        for record in iter_records(&self.path, HydrateImages::NotToolMessages)? {
             if let SessionRecord::Message {
                 message:
                     StoredMessage::System {
@@ -1590,16 +1593,17 @@ impl SessionWriter {
         if result.is_ok() {
             return Ok(());
         }
-        let exact_record_present = iter_records(&self.path).is_ok_and(|mut records| {
-            records.any(|candidate| {
-                matches!(
-                    candidate,
-                    Ok(SessionRecord::ManualCompactionSnapshot(snapshot))
-                        if snapshot.snapshot_id == identity.snapshot_id
-                            && snapshot.operation_id == identity.operation_id
-                )
-            })
-        });
+        let exact_record_present = iter_records(&self.path, HydrateImages::NotToolMessages)
+            .is_ok_and(|mut records| {
+                records.any(|candidate| {
+                    matches!(
+                        candidate,
+                        Ok(SessionRecord::ManualCompactionSnapshot(snapshot))
+                            if snapshot.snapshot_id == identity.snapshot_id
+                                && snapshot.operation_id == identity.operation_id
+                    )
+                })
+            });
         if !exact_record_present {
             return result;
         }
@@ -2794,7 +2798,7 @@ mod tests {
             scan.health_issue.as_ref().map(|issue| issue.code.as_str()),
             Some("inspection_budget")
         );
-        let error = iter_records(path.path())
+        let error = iter_records(path.path(), HydrateImages::NotToolMessages)
             .unwrap()
             .next()
             .unwrap()

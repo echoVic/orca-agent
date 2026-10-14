@@ -119,12 +119,9 @@ pub(crate) fn run_agent_loop(
         subagent_depth,
         subagent_type,
         turn_deps.instructions,
-        config.approval_mode,
+        config,
         turn_deps.memory,
-        config
-            .subagents
-            .delegation
-            .for_child(subagent_depth, config.subagents.max_depth),
+        loop_state.tool_policy(tool_policy).allowed_tools(),
     );
     let shell_readiness = crate::shell_readiness::ShellReadiness::for_config(config);
     let shell_context = shell_readiness.model_context(config.approval_mode);
@@ -345,6 +342,69 @@ mod tests {
     use orca_core::provider_types::{ProviderResponse, ProviderStep};
     use orca_core::subagent_types::SubagentType;
     use orca_mcp::McpRegistry;
+
+    #[test]
+    fn an_owned_restricted_loop_prompt_matches_its_computer_tool_schema() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::Builder::new()
+            .prefix("orca-cu-owned-loop-")
+            .tempdir()
+            .unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let mut config = RunConfig::default();
+        config.cwd = Some(home.path().to_path_buf());
+        config.provider = orca_core::config::ProviderKind::Mock;
+        config.history_mode = orca_core::config::HistoryMode::Disabled;
+        config.computer_use.interactive = true;
+        let allowed_tools = vec!["read_file".to_string(), "computer".to_string()];
+        let subagent_type = SubagentType::General;
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("restricted-owned-loop".to_string());
+        let mut background_workflows = Vec::new();
+        let mut captured_prompt = None;
+        let observer =
+            crate::child_agent_types::ChildAgentCheckpointObserver::new_with_tool_boundary(
+                |observation| {
+                    captured_prompt = observation.conversation.messages[0]
+                        .content_str()
+                        .map(str::to_string);
+                    Ok(())
+                },
+                |_| Ok(()),
+            );
+        let outcome = run_agent_loop(
+            &config,
+            AgentLoopContext::new(home.path(), "mock_offered_tools", 0, false, &subagent_type)
+                .with_services(&instructions, &memory, &registry, &hooks)
+                .with_runtime(&mut cost_tracker, &cancel, &task_registry)
+                .with_execution(&mut background_workflows, None, None),
+            &mut EventFactory::new("restricted-owned-loop".to_string()),
+            &mut EventSink::new(Vec::new(), OutputFormat::Jsonl),
+            AgentConversationContext::Owned {
+                checkpoint_observer: Some(&observer),
+            },
+            AgentToolPolicyContext::new(Some(&allowed_tools), Some("restricted owned loop")),
+        )
+        .expect("owned loop");
+        let AgentLoopOutcome::Completed(result) = outcome else {
+            panic!("completed loop");
+        };
+        assert_eq!(result.status, RunStatus::Success);
+        assert_eq!(
+            result.final_message.as_deref(),
+            Some("Mock offered tools: read_file")
+        );
+        drop(observer);
+        let prompt = captured_prompt.expect("real loop checkpoint prompt");
+        assert!(prompt.contains("### read_file"));
+        assert!(!prompt.contains("### computer"));
+        assert!(!prompt.contains("### bash"));
+    }
 
     #[test]
     fn runtime_turn_context_snapshots_agent_loop_entry_values() {

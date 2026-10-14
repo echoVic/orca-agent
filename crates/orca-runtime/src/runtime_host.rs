@@ -2215,6 +2215,7 @@ pub enum RuntimeHostError {
     ThreadStartFailed { message: String },
     WorkflowLaunchFailed { message: String },
     RuntimeStartFailed { message: String },
+    ToolResultImagesReadFailed { message: String },
     ThreadActorPanicked { thread_id: String, message: String },
     ThreadShutdownTimedOut { thread_id: String },
     SupervisorPanicked,
@@ -2243,6 +2244,9 @@ impl fmt::Display for RuntimeHostError {
             }
             Self::RuntimeStartFailed { message } => {
                 write!(formatter, "failed to start runtime host: {message}")
+            }
+            Self::ToolResultImagesReadFailed { message } => {
+                write!(formatter, "failed to read tool result images: {message}")
             }
             Self::ThreadActorPanicked { thread_id, message } => {
                 write!(
@@ -2415,6 +2419,7 @@ impl RuntimeThreadStartRequest {
         self.parent_thread_id.clone_from(&meta.parent_id);
         self.agent_root_thread_id = Some(scope.root_thread_id.clone());
         self.agent_depth = scope.depth;
+        self.config.computer_use.interactive = false;
         self.agent_type = Some(scope.subagent_type.clone());
         self.agent_task_id = Some(scope.task_id.clone());
         self.agent_task_registry = Some(registry);
@@ -2463,6 +2468,7 @@ impl RuntimeThreadStartRequest {
         agent_task_id: String,
         agent_task_registry: TaskRegistry,
     ) -> Self {
+        self.config.computer_use.interactive = false;
         self.parent_thread_id = Some(parent_thread_id.into());
         self.agent_root_thread_id = Some(root_thread_id.into());
         self.agent_depth = depth;
@@ -2480,6 +2486,7 @@ impl RuntimeThreadStartRequest {
         self.config.history_mode = HistoryMode::Disabled;
         self.config.auto_memory = false;
         self.config.approval_mode = ApprovalMode::Plan;
+        self.config.computer_use.interactive = false;
         self.inherited_conversation = Some(conversation);
         self.parent_thread_id = Some(parent_thread_id.into());
         self
@@ -2526,6 +2533,15 @@ impl RuntimeThreadStartRequest {
             self.prepared_runtime_thread_id,
         )?;
         if let Some(mut conversation) = inherited_conversation {
+            // Preserve the inherited provider-cache prefix unless it advertises
+            // a capability that this side conversation cannot use.
+            if matches!(conversation.messages.first(), Some(Message::System { content, .. })
+                if content.lines().any(|line| line == "### computer"))
+                && let Some(system_prompt) =
+                    thread.session().conversation().messages.first().cloned()
+            {
+                conversation.messages[0] = system_prompt;
+            }
             conversation.internal_context = Default::default();
             conversation.add_system_pinned(SIDE_CONVERSATION_BOUNDARY.to_string());
             *thread.session_mut().conversation_mut() = conversation;
@@ -3902,6 +3918,30 @@ impl RuntimeThreadHandle {
         receive_reply(reply_rx, "runtime thread")?
     }
 
+    /// The images of tool call `tool_call_id`: from the live conversation when it still
+    /// holds them, otherwise from the session history; empty when there are none.
+    pub fn tool_result_images(
+        &self,
+        tool_call_id: &str,
+    ) -> Result<Vec<ImageInput>, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::ReadToolResultImages {
+            tool_call_id: tool_call_id.to_string(),
+            reply: reply_tx,
+        })?;
+        match receive_reply(reply_rx, "runtime thread")?? {
+            ToolResultImageSource::Live(images) => Ok(images),
+            ToolResultImageSource::History(Some(path)) => {
+                crate::thread_store::read_tool_message_images(&path, tool_call_id).map_err(
+                    |error| RuntimeHostError::ToolResultImagesReadFailed {
+                        message: error.to_string(),
+                    },
+                )
+            }
+            ToolResultImageSource::History(None) => Ok(Vec::new()),
+        }
+    }
+
     /// An event producer on the thread's own sequence, as its turns publish
     /// on: what it publishes goes on with the session's sequence and into
     /// its history. Only an idle thread has one to share.
@@ -4795,6 +4835,11 @@ type McpPromptExpansionReply = SyncSender<
     >,
 >;
 
+enum ToolResultImageSource {
+    Live(Vec<ImageInput>),
+    History(Option<PathBuf>),
+}
+
 enum ThreadCommand {
     PromptQueue {
         action: crate::prompt_queue::PromptQueueAction,
@@ -5343,6 +5388,10 @@ enum ThreadCommand {
     },
     ReadSnapshot {
         reply: SyncSender<Result<RuntimeThreadSnapshot, RuntimeHostError>>,
+    },
+    ReadToolResultImages {
+        tool_call_id: String,
+        reply: SyncSender<Result<ToolResultImageSource, RuntimeHostError>>,
     },
     ForkEvents {
         reply: SyncSender<Result<EventFactory, RuntimeHostError>>,
@@ -13613,7 +13662,8 @@ pub(crate) fn surface_tool_action(
         orca_core::approval_types::ActionKind::Write => surface::SurfaceToolAction::Write,
         orca_core::approval_types::ActionKind::Network => surface::SurfaceToolAction::Network,
         orca_core::approval_types::ActionKind::Agent => surface::SurfaceToolAction::Agent,
-        orca_core::approval_types::ActionKind::Shell => surface::SurfaceToolAction::Shell,
+        orca_core::approval_types::ActionKind::Shell
+        | orca_core::approval_types::ActionKind::Computer => surface::SurfaceToolAction::Shell,
     }
 }
 
@@ -14442,6 +14492,7 @@ struct PendingSurfaceBackgroundTransfer {
 
 struct ActiveGeneration {
     context: GenerationContext,
+    tool_images: orca_core::tool_images::RetainedToolImages,
     cancel: CancelToken,
     join: JoinHandle<OperationTaskResult>,
 }
@@ -18585,6 +18636,9 @@ impl ThreadActor {
                 ThreadCommand::ReadSnapshot { reply } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
+                ThreadCommand::ReadToolResultImages { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
                 ThreadCommand::RequestRecap { request, reply } => {
                     let _ = reply.send(crate::recap::RecapResult::Skipped {
                         request_id: request.request_id,
@@ -18744,6 +18798,7 @@ impl ThreadActor {
             &command,
             ThreadCommand::ReadState { .. }
                 | ThreadCommand::ReadSnapshot { .. }
+                | ThreadCommand::ReadToolResultImages { .. }
                 | ThreadCommand::SurfaceReadTaskTranscript { .. }
         );
         #[cfg(test)]
@@ -18760,6 +18815,7 @@ impl ThreadActor {
                 | ThreadCommand::SurfaceManualCompact { .. }
                 | ThreadCommand::ReadState { .. }
                 | ThreadCommand::ReadSnapshot { .. }
+                | ThreadCommand::ReadToolResultImages { .. }
                 | ThreadCommand::SurfaceReadTaskTranscript { .. }
         );
         #[cfg(test)]
@@ -19670,6 +19726,37 @@ impl ThreadActor {
                             &state.thread,
                             self.usage_ledger.totals(),
                         )
+                    })
+                    .ok_or(RuntimeHostError::ThreadUnavailable);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::ReadToolResultImages {
+                tool_call_id,
+                reply,
+            } => {
+                let result = self
+                    .state
+                    .as_ref()
+                    .map(|state| {
+                        let images = state
+                            .thread
+                            .session()
+                            .conversation()
+                            .messages
+                            .iter()
+                            .find_map(|message| match message {
+                                Message::Tool {
+                                    tool_call_id: id,
+                                    images,
+                                    ..
+                                } if id == &tool_call_id && !images.is_empty() => {
+                                    Some(images.clone())
+                                }
+                                _ => None,
+                            });
+                        images.map(ToolResultImageSource::Live).unwrap_or_else(|| {
+                            ToolResultImageSource::History(self.prompt_queue_path.clone())
+                        })
                     })
                     .ok_or(RuntimeHostError::ThreadUnavailable);
                 let _ = reply.send(result);
@@ -20916,6 +21003,20 @@ impl ThreadActor {
                     operation_id: active.operation_id,
                 }));
             }
+            ThreadCommand::ReadToolResultImages {
+                tool_call_id,
+                reply,
+            } => {
+                let source = active
+                    .generation
+                    .tool_images
+                    .for_call(&tool_call_id)
+                    .map(ToolResultImageSource::Live)
+                    .unwrap_or_else(|| {
+                        ToolResultImageSource::History(self.prompt_queue_path.clone())
+                    });
+                let _ = reply.send(Ok(source));
+            }
             ThreadCommand::ForkEvents { reply } => {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
                     operation_id: active.operation_id,
@@ -21102,12 +21203,17 @@ impl ThreadActor {
 
     fn spawn_generation(
         &self,
-        state: ThreadActorState,
+        mut state: ThreadActorState,
         request: &HostedTurnRequest,
         goal_turn: Option<crate::goal_actor::GoalTurnContext>,
         mut writer: Box<dyn HostedOperationWriter>,
         mut context: GenerationContext,
     ) -> ActiveGeneration {
+        let tool_images = state
+            .thread
+            .session_mut()
+            .conversation_mut()
+            .retained_tool_images();
         let executor = Arc::clone(&self.executor);
         let mut task_request = request.clone();
         task_request.surface_goal_turn = goal_turn;
@@ -21158,6 +21264,7 @@ impl ThreadActor {
         });
         ActiveGeneration {
             context,
+            tool_images,
             cancel,
             join,
         }
@@ -23773,6 +23880,226 @@ mod tests {
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[test]
+    fn attached_side_context_drops_interactive_computer_capability() {
+        let mut config = RunConfig::default();
+        config.computer_use.interactive = true;
+        let main = RuntimeThreadStartRequest::new(config.clone(), "main");
+        assert!(crate::computer_use::visibility::tool_visible(
+            &main.config,
+            0,
+            None,
+            true
+        ));
+        let side = RuntimeThreadStartRequest::new(config, "side")
+            .with_attached_side_context("parent", Conversation::new());
+        assert!(!side.config.computer_use.interactive);
+        let provider = crate::tool_invocation::provider_config_for_agent_loop(
+            &side.config,
+            0,
+            &orca_core::subagent_types::SubagentType::General,
+            crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
+            &McpRegistry::default(),
+        );
+        let tools = provider.tools_override.expect("side schemas");
+        assert!(tools.iter().any(|tool| tool.name == "read_file"));
+        assert!(!tools.iter().any(|tool| tool.name == "computer"));
+    }
+
+    #[test]
+    fn attached_side_prompt_does_not_inherit_the_parents_computer_advertisement() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::Builder::new()
+            .prefix("orca-cu-side-")
+            .tempdir()
+            .unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let mut config = RunConfig::default();
+        config.cwd = Some(home.path().to_path_buf());
+        config.computer_use.interactive = true;
+        let mut inherited = Conversation::new();
+        inherited.add_system("### computer\nParent desktop capability".to_string());
+        inherited.add_user("keep inherited user context".to_string());
+        let mut side = RuntimeThreadStartRequest::new(config, "side")
+            .with_attached_side_context("parent", inherited)
+            .start()
+            .expect("side thread");
+        let conversation = side.session_mut().conversation_mut();
+        let prompt = conversation.messages[0]
+            .content_str()
+            .expect("side system prompt");
+        assert!(prompt.contains("### read_file"));
+        assert!(!prompt.contains("### computer"));
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .any(|message| message.content_str() == Some("keep inherited user context"))
+        );
+    }
+
+    #[test]
+    fn attached_side_first_request_preserves_the_parent_prompt_without_computer() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        for condition in [
+            "headless",
+            "whole-tool-deny",
+            "no-advertisement",
+            "advertised",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let captured = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let body = loop {
+                    let mut chunk = [0_u8; 4096];
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0, "provider request ended early");
+                    bytes.extend_from_slice(&chunk[..read]);
+                    let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break serde_json::from_slice::<serde_json::Value>(
+                            &bytes[end + 4..end + 4 + length],
+                        )
+                        .unwrap();
+                    }
+                };
+                let response = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+                body
+            });
+            let mut config = surface_test_config(home.path().to_path_buf(), HistoryMode::Disabled);
+            config.provider = ProviderKind::DeepSeek;
+            config.api_key = Some("test-only".into());
+            config.base_url = Some(base_url);
+            config.computer_use.interactive = condition != "headless";
+            if condition == "whole-tool-deny" {
+                config.permission_rules.rules.push(
+                    orca_core::approval_rules::PermissionRule::whole_tool(
+                        "computer",
+                        orca_core::approval_types::Decision::Deny,
+                    ),
+                );
+            }
+            let parent_prompt = if condition == "advertised" {
+                "Parent instructions: exact whitespace.  \n### computer\nParent desktop capability\n"
+            } else {
+                "Parent instructions: exact whitespace.  \n### read_file\nCached parent prefix\n"
+            };
+            let mut inherited = Conversation::new();
+            inherited.add_system(parent_prompt.to_string());
+            inherited.add_user("inherited context".to_string());
+            let request = RuntimeThreadStartRequest::new(config, "side")
+                .with_attached_side_context("parent", inherited);
+            let side_config = request.config.clone();
+            let mut side = request.start().unwrap();
+            assert_eq!(
+                side.run_turn_to_writer(
+                    &side_config,
+                    "reply",
+                    io::sink(),
+                    crate::controller::ControllerRunOptions::default(),
+                )
+                .unwrap(),
+                RunStatus::Success
+            );
+            let body = captured.join().unwrap();
+            assert_eq!(body["messages"][0]["role"], "system");
+            let actual = body["messages"][0]["content"].as_str().unwrap();
+            if condition == "advertised" {
+                assert!(!actual.contains("### computer"));
+                assert!(actual.contains("### read_file"));
+            } else {
+                assert!(
+                    actual.as_bytes() == parent_prompt.as_bytes(),
+                    "{condition}: first provider request changed the inherited prompt bytes"
+                );
+            }
+            assert!(
+                body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["content"] == "inherited context")
+            );
+        }
+    }
+
+    #[test]
+    fn a_hosted_child_start_request_drops_interactive_computer_capability() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::Builder::new()
+            .prefix("orca-cu-child-")
+            .tempdir()
+            .unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let mut config = RunConfig::default();
+        config.computer_use.interactive = true;
+        let child = RuntimeThreadStartRequest::new(config, "child").with_agent_parent(
+            "parent",
+            "root",
+            1,
+            orca_core::subagent_types::SubagentType::General,
+            "task".to_string(),
+            TaskRegistry::new("root".to_string()),
+        );
+        assert!(!child.config.computer_use.interactive);
+    }
+
+    #[test]
+    fn a_restored_child_scope_drops_interactive_computer_capability() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::Builder::new()
+            .prefix("orca-cu-restored-child-")
+            .tempdir()
+            .unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let registry = TaskRegistry::new_for_cwd("parent-task-session".into(), home.path());
+        let task = registry.create_subagent("restored child".into(), Some("general".into()));
+        registry
+            .bind_subagent_thread(&task.id, "child-thread")
+            .unwrap();
+        let mut meta = crate::history::create_meta(home.path(), "mock", None, "restored child");
+        meta.session_id = "child-thread".into();
+        meta.parent_id = Some("parent-thread".into());
+        meta.agent_scope = Some(crate::thread_store::StoredAgentScope {
+            root_thread_id: "root-thread".into(),
+            depth: 2,
+            subagent_type: orca_core::subagent_types::SubagentType::General,
+            task_id: task.id,
+            task_registry_session_id: registry.session_id().to_string(),
+        });
+        let mut config = RunConfig::default();
+        config.cwd = Some(home.path().to_path_buf());
+        config.computer_use.interactive = true;
+        let mut request = RuntimeThreadStartRequest::new(config, "restore child");
+        request
+            .restore_agent_scope_from_meta(&meta)
+            .expect("restored child scope");
+        assert_eq!(request.agent_depth, 2);
+        assert!(!request.config.computer_use.interactive);
+    }
+
+    #[test]
     fn subagent_activity_dedupe_cache_evicts_oldest_entry() {
         let mut cache = VecDeque::new();
         for index in 0..=SUBAGENT_ACTIVITY_DEDUPE_CAPACITY {
@@ -25073,6 +25400,202 @@ mod tests {
         GrantToken,
     }
 
+    struct HeldToolImageExecutor {
+        recorded: SyncSender<()>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl ThreadOperationExecutor for HeldToolImageExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let image = orca_core::tool_images::tool_image(
+                "image/png",
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
+            ).unwrap();
+            let request = orca_core::tool_types::ToolRequest {
+                id: "running-call".to_string(),
+                name: orca_core::tool_types::ToolName::ReadFile,
+                action: orca_core::approval_types::ActionKind::Read,
+                target: None,
+                raw_arguments: None,
+            };
+            let result = orca_core::tool_types::ToolResult::completed(
+                &request,
+                "[1 image attached]".to_string(),
+                false,
+            )
+            .with_images(vec![image]);
+            assert!(thread.session().surface_commit_path().is_none());
+            crate::session::record_tool_result_for_agent(
+                thread.session_mut().conversation_mut(),
+                None,
+                &result,
+                false,
+            )?;
+            self.recorded.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(SURFACE_TEST_TIMEOUT)
+                .unwrap();
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
+    #[test]
+    fn tool_result_images_are_live_during_an_active_turn_without_history() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (recorded_tx, recorded_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(HeldToolImageExecutor {
+            recorded: recorded_tx,
+            release: Mutex::new(release_rx),
+        }))
+        .unwrap();
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
+                "running screenshot without history",
+            )
+            .unwrap();
+        let operation = thread
+            .start_turn(HostedTurnRequest::new("capture and hold"), io::sink())
+            .unwrap();
+        recorded_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+        assert!(matches!(
+            thread.state().unwrap(),
+            RuntimeThreadState::Running { .. }
+        ));
+        let images = thread.tool_result_images("running-call").unwrap();
+        assert!(matches!(
+            thread.state().unwrap(),
+            RuntimeThreadState::Running { .. }
+        ));
+        release_tx.send(()).unwrap();
+        assert!(operation.wait_timeout(SURFACE_TEST_TIMEOUT).is_some());
+        let expected = orca_core::tool_images::tool_image(
+            "image/png",
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
+        ).unwrap();
+        assert_eq!(images, vec![expected]);
+        host.shutdown().unwrap();
+    }
+
+    struct ToolImageExecutor;
+
+    impl ThreadOperationExecutor for ToolImageExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            thread
+                .session_mut()
+                .writer_mut()
+                .unwrap()
+                .enter_turn(request.turn_id().clone());
+            use base64::Engine as _;
+            for index in 1..=4 {
+                let message = Message::Tool {
+                    tool_call_id: format!("call-{index}"),
+                    content: "[1 image attached]".to_string(),
+                    images: vec![ImageInput {
+                        source: ImageSource::Base64 {
+                            media_type: "image/png".to_string(),
+                            data: base64::engine::general_purpose::STANDARD.encode([index; 32]),
+                        },
+                        detail: ImageDetail::High,
+                    }],
+                    terminal: None,
+                    pinned: false,
+                };
+                thread
+                    .session_mut()
+                    .writer_mut()
+                    .unwrap()
+                    .append_message(&message)?;
+                thread
+                    .session_mut()
+                    .conversation_mut()
+                    .messages
+                    .push(message);
+                orca_core::tool_images::keep_newest_tool_images(
+                    &mut thread.session_mut().conversation_mut().messages,
+                    orca_core::tool_images::MAX_REQUEST_TOOL_IMAGES,
+                );
+            }
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
+    #[test]
+    fn tool_result_images_come_from_the_live_conversation_then_from_history() {
+        use base64::Engine as _;
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(Arc::new(ToolImageExecutor)).unwrap();
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "tool image preview",
+            )
+            .unwrap();
+        thread
+            .start_turn(
+                HostedTurnRequest::new("capture four screenshots"),
+                io::sink(),
+            )
+            .unwrap()
+            .wait();
+        let snapshot = thread.snapshot().unwrap();
+        let first = snapshot.conversation().messages.iter().find(|message| {
+            matches!(message, Message::Tool { tool_call_id, .. } if tool_call_id == "call-1")
+        }).unwrap();
+        assert!(matches!(first, Message::Tool { images, .. } if images.is_empty()));
+        for (call_id, byte) in [("call-4", 4), ("call-1", 1)] {
+            let images = thread.tool_result_images(call_id).unwrap();
+            assert_eq!(images.len(), 1);
+            let ImageSource::Base64 { data, .. } = &images[0].source else {
+                panic!("preview must return the image bytes");
+            };
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .unwrap(),
+                vec![byte; 32]
+            );
+        }
+        assert!(
+            thread
+                .tool_result_images("missing-call")
+                .unwrap()
+                .is_empty()
+        );
+        let path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap()
+            .path;
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"invalid record\n").unwrap();
+        // Recent images must still preview when the history cannot be read.
+        assert_eq!(thread.tool_result_images("call-4").unwrap().len(), 1);
+        assert!(thread.tool_result_images("call-1").is_err());
+        std::fs::write(&path, saved).unwrap();
+        host.shutdown().unwrap();
+    }
+
     struct PanicExecutor;
 
     impl ThreadOperationExecutor for PanicExecutor {
@@ -26147,6 +26670,7 @@ mod tests {
             additional_working_directories: Vec::new(),
             budget: Default::default(),
             subagents: SubagentConfig::default(),
+            computer_use: orca_core::config::ComputerUseConfig::default(),
             tools: ToolConfig {
                 shell_enforcement_decision: Some(
                     orca_core::capability::SandboxEnforcementDecision::new(

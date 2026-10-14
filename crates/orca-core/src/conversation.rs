@@ -4,6 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::approval_types::ActionKind;
+use crate::tool_images::{MAX_REQUEST_TOOL_IMAGES, RetainedToolImages, keep_newest_tool_images};
 use crate::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminal, ToolTerminalSource};
 
 /// The single conversation attachment target used by interactive surfaces.
@@ -383,7 +384,7 @@ pub struct UsageAnchor {
     boundary: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub internal_context: InternalContext,
@@ -392,6 +393,22 @@ pub struct Conversation {
     /// Not persisted: a resumed conversation measures from a full estimate
     /// until its first response.
     pub usage_anchor: Option<UsageAnchor>,
+    retained_tool_images: Option<RetainedToolImages>,
+}
+
+// Prompt snapshots and inherited conversations must not publish into the
+// running conversation's read view.
+impl Clone for Conversation {
+    fn clone(&self) -> Self {
+        Self {
+            messages: self.messages.clone(),
+            internal_context: self.internal_context.clone(),
+            rolling_summary: self.rolling_summary.clone(),
+            summary: self.summary.clone(),
+            usage_anchor: self.usage_anchor,
+            retained_tool_images: None,
+        }
+    }
 }
 
 impl Conversation {
@@ -402,6 +419,29 @@ impl Conversation {
             rolling_summary: None,
             summary: SummaryState::default(),
             usage_anchor: None,
+            retained_tool_images: None,
+        }
+    }
+
+    /// Enable a bounded read view before lending this conversation to a worker.
+    pub fn retained_tool_images(&mut self) -> RetainedToolImages {
+        let retained = self
+            .retained_tool_images
+            .get_or_insert_with(RetainedToolImages::default);
+        retained.replace(&self.messages);
+        retained.clone()
+    }
+
+    /// Adopt a compacted conversation while preserving its running read view.
+    pub fn adopt(&mut self, mut replacement: Self) {
+        replacement.retained_tool_images = self.retained_tool_images.take();
+        *self = replacement;
+        self.refresh_retained_tool_images();
+    }
+
+    fn refresh_retained_tool_images(&self) {
+        if let Some(retained) = &self.retained_tool_images {
+            retained.replace(&self.messages);
         }
     }
 
@@ -584,6 +624,7 @@ impl Conversation {
     }
 
     pub fn add_tool_result_with_terminal(&mut self, result: &ToolResult, content: String) {
+        let added_images = !result.images.is_empty();
         self.messages.push(Message::Tool {
             tool_call_id: result.id.clone(),
             content,
@@ -591,6 +632,10 @@ impl Conversation {
             terminal: Some(result.terminal().clone()),
             pinned: false,
         });
+        let trimmed_images = keep_newest_tool_images(&mut self.messages, MAX_REQUEST_TOOL_IMAGES);
+        if added_images || trimmed_images != 0 {
+            self.refresh_retained_tool_images();
+        }
     }
 
     pub fn last_user_message(&self) -> Option<&str> {
@@ -610,6 +655,7 @@ impl Conversation {
             _ => unreachable!("rposition only matches user messages"),
         };
         self.messages.truncate(index);
+        self.refresh_retained_tool_images();
         Some(prompt)
     }
 
@@ -1028,6 +1074,134 @@ mod tests {
     }
 
     #[test]
+    fn the_live_conversation_keeps_only_the_three_newest_tool_images() {
+        let png = crate::tool_images::tool_image("image/png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string()).unwrap();
+        let mut conv = Conversation::new();
+        for index in 0..5 {
+            let request = ToolRequest {
+                id: format!("call_{index}"),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: None,
+            };
+            let result = ToolResult::completed(&request, format!("screenshot {index}"), false)
+                .with_images(vec![png.clone()]);
+            conv.add_tool_result_with_terminal(&result, result.output.clone().unwrap());
+            assert_eq!(result.images, vec![png.clone()]);
+        }
+        for (index, message) in conv.messages.iter().enumerate() {
+            let Message::Tool {
+                images, content, ..
+            } = message
+            else {
+                panic!("expected a tool message");
+            };
+            if index < 2 {
+                assert!(images.is_empty());
+                assert!(content.ends_with(crate::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE));
+                assert_eq!(
+                    content
+                        .matches(crate::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE)
+                        .count(),
+                    1
+                );
+            } else {
+                assert_eq!(images, std::slice::from_ref(&png));
+                assert!(!content.contains(crate::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE));
+            }
+        }
+    }
+
+    fn screenshot_result(call_id: &str, details: &[ImageDetail]) -> ToolResult {
+        let request = ToolRequest {
+            id: call_id.to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let images = details.iter().map(|detail| ImageInput {
+            source: ImageSource::Base64 { media_type: "image/png".to_string(), data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string() },
+            detail: *detail,
+        }).collect();
+        ToolResult::completed(&request, "[1 image attached]".to_string(), false).with_images(images)
+    }
+
+    #[test]
+    fn retained_tool_images_follow_live_trimming_replacement_and_backtrack() {
+        let mut conversation = Conversation::new();
+        let retained = conversation.retained_tool_images();
+        let first = screenshot_result(
+            "call-1",
+            &[
+                ImageDetail::Low,
+                ImageDetail::High,
+                ImageDetail::Original,
+                ImageDetail::Auto,
+            ],
+        );
+        conversation.add_tool_result_with_terminal(&first, first.output.clone().unwrap());
+        assert_eq!(
+            retained
+                .for_call("call-1")
+                .unwrap()
+                .iter()
+                .map(|image| image.detail)
+                .collect::<Vec<_>>(),
+            vec![ImageDetail::High, ImageDetail::Original, ImageDetail::Auto]
+        );
+        let second = screenshot_result("call-2", &[ImageDetail::Low]);
+        conversation.add_tool_result_with_terminal(&second, second.output.clone().unwrap());
+        assert_eq!(
+            retained
+                .for_call("call-1")
+                .unwrap()
+                .iter()
+                .map(|image| image.detail)
+                .collect::<Vec<_>>(),
+            vec![ImageDetail::Original, ImageDetail::Auto]
+        );
+        assert_eq!(retained.for_call("call-2"), Some(second.images.clone()));
+
+        let mut replacement = conversation.clone();
+        replacement.messages.retain(|message| !matches!(message, Message::Tool { tool_call_id, .. } if tool_call_id == "call-1"));
+        conversation.adopt(replacement);
+        assert!(retained.for_call("call-1").is_none());
+        assert_eq!(retained.for_call("call-2"), Some(second.images.clone()));
+
+        conversation.add_user("new turn".to_string());
+        let third = screenshot_result("call-3", &[ImageDetail::High]);
+        conversation.add_tool_result_with_terminal(&third, third.output.clone().unwrap());
+        assert_eq!(retained.for_call("call-3"), Some(third.images));
+        assert_eq!(
+            conversation.backtrack_last_user().as_deref(),
+            Some("new turn")
+        );
+        assert!(retained.for_call("call-3").is_none());
+        assert_eq!(retained.for_call("call-2"), Some(second.images));
+    }
+
+    #[test]
+    fn retained_tool_images_of_conversation_clones_are_independent() {
+        let mut parent = Conversation::new();
+        let first = screenshot_result("parent-call", &[ImageDetail::High]);
+        parent.add_tool_result_with_terminal(&first, first.output.clone().unwrap());
+        let parent_retained = parent.retained_tool_images();
+        let mut child = parent.clone();
+        let child_retained = child.retained_tool_images();
+        let second = screenshot_result("child-call", &[ImageDetail::Low]);
+        child.add_tool_result_with_terminal(&second, second.output.clone().unwrap());
+        assert!(parent_retained.for_call("child-call").is_none());
+        assert_eq!(
+            parent_retained.for_call("parent-call"),
+            Some(first.images.clone())
+        );
+        assert_eq!(child_retained.for_call("child-call"), Some(second.images));
+        assert_eq!(child_retained.for_call("parent-call"), Some(first.images));
+    }
+
+    #[test]
     fn a_tool_result_keeps_its_images_on_the_tool_message() {
         let request = ToolRequest {
             id: "call_1".to_string(),
@@ -1039,7 +1213,7 @@ mod tests {
         let png = ImageInput {
             source: ImageSource::Base64 {
                 media_type: "image/png".to_string(),
-                data: "aGVsbG8=".to_string(),
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
             },
             detail: ImageDetail::High,
         };

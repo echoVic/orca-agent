@@ -115,11 +115,26 @@ impl CompiledPermissionRule {
     /// A call without a target is matched as an empty one, so a pattern
     /// such as `src/**` never matches it.
     fn matches(&self, tool: &str, target: Option<&str>) -> bool {
+        // App approval never preapproves password entry. Only an explicit
+        // whole-tool allow also covers the separate secure-input target.
+        if tool == "computer"
+            && self.decision == Decision::Allow
+            && self.pattern.is_some()
+            && target.is_some_and(|target| target.ends_with("#secure"))
+        {
+            return false;
+        }
         self.matches_tool(tool)
-            && self
-                .pattern
-                .as_ref()
-                .is_none_or(|pattern| pattern.matches(target.unwrap_or("")))
+            && self.pattern.as_ref().is_none_or(|pattern| {
+                let target = target.unwrap_or("");
+                pattern.matches(target)
+                        // App denies and prompts also cover the secure-input subtarget.
+                        || (tool == "computer"
+                            && matches!(self.decision, Decision::Deny | Decision::Prompt)
+                            && target
+                                .strip_suffix("#secure")
+                                .is_some_and(|app| pattern.matches(app)))
+            })
     }
 
     /// A rule's `tool`, in canonical form, matches a call's tool name either
@@ -293,6 +308,115 @@ mod tests {
         assert!(!rule.matches("bash", Some("npm test")));
         assert!(!rule.matches("edit", Some("cargo test")));
         assert!(!rule.matches("bash", None));
+    }
+
+    #[test]
+    fn patterned_computer_allows_never_preapprove_secure_input() {
+        for pattern in [
+            "com.apple.Safari",
+            "com.apple.Safari#secure",
+            "com.apple.*",
+            "com.apple.Safar?#secure",
+            "*#secure",
+            "*",
+            "**",
+        ] {
+            let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+                rules: vec![PermissionRule::new("computer", pattern, Decision::Allow)],
+            });
+            assert_eq!(
+                compiled.matching_decision("computer", Some("com.apple.Safari#secure")),
+                None,
+                "pattern {pattern:?} must not approve secure input"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_computer_allows_cover_secure_input_and_patterned_denies_still_win() {
+        let whole_allow = PermissionRule::whole_tool("computer", Decision::Allow);
+        let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+            rules: vec![whole_allow.clone()],
+        });
+        assert_eq!(
+            compiled.matching_decision("computer", Some("com.apple.Safari#secure")),
+            Some(Decision::Allow)
+        );
+        for pattern in ["com.apple.*", "com.apple.Safari#secure", "*"] {
+            let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+                rules: vec![
+                    whole_allow.clone(),
+                    PermissionRule::new("computer", pattern, Decision::Deny),
+                ],
+            });
+            assert_eq!(
+                compiled.matching_decision("computer", Some("com.apple.Safari#secure")),
+                Some(Decision::Deny),
+                "deny pattern {pattern:?} must still cover secure input"
+            );
+        }
+    }
+
+    #[test]
+    fn denied_app_bundles_still_deny_secure_input() {
+        let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+            rules: vec![
+                PermissionRule::whole_tool("computer", Decision::Allow),
+                PermissionRule::new("computer", "com.apple.Safari", Decision::Deny),
+            ],
+        });
+        assert_eq!(
+            compiled.matching_decision("computer", Some("com.apple.Safari#secure")),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            compiled.matching_decision("computer", Some("com.apple.Safari")),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            compiled.matching_decision("computer", Some("com.apple.TextEdit#secure")),
+            Some(Decision::Allow)
+        );
+        let unrelated_tool = CompiledPermissionRules::from_rules(PermissionRules {
+            rules: vec![PermissionRule::new(
+                "read_file",
+                "credentials",
+                Decision::Deny,
+            )],
+        });
+        assert_eq!(
+            unrelated_tool.matching_decision("read_file", Some("credentials#secure")),
+            None
+        );
+    }
+
+    #[test]
+    fn secure_input_rule_exclusion_preserves_other_matching() {
+        let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+            rules: vec![
+                PermissionRule::new("computer", "com.apple.*", Decision::Allow),
+                PermissionRule::new("read_file", "*", Decision::Allow),
+            ],
+        });
+        assert_eq!(
+            compiled.matching_decision("computer", Some("com.apple.Safari")),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            compiled.matching_decision("read_file", Some("credentials#secure")),
+            Some(Decision::Allow)
+        );
+        let prompt = CompiledPermissionRules::from_rules(PermissionRules {
+            rules: vec![PermissionRule::new(
+                "computer",
+                "com.apple.*",
+                Decision::Prompt,
+            )],
+        });
+        assert_eq!(
+            prompt.matching_decision("computer", Some("com.apple.Safari#secure")),
+            Some(Decision::Prompt)
+        );
     }
 
     #[test]

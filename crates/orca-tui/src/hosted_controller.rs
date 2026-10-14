@@ -1053,6 +1053,25 @@ pub(crate) fn hosted_tui_controller_loop(
                     &event_tx,
                 );
             }
+            Ok(UserAction::OpenToolImages { call_id }) => {
+                let thread = thread.clone();
+                let event_tx = event_tx.clone();
+                std::thread::spawn(move || {
+                    let result =
+                        thread.as_ref().map_or_else(
+                            || {
+                                Err("cannot read tool result images before a session exists"
+                                    .to_string())
+                            },
+                            |runtime_thread| {
+                                runtime_thread
+                                    .tool_result_images(&call_id)
+                                    .map_err(|error| error.to_string())
+                            },
+                        );
+                    let _ = event_tx.send(TuiEvent::ToolImagesLoaded { call_id, result });
+                });
+            }
             Ok(UserAction::ReadTaskTranscript(request)) => {
                 let result = thread
                     .as_ref()

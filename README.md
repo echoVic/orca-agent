@@ -120,6 +120,11 @@ OS sandbox. Then type a task and press `Enter`.
   soon as the TUI opens. `/mcp` shows how each stands, with its tools and
   prompts, and reconnects, logs in, or logs out; each MCP prompt runs as a
   slash command, `/mcp__<server>__<prompt>`.
+- **Computer use on macOS.** On macOS 14 or later, the main TUI session can
+  inspect and operate other apps to check a UI or work without a command-line
+  interface, with app approval and Esc to stop. See
+  [Computer Use](https://orcaagent.dev/docs/#computer-use) for system permissions
+  and foreground switching.
 - **Plan, goals, and recap.** `/plan` investigates read-only and ends with a
   plan to approve; `/goal` sets a persistent objective; `/recap` summarizes the
   session, and Orca writes one itself when you return after a quiet spell;

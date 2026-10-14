@@ -14,6 +14,7 @@ mod writer;
 
 use orca_core::conversation::Conversation;
 
+pub(crate) use assets::HydrateImages;
 pub use live_thread::LiveThread;
 #[cfg(test)]
 pub(crate) use local::find_session_path;
@@ -29,7 +30,7 @@ pub(crate) use projection::{
     conversation_records_to_thread_items, conversation_records_to_thread_turns,
     message_to_thread_json, messages_to_thread_items, messages_to_thread_turns,
 };
-pub(crate) use reader::SessionRecordSnapshot;
+pub(crate) use reader::{SessionRecordSnapshot, read_tool_message_images};
 pub use retention::{
     SessionRetentionError, SessionRetentionPolicy, SessionRetentionReport, retain_sessions,
 };

@@ -100,7 +100,7 @@ pub(crate) fn record_tool_result_for_agent(
     } else {
         Ok(())
     };
-    conversation.messages.push(message);
+    conversation.add_tool_result_with_terminal(result, result_content.clone());
     history_result?;
     Ok(result_content)
 }
@@ -159,19 +159,18 @@ pub(crate) fn bootstrap_agent_conversation_for_loop(
     subagent_depth: u32,
     subagent_type: &SubagentType,
     instructions: &ProjectInstructions,
-    approval_mode: orca_core::approval_types::ApprovalMode,
+    config: &RunConfig,
     memory: &MemoryBlock,
-    delegation: orca_core::subagent_config::DelegationPolicy,
+    allowed_tools: Option<&[String]>,
 ) -> Conversation {
-    let system_prompt = agent_common::build_agent_system_prompt_with_goal(
+    let system_prompt = agent_common::build_agent_system_prompt_for_config(
         cwd,
+        config,
         subagent_depth,
         subagent_type,
         Some(instructions),
-        approval_mode,
         Some(memory),
-        None,
-        delegation,
+        allowed_tools,
     );
     bootstrap_agent_conversation(None, system_prompt, cwd, prompt)
 }
@@ -251,13 +250,14 @@ impl InteractiveSession {
             config.hooks.clone(),
             orca_core::capability::CapabilitySet::for_approval_mode(config.approval_mode),
         );
-        let system_prompt = agent_common::build_agent_system_prompt(
+        let system_prompt = agent_common::build_agent_system_prompt_for_config(
             &cwd,
+            config,
             0,
             &SubagentType::General,
             Some(&instructions),
-            config.approval_mode,
             Some(&memory),
+            None,
         );
         let (conversation, loaded_transcript) = match &config.history_mode {
             HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => {
@@ -831,7 +831,7 @@ impl InteractiveSession {
                 &outcome.after,
             )?;
         }
-        self.conversation = outcome.after.clone();
+        self.conversation.adopt(outcome.after.clone());
         self.last_manual_compaction = Some(outcome.clone());
         let _ = self.hooks.run_with_cancel(
             HookEvent::PostCompact,
@@ -937,6 +937,7 @@ mod tests {
             additional_working_directories: Vec::new(),
             budget: Default::default(),
             subagents: SubagentConfig::default(),
+            computer_use: orca_core::config::ComputerUseConfig::default(),
             tools: ToolConfig::default(),
             workflows: WorkflowConfig::default(),
             theme: ThemeName::Dark,
@@ -958,6 +959,93 @@ mod tests {
         let _guard = history::lock_test_env();
         let home = history::isolated_test_orca_home_subdir("with-orca-home");
         history::with_test_orca_home(&home, f)
+    }
+
+    #[test]
+    fn headless_main_session_prompt_does_not_advertise_computer() {
+        with_computer_prompt_home(|home| {
+            let mut cfg = config(home.to_path_buf(), HistoryMode::Disabled);
+            let session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+                &cfg,
+                "headless",
+                None,
+                McpRegistry::default(),
+            )
+            .expect("session");
+            let prompt = session.conversation.messages[0].content_str().unwrap();
+            assert!(prompt.contains("### read_file"));
+            assert!(!prompt.contains("### computer"));
+            cfg.computer_use.interactive = true;
+            let session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+                &cfg,
+                "interactive",
+                None,
+                McpRegistry::default(),
+            )
+            .expect("interactive session");
+            let prompt = session.conversation.messages[0].content_str().unwrap();
+            assert_eq!(
+                prompt.contains("### computer"),
+                orca_computer_use::apps::host_supported()
+            );
+        });
+    }
+
+    #[test]
+    fn denied_main_session_prompt_does_not_advertise_computer() {
+        with_computer_prompt_home(|home| {
+            let mut cfg = config(home.to_path_buf(), HistoryMode::Disabled);
+            cfg.computer_use.interactive = true;
+            cfg.permission_rules
+                .rules
+                .push(orca_core::approval_rules::PermissionRule::whole_tool(
+                    "computer",
+                    orca_core::approval_types::Decision::Deny,
+                ));
+            let session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+                &cfg,
+                "denied",
+                None,
+                McpRegistry::default(),
+            )
+            .expect("session");
+            let prompt = session.conversation.messages[0].content_str().unwrap();
+            assert!(prompt.contains("### read_file"));
+            assert!(!prompt.contains("### computer"));
+        });
+    }
+
+    #[test]
+    fn custom_main_session_prompt_does_not_advertise_computer() {
+        with_computer_prompt_home(|home| {
+            let mut cfg = config(home.to_path_buf(), HistoryMode::Disabled);
+            cfg.computer_use.interactive = true;
+            cfg.subagents.effective_definition = Some(
+                orca_core::subagent_types::agent_definition::EffectiveAgentDefinition {
+                    name: "desktop-audit".to_string(),
+                    description: "Audit source".to_string(),
+                    system_prompt: "Report source findings.".to_string(),
+                    allowed_tools: vec!["computer".to_string(), "read_file".to_string()],
+                    model: None,
+                },
+            );
+            let session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+                &cfg,
+                "custom",
+                None,
+                McpRegistry::default(),
+            )
+            .expect("session");
+            let prompt = session.conversation.messages[0].content_str().unwrap();
+            assert!(prompt.contains("### read_file"));
+            assert!(!prompt.contains("### computer"));
+            assert!(!prompt.contains("### bash"));
+            assert!(prompt.contains("Report source findings."));
+        });
+    }
+
+    fn with_computer_prompt_home(f: impl FnOnce(&Path)) {
+        with_orca_home(f);
     }
 
     #[test]
@@ -1074,9 +1162,9 @@ mod tests {
             1,
             &SubagentType::General,
             &instructions,
-            ApprovalMode::Suggest,
+            &RunConfig::default(),
             &memory,
-            orca_core::subagent_config::DelegationPolicy::default(),
+            None,
         );
 
         assert_eq!(conversation.messages.len(), 2);
@@ -1158,6 +1246,46 @@ mod tests {
     }
 
     #[test]
+    fn agent_tool_results_keep_only_the_three_newest_images() {
+        let png = orca_core::tool_images::tool_image("image/png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string()).unwrap();
+        let mut conversation = Conversation::new();
+        for index in 0..5 {
+            let request = ToolRequest {
+                id: format!("call_{index}"),
+                name: ToolName::ReadFile,
+                action: orca_core::approval_types::ActionKind::Read,
+                target: None,
+                raw_arguments: None,
+            };
+            let result = ToolResult::completed(&request, format!("screenshot {index}"), false)
+                .with_images(vec![png.clone()]);
+            record_tool_result_for_agent(&mut conversation, None, &result, false).unwrap();
+            assert_eq!(result.images, vec![png.clone()]);
+        }
+        for (index, message) in conversation.messages.iter().enumerate() {
+            let Message::Tool {
+                images, content, ..
+            } = message
+            else {
+                panic!("expected a tool message");
+            };
+            if index < 2 {
+                assert!(images.is_empty());
+                assert!(content.ends_with(orca_core::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE));
+                assert_eq!(
+                    content
+                        .matches(orca_core::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE)
+                        .count(),
+                    1
+                );
+            } else {
+                assert_eq!(images, std::slice::from_ref(&png));
+                assert!(!content.contains(orca_core::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE));
+            }
+        }
+    }
+
+    #[test]
     fn a_tool_results_images_are_recorded_on_its_tool_message() {
         let request = ToolRequest {
             id: "call-screenshot".to_string(),
@@ -1169,7 +1297,7 @@ mod tests {
         let image = orca_core::conversation::ImageInput {
             source: orca_core::conversation::ImageSource::Base64 {
                 media_type: "image/png".to_string(),
-                data: "AA==".to_string(),
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
             },
             detail: orca_core::conversation::ImageDetail::High,
         };

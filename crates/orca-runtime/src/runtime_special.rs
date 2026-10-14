@@ -46,6 +46,7 @@ pub enum RuntimeInteractionToolDispatch {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeSpecialToolDispatch {
+    Computer,
     GetGoal,
     CreateGoal,
     UpdateGoal,
@@ -102,6 +103,7 @@ impl RuntimeToolActorContext {
             }
         }
         match request.name {
+            ToolName::Computer => RuntimeSpecialToolDispatch::Computer,
             ToolName::GetGoal if goal_mode => RuntimeSpecialToolDispatch::GetGoal,
             ToolName::CreateGoal if goal_mode => RuntimeSpecialToolDispatch::CreateGoal,
             ToolName::UpdateGoal if goal_mode => RuntimeSpecialToolDispatch::UpdateGoal,

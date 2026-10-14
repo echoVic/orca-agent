@@ -436,7 +436,7 @@ fn an_unsupported_mcp_image_leaves_a_note() {
 }
 
 #[test]
-fn an_mcp_image_without_a_media_type_leaves_a_note_instead_of_failing_the_call() {
+fn an_mcp_image_without_a_media_type_is_recognized_from_its_bytes() {
     let (registry, tool_ref) = registry_with_call_tool_result(serde_json::json!({
         "content": [
             {"type": "text", "text": "screenshot taken"},
@@ -449,11 +449,9 @@ fn an_mcp_image_without_a_media_type_leaves_a_note_instead_of_failing_the_call()
         .call_tool(&tool_ref, serde_json::json!({}))
         .expect("a malformed image block must not fail the call");
 
-    assert_eq!(
-        result.output,
-        "screenshot taken\n[image omitted: missing media type]"
-    );
-    assert!(result.images.is_empty());
+    assert_eq!(result.output, "screenshot taken\n[1 image attached]");
+    assert!(matches!(&result.images[0].source,
+        orca_core::conversation::ImageSource::Base64 { media_type, .. } if media_type == "image/png"));
 }
 
 #[test]

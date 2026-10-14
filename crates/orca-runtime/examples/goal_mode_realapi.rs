@@ -235,6 +235,7 @@ fn real_api_config(api_key: String, max_cost_usd_micros: u64) -> Result<RunConfi
             ..orca_core::config::BudgetConfig::default()
         },
         subagents: SubagentConfig::default(),
+        computer_use: orca_core::config::ComputerUseConfig::default(),
         tools: ToolConfig::default(),
         workflows: WorkflowConfig::default(),
         theme: ThemeName::Dark,

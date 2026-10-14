@@ -109,6 +109,7 @@ pub fn assemble_run_config(
         hooks: file.hooks,
         external_tools: orca_tools::external::load_default_external_tools(),
         subagents: file.subagents.normalized(),
+        computer_use: file.computer_use,
         tools: file.tools.normalized(),
         workflows: file.workflows.resolved(),
         theme: file.theme,

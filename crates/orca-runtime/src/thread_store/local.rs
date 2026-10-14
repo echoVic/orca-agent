@@ -12,7 +12,7 @@ use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::tool_types::truncate_output;
 
 use super::LiveThread;
-use super::assets;
+use super::assets::{self, HydrateImages};
 use super::pagination::{page_thread_items, page_thread_turns, page_vec};
 use super::projection::{
     conversation_records_to_thread_items, conversation_records_to_thread_turns,
@@ -155,7 +155,7 @@ impl JsonlThreadStore {
             return Ok(None);
         }
         let mut found = None;
-        for record in iter_records(path)? {
+        for record in iter_records(path, HydrateImages::NotToolMessages)? {
             match record? {
                 SessionRecord::SurfaceShutdownBarrier {
                     barrier_id,
@@ -179,7 +179,7 @@ impl JsonlThreadStore {
             return Ok(None);
         }
         let mut found = None;
-        for record in iter_records(path)? {
+        for record in iter_records(path, HydrateImages::NotToolMessages)? {
             if let SessionRecord::SurfaceFinalizeIntent {
                 finalize_intent_id,
                 expected_settlements,
@@ -202,7 +202,7 @@ impl JsonlThreadStore {
         }
         let mut batches = Vec::<(bool, crate::runtime_surface::StoredSurfaceCommitBatchV1)>::new();
         let mut batch_indices = HashMap::<String, usize>::new();
-        for record in iter_records(path)? {
+        for record in iter_records(path, HydrateImages::NotToolMessages)? {
             match record? {
                 SessionRecord::SurfaceCommitPrepared {
                     commit_id,
@@ -302,7 +302,7 @@ impl JsonlThreadStore {
             target,
             orca_platform::fs::AtomicWritePolicy::NoFollow,
             |output| {
-                for record in iter_records(&path)? {
+                for record in iter_records(&path, HydrateImages::All)? {
                     super::writer::write_record_line(&mut *output, &record?)?;
                 }
                 Ok(())
@@ -408,7 +408,7 @@ pub fn compress_session(selector: &str) -> io::Result<PathBuf> {
     let compressed_path = path.with_extension("jsonl.zst");
     let _owner = super::retention::acquire_idle_owner(&path)?;
     let _lock = acquire_file_lock(&path)?;
-    let mut records = iter_records(&path)?;
+    let mut records = iter_records(&path, HydrateImages::All)?;
     for record in records.by_ref() {
         record?;
     }
@@ -446,7 +446,7 @@ pub(crate) fn load_thread_records(
             format!("no saved session matches '{thread_id}'"),
         )
     })?;
-    let records = iter_records(&path)?;
+    let records = iter_records(&path, HydrateImages::NotToolMessages)?;
     let mut meta = None;
     let mut conversation_records = Vec::new();
     for record in records {
@@ -1091,7 +1091,7 @@ impl ThreadStore for JsonlThreadStore {
             )
         })?;
         let _lock = acquire_file_lock(&path)?;
-        let records = iter_records(&path)?;
+        let records = iter_records(&path, HydrateImages::All)?;
         let mut patched = false;
         let records = records.map(|record| {
             let mut record = record?;

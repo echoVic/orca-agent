@@ -1835,10 +1835,63 @@ pub(crate) fn render_live_messages(
                     end.saturating_sub(start) as u16,
                 ),
                 preview_rect,
-                image: image.clone(),
+                target: crate::image_preview::ImageHitTarget::Image(image.clone()),
             })
         })
         .collect();
+
+    for (index, message) in state.transcript.messages.iter().enumerate() {
+        let ChatMessage::ToolCall {
+            id,
+            output: Some(output),
+            ..
+        } = message
+        else {
+            continue;
+        };
+        let Some(range) = state.transcript.render_cache.message_row_range(index) else {
+            continue;
+        };
+        let start = range.start.max(visible_start);
+        let end = range.end.min(visible_end);
+        if start >= end {
+            continue;
+        }
+        let markers = output
+            .lines()
+            .filter(|line| is_tool_image_marker(line.trim()))
+            .collect::<Vec<_>>();
+        if markers.is_empty() {
+            continue;
+        }
+        for row in start..end {
+            if state
+                .transcript
+                .render_cache
+                .row_text_at(row)
+                .is_some_and(|text| {
+                    markers.iter().any(|marker| {
+                        text.trim().strip_prefix("│").unwrap_or(text.trim()).trim() == marker.trim()
+                    })
+                })
+            {
+                state
+                    .image_hit_areas
+                    .push(crate::image_preview::ImageHitArea {
+                        rect: Rect::new(
+                            area.x,
+                            area.y + row.saturating_sub(visible_start) as u16,
+                            area.width,
+                            1,
+                        ),
+                        preview_rect: None,
+                        target: crate::image_preview::ImageHitTarget::ToolResult {
+                            call_id: id.clone(),
+                        },
+                    });
+            }
+        }
+    }
 
     state.collapsible_hit_areas = crate::transcript_hit::collapsible_hit_areas(
         &state.transcript.messages,
@@ -1853,7 +1906,12 @@ pub(crate) fn render_live_messages(
     let native_previews = state
         .image_hit_areas
         .iter()
-        .filter_map(|hit| hit.preview_rect.map(|rect| (rect, hit.image.clone())))
+        .filter_map(|hit| match &hit.target {
+            crate::image_preview::ImageHitTarget::Image(image) => {
+                hit.preview_rect.map(|rect| (rect, image.clone()))
+            }
+            crate::image_preview::ImageHitTarget::ToolResult { .. } => None,
+        })
         .collect::<Vec<_>>();
     for (rect, image) in native_previews {
         state.image_renderer.paint_native(
@@ -4085,6 +4143,21 @@ fn append_diff_lines(
     }
 }
 
+fn is_tool_image_marker(line: &str) -> bool {
+    #[cfg(test)]
+    tests::TOOL_IMAGE_MARKER_CHECKS.with(|checks| checks.set(checks.get() + 1));
+    if line == "[1 image attached]" {
+        return true;
+    }
+    line.strip_prefix('[')
+        .and_then(|line| line.strip_suffix(" images attached]"))
+        .is_some_and(|count| {
+            !count.is_empty()
+                && count.bytes().all(|byte| byte.is_ascii_digit())
+                && count.parse::<usize>().is_ok_and(|count| count > 0)
+        })
+}
+
 fn append_tool_output_lines(
     lines: &mut Vec<Line<'static>>,
     output: &str,
@@ -4126,9 +4199,23 @@ fn append_tool_output_lines(
     if force_expand {
         return;
     }
-    let hidden = total.saturating_sub(shown);
+    // Attachment rows stay reachable even when the surrounding output is folded.
+    let mut attachment_rows = 0;
+    for marker in output
+        .lines()
+        .skip(shown)
+        .filter(|line| is_tool_image_marker(line.trim()))
+    {
+        lines.push(Line::from(vec![
+            rail.clone(),
+            Span::styled(marker.to_string(), theme.muted_style()),
+        ]));
+        attachment_rows += 1;
+    }
+    let hidden = total.saturating_sub(shown).saturating_sub(attachment_rows);
+    let visible = shown.min(total) + attachment_rows;
     let tail = if expanded && hidden > 0 {
-        format!("{shown} of {total} lines shown · ctrl+o to collapse")
+        format!("{visible} of {total} lines shown · ctrl+o to collapse")
     } else if hidden > 0 {
         format!("+{} · ctrl+o to expand", line_count(hidden))
     } else if clipped {
@@ -6398,7 +6485,7 @@ fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog,
     let labels: Vec<String> = dialog
         .options
         .iter()
-        .map(|option| approval_option_label(*option, &dialog.tool))
+        .map(|option| approval_option_label(*option, &dialog.tool, dialog.target.as_deref()))
         .collect();
     let label_width = labels
         .iter()
@@ -6412,7 +6499,7 @@ fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog,
             &option.key().to_string(),
             &labels[index],
             label_width,
-            approval_option_detail(*option),
+            approval_option_detail(*option, &dialog.tool),
             inner_width,
         ));
     }
@@ -6447,11 +6534,23 @@ fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog,
     frame.render_widget(Paragraph::new(content).block(block), popup);
 }
 
-fn approval_option_label(option: ApprovalOption, tool: &str) -> String {
+fn approval_option_label(option: ApprovalOption, tool: &str, target: Option<&str>) -> String {
     match option {
+        ApprovalOption::Once
+            if tool == "computer" && target.is_some_and(|target| target.ends_with("#secure")) =>
+        {
+            "Allow typing this once".to_string()
+        }
         ApprovalOption::Once => "Allow once".to_string(),
         ApprovalOption::AlwaysTool => format!("Allow {tool} this session"),
+        ApprovalOption::AlwaysTarget if tool == "computer" => {
+            "Allow this app this session".to_string()
+        }
         ApprovalOption::AlwaysTarget => "Allow this exact call".to_string(),
+        ApprovalOption::AlwaysTargetSaved if tool == "computer" => {
+            "Always allow this app (saved)".to_string()
+        }
+        ApprovalOption::AlwaysTargetSaved => "Always allow this target (saved)".to_string(),
         ApprovalOption::AlwaysToolSaved => format!("Always allow {tool} (saved)"),
         ApprovalOption::AlwaysServerSaved => match orca_core::mcp_types::mcp_tool_server(tool) {
             Some(server) => format!("Always allow the {server} server (saved)"),
@@ -6461,11 +6560,18 @@ fn approval_option_label(option: ApprovalOption, tool: &str) -> String {
     }
 }
 
-fn approval_option_detail(option: ApprovalOption) -> &'static str {
+fn approval_option_detail(option: ApprovalOption, tool: &str) -> &'static str {
     match option {
         ApprovalOption::Once => "run it now",
         ApprovalOption::AlwaysTool => "skip approval for this tool until you quit",
+        ApprovalOption::AlwaysTarget if tool == "computer" => {
+            "skip approval for this app until you quit"
+        }
         ApprovalOption::AlwaysTarget => "remember only this exact call",
+        ApprovalOption::AlwaysTargetSaved if tool == "computer" => {
+            "save an allow rule for this app"
+        }
+        ApprovalOption::AlwaysTargetSaved => "save an allow rule for this target",
         ApprovalOption::AlwaysToolSaved => "save an allow rule so future sessions skip it too",
         ApprovalOption::AlwaysServerSaved => {
             "save an allow rule covering every tool on this server"
@@ -7298,6 +7404,13 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    std::thread_local! {
+        // Count actual marker classification work, without elapsed-time thresholds.
+        pub(super) static TOOL_IMAGE_MARKER_CHECKS: std::cell::Cell<usize> = const {
+            std::cell::Cell::new(0)
+        };
+    }
 
     fn set_surface_metrics(
         state: &mut AppState,
@@ -8978,6 +9091,48 @@ mod tests {
             diff_scroll: 0,
         });
         state
+    }
+
+    #[test]
+    fn a_computer_approval_panel_names_the_app_and_its_warning() {
+        let mut state = approval_state();
+        let dialog = state.approval_dialog.as_mut().unwrap();
+        dialog.tool = "computer".into();
+        dialog.target = Some("com.apple.Safari".into());
+        dialog.options = ApprovalDialog::options_for("computer", Some("com.apple.Safari"));
+        dialog.diff = Some(
+            "observe in Safari (com.apple.Safari)\nwarning: Safari web pages may carry instructions aimed at the agent".into(),
+        );
+
+        let frame = frame_string(&mut state, 140, 35);
+        for text in [
+            "observe in Safari (com.apple.Safari)",
+            "warning: Safari web pages may carry instructions aimed at the agent",
+            "Allow this app this session",
+            "skip approval for this app until you quit",
+            "Always allow this app (saved)",
+            "save an allow rule for this app",
+            "1/2/7/4 pick",
+        ] {
+            assert!(frame.contains(text), "missing {text:?}: {frame}");
+        }
+        assert!(!frame.contains("Allow computer this session"), "{frame}");
+    }
+
+    #[test]
+    fn a_secure_computer_approval_only_offers_typing_once_or_deny() {
+        let mut state = approval_state();
+        let dialog = state.approval_dialog.as_mut().unwrap();
+        dialog.tool = "computer".into();
+        dialog.target = Some("com.apple.Safari#secure".into());
+        dialog.options = ApprovalDialog::options_for("computer", Some("com.apple.Safari#secure"));
+
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(frame.contains("Allow typing this once"), "{frame}");
+        assert!(frame.contains("Deny"), "{frame}");
+        assert!(frame.contains("1/4 pick"), "{frame}");
+        assert!(!frame.contains("this session"), "{frame}");
+        assert!(!frame.contains("(saved)"), "{frame}");
     }
 
     #[test]
@@ -11619,6 +11774,68 @@ mod tests {
     }
 
     #[test]
+    fn cached_frames_do_not_scan_offscreen_tool_outputs_for_image_markers() {
+        let theme = Theme::named(ThemeName::Dark);
+        let tool = ChatMessage::ToolCall {
+            id: "computer-image".into(),
+            name: "computer".into(),
+            target: Some("com.apple.Safari".into()),
+            status: "completed".into(),
+            output: Some(format!("{}[1 image attached]", "element\n".repeat(256))),
+            diff: None,
+            kind: None,
+            expanded: false,
+        };
+        let mut state = test_state();
+        state.push_message(ChatMessage::Assistant("older\n".repeat(20)));
+        state.push_message(tool.clone());
+        state.push_message(ChatMessage::Assistant("newer\n".repeat(20)));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 6))
+            .expect("test backend");
+
+        for follow_tail in [true, false] {
+            state.viewport.auto_scroll = follow_tail;
+            state.viewport.scroll_offset = 0;
+            // Warm the real render cache before measuring the per-frame hit-area scan.
+            terminal
+                .draw(|frame| render_live_messages(frame, frame.area(), &mut state, &theme))
+                .expect("warm frame");
+            TOOL_IMAGE_MARKER_CHECKS.with(|checks| checks.set(0));
+            terminal
+                .draw(|frame| render_live_messages(frame, frame.area(), &mut state, &theme))
+                .expect("cached frame");
+
+            let range = state.transcript.render_cache.message_row_range(1).unwrap();
+            let visible_start = state.viewport.viewport_base_row;
+            let visible_end = visible_start + state.viewport.visible_height;
+            assert!(range.end <= visible_start || range.start >= visible_end);
+            assert!(state.image_hit_areas.is_empty());
+            assert_eq!(
+                TOOL_IMAGE_MARKER_CHECKS.with(std::cell::Cell::get),
+                0,
+                "an offscreen tool output must not be scanned on a cached frame"
+            );
+        }
+
+        // The same folded output still exposes its image marker when visible.
+        let mut visible = test_state();
+        visible.push_message(tool);
+        terminal
+            .draw(|frame| render_live_messages(frame, frame.area(), &mut visible, &theme))
+            .expect("visible frame");
+        let hit = visible
+            .image_hit_areas
+            .first()
+            .expect("image marker hit area");
+        assert!(matches!(
+            &hit.target,
+            crate::image_preview::ImageHitTarget::ToolResult { call_id }
+                if call_id == "computer-image"
+        ));
+        assert!(terminal.backend().buffer()[(hit.rect.x + 6, hit.rect.y)].symbol() == "[");
+    }
+
+    #[test]
     fn live_pane_honours_scroll_offset_when_content_overflows() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
@@ -12638,6 +12855,28 @@ mod tests {
         assert_eq!(
             text,
             " ⠋ Running 12s · bash cargo test -p orca-tui · Esc interrupt"
+        );
+    }
+
+    #[test]
+    fn running_activity_line_for_computer_names_the_app() {
+        let mut state = test_state();
+        state.status = AppStatus::Running;
+        state.running_started_at = Some(Instant::now() - Duration::from_secs(3));
+        state.tick = 0;
+        state.push_message(ChatMessage::ToolCall {
+            id: "call-1".into(),
+            name: "computer".into(),
+            target: Some("com.apple.Safari".into()),
+            status: "running".into(),
+            output: None,
+            diff: None,
+            kind: None,
+            expanded: false,
+        });
+        assert_eq!(
+            activity_line(&state, &Theme::named(ThemeName::Dark)).as_deref(),
+            Some(" ⠋ Running 3s · computer com.apple.Safari · Esc interrupt")
         );
     }
 

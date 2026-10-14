@@ -408,6 +408,7 @@ mod tests {
         let config = RunConfig {
             cwd: Some(cwd.path().to_path_buf()),
             approval_mode: ApprovalMode::AutoEdit,
+            computer_use: orca_core::config::ComputerUseConfig::default(),
             tools: orca_core::config::ToolConfig {
                 shell_enforcement_decision: Some(landlock_only_decision()),
                 ..orca_core::config::ToolConfig::default()

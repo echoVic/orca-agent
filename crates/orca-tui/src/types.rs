@@ -337,6 +337,9 @@ pub enum ApprovalOption {
     AlwaysTool,
     /// Approve and remember this tool + target for the rest of the session.
     AlwaysTarget,
+    /// Approve, remember this tool + target for the session, and save an
+    /// allow rule with the target as its pattern to the user config.
+    AlwaysTargetSaved,
     /// MCP tools only: approve, remember this tool for the rest of the
     /// session, and save an allow rule to the user config so future
     /// sessions skip the prompt too.
@@ -358,6 +361,7 @@ impl ApprovalOption {
             ApprovalOption::Deny => '4',
             ApprovalOption::AlwaysToolSaved => '5',
             ApprovalOption::AlwaysServerSaved => '6',
+            ApprovalOption::AlwaysTargetSaved => '7',
         }
     }
 
@@ -369,6 +373,7 @@ impl ApprovalOption {
             ApprovalOption::Deny => 'n',
             ApprovalOption::AlwaysToolSaved => '5',
             ApprovalOption::AlwaysServerSaved => '6',
+            ApprovalOption::AlwaysTargetSaved => '7',
         }
     }
 
@@ -383,6 +388,7 @@ impl ApprovalOption {
             ApprovalOption::AlwaysTarget => "always allow this exact call",
             ApprovalOption::AlwaysToolSaved => "always allow this tool (saved)",
             ApprovalOption::AlwaysServerSaved => "always allow this server (saved)",
+            ApprovalOption::AlwaysTargetSaved => "always allow this target (saved)",
             ApprovalOption::Deny => "deny",
         }
     }
@@ -419,10 +425,24 @@ impl ApprovalDialog {
     /// always gets the same five options, in place of `AlwaysTarget`: an MCP
     /// call's target is its own tool name, so remembering it adds nothing to
     /// `AlwaysTool`, and the two saved options, persisted to the user config, take its place.
+    /// Computer approvals offer session and saved grants for the app;
+    /// missing app targets and secure-field input only offer a single approval or denial.
     /// For every other tool, `AlwaysTarget` is only shown when a target is
     /// present AND the tool is likely to be called again with the same
     /// target (e.g. reading a fixed file path).
     pub fn options_for(tool: &str, target: Option<&str>) -> Vec<ApprovalOption> {
+        if tool == "computer" {
+            return if target.is_none_or(|target| target.ends_with("#secure")) {
+                vec![ApprovalOption::Once, ApprovalOption::Deny]
+            } else {
+                vec![
+                    ApprovalOption::Once,
+                    ApprovalOption::AlwaysTarget,
+                    ApprovalOption::AlwaysTargetSaved,
+                    ApprovalOption::Deny,
+                ]
+            };
+        }
         if orca_core::mcp_types::mcp_tool_server(tool).is_some() {
             return vec![
                 ApprovalOption::Once,
@@ -535,6 +555,7 @@ pub struct AppState {
     pub(crate) conversation_target: ConversationTarget,
     pub(crate) transcript: TranscriptState,
     pub(crate) image_viewer: Option<ImageViewerState>,
+    pub(crate) pending_tool_image_call_id: Option<String>,
     pub(crate) image_renderer: ImageRenderState,
     pub(crate) image_hit_areas: Vec<ImageHitArea>,
     pub(crate) collapsible_hit_areas: Vec<CollapsibleHitArea>,
@@ -1007,6 +1028,7 @@ impl AppState {
         Self {
             transcript: TranscriptState::new(),
             image_viewer: None,
+            pending_tool_image_call_id: None,
             image_renderer: ImageRenderState::default(),
             image_hit_areas: Vec::new(),
             collapsible_hit_areas: Vec::new(),
@@ -1430,6 +1452,7 @@ impl AppState {
     }
 
     pub(crate) fn reset_session_projection(&mut self) {
+        self.pending_tool_image_call_id = None;
         self.surface_session.reset();
         self.task_transcript = None;
         self.clear_messages();

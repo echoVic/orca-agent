@@ -3,7 +3,7 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::assets;
+use super::assets::{self, HydrateImages};
 use super::types::{SessionRecord, StoredSessionHealth, StoredSessionHealthIssue};
 use super::writer::{
     MAX_SESSION_LINE_BYTES, open_regular_history_file, parse_session_record, read_bounded_line,
@@ -42,8 +42,8 @@ impl SessionRecordSnapshot {
         })
     }
 
-    pub fn records(&self) -> io::Result<SessionRecords> {
-        SessionRecords::from_snapshot(self, None)
+    pub fn records(&self, images: HydrateImages) -> io::Result<SessionRecords> {
+        SessionRecords::from_snapshot(self, None, images)
     }
 }
 
@@ -65,6 +65,7 @@ pub(crate) struct SessionRecords {
     path: PathBuf,
     compressed: bool,
     budget: Option<InspectionBudget>,
+    images: HydrateImages,
     line: Vec<u8>,
     offset: u64,
     pub line_number: u64,
@@ -73,18 +74,59 @@ pub(crate) struct SessionRecords {
     pub issue: Option<StoredSessionHealthIssue>,
 }
 
-pub(crate) fn iter_records(path: &Path) -> io::Result<SessionRecords> {
-    SessionRecords::open(path, None)
+pub(crate) fn iter_records(path: &Path, images: HydrateImages) -> io::Result<SessionRecords> {
+    SessionRecords::open(path, None, images)
+}
+
+/// Read preview bytes even for tool images omitted by normal session resume.
+pub(crate) fn read_tool_message_images(
+    path: &Path,
+    tool_call_id: &str,
+) -> io::Result<Vec<orca_core::conversation::ImageInput>> {
+    let mut records = iter_records(path, HydrateImages::None)?;
+    while let Some(record) = records.next() {
+        if let SessionRecord::Message {
+            message:
+                super::types::StoredMessage::Tool {
+                    tool_call_id: id,
+                    images,
+                    ..
+                },
+            ..
+        } = record?
+            && id == tool_call_id
+            && !images.is_empty()
+        {
+            let value = serde_json::from_str(records.text()).map_err(io::Error::other)?;
+            let value = assets::hydrate(path, value, HydrateImages::All)?;
+            let record = serde_json::from_value(value).map_err(io::Error::other)?;
+            let record =
+                super::writer::validate_session_record(record).map_err(io::Error::other)?;
+            if let SessionRecord::Message {
+                message: super::types::StoredMessage::Tool { images, .. },
+                ..
+            } = record
+            {
+                return Ok(images);
+            }
+        }
+    }
+    Ok(Vec::new())
 }
 
 impl SessionRecords {
-    pub fn open(path: &Path, budget: Option<InspectionBudget>) -> io::Result<Self> {
-        Self::from_snapshot(&SessionRecordSnapshot::open(path)?, budget)
+    pub fn open(
+        path: &Path,
+        budget: Option<InspectionBudget>,
+        images: HydrateImages,
+    ) -> io::Result<Self> {
+        Self::from_snapshot(&SessionRecordSnapshot::open(path)?, budget, images)
     }
 
     fn from_snapshot(
         snapshot: &SessionRecordSnapshot,
         budget: Option<InspectionBudget>,
+        images: HydrateImages,
     ) -> io::Result<Self> {
         let path = &snapshot.path;
         let file = SnapshotReader {
@@ -104,6 +146,7 @@ impl SessionRecords {
             path: path.to_path_buf(),
             compressed,
             budget,
+            images,
             line: Vec::new(),
             offset: 0,
             line_number: 0,
@@ -222,7 +265,7 @@ impl Iterator for SessionRecords {
                 if !assets::is_asset_record(&value) {
                     return Err(code);
                 }
-                let value = assets::hydrate(&self.path, value, self.budget.is_none())
+                let value = assets::hydrate(&self.path, value, self.images)
                     .map_err(|_| "invalid_image_asset")?;
                 let record: SessionRecord =
                     serde_json::from_value(value).map_err(|_| "malformed_asset_record")?;
@@ -244,5 +287,160 @@ impl Iterator for SessionRecords {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use orca_core::conversation::{ImageDetail, ImageInput, ImageSource, Message};
+
+    use super::*;
+    use crate::thread_store::types::StoredMessage;
+
+    fn stored_image(path: &Path, message: &Message) -> serde_json::Value {
+        let record = SessionRecord::Message {
+            id: None,
+            turn_id: None,
+            message: StoredMessage::from(message),
+        };
+        assets::externalize(path, serde_json::to_value(record).unwrap()).unwrap()
+    }
+
+    fn tool_message(call_id: &str, image: ImageInput) -> Message {
+        Message::Tool {
+            tool_call_id: call_id.to_string(),
+            content: "screenshot".to_string(),
+            images: vec![image],
+            terminal: None,
+            pinned: false,
+        }
+    }
+
+    fn image(data: &str) -> ImageInput {
+        ImageInput {
+            source: ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: data.to_string(),
+            },
+            detail: ImageDetail::High,
+        }
+    }
+
+    fn write_records(path: &Path, records: &[serde_json::Value]) {
+        let mut file = File::create(path).unwrap();
+        for record in records {
+            serde_json::to_writer(&mut file, record).unwrap();
+            std::io::Write::write_all(&mut file, b"\n").unwrap();
+        }
+    }
+
+    #[test]
+    fn preview_reads_only_the_matching_records_image_assets() {
+        for user_image in [false, true] {
+            for corrupt in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("preview.jsonl");
+                let unrelated_image = image("AQIDBA==");
+                let unrelated_message = if user_image {
+                    Message::user_with_images(
+                        "earlier user image".to_string(),
+                        vec![unrelated_image],
+                    )
+                } else {
+                    tool_message("earlier-tool", unrelated_image)
+                };
+                let unrelated = stored_image(&path, &unrelated_message);
+                let expected = image("BQYHCA==");
+                let target = stored_image(&path, &tool_message("target", expected.clone()));
+                write_records(&path, &[unrelated.clone(), target]);
+                let blob = assets::directory(&path)
+                    .join(unrelated["assets"][0]["sha256"].as_str().unwrap());
+                if corrupt {
+                    fs::write(blob, [9u8; 4]).unwrap();
+                } else {
+                    fs::remove_file(blob).unwrap();
+                }
+
+                assert_eq!(
+                    read_tool_message_images(&path, "target")
+                        .expect("unrelated image assets must not block this preview"),
+                    vec![expected],
+                    "user_image={user_image}, corrupt={corrupt}"
+                );
+                assert!(
+                    read_tool_message_images(&path, "missing-call")
+                        .unwrap()
+                        .is_empty()
+                );
+                if !user_image {
+                    assert!(read_tool_message_images(&path, "earlier-tool").is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preview_still_rejects_corrupt_matching_image_assets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preview.jsonl");
+        let expected = image("AQIDBA==");
+        let record = stored_image(&path, &tool_message("target", expected.clone()));
+        write_records(&path, std::slice::from_ref(&record));
+        assert_eq!(
+            read_tool_message_images(&path, "target").unwrap(),
+            vec![expected]
+        );
+        let blob = assets::directory(&path).join(record["assets"][0]["sha256"].as_str().unwrap());
+        fs::write(blob, [9u8; 4]).unwrap();
+        assert!(read_tool_message_images(&path, "target").is_err());
+    }
+
+    #[test]
+    fn preview_still_rejects_invalid_unrelated_asset_manifests() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preview.jsonl");
+        let mut unrelated = stored_image(&path, &tool_message("earlier-tool", image("AQIDBA==")));
+        let target = stored_image(&path, &tool_message("target", image("BQYHCA==")));
+        unrelated["assets"][0]["sha256"] = serde_json::json!("../../outside");
+        write_records(&path, &[unrelated, target]);
+
+        assert!(read_tool_message_images(&path, "target").is_err());
+    }
+
+    #[test]
+    fn preview_reads_inline_images_and_skips_image_free_matching_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preview.jsonl");
+        let expected = image("AQIDBA==");
+        let empty = SessionRecord::Message {
+            id: None,
+            turn_id: None,
+            message: StoredMessage::from(&Message::Tool {
+                tool_call_id: "target".to_string(),
+                content: "text only".to_string(),
+                images: Vec::new(),
+                terminal: None,
+                pinned: false,
+            }),
+        };
+        let inline = SessionRecord::Message {
+            id: None,
+            turn_id: None,
+            message: StoredMessage::from(&tool_message("target", expected.clone())),
+        };
+        write_records(
+            &path,
+            &[
+                serde_json::to_value(empty).unwrap(),
+                serde_json::to_value(inline).unwrap(),
+            ],
+        );
+
+        assert_eq!(
+            read_tool_message_images(&path, "target").unwrap(),
+            vec![expected]
+        );
     }
 }

@@ -1,0 +1,40 @@
+[package]
+name = "orca-computer-use"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[features]
+test-utils = []
+
+[dependencies]
+crossbeam-channel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true, features = ["png"] }
+base64 = { workspace = true }
+orca-core = { path = "../orca-core" }
+orca-platform = { path = "../orca-platform" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSEnumerator", "NSBundle", "NSError", "NSObject", "NSProcessInfo", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSRunningApplication", "block2", "libc"] }
+objc2-application-services = { version = "0.3.2", default-features = false, features = ["std", "AXUIElement", "AXValue", "AXError", "AXAttributeConstants", "AXActionConstants", "AXRoleConstants", "HIServices", "Processes", "libc"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGEvent", "CGEventTypes", "CGEventSource", "CGRemoteOperation", "CGImage", "CGBitmapContext", "CGContext", "CGColorSpace", "CGDataProvider", "CGWindow", "CGError", "CGSession", "libc"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFRunLoop", "CFDate", "CFMachPort", "CFNumber", "CFString"] }
+objc2-screen-capture-kit = "0.3.2"
+block2 = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_Security"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+orca-computer-use = { path = ".", features = ["test-utils"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSPasteboard", "NSPasteboardItem"] }

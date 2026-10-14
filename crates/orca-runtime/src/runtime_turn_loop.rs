@@ -818,6 +818,7 @@ mod tests {
             external_tools: Vec::<ExternalToolConfig>::new(),
             hooks: Vec::<HookConfig>::new(),
             subagents: SubagentConfig::default(),
+            computer_use: orca_core::config::ComputerUseConfig::default(),
             tools: ToolConfig::default(),
             workflows: WorkflowConfig::default(),
             theme: ThemeName::Dark,
@@ -870,9 +871,9 @@ mod tests {
             0,
             &subagent_type,
             &instructions,
-            config.approval_mode,
+            &config,
             &memory,
-            orca_core::subagent_config::DelegationPolicy::default(),
+            None,
         );
         let mut background_workflows = Vec::new();
         let mut input = RuntimeTurnLoopInput {
@@ -1084,9 +1085,9 @@ mod tests {
             0,
             &subagent_type,
             &instructions,
-            config.approval_mode,
+            &config,
             &memory,
-            orca_core::subagent_config::DelegationPolicy::default(),
+            None,
         );
         let mut background_workflows = Vec::new();
         let response = ProviderResponse {

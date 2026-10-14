@@ -1760,6 +1760,7 @@ mod tests {
                 max_depth: 1,
                 ..SubagentConfig::default()
             },
+            computer_use: orca_core::config::ComputerUseConfig::default(),
             tools: ToolConfig::default(),
             external_tools,
             vim_mode: false,

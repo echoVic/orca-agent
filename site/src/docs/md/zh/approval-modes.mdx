@@ -63,12 +63,26 @@ CLI 选项优先于环境变量、受信任项目配置、用户配置和内置�
 | --- | --- |
 | `1` Allow once | 执行这一次。 |
 | `2` Allow this exact call | 执行，并且之后同一工具、同一目标的调用不再询问。调用没有具体目标时不提供这一项。 |
-| `3` Allow `<tool>` this session | 执行，并且在退出前不再询问这个工具。 |
+| `3` Allow `<tool>` this session | 执行，并且在退出前不再询问这个工具。`computer` 不提供这一项。 |
 | `4` Deny | 不执行。本轮停下，由你告诉 Orca 换什么做法。按 `Esc` 也是拒绝。 |
 | `5` Always allow `<tool>` (saved) | 仅 MCP 工具提供。执行，本会话内不再询问这个工具，并把一条允许规则保存到用户配置，之后的会话也不再询问。 |
 | `6` Always allow the `<server>` server (saved) | 仅 MCP 工具提供。执行，本会话内该服务器上的所有工具都不再询问，改为保存一条覆盖整个服务器的允许规则。 |
+| `7` Always allow this app (saved) | 仅 computer use 提供。执行，本会话允许该应用，并保存一条精确匹配其 bundle id 的 allow 规则。 |
 
 选项 `5`、`6` 只在 MCP 工具的调用里出现，取代 `2` 的位置：MCP 工具调用的目标就是工具自己的名字，再次允许这一次调用，允许的不会比 `3` 更多。规则保存失败时（比如现有配置解析不了），这次调用仍会执行，本会话也仍然不再询问；界面会说明规则未能保存的原因。规则的形状见[权限规则](#权限规则)。
+
+`computer` 调用有应用目标时，选项是 `1` Allow once、`2` Allow this app this session、
+`7` Always allow this app (saved) 和 `4` Deny。没有解析出应用目标的 computer 审批
+只有 `1` 和 `4`。
+
+密码文字输入也只有 `1` 和 `4`，允许选项显示为 **Allow typing this once**。每次 `type`
+或能输入文字的 `key` 调用都会单独询问，包括单独或配合 Shift/Option 的可打印键和
+`Cmd+V`。应用授权和带 `pattern` 的 allow 规则都不能预先批准，即使规则显式写了
+`#secure` 目标。只有整个工具的 allow 规则，即为 `computer` 设置 allow 且不写
+`pattern`，能预先批准；匹配的 deny 规则仍优先。详见[Computer use](computer-use.md#应用授权)。
+
+驱动因坐标操作或过期观察，在投递时才发现密码框时，会拒绝未批准的输入。
+需要重新观察，再以密码框的元素 id 重试并请求审批。
 
 预览内容比面板长时，用 `PgUp`/`PgDn` 翻页查看。
 
@@ -79,6 +93,10 @@ CLI 选项优先于环境变量、受信任项目配置、用户配置和内置�
 ## Plan 模式
 
 在 plan 模式下，Orca 只读地调查，可能会先问几个澄清问题，最后给出计划。随后 **Plan ready** 对话框让你选择：实现计划（切回进入 plan 之前的模式；如果会话一开始就在 plan 模式，则切到 auto-edit），或者留在 plan 模式继续完善。对话进行到一半也可以切到 plan 模式。详见[终端界面](terminal-ui.md)。
+
+对于 `computer`，plan 模式只允许 `list_apps` 和 `observe`。`list_apps` 不需要应用授权。
+`observe` 和 `full-auto` 下的应用调用仍会请求应用授权，已有适用规则或应用授权时除外。
+规则不能放开 plan 模式下的其他 computer 动作。
 
 ## 权限规则
 

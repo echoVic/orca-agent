@@ -919,6 +919,77 @@ fn approval_dialog_resolves_numeric_and_legacy_keys_by_visible_options() {
 }
 
 #[test]
+fn a_computer_approval_without_an_app_cannot_grant_session_access() {
+    let dialog = ApprovalDialog {
+        id: "computer-no-app".into(),
+        interaction: None,
+        tool: "computer".into(),
+        target: None,
+        permission_kind: None,
+        background_task_id: None,
+        selected: 0,
+        options: ApprovalDialog::options_for("computer", None),
+        diff: None,
+        diff_scroll: 0,
+    };
+
+    assert_eq!(
+        dialog.options,
+        vec![ApprovalOption::Once, ApprovalOption::Deny]
+    );
+    for key in ['2', '3', '5', '6', '7', 'a', 'A'] {
+        assert_eq!(
+            dialog.option_for_key(key),
+            None,
+            "unexpected grant on {key}"
+        );
+    }
+    assert_eq!(dialog.option_for_key('1'), Some(ApprovalOption::Once));
+    assert_eq!(dialog.option_for_key('4'), Some(ApprovalOption::Deny));
+}
+
+#[test]
+fn a_computer_approval_offers_this_app_once_for_the_session_or_saved() {
+    assert_eq!(
+        ApprovalDialog::options_for("computer", Some("com.apple.Safari")),
+        vec![
+            ApprovalOption::Once,
+            ApprovalOption::AlwaysTarget,
+            ApprovalOption::AlwaysTargetSaved,
+            ApprovalOption::Deny,
+        ]
+    );
+    assert_eq!(
+        ApprovalDialog::options_for("computer", Some("com.apple.Safari#secure")),
+        vec![ApprovalOption::Once, ApprovalOption::Deny]
+    );
+    let dialog = ApprovalDialog {
+        id: "computer-approval".into(),
+        interaction: None,
+        tool: "computer".into(),
+        target: Some("com.apple.Safari".into()),
+        permission_kind: None,
+        background_task_id: None,
+        selected: 0,
+        options: ApprovalDialog::options_for("computer", Some("com.apple.Safari")),
+        diff: None,
+        diff_scroll: 0,
+    };
+    assert_eq!(
+        dialog.option_for_key('7'),
+        Some(ApprovalOption::AlwaysTargetSaved)
+    );
+    assert_eq!(ApprovalOption::AlwaysTargetSaved.key(), '7');
+    assert_eq!(ApprovalOption::AlwaysTargetSaved.legacy_key(), '7');
+    assert_eq!(
+        ApprovalOption::AlwaysTargetSaved.label(),
+        "always allow this target (saved)"
+    );
+    assert_eq!(dialog.option_for_key('3'), None);
+    assert_eq!(dialog.option_for_key('5'), None);
+}
+
+#[test]
 fn approval_dialog_has_four_options_with_target_and_three_without() {
     // Static-target tool (like read_file) shows AlwaysTarget option.
     let with_target = ApprovalDialog::options_for("read_file", Some("src/auth/token.rs"));

@@ -15,6 +15,7 @@ pub enum ToolName {
     Glob,
     Grep,
     Bash,
+    Computer,
     TaskReadOutput,
     SubagentMessage,
     TaskSendInput,
@@ -66,6 +67,7 @@ impl ToolName {
             "glob" => Self::Glob,
             "grep" => Self::Grep,
             "bash" => Self::Bash,
+            "computer" => Self::Computer,
             "task_read_output" => Self::TaskReadOutput,
             "subagent_message" => Self::SubagentMessage,
             "task_send_input" => Self::TaskSendInput,
@@ -129,6 +131,7 @@ impl ToolName {
             Self::Glob => "glob",
             Self::Grep => "grep",
             Self::Bash => "bash",
+            Self::Computer => "computer",
             Self::TaskReadOutput => "task_read_output",
             Self::SubagentMessage => "subagent_message",
             Self::TaskSendInput => "task_send_input",
@@ -178,6 +181,7 @@ impl ToolName {
             Self::Glob => "glob",
             Self::Grep => "grep",
             Self::Bash => "bash",
+            Self::Computer => "computer",
             Self::TaskReadOutput => "task_read_output",
             Self::SubagentMessage => "subagent_message",
             Self::TaskSendInput => "task_send_input",
@@ -229,6 +233,7 @@ impl ToolName {
             "glob" => Self::Glob,
             "grep" => Self::Grep,
             "bash" => Self::Bash,
+            "computer" => Self::Computer,
             "task_read_output" => Self::TaskReadOutput,
             "subagent_message" => Self::SubagentMessage,
             "task_send_input" => Self::TaskSendInput,
@@ -329,6 +334,7 @@ pub enum ToolCapability {
     FsSearch,
     FsWrite,
     ShellExecute,
+    ComputerUse,
     GitInspect,
     NetworkSearch,
     AgentDelegate,
@@ -397,7 +403,9 @@ impl CapabilitySet {
     }
 
     pub fn action_kind(&self) -> ActionKind {
-        if self.contains(ToolCapability::ShellExecute) {
+        if self.contains(ToolCapability::ComputerUse) {
+            ActionKind::Computer
+        } else if self.contains(ToolCapability::ShellExecute) {
             ActionKind::Shell
         } else if self.contains(ToolCapability::FsWrite) {
             ActionKind::Write
@@ -1172,6 +1180,27 @@ fn approx_bytes_for_tokens(tokens: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn computer_actions_have_a_builtin_name_and_take_capability_precedence() {
+        let name = ToolName::Computer;
+        assert_eq!(ToolName::plain("computer"), name);
+        assert_eq!(ToolName::from_str("computer"), Some(name.clone()));
+        assert_eq!(name.as_str(), "computer");
+        assert_eq!(name.local_name(), "computer");
+        assert_eq!(serde_json::to_string(&name).unwrap(), "\"computer\"");
+        assert_eq!(
+            serde_json::from_str::<ToolName>("\"computer\"").unwrap(),
+            name
+        );
+        assert_eq!(ActionKind::Computer.as_str(), "computer");
+        let capabilities = CapabilitySet::new(vec![
+            ToolCapability::ComputerUse,
+            ToolCapability::ShellExecute,
+        ]);
+        assert_eq!(capabilities.action_kind(), ActionKind::Computer);
+        assert!(!CapabilitySet::new(vec![ToolCapability::ComputerUse]).is_read_only());
+    }
 
     #[test]
     fn tool_name_round_trips_plain_names() {

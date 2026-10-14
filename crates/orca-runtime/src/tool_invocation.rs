@@ -19,6 +19,7 @@ pub struct ToolInvocation {
     pub requested: ToolRequest,
     pub effective: ToolRequest,
     pub action: Option<ActionKind>,
+    pub approval_preview: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +125,9 @@ pub(crate) fn provider_tool_schema_override(
             .into_iter()
             .filter(|definition| {
                 // A policy the model cannot act on must not be advertised.
-                definition.name != "subagent" || tool_policy.delegation().allows_new_children()
+                (definition.name != "subagent" || tool_policy.delegation().allows_new_children())
+                    && (definition.name != "computer"
+                        || (subagent_depth == 0 && tool_policy.allowed_tools().is_none()))
             })
             .map(|definition| ProviderToolDefinition {
                 name: definition.name,
@@ -153,6 +156,11 @@ pub(crate) fn provider_config_for_agent_loop(
     );
     if let Some(tools) = tools_override.as_mut() {
         omit_unavailable_shell_launch_tools(tools, &shell_readiness);
+        if !crate::computer_use::visibility::session_visible(config, subagent_depth)
+            || tool_policy.allowed_tools().is_some()
+        {
+            tools.retain(|tool| tool.name != "computer");
+        }
     }
     let mut provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
@@ -276,6 +284,7 @@ pub fn prepare_tool_invocation(
         requested: tool_request.clone(),
         effective,
         action,
+        approval_preview: None,
     }
 }
 
@@ -306,6 +315,7 @@ pub fn prepare_tool_invocation_with_external(
         requested: tool_request.clone(),
         effective,
         action,
+        approval_preview: None,
     }
 }
 
@@ -423,12 +433,45 @@ pub fn approval_request_for_invocation(invocation: &ToolInvocation) -> Option<Ap
         ),
         tool: Some(invocation.effective.name.as_str().to_string()),
         target: invocation.effective.target.clone(),
-        preview: None,
+        preview: invocation.approval_preview.clone(),
     })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_tools_omit_computer_outside_the_tui() {
+        let registry = orca_mcp::McpRegistry::default();
+        let policy = super::AgentToolPolicyContext::unrestricted();
+        let raw = super::provider_tool_schema_override(
+            0,
+            &orca_core::subagent_types::SubagentType::General,
+            policy,
+            &registry,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            raw.iter().any(|tool| tool.name == "computer"),
+            "computer must be registered before testing its visibility"
+        );
+        let config = orca_core::config::RunConfig::default();
+        let provider = super::provider_config_for_agent_loop(
+            &config,
+            0,
+            &orca_core::subagent_types::SubagentType::General,
+            policy,
+            &registry,
+        );
+        assert!(
+            !provider
+                .tools_override
+                .unwrap()
+                .iter()
+                .any(|tool| tool.name == "computer")
+        );
+    }
+
     use orca_core::approval_rules::PermissionRules;
     use orca_core::approval_types::{ActionKind, ApprovalMode};
     use orca_core::config::{
@@ -487,6 +530,7 @@ mod tests {
                 max_depth: 1,
                 ..SubagentConfig::default()
             },
+            computer_use: orca_core::config::ComputerUseConfig::default(),
             tools: ToolConfig {
                 shell_enforcement_decision: Some(
                     orca_core::capability::SandboxEnforcementDecision::new(
@@ -524,6 +568,24 @@ mod tests {
 
     fn schema_names(tools: &[ProviderToolDefinition]) -> Vec<&str> {
         tools.iter().map(|tool| tool.name.as_str()).collect()
+    }
+
+    #[test]
+    fn an_approval_request_carries_the_invocation_preview() {
+        let requested = request(
+            ToolName::plain("computer"),
+            ActionKind::Computer,
+            Some("com.apple.Safari"),
+            None,
+        );
+        let invocation = ToolInvocation {
+            effective: requested.clone(),
+            requested,
+            action: Some(ActionKind::Computer),
+            approval_preview: Some("operate Safari".into()),
+        };
+        let approval = approval_request_for_invocation(&invocation).unwrap();
+        assert_eq!(approval.preview.as_deref(), Some("operate Safari"));
     }
 
     #[test]
@@ -652,6 +714,7 @@ mod tests {
             requested: request.clone(),
             effective: request,
             action: Some(ActionKind::Shell),
+            approval_preview: None,
         };
         let readiness = crate::shell_readiness::ShellReadiness::Blocked {
             detail: "seatbelt probe terminated by signal 6".to_string(),
@@ -859,6 +922,7 @@ mod tests {
                 None,
             ),
             action: Some(ActionKind::Read),
+            approval_preview: None,
         };
 
         let approval = approval_request_for_invocation(&invocation).expect("approval");

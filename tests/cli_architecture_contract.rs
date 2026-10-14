@@ -25,6 +25,7 @@ fn root_binary_exposes_the_supported_command_surface() {
     for option in ["--resume", "--fork", "--continue", "--model", "--mode"] {
         assert!(tokens.contains(&option), "root help is missing {option}");
     }
+    assert!(!stdout.contains("computer-use-driver"));
 }
 
 #[test]

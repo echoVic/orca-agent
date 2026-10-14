@@ -78,6 +78,7 @@ pub enum ActionKind {
     Network,
     Agent,
     Shell,
+    Computer,
 }
 
 impl ActionKind {
@@ -88,6 +89,7 @@ impl ActionKind {
             Self::Network => "network",
             Self::Agent => "agent",
             Self::Shell => "shell",
+            Self::Computer => "computer",
         }
     }
 }

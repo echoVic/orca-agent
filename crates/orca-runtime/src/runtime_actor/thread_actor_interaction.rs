@@ -1285,7 +1285,8 @@ impl ThreadActor {
                 interaction_request.clone(),
                 execution_context_fingerprint,
                 surface::DurableInteractionContinuationIntent::ToolInvocation(
-                    surface::ToolInvocationIntent::before_invocation(tool, authority),
+                    surface::ToolInvocationIntent::before_invocation(tool, authority)
+                        .with_computer_approval(approval.clone()),
                 ),
             )
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;

@@ -8599,6 +8599,7 @@ rl.on("line", (line) => {
             additional_working_directories: Vec::new(),
             budget: Default::default(),
             subagents: SubagentConfig::default(),
+            computer_use: orca_core::config::ComputerUseConfig::default(),
             tools: ToolConfig {
                 shell_enforcement_decision: Some(
                     orca_core::capability::SandboxEnforcementDecision::new(

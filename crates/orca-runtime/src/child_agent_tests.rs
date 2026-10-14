@@ -62,6 +62,7 @@ fn config(model: Option<&str>) -> RunConfig {
         additional_working_directories: Vec::new(),
         budget: Default::default(),
         subagents: SubagentConfig::default(),
+        computer_use: orca_core::config::ComputerUseConfig::default(),
         tools: ToolConfig::default(),
         workflows: WorkflowConfig::default(),
         theme: ThemeName::default(),
@@ -354,7 +355,7 @@ fn a_child_agent_on_a_model_that_cannot_see_images_gets_a_note() {
             images: vec![ImageInput {
                 source: ImageSource::Base64 {
                     media_type: "image/png".to_string(),
-                    data: "AA==".to_string(),
+                    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
                 },
                 detail: ImageDetail::High,
             }],
@@ -433,7 +434,7 @@ fn a_child_agent_on_a_custom_vision_model_gets_a_note_instead_of_tool_images() {
     let image = ImageInput {
         source: ImageSource::Base64 {
             media_type: "image/png".to_string(),
-            data: "AA==".to_string(),
+            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
         },
         detail: ImageDetail::High,
     };

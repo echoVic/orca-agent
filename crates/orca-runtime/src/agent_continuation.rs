@@ -2837,7 +2837,10 @@ impl ChildAgentCoordinator {
         let snapshot = crate::thread_store::SessionRecordSnapshot::open(&transcript.path)
             .map_err(|_| mismatch())?;
         let mut initial_cursor = None;
-        for entry in snapshot.records().map_err(|_| mismatch())? {
+        for entry in snapshot
+            .records(crate::thread_store::HydrateImages::NotToolMessages)
+            .map_err(|_| mismatch())?
+        {
             if let crate::thread_store::SessionRecord::SurfaceCommitPrepared {
                 batch: Some(batch),
                 ..
@@ -4267,7 +4270,7 @@ mod tests {
             images: vec![ImageInput {
                 source: orca_core::conversation::ImageSource::Base64 {
                     media_type: "image/png".to_string(),
-                    data: "AA==".to_string(),
+                    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
                 },
                 detail: orca_core::conversation::ImageDetail::High,
             }],

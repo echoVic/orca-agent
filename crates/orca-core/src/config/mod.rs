@@ -20,6 +20,28 @@ pub mod mcp_credentials;
 pub mod toml_text;
 pub mod user_edit;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ComputerUseConfig {
+    #[serde(default = "default_true")]
+    pub foreground_fallback: bool,
+    /// Set only by the interactive TUI launch; never read from or written to a file.
+    #[serde(skip)]
+    pub interactive: bool,
+}
+
+impl Default for ComputerUseConfig {
+    fn default() -> Self {
+        Self {
+            foreground_fallback: true,
+            interactive: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VimInsertEscapeSequence {
     value: String,
@@ -446,6 +468,7 @@ pub struct RunConfig {
     pub budget: BudgetConfig,
     pub subagents: SubagentConfig,
     pub tools: ToolConfig,
+    pub computer_use: ComputerUseConfig,
     pub workflows: WorkflowConfig,
     pub theme: ThemeName,
     pub vim_mode: bool,
@@ -492,6 +515,7 @@ impl Default for RunConfig {
             budget: BudgetConfig::default(),
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
+            computer_use: ComputerUseConfig::default(),
             workflows: WorkflowConfig::default(),
             theme: ThemeName::default(),
             vim_mode: false,
@@ -1120,6 +1144,7 @@ mod tests {
                 ..BudgetConfig::default()
             },
             subagents: SubagentConfig::default(),
+            computer_use: ComputerUseConfig::default(),
             tools: ToolConfig::default(),
             workflows: WorkflowConfig::default(),
             theme: ThemeName::Auto,
@@ -1208,6 +1233,7 @@ mod tests {
                 delegation: crate::subagent_config::DelegationPolicy::Adaptive,
                 ..SubagentConfig::default()
             },
+            computer_use: ComputerUseConfig::default(),
             tools: ToolConfig::default(),
             workflows: WorkflowConfig::default(),
             theme: ThemeName::default(),
@@ -1293,6 +1319,7 @@ mod tests {
             )],
             budget: BudgetConfig::default(),
             subagents: SubagentConfig::default(),
+            computer_use: ComputerUseConfig::default(),
             tools: ToolConfig::default(),
             workflows: WorkflowConfig::default(),
             theme: ThemeName::default(),
