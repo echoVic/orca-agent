@@ -81,18 +81,7 @@ impl ComputerCall {
                         _ => return Err("\"count\" must be 1 or 2".into()),
                     },
                 };
-                let modifiers = string_list(arguments, "modifiers", name, false)?;
-                for modifier in &modifiers {
-                    keys::parse_key(modifier)?;
-                    if !matches!(
-                        modifier.as_str(),
-                        "cmd" | "shift" | "option" | "alt" | "ctrl"
-                    ) {
-                        return Err(format!(
-                            "\"modifiers\" contains a non-modifier key {modifier:?}"
-                        ));
-                    }
-                }
+                let modifiers = parse_modifiers(arguments, name)?;
                 Action::Click {
                     target,
                     button,
@@ -110,9 +99,12 @@ impl ComputerCall {
             }
             "key" => {
                 let keys = string_list(arguments, "keys", name, true)?;
-                keys::parse_combo(&keys)?;
+                let mut merged_keys = parse_modifiers(arguments, name)?;
+                merged_keys.retain(|modifier| !keys.contains(modifier));
+                merged_keys.extend(keys);
+                keys::parse_combo(&merged_keys)?;
                 Action::Key {
-                    keys,
+                    keys: merged_keys,
                     target: optional_target(arguments, name)?,
                 }
             }
@@ -190,7 +182,15 @@ fn action_fields(action: &str) -> Result<&'static [&'static str], String> {
             "observe",
         ],
         "type" => &["action", "app", "window", "target", "text", "observe"],
-        "key" => &["action", "app", "window", "target", "keys", "observe"],
+        "key" => &[
+            "action",
+            "app",
+            "window",
+            "target",
+            "keys",
+            "modifiers",
+            "observe",
+        ],
         "scroll" => &[
             "action",
             "app",
@@ -212,12 +212,6 @@ pub fn action_fields_for_test(action: &str) -> Option<&'static [&'static str]> {
 
 fn validate_action_fields(arguments: &Value, action: &str) -> Result<(), String> {
     let allowed = action_fields(action)?;
-    if action == "key" && arguments.get("modifiers").is_some() {
-        return Err(
-            "`key` takes its modifiers inside `keys`, for example `[\"cmd\",\"shift\",\"t\"]`"
-                .into(),
-        );
-    }
     for field in arguments
         .as_object()
         .expect("arguments were checked")
@@ -284,6 +278,22 @@ fn string_list(
             .collect(),
         _ => Err(format!("{action} needs \"{field}\" as an array of strings")),
     }
+}
+
+fn parse_modifiers(arguments: &Value, action: &str) -> Result<Vec<String>, String> {
+    let modifiers = string_list(arguments, "modifiers", action, false)?;
+    for modifier in &modifiers {
+        keys::parse_key(modifier)?;
+        if !matches!(
+            modifier.as_str(),
+            "cmd" | "shift" | "option" | "alt" | "ctrl"
+        ) {
+            return Err(format!(
+                "\"modifiers\" contains a non-modifier key {modifier:?}"
+            ));
+        }
+    }
+    Ok(modifiers)
 }
 
 fn target_error(action: &str) -> String {
@@ -397,7 +407,7 @@ mod tests {
                 "must identify the rejected field: {error}"
             );
             assert!(
-                error.contains("remove") || error.contains("inside `keys`"),
+                error.contains("remove"),
                 "must explain how to correct the call: {error}"
             );
         }
@@ -451,8 +461,8 @@ mod tests {
     #[test]
     fn key_rejects_fields_from_other_actions() {
         rejects_unrelated_fields(
-            json!({"action":"key", "app":"x", "window":7, "target":{"element":1}, "keys":["cmd","s"], "observe":false}),
-            &["app", "window", "target", "keys", "observe"],
+            json!({"action":"key", "app":"x", "window":7, "target":{"element":1}, "keys":["s"], "modifiers":["cmd"], "observe":false}),
+            &["app", "window", "target", "keys", "modifiers", "observe"],
         );
     }
 
@@ -465,27 +475,110 @@ mod tests {
     }
 
     #[test]
-    fn key_modifiers_explain_the_correct_keys_array() {
-        assert_eq!(ComputerCall::parse(&json!({"action":"key", "app":"TextEdit", "keys":["t"], "modifiers":["shift","cmd"]})).unwrap_err(), "`key` takes its modifiers inside `keys`, for example `[\"cmd\",\"shift\",\"t\"]`");
-        assert!(
-            ComputerCall::parse(
-                &json!({"action":"key", "app":"TextEdit", "keys":["cmd","shift","t"]})
+    fn key_modifiers_are_prepended_in_the_given_order() {
+        for (modifiers, expected) in [
+            (json!(["cmd", "shift"]), vec!["cmd", "shift", "t"]),
+            (json!(["shift", "cmd"]), vec!["shift", "cmd", "t"]),
+            (json!([]), vec!["t"]),
+            (json!(["alt", "ctrl"]), vec!["alt", "ctrl", "t"]),
+            (json!(["option"]), vec!["option", "t"]),
+        ] {
+            let call = ComputerCall::parse(
+                &json!({"action":"key", "app":"TextEdit", "keys":["t"], "modifiers":modifiers}),
             )
-            .is_ok()
+            .unwrap();
+            assert_eq!(
+                call,
+                ComputerCall::Act {
+                    app: "TextEdit".into(),
+                    window: None,
+                    observe_after: true,
+                    action: Action::Key {
+                        keys: expected.iter().map(|key| (*key).to_owned()).collect(),
+                        target: None,
+                    },
+                }
+            );
+            assert_eq!(
+                call,
+                ComputerCall::parse(&json!({"action":"key", "app":"TextEdit", "keys":expected}))
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn key_modifiers_skip_keys_already_in_the_combo() {
+        let call = ComputerCall::parse(&json!({"action":"key", "app":"TextEdit", "keys":["shift","cmd","t"], "modifiers":["cmd","option","shift"]})).unwrap();
+        assert_eq!(
+            call,
+            ComputerCall::Act {
+                app: "TextEdit".into(),
+                window: None,
+                observe_after: true,
+                action: Action::Key {
+                    keys: vec!["option".into(), "shift".into(), "cmd".into(), "t".into()],
+                    target: None,
+                },
+            }
         );
     }
 
     #[test]
-    fn key_modifier_hint_wins_over_unrelated_fields_in_every_order() {
+    fn key_modifiers_follow_click_validation() {
+        for (modifiers, expected) in [
+            (
+                json!(["s"]),
+                "\"modifiers\" contains a non-modifier key \"s\"",
+            ),
+            (json!(["unknown"]), "unknown key \"unknown\""),
+            (json!([1]), "\"modifiers\" must be an array of strings"),
+            (
+                Value::Null,
+                "key needs \"modifiers\" as an array of strings",
+            ),
+        ] {
+            assert_eq!(
+                ComputerCall::parse(
+                    &json!({"action":"key", "app":"TextEdit", "keys":["t"], "modifiers":modifiers})
+                )
+                .unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn paste_with_separate_modifiers_enters_text() {
+        let call = ComputerCall::parse(
+            &json!({"action":"key", "app":"TextEdit", "keys":["v"], "modifiers":["cmd"]}),
+        )
+        .unwrap();
+        let ComputerCall::Act {
+            action: Action::Key { keys, .. },
+            ..
+        } = call
+        else {
+            panic!("key action")
+        };
+        let stroke = keys::parse_combo(&keys).unwrap();
+        assert!(stroke.enters_text());
+        assert_eq!(
+            stroke,
+            keys::parse_combo(&["cmd".into(), "v".into()]).unwrap()
+        );
+    }
+
+    #[test]
+    fn key_rejects_unrelated_fields_even_with_modifiers() {
         for raw in [
             r#"{"action":"key","app":"x","button":"left","keys":["t"],"modifiers":["cmd","shift"]}"#,
             r#"{"modifiers":["cmd","shift"],"keys":["t"],"button":"left","app":"x","action":"key"}"#,
-            r#"{"action":"key","amount":2,"keys":["t"],"modifiers":null}"#,
         ] {
             let arguments: Value = serde_json::from_str(raw).unwrap();
             assert_eq!(
                 ComputerCall::parse(&arguments).unwrap_err(),
-                "`key` takes its modifiers inside `keys`, for example `[\"cmd\",\"shift\",\"t\"]`"
+                "key does not accept \"button\"; remove it. Allowed fields: action, app, window, target, keys, modifiers, observe"
             );
         }
     }

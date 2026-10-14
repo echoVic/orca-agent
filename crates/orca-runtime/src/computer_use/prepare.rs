@@ -832,19 +832,16 @@ mod tests {
     }
 
     #[test]
-    fn a_key_modifier_field_is_rejected_before_driver_launch() {
+    fn a_non_modifier_key_is_rejected_before_driver_launch() {
         let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
         let service = ComputerUseService::new_for_test(Arc::new(launcher.clone()));
         let (_, mut invocation) = setup(
             FakeDesktop::with_textedit(),
-            json!({"action":"key", "app":"TextEdit", "keys":["t"], "modifiers":["shift","cmd"]}),
+            json!({"action":"key", "app":"TextEdit", "keys":["t"], "modifiers":["s"]}),
         );
         let error =
             prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap_err();
-        assert_eq!(
-            error,
-            "`key` takes its modifiers inside `keys`, for example `[\"cmd\",\"shift\",\"t\"]`"
-        );
+        assert_eq!(error, "\"modifiers\" contains a non-modifier key \"s\"");
         assert_eq!(launcher.launches(), 0);
     }
 
@@ -911,6 +908,70 @@ mod tests {
             setup(FakeDesktop::with_textedit(), json!({"action":"list_apps"}));
         assert!(prepare_invocation(&mut invocation, &config, &service).is_err());
         assert_eq!(launcher.launches(), 0);
+    }
+
+    #[test]
+    fn separate_key_modifiers_preserve_password_approval() {
+        for (key, expected) in [
+            ("v", "com.apple.TextEdit#secure"),
+            ("s", "com.apple.TextEdit"),
+        ] {
+            let (service, mut invocation) = setup(
+                FakeDesktop::with_textedit(),
+                json!({"action":"key", "app":"TextEdit", "keys":[key], "modifiers":["cmd"], "target":{"element":14}}),
+            );
+            let Reply::Observed { observation } = service
+                .call(
+                    Request::Observe(ObserveParams {
+                        app: "com.apple.TextEdit".into(),
+                        window: None,
+                        query: None,
+                        max_elements: 300,
+                        include_screenshot: false,
+                    }),
+                    Duration::from_secs(30),
+                )
+                .unwrap()
+            else {
+                panic!("observation")
+            };
+            service.record_observation(&observation);
+            prepare_invocation(&mut invocation, &interactive_config(), &service).unwrap();
+            assert_eq!(
+                invocation.effective.target.as_deref(),
+                Some(expected),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn computer_modifier_schema_reaches_the_provider_and_parser() {
+        let registry = orca_tools::registry::default_tool_registry();
+        let spec = registry.get("computer").unwrap().spec();
+        let wire = orca_provider::tool_schema::deepseek_tools_schema(&[
+            orca_provider::tool_schema::ProviderToolDefinition {
+                name: "computer".into(),
+                description: spec.description.to_string(),
+                input_schema: spec.input_schema.clone(),
+                strict_capable: false,
+            },
+        ]);
+        let modifiers =
+            &wire[0]["function"]["parameters"]["properties"]["modifiers"]["items"]["enum"];
+        assert_eq!(modifiers, &json!(["cmd", "shift", "option", "alt", "ctrl"]));
+        for modifier in modifiers.as_array().unwrap() {
+            for action in ["click", "key"] {
+                let mut arguments = json!({
+                    "action":action, "app":"TextEdit", "target":{"element":14},
+                    "modifiers":[modifier],
+                });
+                if action == "key" {
+                    arguments["keys"] = json!(["t"]);
+                }
+                orca_computer_use::call::ComputerCall::parse(&arguments).unwrap();
+            }
+        }
     }
 
     #[test]

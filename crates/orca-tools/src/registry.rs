@@ -1737,7 +1737,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     },
                     "button": { "type": "string", "enum": ["left", "right"], "description": "The mouse button to click, defaulting to left." },
                     "count": { "type": "integer", "enum": [1, 2], "description": "The number of clicks, either one or two." },
-                    "modifiers": { "type": "array", "items": { "type": "string", "enum": ["cmd", "shift", "option", "ctrl"] }, "description": "Modifier keys to hold during a click." },
+                    "modifiers": { "type": "array", "items": { "type": "string", "enum": ["cmd", "shift", "option", "alt", "ctrl"] }, "description": "Modifier keys to hold during a click or a key action; for key they are added in front of keys." },
                     "text": { "type": "string", "description": "Insert text only at the target or current focus; tab, newline and return are inserted only in multi-line text areas, otherwise use key. Other control characters, including macOS function-key characters, are refused." },
                     "keys": { "type": "array", "items": { "type": "string" }, "description": "The key names in the keyboard shortcut to send." },
                     "direction": { "type": "string", "enum": ["up", "down", "left", "right"], "description": "The direction to scroll." },
