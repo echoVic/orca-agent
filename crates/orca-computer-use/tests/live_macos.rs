@@ -3792,6 +3792,376 @@ end tell",
         live.assert_log_contains(&log, r#""type":"canvas_click""#);
     });
 }
+
+struct SafariPage {
+    application: NativeAxElement,
+    file: PathBuf,
+    title: String,
+    tab: std::cell::RefCell<Option<NativeAxElement>>,
+}
+
+impl SafariPage {
+    fn retain_tab(&self) {
+        if self.tab.borrow().is_some() {
+            return;
+        }
+        let mut tabs = vec![];
+        for window in native_ax_array_elements(&self.application, "AXWindows", fixture_ax_value) {
+            let title = self.title.clone();
+            if let Some(tab) = native_ax_find(&window, move |node| {
+                native_ax_string(node, "AXRole").as_deref() == Some("AXRadioButton")
+                    && ["AXTitle", "AXDescription"].into_iter().any(|name| {
+                        native_ax_string(node, name).is_some_and(|text| text.contains(&title))
+                    })
+            }) {
+                tabs.push(tab);
+            }
+        }
+        assert!(
+            tabs.len() <= 1,
+            "ambiguous test Safari tab; refusing cleanup"
+        );
+        *self.tab.borrow_mut() = tabs.pop();
+    }
+
+    fn document_path(window: &NativeAxElement) -> Option<PathBuf> {
+        use objc2_core_foundation::{CFString, CFURL};
+        let document = native_ax_optional_value(window, "AXDocument");
+        let path = document.and_then(|value| {
+            let url = value.downcast_ref::<CFURL>().map(|url| url.to_file_path());
+            url.unwrap_or_else(|| {
+                let text = value.downcast_ref::<CFString>()?;
+                CFURL::from_string(None, text, None)?.to_file_path()
+            })
+        });
+        path.and_then(|path| path.canonicalize().ok())
+    }
+
+    fn is_page(&self, window: &NativeAxElement) -> bool {
+        Self::document_path(window).as_ref() == Some(&self.file)
+            || native_ax_string(window, "AXTitle").as_deref() == Some(self.title.as_str())
+    }
+
+    fn window(&self) -> Option<NativeAxElement> {
+        let mut windows: Vec<_> =
+            native_ax_array_elements(&self.application, "AXWindows", fixture_ax_value)
+                .into_iter()
+                .filter(|window| self.is_page(window))
+                .collect();
+        assert!(
+            windows.len() <= 1,
+            "ambiguous test Safari page; refusing cleanup"
+        );
+        windows.pop()
+    }
+
+    fn close(&self) {
+        use objc2_application_services::AXError;
+        use objc2_core_foundation::CFString;
+        self.retain_tab();
+        if let Some(tab) = self.tab.borrow().as_ref() {
+            // Use the retained control: its title changes after the page receives a click.
+            assert_eq!(
+                unsafe { tab.perform_action(&CFString::from_str("AXPress")) },
+                AXError::Success
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let window = loop {
+            if let Some(window) = self.window() {
+                break window;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test Safari page not found for cleanup"
+            );
+            thread::sleep(Duration::from_millis(100));
+        };
+        let pid = native_ax_pid(&self.application);
+        record_restoration(
+            Some(pid),
+            CGEvent::location(Some(&CGEvent::new(None).unwrap())),
+        );
+        assert_eq!(
+            unsafe { window.perform_action(&CFString::from_str("AXRaise")) },
+            AXError::Success
+        );
+        let menu = fixture_ax_element(&self.application, "AXMenuBar").unwrap();
+        let close_tab = native_ax_find(&menu, |node| {
+            native_ax_string(node, "AXMenuItemCmdChar")
+                .is_some_and(|key| key.eq_ignore_ascii_case("w"))
+                && native_ax_string(node, "AXMenuItemCmdModifiers").as_deref() == Some("0")
+        })
+        .expect("native Safari Cmd+W menu item");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(focused) = fixture_ax_element(&self.application, "AXFocusedWindow")
+                && focused.element == window.element
+                && self.is_page(&focused)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "refusing to close another Safari tab"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            unsafe { close_tab.perform_action(&CFString::from_str("AXPress")) },
+            AXError::Success
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.window().is_some() {
+            assert!(Instant::now() < deadline, "test Safari tab did not close");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for SafariPage {
+    fn drop(&mut self) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.close())).is_err() {
+            record_gui_failure(
+                GuiFailureKind::NativeOperation,
+                "could not close only the test-owned Safari tab".into(),
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn a_covered_safari_page_point_is_refused_and_an_uncovered_point_clicks() {
+    run_live_test(|| {
+        use objc2_application_services::{AXError, AXValue, AXValueType};
+        use objc2_core_foundation::{CFString, CGPoint, CGSize};
+        use orca_computer_use::driver::macos::{test_check_click_point, test_click_at_point};
+
+        fn frame(element: &NativeAxElement) -> (CGPoint, CGSize) {
+            let mut point = CGPoint::default();
+            let mut size = CGSize::default();
+            for (name, kind, pointer) in [
+                (
+                    "AXPosition",
+                    AXValueType::CGPoint,
+                    std::ptr::NonNull::from(&mut point).cast(),
+                ),
+                (
+                    "AXSize",
+                    AXValueType::CGSize,
+                    std::ptr::NonNull::from(&mut size).cast(),
+                ),
+            ] {
+                let value = fixture_ax_value(element, name)
+                    .unwrap()
+                    .downcast::<AXValue>()
+                    .unwrap();
+                assert!(unsafe { value.value(kind, pointer) });
+            }
+            (point, size)
+        }
+
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let title = format!(
+            "Orca Safari click probe {}",
+            live.directory.path().file_name().unwrap().to_string_lossy()
+        );
+        let file = live.directory.path().join("safari-click.html");
+        std::fs::write(
+            &file,
+            format!(
+                r#"<!doctype html><meta charset="utf-8"><title>{title}</title>
+<style>html,body {{ margin:0; width:100%; height:100%; }}</style>
+<body>Orca Safari click probe
+<script>document.addEventListener('click', event => {{
+document.title = `clicked ${{event.clientX}},${{event.clientY}}`;
+}});</script></body>"#
+            ),
+        )
+        .unwrap();
+
+        // Safari must never enter Live's app-termination cleanup, even on a cold launch.
+        let Reply::Launched { app } = live
+            .client
+            .call(
+                Request::LaunchApp {
+                    app: "com.apple.Safari".into(),
+                    open: vec![],
+                },
+                Duration::from_secs(60),
+            )
+            .unwrap()
+        else {
+            panic!("expected launched Safari");
+        };
+        let pid = app.pid.unwrap();
+        // Arm cleanup before opening: Safari may choose a new window or a tab in an existing one.
+        let safari = SafariPage {
+            application: NativeAxElement::application(pid),
+            file: file.canonicalize().unwrap(),
+            title: title.clone(),
+            tab: std::cell::RefCell::new(None),
+        };
+        assert!(matches!(
+            live.client
+                .call(
+                    Request::LaunchApp {
+                        app: "com.apple.Safari".into(),
+                        open: vec![file.to_string_lossy().into_owned()],
+                    },
+                    Duration::from_secs(60),
+                )
+                .unwrap(),
+            Reply::Launched { .. }
+        ));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (window, id) = loop {
+            if let Some(window) = safari.window()
+                && native_ax_string(&window, "AXTitle").as_deref() == Some(&title)
+                && let Some(id) = live
+                    .apps()
+                    .into_iter()
+                    .filter(|app| app.pid == Some(pid))
+                    .flat_map(|app| app.windows)
+                    .find(|window| window.title == title)
+                    .map(|window| window.id)
+            {
+                break (window, id);
+            }
+            assert!(Instant::now() < deadline, "local Safari page did not load");
+            thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(
+            SafariPage::document_path(&window).as_ref(),
+            Some(&safari.file),
+            "native file URL must identify our tab after its title changes"
+        );
+        safari.retain_tab();
+        assert!(
+            safari.tab.borrow().is_some(),
+            "show Safari's tab bar so cleanup can retain the test-owned tab"
+        );
+        live.fixture_frontmost(pid);
+        assert_eq!(
+            unsafe { window.perform_action(&CFString::from_str("AXRaise")) },
+            AXError::Success
+        );
+        let page = native_ax_find(&window, |node| {
+            native_ax_string(node, "AXRole").as_deref() == Some("AXWebArea")
+        })
+        .expect("native Safari web area");
+        let (page_origin, page_size) = frame(&page);
+        assert!(page_size.width >= 600.0 && page_size.height >= 240.0);
+        let covered = CGPoint::new(
+            page_origin.x + page_size.width * 0.25,
+            page_origin.y + page_size.height * 0.5,
+        );
+        let uncovered = CGPoint::new(page_origin.x + page_size.width * 0.75, covered.y);
+        let observed = live.observe_window("com.apple.Safari", Some(id), None, 300, true);
+        let (origin, window_size) = frame(&window);
+        let image = observed.screenshot.as_ref().unwrap();
+        let (cover_pid, _) = live.launch_fixture();
+        let cover = fixture_window(cover_pid);
+        let position = CGPoint::new(covered.x - 100.0, covered.y - 60.0);
+        let size = CGSize::new(220.0, 160.0);
+        for (name, value) in [
+            ("AXPosition", unsafe {
+                AXValue::new(
+                    AXValueType::CGPoint,
+                    std::ptr::NonNull::from(&position).cast(),
+                )
+            }),
+            ("AXSize", unsafe {
+                AXValue::new(AXValueType::CGSize, std::ptr::NonNull::from(&size).cast())
+            }),
+        ] {
+            assert_eq!(
+                unsafe {
+                    cover.set_attribute_value(&CFString::from_str(name), value.unwrap().as_ref())
+                },
+                AXError::Success
+            );
+        }
+        live.fixture_frontmost(cover_pid);
+        live.background_state = Some((
+            cover_pid,
+            CGEvent::location(Some(&CGEvent::new(None).unwrap())),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while test_check_click_point(cover_pid, covered).is_err()
+            || test_check_click_point(pid, uncovered).is_err()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "fixture must cover only the left page point"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        // Like the Finder occlusion test, bypass activation so the cover stays in front.
+        let before = orca_computer_use::driver::macos::last_test_process_hid_post();
+        let failure = test_click_at_point(pid, covered).unwrap_err();
+        assert_eq!(failure.message, "Another window covers the target point");
+        assert_eq!(
+            orca_computer_use::driver::macos::last_test_process_hid_post(),
+            before
+        );
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            assert_eq!(
+                native_ax_string(&window, "AXTitle").as_deref(),
+                Some(title.as_str())
+            );
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        live.assert_frontmost_and_pointer_unchanged();
+        let outcome = live
+            .act_app(
+                "com.apple.Safari",
+                Some(id),
+                Action::Click {
+                    target: Target::Point {
+                        point: [
+                            (uncovered.x - origin.x) * f64::from(image.width) / window_size.width,
+                            (uncovered.y - origin.y) * f64::from(image.height) / window_size.height,
+                        ],
+                    },
+                    button: Button::Left,
+                    count: 1,
+                    modifiers: vec!["shift".into()],
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert!(outcome.foreground_used);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let title = native_ax_string(&window, "AXTitle").unwrap();
+            if let Some((x, y)) = title
+                .strip_prefix("clicked ")
+                .and_then(|s| s.split_once(','))
+                && x.parse::<u32>().is_ok()
+                && y.parse::<u32>().is_ok()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "page did not receive the click: {title:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        live.assert_frontmost_and_pointer_unchanged();
+        drop(safari);
+    });
+}
+
 #[test]
 #[ignore]
 fn a_minimized_window_is_clicked_then_minimized_again() {
