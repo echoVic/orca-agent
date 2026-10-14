@@ -18,6 +18,11 @@ pub(super) fn stale() -> DriverError {
         "the window changed since the last observe; observe again",
     )
 }
+
+pub(super) fn should_collapse_type_selection(was_focused: bool) -> bool {
+    !was_focused
+}
+
 fn foreground(message: impl Into<String>) -> DriverError {
     error(ErrorKind::NeedsForeground, message)
 }
@@ -282,6 +287,20 @@ impl MacDriver {
         {
             return Err(stale());
         }
+        // Keep the original focus even if the background attempt changes it
+        // before requesting foreground fallback.
+        let type_target_was_focused = if let Action::Type {
+            target: Some(target @ Target::Element { .. }),
+            ..
+        } = &params.action
+        {
+            let target = target_element(table, &application, *target)?;
+            application
+                .attribute_element("AXFocusedUIElement")?
+                .is_some_and(|focused| focused.0 == target.0)
+        } else {
+            false
+        };
         let mut outcome = ActOutcome {
             foreground_used: false,
             note: None,
@@ -354,14 +373,22 @@ impl MacDriver {
                     }
                 }
                 Action::Type { text, target } => {
-                    let element = focus(table, &application, *target)?;
+                    // Setting AXFocused again can replace an intentional selection.
+                    let element = match target {
+                        Some(target) if type_target_was_focused => {
+                            target_element(table, &application, *target)?
+                        }
+                        _ => focus(table, &application, *target)?,
+                    };
                     check_type_recipient(&element, text)?;
                     check_background_keyboard(pid, &application, &element, action_deadline)?;
                     check_secure_approval(&application, Some(&element), params.secure_approved)?;
                     if target.is_some() {
                         let focused = keyboard_recipient(&application, Some(&element))?
                             .ok_or_else(|| foreground("The app has no focused element"))?;
-                        focused.collapse_selection_to_end();
+                        if should_collapse_type_selection(type_target_was_focused) {
+                            focused.collapse_selection_to_end();
+                        }
                         check_secure_approval(
                             &application,
                             Some(&element),
@@ -417,7 +444,7 @@ impl MacDriver {
                 return Err(failure);
             }
             outcome.note = Some(foreground::run(
-                pid,
+                type_target_was_focused,
                 &application,
                 &ax_window,
                 table,
@@ -810,6 +837,16 @@ fn scroll(
 mod tests {
     use super::*;
     use crate::geometry::CaptureGeometry;
+
+    #[test]
+    fn typing_into_an_already_focused_element_keeps_its_selection() {
+        assert!(!should_collapse_type_selection(true));
+    }
+
+    #[test]
+    fn typing_into_an_unfocused_element_collapses_its_selection() {
+        assert!(should_collapse_type_selection(false));
+    }
 
     fn offscreen_target_with_stale_read(stage: &str) -> Result<u32, DriverError> {
         nearest_offscreen_scroll_target(

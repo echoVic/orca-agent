@@ -263,7 +263,7 @@ Step 3 的真机测试现在是 `typing_with_a_chinese_input_method_enters_the_t
 
 完整报告位于 `.superpowers/sdd/2026-10-11-computer-use-phase2/acceptance-report.md`；TUI captures、逐项请求／结果和独立核验位于 `/tmp/orca-acceptance/captures/run-20261012-real/`。
 
-**已知限制（2026-10-13）**：远程控制软件（本机是 UU 远程）连接时会在屏幕最上层放一个全屏窗口（layer 1000），前台操作的命中检测因此判定目标被遮挡而拒绝；断开远程后同一组真机测试全部通过。按元素 `type` 在聚焦时会把选区折叠到末尾，所以先 Cmd+A 再按元素 `type` 会追加而不是替换（验收复跑中的 TextEdit 现象）。
+**已知限制（2026-10-13）**：远程控制软件（本机是 UU 远程）连接时会在屏幕最上层放一个全屏窗口（layer 1000），前台操作的命中检测因此判定目标被遮挡而拒绝；断开远程后同一组真机测试全部通过。按元素 `type` 在聚焦时会把选区折叠到末尾，所以先 Cmd+A 再按元素 `type` 会追加而不是替换（验收复跑中的 TextEdit 现象）。2026-10-14 的改动让按元素 `type` 保留原本已聚焦元素的选区，仅在目标原本未聚焦时折叠到末尾，仍待真机验证。
 
 **验收复跑（2026-10-13）**：在 `feat/computer-use-phase2`、HEAD `b28452ab` 上，用简报指定的已有 `target/release/orca --model auto` 完整重跑六项真实模型任务，没有重建二进制或修改源码。Orca 在当前 shell 创建的 `tmux -L orca-accept` 中运行，使用用户正常的 Orca home，实际路由为 `deepseek-flash`。工作区仍为 untrusted；本次没有弹出欢迎信任面板，未按 `T`。六项均通过独立实际效果核验，首轮为两项通过。
 

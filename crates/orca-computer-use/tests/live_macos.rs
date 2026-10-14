@@ -3884,6 +3884,111 @@ fn background_type_with_a_target_inserts_after_existing_text() {
 
 #[test]
 #[ignore]
+fn background_element_type_preserves_selection_and_appends_when_unfocused() {
+    element_type_preserves_selection(false);
+}
+
+#[test]
+#[ignore]
+fn foreground_element_type_preserves_selection_and_appends_when_unfocused() {
+    element_type_preserves_selection(true);
+}
+
+fn element_type_preserves_selection(foreground: bool) {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let mut flags = vec!["--prefilled-name"];
+        if foreground {
+            flags.push("--modal-window");
+        }
+        let (pid, log) = live.launch_fixture_with_flags(&flags);
+        let window = fixture_window(pid);
+        let field = fixture_ax_named(&window, "Name").unwrap();
+        let editor = fixture_ax_role(&window, "AXTextArea").unwrap();
+        set_fixture_ax_bool(&editor, "AXFocused", true);
+        let application = NativeAxElement::application(pid);
+        assert_ne!(
+            fixture_ax_element(&application, "AXFocusedUIElement")
+                .unwrap()
+                .element,
+            field.element,
+            "the initial element type must change focus"
+        );
+        live.make_finder_frontmost();
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let target = element_named(&obs, "Name");
+        let appended = live
+            .act_with_fallback(
+                Action::Type {
+                    text: "x".into(),
+                    target: Some(target),
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(appended.foreground_used, foreground);
+        assert_eq!(live.fixture_control_value("Name"), "a🦀cx");
+        assert_eq!(
+            fixture_ax_element(&application, "AXFocusedUIElement")
+                .unwrap()
+                .element,
+            field.element,
+            "element type must focus the field"
+        );
+        let selected = live
+            .act_with_fallback(
+                Action::Key {
+                    keys: vec!["cmd".into(), "a".into()],
+                    target: None,
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert!(selected.foreground_used);
+        let replaced = live
+            .act_with_fallback(
+                Action::Type {
+                    text: "replacement".into(),
+                    target: Some(target),
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(replaced.foreground_used, foreground);
+        assert_eq!(live.fixture_control_value("Name"), "replacement");
+        live.assert_log_contains(&log, r#""value":"replacement""#);
+        live.act_with_fallback(
+            Action::Key {
+                keys: vec!["left".into()],
+                target: None,
+            },
+            false,
+            true,
+        )
+        .unwrap();
+        let inserted = live
+            .act_with_fallback(
+                Action::Type {
+                    text: "!".into(),
+                    target: Some(target),
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(inserted.foreground_used, foreground);
+        assert_eq!(live.fixture_control_value("Name"), "replacemen!t");
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+#[test]
+#[ignore]
 fn unreported_password_focus_refuses_unapproved_text_keys() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {

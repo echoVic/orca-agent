@@ -152,7 +152,7 @@ fn check_window(window: &AxElement, table: &ElementTable) -> Result<(), DriverEr
 }
 
 pub(super) fn run(
-    pid: i32,
+    type_target_was_focused: bool,
     application: &AxElement,
     window: &AxElement,
     table: &ElementTable,
@@ -160,6 +160,7 @@ pub(super) fn run(
     aborted: &AtomicBool,
     action_deadline: Instant,
 ) -> Result<String, DriverError> {
+    let pid = application.pid()?;
     let deadline = (Instant::now() + crate::timing::IDLE_WAIT_LIMIT).min(action_deadline);
     loop {
         check_abort(aborted)?;
@@ -308,7 +309,9 @@ pub(super) fn run(
                         params.secure_approved,
                     )?;
                     if matches!(target_location(params), Some(Target::Element { .. })) {
-                        focused.collapse_selection_to_end();
+                        if actions::should_collapse_type_selection(type_target_was_focused) {
+                            focused.collapse_selection_to_end();
+                        }
                         actions::check_foreground_secure_approval(
                             application,
                             target_element.as_ref(),
