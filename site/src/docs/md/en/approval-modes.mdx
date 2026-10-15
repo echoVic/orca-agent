@@ -76,13 +76,13 @@ the input:
 | --- | --- |
 | `1` Allow once | Run this call. |
 | `2` Allow this exact call | Run it, and allow the same tool with the same target again without asking. Not offered when the call has no specific target. |
-| `3` Allow `<tool>` this session | Run it, and stop asking for this tool until you quit. Not offered for `computer`. |
+| `3` Allow `<tool>` this session | Run it, and stop asking for this tool until you quit. For `computer` it reads **Allow all apps this session**. |
 | `4` Deny | Do not run it. The turn stops so you can tell Orca what to do instead. `Esc` also denies. |
-| `5` Always allow `<tool>` (saved) | MCP tools only. Run it, stop asking for this tool for the rest of the session, and save an allow rule to the user config so future sessions skip the prompt too. |
+| `5` Always allow `<tool>` (saved) | MCP tools and computer use. Run it, stop asking for this tool for the rest of the session, and save an allow rule to the user config so future sessions skip the prompt too. For `computer` it reads **Always allow all apps (saved)** and saves `pattern = "*"`. |
 | `6` Always allow the `<server>` server (saved) | MCP tools only. Run it, and do the same for every tool on that server, saving a server-wide allow rule instead. |
 | `7` Always allow this app (saved) | Computer use only. Run it, remember this app for the session, and save an allow rule for its exact bundle id. |
 
-Choices `5` and `6` only appear for an MCP tool call, in place of `2`: an MCP
+For an MCP tool call, choices `5` and `6` appear in place of `2`: an MCP
 tool call's target is the tool's own name, so allowing that exact call again
 would allow nothing more than `3` does. If the rule cannot be saved — an
 existing config that fails to parse, for example — the call still runs and the
@@ -90,15 +90,23 @@ rest of this session still skips the prompt; a message explains that the rule
 was not saved. See [Permission rules](#permission-rules) for the rule shape.
 
 For `computer` calls with an app target, the choices are `1` Allow once,
-`2` Allow this app this session, `7` Always allow this app (saved), and `4`
-Deny. A computer approval with no resolved app target offers only `1` and `4`.
+`2` Allow this app this session, `3` Allow all apps this session, `7` Always
+allow this app (saved), `5` Always allow all apps (saved), and `4` Deny. A computer approval with no resolved app target offers only `1` and `4`.
+
+Outside `full-auto`, terminals and IDEs need approval for that app itself:
+`1`, `2`, or `7`, or an allow rule whose `pattern` is the exact bundle id.
+**Allow all apps this session**, `pattern = "*"` or another wildcard, and a
+whole-tool allow rule do not cover them. Their approval panel does not offer
+the two all-app options.
 
 Password text entry also offers only `1` and `4`, with **Allow typing this
 once** as the approval label. It asks separately for each `type` or
 text-entering `key` call, including printable keys alone or with Shift/Option
-and `Cmd+V`. App grants and patterned allow rules, even one naming an explicit
-`#secure` target, do not preapprove these calls. Only a whole-tool allow rule
-for `computer` without a `pattern` does; matching deny rules still win. See
+and `Cmd+V`. App grants, grants for all apps, `full-auto`, and patterned allow
+rules, including `*` and one naming an explicit `#secure` target, do not
+preapprove these calls. Only a whole-tool allow rule
+for `computer` without a `pattern` does for apps that do not run commands;
+matching deny rules still win. See
 [Computer use](computer-use.md#app-approval).
 
 If the driver detects a password field only during a point action or from a
@@ -125,10 +133,10 @@ can switch to plan mode in the middle of a conversation. See
 [Terminal UI](terminal-ui.md).
 
 For `computer`, plan mode permits only `list_apps` and `observe`.
-`list_apps` needs no app approval. Orca still asks for app approval for
-`observe` and for app calls in `full-auto`, unless an applicable rule or app
-grant already allows them. Rules cannot permit other computer actions in
-plan mode.
+`list_apps` needs no app approval, and `observe` asks for it unless an
+applicable rule or grant already allows it. Rules cannot permit other computer
+actions in plan mode. In `full-auto`, app calls run without app approval; see
+[Computer use](computer-use.md#approval-modes).
 
 ## Permission rules
 

@@ -6,6 +6,7 @@ pub mod approval_types;
 pub mod budget;
 pub mod cancel;
 pub mod capability;
+pub mod computer_apps;
 pub mod config;
 pub mod conversation;
 pub mod cost_types;

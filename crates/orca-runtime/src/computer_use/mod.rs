@@ -35,6 +35,10 @@ struct ServiceState {
     latest_window: HashMap<String, u32>,
     turn_cancel: Option<CancelToken>,
     turn_generation: Option<u64>,
+    /// Risk warnings by bundle id, and the apps whose first result showed theirs.
+    /// Driver restarts keep both: the warning is shown once per session.
+    risk_warnings: HashMap<String, String>,
+    warned_apps: HashSet<String>,
     #[cfg(test)]
     before_esc_close: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -265,6 +269,28 @@ impl ComputerUseService {
                 focused: observation.focused_secure,
             },
         );
+    }
+
+    /// Remembers an app's risk warning for its first result this session.
+    pub(crate) fn note_risk_warning(&self, bundle_id: &str, warning: &str) {
+        self.state
+            .lock()
+            .expect("computer-use service lock poisoned")
+            .risk_warnings
+            .insert(bundle_id.to_owned(), warning.to_owned());
+    }
+
+    /// The app's risk warning, only the first time this session.
+    pub(crate) fn take_risk_warning(&self, bundle_id: &str) -> Option<String> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("computer-use service lock poisoned");
+        let warning = state.risk_warnings.get(bundle_id)?.clone();
+        state
+            .warned_apps
+            .insert(bundle_id.to_owned())
+            .then_some(warning)
     }
 
     pub(crate) fn latest_window(&self, bundle_id: &str) -> Option<u32> {

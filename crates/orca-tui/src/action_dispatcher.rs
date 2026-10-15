@@ -1101,13 +1101,32 @@ mod tests {
 
     #[test]
     fn interrupt_reports_surface_cancel_rejection_instead_of_silently_succeeding() {
-        let _env = crate::test_support::lock_process_env();
-        let home = tempfile::tempdir().expect("temporary ORCA_HOME");
-        let previous = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        const CHILD_ENV: &str = "ORCA_TUI_CANCEL_REJECTION_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "action_dispatcher::tests::interrupt_reports_surface_cancel_rejection_instead_of_silently_succeeding",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("ORCA_HOME", home.path())
+                .output()
+                .expect("run isolated surface cancel test");
+            assert!(
+                output.status.success(),
+                "isolated surface cancel test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let home = std::path::PathBuf::from(
+            std::env::var_os("ORCA_HOME").expect("isolated child ORCA_HOME"),
+        );
         let host = RuntimeHost::start().expect("runtime host");
         let mut config = crate::test_support::test_run_config();
-        config.cwd = Some(home.path().to_path_buf());
+        config.cwd = Some(home);
         config.history_mode = HistoryMode::Record;
         let thread = host
             .start_thread(config, "detached surface cancel")
@@ -1166,10 +1185,6 @@ mod tests {
         dispatcher.shutdown().expect("shutdown dispatcher");
         thread.shutdown().expect("thread shutdown");
         host.shutdown().expect("host shutdown");
-        match previous {
-            Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]

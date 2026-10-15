@@ -123,7 +123,16 @@ fn execute_with_timeout(
     if cancel.is_cancelled() {
         return ToolResult::cancelled_before_start(request, "the turn was cancelled");
     }
-    let reply = match service.call(driver_request, timeout) {
+    let reply = service.call(driver_request, timeout);
+    // An app's first result this session carries its risk warning, whatever
+    // the outcome, so calls approved without a panel (full-auto, rules,
+    // session grants) show it too.
+    let warning = service.take_risk_warning(app);
+    let noted = |text: String| match &warning {
+        Some(warning) => format!("{warning}\n{text}"),
+        None => text,
+    };
+    let reply = match reply {
         Ok(reply) => reply,
         Err(error) if cancel.is_cancelled() => {
             service.reset();
@@ -132,7 +141,7 @@ fn execute_with_timeout(
                 message.push_str("; ");
                 message.push_str(&error.message);
             }
-            return ToolResult::cancelled(request, message, None);
+            return ToolResult::cancelled(request, noted(message), None);
         }
         Err(error @ (CallError::TimedOut | CallError::Disconnected)) => {
             service.reset();
@@ -144,10 +153,10 @@ fn execute_with_timeout(
             // Disconnection and timeout have the same recovery instruction.
             return ToolResult::failed(
                 request,
-                format!(
+                noted(format!(
                     "the computer-use driver did not answer in {} s and {stopped}; observe again before acting",
                     timeout.as_secs()
-                ),
+                )),
                 None,
             );
         }
@@ -155,7 +164,7 @@ fn execute_with_timeout(
             if error.kind == ErrorKind::NeedsSecureApproval {
                 return ToolResult::failed(
                     request,
-                    "The driver detected text entry into a password field that was not separately approved. Observe the app again, then target the secure field by element number so Orca can ask for separate approval; no text was entered.",
+                    noted("The driver detected text entry into a password field that was not separately approved. Observe the app again, then target the secure field by element number so Orca can ask for separate approval; no text was entered.".into()),
                     None,
                 );
             }
@@ -167,7 +176,7 @@ fn execute_with_timeout(
                     append_windows(&mut message, app);
                 }
             }
-            return ToolResult::failed(request, message, None);
+            return ToolResult::failed(request, noted(message), None);
         }
     };
     let mut images = Vec::new();
@@ -185,10 +194,10 @@ fn execute_with_timeout(
             if !matches!(call, ComputerCall::LaunchApp { .. }) || launched.bundle_id != app {
                 return ToolResult::failed(
                     request,
-                    format!(
+                    noted(format!(
                         "The launched app's bundle ID {:?} does not match the approved ID {app:?}",
                         launched.bundle_id
-                    ),
+                    )),
                     None,
                 );
             }
@@ -202,7 +211,7 @@ fn execute_with_timeout(
             let ComputerCall::Act { action, .. } = &call else {
                 return ToolResult::failed(
                     request,
-                    "computer-use driver returned an unexpected action result",
+                    noted("computer-use driver returned an unexpected action result".into()),
                     None,
                 );
             };
@@ -226,12 +235,12 @@ fn execute_with_timeout(
         _ => {
             return ToolResult::failed(
                 request,
-                "computer-use driver returned an unexpected result",
+                noted("computer-use driver returned an unexpected result".into()),
                 None,
             );
         }
     };
-    ToolResult::completed(request, output, false).with_images(images)
+    ToolResult::completed(request, noted(output), false).with_images(images)
 }
 
 fn app_line(app: &AppInfo) -> String {
@@ -373,6 +382,90 @@ mod tests {
             &CancelToken::new(),
         );
         assert_eq!(result.status, ToolStatus::Completed);
+    }
+
+    #[test]
+    fn a_warned_apps_first_result_this_session_carries_its_warning() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_app("com.apple.finder", "Finder"));
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let service = thread_store.get::<ComputerUseService>().unwrap();
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let call = request(json!({"action":"observe", "app":"Finder"}), None);
+            let mut invocation = crate::tool_invocation::ToolInvocation {
+                requested: call.clone(),
+                effective: call,
+                action: Some(ActionKind::Computer),
+                approval_preview: None,
+            };
+            crate::computer_use::prepare::prepare_invocation(
+                &mut invocation,
+                &flash_config(),
+                &service,
+            )
+            .unwrap();
+            let result = execute(
+                &invocation.effective,
+                &flash_config(),
+                0,
+                RuntimeExtensionStores::new(&thread_store, &turn_store),
+                Path::new("/"),
+                &CancelToken::new(),
+            );
+            assert_eq!(result.status, ToolStatus::Completed);
+            outputs.push(result.output.unwrap());
+        }
+        assert!(
+            outputs[0].starts_with("warning: Finder can read and write any file\nFinder "),
+            "{}",
+            outputs[0]
+        );
+        assert!(!outputs[1].contains("warning:"), "{}", outputs[1]);
+    }
+
+    #[test]
+    fn a_warned_apps_first_result_carries_its_warning_even_when_it_fails() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_app("com.apple.finder", "Finder"));
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let service = thread_store.get::<ComputerUseService>().unwrap();
+        let mut results = Vec::new();
+        for args in [
+            json!({"action":"click", "app":"Finder", "target":{"element":999}}),
+            json!({"action":"observe", "app":"Finder"}),
+        ] {
+            let call = request(args, None);
+            let mut invocation = crate::tool_invocation::ToolInvocation {
+                requested: call.clone(),
+                effective: call,
+                action: Some(ActionKind::Computer),
+                approval_preview: None,
+            };
+            crate::computer_use::prepare::prepare_invocation(
+                &mut invocation,
+                &flash_config(),
+                &service,
+            )
+            .unwrap();
+            results.push(execute(
+                &invocation.effective,
+                &flash_config(),
+                0,
+                RuntimeExtensionStores::new(&thread_store, &turn_store),
+                Path::new("/"),
+                &CancelToken::new(),
+            ));
+        }
+        assert_eq!(results[0].status, ToolStatus::Failed);
+        let error = results[0].error.as_deref().unwrap();
+        assert!(
+            error.starts_with("warning: Finder can read and write any file\n"),
+            "{error}"
+        );
+        assert_eq!(results[1].status, ToolStatus::Completed);
+        let output = results[1].output.as_deref().unwrap();
+        assert!(!output.contains("warning:"), "{output}");
     }
 
     #[test]

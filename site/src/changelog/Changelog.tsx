@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.12":
+        "Fewer computer-use prompts. In full-auto, app calls no longer ask for app approval; typing into a password field still asks every time, deny and prompt rules still apply, and blocked apps stay blocked. The approval panel adds Allow all apps this session and Always allow all apps (saved), which saves pattern = \"*\"; neither covers password entry. Outside full-auto, terminals and IDEs still need approval for the app itself, and wildcard or whole-tool allow rules no longer cover them. The key action also accepts a separate modifiers array.",
       "v0.5.11":
         "Computer use arrives on macOS. On macOS 14 or later, the interactive TUI's main session gets a computer tool that lists and launches apps, observes a window's screenshot and accessibility elements, clicks, types, sends keys and scrolls. Each app asks for approval once, for the session, or saved as a rule with its exact bundle id; password managers and finance apps are refused unless a rule names them exactly, and the terminal running Orca is never operated. Typing into a password field asks every time, and Esc stops the turn from anywhere while computer use runs. Orca acts in the background where it can; when it cannot, it switches to the app briefly, restores the previous app and pointer, and says so. Command shortcuts and typing into Save panels always take that path, and [computer_use] foreground_fallback = false turns it off. launch_app finds an app by its English or display name even when it is not running and opens it without taking focus. Click a tool row's image line to preview its screenshot. Live conversations keep only the newest three tool images, image types are read from file headers, and resuming a session no longer loads tool image data. The Terminal-Bench adapter keeps the task instruction out of command lines, so a task's own pkill can no longer end the trial.",
       "v0.5.10":
@@ -698,6 +700,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.12":
+        "computer use 的审批少了。full-auto 下应用调用不再请求应用授权；往密码框输入仍然每次询问，deny 和 prompt 规则仍然生效，默认禁止的应用仍然禁止。审批面板新增“本会话允许所有应用”和“总是允许所有应用（保存）”，后者保存 pattern = \"*\"，两者都不覆盖密码输入。在 full-auto 之外，终端和 IDE 仍需要针对该应用本身的授权，通配符和整个工具的 allow 规则不再覆盖它们。key 动作也接受单独的 modifiers 数组。",
       "v0.5.11":
         "macOS 上可以用 computer use 了。在 macOS 14 及以上，交互式 TUI 的主会话多了 computer 工具：列出和启动应用、观察窗口的截图和无障碍元素、点击、输入、按键和滚动。每个应用都要授权，可以只允许一次、本会话允许，或保存为写明 bundle id 的规则；密码管理器和金融类应用默认禁止，只有写明其 bundle id 的规则才能放开，运行 Orca 的终端永远不能操作。往密码框输入每次单独询问；computer use 运行期间，在任何地方按 Esc 都能停止这一轮。Orca 尽量在后台操作，做不到时短暂切到前台，再恢复原来的前台应用和鼠标位置，并在结果里注明；Cmd 快捷键和往保存面板里输入总是这样做，[computer_use] foreground_fallback = false 可以关掉。launch_app 能按英文名或显示名找到没在运行的应用，启动时不抢走焦点。点击工具结果里的图片那一行可以预览截图。实时对话只保留最近三张工具图片，图片类型按文件头判断，恢复会话不再读取工具图片数据。Terminal-Bench 适配器不再把任务指令放进命令行，任务自己的 pkill 不会再结束这次评测。",
       "v0.5.10":

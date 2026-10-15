@@ -19,16 +19,26 @@ replace Accessibility permission.
 
 ## App approval
 
-Before Orca first observes or operates an app, it asks for approval unless a
-permission rule already decides the call. The panel offers:
+Before Orca first observes or operates an app, it asks for approval, unless a
+permission rule already decides the call or the session is in `full-auto` (see
+[Approval modes](#approval-modes)). The panel offers:
 
 - `1` **Allow once**: run this call; later calls ask again.
 - `2` **Allow this app this session**: skip approval for this app until you quit.
-- `7` **Always allow this app (saved)**: save an allow rule for future sessions.
+- `3` **Allow all apps this session**: skip approval for every app until you quit.
+- `7` **Always allow this app (saved)**: save an allow rule for this app for future sessions.
+- `5` **Always allow all apps (saved)**: save an allow rule for every app for future sessions.
 - `4` **Deny**: refuse the call and ask Orca for another way.
 
-The saved option writes the app's exact bundle id to the user configuration,
-at `$ORCA_HOME/config.toml` or, when unset, `~/.orca/config.toml`:
+Outside `full-auto`, terminals and IDEs need approval for that app itself:
+`1`, `2`, or `7`, or an allow rule whose `pattern` is the exact bundle id.
+**Allow all apps this session**, `pattern = "*"` or another wildcard, and a
+whole-tool allow rule do not cover them. Their approval panel does not offer
+the two all-app options.
+
+The saved options write to the user configuration, at `$ORCA_HOME/config.toml`
+or, when unset, `~/.orca/config.toml`. `7` saves the app's exact bundle id as
+the rule's `pattern`, and `5` saves `pattern = "*"`:
 
 ~~~toml
 [[permissions.rules]]
@@ -43,10 +53,11 @@ and text-entering `key` actions: printable keys alone or with Shift/Option,
 and `Cmd+V` (also with Shift/Option). Navigation and other non-text shortcuts
 do not trigger this separate check.
 
-An app grant does not preapprove password entry. Patterned allow rules,
-including exact app ids, wildcards, and an explicit `#secure` target, also
-leave this check in place. Only a whole-tool allow rule for `computer`,
-without a `pattern`, preapproves it. A matching deny rule still takes
+App grants, including those for all apps, do not preapprove password entry,
+and neither does `full-auto`. Patterned allow rules, including exact app ids,
+wildcards such as `*`, and an explicit `#secure` target, also leave this check
+in place. Only a whole-tool allow rule for `computer`,
+without a `pattern`, preapproves it for apps that do not run commands. A matching deny rule still takes
 precedence; see [permission rules](approval-modes.md#permission-rules).
 
 If a point target or a stale observation reveals a password field only
@@ -74,17 +85,25 @@ Orca can never operate its own host terminal, regardless of rules; if the
 host cannot be identified, all listed terminal apps are blocked. Other
 listed terminals (Terminal, iTerm2, Ghostty, Warp, kitty, Alacritty, WezTerm,
 cmux) and IDEs (VS Code, apps under `com.todesktop.` or `com.jetbrains.`,
-Xcode, Zed) warn that they can run commands outside Orca's sandbox;
+Xcode, Zed) warn that they can run commands outside Orca's sandbox. Outside
+`full-auto`, these apps require their own approval as described above.
 Finder warns about file access, System Settings about changing settings,
 and listed browsers (Safari, Chrome, Firefox, Arc, Edge, Brave) about web
-pages carrying instructions aimed at the agent.
+pages carrying instructions aimed at the agent. The warning appears in the
+approval panel and in the app's first result in each session, so calls that
+run without a panel, in `full-auto` or under a rule or grant, still show it.
 
 ## Approval modes
 
 Plan mode permits only `list_apps` and `observe`; launching, clicking,
 typing, sending keys, and scrolling are refused. `list_apps` needs no app
-approval. `observe` still asks for app approval, as do app calls in
-`full-auto`, unless an applicable rule or app grant already allows them.
+approval. In `plan`, `suggest`, and `auto-edit`, app calls, `observe`
+included, ask for app approval unless an applicable rule or grant already
+allows them.
+
+`full-auto` already runs commands on the host, so app calls run there without
+app approval. Password entry still asks each time, deny and prompt rules still
+apply, and apps blocked by default stay blocked.
 
 ## Observations and screenshots
 

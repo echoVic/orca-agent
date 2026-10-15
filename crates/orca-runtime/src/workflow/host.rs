@@ -149,6 +149,7 @@ impl WorkflowHost {
         ipc_paths: &WorkflowHostIpcPaths,
     ) -> io::Result<Vec<HostEvent>> {
         Self::run_collecting_events_with_agent_and_event_callback_inner(
+            Command::new(Self::node_executable()),
             script_path,
             args,
             Some(ipc_paths),
@@ -196,6 +197,7 @@ impl WorkflowHost {
         E: FnMut(&HostEvent) -> io::Result<()>,
     {
         Self::run_collecting_events_with_agent_and_event_callback_inner(
+            Command::new(Self::node_executable()),
             script_path,
             args,
             None,
@@ -219,6 +221,7 @@ impl WorkflowHost {
         E: FnMut(&HostEvent) -> io::Result<()>,
     {
         Self::run_collecting_events_with_agent_and_event_callback_inner(
+            Command::new(Self::node_executable()),
             script_path,
             args,
             Some(ipc_paths),
@@ -247,6 +250,7 @@ impl WorkflowHost {
         A: Fn(),
     {
         Self::run_collecting_events_with_agent_and_event_callback_inner(
+            Command::new(Self::node_executable()),
             script_path,
             args,
             Some(ipc_paths),
@@ -260,6 +264,7 @@ impl WorkflowHost {
     }
 
     fn run_collecting_events_with_agent_and_event_callback_inner<F, E, C, A>(
+        mut command: Command,
         script_path: &Path,
         args: Value,
         ipc_paths: Option<&WorkflowHostIpcPaths>,
@@ -285,7 +290,6 @@ impl WorkflowHost {
         let args_json = String::from_utf8(args_json)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
-        let mut command = Command::new(Self::node_executable());
         command.arg(&host_path).arg(script_path).arg(args_json);
         if let Some(ipc_paths) = ipc_paths {
             command
@@ -1152,30 +1156,79 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn event_callback_error_reaps_workflow_process_group() {
-        let _guard = crate::history::lock_test_env();
+        use std::ffi::CString;
+        use std::os::unix::fs::OpenOptionsExt;
+
         let temp = tempfile::tempdir().expect("tempdir");
         let survivor_marker = temp.path().join("workflow-survivor");
+        let gate = temp.path().join("descendant-gate");
+        let gate_path = CString::new(gate.as_os_str().as_encoded_bytes()).expect("FIFO path");
+        assert_eq!(unsafe { libc::mkfifo(gate_path.as_ptr(), 0o600) }, 0);
+        let gate_keeper = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate)
+            .expect("open descendant gate");
+        let gate_writer = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&gate)
+            .expect("keep descendant waiting for release");
         let node = write_fake_node_script(
             temp.path(),
             r#"#!/bin/sh
-(sleep 0.4; : > "$ORCA_WORKFLOW_TEST_MARKER") &
-printf '{"type":"phase_started","name":"scan"}\n'
+(
+  exec 3< "$ORCA_WORKFLOW_TEST_GATE"
+  printf '{"type":"phase_started","name":"scan"}\n'
+  exec >/dev/null 2>&1
+  read -r release <&3
+  : > "$ORCA_WORKFLOW_TEST_MARKER"
+) &
 wait
 "#,
         );
-        let _node_path = TestEnvVar::set("ORCA_NODE_PATH", &node);
-        let _marker = TestEnvVar::set("ORCA_WORKFLOW_TEST_MARKER", &survivor_marker);
+        let mut command = Command::new(&node);
+        command
+            .env("ORCA_WORKFLOW_TEST_GATE", &gate)
+            .env("ORCA_WORKFLOW_TEST_MARKER", &survivor_marker);
 
-        let error = WorkflowHost::run_collecting_events_with_agent_and_event_callback(
+        let error = WorkflowHost::run_collecting_events_with_agent_and_event_callback_inner(
+            command,
             &temp.path().join("unused-workflow.js"),
             serde_json::json!(null),
+            None,
+            WorkflowHostRunPolicy::collecting(),
             |_| unreachable!("fixture does not emit agent calls"),
             |_| Err(io::Error::other("event callback failed")),
+            || Ok(false),
+            || {},
         )
         .expect_err("event callback should fail");
 
         assert_eq!(error.to_string(), "event callback failed");
-        thread::sleep(std::time::Duration::from_millis(600));
+        drop(gate_keeper);
+        // Keep a writer open so a surviving descendant cannot exit on EOF.
+        // Wait for signal delivery to close its read end; reaping the parent
+        // does not synchronize descendant exit.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let gate_error = loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&gate)
+            {
+                Err(error) => break error,
+                Ok(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "workflow descendant continued after callback error"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        assert_eq!(gate_error.raw_os_error(), Some(libc::ENXIO));
+        drop(gate_writer);
         assert!(
             !survivor_marker.exists(),
             "workflow descendant continued after callback error"
@@ -1274,6 +1327,7 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
         let predicate_stop_at = Arc::clone(&stop_requested_at);
 
         let result = WorkflowHost::run_collecting_events_with_agent_and_event_callback_inner(
+            Command::new(WorkflowHost::node_executable()),
             &script,
             serde_json::Value::Null,
             None,

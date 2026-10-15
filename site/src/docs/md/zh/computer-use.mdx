@@ -15,16 +15,24 @@ Computer use 只在 macOS 14 及以上、交互式 TUI 的主会话中可用。�
 
 ## 应用授权
 
-第一次观察或操作应用前，Orca 会请求授权；已有权限规则决定这次调用时除外。
-面板提供四个选项：
+第一次观察或操作应用前，Orca 会请求授权；已有权限规则决定这次调用，或会话处于
+`full-auto`（见[审批模式](#审批模式)）时除外。面板提供六个选项：
 
 - `1` **Allow once**（仅这一次）：执行当前调用，下次仍会询问。
 - `2` **Allow this app this session**（本会话允许该应用）：退出前不再询问该应用的授权。
-- `7` **Always allow this app (saved)**（总是允许该应用）：保存允许规则，后续会话也生效。
+- `3` **Allow all apps this session**（本会话允许所有应用）：退出前不再询问任何应用的授权。
+- `7` **Always allow this app (saved)**（总是允许该应用）：为该应用保存允许规则，后续会话也生效。
+- `5` **Always allow all apps (saved)**（总是允许所有应用）：为所有应用保存允许规则，后续会话也生效。
 - `4` **Deny**（拒绝）：拒绝当前调用，让 Orca 寻找其他办法。
 
-保存选项把应用的完整 bundle id 写入用户配置：设置了 `ORCA_HOME` 时是
-`$ORCA_HOME/config.toml`，否则是 `~/.orca/config.toml`：
+在 `full-auto` 之外，终端和 IDE 需要针对该应用本身的授权：`1`、`2` 或 `7`，
+或者 `pattern` 为精确 bundle id 的 allow 规则。**Allow all apps this session**、
+`pattern = "*"` 或其他通配符，以及整个工具的 allow 规则都不覆盖它们。
+它们的授权面板不提供两个“所有应用”选项。
+
+保存选项写入用户配置：设置了 `ORCA_HOME` 时是 `$ORCA_HOME/config.toml`，否则是
+`~/.orca/config.toml`。`7` 把应用的完整 bundle id 写成规则的 `pattern`，`5` 写入
+`pattern = "*"`：
 
 ~~~toml
 [[permissions.rules]]
@@ -39,8 +47,8 @@ decision = "allow"
 以及 `Cmd+V`（也包括配合 Shift/Option 的粘贴）。导航键和其他非文字快捷键不触发
 这项单独审批。
 
-应用授权不能预先批准密码输入。带 `pattern` 的 allow 规则也不能，包括精确应用 id、
-通配符和显式的 `#secure` 目标。只有整个工具的 allow 规则，即 `tool = "computer"`、
+应用授权（包括所有应用的授权）和 `full-auto` 都不能预先批准密码输入。带 `pattern`
+的 allow 规则也不能，包括精确应用 id、`*` 这样的通配符和显式的 `#secure` 目标。对不能执行命令的应用，只有整个工具的 allow 规则，即 `tool = "computer"`、
 `decision = "allow"` 且不写 `pattern`，能预先批准。匹配的 deny 规则仍优先，详见
 [权限规则](approval-modes.md#权限规则)。
 
@@ -64,15 +72,20 @@ decision = "allow"
 运行 Orca 的宿主终端永远不能操作，任何规则都不能放开；无法识别宿主时，清单中的
 终端应用全部禁止操作。其他清单内的终端（Terminal、iTerm2、Ghostty、Warp、kitty、
 Alacritty、WezTerm、cmux）和 IDE（VS Code、`com.todesktop.` 或 `com.jetbrains.` 下的
-应用、Xcode、Zed）会警告它们能在 Orca 沙箱外执行命令；访达警告文件访问，系统设置警告
+应用、Xcode、Zed）会警告它们能在 Orca 沙箱外执行命令；在 `full-auto` 之外，
+这些应用需要前文所述的单独授权。访达警告文件访问，系统设置警告
 修改系统设置，清单内的浏览器（Safari、Chrome、Firefox、Arc、Edge、Brave）警告网页
-可能携带针对代理的指令。
+可能携带针对代理的指令。警告显示在授权面板里，也会出现在每个会话第一次操作该应用的
+结果里；在 `full-auto` 下、或因规则和授权而不弹面板的调用，也能看到它。
 
 ## 审批模式
 
 Plan 模式只允许 `list_apps` 和 `observe`，拒绝启动、点击、输入文字、发送按键和滚动。
-`list_apps` 不需要应用授权；`observe` 仍会请求应用授权。`full-auto` 下的应用调用
-也需要授权，已有适用规则或应用授权时除外。
+`list_apps` 不需要应用授权。在 `plan`、`suggest` 和 `auto-edit` 下，应用调用（包括
+`observe`）都会请求应用授权，已有适用规则或授权时除外。
+
+`full-auto` 本来就能在宿主机上执行命令，所以这时应用调用不再请求应用授权。密码输入
+仍然每次询问，deny 和 prompt 规则仍然生效，默认禁止的应用仍然禁止。
 
 ## 观察和截图
 

@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.11";
+export const releaseVersion = "v0.5.12";
 
 export const releases = [
+  {
+    version: "v0.5.12",
+    date: "2026-10-15",
+    title: "Fewer computer-use prompts",
+    body: "In full-auto, computer use no longer asks for app approval; typing into a password field still asks every time. The approval panel adds grants for every app, for the session or saved as pattern = \"*\", and neither covers password entry. Outside full-auto, terminals and IDEs still need approval for the app itself. The key action also accepts a separate modifiers array.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.12",
+  },
   {
     version: "v0.5.11",
     date: "2026-10-14",

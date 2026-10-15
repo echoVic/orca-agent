@@ -115,6 +115,21 @@ impl CompiledPermissionRule {
     /// A call without a target is matched as an empty one, so a pattern
     /// such as `src/**` never matches it.
     fn matches(&self, tool: &str, target: Option<&str>) -> bool {
+        // Command-running apps need an allow naming that exact app.
+        if tool == "computer"
+            && self.decision == Decision::Allow
+            && let Some(target) = target
+        {
+            let app = target.strip_suffix("#secure").unwrap_or(target);
+            if crate::computer_apps::runs_commands(app)
+                && self
+                    .pattern
+                    .as_ref()
+                    .is_none_or(|pattern| pattern.pattern != app.as_bytes())
+            {
+                return false;
+            }
+        }
         // App approval never preapproves password entry. Only an explicit
         // whole-tool allow also covers the separate secure-input target.
         if tool == "computer"
@@ -308,6 +323,98 @@ mod tests {
         assert!(!rule.matches("bash", Some("npm test")));
         assert!(!rule.matches("edit", Some("cargo test")));
         assert!(!rule.matches("bash", None));
+    }
+
+    #[test]
+    fn command_running_apps_require_an_exact_bundle_id_allow() {
+        for app in [
+            "com.apple.Terminal",
+            "com.microsoft.VSCode",
+            "com.jetbrains.intellij",
+        ] {
+            let exact = CompiledPermissionRules::from_rules(PermissionRules {
+                rules: vec![PermissionRule::new("computer", app, Decision::Allow)],
+            });
+            assert_eq!(
+                exact.matching_decision("computer", Some(app)),
+                Some(Decision::Allow)
+            );
+            assert_eq!(
+                exact.matching_decision("computer", Some(&format!("{app}#secure"))),
+                None
+            );
+        }
+        for rule in [
+            PermissionRule::new("computer", "*", Decision::Allow),
+            PermissionRule::new("computer", "com.apple.*", Decision::Allow),
+            PermissionRule::whole_tool("computer", Decision::Allow),
+        ] {
+            let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+                rules: vec![rule.clone()],
+            });
+            for app in [
+                "com.apple.Terminal",
+                "com.microsoft.VSCode",
+                "com.jetbrains.intellij",
+                "COM.APPLE.TERMINAL",
+            ] {
+                for target in [app.to_owned(), format!("{app}#secure")] {
+                    assert_eq!(
+                        compiled.matching_decision("computer", Some(&target)),
+                        None,
+                        "{rule:?}: {target}"
+                    );
+                }
+            }
+            assert_eq!(
+                compiled.matching_decision("computer", Some("com.apple.TextEdit")),
+                Some(Decision::Allow)
+            );
+        }
+    }
+
+    #[test]
+    fn command_running_app_allows_match_bundle_ids_byte_for_byte() {
+        for pattern in [
+            "com.apple.Termina?",
+            "com.jetbrains.*",
+            "com.todesktop.*",
+            "com.apple.Terminal*",
+            "com.apple.terminal",
+        ] {
+            let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+                rules: vec![PermissionRule::new("computer", pattern, Decision::Allow)],
+            });
+            for app in [
+                "com.apple.Terminal",
+                "com.jetbrains.intellij",
+                "com.todesktop.cursor",
+            ] {
+                assert_eq!(
+                    compiled.matching_decision("computer", Some(app)),
+                    None,
+                    "{pattern}: {app}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wildcard_denies_and_prompts_still_match_command_running_apps() {
+        for decision in [Decision::Deny, Decision::Prompt] {
+            for pattern in ["*", "com.apple.*", "com.apple.Termina?"] {
+                let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+                    rules: vec![PermissionRule::new("computer", pattern, decision)],
+                });
+                for target in ["com.apple.Terminal", "com.apple.Terminal#secure"] {
+                    assert_eq!(
+                        compiled.matching_decision("computer", Some(target)),
+                        Some(decision),
+                        "{pattern}: {target}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
