@@ -1,5 +1,12 @@
 # Orca
 
+[![Latest release](https://img.shields.io/github/v/release/echoVic/orca-agent)](https://github.com/echoVic/orca-agent/releases/latest)
+[![npm](https://img.shields.io/npm/v/@blade-ai/orca)](https://www.npmjs.com/package/@blade-ai/orca)
+[![MIT license](https://img.shields.io/github/license/echoVic/orca-agent)](LICENSE)
+[![Linux CI](https://img.shields.io/github/actions/workflow/status/echoVic/orca-agent/runtime-contract.yml?branch=main&label=linux)](https://github.com/echoVic/orca-agent/actions/workflows/runtime-contract.yml)
+[![Windows CI](https://img.shields.io/github/actions/workflow/status/echoVic/orca-agent/windows-ci.yml?branch=main&label=windows)](https://github.com/echoVic/orca-agent/actions/workflows/windows-ci.yml)
+[![GitHub stars](https://img.shields.io/github/stars/echoVic/orca-agent)](https://github.com/echoVic/orca-agent/stargazers)
+
 A DeepSeek-native coding agent for your terminal.
 
 Give Orca a task and it reads code, edits files, runs commands, verifies the
@@ -10,6 +17,8 @@ runs locally, and is MIT licensed.
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md)
 
 [Website](https://orcaagent.dev/) · [Changelog](https://orcaagent.dev/changelog/) · [Releases](https://github.com/echoVic/orca-agent/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
+
+![Orca's first run: trust the workspace, then enter a DeepSeek API key](docs/demo.gif)
 
 ## Install
 
@@ -293,6 +302,16 @@ More detail:
 
 - QQ group: `472309526`
 - [Telegram](https://t.me/+11No1w5ZbTMyZTQ1)
+
+## Related projects
+
+- [blade-code](https://github.com/echoVic/blade-code) is a TypeScript coding
+  agent with a CLI, a web UI, and a headless mode.
+- [boss-skill](https://github.com/echoVic/boss-skill) turns one coding agent
+  into an auditable team workflow, from PM through DevOps.
+- [blade-agent-sdk](https://github.com/echoVic/blade-agent-sdk) is a
+  session-first TypeScript SDK for multi-turn agents, streaming tools, MCP,
+  and subagents.
 
 ## Contributing
 
