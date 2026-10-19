@@ -102,6 +102,8 @@ fn trials() -> Vec<libtest_mimic::Trial> {
         background_type_with_a_target_inserts_after_existing_text,
         background_element_type_preserves_selection_and_appends_when_unfocused,
         foreground_element_type_preserves_selection_and_appends_when_unfocused,
+        background_element_type_preserves_selection_without_app_focus,
+        foreground_element_type_preserves_selection_without_app_focus_or_click,
         unreported_password_focus_refuses_unapproved_text_keys,
         foreground_type_at_a_point_keeps_the_clicked_caret,
         foreground_type_with_an_element_target_inserts_after_existing_text,
@@ -4303,6 +4305,95 @@ fn background_element_type_preserves_selection_and_appends_when_unfocused() {
 
 fn foreground_element_type_preserves_selection_and_appends_when_unfocused() {
     element_type_preserves_selection(true);
+}
+
+fn background_element_type_preserves_selection_without_app_focus() {
+    element_type_without_app_focus(false);
+}
+
+fn foreground_element_type_preserves_selection_without_app_focus_or_click() {
+    element_type_without_app_focus(true);
+}
+
+fn element_type_without_app_focus(foreground: bool) {
+    run_live_test(|| {
+        use objc2_application_services::{AXError, AXValue, AXValueType};
+        use objc2_core_foundation::{CFBoolean, CFRange, CFString};
+
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let mut flags = vec!["--prefilled-name", "--hide-focused-element"];
+        if foreground {
+            flags.extend(["--modal-window", "--reveal-focus-after-raise-check"]);
+        }
+        let (pid, log) = live.launch_fixture_with_flags(&flags);
+        let field = fixture_ax_named(&fixture_window(pid), "Name").unwrap();
+        let application = NativeAxElement::application(pid);
+        assert!(native_ax_optional_element(&application, "AXFocusedUIElement").is_none());
+        assert_eq!(
+            native_ax_optional_value(&field, "AXFocused")
+                .and_then(|value| value.downcast_ref::<CFBoolean>().map(|flag| flag.value())),
+            Some(true),
+            "the target itself must report focus when application focus is absent"
+        );
+        let range = CFRange::new(1, 2); // Select the crab's two UTF-16 units.
+        let selection =
+            unsafe { AXValue::new(AXValueType::CFRange, std::ptr::NonNull::from(&range).cast()) }
+                .unwrap();
+        assert_eq!(
+            unsafe {
+                field.set_attribute_value(
+                    &CFString::from_str("AXSelectedTextRange"),
+                    selection.as_ref(),
+                )
+            },
+            AXError::Success
+        );
+        live.make_finder_frontmost();
+        let observed = live.observe("dev.orca.cu-fixture", None);
+        let target = element_named(&observed, "Name");
+        let mouse_before = orca_computer_use::driver::macos::test_mouse_down_count();
+        let outcome = live
+            .act_with_fallback(
+                Action::Type {
+                    text: "x".into(),
+                    target: Some(target),
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(outcome.foreground_used, foreground);
+        assert_eq!(live.fixture_control_value("Name"), "axc");
+        assert_eq!(
+            orca_computer_use::driver::macos::test_mouse_down_count(),
+            mouse_before,
+            "an already-focused target must not be clicked"
+        );
+        if foreground {
+            live.assert_log_contains(&log, r#""type":"omitted_raised_app_focus""#);
+            // Also cover the adjacent Key shortcut with app-level focus absent
+            // for its first check after AXRaise. Navigation must not click.
+            let outcome = live
+                .act_with_fallback(
+                    Action::Key {
+                        keys: vec!["left".into()],
+                        target: Some(target),
+                    },
+                    false,
+                    true,
+                )
+                .unwrap();
+            assert!(outcome.foreground_used);
+            assert_eq!(
+                orca_computer_use::driver::macos::test_mouse_down_count(),
+                mouse_before,
+                "already-focused foreground navigation must not click"
+            );
+        }
+        live.assert_frontmost_and_pointer_unchanged();
+    });
 }
 
 fn element_type_preserves_selection(foreground: bool) {

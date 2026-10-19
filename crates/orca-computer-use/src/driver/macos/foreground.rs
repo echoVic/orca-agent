@@ -292,13 +292,10 @@ pub(super) fn run(
                         // keyboard recipient without an unnecessary pointer click.
                         let already_focused =
                             if matches!(target_location(params), Some(Target::Element { .. })) {
-                                let focused =
-                                    application.attribute_element("AXFocusedUIElement")?;
-                                target_element.as_ref().is_some_and(|target| {
-                                    focused
-                                        .as_ref()
-                                        .is_some_and(|focused| focused.0 == target.0)
-                                })
+                                actions::keyboard_target_is_focused(
+                                    target_element.as_ref(),
+                                    |target| actions::keyboard_recipient(application, target),
+                                )?
                             } else {
                                 false
                             };
@@ -339,13 +336,10 @@ pub(super) fn run(
                         // keyboard recipient without an unnecessary pointer click.
                         let already_focused =
                             if matches!(target_location(params), Some(Target::Element { .. })) {
-                                let focused =
-                                    application.attribute_element("AXFocusedUIElement")?;
-                                target_element.as_ref().is_some_and(|target| {
-                                    focused
-                                        .as_ref()
-                                        .is_some_and(|focused| focused.0 == target.0)
-                                })
+                                actions::keyboard_target_is_focused(
+                                    target_element.as_ref(),
+                                    |target| actions::keyboard_recipient(application, target),
+                                )?
                             } else {
                                 false
                             };

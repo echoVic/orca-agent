@@ -65,6 +65,10 @@ var pendingProbeRaise = true
 let foregroundPasswordProbe = CommandLine.arguments.contains("--foreground-password-probe")
 let foregroundTypeProbe = CommandLine.arguments.contains("--foreground-type-probe")
 let rejectEarlyHit = CommandLine.arguments.contains("--reject-hit-before-raise")
+// Keep app-level focus absent through the foreground click decision, then
+// reveal it for the unchanged wait_for_focus and system-recipient checks.
+var raisedForFocusProbe = false
+var omittedRaisedFocus = false
 final class ProbeWindow: NSWindow {
     override func isAccessibilityModal() -> Bool {
         if let flag = CommandLine.arguments.first(where: { $0.hasPrefix("--window-modal-error=") }), let code = Int(flag.dropFirst("--window-modal-error=".count)) { failAX(code); return false }
@@ -73,6 +77,10 @@ final class ProbeWindow: NSWindow {
     }
     override func accessibilityPerformRaise() -> Bool {
         pendingProbeRaise = false
+        if CommandLine.arguments.contains("--reveal-focus-after-raise-check") {
+            raisedForFocusProbe = true
+            omittedRaisedFocus = false
+        }
         return super.accessibilityPerformRaise()
     }
     override func accessibilityHitTest(_ point: NSPoint) -> Any? {
@@ -132,7 +140,15 @@ final class ProbeApplication: NSApplication {
     }
     override func accessibilityApplicationFocusedUIElement() -> Any? {
         if windows.contains(where: { $0.firstResponder is Canvas }) { return nil }
-        if CommandLine.arguments.contains("--hide-focused-element") { return nil }
+        if CommandLine.arguments.contains("--hide-focused-element") {
+            if !raisedForFocusProbe || !omittedRaisedFocus {
+                if raisedForFocusProbe {
+                    omittedRaisedFocus = true
+                    log(["type": "omitted_raised_app_focus"])
+                }
+                return nil
+            }
+        }
         if foregroundTypeProbe && pendingProbeRaise { return nil }
         if (CommandLine.arguments.contains("--expire-selection-focus") || CommandLine.arguments.contains("--no-name-length")), let focus = expiringSelectionFocus { return focus }
         if foregroundPasswordProbe, let window = windows.first(where: { $0.title == "Orca CU Fixture" }), (window.firstResponder == nil || window.firstResponder === window) { return nil }
