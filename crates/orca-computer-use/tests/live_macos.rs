@@ -5537,9 +5537,11 @@ fn textedit_save_panel_uses_foreground_for_typing() {
         assert!(outcome.foreground_used);
         let targeted_value = native_ax_string(&name, "AXValue").unwrap();
         eprintln!("element-targeted panel receipt: {targeted_value:?}");
-        assert!(
-            targeted_value.ends_with("-target"),
-            "element-targeted panel receipt: {targeted_value:?}"
+        // The focused caret stays after the stem, before any visible extension.
+        assert_eq!(
+            targeted_value,
+            after.replacen("orca-panel-name", "orca-panel-name-target", 1),
+            "element-targeted panel receipt must preserve the caret and filename suffix"
         );
         let before_key = native_ax_string(&name, "AXValue").unwrap();
         let outcome = live
