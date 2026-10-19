@@ -181,7 +181,9 @@ final class ModalAncestor: NSAccessibilityElement {
     init(_ index: Int) { self.index = index; super.init() }
     override func accessibilityRole() -> NSAccessibility.Role? {
         if CommandLine.arguments.contains("--slow-modal-walk") {
-            Thread.sleep(forTimeInterval: 0.84)
+            // 34 reads consume 13.6s, leaving room for foreground activation
+            // before the shared 30s deadline without fitting 20s of typing.
+            Thread.sleep(forTimeInterval: 0.4)
             log(["type": "slow_modal_read", "index": index])
             if index == 33 { return .sheet }
         }

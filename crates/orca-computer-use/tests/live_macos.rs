@@ -6159,7 +6159,7 @@ fn native_slow_ancestry_and_foreground_delivery_share_one_action_deadline() {
                 app: "dev.orca.cu-fixture".into(),
                 window: Some(obs.window.id),
                 action: Action::Type {
-                    text: "x".repeat(4000),
+                    text: "x".repeat(1000),
                     target: None,
                 },
                 foreground_fallback: true,
@@ -6178,8 +6178,9 @@ fn native_slow_ancestry_and_foreground_delivery_share_one_action_deadline() {
             panic!("native deadline error must reach the caller")
         };
         assert_eq!(error.kind, ErrorKind::Failed);
-        // The slow walk leaves too little of the shared deadline for 4000
-        // characters, so delivery is refused before anything is typed.
+        // 1000 characters need 20s of HID delivery: they fit a fresh 30s
+        // deadline, but not the <=16.4s left after 34 ancestry reads at 0.4s.
+        // Refuse before typing, with ample time left for foreground setup.
         assert!(
             error
                 .message
