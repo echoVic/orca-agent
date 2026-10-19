@@ -1152,7 +1152,8 @@ mod tests {
     fn sync_subagent_receives_only_remaining_aggregate_budget() {
         let mut config = config(SubagentConfig::default());
         config.budget.max_cost_usd_micros = Some(500_000);
-        let mut cost_tracker = CostTracker::new(None);
+        let mut cost_tracker =
+            CostTracker::new(None).with_clock(crate::pricing::rates::off_peak_instant);
         cost_tracker.add_usage(Usage {
             input_tokens: 1_000_000,
             output_tokens: 0,
@@ -1162,12 +1163,12 @@ mod tests {
         let child_config =
             super::config_for_remaining_subagent_budget(&config, &cost_tracker, None);
 
-        // 1M flash input tokens ≈ $0.14, leaving ≈ $0.36 of the $0.50 budget.
+        // 1M flash input tokens cost $0.15 off-peak, leaving $0.35 of the $0.50 budget.
         let remaining = child_config
             .budget
             .max_cost_usd_micros
             .expect("remaining budget");
-        assert!((remaining as f64 - 360_000.0).abs() < 2_000.0);
+        assert!((remaining as f64 - 350_000.0).abs() < 2_000.0);
         assert_eq!(config.budget.max_cost_usd_micros, Some(500_000));
     }
 

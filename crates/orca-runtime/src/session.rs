@@ -239,6 +239,7 @@ impl InteractiveSession {
         prepared_record_meta: Option<SessionMeta>,
         runtime_thread_id: Option<String>,
     ) -> io::Result<Self> {
+        crate::pricing::refresh::ensure_background_refresh(config.pricing_refresh);
         let cwd = config
             .cwd
             .clone()
@@ -418,6 +419,9 @@ impl InteractiveSession {
             && !matches!(config.history_mode, HistoryMode::Disabled))
         .then(memory::AutomaticMemoryWorker::start)
         .flatten();
+        let cost_tracker = CostTracker::with_overrides(None, &config.model.price_overrides());
+        #[cfg(test)]
+        let cost_tracker = cost_tracker.with_clock(crate::pricing::rates::off_peak_instant);
         let session = Self {
             store,
             conversation,
@@ -426,7 +430,7 @@ impl InteractiveSession {
             next_event_seq,
             completion_error: None,
             instructions,
-            cost_tracker: CostTracker::new(None),
+            cost_tracker,
             usage_baseline,
             mcp_registry,
             hooks,

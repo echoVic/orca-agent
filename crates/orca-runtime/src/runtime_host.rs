@@ -23524,6 +23524,10 @@ fn provider_response_usage_totals(
 ) -> Option<UsageTotals> {
     let usage = response.usage.filter(|usage| !usage.is_empty())?;
     let mut tracker = crate::cost::CostTracker::new(model);
+    #[cfg(test)]
+    {
+        tracker = tracker.with_clock(crate::pricing::rates::off_peak_instant);
+    }
     Some(tracker.add_usage(usage))
 }
 
@@ -40570,7 +40574,7 @@ mod tests {
                 assistant_content: Some("finished".to_string()),
                 assistant_reasoning: None,
                 tool_calls: Vec::new(),
-                // V4-Flash pricing: 100k in + 10k out = 14,000 + 2,800 micros.
+                // Off-peak flash: 100k in + 10k out = 15,000 + 6,000 micros.
                 usage: Some(Usage {
                     input_tokens: 100_000,
                     output_tokens: 10_000,
@@ -40613,7 +40617,7 @@ mod tests {
             "tool accounting resumed from the snapshot"
         );
         assert_eq!(
-            usage.cost_usd_micros, 20_800,
+            usage.cost_usd_micros, 25_000,
             "the response delta is added exactly once to the pre-suspension cost"
         );
 

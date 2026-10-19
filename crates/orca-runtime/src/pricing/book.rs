@@ -168,7 +168,6 @@ pub fn current() -> Arc<PriceBook> {
         .clone()
 }
 
-#[allow(dead_code)]
 pub(crate) fn install(cache: &PricingCache) {
     let book = Arc::new(merge(Some(cache)));
     *global()

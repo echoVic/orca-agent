@@ -223,7 +223,6 @@ pub fn refresh_and_store(
 }
 
 /// Starts at most one background refresh per process, when it is due.
-#[allow(dead_code)]
 pub(crate) fn ensure_background_refresh(enabled: bool) {
     static STARTED: AtomicBool = AtomicBool::new(false);
     if !enabled || STARTED.swap(true, Ordering::AcqRel) {

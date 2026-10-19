@@ -318,7 +318,8 @@ fn route_child_agent_model_updates_provider_config_and_cost_model() {
     // Seeded with a different model than the auto route resolves to, so the
     // assertion below actually proves route_child_agent_model overrides the
     // tracker's pricing rather than merely leaving it unchanged.
-    let mut tracker = CostTracker::new(Some(orca_core::model::PRO_MODEL));
+    let mut tracker = CostTracker::new(Some(orca_core::model::PRO_MODEL))
+        .with_clock(crate::pricing::rates::off_peak_instant);
 
     let provider_config =
         route_child_agent_model(&runtime_config, &request, &setup, &mut tracker).provider_config;
@@ -329,7 +330,7 @@ fn route_child_agent_model_updates_provider_config_and_cost_model() {
     });
 
     assert_eq!(provider_config.model.as_deref(), Some(FLASH_MODEL));
-    let expected_flash_cost = (1_000.0 * 0.14 + 1_000.0 * 0.28) / 1_000_000.0;
+    let expected_flash_cost = (1_000.0 * 0.15 + 1_000.0 * 0.6) / 1_000_000.0;
     assert!((totals.estimated_cost_usd - expected_flash_cost).abs() < 1e-12);
 }
 
