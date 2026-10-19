@@ -341,6 +341,10 @@ fn execute_subagent_batch(
     );
     let batch_id = uuid::Uuid::now_v7().to_string();
 
+    let event_registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(mcp_registry),
+        &config.external_tools,
+    );
     for (idx, tool_request) in tool_requests.iter().enumerate() {
         if event_error.is_some() {
             let result = tool_types::ToolResult::failed_before_start(
@@ -351,7 +355,11 @@ fn execute_subagent_batch(
             if emit_deltas {
                 emit_batch_event(
                     sink,
-                    events.tool_call_requested(tool_request),
+                    crate::lifecycle::RuntimeTaskActor::tool_call_requested_event_with_registry_for(
+                        events,
+                        tool_request,
+                        &event_registry,
+                    ),
                     &mut event_error,
                 );
                 emit_batch_event(sink, events.tool_call_completed(&result), &mut event_error);
@@ -360,7 +368,12 @@ fn execute_subagent_batch(
             continue;
         }
         if emit_deltas {
-            let requested = events.tool_call_requested(tool_request);
+            let requested =
+                crate::lifecycle::RuntimeTaskActor::tool_call_requested_event_with_registry_for(
+                    events,
+                    tool_request,
+                    &event_registry,
+                );
             if !emit_batch_event(sink, requested, &mut event_error) {
                 let result = tool_types::ToolResult::failed_before_start(
                     tool_request,
