@@ -2408,3 +2408,4 @@ git commit -m "docs: explain peak-hour cost estimates and the pricing settings" 
 - Batch E2：价格覆盖改在每个进程的 `build_run_config` 安装，覆盖 detached worker，移除会话构造时对全局覆盖的写入；长进程使用最近加载的用户配置。
 - Batch E3：用户覆盖价格上限设为每百万 tokens 10,000 美元；正无穷成本转换为 `u64::MAX`，避免预算溢出后按零收费。
 - Batch E4：缓存升为 v2，按每模型 `last_updated` 内容日期合并而非抓取时间；宽松回退日期，忽略 v1，来源仅在缓存条目实际生效时标为 Fetched。
+- Batch E5：缓存新鲜度和 ETag 仅用于相同 source URL，切换来源时无条件抓取且替换缓存。

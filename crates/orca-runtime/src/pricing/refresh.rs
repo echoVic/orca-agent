@@ -100,7 +100,7 @@ pub fn fetch(url: &str, previous: Option<&PricingCache>, now: DateTime<Utc>) -> 
     fetch_with_limits(url, previous, now, REQUEST_TIMEOUT, MAX_BODY_BYTES)
 }
 
-/// One conditional GET of `url`, sending `previous`'s ETag.
+/// One GET of `url`, sending an ETag only for a cached copy of that URL.
 pub fn fetch_with_limits(
     url: &str,
     previous: Option<&PricingCache>,
@@ -123,6 +123,7 @@ fn try_fetch(
 ) -> Result<RefreshOutcome, String> {
     use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, ETAG, IF_NONE_MATCH, USER_AGENT};
 
+    let previous = previous.filter(|cache| cache.source == url);
     let client = orca_mcp::http::blocking_client()?;
     let mut request = client
         .get(url)
@@ -207,10 +208,13 @@ pub fn refresh_url(
     if url_override.is_none() && dev_build {
         return None;
     }
-    if cached.is_some_and(|cache| now.signed_duration_since(cache.fetched_at) < refresh_after()) {
+    let url = url_override.unwrap_or_else(|| DEFAULT_URL.to_string());
+    if cached.is_some_and(|cache| {
+        cache.source == url && now.signed_duration_since(cache.fetched_at) < refresh_after()
+    }) {
         return None;
     }
-    Some(url_override.unwrap_or_else(|| DEFAULT_URL.to_string()))
+    Some(url)
 }
 
 /// Fetches and caches; a cache that cannot be written still counts, so the
@@ -505,7 +509,8 @@ mod tests {
     #[test]
     fn fetch_sends_the_etag_and_keeps_the_cache_on_304() {
         let (url, server) = serve(vec![response("304 Not Modified", &[], b"")]);
-        let previous = cached("2026-10-18T08:00:00Z", Some("\"v1\""));
+        let mut previous = cached("2026-10-18T08:00:00Z", Some("\"v1\""));
+        previous.source = url.clone();
         let outcome = fetch(&url, Some(&previous), now());
         let RefreshOutcome::NotModified(cache) = outcome else {
             panic!("expected not-modified, got {outcome:?}");
@@ -553,6 +558,37 @@ mod tests {
         let outcome = fetch_with_limits(&url, None, now(), Duration::from_millis(500), 1024);
         assert!(matches!(outcome, RefreshOutcome::Failed(_)), "{outcome:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn freshness_is_scoped_to_the_selected_source_url() {
+        let fresh = cached("2026-10-20T02:00:00Z", Some("old-source-etag"));
+        let other = "http://127.0.0.1:9/api.json".to_string();
+        assert_eq!(
+            refresh_url(true, Some(other.clone()), true, Some(&fresh), now()),
+            Some(other)
+        );
+        assert_eq!(refresh_url(true, None, false, Some(&fresh), now()), None);
+    }
+
+    #[test]
+    fn a_different_source_receives_no_etag_and_replaces_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pricing-cache.json");
+        let previous = cached("2026-10-20T02:00:00Z", Some("old-source-etag"));
+        book::write_cache(&path, &previous).unwrap();
+        let (url, server) = serve(vec![response(
+            "200 OK",
+            &[("ETag", "new-source-etag")],
+            MODELS_DEV.as_bytes(),
+        )]);
+        let outcome = refresh_and_store(&url, &path, Some(&previous), now());
+        let heads = server.join().unwrap();
+        assert!(!heads[0].contains("if-none-match"), "{heads:?}");
+        assert!(matches!(outcome, RefreshOutcome::Updated(_)), "{outcome:?}");
+        let stored = read_cache(&path).unwrap();
+        assert_eq!(stored.source, url);
+        assert_eq!(stored.etag.as_deref(), Some("new-source-etag"));
     }
 
     #[test]

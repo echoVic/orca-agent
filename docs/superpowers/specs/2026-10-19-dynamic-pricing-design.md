@@ -51,7 +51,7 @@
 **请求：**
 
 - `GET https://models.dev/api.json`。环境变量 `ORCA_PRICING_URL` 可以替换这个地址。
-- 请求头：`Accept-Encoding: gzip`、`User-Agent: orca/<版本>`。有缓存时再带上 `If-None-Match: <etag>`。
+- 请求头：`Accept-Encoding: gzip`、`User-Agent: orca/<版本>`。缓存的 `source` 与请求 URL 相同时才带上 `If-None-Match: <etag>`。
 - 客户端必须用 `orca_mcp::http::blocking_client()`，这是 CI 的 http-client 边界校验所要求的。请求在普通 `std::thread` 里发，不在 tokio 上下文里。
 - 总超时 15 秒。解压后的内容超过 32 MiB 就放弃。
 - 工作区的 reqwest 没开 `gzip` feature，也不为这一个请求打开（打开会影响所有客户端）。这里自己用 `flate2` 解压；`flate2` 已经在依赖树里。
@@ -109,7 +109,7 @@
 ### 1.5 什么时候刷新
 
 - 一个进程第一次创建会话时（`InteractiveSession` 的内部构造函数，所有入口都经过这里），会检查一次是否需要刷新，用进程级 `Once` 保证只检查一次。
-- 只有同时满足以下条件才刷新：配置 `pricing.refresh` 为 true（默认就是 true）；缓存缺失，或 `fetched_at` 已超过 24 小时。
+- 只有同时满足以下条件才刷新：配置 `pricing.refresh` 为 true（默认就是 true）；当前 URL 没有缓存，或 `fetched_at` 已超过 24 小时。不同来源的缓存不影响新 URL 的刷新时效，也不向新来源发送旧 ETag。
 - 开发构建不刷新，判断方式和 update check 的 `is_dev_build_run()` 相同（debug 构建，或可执行文件在 `target/` 下）。例外是设置了 `ORCA_PRICING_URL`：测试用它把请求指到本地 fixture。因此测试永远不会访问外网，也不会写 `~/.orca`。
 - 刷新在后台线程里进行，不阻塞启动，也不阻塞任何 turn。进程在刷新完成前退出也没关系，下次再试。
 - 子代理 worker 也会走到这里。缓存通常已经被父进程刷新过，所以 worker 一般不会去拉。
