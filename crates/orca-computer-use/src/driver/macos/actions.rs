@@ -23,6 +23,14 @@ pub(super) fn should_collapse_type_selection(was_focused: bool) -> bool {
     !was_focused
 }
 
+fn type_target_is_still_focused<T: PartialEq>(
+    was_focused: bool,
+    target: &T,
+    recipient: Option<&T>,
+) -> bool {
+    was_focused && recipient == Some(target)
+}
+
 pub(super) fn keyboard_target_is_focused<T: PartialEq>(
     target: Option<&T>,
     read_recipient: impl FnOnce(Option<&T>) -> Result<Option<T>, DriverError>,
@@ -297,9 +305,9 @@ impl MacDriver {
         {
             return Err(stale());
         }
-        // Keep the original focus even if the background attempt changes it
-        // before requesting foreground fallback.
-        let type_target_was_focused = if let Action::Type {
+        // Keep original focus for fallback unless a fresh recipient check
+        // proves the target lost it before the background attempt.
+        let mut type_target_was_focused = if let Action::Type {
             target: Some(target @ Target::Element { .. }),
             ..
         } = &params.action
@@ -386,7 +394,18 @@ impl MacDriver {
                     // Setting AXFocused again can replace an intentional selection.
                     let element = match target {
                         Some(target) if type_target_was_focused => {
-                            target_element(table, &application, *target)?
+                            let element = target_element(table, &application, *target)?;
+                            let recipient = keyboard_recipient(&application, Some(&element))?;
+                            type_target_was_focused = type_target_is_still_focused(
+                                type_target_was_focused,
+                                &element,
+                                recipient.as_ref(),
+                            );
+                            if type_target_was_focused {
+                                element
+                            } else {
+                                focus(table, &application, Some(*target))?
+                            }
                         }
                         _ => focus(table, &application, *target)?,
                     };
@@ -856,6 +875,26 @@ mod tests {
     #[test]
     fn typing_into_an_unfocused_element_collapses_its_selection() {
         assert!(should_collapse_type_selection(false));
+    }
+
+    #[test]
+    fn type_focus_recheck_requires_refocus_and_collapse_after_focus_moves() {
+        for recipient in [None, Some(7)] {
+            let keep_selection = type_target_is_still_focused(true, &42, recipient.as_ref());
+            assert!(
+                !keep_selection,
+                "initial focus alone cannot skip refocusing"
+            );
+            assert!(should_collapse_type_selection(keep_selection));
+        }
+    }
+
+    #[test]
+    fn type_focus_recheck_preserves_selection_only_for_continuous_target_focus() {
+        assert!(type_target_is_still_focused(true, &42, Some(&42)));
+        // Newly acquired focus must still collapse any selection made by Cocoa.
+        assert!(!type_target_is_still_focused(false, &42, Some(&42)));
+        assert!(!type_target_is_still_focused(false, &42, None));
     }
 
     #[test]
