@@ -2095,6 +2095,7 @@ mod tests {
             .expect("start turn");
 
         assert!(result.error.is_none());
+        drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"turn.started\""));
         assert!(output.contains("hello"));
@@ -2165,6 +2166,7 @@ mod tests {
             }
             RuntimeTurnOpeningResult::Return(_) => panic!("opening should continue"),
         }
+        drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"turn.started\""));
         assert!(output.contains("\"type\":\"model.routed\""));
@@ -2388,6 +2390,7 @@ mod tests {
             Some(orca_core::model::FLASH_MODEL)
         );
         assert_eq!(result.decision.actual_model, orca_core::model::FLASH_MODEL);
+        drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"model.routed\""));
         assert!(output.contains(orca_core::model::FLASH_MODEL));
@@ -2440,6 +2443,7 @@ mod tests {
             Some(orca_core::model::FLASH_MODEL)
         );
         assert_eq!(result.decision.actual_model, orca_core::model::FLASH_MODEL);
+        drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains(orca_core::model::FLASH_MODEL));
     }

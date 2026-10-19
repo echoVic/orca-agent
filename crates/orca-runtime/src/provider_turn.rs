@@ -1430,6 +1430,7 @@ mod tests {
             }
             _ => panic!("expected non-compaction provider error to fail"),
         }
+        drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"error\""));
         assert!(output.contains("DeepSeek provider error: quota"));
@@ -1450,6 +1451,7 @@ mod tests {
         let summary = registry.summary(&task.id).expect("root task summary");
         assert_eq!(summary.retry_count, 1);
         assert!(summary.error.is_some());
+        drop(sink);
         assert!(
             String::from_utf8(output)
                 .expect("event output")
@@ -1893,6 +1895,7 @@ mod tests {
             _ => panic!("expected provider error step failure"),
         }
         assert!(!step.reactive_compacted_for_test());
+        drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"error\""));
         assert!(output.contains("DeepSeek provider error: quota"));

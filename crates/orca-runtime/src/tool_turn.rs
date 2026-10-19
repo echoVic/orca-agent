@@ -1762,6 +1762,7 @@ mod tests {
 
         let summary = registry.summary(&task.id).expect("root task summary");
         assert!(summary.output_truncated);
+        drop(sink);
         assert!(
             String::from_utf8(output)
                 .expect("event output")

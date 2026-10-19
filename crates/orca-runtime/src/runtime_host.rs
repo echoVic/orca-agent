@@ -200,6 +200,11 @@ fn take_passthrough_finish_failure() -> bool {
 }
 
 pub trait HostedOperationWriter: io::Write + Send + 'static {
+    /// Only the exec stdout relay opts in; internal and server writers stay lossless.
+    fn coalesce_jsonl_deltas(&self) -> bool {
+        false
+    }
+
     fn finish_generation(&mut self, commit_terminal: bool) -> io::Result<()>;
 }
 
@@ -499,6 +504,7 @@ pub struct HostedTurnRequest {
     root_task_id: Option<String>,
     generation_handler_factory: Option<Arc<HostedGenerationHandlerFactory>>,
     usage_credit: UsageTotals,
+    coalesce_jsonl_deltas: bool,
     surface_goal_owned: bool,
     surface_goal_turn: Option<crate::goal_actor::GoalTurnContext>,
 }
@@ -662,6 +668,7 @@ impl HostedTurnRequest {
             root_task_id: None,
             generation_handler_factory: None,
             usage_credit: UsageTotals::default(),
+            coalesce_jsonl_deltas: false,
             surface_goal_owned: false,
             surface_goal_turn: None,
         }
@@ -895,6 +902,7 @@ impl HostedTurnRequest {
             ThreadTurnToolMode::Standard
         };
         let mut request = ThreadTurnRequest::new(self.prompt.clone())
+            .with_jsonl_delta_coalescing(self.coalesce_jsonl_deltas)
             .with_images(self.images.clone())
             .with_turn_id(self.turn_id.clone())
             .with_prompt_placement(prompt_placement)
@@ -3285,6 +3293,17 @@ impl HeadlessSurfaceSession {
     where
         W: io::Write + Send + 'static,
     {
+        self.start_turn_with_output(prompt, PassthroughHostedOperationWriter::new(writer))
+    }
+
+    pub(crate) fn start_turn_with_output<W>(
+        &self,
+        prompt: &str,
+        writer: W,
+    ) -> io::Result<HeadlessOperationHandle>
+    where
+        W: HostedOperationWriter,
+    {
         let intent = surface::OperationRequestIntent {
             correlation: surface::OperationIngressCorrelation::Headless,
             kind: surface::OperationKind::UserTurn,
@@ -3314,7 +3333,7 @@ impl HeadlessSurfaceSession {
                     surface::SurfaceRequestId::new(),
                     reserved.operation_id.clone(),
                     reserved.lease.lease_id,
-                    PassthroughHostedOperationWriter::new(writer),
+                    writer,
                 )
                 .map_err(headless_surface_error)?,
             "admit",
@@ -21217,6 +21236,7 @@ impl ThreadActor {
         let executor = Arc::clone(&self.executor);
         let mut task_request = request.clone();
         task_request.surface_goal_turn = goal_turn;
+        task_request.coalesce_jsonl_deltas = writer.coalesce_jsonl_deltas();
         let cancel = CancelToken::new();
         if let Some(factory) = request.generation_handler_factory.as_ref() {
             context.handlers = factory(context.fence(), cancel.clone());
