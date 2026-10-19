@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
+use orca_core::approval_types::ActionKind;
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 use orca_core::thread_identity::TurnId;
 use sha2::{Digest, Sha256};
@@ -30,8 +31,8 @@ use crate::surface::{
     SurfaceCommitBatch, SurfaceEvent, SurfaceInputRequest, SurfaceInputRequestBlock,
     SurfaceInteractionKind, SurfaceInteractionRequest, SurfaceInteractionRoute, SurfaceOperationId,
     SurfaceRequestId, SurfaceScope, SurfaceSubscriptionItem, SurfaceSubscriptionReceiver,
-    SurfaceToolRequest, SurfaceToolResultKind, SurfaceWorkflowResultStatus, ToolPatch,
-    ToolTerminalSource, UncommittedMutation, WorkflowPatch,
+    SurfaceToolAction, SurfaceToolRequest, SurfaceToolResultKind, SurfaceWorkflowResultStatus,
+    ToolPatch, ToolTerminalSource, UncommittedMutation, WorkflowPatch,
 };
 use crate::thread_store::{
     SortDirection, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchPage,
@@ -1988,6 +1989,13 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
             projector.streams.remove(&serialized_id(stream_id));
         }
         SurfaceEvent::Tool(ToolPatch::Requested { request }) => {
+            let action = match request.action {
+                SurfaceToolAction::Read => ActionKind::Read,
+                SurfaceToolAction::Write => ActionKind::Write,
+                SurfaceToolAction::Network => ActionKind::Network,
+                SurfaceToolAction::Agent => ActionKind::Agent,
+                SurfaceToolAction::Shell => ActionKind::Shell,
+            };
             projector
                 .tools
                 .insert(request.tool_call_id.as_str().to_string(), request.clone());
@@ -1998,6 +2006,7 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                 serde_json::json!({
                     "id": request.tool_call_id.as_str(),
                     "name": request.name.as_str(),
+                    "action": action,
                     "target": request.target.as_ref().map(DisplayText::as_str),
                     "raw_arguments": request.raw_arguments.as_str(),
                 }),

@@ -120,6 +120,73 @@ fn read_request(stream: &TcpStream) -> io::Result<Value> {
 }
 
 #[test]
+fn server_deepseek_requested_events_report_canonical_action_and_target() {
+    use orca_core::approval_types::ApprovalMode;
+    use orca_core::config::{HistoryMode, ProviderKind, RunConfig};
+    use orca_core::model::ModelSelection;
+    use orca_runtime::server::JsonlSurfaceAdapter;
+
+    let home = tempfile::tempdir().unwrap();
+    let previous_home = std::env::var_os("ORCA_HOME");
+    unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+    let cwd = tempfile::tempdir().unwrap();
+    let mut endpoint = ScriptedEndpoint::start();
+    let config = RunConfig {
+        cwd: Some(cwd.path().to_path_buf()),
+        provider: ProviderKind::DeepSeek,
+        model: ModelSelection::parse(Some("deepseek-flash".to_string())).unwrap(),
+        api_key: Some("local-contract-fixture".to_string()),
+        base_url: Some(endpoint.url.clone()),
+        approval_mode: ApprovalMode::FullAuto,
+        history_mode: HistoryMode::Disabled,
+        ..RunConfig::default()
+    };
+    let mut runtime = JsonlSurfaceAdapter::start().unwrap();
+    let thread_id = runtime.start_thread(&config).unwrap();
+    let mut output = Vec::new();
+    runtime
+        .run_turn(
+            &config,
+            &thread_id,
+            "Create snake.py and run the command.",
+            &mut output,
+        )
+        .unwrap();
+    runtime.shutdown().unwrap();
+    unsafe {
+        if let Some(previous) = previous_home {
+            std::env::set_var("ORCA_HOME", previous);
+        } else {
+            std::env::remove_var("ORCA_HOME");
+        }
+    }
+    assert!(endpoint.finish().len() >= 2);
+
+    let events = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let requested = events
+        .iter()
+        .find(|event| {
+            event["type"] == "tool.call.requested" && event["payload"]["id"] == "call-write"
+        })
+        .expect("server projects the committed write request");
+    assert_eq!(requested["payload"]["name"], "write_file");
+    assert_eq!(requested["payload"]["target"], "snake.py");
+    assert_eq!(
+        requested["payload"]["raw_arguments"],
+        r#"{"path":"snake.py","content":"print(1)\n"}"#
+    );
+    assert_eq!(requested["payload"]["action"], "write");
+    assert_eq!(
+        std::fs::read_to_string(cwd.path().join("snake.py")).unwrap(),
+        "print(1)\n"
+    );
+}
+
+#[test]
 fn exec_deepseek_requested_events_report_canonical_action_and_target() {
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
