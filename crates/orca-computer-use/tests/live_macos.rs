@@ -1,22 +1,18 @@
 #![cfg(target_os = "macos")]
-#![cfg_attr(target_os = "macos", no_main)]
-#![cfg_attr(target_os = "macos", reexport_test_harness_main = "rust_tests")]
 
-// Keep the standard ignored/serial libtest interface, but let AppKit's actual
-// main thread deliver runningApplications updates while libtest runs tests.
-#[unsafe(export_name = "main")]
-extern "C" fn macos_test_main() -> i32 {
+// AppKit must deliver runningApplications updates on the actual main thread.
+pub fn run(cli: super::harness::Cli) -> i32 {
     use objc2_core_foundation::{CFRunLoop, kCFRunLoopDefaultMode};
     let workspace = NSWorkspace::sharedWorkspace();
     let frontmost = workspace
         .frontmostApplication()
         .map(|app| app.processIdentifier());
     let pointer = CGEvent::location(Some(&CGEvent::new(None).expect("read suite pointer")));
-    let harness = std::thread::spawn(rust_tests);
+    let harness = std::thread::spawn(move || cli.run(trials()));
     while !harness.is_finished() {
         CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.01, true);
     }
-    let passed = harness.join().is_ok();
+    let passed = harness.join().is_ok_and(|result| result.num_failed == 0);
     let restored = restore_suite_if_live(
         LIVE_TEST_RAN.load(std::sync::atomic::Ordering::SeqCst),
         || run_live_test(|| record_restoration(frontmost, pointer)),
@@ -30,6 +26,122 @@ extern "C" fn macos_test_main() -> i32 {
     } else {
         101
     }
+}
+
+// The registry owns test names and ignore status now that stable Rust no longer
+// generates this target's harness. All live desktop tests stay opt-in.
+fn trials() -> Vec<libtest_mimic::Trial> {
+    macro_rules! cases {
+        ($ignored:expr; $($name:ident),* $(,)?) => {
+            vec![$(super::harness::trial(stringify!($name), $ignored, $name)),*]
+        };
+    }
+    let mut tests = cases! { false;
+        an_already_restored_frontmost_app_needs_no_activation,
+        hid_activity_distinguishes_user_interference_from_a_regression,
+        a_driver_hid_post_is_not_user_interference,
+        stale_ax_reads_resolve_again_before_retrying,
+        stale_ax_reads_stop_after_five_attempts,
+        successful_and_other_failed_ax_reads_are_not_retried,
+        warp_precision_accepts_rounding_but_rejects_a_moved_pointer,
+        a_suite_without_live_tests_does_not_restore_the_gui,
+    };
+    tests.extend(cases! { true;
+        hello_reports_permissions_the_os_and_the_host_terminal,
+        list_and_resolve_find_the_fixture_by_name_and_bundle_id,
+        a_second_driver_finds_the_session_lock_held,
+        launch_app_opens_a_file_in_textedit,
+        opening_a_nonexistent_file_in_already_running_textedit_returns_an_error,
+        cleanup_only_selects_explicitly_launched_processes,
+        cleanup_preserves_an_app_launched_by_another_live_session,
+        launch_attribution_registers_only_pids_that_appeared_during_the_request,
+        observe_lists_the_fixture_controls_in_screenshot_pixels,
+        observe_with_a_query_keeps_matches_and_their_ancestors,
+        observe_captures_a_window_covered_by_another,
+        observe_of_an_electron_app_waits_for_its_tree,
+        observe_stocks_after_dismissing_its_welcome_page,
+        clicking_an_element_presses_it_in_the_background,
+        typing_goes_into_the_focused_field_in_the_background,
+        typing_with_a_chinese_input_method_enters_the_text_exactly,
+        typing_into_the_password_field_needs_approval_first,
+        a_point_on_the_button_presses_it,
+        a_point_on_the_canvas_needs_the_foreground,
+        scrolling_the_list_moves_it_in_the_background,
+        an_action_after_the_window_moved_is_stale,
+        cmd_a_reaches_the_focused_field,
+        cmd_s_saves_textedit_in_the_background,
+        a_point_on_a_hidden_button_needs_the_foreground,
+        a_canvas_with_no_focused_element_receives_an_untargeted_text_key,
+        a_canvas_click_uses_the_foreground_and_restores_it,
+        two_foreground_actions_in_a_row_do_not_count_as_user_activity,
+        the_esc_listener_swallows_a_user_esc_and_reports_it,
+        the_drivers_own_esc_passes_the_listener,
+        the_listener_is_gone_after_the_turn_ends,
+        a_busy_user_makes_the_fallback_give_up,
+        a_double_canvas_click_uses_the_foreground,
+        a_failed_foreground_action_restores_the_app_and_pointer,
+        esc_stops_a_foreground_action_and_releases_it,
+        a_window_moved_during_the_foreground_idle_wait_is_stale,
+        held_input_is_released_through_hid_after_finder_becomes_frontmost,
+        foreground_password_focus_requires_approval_after_the_click,
+        foreground_text_key_checks_password_focus_after_the_click,
+        an_observed_text_area_with_a_failed_description_can_be_targeted_by_id,
+        an_action_after_the_element_label_changed_is_stale,
+        text_keys_into_password_require_approval,
+        paste_into_focused_password_requires_approval,
+        background_type_checks_password_focus_after_a_noop_focus_setter,
+        act_and_observe_choose_the_first_window_when_main_is_absent,
+        approved_actions_and_observations_require_the_exact_bundle_id,
+        closing_a_window_preserves_the_successful_action_outcome,
+        launching_a_cold_app_does_not_activate_it,
+        an_offscreen_row_is_scrolled_in_or_refused_before_hid_clicking,
+        a_finder_window_covering_the_canvas_is_refused_without_posting,
+        a_covered_safari_page_point_is_refused_and_an_uncovered_point_clicks,
+        a_minimized_window_is_clicked_then_minimized_again,
+        a_foreground_scroll_moves_the_target_list_and_restores_the_pointer,
+        background_type_with_a_target_inserts_after_existing_text,
+        background_element_type_preserves_selection_and_appends_when_unfocused,
+        foreground_element_type_preserves_selection_and_appends_when_unfocused,
+        background_element_type_preserves_selection_without_app_focus,
+        foreground_element_type_preserves_selection_without_app_focus_or_click,
+        unreported_password_focus_refuses_unapproved_text_keys,
+        foreground_type_at_a_point_keeps_the_clicked_caret,
+        foreground_type_with_an_element_target_inserts_after_existing_text,
+        targeted_type_without_ax_value_uses_the_character_count,
+        targeted_type_without_a_readable_length_still_delivers_text,
+        targeted_type_with_an_unwritable_selection_still_delivers_text,
+        foreground_point_click_double_skips_the_pre_activation_hit_test,
+        foreground_point_click_right_skips_the_pre_activation_hit_test,
+        foreground_point_click_modified_skips_the_pre_activation_hit_test,
+        foreground_point_click_hidden_skips_the_pre_activation_hit_test,
+        calculator_observe_survives_failed_subroles_and_digit_press_changes_display,
+        finder_observe_survives_failed_subroles_and_scrolls_own_300_file_list_to_bottom,
+        a_failed_text_subrole_is_secure_and_needs_approval,
+        a_missing_text_subrole_is_ordinary,
+        an_unsupported_text_subrole_is_ordinary,
+        one_failed_role_does_not_abort_observation,
+        one_failed_frame_does_not_abort_observation,
+        one_failed_children_read_does_not_abort_observation,
+        textedit_save_panel_uses_foreground_for_typing,
+        background_type_300_characters_roundtrips_in_fixture_text_area,
+        background_type_300_characters_roundtrips_in_textedit_document,
+        a_running_localized_textedit_resolves_by_its_english_name_for_observe,
+        cold_textedit_launches_by_english_name,
+        cold_calculator_launches_by_english_name,
+        literal_type_refuses_single_line_controls_and_inserts_tabs_in_text_areas,
+        native_control_chunks_stop_when_the_recipient_moves_or_becomes_secure,
+        native_modality_errors_depth_and_ordinary_role_reads_have_distinct_outcomes,
+        native_slow_ancestry_and_foreground_delivery_share_one_action_deadline,
+        ordinary_fixture_name_and_textedit_body_type_key_and_paste_without_approval,
+        native_type_control_validation_and_foreground_300_character_receipts,
+        textedit_300_characters_roundtrip_through_the_real_hid_splitter,
+        real_foreign_pid_keyboard_recipients_require_foreground,
+        real_app_identities_keep_exact_ids_instances_and_declared_folder_names,
+        native_runtime_preview_and_provider_schema_use_canonical_ids_before_approval,
+        canvas_colour_is_bounded_and_its_middle_receives_the_click,
+    });
+    tests.sort_by(|a, b| a.name().cmp(b.name()));
+    tests
 }
 
 use std::collections::HashSet;
@@ -387,10 +499,7 @@ impl Live {
             .find(|pid| self.launched.contains(pid))
             .expect("test-owned fixture PID");
         let window = fixture_window(pid);
-        let element = native_ax_nodes(&window)
-            .into_iter()
-            .find(|e| native_ax_string(e, "AXDescription").as_deref() == Some(label))
-            .expect("test-owned control");
+        let element = fixture_ax_named(&window, label).expect("test-owned control");
         native_ax_string(&element, "AXValue").expect("native test value")
     }
 
@@ -664,7 +773,6 @@ fn restore_app_if_needed(
     current == Some(expected) || activate()
 }
 
-#[test]
 fn an_already_restored_frontmost_app_needs_no_activation() {
     assert!(restore_app_if_needed(42, Some(42), || false));
     let mut called = false;
@@ -741,8 +849,6 @@ fn record_restoration(frontmost: Option<i32>, pointer: objc2_core_foundation::CG
     }
 }
 
-#[test]
-#[ignore]
 fn hello_reports_permissions_the_os_and_the_host_terminal() {
     run_live_test(|| {
         let Some(live) = Live::start() else { return };
@@ -756,8 +862,6 @@ fn hello_reports_permissions_the_os_and_the_host_terminal() {
     });
 }
 
-#[test]
-#[ignore]
 fn list_and_resolve_find_the_fixture_by_name_and_bundle_id() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -791,8 +895,6 @@ fn list_and_resolve_find_the_fixture_by_name_and_bundle_id() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_second_driver_finds_the_session_lock_held() {
     run_live_test(|| {
         use orca_computer_use::serve::{DriverHandler, LineWriter};
@@ -864,8 +966,6 @@ fn a_second_driver_finds_the_session_lock_held() {
     });
 }
 
-#[test]
-#[ignore]
 fn launch_app_opens_a_file_in_textedit() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -900,8 +1000,6 @@ fn launch_app_opens_a_file_in_textedit() {
     });
 }
 
-#[test]
-#[ignore]
 fn opening_a_nonexistent_file_in_already_running_textedit_returns_an_error() {
     run_live_test(|| {
         use orca_computer_use::client::CallError;
@@ -960,8 +1058,6 @@ fn opening_a_nonexistent_file_in_already_running_textedit_returns_an_error() {
     });
 }
 
-#[test]
-#[ignore]
 fn cleanup_only_selects_explicitly_launched_processes() {
     run_live_test(|| {
         let running = HashSet::from([10]);
@@ -973,8 +1069,6 @@ fn cleanup_only_selects_explicitly_launched_processes() {
     });
 }
 
-#[test]
-#[ignore]
 fn cleanup_preserves_an_app_launched_by_another_live_session() {
     run_live_test(|| {
         let Some(mut owner) = Live::start() else {
@@ -996,8 +1090,6 @@ fn cleanup_preserves_an_app_launched_by_another_live_session() {
     });
 }
 
-#[test]
-#[ignore]
 fn launch_attribution_registers_only_pids_that_appeared_during_the_request() {
     run_live_test(|| {
         let before = HashSet::from([10, 20]);
@@ -1022,8 +1114,6 @@ fn launch_attribution_registers_only_pids_that_appeared_during_the_request() {
     });
 }
 
-#[test]
-#[ignore]
 fn observe_lists_the_fixture_controls_in_screenshot_pixels() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -1086,8 +1176,6 @@ fn observe_lists_the_fixture_controls_in_screenshot_pixels() {
     });
 }
 
-#[test]
-#[ignore]
 fn observe_with_a_query_keeps_matches_and_their_ancestors() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -1154,8 +1242,6 @@ impl Drop for FinderWindow {
     }
 }
 
-#[test]
-#[ignore]
 fn observe_captures_a_window_covered_by_another() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -1246,8 +1332,6 @@ end tell",
     });
 }
 
-#[test]
-#[ignore]
 fn observe_of_an_electron_app_waits_for_its_tree() {
     run_live_test(|| {
         let Ok(bundle) = std::env::var("ORCA_CU_ELECTRON_APP") else {
@@ -1362,10 +1446,8 @@ fn observe_of_an_electron_app_waits_for_its_tree() {
                 .iter()
                 .find(|e| e.role == "text area")
                 .unwrap();
-            let native = native_ax_nodes(&native_window_named(app.pid.unwrap(), ""))
-                .into_iter()
-                .find(|e| native_ax_string(e, "AXRole").as_deref() == Some("AXTextArea"))
-                .unwrap();
+            let native =
+                fixture_ax_role(&native_window_named(app.pid.unwrap(), ""), "AXTextArea").unwrap();
             let mut ancestor = Some(native.clone());
             let mut depth = 0;
             while let Some(node) = ancestor {
@@ -1374,8 +1456,7 @@ fn observe_of_an_electron_app_waits_for_its_tree() {
                 }
                 depth += 1;
                 assert!(depth < 100);
-                ancestor = native_ax_optional_value(&node, "AXParent")
-                    .and_then(|v| v.downcast::<objc2_application_services::AXUIElement>().ok());
+                ancestor = native_ax_optional_element(&node, "AXParent");
             }
             assert!(
                 depth > 8,
@@ -1398,11 +1479,8 @@ fn observe_of_an_electron_app_waits_for_its_tree() {
                 if phase == "background" {
                     live.make_finder_frontmost();
                 }
-                let application = unsafe {
-                    objc2_application_services::AXUIElement::new_application(app.pid.unwrap())
-                };
-                let focus = native_ax_optional_value(&application, "AXFocusedUIElement")
-                    .and_then(|v| v.downcast::<objc2_application_services::AXUIElement>().ok());
+                let application = NativeAxElement::application(app.pid.unwrap());
+                let focus = native_ax_optional_element(&application, "AXFocusedUIElement");
                 let focused_flag = native_ax_optional_value(&native, "AXFocused").and_then(|v| {
                     v.downcast_ref::<objc2_core_foundation::CFBoolean>()
                         .map(|v| v.value())
@@ -1452,8 +1530,6 @@ fn observe_of_an_electron_app_waits_for_its_tree() {
     });
 }
 
-#[test]
-#[ignore]
 fn observe_stocks_after_dismissing_its_welcome_page() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -1556,8 +1632,6 @@ fn background_fixture() -> Option<(Live, PathBuf, Observation)> {
     let observation = live.observe("dev.orca.cu-fixture", None);
     Some((live, log, observation))
 }
-#[test]
-#[ignore]
 fn clicking_an_element_presses_it_in_the_background() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1572,8 +1646,6 @@ fn clicking_an_element_presses_it_in_the_background() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
-#[test]
-#[ignore]
 fn typing_goes_into_the_focused_field_in_the_background() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1636,8 +1708,6 @@ fn current_keyboard_input_source() -> Option<(String, Vec<String>)> {
     Some((id, languages))
 }
 
-#[test]
-#[ignore]
 fn typing_with_a_chinese_input_method_enters_the_text_exactly() {
     run_live_test(|| {
         let source = current_keyboard_input_source();
@@ -1683,8 +1753,6 @@ fn typing_with_a_chinese_input_method_enters_the_text_exactly() {
     });
 }
 
-#[test]
-#[ignore]
 fn typing_into_the_password_field_needs_approval_first() {
     run_live_test(|| {
         let Some((live, _, obs)) = background_fixture() else {
@@ -1702,8 +1770,6 @@ fn typing_into_the_password_field_needs_approval_first() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
-#[test]
-#[ignore]
 fn a_point_on_the_button_presses_it() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1729,8 +1795,6 @@ fn a_point_on_the_button_presses_it() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
-#[test]
-#[ignore]
 fn a_point_on_the_canvas_needs_the_foreground() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1762,8 +1826,6 @@ fn a_point_on_the_canvas_needs_the_foreground() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
-#[test]
-#[ignore]
 fn scrolling_the_list_moves_it_in_the_background() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1791,8 +1853,6 @@ fn scrolling_the_list_moves_it_in_the_background() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
-#[test]
-#[ignore]
 fn an_action_after_the_window_moved_is_stale() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1818,8 +1878,6 @@ fn an_action_after_the_window_moved_is_stale() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
-#[test]
-#[ignore]
 fn cmd_a_reaches_the_focused_field() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1899,8 +1957,6 @@ fn file_changed(file: &std::path::Path, before: std::time::SystemTime) -> bool {
     }
 }
 
-#[test]
-#[ignore]
 fn cmd_s_saves_textedit_in_the_background() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -1954,10 +2010,7 @@ fn cmd_s_saves_textedit_in_the_background() {
         )
         .unwrap();
         let native_window = native_window_named(app.pid.unwrap(), "orca-cu-cmd-s.txt");
-        let native_text = native_ax_nodes(&native_window)
-            .into_iter()
-            .find(|e| native_ax_string(e, "AXRole").as_deref() == Some("AXTextArea"))
-            .unwrap();
+        let native_text = fixture_ax_role(&native_window, "AXTextArea").unwrap();
         let edited_deadline = Instant::now() + Duration::from_secs(3);
         loop {
             if native_ax_string(&native_text, "AXValue")
@@ -2040,7 +2093,6 @@ fn failure_is_inconclusive(
     last_input > 0.0 && last_own_hid.is_none_or(|own| last_input > own)
 }
 
-#[test]
 fn hid_activity_distinguishes_user_interference_from_a_regression() {
     let state = GuiFailureKind::StateMismatch;
     assert!(failure_is_inconclusive(state, 10.0, 2.0, None, None));
@@ -2059,8 +2111,6 @@ fn hid_activity_distinguishes_user_interference_from_a_regression() {
     ));
 }
 
-#[test]
-#[ignore]
 fn a_point_on_a_hidden_button_needs_the_foreground() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -2113,8 +2163,43 @@ fn a_point_on_a_hidden_button_needs_the_foreground() {
     });
 }
 
-#[test]
-#[ignore]
+fn a_canvas_with_no_focused_element_receives_an_untargeted_text_key() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) = live.launch_fixture_with_flags(&["--canvas-only"]);
+        live.fixture_frontmost(pid);
+        live.background_state = Some((pid, CGEvent::location(Some(&CGEvent::new(None).unwrap()))));
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        assert!(!obs.truncated);
+        assert!(obs.elements.iter().all(|element| !element.secure));
+        live.act_with_fallback(click_target(live.point_inside(&obs, "canvas")), false, true)
+            .unwrap();
+        live.assert_log_contains(&log, r#""type":"canvas_click""#);
+        let application = NativeAxElement::application(pid);
+        assert!(fixture_ax_value(&application, "AXFocusedUIElement").is_none());
+        let outcome = live
+            .act_with_fallback(
+                Action::Key {
+                    keys: vec!["a".into()],
+                    target: None,
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert!(outcome.foreground_used);
+        assert!(outcome.note.unwrap().contains("reports no focused element"));
+        live.assert_log_contains(&log, r#""type":"canvas_key""#);
+        assert!(std::fs::read_to_string(&log).unwrap().lines().any(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            event["type"] == "canvas_key" && event["characters"] == "a"
+        }));
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
 fn a_canvas_click_uses_the_foreground_and_restores_it() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -2171,8 +2256,6 @@ fn a_canvas_click_uses_the_foreground_and_restores_it() {
     });
 }
 
-#[test]
-#[ignore]
 fn two_foreground_actions_in_a_row_do_not_count_as_user_activity() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -2230,8 +2313,6 @@ fn log_has_esc(log: &std::path::Path) -> bool {
         .any(|event| event["type"] == "keydown" && event["chars"] == "\u{1b}")
 }
 
-#[test]
-#[ignore]
 fn the_esc_listener_swallows_a_user_esc_and_reports_it() {
     run_live_test(|| {
         let Some((live, pid, log)) = esc_fixture() else {
@@ -2256,8 +2337,6 @@ fn the_esc_listener_swallows_a_user_esc_and_reports_it() {
     });
 }
 
-#[test]
-#[ignore]
 fn the_drivers_own_esc_passes_the_listener() {
     run_live_test(|| {
         let Some((live, pid, log)) = esc_fixture() else {
@@ -2277,8 +2356,6 @@ fn the_drivers_own_esc_passes_the_listener() {
     });
 }
 
-#[test]
-#[ignore]
 fn the_listener_is_gone_after_the_turn_ends() {
     run_live_test(|| {
         let Some((live, pid, log)) = esc_fixture() else {
@@ -2299,8 +2376,6 @@ fn the_listener_is_gone_after_the_turn_ends() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_busy_user_makes_the_fallback_give_up() {
     run_live_test(|| {
         use objc2_core_graphics::{CGEventTapLocation, CGMouseButton};
@@ -2366,8 +2441,6 @@ fn a_busy_user_makes_the_fallback_give_up() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_double_canvas_click_uses_the_foreground() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -2389,8 +2462,6 @@ fn a_double_canvas_click_uses_the_foreground() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_failed_foreground_action_restores_the_app_and_pointer() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -2427,8 +2498,6 @@ fn a_failed_foreground_action_restores_the_app_and_pointer() {
     });
 }
 
-#[test]
-#[ignore]
 fn esc_stops_a_foreground_action_and_releases_it() {
     run_live_test(|| {
         use objc2_core_graphics::CGEventFlags;
@@ -2512,8 +2581,6 @@ fn esc_stops_a_foreground_action_and_releases_it() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_window_moved_during_the_foreground_idle_wait_is_stale() {
     run_live_test(|| {
         use objc2_core_graphics::{CGEventTapLocation, CGMouseButton};
@@ -2581,7 +2648,6 @@ fn a_window_moved_during_the_foreground_idle_wait_is_stale() {
     });
 }
 
-#[test]
 fn a_driver_hid_post_is_not_user_interference() {
     let state = GuiFailureKind::StateMismatch;
     assert!(!failure_is_inconclusive(state, 10.0, 2.0, None, Some(8.0)));
@@ -2610,9 +2676,9 @@ fn a_driver_hid_post_is_not_user_interference() {
 }
 
 fn title_bar_button_frames(pid: i32, observation: &Observation) -> Vec<[i32; 4]> {
-    use objc2_application_services::{AXUIElement, AXValue, AXValueType};
+    use objc2_application_services::{AXValue, AXValueType};
     use objc2_core_foundation::{CFString, CGPoint, CGSize};
-    fn frame(element: &AXUIElement) -> [f64; 4] {
+    fn frame(element: &NativeAxElement) -> [f64; 4] {
         let mut point = CGPoint::default();
         let mut size = CGSize::default();
         for (name, kind, pointer) in [
@@ -2635,11 +2701,8 @@ fn title_bar_button_frames(pid: i32, observation: &Observation) -> Vec<[i32; 4]>
         }
         [point.x, point.y, size.width, size.height]
     }
-    let app = unsafe { AXUIElement::new_application(pid) };
-    let window = fixture_ax_value(&app, "AXMainWindow")
-        .unwrap()
-        .downcast::<AXUIElement>()
-        .unwrap();
+    let app = NativeAxElement::application(pid);
+    let window = fixture_ax_element(&app, "AXMainWindow").unwrap();
     let [x, y, width, height] = frame(&window);
     let screenshot = observation.screenshot.as_ref().unwrap();
     let geometry = orca_computer_use::geometry::CaptureGeometry {
@@ -2654,10 +2717,9 @@ fn title_bar_button_frames(pid: i32, observation: &Observation) -> Vec<[i32; 4]>
         "AXZoomButton",
         "AXFullScreenButton",
     ] {
-        let Some(value) = fixture_ax_value(&window, name) else {
+        let Some(button) = fixture_ax_element(&window, name) else {
             continue;
         };
-        let button = value.downcast::<AXUIElement>().unwrap();
         let subrole = fixture_ax_value(&button, "AXSubrole")
             .unwrap()
             .downcast::<CFString>()
@@ -2676,21 +2738,194 @@ fn title_bar_button_frames(pid: i32, observation: &Observation) -> Vec<[i32; 4]>
     frames
 }
 
+fn retry_stale_ax_read<E, T>(
+    mut element: E,
+    mut find: impl FnMut() -> E,
+    mut read: impl FnMut(&E) -> (objc2_application_services::AXError, T),
+) -> (objc2_application_services::AXError, T) {
+    use objc2_application_services::AXError;
+    for attempt in 0..5 {
+        let result = read(&element);
+        if result.0 != AXError::InvalidUIElement || attempt == 4 {
+            return result;
+        }
+        thread::sleep(Duration::from_millis(100));
+        element = find();
+    }
+    unreachable!()
+}
+
+fn stale_ax_reads_resolve_again_before_retrying() {
+    use objc2_application_services::AXError;
+    let mut finds = 0;
+    let mut reads = vec![];
+    let started = Instant::now();
+    let result = retry_stale_ax_read(
+        0,
+        || {
+            finds += 1;
+            finds
+        },
+        |element| {
+            reads.push(*element);
+            if *element == 0 {
+                (AXError::InvalidUIElement, "stale")
+            } else {
+                (AXError::Success, "fresh")
+            }
+        },
+    );
+    assert_eq!(result, (AXError::Success, "fresh"));
+    assert_eq!(finds, 1);
+    assert_eq!(reads, [0, 1]);
+    assert!(started.elapsed() >= Duration::from_millis(100));
+}
+
+fn stale_ax_reads_stop_after_five_attempts() {
+    use objc2_application_services::AXError;
+    let mut finds = 0;
+    let mut reads = 0;
+    let started = Instant::now();
+    let result = retry_stale_ax_read(
+        (),
+        || finds += 1,
+        |_| {
+            reads += 1;
+            (AXError::InvalidUIElement, "stale")
+        },
+    );
+    assert_eq!(result, (AXError::InvalidUIElement, "stale"));
+    assert_eq!(finds, 4);
+    assert_eq!(reads, 5);
+    assert!(started.elapsed() >= Duration::from_millis(400));
+}
+
+fn successful_and_other_failed_ax_reads_are_not_retried() {
+    use objc2_application_services::AXError;
+    for error in [
+        AXError::Success,
+        AXError::Failure,
+        AXError::CannotComplete,
+        AXError::NoValue,
+        AXError::AttributeUnsupported,
+    ] {
+        let mut reads = 0;
+        let result = retry_stale_ax_read(
+            (),
+            || panic!("a non-stale read must not resolve again"),
+            |_| {
+                reads += 1;
+                (error, "value")
+            },
+        );
+        assert_eq!(result, (error, "value"));
+        assert_eq!(reads, 1);
+    }
+}
+
+// Retain the native discovery path so an independent read can replace a stale
+// handle without consulting the driver's observed tree.
+#[derive(Clone)]
+struct NativeAxElement {
+    element: objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>,
+    find: std::rc::Rc<
+        dyn Fn() -> objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>,
+    >,
+}
+
+impl std::ops::Deref for NativeAxElement {
+    type Target = objc2_application_services::AXUIElement;
+
+    fn deref(&self) -> &Self::Target {
+        &self.element
+    }
+}
+
+impl NativeAxElement {
+    fn application(pid: i32) -> Self {
+        let find = std::rc::Rc::new(move || unsafe {
+            objc2_application_services::AXUIElement::new_application(pid)
+        });
+        Self {
+            element: find(),
+            find,
+        }
+    }
+
+    fn refound(&self) -> Self {
+        Self {
+            element: (self.find)(),
+            find: self.find.clone(),
+        }
+    }
+
+    fn read<T>(
+        &self,
+        mut read: impl FnMut(
+            &objc2_application_services::AXUIElement,
+        ) -> (objc2_application_services::AXError, T),
+    ) -> (objc2_application_services::AXError, T) {
+        retry_stale_ax_read(
+            self.element.clone(),
+            || (self.find)(),
+            |element| read(element),
+        )
+    }
+}
+
+fn fixture_ax_element(element: &NativeAxElement, name: &str) -> Option<NativeAxElement> {
+    let value = fixture_ax_value(element, name)?;
+    let native = value
+        .downcast::<objc2_application_services::AXUIElement>()
+        .unwrap();
+    let parent = element.clone();
+    let name = name.to_owned();
+    Some(NativeAxElement {
+        element: native,
+        find: std::rc::Rc::new(move || {
+            fixture_ax_element(&parent.refound(), &name)
+                .unwrap()
+                .element
+        }),
+    })
+}
+
+fn native_ax_optional_element(element: &NativeAxElement, name: &str) -> Option<NativeAxElement> {
+    let value = native_ax_optional_value(element, name)?;
+    let native = value
+        .downcast::<objc2_application_services::AXUIElement>()
+        .ok()?;
+    let parent = element.clone();
+    let name = name.to_owned();
+    Some(NativeAxElement {
+        element: native,
+        find: std::rc::Rc::new(move || {
+            native_ax_optional_element(&parent.refound(), &name)
+                .unwrap()
+                .element
+        }),
+    })
+}
+
 fn fixture_ax_value(
-    element: &objc2_application_services::AXUIElement,
+    element: &NativeAxElement,
     name: &str,
 ) -> Option<objc2_core_foundation::CFRetained<objc2_core_foundation::CFType>> {
     use objc2_application_services::AXError;
     use objc2_core_foundation::CFString;
     use std::ptr::NonNull;
-    assert_eq!(
-        unsafe { element.set_messaging_timeout(2.0) },
-        AXError::Success
-    );
-    let mut value = std::ptr::null();
-    let result = unsafe {
-        element.copy_attribute_value(&CFString::from_str(name), NonNull::from(&mut value))
-    };
+    let (result, (timeout, value)) = element.read(|element| {
+        let timeout = unsafe { element.set_messaging_timeout(2.0) };
+        if timeout != AXError::Success {
+            return (timeout, (timeout, std::ptr::null()));
+        }
+        let mut value = std::ptr::null();
+        let result = unsafe {
+            element.copy_attribute_value(&CFString::from_str(name), NonNull::from(&mut value))
+        };
+        (result, (timeout, value))
+    });
+    assert_eq!(timeout, AXError::Success);
     if result == AXError::NoValue || result == AXError::AttributeUnsupported {
         return None;
     }
@@ -2704,13 +2939,10 @@ fn fixture_screen_point(
     observation: &Observation,
     name: &str,
 ) -> objc2_core_foundation::CGPoint {
-    use objc2_application_services::{AXUIElement, AXValue, AXValueType};
+    use objc2_application_services::{AXValue, AXValueType};
     use objc2_core_foundation::{CGPoint, CGSize};
-    let app = unsafe { AXUIElement::new_application(pid) };
-    let window = fixture_ax_value(&app, "AXMainWindow")
-        .unwrap()
-        .downcast::<AXUIElement>()
-        .unwrap();
+    let app = NativeAxElement::application(pid);
+    let window = fixture_ax_element(&app, "AXMainWindow").unwrap();
     let mut origin = CGPoint::default();
     let mut size = CGSize::default();
     let position = fixture_ax_value(&window, "AXPosition")
@@ -2757,8 +2989,6 @@ fn fixture_screen_point(
     CGPoint::new(x, y)
 }
 
-#[test]
-#[ignore]
 fn held_input_is_released_through_hid_after_finder_becomes_frontmost() {
     run_live_test(|| {
         use objc2_core_graphics::{CGEventFlags, CGMouseButton};
@@ -2870,19 +3100,14 @@ impl Drop for HeldInputRecovery {
     }
 }
 
-#[test]
-#[ignore]
 fn foreground_password_focus_requires_approval_after_the_click() {
     password_focus_after_click(false);
 }
-#[test]
-#[ignore]
 fn foreground_text_key_checks_password_focus_after_the_click() {
     password_focus_after_click(true);
 }
 fn password_focus_after_click(key: bool) {
     run_live_test(|| {
-        use objc2_application_services::AXUIElement;
         use objc2_core_foundation::CFString;
         let Some(mut live) = Live::start() else {
             return;
@@ -2892,7 +3117,7 @@ fn password_focus_after_click(key: bool) {
         live.fixture_frontmost(pid);
         live.background_state = Some((pid, CGEvent::location(Some(&CGEvent::new(None).unwrap()))));
         let obs = live.observe("dev.orca.cu-fixture", None);
-        let app = unsafe { AXUIElement::new_application(pid) };
+        let app = NativeAxElement::application(pid);
         assert!(
             fixture_ax_value(&app, "AXFocusedUIElement").is_none(),
             "the probe starts with no focused element"
@@ -2900,16 +3125,11 @@ fn password_focus_after_click(key: bool) {
         let target = live.point_inside(&obs, "Password");
         // Read the real secure field from the tree, bypassing only the probe's
         // non-focusable hit-test behavior; foreground HID still clicks the real view.
-        let window = fixture_ax_value(&app, "AXMainWindow")
-            .unwrap()
-            .downcast::<AXUIElement>()
-            .unwrap();
+        let window = fixture_ax_element(&app, "AXMainWindow").unwrap();
 
         // Read the password field through the AX tree, not an intercepted hit.
-        fn find_secure(
-            element: &AXUIElement,
-        ) -> Option<objc2_core_foundation::CFRetained<AXUIElement>> {
-            native_ax_nodes(element).into_iter().find(|node| {
+        fn find_secure(element: &NativeAxElement) -> Option<NativeAxElement> {
+            native_ax_find(element, |node| {
                 native_ax_string(node, "AXSubrole").as_deref() == Some("AXSecureTextField")
             })
         }
@@ -2966,11 +3186,9 @@ fn password_focus_after_click(key: bool) {
     });
 }
 
-#[test]
-#[ignore]
 fn an_observed_text_area_with_a_failed_description_can_be_targeted_by_id() {
     run_live_test(|| {
-        use objc2_application_services::{AXError, AXUIElement};
+        use objc2_application_services::AXError;
         use objc2_core_foundation::CFString;
         let Some((live, log, obs)) = background_fixture() else {
             return;
@@ -2979,19 +3197,19 @@ fn an_observed_text_area_with_a_failed_description_can_be_targeted_by_id() {
             .into_iter()
             .next()
             .unwrap();
-        let app = unsafe { AXUIElement::new_application(pid) };
-        let window = fixture_ax_value(&app, "AXMainWindow")
-            .unwrap()
-            .downcast::<AXUIElement>()
-            .unwrap();
+        let app = NativeAxElement::application(pid);
+        let window = fixture_ax_element(&app, "AXMainWindow").unwrap();
         let text = fixture_ax_role(&window, "AXTextArea").expect("fixture text view");
-        let mut value = std::ptr::null();
-        let description = unsafe {
-            text.copy_attribute_value(
-                &CFString::from_str("AXDescription"),
-                std::ptr::NonNull::from(&mut value),
-            )
-        };
+        let (description, value) = text.read(|text| {
+            let mut value = std::ptr::null();
+            let description = unsafe {
+                text.copy_attribute_value(
+                    &CFString::from_str("AXDescription"),
+                    std::ptr::NonNull::from(&mut value),
+                )
+            };
+            (description, value)
+        });
         assert_eq!(
             description,
             AXError::Failure,
@@ -3037,8 +3255,6 @@ fn an_observed_text_area_with_a_failed_description_can_be_targeted_by_id() {
     });
 }
 
-#[test]
-#[ignore]
 fn an_action_after_the_element_label_changed_is_stale() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -3087,13 +3303,11 @@ fn an_action_after_the_element_label_changed_is_stale() {
     });
 }
 
-fn fixture_ax_role(
-    element: &objc2_application_services::AXUIElement,
-    role: &str,
-) -> Option<objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>> {
-    native_ax_nodes(element)
-        .into_iter()
-        .find(|node| native_ax_string(node, "AXRole").as_deref() == Some(role))
+fn fixture_ax_role(element: &NativeAxElement, role: &str) -> Option<NativeAxElement> {
+    let role = role.to_owned();
+    native_ax_find(element, move |node| {
+        native_ax_string(node, "AXRole").as_deref() == Some(&role)
+    })
 }
 
 fn pointer_restored(
@@ -3105,7 +3319,6 @@ fn pointer_restored(
     (expected.x - actual.x).abs() <= 1.0 && (expected.y - actual.y).abs() <= 1.0
 }
 
-#[test]
 fn warp_precision_accepts_rounding_but_rejects_a_moved_pointer() {
     use objc2_core_foundation::CGPoint;
     let expected = CGPoint::new(1439.8359375, 992.703125);
@@ -3114,19 +3327,16 @@ fn warp_precision_accepts_rounding_but_rejects_a_moved_pointer() {
     assert!(!pointer_restored(expected, CGPoint::new(1439.0, 990.0)));
 }
 
-fn fixture_ax_named(
-    element: &objc2_application_services::AXUIElement,
-    name: &str,
-) -> Option<objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>> {
-    native_ax_nodes(element)
-        .into_iter()
-        .find(|node| native_ax_string(node, "AXDescription").as_deref() == Some(name))
+fn fixture_ax_named(element: &NativeAxElement, name: &str) -> Option<NativeAxElement> {
+    let name = name.to_owned();
+    native_ax_find(element, move |node| {
+        native_ax_string(node, "AXDescription").as_deref() == Some(&name)
+    })
 }
 
 fn password_length(pid: i32) -> usize {
-    use objc2_application_services::AXUIElement;
     use objc2_core_foundation::CFString;
-    let app = unsafe { AXUIElement::new_application(pid) };
+    let app = NativeAxElement::application(pid);
     let field = fixture_ax_named(&app, "Password").expect("password field");
     fixture_ax_value(&field, "AXValue")
         .unwrap()
@@ -3179,8 +3389,6 @@ impl Drop for TestClipboard {
     }
 }
 
-#[test]
-#[ignore]
 fn text_keys_into_password_require_approval() {
     run_live_test(|| {
         let Some((live, _, obs)) = background_fixture() else {
@@ -3212,8 +3420,6 @@ fn text_keys_into_password_require_approval() {
     });
 }
 
-#[test]
-#[ignore]
 fn paste_into_focused_password_requires_approval() {
     run_live_test(|| {
         let Some((live, _, obs)) = background_fixture() else {
@@ -3249,8 +3455,6 @@ fn paste_into_focused_password_requires_approval() {
     });
 }
 
-#[test]
-#[ignore]
 fn background_type_checks_password_focus_after_a_noop_focus_setter() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -3285,7 +3489,6 @@ fn background_type_checks_password_focus_after_a_noop_focus_setter() {
 fn restore_suite_if_live(live_ran: bool, restore: impl FnOnce()) -> bool {
     !live_ran || std::panic::catch_unwind(std::panic::AssertUnwindSafe(restore)).is_ok()
 }
-#[test]
 fn a_suite_without_live_tests_does_not_restore_the_gui() {
     let restored = std::cell::Cell::new(0);
     assert!(restore_suite_if_live(false, || restored.set(restored.get() + 1)));
@@ -3294,16 +3497,13 @@ fn a_suite_without_live_tests_does_not_restore_the_gui() {
     assert_eq!(restored.get(), 1, "live-suite restoration positive control");
 }
 
-#[test]
-#[ignore]
 fn act_and_observe_choose_the_first_window_when_main_is_absent() {
     run_live_test(|| {
-        use objc2_application_services::AXUIElement;
         let Some(mut live) = Live::start() else {
             return;
         };
         let (pid, log) = live.launch_fixture_with_flags(&["--no-main-window"]);
-        let application = unsafe { AXUIElement::new_application(pid) };
+        let application = NativeAxElement::application(pid);
         assert!(fixture_ax_value(&application, "AXMainWindow").is_none());
         let obs = live.observe("dev.orca.cu-fixture", None);
         let outcome = live
@@ -3325,8 +3525,6 @@ fn act_and_observe_choose_the_first_window_when_main_is_absent() {
     });
 }
 
-#[test]
-#[ignore]
 fn approved_actions_and_observations_require_the_exact_bundle_id() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -3368,8 +3566,6 @@ fn approved_actions_and_observations_require_the_exact_bundle_id() {
     });
 }
 
-#[test]
-#[ignore]
 fn closing_a_window_preserves_the_successful_action_outcome() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -3393,8 +3589,6 @@ fn closing_a_window_preserves_the_successful_action_outcome() {
     });
 }
 
-#[test]
-#[ignore]
 fn launching_a_cold_app_does_not_activate_it() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -3455,17 +3649,10 @@ fn set_fixture_ax_bool(element: &objc2_application_services::AXUIElement, name: 
         AXError::Success
     );
 }
-fn fixture_window(
-    pid: i32,
-) -> objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement> {
-    let application = unsafe { objc2_application_services::AXUIElement::new_application(pid) };
-    fixture_ax_value(&application, "AXMainWindow")
-        .unwrap()
-        .downcast()
-        .unwrap()
+fn fixture_window(pid: i32) -> NativeAxElement {
+    let application = NativeAxElement::application(pid);
+    fixture_ax_element(&application, "AXMainWindow").unwrap()
 }
-#[test]
-#[ignore]
 fn an_offscreen_row_is_scrolled_in_or_refused_before_hid_clicking() {
     run_live_test(|| {
         use orca_computer_use::driver::macos::test_element_click_point;
@@ -3481,7 +3668,7 @@ fn an_offscreen_row_is_scrolled_in_or_refused_before_hid_clicking() {
             .expect("offscreen row");
         let window = fixture_window(pid);
         let native_row = fixture_ax_named(&window, row.label.as_ref().unwrap()).unwrap();
-        let point = test_element_click_point(native_row, window.clone());
+        let point = test_element_click_point(native_row.element, window.element.clone());
         if let Ok(point) = point {
             // Read-only RED: the old native frame center was outside the window.
             let system = unsafe { objc2_application_services::AXUIElement::new_system_wide() };
@@ -3554,8 +3741,6 @@ fn an_offscreen_row_is_scrolled_in_or_refused_before_hid_clicking() {
         live.assert_log_contains(&log, r#""type":"canvas_click""#);
     });
 }
-#[test]
-#[ignore]
 fn a_finder_window_covering_the_canvas_is_refused_without_posting() {
     run_live_test(|| {
         use orca_computer_use::driver::macos::test_check_click_point;
@@ -3613,8 +3798,384 @@ end tell",
         live.assert_log_contains(&log, r#""type":"canvas_click""#);
     });
 }
-#[test]
-#[ignore]
+
+struct SafariPage {
+    application: NativeAxElement,
+    file: PathBuf,
+    title: String,
+    tab: std::cell::RefCell<Option<NativeAxElement>>,
+}
+
+impl SafariPage {
+    fn retain_tab(&self) {
+        if self.tab.borrow().is_some() {
+            return;
+        }
+        let mut tabs = vec![];
+        for window in native_ax_array_elements(&self.application, "AXWindows", fixture_ax_value) {
+            let title = self.title.clone();
+            if let Some(tab) = native_ax_find(&window, move |node| {
+                native_ax_string(node, "AXRole").as_deref() == Some("AXRadioButton")
+                    && ["AXTitle", "AXDescription"].into_iter().any(|name| {
+                        native_ax_string(node, name).is_some_and(|text| text.contains(&title))
+                    })
+            }) {
+                tabs.push(tab);
+            }
+        }
+        assert!(
+            tabs.len() <= 1,
+            "ambiguous test Safari tab; refusing cleanup"
+        );
+        *self.tab.borrow_mut() = tabs.pop();
+    }
+
+    fn document_path(window: &NativeAxElement) -> Option<PathBuf> {
+        use objc2_core_foundation::{CFString, CFURL};
+        // Safari 26 advertises AXDocument on its window but returns NoValue.
+        // The page's AXURL remains readable even after document.title changes.
+        let document = native_ax_find(window, |node| {
+            native_ax_string(node, "AXRole").as_deref() == Some("AXWebArea")
+        })
+        .and_then(|page| native_ax_optional_value(&page, "AXURL"))
+        .or_else(|| native_ax_optional_value(window, "AXDocument"));
+        let path = document.and_then(|value| {
+            let url = value.downcast_ref::<CFURL>().map(|url| url.to_file_path());
+            url.unwrap_or_else(|| {
+                let text = value.downcast_ref::<CFString>()?;
+                CFURL::from_string(None, text, None)?.to_file_path()
+            })
+        });
+        path.and_then(|path| path.canonicalize().ok())
+    }
+
+    fn is_page(&self, window: &NativeAxElement) -> bool {
+        Self::document_path(window).as_ref() == Some(&self.file)
+    }
+
+    fn window(&self) -> Option<NativeAxElement> {
+        let mut windows: Vec<_> =
+            native_ax_array_elements(&self.application, "AXWindows", fixture_ax_value)
+                .into_iter()
+                .filter(|window| self.is_page(window))
+                .collect();
+        assert!(
+            windows.len() <= 1,
+            "ambiguous test Safari page; refusing cleanup"
+        );
+        windows.pop()
+    }
+
+    fn close(&self) {
+        use objc2_application_services::AXError;
+        use objc2_core_foundation::CFString;
+        self.retain_tab();
+        if let Some(tab) = self.tab.borrow().as_ref() {
+            // Use the retained control: its title changes after the page receives a click.
+            assert_eq!(
+                unsafe { tab.perform_action(&CFString::from_str("AXPress")) },
+                AXError::Success
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let window = loop {
+            if let Some(window) = self.window() {
+                break window;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test Safari page not found for cleanup"
+            );
+            thread::sleep(Duration::from_millis(100));
+        };
+        let pid = native_ax_pid(&self.application);
+        record_restoration(
+            Some(pid),
+            CGEvent::location(Some(&CGEvent::new(None).unwrap())),
+        );
+        assert_eq!(
+            unsafe { window.perform_action(&CFString::from_str("AXRaise")) },
+            AXError::Success
+        );
+        let menu = fixture_ax_element(&self.application, "AXMenuBar").unwrap();
+        let close_tab = native_ax_find(&menu, |node| {
+            native_ax_string(node, "AXMenuItemCmdChar")
+                .is_some_and(|key| key.eq_ignore_ascii_case("w"))
+                && native_ax_string(node, "AXMenuItemCmdModifiers").as_deref() == Some("0")
+        })
+        .expect("native Safari Cmd+W menu item");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(focused) = fixture_ax_element(&self.application, "AXFocusedWindow")
+                && focused.element == window.element
+                && self.is_page(&focused)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "refusing to close another Safari tab"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            unsafe { close_tab.perform_action(&CFString::from_str("AXPress")) },
+            AXError::Success
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.window().is_some() {
+            assert!(Instant::now() < deadline, "test Safari tab did not close");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for SafariPage {
+    fn drop(&mut self) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.close())).is_err() {
+            record_gui_failure(
+                GuiFailureKind::NativeOperation,
+                "could not close only the test-owned Safari tab".into(),
+            );
+        }
+    }
+}
+
+fn a_covered_safari_page_point_is_refused_and_an_uncovered_point_clicks() {
+    run_live_test(|| {
+        use objc2_application_services::{AXError, AXValue, AXValueType};
+        use objc2_core_foundation::{CFString, CGPoint, CGSize};
+        use orca_computer_use::driver::macos::{test_check_click_point, test_click_at_point};
+
+        fn frame(element: &NativeAxElement) -> (CGPoint, CGSize) {
+            let mut point = CGPoint::default();
+            let mut size = CGSize::default();
+            for (name, kind, pointer) in [
+                (
+                    "AXPosition",
+                    AXValueType::CGPoint,
+                    std::ptr::NonNull::from(&mut point).cast(),
+                ),
+                (
+                    "AXSize",
+                    AXValueType::CGSize,
+                    std::ptr::NonNull::from(&mut size).cast(),
+                ),
+            ] {
+                let value = fixture_ax_value(element, name)
+                    .unwrap()
+                    .downcast::<AXValue>()
+                    .unwrap();
+                assert!(unsafe { value.value(kind, pointer) });
+            }
+            (point, size)
+        }
+
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let title = format!(
+            "Orca Safari click probe {}",
+            live.directory.path().file_name().unwrap().to_string_lossy()
+        );
+        let file = live.directory.path().join("safari-click.html");
+        std::fs::write(
+            &file,
+            format!(
+                r#"<!doctype html><meta charset="utf-8"><title>{title}</title>
+<style>html,body {{ margin:0; width:100%; height:100%; }}</style>
+<body>Orca Safari click probe
+<script>document.addEventListener('click', event => {{
+document.title = `clicked ${{event.clientX}},${{event.clientY}}`;
+}});</script></body>"#
+            ),
+        )
+        .unwrap();
+
+        // Safari must never enter Live's app-termination cleanup, even on a cold launch.
+        let Reply::Launched { app } = live
+            .client
+            .call(
+                Request::LaunchApp {
+                    app: "com.apple.Safari".into(),
+                    open: vec![],
+                },
+                Duration::from_secs(60),
+            )
+            .unwrap()
+        else {
+            panic!("expected launched Safari");
+        };
+        let pid = app.pid.unwrap();
+        // Arm cleanup before opening: Safari may choose a new window or a tab in an existing one.
+        let safari = SafariPage {
+            application: NativeAxElement::application(pid),
+            file: file.canonicalize().unwrap(),
+            title: title.clone(),
+            tab: std::cell::RefCell::new(None),
+        };
+        assert!(matches!(
+            live.client
+                .call(
+                    Request::LaunchApp {
+                        app: "com.apple.Safari".into(),
+                        open: vec![file.to_string_lossy().into_owned()],
+                    },
+                    Duration::from_secs(60),
+                )
+                .unwrap(),
+            Reply::Launched { .. }
+        ));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (window, id) = loop {
+            if let Some(window) = safari.window()
+                && native_ax_string(&window, "AXTitle").as_deref() == Some(&title)
+                && let Some(id) = live
+                    .apps()
+                    .into_iter()
+                    .filter(|app| app.pid == Some(pid))
+                    .flat_map(|app| app.windows)
+                    .find(|window| window.title == title)
+                    .map(|window| window.id)
+            {
+                break (window, id);
+            }
+            assert!(Instant::now() < deadline, "local Safari page did not load");
+            thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(
+            SafariPage::document_path(&window).as_ref(),
+            Some(&safari.file),
+            "native file URL must identify our test-owned tab"
+        );
+        safari.retain_tab();
+        assert!(
+            safari.tab.borrow().is_some(),
+            "show Safari's tab bar so cleanup can retain the test-owned tab"
+        );
+        live.fixture_frontmost(pid);
+        assert_eq!(
+            unsafe { window.perform_action(&CFString::from_str("AXRaise")) },
+            AXError::Success
+        );
+        let page = native_ax_find(&window, |node| {
+            native_ax_string(node, "AXRole").as_deref() == Some("AXWebArea")
+        })
+        .expect("native Safari web area");
+        let (page_origin, page_size) = frame(&page);
+        assert!(page_size.width >= 600.0 && page_size.height >= 240.0);
+        let covered = CGPoint::new(
+            page_origin.x + page_size.width * 0.25,
+            page_origin.y + page_size.height * 0.5,
+        );
+        let uncovered = CGPoint::new(page_origin.x + page_size.width * 0.75, covered.y);
+        let observed = live.observe_window("com.apple.Safari", Some(id), None, 300, true);
+        let (origin, window_size) = frame(&window);
+        let image = observed.screenshot.as_ref().unwrap();
+        let (cover_pid, _) = live.launch_fixture();
+        let cover = fixture_window(cover_pid);
+        let position = CGPoint::new(covered.x - 100.0, covered.y - 60.0);
+        let size = CGSize::new(220.0, 160.0);
+        for (name, value) in [
+            ("AXPosition", unsafe {
+                AXValue::new(
+                    AXValueType::CGPoint,
+                    std::ptr::NonNull::from(&position).cast(),
+                )
+            }),
+            ("AXSize", unsafe {
+                AXValue::new(AXValueType::CGSize, std::ptr::NonNull::from(&size).cast())
+            }),
+        ] {
+            assert_eq!(
+                unsafe {
+                    cover.set_attribute_value(&CFString::from_str(name), value.unwrap().as_ref())
+                },
+                AXError::Success
+            );
+        }
+        live.fixture_frontmost(cover_pid);
+        live.background_state = Some((
+            cover_pid,
+            CGEvent::location(Some(&CGEvent::new(None).unwrap())),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while test_check_click_point(cover_pid, covered).is_err()
+            || test_check_click_point(pid, uncovered).is_err()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "fixture must cover only the left page point"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        // Like the Finder occlusion test, bypass activation so the cover stays in front.
+        let before = orca_computer_use::driver::macos::last_test_process_hid_post();
+        let failure = test_click_at_point(pid, covered).unwrap_err();
+        assert_eq!(failure.message, "Another window covers the target point");
+        assert_eq!(
+            orca_computer_use::driver::macos::last_test_process_hid_post(),
+            before
+        );
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            assert_eq!(
+                native_ax_string(&window, "AXTitle").as_deref(),
+                Some(title.as_str())
+            );
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        live.assert_frontmost_and_pointer_unchanged();
+        let outcome = live
+            .act_app(
+                "com.apple.Safari",
+                Some(id),
+                Action::Click {
+                    target: Target::Point {
+                        point: [
+                            (uncovered.x - origin.x) * f64::from(image.width) / window_size.width,
+                            (uncovered.y - origin.y) * f64::from(image.height) / window_size.height,
+                        ],
+                    },
+                    button: Button::Left,
+                    count: 1,
+                    modifiers: vec!["shift".into()],
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert!(outcome.foreground_used);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let title = native_ax_string(&window, "AXTitle").unwrap();
+            if let Some((x, y)) = title
+                .strip_prefix("clicked ")
+                .and_then(|s| s.split_once(','))
+                && x.parse::<u32>().is_ok()
+                && y.parse::<u32>().is_ok()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "page did not receive the click: {title:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            SafariPage::document_path(&window).as_ref(),
+            Some(&safari.file),
+            "native file URL must identify our tab after its title changes"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+        drop(safari);
+    });
+}
+
 fn a_minimized_window_is_clicked_then_minimized_again() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -3657,8 +4218,6 @@ fn a_minimized_window_is_clicked_then_minimized_again() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_foreground_scroll_moves_the_target_list_and_restores_the_pointer() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -3704,8 +4263,6 @@ fn a_foreground_scroll_moves_the_target_list_and_restores_the_pointer() {
     });
 }
 
-#[test]
-#[ignore]
 fn background_type_with_a_target_inserts_after_existing_text() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -3742,8 +4299,196 @@ fn background_type_with_a_target_inserts_after_existing_text() {
     });
 }
 
-#[test]
-#[ignore]
+fn background_element_type_preserves_selection_and_appends_when_unfocused() {
+    element_type_preserves_selection(false);
+}
+
+fn foreground_element_type_preserves_selection_and_appends_when_unfocused() {
+    element_type_preserves_selection(true);
+}
+
+fn background_element_type_preserves_selection_without_app_focus() {
+    element_type_without_app_focus(false);
+}
+
+fn foreground_element_type_preserves_selection_without_app_focus_or_click() {
+    element_type_without_app_focus(true);
+}
+
+fn element_type_without_app_focus(foreground: bool) {
+    run_live_test(|| {
+        use objc2_application_services::{AXError, AXValue, AXValueType};
+        use objc2_core_foundation::{CFBoolean, CFRange, CFString};
+
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let mut flags = vec!["--prefilled-name", "--hide-focused-element"];
+        if foreground {
+            flags.extend(["--modal-window", "--reveal-focus-after-raise-check"]);
+        }
+        let (pid, log) = live.launch_fixture_with_flags(&flags);
+        let field = fixture_ax_named(&fixture_window(pid), "Name").unwrap();
+        let application = NativeAxElement::application(pid);
+        assert!(native_ax_optional_element(&application, "AXFocusedUIElement").is_none());
+        assert_eq!(
+            native_ax_optional_value(&field, "AXFocused")
+                .and_then(|value| value.downcast_ref::<CFBoolean>().map(|flag| flag.value())),
+            Some(true),
+            "the target itself must report focus when application focus is absent"
+        );
+        let range = CFRange::new(1, 2); // Select the crab's two UTF-16 units.
+        let selection =
+            unsafe { AXValue::new(AXValueType::CFRange, std::ptr::NonNull::from(&range).cast()) }
+                .unwrap();
+        assert_eq!(
+            unsafe {
+                field.set_attribute_value(
+                    &CFString::from_str("AXSelectedTextRange"),
+                    selection.as_ref(),
+                )
+            },
+            AXError::Success
+        );
+        live.make_finder_frontmost();
+        let observed = live.observe("dev.orca.cu-fixture", None);
+        let target = element_named(&observed, "Name");
+        let mouse_before = orca_computer_use::driver::macos::test_mouse_down_count();
+        let outcome = live
+            .act_with_fallback(
+                Action::Type {
+                    text: "x".into(),
+                    target: Some(target),
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(outcome.foreground_used, foreground);
+        assert_eq!(live.fixture_control_value("Name"), "axc");
+        assert_eq!(
+            orca_computer_use::driver::macos::test_mouse_down_count(),
+            mouse_before,
+            "an already-focused target must not be clicked"
+        );
+        if foreground {
+            live.assert_log_contains(&log, r#""type":"omitted_raised_app_focus""#);
+            // Also cover the adjacent Key shortcut with app-level focus absent
+            // for its first check after AXRaise. Navigation must not click.
+            let outcome = live
+                .act_with_fallback(
+                    Action::Key {
+                        keys: vec!["left".into()],
+                        target: Some(target),
+                    },
+                    false,
+                    true,
+                )
+                .unwrap();
+            assert!(outcome.foreground_used);
+            assert_eq!(
+                orca_computer_use::driver::macos::test_mouse_down_count(),
+                mouse_before,
+                "already-focused foreground navigation must not click"
+            );
+        }
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+fn element_type_preserves_selection(foreground: bool) {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let mut flags = vec!["--prefilled-name"];
+        if foreground {
+            flags.push("--modal-window");
+        }
+        let (pid, log) = live.launch_fixture_with_flags(&flags);
+        let window = fixture_window(pid);
+        let field = fixture_ax_named(&window, "Name").unwrap();
+        let editor = fixture_ax_role(&window, "AXTextArea").unwrap();
+        set_fixture_ax_bool(&editor, "AXFocused", true);
+        let application = NativeAxElement::application(pid);
+        assert_ne!(
+            fixture_ax_element(&application, "AXFocusedUIElement")
+                .unwrap()
+                .element,
+            field.element,
+            "the initial element type must change focus"
+        );
+        live.make_finder_frontmost();
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let target = element_named(&obs, "Name");
+        let appended = live
+            .act_with_fallback(
+                Action::Type {
+                    text: "x".into(),
+                    target: Some(target),
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(appended.foreground_used, foreground);
+        assert_eq!(live.fixture_control_value("Name"), "a🦀cx");
+        assert_eq!(
+            fixture_ax_element(&application, "AXFocusedUIElement")
+                .unwrap()
+                .element,
+            field.element,
+            "element type must focus the field"
+        );
+        let selected = live
+            .act_with_fallback(
+                Action::Key {
+                    keys: vec!["cmd".into(), "a".into()],
+                    target: None,
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert!(selected.foreground_used);
+        let replaced = live
+            .act_with_fallback(
+                Action::Type {
+                    text: "replacement".into(),
+                    target: Some(target),
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(replaced.foreground_used, foreground);
+        assert_eq!(live.fixture_control_value("Name"), "replacement");
+        live.assert_log_contains(&log, r#""value":"replacement""#);
+        live.act_with_fallback(
+            Action::Key {
+                keys: vec!["left".into()],
+                target: None,
+            },
+            false,
+            true,
+        )
+        .unwrap();
+        let inserted = live
+            .act_with_fallback(
+                Action::Type {
+                    text: "!".into(),
+                    target: Some(target),
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(inserted.foreground_used, foreground);
+        assert_eq!(live.fixture_control_value("Name"), "replacemen!t");
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
 fn unreported_password_focus_refuses_unapproved_text_keys() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -3778,8 +4523,6 @@ fn unreported_password_focus_refuses_unapproved_text_keys() {
     });
 }
 
-#[test]
-#[ignore]
 fn foreground_type_at_a_point_keeps_the_clicked_caret() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -3837,8 +4580,6 @@ fn foreground_type_at_a_point_keeps_the_clicked_caret() {
     });
 }
 
-#[test]
-#[ignore]
 fn foreground_type_with_an_element_target_inserts_after_existing_text() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -3891,20 +4632,15 @@ fn type_with_optional_selection(flags: &[&str], expected: &str) {
         assert!(!control.foreground_used);
         live.assert_log_contains(&log, "\"value\":\"a🦀cu\"");
         if flags.contains(&"--expire-selection-focus") || flags.contains(&"--no-name-length") {
-            let app = unsafe {
-                objc2_application_services::AXUIElement::new_application(
-                    live.apps()
-                        .into_iter()
-                        .find(|a| a.bundle_id == "dev.orca.cu-fixture")
-                        .unwrap()
-                        .pid
-                        .unwrap(),
-                )
-            };
-            let focused = fixture_ax_value(&app, "AXFocusedUIElement")
-                .unwrap()
-                .downcast::<objc2_application_services::AXUIElement>()
-                .unwrap();
+            let app = NativeAxElement::application(
+                live.apps()
+                    .into_iter()
+                    .find(|a| a.bundle_id == "dev.orca.cu-fixture")
+                    .unwrap()
+                    .pid
+                    .unwrap(),
+            );
+            let focused = fixture_ax_element(&app, "AXFocusedUIElement").unwrap();
             assert_eq!(
                 fixture_ax_value(&focused, "AXIdentifier")
                     .unwrap()
@@ -3935,27 +4671,82 @@ fn type_with_optional_selection(flags: &[&str], expected: &str) {
     });
 }
 
-#[test]
-#[ignore]
 fn targeted_type_without_ax_value_uses_the_character_count() {
-    type_with_optional_selection(&["--no-name-value"], "a🦀cux");
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let (pid, log) = live.launch_fixture_with_flags(&[
+            "--prefilled-name",
+            "--no-name-value",
+            "--select-name-on-focus",
+        ]);
+        let window = fixture_window(pid);
+        let field = fixture_ax_named(&window, "Name").unwrap();
+        let editor = fixture_ax_role(&window, "AXTextArea").unwrap();
+        set_fixture_ax_bool(&editor, "AXFocused", true);
+        live.make_finder_frontmost();
+        let obs = live.observe("dev.orca.cu-fixture", None);
+        let application = NativeAxElement::application(pid);
+        assert_ne!(
+            fixture_ax_element(&application, "AXFocusedUIElement")
+                .unwrap()
+                .element,
+            field.element,
+            "targeted type must change focus to exercise selection collapse"
+        );
+        assert!(fixture_ax_value(&field, "AXValue").is_none());
+        let outcome = live
+            .act(
+                Action::Type {
+                    text: "x".into(),
+                    target: Some(element_named(&obs, "Name")),
+                },
+                false,
+            )
+            .unwrap();
+        assert!(!outcome.foreground_used);
+        live.assert_log_contains(&log, "\"type\":\"input\"");
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let selection = events
+            .iter()
+            .find(|event| event["type"] == "name_selection")
+            .expect("focusing Name must select the crab's two UTF-16 code units");
+        assert_eq!(selection["location"], 1);
+        assert_eq!(selection["length"], 2);
+        let length = events
+            .iter()
+            .find(|event| event["type"] == "name_length")
+            .expect("selection collapse must read AXNumberOfCharacters without AXValue");
+        assert_eq!(length["length"], 4);
+        // Without collapse, the newly focused field replaces the selected crab with x.
+        assert_eq!(
+            events
+                .iter()
+                .rev()
+                .find(|event| event["type"] == "input")
+                .expect("text delivery receipt")["value"],
+            "a🦀cx",
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
 }
 
-#[test]
-#[ignore]
 fn targeted_type_without_a_readable_length_still_delivers_text() {
     type_with_optional_selection(&["--no-name-value", "--no-name-length"], "a🦀cux");
 }
 
-#[test]
-#[ignore]
 fn targeted_type_with_an_unwritable_selection_still_delivers_text() {
     type_with_optional_selection(&["--expire-selection-focus"], "a🦀cux");
 }
 
 fn foreground_point_click_without_early_hit(variant: &str) {
     run_live_test(|| {
-        use objc2_application_services::{AXError, AXUIElement};
+        use objc2_application_services::AXError;
         use objc2_core_foundation::CFString;
         let Some(mut live) = Live::start() else {
             return;
@@ -3984,11 +4775,8 @@ fn foreground_point_click_without_early_hit(variant: &str) {
                 vec![]
             },
         };
-        let app = unsafe { AXUIElement::new_application(pid) };
-        let window = fixture_ax_value(&app, "AXMainWindow")
-            .unwrap()
-            .downcast::<AXUIElement>()
-            .unwrap();
+        let app = NativeAxElement::application(pid);
+        let window = fixture_ax_element(&app, "AXMainWindow").unwrap();
         assert_eq!(
             unsafe { window.perform_action(&CFString::from_str("AXRaise")) },
             AXError::Success
@@ -4032,43 +4820,38 @@ fn foreground_point_click_without_early_hit(variant: &str) {
     });
 }
 
-#[test]
-#[ignore]
 fn foreground_point_click_double_skips_the_pre_activation_hit_test() {
     foreground_point_click_without_early_hit("double");
 }
 
-#[test]
-#[ignore]
 fn foreground_point_click_right_skips_the_pre_activation_hit_test() {
     foreground_point_click_without_early_hit("right");
 }
 
-#[test]
-#[ignore]
 fn foreground_point_click_modified_skips_the_pre_activation_hit_test() {
     foreground_point_click_without_early_hit("modified");
 }
 
-#[test]
-#[ignore]
 fn foreground_point_click_hidden_skips_the_pre_activation_hit_test() {
     foreground_point_click_without_early_hit("hidden");
 }
 
 fn native_ax_optional_value(
-    element: &objc2_application_services::AXUIElement,
+    element: &NativeAxElement,
     name: &str,
 ) -> Option<objc2_core_foundation::CFRetained<objc2_core_foundation::CFType>> {
     use objc2_application_services::AXError;
     use objc2_core_foundation::CFString;
-    let mut value = std::ptr::null();
-    let result = unsafe {
-        element.copy_attribute_value(
-            &CFString::from_str(name),
-            std::ptr::NonNull::from(&mut value),
-        )
-    };
+    let (result, value) = element.read(|element| {
+        let mut value = std::ptr::null();
+        let result = unsafe {
+            element.copy_attribute_value(
+                &CFString::from_str(name),
+                std::ptr::NonNull::from(&mut value),
+            )
+        };
+        (result, value)
+    });
     if matches!(
         result,
         AXError::Failure | AXError::NoValue | AXError::AttributeUnsupported
@@ -4081,24 +4864,51 @@ fn native_ax_optional_value(
 }
 
 // Native controls read only the test's own app/window, independently of Orca's tree.
-fn native_ax_nodes(
-    root: &objc2_application_services::AXUIElement,
-) -> Vec<objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>> {
+fn native_ax_array_elements(
+    parent: &NativeAxElement,
+    name: &str,
+    read: fn(
+        &NativeAxElement,
+        &str,
+    ) -> Option<objc2_core_foundation::CFRetained<objc2_core_foundation::CFType>>,
+) -> Vec<NativeAxElement> {
     use objc2_application_services::AXUIElement;
     use objc2_core_foundation::{CFArray, CFRetained, CFType};
-    let mut nodes = vec![unsafe { CFRetained::retain(std::ptr::NonNull::from(root)) }];
+    let Some(children) = read(parent, name) else {
+        return vec![];
+    };
+    let Some(array) = children.downcast_ref::<CFArray>() else {
+        return vec![];
+    };
+    (0..array.len())
+        .filter_map(|i| {
+            let child = unsafe { &*array.value_at_index(i as isize).cast::<CFType>() };
+            let child = child.downcast_ref::<AXUIElement>()?;
+            let parent = parent.clone();
+            let name = name.to_owned();
+            Some(NativeAxElement {
+                element: unsafe { CFRetained::retain(std::ptr::NonNull::from(child)) },
+                find: std::rc::Rc::new(move || {
+                    let children = read(&parent.refound(), &name).expect("native element array");
+                    let array = children.downcast_ref::<CFArray>().unwrap();
+                    assert!(i < array.len(), "native element still in {name}");
+                    let child = unsafe { &*array.value_at_index(i as isize).cast::<CFType>() };
+                    let child = child.downcast_ref::<AXUIElement>().unwrap();
+                    unsafe { CFRetained::retain(std::ptr::NonNull::from(child)) }
+                }),
+            })
+        })
+        .collect()
+}
+
+fn native_ax_nodes(root: &NativeAxElement) -> Vec<NativeAxElement> {
+    let mut nodes = vec![root.clone()];
     let mut index = 0;
     while index < nodes.len() && index < 5000 {
-        if let Some(children) = native_ax_optional_value(&nodes[index], "AXChildren")
-            && let Some(array) = children.downcast_ref::<CFArray>()
+        for child in native_ax_array_elements(&nodes[index], "AXChildren", native_ax_optional_value)
         {
-            for i in 0..array.len() {
-                let child = unsafe { &*array.value_at_index(i as isize).cast::<CFType>() };
-                if let Some(child) = child.downcast_ref::<AXUIElement>()
-                    && !nodes.iter().any(|seen| &**seen == child)
-                {
-                    nodes.push(unsafe { CFRetained::retain(std::ptr::NonNull::from(child)) });
-                }
+            if !nodes.iter().any(|seen| seen.element == child.element) {
+                nodes.push(child);
             }
         }
         index += 1;
@@ -4106,10 +4916,33 @@ fn native_ax_nodes(
     nodes
 }
 
-fn native_ax_string(
-    element: &objc2_application_services::AXUIElement,
-    name: &str,
-) -> Option<String> {
+fn native_ax_find(
+    root: &NativeAxElement,
+    predicate: impl Fn(&NativeAxElement) -> bool + 'static,
+) -> Option<NativeAxElement> {
+    native_ax_find_in(root, &native_ax_nodes(root), predicate)
+}
+
+fn native_ax_find_in(
+    root: &NativeAxElement,
+    nodes: &[NativeAxElement],
+    predicate: impl Fn(&NativeAxElement) -> bool + 'static,
+) -> Option<NativeAxElement> {
+    let element = nodes.iter().find(|node| predicate(node))?.element.clone();
+    let root = root.clone();
+    Some(NativeAxElement {
+        element,
+        find: std::rc::Rc::new(move || {
+            native_ax_nodes(&root.refound())
+                .into_iter()
+                .find(&predicate)
+                .expect("native control still matches its lookup")
+                .element
+        }),
+    })
+}
+
+fn native_ax_string(element: &NativeAxElement, name: &str) -> Option<String> {
     use objc2_core_foundation::{CFNumber, CFString};
     native_ax_optional_value(element, name).and_then(|value| {
         value
@@ -4140,11 +4973,9 @@ fn launch_test_app(live: &mut Live, bundle: &str, open: Vec<String>) -> AppInfo 
     app
 }
 
-#[test]
-#[ignore]
 fn calculator_observe_survives_failed_subroles_and_digit_press_changes_display() {
     run_live_test(|| {
-        use objc2_application_services::{AXError, AXUIElement};
+        use objc2_application_services::AXError;
         use objc2_core_foundation::CFString;
         let Some(mut live) = Live::start() else {
             return;
@@ -4154,12 +4985,9 @@ fn calculator_observe_survives_failed_subroles_and_digit_press_changes_display()
             return;
         }
         let app = launch_test_app(&mut live, "com.apple.calculator", vec![]);
-        let application = unsafe { AXUIElement::new_application(app.pid.unwrap()) };
+        let application = NativeAxElement::application(app.pid.unwrap());
         live.fixture_frontmost(app.pid.unwrap());
-        let native_window = fixture_ax_value(&application, "AXMainWindow")
-            .unwrap()
-            .downcast::<AXUIElement>()
-            .unwrap();
+        let native_window = fixture_ax_element(&application, "AXMainWindow").unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let nodes = loop {
             let nodes = native_ax_nodes(&native_window);
@@ -4182,52 +5010,51 @@ fn calculator_observe_survives_failed_subroles_and_digit_press_changes_display()
             "native button positive control"
         );
         let has_failed_subrole = nodes.iter().any(|node| {
-            let mut value = std::ptr::null();
-            let result = unsafe {
-                node.copy_attribute_value(
-                    &CFString::from_str("AXSubrole"),
-                    std::ptr::NonNull::from(&mut value),
-                )
-            };
-            if let Some(pointer) = std::ptr::NonNull::new(value.cast_mut()) {
-                drop(unsafe { objc2_core_foundation::CFRetained::from_raw(pointer) });
-            }
+            let (result, ()) = node.read(|node| {
+                let mut value = std::ptr::null();
+                let result = unsafe {
+                    node.copy_attribute_value(
+                        &CFString::from_str("AXSubrole"),
+                        std::ptr::NonNull::from(&mut value),
+                    )
+                };
+                if let Some(pointer) = std::ptr::NonNull::new(value.cast_mut()) {
+                    drop(unsafe { objc2_core_foundation::CFRetained::from_raw(pointer) });
+                }
+                (result, ())
+            });
             result == AXError::Failure
         });
         assert!(
             has_failed_subrole,
             "same-app native AXSubrole Failure control"
         );
-        let clear = nodes
-            .iter()
-            .find(|node| {
-                native_ax_string(node, "AXRole").as_deref() == Some("AXButton")
-                    && ["AXTitle", "AXDescription"].iter().any(|name| {
-                        native_ax_string(node, name).as_deref().is_some_and(|s| {
-                            s.to_lowercase().contains("clear")
-                                || s.contains("清除")
-                                || s == "C"
-                                || s == "AC"
-                        })
+        let clear = native_ax_find_in(&native_window, &nodes, |node| {
+            native_ax_string(node, "AXRole").as_deref() == Some("AXButton")
+                && ["AXTitle", "AXDescription"].iter().any(|name| {
+                    native_ax_string(node, name).as_deref().is_some_and(|s| {
+                        s.to_lowercase().contains("clear")
+                            || s.contains("清除")
+                            || s == "C"
+                            || s == "AC"
                     })
-            })
-            .expect("native clear control");
+                })
+        })
+        .expect("native clear control");
         assert_eq!(
             unsafe { clear.perform_action(&CFString::from_str("AXPress")) },
             AXError::Success
         );
         thread::sleep(Duration::from_millis(150));
-        let native_digit = nodes
-            .iter()
-            .find(|node| {
-                native_ax_string(node, "AXRole").as_deref() == Some("AXButton")
-                    && ["AXTitle", "AXDescription"].iter().any(|name| {
-                        native_ax_string(node, name)
-                            .as_deref()
-                            .is_some_and(|s| s == "7" || s.eq_ignore_ascii_case("seven"))
-                    })
-            })
-            .expect("native digit 7");
+        let native_digit = native_ax_find_in(&native_window, &nodes, |node| {
+            native_ax_string(node, "AXRole").as_deref() == Some("AXButton")
+                && ["AXTitle", "AXDescription"].iter().any(|name| {
+                    native_ax_string(node, name)
+                        .as_deref()
+                        .is_some_and(|s| s == "7" || s.eq_ignore_ascii_case("seven"))
+                })
+        })
+        .expect("native digit 7");
         assert_eq!(
             unsafe { native_digit.perform_action(&CFString::from_str("AXPress")) },
             AXError::Success
@@ -4310,11 +5137,8 @@ fn calculator_observe_survives_failed_subroles_and_digit_press_changes_display()
     });
 }
 
-#[test]
-#[ignore]
 fn finder_observe_survives_failed_subroles_and_scrolls_own_300_file_list_to_bottom() {
     run_live_test(|| {
-        use objc2_application_services::AXUIElement;
         let Some(live) = Live::start() else {
             return;
         };
@@ -4364,35 +5188,11 @@ fn finder_observe_survives_failed_subroles_and_scrolls_own_300_file_list_to_bott
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(50));
         };
-        let application = unsafe { AXUIElement::new_application(app.pid.unwrap()) };
-        let windows = fixture_ax_value(&application, "AXWindows").unwrap();
-        let windows = windows
-            .downcast_ref::<objc2_core_foundation::CFArray>()
-            .unwrap();
-        let native_window = (0..windows.len())
-            .find_map(|i| {
-                let value = unsafe {
-                    &*windows
-                        .value_at_index(i as isize)
-                        .cast::<objc2_core_foundation::CFType>()
-                };
-                let w = value.downcast_ref::<AXUIElement>()?;
-                (native_ax_string(w, "AXTitle").as_deref() == Some("orca-cu-300-files")).then(
-                    || unsafe {
-                        objc2_core_foundation::CFRetained::retain(std::ptr::NonNull::from(w))
-                    },
-                )
-            })
-            .expect("only our scratch Finder window");
-        let nodes = native_ax_nodes(&native_window);
-        let scroll = nodes
-            .iter()
-            .find(|n| native_ax_string(n, "AXRole").as_deref() == Some("AXScrollArea"))
-            .expect("native list control");
-        let bar = fixture_ax_value(scroll, "AXVerticalScrollBar")
-            .unwrap()
-            .downcast::<AXUIElement>()
-            .unwrap();
+        let native_window = native_ax_window_matching(app.pid.unwrap(), |window| {
+            native_ax_string(window, "AXTitle").as_deref() == Some("orca-cu-300-files")
+        });
+        let scroll = fixture_ax_role(&native_window, "AXScrollArea").expect("native list control");
+        let bar = fixture_ax_element(&scroll, "AXVerticalScrollBar").unwrap();
         assert_eq!(
             native_ax_string(&bar, "AXValue").as_deref(),
             Some("0"),
@@ -4459,10 +5259,7 @@ fn unreadable_subrole_requires_approval(code: i32) {
         let option = format!("--subrole-error={code}");
         let (pid, _) = live.launch_fixture_with_flags(&["--prefilled-name", &option]);
         let window = fixture_window(pid);
-        let name = native_ax_nodes(&window)
-            .into_iter()
-            .find(|e| native_ax_string(e, "AXDescription").as_deref() == Some("Name"))
-            .unwrap();
+        let name = fixture_ax_named(&window, "Name").unwrap();
         // Even Failure has a same-field native read/write control before observe.
         let initial = native_ax_string(&name, "AXValue").unwrap();
         assert_eq!(
@@ -4520,18 +5317,12 @@ fn unreadable_subrole_requires_approval(code: i32) {
     });
 }
 
-#[test]
-#[ignore]
 fn a_failed_text_subrole_is_secure_and_needs_approval() {
     unreadable_subrole_requires_approval(-25200);
 }
-#[test]
-#[ignore]
 fn a_missing_text_subrole_is_ordinary() {
     absent_subrole_is_ordinary(-25212);
 }
-#[test]
-#[ignore]
 fn an_unsupported_text_subrole_is_ordinary() {
     absent_subrole_is_ordinary(-25205);
 }
@@ -4544,17 +5335,10 @@ fn one_bad_button_preserves_the_tree(flag: &str) {
         let (pid, _) = live.launch_fixture_with_flags(&[flag, "--prefilled-name"]);
         let window = fixture_window(pid);
         let name = if flag == "--bad-button-children" {
-            let application =
-                unsafe { objc2_application_services::AXUIElement::new_application(pid) };
-            fixture_ax_value(&application, "AXFocusedUIElement")
-                .unwrap()
-                .downcast::<objc2_application_services::AXUIElement>()
-                .unwrap()
+            let application = NativeAxElement::application(pid);
+            fixture_ax_element(&application, "AXFocusedUIElement").unwrap()
         } else {
-            native_ax_nodes(&window)
-                .into_iter()
-                .find(|e| native_ax_string(e, "AXDescription").as_deref() == Some("Name"))
-                .unwrap()
+            fixture_ax_named(&window, "Name").unwrap()
         };
         assert_eq!(
             unsafe {
@@ -4591,56 +5375,58 @@ fn one_bad_button_preserves_the_tree(flag: &str) {
         }
     });
 }
-#[test]
-#[ignore]
 fn one_failed_role_does_not_abort_observation() {
     one_bad_button_preserves_the_tree("--bad-button-role");
 }
-#[test]
-#[ignore]
 fn one_failed_frame_does_not_abort_observation() {
     one_bad_button_preserves_the_tree("--bad-button-frame");
 }
-#[test]
-#[ignore]
 fn one_failed_children_read_does_not_abort_observation() {
     one_bad_button_preserves_the_tree("--bad-button-children");
 }
 
-fn native_window_named(
+fn native_ax_window_matching(
     pid: i32,
-    title: &str,
-) -> objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement> {
-    use objc2_application_services::AXUIElement;
-    use objc2_core_foundation::{CFArray, CFRetained, CFType};
-    let app = unsafe { AXUIElement::new_application(pid) };
-    let windows = fixture_ax_value(&app, "AXWindows").unwrap();
-    let windows = windows.downcast_ref::<CFArray>().unwrap();
-    (0..windows.len())
-        .find_map(|i| {
-            let value = unsafe { &*windows.value_at_index(i as isize).cast::<CFType>() };
-            let window = value.downcast_ref::<AXUIElement>()?;
-            native_ax_string(window, "AXTitle")
-                .filter(|t| t.contains(title))
-                .map(|_| unsafe { CFRetained::retain(std::ptr::NonNull::from(window)) })
-        })
-        .expect("only the named test-owned window")
+    predicate: impl Fn(&NativeAxElement) -> bool + 'static,
+) -> NativeAxElement {
+    let app = NativeAxElement::application(pid);
+    let find = std::rc::Rc::new(move || {
+        native_ax_array_elements(&app.refound(), "AXWindows", fixture_ax_value)
+            .into_iter()
+            .find(&predicate)
+            .expect("only the named test-owned window")
+            .element
+    });
+    NativeAxElement {
+        element: find(),
+        find,
+    }
 }
 
-fn native_ax_pid(element: &objc2_application_services::AXUIElement) -> i32 {
-    let mut pid = 0;
-    assert_eq!(
-        unsafe { element.pid(std::ptr::NonNull::from(&mut pid)) },
-        objc2_application_services::AXError::Success
-    );
+fn native_window_named(pid: i32, title: &str) -> NativeAxElement {
+    let title = title.to_owned();
+    native_ax_window_matching(pid, move |window| {
+        native_ax_string(window, "AXTitle").is_some_and(|t| t.contains(&title))
+    })
+}
+
+fn native_ax_pid(element: &NativeAxElement) -> i32 {
+    let (result, pid) = element.read(|element| {
+        let mut pid = 0;
+        (
+            unsafe { element.pid(std::ptr::NonNull::from(&mut pid)) },
+            pid,
+        )
+    });
+    assert_eq!(result, objc2_application_services::AXError::Success);
     pid
 }
 
-#[test]
-#[ignore]
 fn textedit_save_panel_uses_foreground_for_typing() {
     run_live_test(|| {
-        use objc2_application_services::AXUIElement;
+        use objc2_application_services::{AXError, AXValue, AXValueType};
+        use objc2_core_foundation::{CFRange, CFString};
+
         let Some(mut live) = Live::start() else {
             return;
         };
@@ -4663,10 +5449,23 @@ fn textedit_save_panel_uses_foreground_for_typing() {
             .unwrap()
             .id;
         let native_window = native_window_named(pid, "orca-cu-save-panel.txt");
-        let editor = native_ax_nodes(&native_window)
-            .into_iter()
-            .find(|e| native_ax_string(e, "AXRole").as_deref() == Some("AXTextArea"))
-            .unwrap();
+        let editor = fixture_ax_role(&native_window, "AXTextArea").unwrap();
+        // Element type preserves an already-focused editor's selection. Set a
+        // known caret instead of depending on TextEdit's initial selection.
+        set_fixture_ax_bool(&editor, "AXFocused", true);
+        let caret = CFRange::new(0, 0);
+        let selection =
+            unsafe { AXValue::new(AXValueType::CFRange, std::ptr::NonNull::from(&caret).cast()) }
+                .unwrap();
+        assert_eq!(
+            unsafe {
+                editor.set_attribute_value(
+                    &CFString::from_str("AXSelectedTextRange"),
+                    selection.as_ref(),
+                )
+            },
+            AXError::Success
+        );
         live.make_finder_frontmost();
         let observed = live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
         let area = observed
@@ -4689,7 +5488,7 @@ fn textedit_save_panel_uses_foreground_for_typing() {
         assert!(!control.foreground_used);
         assert_eq!(
             native_ax_string(&editor, "AXValue").as_deref(),
-            Some("Seed.Background control"),
+            Some("Background controlSeed."),
             "main-editor background positive control"
         );
         live.assert_frontmost_and_pointer_unchanged();
@@ -4704,11 +5503,10 @@ fn textedit_save_panel_uses_foreground_for_typing() {
             true,
         )
         .unwrap();
-        let application = unsafe { AXUIElement::new_application(pid) };
+        let application = NativeAxElement::application(pid);
         let deadline = Instant::now() + Duration::from_secs(5);
         let name = loop {
-            if let Some(focus) = native_ax_optional_value(&application, "AXFocusedUIElement")
-                .and_then(|v| v.downcast::<AXUIElement>().ok())
+            if let Some(focus) = native_ax_optional_element(&application, "AXFocusedUIElement")
                 && native_ax_string(&focus, "AXValue")
                     .is_some_and(|v| v.contains("orca-cu-save-panel"))
             {
@@ -4737,8 +5535,7 @@ fn textedit_save_panel_uses_foreground_for_typing() {
             native_ax_pid(&name)
         );
         for attribute in ["AXTopLevelUIElement", "AXWindow"] {
-            let shortcut = native_ax_optional_value(&name, attribute)
-                .and_then(|value| value.downcast::<AXUIElement>().ok());
+            let shortcut = native_ax_optional_element(&name, attribute);
             let metadata = shortcut.as_ref().map(|element| {
                 (
                     native_ax_string(element, "AXRole"),
@@ -4766,8 +5563,7 @@ fn textedit_save_panel_uses_foreground_for_typing() {
                 native_ax_string(&node, "AXSubrole"),
                 native_ax_pid(&node)
             );
-            ancestor = native_ax_optional_value(&node, "AXParent")
-                .and_then(|v| v.downcast::<AXUIElement>().ok());
+            ancestor = native_ax_optional_element(&node, "AXParent");
         }
         eprintln!("Save input source: {:?}", current_keyboard_input_source());
         let before = native_ax_string(&name, "AXValue").unwrap();
@@ -4832,9 +5628,11 @@ fn textedit_save_panel_uses_foreground_for_typing() {
         assert!(outcome.foreground_used);
         let targeted_value = native_ax_string(&name, "AXValue").unwrap();
         eprintln!("element-targeted panel receipt: {targeted_value:?}");
-        assert!(
-            targeted_value.ends_with("-target"),
-            "element-targeted panel receipt: {targeted_value:?}"
+        // The focused caret stays after the stem, before any visible extension.
+        assert_eq!(
+            targeted_value,
+            after.replacen("orca-panel-name", "orca-panel-name-target", 1),
+            "element-targeted panel receipt must preserve the caret and filename suffix"
         );
         let before_key = native_ax_string(&name, "AXValue").unwrap();
         let outcome = live
@@ -4883,8 +5681,8 @@ fn textedit_save_panel_uses_foreground_for_typing() {
         let source = live.background_state.unwrap();
         live.fixture_frontmost(pid);
         let point = orca_computer_use::driver::macos::test_element_click_point(
-            name.clone(),
-            native_window.clone(),
+            name.element.clone(),
+            native_window.element.clone(),
         )
         .unwrap();
         let blocked =
@@ -4919,7 +5717,7 @@ fn background_300_roundtrip(
     live: &Live,
     app: &str,
     window: u32,
-    editor: &objc2_application_services::AXUIElement,
+    editor: &NativeAxElement,
     log: Option<&std::path::Path>,
 ) {
     let observed = live.observe_window(app, Some(window), None, 300, false);
@@ -5007,8 +5805,6 @@ fn background_300_roundtrip(
     live.assert_frontmost_and_pointer_unchanged();
 }
 
-#[test]
-#[ignore]
 fn background_type_300_characters_roundtrips_in_fixture_text_area() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -5029,8 +5825,6 @@ fn background_type_300_characters_roundtrips_in_fixture_text_area() {
     });
 }
 
-#[test]
-#[ignore]
 fn background_type_300_characters_roundtrips_in_textedit_document() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -5060,8 +5854,6 @@ fn background_type_300_characters_roundtrips_in_textedit_document() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_running_localized_textedit_resolves_by_its_english_name_for_observe() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -5171,13 +5963,9 @@ fn cold_launch_by_name(name: &str, bundle: &str) {
         }
     });
 }
-#[test]
-#[ignore]
 fn cold_textedit_launches_by_english_name() {
     cold_launch_by_name("TextEdit", "com.apple.TextEdit");
 }
-#[test]
-#[ignore]
 fn cold_calculator_launches_by_english_name() {
     cold_launch_by_name("Calculator", "com.apple.calculator");
 }
@@ -5209,8 +5997,6 @@ fn absent_subrole_is_ordinary(code: i32) {
     });
 }
 
-#[test]
-#[ignore]
 fn literal_type_refuses_single_line_controls_and_inserts_tabs_in_text_areas() {
     run_live_test(|| {
         use objc2_core_foundation::CFString;
@@ -5289,8 +6075,6 @@ fn literal_type_refuses_single_line_controls_and_inserts_tabs_in_text_areas() {
     });
 }
 
-#[test]
-#[ignore]
 fn native_control_chunks_stop_when_the_recipient_moves_or_becomes_secure() {
     run_live_test(|| {
         for (flag, foreground) in [
@@ -5362,8 +6146,6 @@ fn native_control_chunks_stop_when_the_recipient_moves_or_becomes_secure() {
     });
 }
 
-#[test]
-#[ignore]
 fn native_modality_errors_depth_and_ordinary_role_reads_have_distinct_outcomes() {
     run_live_test(|| {
         for (flag, expected) in [
@@ -5390,7 +6172,7 @@ fn native_modality_errors_depth_and_ordinary_role_reads_have_distinct_outcomes()
                 objc2_application_services::AXError::Success
             );
             let outcome = orca_computer_use::driver::macos::test_native_modality(
-                node.clone(),
+                node.element.clone(),
                 Duration::from_secs(30),
             );
             let actual = outcome.map_err(|error| error.kind);
@@ -5438,9 +6220,12 @@ fn native_modality_errors_depth_and_ordinary_role_reads_have_distinct_outcomes()
         };
         let (pid, _) = live.launch_fixture_with_flags(&["--name-role-failure"]);
         let node = fixture_ax_named(&fixture_window(pid), "Name").unwrap();
-        let ordinary =
-            orca_computer_use::driver::macos::test_native_type_role(node.clone(), "ordinary");
-        let controls = orca_computer_use::driver::macos::test_native_type_role(node, "user\tpass");
+        let ordinary = orca_computer_use::driver::macos::test_native_type_role(
+            node.element.clone(),
+            "ordinary",
+        );
+        let controls =
+            orca_computer_use::driver::macos::test_native_type_role(node.element, "user\tpass");
         eprintln!(
             "real AXRole Failure: ordinary checker={ordinary:?}, control checker={controls:?}"
         );
@@ -5449,8 +6234,6 @@ fn native_modality_errors_depth_and_ordinary_role_reads_have_distinct_outcomes()
     });
 }
 
-#[test]
-#[ignore]
 fn native_slow_ancestry_and_foreground_delivery_share_one_action_deadline() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -5469,7 +6252,7 @@ fn native_slow_ancestry_and_foreground_delivery_share_one_action_deadline() {
                 app: "dev.orca.cu-fixture".into(),
                 window: Some(obs.window.id),
                 action: Action::Type {
-                    text: "x".repeat(4000),
+                    text: "x".repeat(1000),
                     target: None,
                 },
                 foreground_fallback: true,
@@ -5488,8 +6271,9 @@ fn native_slow_ancestry_and_foreground_delivery_share_one_action_deadline() {
             panic!("native deadline error must reach the caller")
         };
         assert_eq!(error.kind, ErrorKind::Failed);
-        // The slow walk leaves too little of the shared deadline for 4000
-        // characters, so delivery is refused before anything is typed.
+        // 1000 characters need 20s of HID delivery: they fit a fresh 30s
+        // deadline, but not the <=16.4s left after 34 ancestry reads at 0.4s.
+        // Refuse before typing, with ample time left for foreground setup.
         assert!(
             error
                 .message
@@ -5521,7 +6305,7 @@ fn native_slow_ancestry_and_foreground_delivery_share_one_action_deadline() {
     });
 }
 
-fn assert_native_text(element: &objc2_application_services::AXUIElement, expected: &str) {
+fn assert_native_text(element: &NativeAxElement, expected: &str) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let actual = native_ax_string(element, "AXValue").unwrap();
@@ -5540,7 +6324,7 @@ fn ordinary_native_actions(
     live: &Live,
     app: &str,
     window: u32,
-    node: &objc2_application_services::AXUIElement,
+    node: &NativeAxElement,
     role: &str,
 ) {
     let observed = live.observe_window(app, Some(window), None, 300, false);
@@ -5611,8 +6395,6 @@ fn ordinary_native_actions(
     live.assert_frontmost_and_pointer_unchanged();
 }
 
-#[test]
-#[ignore]
 fn ordinary_fixture_name_and_textedit_body_type_key_and_paste_without_approval() {
     run_live_test(|| {
         {
@@ -5661,8 +6443,6 @@ fn ordinary_fixture_name_and_textedit_body_type_key_and_paste_without_approval()
     });
 }
 
-#[test]
-#[ignore]
 fn native_type_control_validation_and_foreground_300_character_receipts() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -5783,8 +6563,6 @@ fn native_type_control_validation_and_foreground_300_character_receipts() {
     });
 }
 
-#[test]
-#[ignore]
 fn textedit_300_characters_roundtrip_through_the_real_hid_splitter() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -5818,8 +6596,6 @@ fn textedit_300_characters_roundtrip_through_the_real_hid_splitter() {
     });
 }
 
-#[test]
-#[ignore]
 fn real_foreign_pid_keyboard_recipients_require_foreground() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -5831,15 +6607,19 @@ fn real_foreign_pid_keyboard_recipients_require_foreground() {
         let (second, _) = live.launch_fixture();
         let b = fixture_ax_named(&fixture_window(second), "Name").unwrap();
         assert_ne!(native_ax_pid(&a), native_ax_pid(&b));
-        let same =
-            orca_computer_use::driver::macos::test_native_keyboard_recipient(first, a.clone());
+        let same = orca_computer_use::driver::macos::test_native_keyboard_recipient(
+            first,
+            a.element.clone(),
+        );
         assert!(
             same.is_ok(),
             "same-process background positive control {same:?}"
         );
-        let other =
-            orca_computer_use::driver::macos::test_native_keyboard_recipient(first, b.clone())
-                .unwrap_err();
+        let other = orca_computer_use::driver::macos::test_native_keyboard_recipient(
+            first,
+            b.element.clone(),
+        )
+        .unwrap_err();
         assert_eq!(other.kind, ErrorKind::NeedsForeground);
         assert_eq!(native_ax_string(&b, "AXValue").as_deref(), Some(""));
         assert_eq!(
@@ -5928,8 +6708,6 @@ fn native_resolve(
     Ok(app)
 }
 
-#[test]
-#[ignore]
 fn real_app_identities_keep_exact_ids_instances_and_declared_folder_names() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -6061,8 +6839,6 @@ fn real_app_identities_keep_exact_ids_instances_and_declared_folder_names() {
     });
 }
 
-#[test]
-#[ignore]
 fn native_runtime_preview_and_provider_schema_use_canonical_ids_before_approval() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -6124,8 +6900,6 @@ fn native_runtime_preview_and_provider_schema_use_canonical_ids_before_approval(
     });
 }
 
-#[test]
-#[ignore]
 fn canvas_colour_is_bounded_and_its_middle_receives_the_click() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {

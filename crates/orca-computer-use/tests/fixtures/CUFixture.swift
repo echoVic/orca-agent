@@ -16,11 +16,17 @@ func log(_ event: [String: Any]) {
 log(["type": "started", "pid": Int(ProcessInfo.processInfo.processIdentifier)])
 
 final class Canvas: NSView {
+    override var acceptsFirstResponder: Bool { true }
     override func isAccessibilityElement() -> Bool { false }
+    override func isAccessibilityFocused() -> Bool { false }
     override func accessibilityChildren() -> [Any]? { [] }
     override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
         log(["type": "canvas_click", "x": point.x, "y": point.y, "clicks": event.clickCount])
+    }
+    override func keyDown(with event: NSEvent) {
+        log(["type": "canvas_key", "characters": event.characters ?? ""])
     }
     override func rightMouseDown(with event: NSEvent) {
         log(["type": "canvas_right_click"])
@@ -59,6 +65,10 @@ var pendingProbeRaise = true
 let foregroundPasswordProbe = CommandLine.arguments.contains("--foreground-password-probe")
 let foregroundTypeProbe = CommandLine.arguments.contains("--foreground-type-probe")
 let rejectEarlyHit = CommandLine.arguments.contains("--reject-hit-before-raise")
+// Keep app-level focus absent through the foreground click decision, then
+// reveal it for the unchanged wait_for_focus and system-recipient checks.
+var raisedForFocusProbe = false
+var omittedRaisedFocus = false
 final class ProbeWindow: NSWindow {
     override func isAccessibilityModal() -> Bool {
         if let flag = CommandLine.arguments.first(where: { $0.hasPrefix("--window-modal-error=") }), let code = Int(flag.dropFirst("--window-modal-error=".count)) { failAX(code); return false }
@@ -67,6 +77,10 @@ final class ProbeWindow: NSWindow {
     }
     override func accessibilityPerformRaise() -> Bool {
         pendingProbeRaise = false
+        if CommandLine.arguments.contains("--reveal-focus-after-raise-check") {
+            raisedForFocusProbe = true
+            omittedRaisedFocus = false
+        }
         return super.accessibilityPerformRaise()
     }
     override func accessibilityHitTest(_ point: NSPoint) -> Any? {
@@ -125,7 +139,16 @@ final class ProbeApplication: NSApplication {
         return super.accessibilityMainWindow()
     }
     override func accessibilityApplicationFocusedUIElement() -> Any? {
-        if CommandLine.arguments.contains("--hide-focused-element") { return nil }
+        if windows.contains(where: { $0.firstResponder is Canvas }) { return nil }
+        if CommandLine.arguments.contains("--hide-focused-element") {
+            if !raisedForFocusProbe || !omittedRaisedFocus {
+                if raisedForFocusProbe {
+                    omittedRaisedFocus = true
+                    log(["type": "omitted_raised_app_focus"])
+                }
+                return nil
+            }
+        }
         if foregroundTypeProbe && pendingProbeRaise { return nil }
         if (CommandLine.arguments.contains("--expire-selection-focus") || CommandLine.arguments.contains("--no-name-length")), let focus = expiringSelectionFocus { return focus }
         if foregroundPasswordProbe, let window = windows.first(where: { $0.title == "Orca CU Fixture" }), (window.firstResponder == nil || window.firstResponder === window) { return nil }
@@ -174,7 +197,9 @@ final class ModalAncestor: NSAccessibilityElement {
     init(_ index: Int) { self.index = index; super.init() }
     override func accessibilityRole() -> NSAccessibility.Role? {
         if CommandLine.arguments.contains("--slow-modal-walk") {
-            Thread.sleep(forTimeInterval: 0.84)
+            // 34 reads consume 13.6s, leaving room for foreground activation
+            // before the shared 30s deadline without fitting 20s of typing.
+            Thread.sleep(forTimeInterval: 0.4)
             log(["type": "slow_modal_read", "index": index])
             if index == 33 { return .sheet }
         }
@@ -218,12 +243,21 @@ final class ProbeField: NSTextField {
     override func setAccessibilityFocused(_ focused: Bool) {
         if CommandLine.arguments.contains("--sticky-password-focus") || (foregroundTypeProbe && pendingProbeRaise) { return }
         super.setAccessibilityFocused(focused)
+        if focused && CommandLine.arguments.contains("--select-name-on-focus"),
+           let editor = currentEditor() as? NSTextView {
+            editor.setSelectedRange(NSRange(location: 1, length: 2))
+            let selection = editor.selectedRange()
+            log(["type": "name_selection", "location": selection.location, "length": selection.length])
+        }
     }
     override func accessibilityValue() -> String? {
         if CommandLine.arguments.contains("--no-name-value") { return nil }
         return super.accessibilityValue()
     }
     override func accessibilityNumberOfCharacters() -> Int {
+        if CommandLine.arguments.contains("--select-name-on-focus") {
+            log(["type": "name_length", "length": stringValue.utf16.count])
+        }
         return stringValue.utf16.count
     }
 }
@@ -311,7 +345,9 @@ NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
     return event
 }
 let canvas = Canvas(frame: NSRect(x: 340, y: 140, width: 280, height: 220))
-for view in [button, controller.label, field, secure, scroll, canvas] as [NSView] {
+let views: [NSView] = CommandLine.arguments.contains("--canvas-only")
+    ? [canvas] : [button, controller.label, field, secure, scroll, canvas]
+for view in views {
     window.contentView!.addSubview(view)
 }
 if foregroundPasswordProbe || foregroundTypeProbe || rejectEarlyHit {

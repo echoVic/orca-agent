@@ -10,7 +10,13 @@ use objc2_core_graphics::{
     CGError, CGEvent, CGEventSource, CGEventSourceStateID, CGEventType, CGWarpMouseCursorPosition,
 };
 
-use super::{actions, ax::AxElement, error, events::HidEvents, tree::ElementTable};
+use super::{
+    actions,
+    ax::AxElement,
+    error,
+    events::HidEvents,
+    tree::{self, ElementTable, SecurityScan},
+};
 use crate::keys::parse_combo;
 use crate::protocol::{ActParams, Action, Button, DriverError, ErrorKind, Target};
 
@@ -152,7 +158,7 @@ fn check_window(window: &AxElement, table: &ElementTable) -> Result<(), DriverEr
 }
 
 pub(super) fn run(
-    pid: i32,
+    type_target_was_focused: bool,
     application: &AxElement,
     window: &AxElement,
     table: &ElementTable,
@@ -160,6 +166,7 @@ pub(super) fn run(
     aborted: &AtomicBool,
     action_deadline: Instant,
 ) -> Result<String, DriverError> {
+    let pid = application.pid()?;
     let deadline = (Instant::now() + crate::timing::IDLE_WAIT_LIMIT).min(action_deadline);
     loop {
         check_abort(aborted)?;
@@ -234,6 +241,7 @@ pub(super) fn run(
             .unwrap_or(false)
             .then(|| window.clone()),
     };
+    let mut unfocused_key = false;
     let result = (|| {
         check_abort(aborted)?;
         let target = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
@@ -284,13 +292,10 @@ pub(super) fn run(
                         // keyboard recipient without an unnecessary pointer click.
                         let already_focused =
                             if matches!(target_location(params), Some(Target::Element { .. })) {
-                                let focused =
-                                    application.attribute_element("AXFocusedUIElement")?;
-                                target_element.as_ref().is_some_and(|target| {
-                                    focused
-                                        .as_ref()
-                                        .is_some_and(|focused| focused.0 == target.0)
-                                })
+                                actions::keyboard_target_is_focused(
+                                    target_element.as_ref(),
+                                    |target| actions::keyboard_recipient(application, target),
+                                )?
                             } else {
                                 false
                             };
@@ -301,14 +306,18 @@ pub(super) fn run(
                     // Activation and the click can change focus after the
                     // preflight check. Inspect the actual keyboard recipient
                     // immediately before delivering any foreground text.
-                    let focused = wait_for_focus(application, aborted)?;
+                    let focused = wait_for_focus(application, aborted)?.ok_or_else(|| {
+                        error(ErrorKind::Failed, "The app has no focused element")
+                    })?;
                     actions::check_foreground_secure_approval(
                         application,
                         target_element.as_ref(),
                         params.secure_approved,
                     )?;
                     if matches!(target_location(params), Some(Target::Element { .. })) {
-                        focused.collapse_selection_to_end();
+                        if actions::should_collapse_type_selection(type_target_was_focused) {
+                            focused.collapse_selection_to_end();
+                        }
                         actions::check_foreground_secure_approval(
                             application,
                             target_element.as_ref(),
@@ -327,13 +336,10 @@ pub(super) fn run(
                         // keyboard recipient without an unnecessary pointer click.
                         let already_focused =
                             if matches!(target_location(params), Some(Target::Element { .. })) {
-                                let focused =
-                                    application.attribute_element("AXFocusedUIElement")?;
-                                target_element.as_ref().is_some_and(|target| {
-                                    focused
-                                        .as_ref()
-                                        .is_some_and(|focused| focused.0 == target.0)
-                                })
+                                actions::keyboard_target_is_focused(
+                                    target_element.as_ref(),
+                                    |target| actions::keyboard_recipient(application, target),
+                                )?
                             } else {
                                 false
                             };
@@ -344,14 +350,40 @@ pub(super) fn run(
                     let stroke =
                         parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
                     if stroke.enters_text() {
-                        if !params.secure_approved {
-                            wait_for_focus(application, aborted)?;
+                        if !params.secure_approved
+                            && wait_for_focus(application, aborted)?.is_none()
+                        {
+                            if matches!(
+                                keyboard_target(&params.action),
+                                Some(Target::Element { .. })
+                            ) {
+                                return Err(error(
+                                    ErrorKind::Failed,
+                                    "The app has no focused element",
+                                ));
+                            }
+                            let app_focus = application.attribute_element("AXFocusedUIElement")?;
+                            let system_focus = AxElement::system_wide()?
+                                .attribute_element("AXFocusedUIElement")?;
+                            if !allows_unfocused_key(
+                                app_focus.is_some(),
+                                system_focus.is_some(),
+                                tree::scan_security(Some(window), action_deadline),
+                            ) {
+                                return Err(error(
+                                    ErrorKind::Failed,
+                                    "The app has no focused element",
+                                ));
+                            }
+                            unfocused_key = true;
                         }
-                        actions::check_foreground_secure_approval(
-                            application,
-                            target_element.as_ref(),
-                            params.secure_approved,
-                        )?;
+                        if !unfocused_key {
+                            actions::check_foreground_secure_approval(
+                                application,
+                                target_element.as_ref(),
+                                params.secure_approved,
+                            )?;
+                        }
                     }
                     hid.key(stroke)?;
                 }
@@ -363,7 +395,13 @@ pub(super) fn run(
     })();
     let restored = restore.finish();
     // Preserve successful delivery, and disclose any restoration failure.
-    finish_foreground(result, restored, &name)
+    finish_foreground(result, restored, &name).map(|note| {
+        if unfocused_key {
+            format!("{note}; sent key to an app that reports no focused element")
+        } else {
+            note
+        }
+    })
 }
 fn finish_foreground(
     result: Result<(), DriverError>,
@@ -405,17 +443,52 @@ fn successful_actions_keep_success_when_restoration_fails() {
     );
 }
 
-fn wait_for_focus(application: &AxElement, aborted: &AtomicBool) -> Result<AxElement, DriverError> {
+fn wait_for_focus(
+    application: &AxElement,
+    aborted: &AtomicBool,
+) -> Result<Option<AxElement>, DriverError> {
     let focus_deadline = Instant::now() + crate::timing::FOCUS_WAIT_LIMIT;
     loop {
         check_abort(aborted)?;
         if let Some(element) = application.attribute_element("AXFocusedUIElement")? {
-            return Ok(element);
+            return Ok(Some(element));
         }
         if Instant::now() >= focus_deadline {
-            return Err(error(ErrorKind::Failed, "The app has no focused element"));
+            return Ok(None);
         }
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn allows_unfocused_key(
+    app_focus_present: bool,
+    system_focus_present: bool,
+    scan: SecurityScan,
+) -> bool {
+    !app_focus_present && !system_focus_present && scan == SecurityScan::Clean
+}
+
+#[cfg(test)]
+#[test]
+fn unfocused_keys_require_both_focuses_absent_and_a_fresh_clean_scan() {
+    for app_focus in [false, true] {
+        for system_focus in [false, true] {
+            for (scan, safe) in [
+                (SecurityScan::Clean, true),
+                (SecurityScan::SecurePresent, false),
+                (SecurityScan::Incomplete, false),
+            ] {
+                let expected = match (app_focus, system_focus) {
+                    (false, false) => safe,
+                    _ => false,
+                };
+                assert_eq!(
+                    allows_unfocused_key(app_focus, system_focus, scan),
+                    expected,
+                    "app focus: {app_focus}, system focus: {system_focus}, scan: {scan:?}"
+                );
+            }
+        }
     }
 }
 fn keyboard_target(action: &Action) -> Option<Target> {

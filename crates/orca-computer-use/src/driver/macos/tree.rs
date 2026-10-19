@@ -161,6 +161,93 @@ impl TreeNode for AxElement {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SecurityScan {
+    Clean,
+    SecurePresent,
+    Incomplete,
+}
+
+trait SecurityTreeNode: TreeNode {
+    fn security_role_until(&self, deadline: Instant) -> Result<Option<String>, DriverError>;
+    fn security_subrole_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<super::ax::SubroleRead, DriverError>;
+    fn security_children_until(&self, deadline: Instant) -> Result<Vec<Self>, DriverError>;
+}
+
+const SECURITY_SCAN_BUDGET: Duration = Duration::from_millis(750);
+const SECURITY_SCAN_MAX_ELEMENTS: usize = 4096;
+
+impl SecurityTreeNode for AxElement {
+    fn security_role_until(&self, deadline: Instant) -> Result<Option<String>, DriverError> {
+        self.security_string_until("AXRole", deadline)
+    }
+    fn security_subrole_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<super::ax::SubroleRead, DriverError> {
+        AxElement::security_subrole_until(self, deadline)
+    }
+    fn security_children_until(&self, deadline: Instant) -> Result<Vec<Self>, DriverError> {
+        AxElement::security_children_until(self, deadline, SECURITY_SCAN_MAX_ELEMENTS)
+    }
+}
+
+pub(super) fn scan_security(window: Option<&AxElement>, action_deadline: Instant) -> SecurityScan {
+    scan_security_until(
+        window.cloned(),
+        (Instant::now() + SECURITY_SCAN_BUDGET).min(action_deadline),
+        SECURITY_SCAN_MAX_ELEMENTS,
+    )
+}
+
+fn scan_security_until<N: SecurityTreeNode>(
+    window: Option<N>,
+    deadline: Instant,
+    max_elements: usize,
+) -> SecurityScan {
+    use super::ax::{SubroleRead, secure_text_role};
+    let Some(window) = window else {
+        return SecurityScan::Incomplete;
+    };
+    let mut pending = vec![(window, 0)];
+    let mut visited = 0;
+    while let Some((node, depth)) = pending.pop() {
+        visited += 1;
+        if Instant::now() >= deadline || visited >= max_elements {
+            return SecurityScan::Incomplete;
+        }
+        let Ok(role) = node.security_role_until(deadline) else {
+            return SecurityScan::Incomplete;
+        };
+        if Instant::now() >= deadline {
+            return SecurityScan::Incomplete;
+        }
+        let Ok(subrole) = node.security_subrole_until(deadline) else {
+            return SecurityScan::Incomplete;
+        };
+        if Instant::now() >= deadline {
+            return SecurityScan::Incomplete;
+        }
+        if secure_text_role(role.as_deref().unwrap_or_default(), &subrole) {
+            return SecurityScan::SecurePresent;
+        }
+        if matches!(subrole, SubroleRead::Failure) || depth >= 30 {
+            return SecurityScan::Incomplete;
+        }
+        let Ok(children) = node.security_children_until(deadline) else {
+            return SecurityScan::Incomplete;
+        };
+        if Instant::now() >= deadline || pending.len() + children.len() >= max_elements - visited {
+            return SecurityScan::Incomplete;
+        }
+        pending.extend(children.into_iter().map(|child| (child, depth + 1)));
+    }
+    SecurityScan::Clean
+}
+
 #[derive(Clone, Copy, Default)]
 struct Depth {
     ax: u16,
@@ -206,6 +293,9 @@ fn walk_until<N: TreeNode>(
     elements: &mut Vec<Element>,
     entries: &mut Vec<N::Entry>,
 ) -> Result<(), DriverError> {
+    if depth.ax >= 30 {
+        budget.truncated = true;
+    }
     if depth.ax > 30 || budget.expired() {
         return Ok(());
     }
@@ -215,6 +305,7 @@ fn walk_until<N: TreeNode>(
     };
     let retained = match element.retained(geometry, budget.deadline) {
         Err(failure) if depth.ax > 0 && failure.kind == crate::protocol::ErrorKind::Stale => {
+            budget.truncated = true;
             return Ok(());
         }
         result => result?,
@@ -233,6 +324,7 @@ fn walk_until<N: TreeNode>(
     if depth.ax < 30 && !budget.expired() {
         let children = match element.children_until(budget.deadline) {
             Err(failure) if depth.ax > 0 && failure.kind == crate::protocol::ErrorKind::Stale => {
+                budget.truncated = true;
                 return Ok(());
             }
             result => result?,
@@ -575,7 +667,7 @@ mod regression_tests {
                 on_children,
             };
             let mut elements = vec![];
-            walk(
+            let truncated = walk(
                 tree.clone(),
                 Depth::default(),
                 geometry(),
@@ -584,6 +676,7 @@ mod regression_tests {
                 &mut vec![],
             )
             .unwrap();
+            assert!(truncated, "a skipped stale subtree is incomplete");
             assert!(elements.iter().any(|e| e.label.as_deref() == Some("First")));
             assert!(elements.iter().any(|e| e.label.as_deref() == Some("Last")));
             assert_eq!(
@@ -620,6 +713,26 @@ mod regression_tests {
                 "timeouts must remain fatal"
             );
         }
+    }
+
+    #[test]
+    fn a_depth_limited_tree_does_not_certify_unseen_descendants() {
+        let mut tree = Node::control("Password");
+        for _ in 0..31 {
+            tree = Node::group(vec![tree]);
+        }
+        let mut elements = vec![];
+        let truncated = walk(
+            tree,
+            Depth::default(),
+            geometry(),
+            Instant::now() + Duration::from_secs(1),
+            &mut elements,
+            &mut vec![],
+        )
+        .unwrap();
+        assert!(elements.is_empty());
+        assert!(truncated, "a skipped deep subtree is incomplete");
     }
 
     #[test]
@@ -832,4 +945,197 @@ fn title_bar_buttons_do_not_count_as_an_element_tree() {
     assert!(!has_element_tree(&entries));
     entries[0].window_frame_control = false;
     assert!(has_element_tree(&entries));
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::super::ax::SubroleRead;
+    use super::*;
+
+    #[derive(Clone)]
+    struct SecurityNode {
+        role: Result<Option<&'static str>, ()>,
+        subrole: Result<Option<&'static str>, ()>,
+        children: Result<Vec<Self>, ()>,
+        frame_readable: bool,
+        expire_on_children: bool,
+    }
+
+    impl SecurityNode {
+        fn clean(children: Vec<Self>) -> Self {
+            Self {
+                role: Ok(Some("AXTextField")),
+                subrole: Ok(None),
+                children: Ok(children),
+                frame_readable: true,
+                expire_on_children: false,
+            }
+        }
+    }
+
+    impl TreeNode for SecurityNode {
+        type Entry = ();
+        fn is_content(_: &()) -> bool {
+            true
+        }
+        fn retained(
+            &self,
+            _geometry: CaptureGeometry,
+            _deadline: Instant,
+        ) -> Result<Option<(Element, ())>, DriverError> {
+            assert!(
+                self.frame_readable,
+                "the security scan must not read frames"
+            );
+            Ok(None)
+        }
+        fn children_until(&self, deadline: Instant) -> Result<Vec<Self>, DriverError> {
+            self.security_children_until(deadline)
+        }
+    }
+
+    impl SecurityTreeNode for SecurityNode {
+        fn security_role_until(&self, _deadline: Instant) -> Result<Option<String>, DriverError> {
+            self.role.map(|role| role.map(str::to_owned)).map_err(|()| {
+                super::super::error(crate::protocol::ErrorKind::Failed, "role read failed")
+            })
+        }
+        fn security_subrole_until(&self, _deadline: Instant) -> Result<SubroleRead, DriverError> {
+            Ok(match self.subrole {
+                Ok(Some(value)) => SubroleRead::Value(value.into()),
+                Ok(None) => SubroleRead::Absent,
+                Err(()) => SubroleRead::Failure,
+            })
+        }
+        fn security_children_until(&self, deadline: Instant) -> Result<Vec<Self>, DriverError> {
+            if self.expire_on_children {
+                thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+            }
+            self.children.clone().map_err(|()| {
+                super::super::error(crate::protocol::ErrorKind::Failed, "children read failed")
+            })
+        }
+    }
+
+    fn scan(node: SecurityNode) -> SecurityScan {
+        scan_security_until(Some(node), Instant::now() + Duration::from_secs(1), 4096)
+    }
+
+    #[test]
+    fn a_clean_tree_is_safe_without_frame_reads() {
+        assert_eq!(
+            scan(SecurityNode::clean(vec![SecurityNode::clean(vec![])])),
+            SecurityScan::Clean
+        );
+    }
+
+    #[test]
+    fn a_secure_node_with_an_unreadable_frame_is_still_secure() {
+        let mut node = SecurityNode::clean(vec![]);
+        node.subrole = Ok(Some("AXSecureTextField"));
+        node.frame_readable = false;
+        assert_eq!(
+            scan(SecurityNode::clean(vec![node])),
+            SecurityScan::SecurePresent
+        );
+    }
+
+    #[test]
+    fn a_failed_children_read_is_incomplete() {
+        let mut node = SecurityNode::clean(vec![]);
+        node.children = Err(());
+        assert_eq!(scan(node), SecurityScan::Incomplete);
+    }
+
+    #[test]
+    fn a_failed_role_read_is_incomplete() {
+        let mut node = SecurityNode::clean(vec![]);
+        node.role = Err(());
+        assert_eq!(scan(node), SecurityScan::Incomplete);
+    }
+
+    #[test]
+    fn a_failed_text_subrole_read_is_secure() {
+        let mut node = SecurityNode::clean(vec![]);
+        node.subrole = Err(());
+        assert_eq!(scan(node), SecurityScan::SecurePresent);
+    }
+
+    #[test]
+    fn a_failed_nontext_subrole_read_is_incomplete() {
+        let mut node = SecurityNode::clean(vec![]);
+        node.role = Ok(Some("AXButton"));
+        node.subrole = Err(());
+        assert_eq!(scan(node), SecurityScan::Incomplete);
+    }
+
+    #[test]
+    fn an_unsupported_subrole_is_fine() {
+        assert_eq!(scan(SecurityNode::clean(vec![])), SecurityScan::Clean);
+    }
+
+    #[test]
+    fn a_missing_role_fails_closed() {
+        let mut node = SecurityNode::clean(vec![]);
+        node.role = Ok(None);
+        assert_eq!(scan(node), SecurityScan::SecurePresent);
+    }
+
+    #[test]
+    fn a_security_depth_cutoff_is_incomplete() {
+        let mut node = SecurityNode::clean(vec![]);
+        for _ in 0..30 {
+            node = SecurityNode::clean(vec![node]);
+        }
+        assert_eq!(scan(node), SecurityScan::Incomplete);
+    }
+
+    #[test]
+    fn a_security_element_count_cutoff_is_incomplete() {
+        let node = SecurityNode::clean(vec![SecurityNode::clean(vec![])]);
+        assert_eq!(
+            scan_security_until(
+                Some(node.clone()),
+                Instant::now() + Duration::from_secs(1),
+                2
+            ),
+            SecurityScan::Incomplete
+        );
+        assert_eq!(
+            scan_security_until(Some(node), Instant::now() + Duration::from_secs(1), 3),
+            SecurityScan::Clean
+        );
+    }
+
+    #[test]
+    fn an_expired_security_budget_is_incomplete() {
+        assert_eq!(
+            scan_security_until(Some(SecurityNode::clean(vec![])), Instant::now(), 4096),
+            SecurityScan::Incomplete
+        );
+    }
+
+    #[test]
+    fn a_budget_expiring_during_the_final_children_read_is_incomplete() {
+        let mut node = SecurityNode::clean(vec![]);
+        node.expire_on_children = true;
+        assert_eq!(
+            scan_security_until(Some(node), Instant::now() + Duration::from_millis(50), 4096),
+            SecurityScan::Incomplete,
+        );
+    }
+
+    #[test]
+    fn an_unavailable_window_is_incomplete() {
+        assert_eq!(
+            scan_security_until::<SecurityNode>(
+                None,
+                Instant::now() + Duration::from_secs(1),
+                4096
+            ),
+            SecurityScan::Incomplete
+        );
+    }
 }

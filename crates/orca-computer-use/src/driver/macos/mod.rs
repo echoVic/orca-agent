@@ -19,6 +19,7 @@ pub use events::{
 #[cfg(feature = "test-utils")]
 pub use foreground::test_element_click_point;
 mod foreground;
+mod occlusion;
 mod permissions;
 mod tree;
 
