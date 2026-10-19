@@ -1,22 +1,18 @@
 #![cfg(target_os = "macos")]
-#![cfg_attr(target_os = "macos", no_main)]
-#![cfg_attr(target_os = "macos", reexport_test_harness_main = "rust_tests")]
 
-// Keep the standard ignored/serial libtest interface, but let AppKit's actual
-// main thread deliver runningApplications updates while libtest runs tests.
-#[unsafe(export_name = "main")]
-extern "C" fn macos_test_main() -> i32 {
+// AppKit must deliver runningApplications updates on the actual main thread.
+pub fn run(cli: super::harness::Cli) -> i32 {
     use objc2_core_foundation::{CFRunLoop, kCFRunLoopDefaultMode};
     let workspace = NSWorkspace::sharedWorkspace();
     let frontmost = workspace
         .frontmostApplication()
         .map(|app| app.processIdentifier());
     let pointer = CGEvent::location(Some(&CGEvent::new(None).expect("read suite pointer")));
-    let harness = std::thread::spawn(rust_tests);
+    let harness = std::thread::spawn(move || cli.run(trials()));
     while !harness.is_finished() {
         CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.01, true);
     }
-    let passed = harness.join().is_ok();
+    let passed = harness.join().is_ok_and(|result| result.num_failed == 0);
     let restored = restore_suite_if_live(
         LIVE_TEST_RAN.load(std::sync::atomic::Ordering::SeqCst),
         || run_live_test(|| record_restoration(frontmost, pointer)),
@@ -30,6 +26,120 @@ extern "C" fn macos_test_main() -> i32 {
     } else {
         101
     }
+}
+
+// The registry owns test names and ignore status now that stable Rust no longer
+// generates this target's harness. All live desktop tests stay opt-in.
+fn trials() -> Vec<libtest_mimic::Trial> {
+    macro_rules! cases {
+        ($ignored:expr; $($name:ident),* $(,)?) => {
+            vec![$(super::harness::trial(stringify!($name), $ignored, $name)),*]
+        };
+    }
+    let mut tests = cases! { false;
+        an_already_restored_frontmost_app_needs_no_activation,
+        hid_activity_distinguishes_user_interference_from_a_regression,
+        a_driver_hid_post_is_not_user_interference,
+        stale_ax_reads_resolve_again_before_retrying,
+        stale_ax_reads_stop_after_five_attempts,
+        successful_and_other_failed_ax_reads_are_not_retried,
+        warp_precision_accepts_rounding_but_rejects_a_moved_pointer,
+        a_suite_without_live_tests_does_not_restore_the_gui,
+    };
+    tests.extend(cases! { true;
+        hello_reports_permissions_the_os_and_the_host_terminal,
+        list_and_resolve_find_the_fixture_by_name_and_bundle_id,
+        a_second_driver_finds_the_session_lock_held,
+        launch_app_opens_a_file_in_textedit,
+        opening_a_nonexistent_file_in_already_running_textedit_returns_an_error,
+        cleanup_only_selects_explicitly_launched_processes,
+        cleanup_preserves_an_app_launched_by_another_live_session,
+        launch_attribution_registers_only_pids_that_appeared_during_the_request,
+        observe_lists_the_fixture_controls_in_screenshot_pixels,
+        observe_with_a_query_keeps_matches_and_their_ancestors,
+        observe_captures_a_window_covered_by_another,
+        observe_of_an_electron_app_waits_for_its_tree,
+        observe_stocks_after_dismissing_its_welcome_page,
+        clicking_an_element_presses_it_in_the_background,
+        typing_goes_into_the_focused_field_in_the_background,
+        typing_with_a_chinese_input_method_enters_the_text_exactly,
+        typing_into_the_password_field_needs_approval_first,
+        a_point_on_the_button_presses_it,
+        a_point_on_the_canvas_needs_the_foreground,
+        scrolling_the_list_moves_it_in_the_background,
+        an_action_after_the_window_moved_is_stale,
+        cmd_a_reaches_the_focused_field,
+        cmd_s_saves_textedit_in_the_background,
+        a_point_on_a_hidden_button_needs_the_foreground,
+        a_canvas_with_no_focused_element_receives_an_untargeted_text_key,
+        a_canvas_click_uses_the_foreground_and_restores_it,
+        two_foreground_actions_in_a_row_do_not_count_as_user_activity,
+        the_esc_listener_swallows_a_user_esc_and_reports_it,
+        the_drivers_own_esc_passes_the_listener,
+        the_listener_is_gone_after_the_turn_ends,
+        a_busy_user_makes_the_fallback_give_up,
+        a_double_canvas_click_uses_the_foreground,
+        a_failed_foreground_action_restores_the_app_and_pointer,
+        esc_stops_a_foreground_action_and_releases_it,
+        a_window_moved_during_the_foreground_idle_wait_is_stale,
+        held_input_is_released_through_hid_after_finder_becomes_frontmost,
+        foreground_password_focus_requires_approval_after_the_click,
+        foreground_text_key_checks_password_focus_after_the_click,
+        an_observed_text_area_with_a_failed_description_can_be_targeted_by_id,
+        an_action_after_the_element_label_changed_is_stale,
+        text_keys_into_password_require_approval,
+        paste_into_focused_password_requires_approval,
+        background_type_checks_password_focus_after_a_noop_focus_setter,
+        act_and_observe_choose_the_first_window_when_main_is_absent,
+        approved_actions_and_observations_require_the_exact_bundle_id,
+        closing_a_window_preserves_the_successful_action_outcome,
+        launching_a_cold_app_does_not_activate_it,
+        an_offscreen_row_is_scrolled_in_or_refused_before_hid_clicking,
+        a_finder_window_covering_the_canvas_is_refused_without_posting,
+        a_covered_safari_page_point_is_refused_and_an_uncovered_point_clicks,
+        a_minimized_window_is_clicked_then_minimized_again,
+        a_foreground_scroll_moves_the_target_list_and_restores_the_pointer,
+        background_type_with_a_target_inserts_after_existing_text,
+        background_element_type_preserves_selection_and_appends_when_unfocused,
+        foreground_element_type_preserves_selection_and_appends_when_unfocused,
+        unreported_password_focus_refuses_unapproved_text_keys,
+        foreground_type_at_a_point_keeps_the_clicked_caret,
+        foreground_type_with_an_element_target_inserts_after_existing_text,
+        targeted_type_without_ax_value_uses_the_character_count,
+        targeted_type_without_a_readable_length_still_delivers_text,
+        targeted_type_with_an_unwritable_selection_still_delivers_text,
+        foreground_point_click_double_skips_the_pre_activation_hit_test,
+        foreground_point_click_right_skips_the_pre_activation_hit_test,
+        foreground_point_click_modified_skips_the_pre_activation_hit_test,
+        foreground_point_click_hidden_skips_the_pre_activation_hit_test,
+        calculator_observe_survives_failed_subroles_and_digit_press_changes_display,
+        finder_observe_survives_failed_subroles_and_scrolls_own_300_file_list_to_bottom,
+        a_failed_text_subrole_is_secure_and_needs_approval,
+        a_missing_text_subrole_is_ordinary,
+        an_unsupported_text_subrole_is_ordinary,
+        one_failed_role_does_not_abort_observation,
+        one_failed_frame_does_not_abort_observation,
+        one_failed_children_read_does_not_abort_observation,
+        textedit_save_panel_uses_foreground_for_typing,
+        background_type_300_characters_roundtrips_in_fixture_text_area,
+        background_type_300_characters_roundtrips_in_textedit_document,
+        a_running_localized_textedit_resolves_by_its_english_name_for_observe,
+        cold_textedit_launches_by_english_name,
+        cold_calculator_launches_by_english_name,
+        literal_type_refuses_single_line_controls_and_inserts_tabs_in_text_areas,
+        native_control_chunks_stop_when_the_recipient_moves_or_becomes_secure,
+        native_modality_errors_depth_and_ordinary_role_reads_have_distinct_outcomes,
+        native_slow_ancestry_and_foreground_delivery_share_one_action_deadline,
+        ordinary_fixture_name_and_textedit_body_type_key_and_paste_without_approval,
+        native_type_control_validation_and_foreground_300_character_receipts,
+        textedit_300_characters_roundtrip_through_the_real_hid_splitter,
+        real_foreign_pid_keyboard_recipients_require_foreground,
+        real_app_identities_keep_exact_ids_instances_and_declared_folder_names,
+        native_runtime_preview_and_provider_schema_use_canonical_ids_before_approval,
+        canvas_colour_is_bounded_and_its_middle_receives_the_click,
+    });
+    tests.sort_by(|a, b| a.name().cmp(b.name()));
+    tests
 }
 
 use std::collections::HashSet;
@@ -661,7 +771,6 @@ fn restore_app_if_needed(
     current == Some(expected) || activate()
 }
 
-#[test]
 fn an_already_restored_frontmost_app_needs_no_activation() {
     assert!(restore_app_if_needed(42, Some(42), || false));
     let mut called = false;
@@ -738,8 +847,6 @@ fn record_restoration(frontmost: Option<i32>, pointer: objc2_core_foundation::CG
     }
 }
 
-#[test]
-#[ignore]
 fn hello_reports_permissions_the_os_and_the_host_terminal() {
     run_live_test(|| {
         let Some(live) = Live::start() else { return };
@@ -753,8 +860,6 @@ fn hello_reports_permissions_the_os_and_the_host_terminal() {
     });
 }
 
-#[test]
-#[ignore]
 fn list_and_resolve_find_the_fixture_by_name_and_bundle_id() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -788,8 +893,6 @@ fn list_and_resolve_find_the_fixture_by_name_and_bundle_id() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_second_driver_finds_the_session_lock_held() {
     run_live_test(|| {
         use orca_computer_use::serve::{DriverHandler, LineWriter};
@@ -861,8 +964,6 @@ fn a_second_driver_finds_the_session_lock_held() {
     });
 }
 
-#[test]
-#[ignore]
 fn launch_app_opens_a_file_in_textedit() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -897,8 +998,6 @@ fn launch_app_opens_a_file_in_textedit() {
     });
 }
 
-#[test]
-#[ignore]
 fn opening_a_nonexistent_file_in_already_running_textedit_returns_an_error() {
     run_live_test(|| {
         use orca_computer_use::client::CallError;
@@ -957,8 +1056,6 @@ fn opening_a_nonexistent_file_in_already_running_textedit_returns_an_error() {
     });
 }
 
-#[test]
-#[ignore]
 fn cleanup_only_selects_explicitly_launched_processes() {
     run_live_test(|| {
         let running = HashSet::from([10]);
@@ -970,8 +1067,6 @@ fn cleanup_only_selects_explicitly_launched_processes() {
     });
 }
 
-#[test]
-#[ignore]
 fn cleanup_preserves_an_app_launched_by_another_live_session() {
     run_live_test(|| {
         let Some(mut owner) = Live::start() else {
@@ -993,8 +1088,6 @@ fn cleanup_preserves_an_app_launched_by_another_live_session() {
     });
 }
 
-#[test]
-#[ignore]
 fn launch_attribution_registers_only_pids_that_appeared_during_the_request() {
     run_live_test(|| {
         let before = HashSet::from([10, 20]);
@@ -1019,8 +1112,6 @@ fn launch_attribution_registers_only_pids_that_appeared_during_the_request() {
     });
 }
 
-#[test]
-#[ignore]
 fn observe_lists_the_fixture_controls_in_screenshot_pixels() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -1083,8 +1174,6 @@ fn observe_lists_the_fixture_controls_in_screenshot_pixels() {
     });
 }
 
-#[test]
-#[ignore]
 fn observe_with_a_query_keeps_matches_and_their_ancestors() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -1151,8 +1240,6 @@ impl Drop for FinderWindow {
     }
 }
 
-#[test]
-#[ignore]
 fn observe_captures_a_window_covered_by_another() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -1243,8 +1330,6 @@ end tell",
     });
 }
 
-#[test]
-#[ignore]
 fn observe_of_an_electron_app_waits_for_its_tree() {
     run_live_test(|| {
         let Ok(bundle) = std::env::var("ORCA_CU_ELECTRON_APP") else {
@@ -1443,8 +1528,6 @@ fn observe_of_an_electron_app_waits_for_its_tree() {
     });
 }
 
-#[test]
-#[ignore]
 fn observe_stocks_after_dismissing_its_welcome_page() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -1547,8 +1630,6 @@ fn background_fixture() -> Option<(Live, PathBuf, Observation)> {
     let observation = live.observe("dev.orca.cu-fixture", None);
     Some((live, log, observation))
 }
-#[test]
-#[ignore]
 fn clicking_an_element_presses_it_in_the_background() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1563,8 +1644,6 @@ fn clicking_an_element_presses_it_in_the_background() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
-#[test]
-#[ignore]
 fn typing_goes_into_the_focused_field_in_the_background() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1627,8 +1706,6 @@ fn current_keyboard_input_source() -> Option<(String, Vec<String>)> {
     Some((id, languages))
 }
 
-#[test]
-#[ignore]
 fn typing_with_a_chinese_input_method_enters_the_text_exactly() {
     run_live_test(|| {
         let source = current_keyboard_input_source();
@@ -1674,8 +1751,6 @@ fn typing_with_a_chinese_input_method_enters_the_text_exactly() {
     });
 }
 
-#[test]
-#[ignore]
 fn typing_into_the_password_field_needs_approval_first() {
     run_live_test(|| {
         let Some((live, _, obs)) = background_fixture() else {
@@ -1693,8 +1768,6 @@ fn typing_into_the_password_field_needs_approval_first() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
-#[test]
-#[ignore]
 fn a_point_on_the_button_presses_it() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1720,8 +1793,6 @@ fn a_point_on_the_button_presses_it() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
-#[test]
-#[ignore]
 fn a_point_on_the_canvas_needs_the_foreground() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1753,8 +1824,6 @@ fn a_point_on_the_canvas_needs_the_foreground() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
-#[test]
-#[ignore]
 fn scrolling_the_list_moves_it_in_the_background() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1782,8 +1851,6 @@ fn scrolling_the_list_moves_it_in_the_background() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
-#[test]
-#[ignore]
 fn an_action_after_the_window_moved_is_stale() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1809,8 +1876,6 @@ fn an_action_after_the_window_moved_is_stale() {
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
-#[test]
-#[ignore]
 fn cmd_a_reaches_the_focused_field() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -1890,8 +1955,6 @@ fn file_changed(file: &std::path::Path, before: std::time::SystemTime) -> bool {
     }
 }
 
-#[test]
-#[ignore]
 fn cmd_s_saves_textedit_in_the_background() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -2028,7 +2091,6 @@ fn failure_is_inconclusive(
     last_input > 0.0 && last_own_hid.is_none_or(|own| last_input > own)
 }
 
-#[test]
 fn hid_activity_distinguishes_user_interference_from_a_regression() {
     let state = GuiFailureKind::StateMismatch;
     assert!(failure_is_inconclusive(state, 10.0, 2.0, None, None));
@@ -2047,8 +2109,6 @@ fn hid_activity_distinguishes_user_interference_from_a_regression() {
     ));
 }
 
-#[test]
-#[ignore]
 fn a_point_on_a_hidden_button_needs_the_foreground() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -2101,8 +2161,6 @@ fn a_point_on_a_hidden_button_needs_the_foreground() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_canvas_with_no_focused_element_receives_an_untargeted_text_key() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -2140,8 +2198,6 @@ fn a_canvas_with_no_focused_element_receives_an_untargeted_text_key() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_canvas_click_uses_the_foreground_and_restores_it() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -2198,8 +2254,6 @@ fn a_canvas_click_uses_the_foreground_and_restores_it() {
     });
 }
 
-#[test]
-#[ignore]
 fn two_foreground_actions_in_a_row_do_not_count_as_user_activity() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -2257,8 +2311,6 @@ fn log_has_esc(log: &std::path::Path) -> bool {
         .any(|event| event["type"] == "keydown" && event["chars"] == "\u{1b}")
 }
 
-#[test]
-#[ignore]
 fn the_esc_listener_swallows_a_user_esc_and_reports_it() {
     run_live_test(|| {
         let Some((live, pid, log)) = esc_fixture() else {
@@ -2283,8 +2335,6 @@ fn the_esc_listener_swallows_a_user_esc_and_reports_it() {
     });
 }
 
-#[test]
-#[ignore]
 fn the_drivers_own_esc_passes_the_listener() {
     run_live_test(|| {
         let Some((live, pid, log)) = esc_fixture() else {
@@ -2304,8 +2354,6 @@ fn the_drivers_own_esc_passes_the_listener() {
     });
 }
 
-#[test]
-#[ignore]
 fn the_listener_is_gone_after_the_turn_ends() {
     run_live_test(|| {
         let Some((live, pid, log)) = esc_fixture() else {
@@ -2326,8 +2374,6 @@ fn the_listener_is_gone_after_the_turn_ends() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_busy_user_makes_the_fallback_give_up() {
     run_live_test(|| {
         use objc2_core_graphics::{CGEventTapLocation, CGMouseButton};
@@ -2393,8 +2439,6 @@ fn a_busy_user_makes_the_fallback_give_up() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_double_canvas_click_uses_the_foreground() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -2416,8 +2460,6 @@ fn a_double_canvas_click_uses_the_foreground() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_failed_foreground_action_restores_the_app_and_pointer() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -2454,8 +2496,6 @@ fn a_failed_foreground_action_restores_the_app_and_pointer() {
     });
 }
 
-#[test]
-#[ignore]
 fn esc_stops_a_foreground_action_and_releases_it() {
     run_live_test(|| {
         use objc2_core_graphics::CGEventFlags;
@@ -2539,8 +2579,6 @@ fn esc_stops_a_foreground_action_and_releases_it() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_window_moved_during_the_foreground_idle_wait_is_stale() {
     run_live_test(|| {
         use objc2_core_graphics::{CGEventTapLocation, CGMouseButton};
@@ -2608,7 +2646,6 @@ fn a_window_moved_during_the_foreground_idle_wait_is_stale() {
     });
 }
 
-#[test]
 fn a_driver_hid_post_is_not_user_interference() {
     let state = GuiFailureKind::StateMismatch;
     assert!(!failure_is_inconclusive(state, 10.0, 2.0, None, Some(8.0)));
@@ -2716,7 +2753,6 @@ fn retry_stale_ax_read<E, T>(
     unreachable!()
 }
 
-#[test]
 fn stale_ax_reads_resolve_again_before_retrying() {
     use objc2_application_services::AXError;
     let mut finds = 0;
@@ -2743,7 +2779,6 @@ fn stale_ax_reads_resolve_again_before_retrying() {
     assert!(started.elapsed() >= Duration::from_millis(100));
 }
 
-#[test]
 fn stale_ax_reads_stop_after_five_attempts() {
     use objc2_application_services::AXError;
     let mut finds = 0;
@@ -2763,7 +2798,6 @@ fn stale_ax_reads_stop_after_five_attempts() {
     assert!(started.elapsed() >= Duration::from_millis(400));
 }
 
-#[test]
 fn successful_and_other_failed_ax_reads_are_not_retried() {
     use objc2_application_services::AXError;
     for error in [
@@ -2953,8 +2987,6 @@ fn fixture_screen_point(
     CGPoint::new(x, y)
 }
 
-#[test]
-#[ignore]
 fn held_input_is_released_through_hid_after_finder_becomes_frontmost() {
     run_live_test(|| {
         use objc2_core_graphics::{CGEventFlags, CGMouseButton};
@@ -3066,13 +3098,9 @@ impl Drop for HeldInputRecovery {
     }
 }
 
-#[test]
-#[ignore]
 fn foreground_password_focus_requires_approval_after_the_click() {
     password_focus_after_click(false);
 }
-#[test]
-#[ignore]
 fn foreground_text_key_checks_password_focus_after_the_click() {
     password_focus_after_click(true);
 }
@@ -3156,8 +3184,6 @@ fn password_focus_after_click(key: bool) {
     });
 }
 
-#[test]
-#[ignore]
 fn an_observed_text_area_with_a_failed_description_can_be_targeted_by_id() {
     run_live_test(|| {
         use objc2_application_services::AXError;
@@ -3227,8 +3253,6 @@ fn an_observed_text_area_with_a_failed_description_can_be_targeted_by_id() {
     });
 }
 
-#[test]
-#[ignore]
 fn an_action_after_the_element_label_changed_is_stale() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -3293,7 +3317,6 @@ fn pointer_restored(
     (expected.x - actual.x).abs() <= 1.0 && (expected.y - actual.y).abs() <= 1.0
 }
 
-#[test]
 fn warp_precision_accepts_rounding_but_rejects_a_moved_pointer() {
     use objc2_core_foundation::CGPoint;
     let expected = CGPoint::new(1439.8359375, 992.703125);
@@ -3364,8 +3387,6 @@ impl Drop for TestClipboard {
     }
 }
 
-#[test]
-#[ignore]
 fn text_keys_into_password_require_approval() {
     run_live_test(|| {
         let Some((live, _, obs)) = background_fixture() else {
@@ -3397,8 +3418,6 @@ fn text_keys_into_password_require_approval() {
     });
 }
 
-#[test]
-#[ignore]
 fn paste_into_focused_password_requires_approval() {
     run_live_test(|| {
         let Some((live, _, obs)) = background_fixture() else {
@@ -3434,8 +3453,6 @@ fn paste_into_focused_password_requires_approval() {
     });
 }
 
-#[test]
-#[ignore]
 fn background_type_checks_password_focus_after_a_noop_focus_setter() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -3470,7 +3487,6 @@ fn background_type_checks_password_focus_after_a_noop_focus_setter() {
 fn restore_suite_if_live(live_ran: bool, restore: impl FnOnce()) -> bool {
     !live_ran || std::panic::catch_unwind(std::panic::AssertUnwindSafe(restore)).is_ok()
 }
-#[test]
 fn a_suite_without_live_tests_does_not_restore_the_gui() {
     let restored = std::cell::Cell::new(0);
     assert!(restore_suite_if_live(false, || restored.set(restored.get() + 1)));
@@ -3479,8 +3495,6 @@ fn a_suite_without_live_tests_does_not_restore_the_gui() {
     assert_eq!(restored.get(), 1, "live-suite restoration positive control");
 }
 
-#[test]
-#[ignore]
 fn act_and_observe_choose_the_first_window_when_main_is_absent() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -3509,8 +3523,6 @@ fn act_and_observe_choose_the_first_window_when_main_is_absent() {
     });
 }
 
-#[test]
-#[ignore]
 fn approved_actions_and_observations_require_the_exact_bundle_id() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -3552,8 +3564,6 @@ fn approved_actions_and_observations_require_the_exact_bundle_id() {
     });
 }
 
-#[test]
-#[ignore]
 fn closing_a_window_preserves_the_successful_action_outcome() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -3577,8 +3587,6 @@ fn closing_a_window_preserves_the_successful_action_outcome() {
     });
 }
 
-#[test]
-#[ignore]
 fn launching_a_cold_app_does_not_activate_it() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -3643,8 +3651,6 @@ fn fixture_window(pid: i32) -> NativeAxElement {
     let application = NativeAxElement::application(pid);
     fixture_ax_element(&application, "AXMainWindow").unwrap()
 }
-#[test]
-#[ignore]
 fn an_offscreen_row_is_scrolled_in_or_refused_before_hid_clicking() {
     run_live_test(|| {
         use orca_computer_use::driver::macos::test_element_click_point;
@@ -3733,8 +3739,6 @@ fn an_offscreen_row_is_scrolled_in_or_refused_before_hid_clicking() {
         live.assert_log_contains(&log, r#""type":"canvas_click""#);
     });
 }
-#[test]
-#[ignore]
 fn a_finder_window_covering_the_canvas_is_refused_without_posting() {
     run_live_test(|| {
         use orca_computer_use::driver::macos::test_check_click_point;
@@ -3930,8 +3934,6 @@ impl Drop for SafariPage {
     }
 }
 
-#[test]
-#[ignore]
 fn a_covered_safari_page_point_is_refused_and_an_uncovered_point_clicks() {
     run_live_test(|| {
         use objc2_application_services::{AXError, AXValue, AXValueType};
@@ -4162,8 +4164,6 @@ document.title = `clicked ${{event.clientX}},${{event.clientY}}`;
     });
 }
 
-#[test]
-#[ignore]
 fn a_minimized_window_is_clicked_then_minimized_again() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {
@@ -4206,8 +4206,6 @@ fn a_minimized_window_is_clicked_then_minimized_again() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_foreground_scroll_moves_the_target_list_and_restores_the_pointer() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -4253,8 +4251,6 @@ fn a_foreground_scroll_moves_the_target_list_and_restores_the_pointer() {
     });
 }
 
-#[test]
-#[ignore]
 fn background_type_with_a_target_inserts_after_existing_text() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -4291,14 +4287,10 @@ fn background_type_with_a_target_inserts_after_existing_text() {
     });
 }
 
-#[test]
-#[ignore]
 fn background_element_type_preserves_selection_and_appends_when_unfocused() {
     element_type_preserves_selection(false);
 }
 
-#[test]
-#[ignore]
 fn foreground_element_type_preserves_selection_and_appends_when_unfocused() {
     element_type_preserves_selection(true);
 }
@@ -4396,8 +4388,6 @@ fn element_type_preserves_selection(foreground: bool) {
     });
 }
 
-#[test]
-#[ignore]
 fn unreported_password_focus_refuses_unapproved_text_keys() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -4432,8 +4422,6 @@ fn unreported_password_focus_refuses_unapproved_text_keys() {
     });
 }
 
-#[test]
-#[ignore]
 fn foreground_type_at_a_point_keeps_the_clicked_caret() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -4491,8 +4479,6 @@ fn foreground_type_at_a_point_keeps_the_clicked_caret() {
     });
 }
 
-#[test]
-#[ignore]
 fn foreground_type_with_an_element_target_inserts_after_existing_text() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -4584,8 +4570,6 @@ fn type_with_optional_selection(flags: &[&str], expected: &str) {
     });
 }
 
-#[test]
-#[ignore]
 fn targeted_type_without_ax_value_uses_the_character_count() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -4651,14 +4635,10 @@ fn targeted_type_without_ax_value_uses_the_character_count() {
     });
 }
 
-#[test]
-#[ignore]
 fn targeted_type_without_a_readable_length_still_delivers_text() {
     type_with_optional_selection(&["--no-name-value", "--no-name-length"], "a🦀cux");
 }
 
-#[test]
-#[ignore]
 fn targeted_type_with_an_unwritable_selection_still_delivers_text() {
     type_with_optional_selection(&["--expire-selection-focus"], "a🦀cux");
 }
@@ -4739,26 +4719,18 @@ fn foreground_point_click_without_early_hit(variant: &str) {
     });
 }
 
-#[test]
-#[ignore]
 fn foreground_point_click_double_skips_the_pre_activation_hit_test() {
     foreground_point_click_without_early_hit("double");
 }
 
-#[test]
-#[ignore]
 fn foreground_point_click_right_skips_the_pre_activation_hit_test() {
     foreground_point_click_without_early_hit("right");
 }
 
-#[test]
-#[ignore]
 fn foreground_point_click_modified_skips_the_pre_activation_hit_test() {
     foreground_point_click_without_early_hit("modified");
 }
 
-#[test]
-#[ignore]
 fn foreground_point_click_hidden_skips_the_pre_activation_hit_test() {
     foreground_point_click_without_early_hit("hidden");
 }
@@ -4900,8 +4872,6 @@ fn launch_test_app(live: &mut Live, bundle: &str, open: Vec<String>) -> AppInfo 
     app
 }
 
-#[test]
-#[ignore]
 fn calculator_observe_survives_failed_subroles_and_digit_press_changes_display() {
     run_live_test(|| {
         use objc2_application_services::AXError;
@@ -5066,8 +5036,6 @@ fn calculator_observe_survives_failed_subroles_and_digit_press_changes_display()
     });
 }
 
-#[test]
-#[ignore]
 fn finder_observe_survives_failed_subroles_and_scrolls_own_300_file_list_to_bottom() {
     run_live_test(|| {
         let Some(live) = Live::start() else {
@@ -5248,18 +5216,12 @@ fn unreadable_subrole_requires_approval(code: i32) {
     });
 }
 
-#[test]
-#[ignore]
 fn a_failed_text_subrole_is_secure_and_needs_approval() {
     unreadable_subrole_requires_approval(-25200);
 }
-#[test]
-#[ignore]
 fn a_missing_text_subrole_is_ordinary() {
     absent_subrole_is_ordinary(-25212);
 }
-#[test]
-#[ignore]
 fn an_unsupported_text_subrole_is_ordinary() {
     absent_subrole_is_ordinary(-25205);
 }
@@ -5312,18 +5274,12 @@ fn one_bad_button_preserves_the_tree(flag: &str) {
         }
     });
 }
-#[test]
-#[ignore]
 fn one_failed_role_does_not_abort_observation() {
     one_bad_button_preserves_the_tree("--bad-button-role");
 }
-#[test]
-#[ignore]
 fn one_failed_frame_does_not_abort_observation() {
     one_bad_button_preserves_the_tree("--bad-button-frame");
 }
-#[test]
-#[ignore]
 fn one_failed_children_read_does_not_abort_observation() {
     one_bad_button_preserves_the_tree("--bad-button-children");
 }
@@ -5365,8 +5321,6 @@ fn native_ax_pid(element: &NativeAxElement) -> i32 {
     pid
 }
 
-#[test]
-#[ignore]
 fn textedit_save_panel_uses_foreground_for_typing() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -5729,8 +5683,6 @@ fn background_300_roundtrip(
     live.assert_frontmost_and_pointer_unchanged();
 }
 
-#[test]
-#[ignore]
 fn background_type_300_characters_roundtrips_in_fixture_text_area() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -5751,8 +5703,6 @@ fn background_type_300_characters_roundtrips_in_fixture_text_area() {
     });
 }
 
-#[test]
-#[ignore]
 fn background_type_300_characters_roundtrips_in_textedit_document() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -5782,8 +5732,6 @@ fn background_type_300_characters_roundtrips_in_textedit_document() {
     });
 }
 
-#[test]
-#[ignore]
 fn a_running_localized_textedit_resolves_by_its_english_name_for_observe() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -5893,13 +5841,9 @@ fn cold_launch_by_name(name: &str, bundle: &str) {
         }
     });
 }
-#[test]
-#[ignore]
 fn cold_textedit_launches_by_english_name() {
     cold_launch_by_name("TextEdit", "com.apple.TextEdit");
 }
-#[test]
-#[ignore]
 fn cold_calculator_launches_by_english_name() {
     cold_launch_by_name("Calculator", "com.apple.calculator");
 }
@@ -5931,8 +5875,6 @@ fn absent_subrole_is_ordinary(code: i32) {
     });
 }
 
-#[test]
-#[ignore]
 fn literal_type_refuses_single_line_controls_and_inserts_tabs_in_text_areas() {
     run_live_test(|| {
         use objc2_core_foundation::CFString;
@@ -6011,8 +5953,6 @@ fn literal_type_refuses_single_line_controls_and_inserts_tabs_in_text_areas() {
     });
 }
 
-#[test]
-#[ignore]
 fn native_control_chunks_stop_when_the_recipient_moves_or_becomes_secure() {
     run_live_test(|| {
         for (flag, foreground) in [
@@ -6084,8 +6024,6 @@ fn native_control_chunks_stop_when_the_recipient_moves_or_becomes_secure() {
     });
 }
 
-#[test]
-#[ignore]
 fn native_modality_errors_depth_and_ordinary_role_reads_have_distinct_outcomes() {
     run_live_test(|| {
         for (flag, expected) in [
@@ -6174,8 +6112,6 @@ fn native_modality_errors_depth_and_ordinary_role_reads_have_distinct_outcomes()
     });
 }
 
-#[test]
-#[ignore]
 fn native_slow_ancestry_and_foreground_delivery_share_one_action_deadline() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -6336,8 +6272,6 @@ fn ordinary_native_actions(
     live.assert_frontmost_and_pointer_unchanged();
 }
 
-#[test]
-#[ignore]
 fn ordinary_fixture_name_and_textedit_body_type_key_and_paste_without_approval() {
     run_live_test(|| {
         {
@@ -6386,8 +6320,6 @@ fn ordinary_fixture_name_and_textedit_body_type_key_and_paste_without_approval()
     });
 }
 
-#[test]
-#[ignore]
 fn native_type_control_validation_and_foreground_300_character_receipts() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -6508,8 +6440,6 @@ fn native_type_control_validation_and_foreground_300_character_receipts() {
     });
 }
 
-#[test]
-#[ignore]
 fn textedit_300_characters_roundtrip_through_the_real_hid_splitter() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -6543,8 +6473,6 @@ fn textedit_300_characters_roundtrip_through_the_real_hid_splitter() {
     });
 }
 
-#[test]
-#[ignore]
 fn real_foreign_pid_keyboard_recipients_require_foreground() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -6657,8 +6585,6 @@ fn native_resolve(
     Ok(app)
 }
 
-#[test]
-#[ignore]
 fn real_app_identities_keep_exact_ids_instances_and_declared_folder_names() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -6790,8 +6716,6 @@ fn real_app_identities_keep_exact_ids_instances_and_declared_folder_names() {
     });
 }
 
-#[test]
-#[ignore]
 fn native_runtime_preview_and_provider_schema_use_canonical_ids_before_approval() {
     run_live_test(|| {
         let Some(mut live) = Live::start() else {
@@ -6853,8 +6777,6 @@ fn native_runtime_preview_and_provider_schema_use_canonical_ids_before_approval(
     });
 }
 
-#[test]
-#[ignore]
 fn canvas_colour_is_bounded_and_its_middle_receives_the_click() {
     run_live_test(|| {
         let Some((live, log, obs)) = background_fixture() else {

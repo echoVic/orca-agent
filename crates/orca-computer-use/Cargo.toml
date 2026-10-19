@@ -33,8 +33,15 @@ libc = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_Security"] }
 
 [dev-dependencies]
+clap = { workspace = true }
+libtest-mimic = "0.8.2"
 tempfile = { workspace = true }
 orca-computer-use = { path = ".", features = ["test-utils"] }
+
+[[test]]
+name = "live_macos"
+path = "tests/live_macos/main.rs"
+harness = false
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSPasteboard", "NSPasteboardItem"] }
