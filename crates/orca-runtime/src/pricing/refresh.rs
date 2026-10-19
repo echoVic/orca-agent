@@ -11,6 +11,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use flate2::read::GzDecoder;
 use orca_core::model::canonical_model_name;
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::book::{self, CACHE_VERSION, PricingCache};
 use super::rates::Rates;
@@ -37,19 +38,7 @@ struct ModelsDevApi {
 #[derive(Deserialize)]
 struct ModelsDevProvider {
     #[serde(default)]
-    models: BTreeMap<String, ModelsDevModel>,
-}
-
-#[derive(Deserialize)]
-struct ModelsDevModel {
-    cost: Option<ModelsDevCost>,
-}
-
-#[derive(Deserialize)]
-struct ModelsDevCost {
-    input: Option<f64>,
-    output: Option<f64>,
-    cache_read: Option<f64>,
+    models: BTreeMap<String, Value>,
 }
 
 /// DeepSeek's off-peak prices in a models.dev `api.json` body, by canonical
@@ -63,12 +52,14 @@ pub fn parse_models_dev(body: &[u8]) -> Result<BTreeMap<String, Rates>, String> 
         .ok_or_else(|| "models.dev lists no deepseek provider".to_string())?;
     let mut prices = BTreeMap::new();
     for (id, model) in provider.models {
-        let Some(ModelsDevCost {
-            input: Some(input),
-            output: Some(output),
-            cache_read: Some(cache_read),
-        }) = model.cost
-        else {
+        let Some(cost) = model.get("cost") else {
+            continue;
+        };
+        let (Some(input), Some(cache_read), Some(output)) = (
+            cost.get("input").and_then(Value::as_f64),
+            cost.get("cache_read").and_then(Value::as_f64),
+            cost.get("output").and_then(Value::as_f64),
+        ) else {
             continue;
         };
         let rates = Rates {
@@ -369,6 +360,29 @@ mod tests {
         }}}"#;
         let prices = parse_models_dev(body.as_bytes()).unwrap();
         assert_eq!(prices.get(FLASH_MODEL), Some(&FLASH_RATES));
+    }
+
+    #[test]
+    fn parse_skips_malformed_entries_without_losing_well_formed_models() {
+        let body = r#"{"deepseek": {"models": {
+          "deepseek-flash": {"cost": {"input": 0.15, "cache_read": 0.003, "output": 0.6}},
+          "bad-string-input": {"cost": {"input": "0.15", "cache_read": 0.003, "output": 0.6}},
+          "bad-null-cost": {"cost": null},
+          "bad-object-input": {"cost": {"input": {"tier": 1}, "cache_read": 0.003, "output": 0.6}},
+          "bad-non-object": "not an object"
+        }}}"#;
+        let prices = parse_models_dev(body.as_bytes()).unwrap();
+        assert_eq!(
+            prices,
+            BTreeMap::from([(FLASH_MODEL.to_string(), FLASH_RATES)])
+        );
+
+        let mut malformed_only: serde_json::Value = serde_json::from_str(body).unwrap();
+        malformed_only["deepseek"]["models"]
+            .as_object_mut()
+            .unwrap()
+            .remove(FLASH_MODEL);
+        assert!(parse_models_dev(&serde_json::to_vec(&malformed_only).unwrap()).is_err());
     }
 
     #[test]
