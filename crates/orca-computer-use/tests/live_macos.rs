@@ -3830,7 +3830,13 @@ impl SafariPage {
 
     fn document_path(window: &NativeAxElement) -> Option<PathBuf> {
         use objc2_core_foundation::{CFString, CFURL};
-        let document = native_ax_optional_value(window, "AXDocument");
+        // Safari 26 advertises AXDocument on its window but returns NoValue.
+        // The page's AXURL remains readable even after document.title changes.
+        let document = native_ax_find(window, |node| {
+            native_ax_string(node, "AXRole").as_deref() == Some("AXWebArea")
+        })
+        .and_then(|page| native_ax_optional_value(&page, "AXURL"))
+        .or_else(|| native_ax_optional_value(window, "AXDocument"));
         let path = document.and_then(|value| {
             let url = value.downcast_ref::<CFURL>().map(|url| url.to_file_path());
             url.unwrap_or_else(|| {
@@ -3843,7 +3849,6 @@ impl SafariPage {
 
     fn is_page(&self, window: &NativeAxElement) -> bool {
         Self::document_path(window).as_ref() == Some(&self.file)
-            || native_ax_string(window, "AXTitle").as_deref() == Some(self.title.as_str())
     }
 
     fn window(&self) -> Option<NativeAxElement> {
@@ -4039,7 +4044,7 @@ document.title = `clicked ${{event.clientX}},${{event.clientY}}`;
         assert_eq!(
             SafariPage::document_path(&window).as_ref(),
             Some(&safari.file),
-            "native file URL must identify our tab after its title changes"
+            "native file URL must identify our test-owned tab"
         );
         safari.retain_tab();
         assert!(
@@ -4159,6 +4164,11 @@ document.title = `clicked ${{event.clientX}},${{event.clientY}}`;
             );
             thread::sleep(Duration::from_millis(50));
         }
+        assert_eq!(
+            SafariPage::document_path(&window).as_ref(),
+            Some(&safari.file),
+            "native file URL must identify our tab after its title changes"
+        );
         live.assert_frontmost_and_pointer_unchanged();
         drop(safari);
     });
