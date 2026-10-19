@@ -2413,3 +2413,4 @@ git commit -m "docs: explain peak-hour cost estimates and the pricing settings" 
 - Batch E7：读取缓存时传入当前时间并忽略超前一天以上的抓取时间，新鲜度限定为非负且不足 24 小时；规格记录 release 自定义 target-dir 的联网保护限制。
 
 - Batch F1：可信项目层导致合并配置解析失败时重试用户层，成功则告警并忽略项目配置，保留用户预算和价格覆盖；用户层也无效时仍告警并使用默认配置。
+- Batch F2：保留 `build_run_config` 的价格覆盖安装，并在 `InteractiveSession` 构造时安装同一用户配置映射，兼顾 detached worker 和直接传入 `RunConfig` 的库调用。

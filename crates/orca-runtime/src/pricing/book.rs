@@ -169,6 +169,8 @@ fn global_user_overrides() -> &'static RwLock<Arc<BTreeMap<String, Rates>>> {
     OVERRIDES.get_or_init(|| RwLock::new(Arc::default()))
 }
 
+/// Replace the user-config map, installed by both build_run_config (including
+/// detached workers) and InteractiveSession construction (direct RunConfig callers).
 pub(crate) fn set_user_overrides(overrides: BTreeMap<String, Rates>) {
     *global_user_overrides()
         .write()

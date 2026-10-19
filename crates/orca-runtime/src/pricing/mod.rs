@@ -33,8 +33,8 @@ pub fn rates_from_overrides(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    // Run-config loading replaces process-wide overrides; isolate these tests
-    // from configs loaded concurrently by the rest of the lib-test suite.
+    // Run-config loading and session construction replace process-wide overrides;
+    // isolate these tests from configs loaded concurrently by the lib-test suite.
     pub(crate) fn with_isolated_user_overrides(test: impl FnOnce()) {
         let thread = std::thread::current();
         let name = thread.name().expect("test thread name");

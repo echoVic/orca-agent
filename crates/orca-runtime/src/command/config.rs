@@ -46,6 +46,9 @@ impl RunConfigRequest {
     }
 }
 
+/// Load the user config and install its process-wide price overrides, including
+/// for detached workers. InteractiveSession installs the same map for callers
+/// that supply a RunConfig directly.
 pub fn build_run_config(request: RunConfigRequest) -> Result<RunConfig, String> {
     let file = load_effective_config(&request.config_cwd, request.overrides.clone())?;
     let config = assemble_run_config(request, file)?;

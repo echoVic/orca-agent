@@ -240,6 +240,11 @@ impl InteractiveSession {
         runtime_thread_id: Option<String>,
     ) -> io::Result<Self> {
         crate::pricing::refresh::ensure_background_refresh(config.pricing_refresh);
+        // Like build_run_config (also used by detached workers), install the
+        // user-config map for callers that supply a RunConfig directly.
+        crate::pricing::book::set_user_overrides(crate::pricing::rates_from_overrides(
+            &config.model.price_overrides(),
+        ));
         let cwd = config
             .cwd
             .clone()
@@ -962,6 +967,45 @@ mod tests {
         let _guard = history::lock_test_env();
         let home = history::isolated_test_orca_home_subdir("with-orca-home");
         history::with_test_orca_home(&home, f)
+    }
+
+    #[test]
+    fn session_from_handmade_run_config_installs_user_price_overrides() {
+        crate::pricing::tests::with_isolated_user_overrides(|| {
+            use orca_core::model::{ModelDefinition, ModelPriceOverride, UsdPerMillion};
+
+            let cwd = tempdir().unwrap();
+            let model = "handmade-session-user-price-probe";
+            let mut cfg = config(cwd.path().into(), HistoryMode::Disabled);
+            cfg.model = ModelSelection::parse_with_models(
+                Some(model.into()),
+                std::collections::BTreeMap::from([(
+                    model.into(),
+                    ModelDefinition {
+                        pricing: Some(ModelPriceOverride {
+                            input_cache_miss: UsdPerMillion::new(1.0).unwrap(),
+                            input_cache_hit: UsdPerMillion::new(0.5).unwrap(),
+                            output: UsdPerMillion::new(2.0).unwrap(),
+                        }),
+                        ..ModelDefinition::default()
+                    },
+                )]),
+            )
+            .unwrap();
+            assert!(!crate::pricing::book::user_overrides().contains_key(model));
+
+            let _session = InteractiveSession::new_with_preloaded(&cfg, "price probe", None)
+                .expect("session from a hand-made RunConfig");
+
+            assert_eq!(
+                crate::pricing::book::user_overrides().get(model),
+                Some(&crate::pricing::rates::Rates {
+                    input_cache_miss: 1.0,
+                    input_cache_hit: 0.5,
+                    output: 2.0,
+                })
+            );
+        });
     }
 
     #[test]
