@@ -2746,7 +2746,13 @@ fn retry_stale_ax_read<E, T>(
     use objc2_application_services::AXError;
     for attempt in 0..5 {
         let result = read(&element);
-        if result.0 != AXError::InvalidUIElement || attempt == 4 {
+        // A busy, newly launched fixture can temporarily return CannotComplete
+        // even with the messaging timeout set. Bound both transient failures.
+        if !matches!(
+            result.0,
+            AXError::InvalidUIElement | AXError::CannotComplete
+        ) || attempt == 4
+        {
             return result;
         }
         thread::sleep(Duration::from_millis(100));
@@ -2757,47 +2763,58 @@ fn retry_stale_ax_read<E, T>(
 
 fn stale_ax_reads_resolve_again_before_retrying() {
     use objc2_application_services::AXError;
-    let mut finds = 0;
-    let mut reads = vec![];
-    let started = Instant::now();
-    let result = retry_stale_ax_read(
-        0,
-        || {
-            finds += 1;
-            finds
-        },
-        |element| {
-            reads.push(*element);
-            if *element == 0 {
-                (AXError::InvalidUIElement, "stale")
-            } else {
-                (AXError::Success, "fresh")
-            }
-        },
-    );
-    assert_eq!(result, (AXError::Success, "fresh"));
-    assert_eq!(finds, 1);
-    assert_eq!(reads, [0, 1]);
-    assert!(started.elapsed() >= Duration::from_millis(100));
+    for (errors, expected_reads) in [
+        (vec![AXError::InvalidUIElement], vec![0, 1]),
+        (vec![AXError::CannotComplete], vec![0, 1]),
+        (
+            vec![AXError::CannotComplete, AXError::InvalidUIElement],
+            vec![0, 1, 2],
+        ),
+    ] {
+        let mut finds = 0;
+        let mut reads = vec![];
+        let started = Instant::now();
+        let result = retry_stale_ax_read(
+            0,
+            || {
+                finds += 1;
+                finds
+            },
+            |element| {
+                reads.push(*element);
+                if let Some(&error) = errors.get(*element) {
+                    (error, "transient")
+                } else {
+                    (AXError::Success, "fresh")
+                }
+            },
+        );
+        assert_eq!(result, (AXError::Success, "fresh"));
+        assert_eq!(finds, errors.len());
+        assert_eq!(reads, expected_reads);
+        assert!(started.elapsed() >= Duration::from_millis(100 * errors.len() as u64));
+    }
 }
 
 fn stale_ax_reads_stop_after_five_attempts() {
     use objc2_application_services::AXError;
-    let mut finds = 0;
-    let mut reads = 0;
-    let started = Instant::now();
-    let result = retry_stale_ax_read(
-        (),
-        || finds += 1,
-        |_| {
-            reads += 1;
-            (AXError::InvalidUIElement, "stale")
-        },
-    );
-    assert_eq!(result, (AXError::InvalidUIElement, "stale"));
-    assert_eq!(finds, 4);
-    assert_eq!(reads, 5);
-    assert!(started.elapsed() >= Duration::from_millis(400));
+    for error in [AXError::InvalidUIElement, AXError::CannotComplete] {
+        let mut finds = 0;
+        let mut reads = 0;
+        let started = Instant::now();
+        let result = retry_stale_ax_read(
+            (),
+            || finds += 1,
+            |_| {
+                reads += 1;
+                (error, "transient")
+            },
+        );
+        assert_eq!(result, (error, "transient"));
+        assert_eq!(finds, 4);
+        assert_eq!(reads, 5);
+        assert!(started.elapsed() >= Duration::from_millis(400));
+    }
 }
 
 fn successful_and_other_failed_ax_reads_are_not_retried() {
@@ -2805,14 +2822,13 @@ fn successful_and_other_failed_ax_reads_are_not_retried() {
     for error in [
         AXError::Success,
         AXError::Failure,
-        AXError::CannotComplete,
         AXError::NoValue,
         AXError::AttributeUnsupported,
     ] {
         let mut reads = 0;
         let result = retry_stale_ax_read(
             (),
-            || panic!("a non-stale read must not resolve again"),
+            || panic!("a non-transient read must not resolve again"),
             |_| {
                 reads += 1;
                 (error, "value")
