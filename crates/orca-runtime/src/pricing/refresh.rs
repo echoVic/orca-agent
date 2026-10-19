@@ -7,13 +7,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use flate2::read::GzDecoder;
 use orca_core::model::canonical_model_name;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::book::{self, CACHE_VERSION, PricingCache};
+use super::book::{self, CACHE_VERSION, CachedRates, PricingCache};
 use super::rates::Rates;
 
 pub const DEFAULT_URL: &str = "https://models.dev/api.json";
@@ -44,13 +44,17 @@ struct ModelsDevProvider {
 /// DeepSeek's off-peak prices in a models.dev `api.json` body, by canonical
 /// model name. Incomplete and implausible entries are skipped; a canonical
 /// entry wins over an alias of it.
-pub fn parse_models_dev(body: &[u8]) -> Result<BTreeMap<String, Rates>, String> {
+pub fn parse_models_dev(
+    body: &[u8],
+    fetched_at: DateTime<Utc>,
+) -> Result<BTreeMap<String, CachedRates>, String> {
     let api: ModelsDevApi = serde_json::from_slice(body)
         .map_err(|error| format!("invalid models.dev JSON: {error}"))?;
     let provider = api
         .deepseek
         .ok_or_else(|| "models.dev lists no deepseek provider".to_string())?;
     let mut prices = BTreeMap::new();
+    let fetch_date = fetched_at.date_naive();
     for (id, model) in provider.models {
         let Some(cost) = model.get("cost") else {
             continue;
@@ -72,7 +76,18 @@ pub fn parse_models_dev(body: &[u8]) -> Result<BTreeMap<String, Rates>, String> 
             continue;
         }
         if id == canonical || !prices.contains_key(canonical) {
-            prices.insert(canonical.to_string(), rates);
+            let updated = model
+                .get("last_updated")
+                .and_then(Value::as_str)
+                .filter(|text| text.len() == 10 && text.is_ascii())
+                .and_then(|text| {
+                    NaiveDate::parse_from_str(text, "%Y-%m-%d")
+                        .ok()
+                        .filter(|date| date.to_string() == text)
+                })
+                .filter(|date| *date <= fetch_date)
+                .unwrap_or(fetch_date);
+            prices.insert(canonical.to_string(), CachedRates { rates, updated });
         }
     }
     if prices.is_empty() {
@@ -147,7 +162,7 @@ fn try_fetch(
     } else {
         raw
     };
-    let models = parse_models_dev(&body)?;
+    let models = parse_models_dev(&body, now)?;
     Ok(RefreshOutcome::Updated(PricingCache {
         version: CACHE_VERSION,
         source: url.to_string(),
@@ -336,15 +351,58 @@ mod tests {
             source: DEFAULT_URL.to_string(),
             fetched_at: fetched_at.parse().unwrap(),
             etag: etag.map(str::to_string),
-            models: BTreeMap::from([(FLASH_MODEL.to_string(), FLASH_RATES)]),
+            models: BTreeMap::from([(
+                FLASH_MODEL.to_string(),
+                CachedRates {
+                    rates: FLASH_RATES,
+                    updated: fetched_at.parse::<DateTime<Utc>>().unwrap().date_naive(),
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn fetch_records_content_dates_and_lenient_fallbacks() {
+        for (last_updated, expected) in [
+            (Some(serde_json::json!("2026-10-18")), "2026-10-18"),
+            (None, "2026-10-20"),
+            (Some(serde_json::json!("not a date")), "2026-10-20"),
+            (Some(serde_json::json!("2026-02-30")), "2026-10-20"),
+            (Some(serde_json::json!("2026-1-2")), "2026-10-20"),
+            (Some(serde_json::json!("-0001-01-01")), "2026-10-20"),
+            (Some(serde_json::json!(123)), "2026-10-20"),
+            (Some(serde_json::json!("2026-10-21")), "2026-10-20"),
+        ] {
+            let mut body: Value = serde_json::from_str(MODELS_DEV).unwrap();
+            if let Some(date) = last_updated {
+                body["deepseek"]["models"][FLASH_MODEL]["last_updated"] = date;
+            }
+            let (url, server) = serve(vec![response(
+                "200 OK",
+                &[],
+                &serde_json::to_vec(&body).unwrap(),
+            )]);
+            let outcome = fetch(&url, None, now());
+            server.join().unwrap();
+            let RefreshOutcome::Updated(cache) = outcome else {
+                panic!("expected updated prices, got {outcome:?}");
+            };
+            let value = serde_json::to_value(cache).unwrap();
+            assert_eq!(value["models"][FLASH_MODEL]["updated"], expected);
         }
     }
 
     #[test]
     fn parse_keeps_canonical_deepseek_prices() {
-        let prices = parse_models_dev(MODELS_DEV.as_bytes()).unwrap();
-        assert_eq!(prices.get(FLASH_MODEL), Some(&FLASH_RATES));
-        assert_eq!(prices.get(PRO_MODEL), Some(&PRO_RATES));
+        let prices = parse_models_dev(MODELS_DEV.as_bytes(), now()).unwrap();
+        assert_eq!(
+            prices.get(FLASH_MODEL).map(|entry| entry.rates),
+            Some(FLASH_RATES)
+        );
+        assert_eq!(
+            prices.get(PRO_MODEL).map(|entry| entry.rates),
+            Some(PRO_RATES)
+        );
         assert_eq!(
             prices.len(),
             2,
@@ -358,8 +416,11 @@ mod tests {
           "deepseek-v4-flash": {"cost": {"input": 0.2, "output": 0.8, "cache_read": 0.004}},
           "deepseek-flash": {"cost": {"input": 0.15, "output": 0.6, "cache_read": 0.003}}
         }}}"#;
-        let prices = parse_models_dev(body.as_bytes()).unwrap();
-        assert_eq!(prices.get(FLASH_MODEL), Some(&FLASH_RATES));
+        let prices = parse_models_dev(body.as_bytes(), now()).unwrap();
+        assert_eq!(
+            prices.get(FLASH_MODEL).map(|entry| entry.rates),
+            Some(FLASH_RATES)
+        );
     }
 
     #[test]
@@ -371,10 +432,16 @@ mod tests {
           "bad-object-input": {"cost": {"input": {"tier": 1}, "cache_read": 0.003, "output": 0.6}},
           "bad-non-object": "not an object"
         }}}"#;
-        let prices = parse_models_dev(body.as_bytes()).unwrap();
+        let prices = parse_models_dev(body.as_bytes(), now()).unwrap();
         assert_eq!(
             prices,
-            BTreeMap::from([(FLASH_MODEL.to_string(), FLASH_RATES)])
+            BTreeMap::from([(
+                FLASH_MODEL.to_string(),
+                CachedRates {
+                    rates: FLASH_RATES,
+                    updated: now().date_naive()
+                }
+            )])
         );
 
         let mut malformed_only: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -382,7 +449,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove(FLASH_MODEL);
-        assert!(parse_models_dev(&serde_json::to_vec(&malformed_only).unwrap()).is_err());
+        assert!(parse_models_dev(&serde_json::to_vec(&malformed_only).unwrap(), now()).is_err());
     }
 
     #[test]
@@ -392,12 +459,12 @@ mod tests {
           "deepseek-v4-pro": {"cost": {"input": 0.66, "output": 1.98}},
           "deepseek-v5-flash": {"cost": {"input": 0.3, "output": 1.2, "cache_read": 0.006}}
         }}}"#;
-        let prices = parse_models_dev(body.as_bytes()).unwrap();
+        let prices = parse_models_dev(body.as_bytes(), now()).unwrap();
         assert_eq!(prices.keys().collect::<Vec<_>>(), ["deepseek-v5-flash"]);
 
-        assert!(parse_models_dev(br#"{"openai": {"models": {}}}"#).is_err());
-        assert!(parse_models_dev(br#"{"deepseek": {"models": {}}}"#).is_err());
-        assert!(parse_models_dev(b"not json").is_err());
+        assert!(parse_models_dev(br#"{"openai": {"models": {}}}"#, now()).is_err());
+        assert!(parse_models_dev(br#"{"deepseek": {"models": {}}}"#, now()).is_err());
+        assert!(parse_models_dev(b"not json", now()).is_err());
     }
 
     #[test]
@@ -415,7 +482,10 @@ mod tests {
         assert_eq!(cache.source, url);
         assert_eq!(cache.fetched_at, now());
         assert_eq!(cache.etag.as_deref(), Some("W/\"v1\""));
-        assert_eq!(cache.models.get(FLASH_MODEL), Some(&FLASH_RATES));
+        assert_eq!(
+            cache.models.get(FLASH_MODEL).map(|entry| entry.rates),
+            Some(FLASH_RATES)
+        );
         let heads = server.join().unwrap();
         assert!(heads[0].contains("accept-encoding: gzip"), "{heads:?}");
         assert!(heads[0].contains("user-agent: orca-pricing"), "{heads:?}");

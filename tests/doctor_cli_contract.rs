@@ -222,7 +222,7 @@ fn doctor_reports_which_prices_estimates_use() {
 
     fs::write(
         home.join("pricing-cache.json"),
-        r#"{"version":1,"source":"https://models.dev/api.json","fetched_at":"2026-10-20T00:00:00Z","models":{"deepseek-flash":{"input_cache_miss":0.2,"input_cache_hit":0.004,"output":0.8}}}"#,
+        r#"{"version":2,"source":"https://models.dev/api.json","fetched_at":"2026-10-20T00:00:00Z","models":{"deepseek-flash":{"input_cache_miss":0.2,"input_cache_hit":0.004,"output":0.8,"updated":"2026-10-20"}}}"#,
     )
     .unwrap();
     fs::write(home.join("config.toml"), "[pricing]\nrefresh = false\n").unwrap();

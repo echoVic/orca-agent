@@ -14,12 +14,20 @@ use serde::{Deserialize, Serialize};
 use super::rates::{self, Rates};
 
 pub const CACHE_FILE: &str = "pricing-cache.json";
-pub const CACHE_VERSION: u32 = 1;
+pub const CACHE_VERSION: u32 = 2;
 /// The highest price accepted from any source, in US dollars per million tokens.
 const MAX_PRICE: f64 = 100.0;
 /// How far a fetched price may move from the built-in one before it is taken
 /// for a unit error (per token, per thousand tokens).
 const MAX_DRIFT: f64 = 10.0;
+
+/// A model's off-peak prices and the date its source content was updated.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CachedRates {
+    #[serde(flatten)]
+    pub rates: Rates,
+    pub updated: NaiveDate,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PricingCache {
@@ -28,7 +36,7 @@ pub struct PricingCache {
     pub fetched_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
-    pub models: BTreeMap<String, Rates>,
+    pub models: BTreeMap<String, CachedRates>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -92,9 +100,9 @@ fn within_drift(reference: f64, price: f64) -> bool {
     price >= reference / MAX_DRIFT && price <= reference * MAX_DRIFT
 }
 
-/// The built-in table overlaid by `cache`: a cache fetched on or after the
-/// built-in date wins for every model it lists; an older one only adds models
-/// the built-in table lacks.
+/// The built-in table overlaid by cached content updated on or after the
+/// built-in date. Older content only adds models the built-in table lacks;
+/// fetching unchanged content again does not change its precedence.
 pub fn merge(cache: Option<&PricingCache>) -> PriceBook {
     let mut models: BTreeMap<String, Rates> = rates::builtin_rates()
         .into_iter()
@@ -107,13 +115,14 @@ pub fn merge(cache: Option<&PricingCache>) -> PriceBook {
             source: PriceSource::Builtin { as_of },
         };
     };
-    let cache_is_current = cache.fetched_at.date_naive() >= as_of;
-    for (model, rates) in &cache.models {
-        if cache_is_current || !models.contains_key(model) {
-            models.insert(model.clone(), *rates);
+    let mut uses_cache = false;
+    for (model, entry) in &cache.models {
+        if entry.updated >= as_of || !models.contains_key(model) {
+            models.insert(model.clone(), entry.rates);
+            uses_cache = true;
         }
     }
-    let source = if cache_is_current {
+    let source = if uses_cache {
         PriceSource::Fetched {
             source: cache.source.clone(),
             fetched_at: cache.fetched_at,
@@ -138,7 +147,7 @@ pub fn read_cache(path: &Path) -> Option<PricingCache> {
     }
     cache
         .models
-        .retain(|model, rates| rates_are_plausible(model, *rates));
+        .retain(|model, entry| rates_are_plausible(model, entry.rates));
     (!cache.models.is_empty()).then_some(cache)
 }
 
@@ -218,10 +227,73 @@ mod tests {
             fetched_at: fetched_at.parse().unwrap(),
             etag: Some("W/\"v1\"".to_string()),
             models: BTreeMap::from([
-                (FLASH_MODEL.to_string(), FETCHED_FLASH),
-                ("deepseek-v5-flash".to_string(), NEW_MODEL),
+                (
+                    FLASH_MODEL.to_string(),
+                    CachedRates {
+                        rates: FETCHED_FLASH,
+                        updated: fetched_at.parse::<DateTime<Utc>>().unwrap().date_naive(),
+                    },
+                ),
+                (
+                    "deepseek-v5-flash".to_string(),
+                    CachedRates {
+                        rates: NEW_MODEL,
+                        updated: fetched_at.parse::<DateTime<Utc>>().unwrap().date_naive(),
+                    },
+                ),
             ]),
         }
+    }
+
+    fn content_dated_cache(updated: &str, add_model: bool) -> PricingCache {
+        let mut value = serde_json::json!({
+            "version": CACHE_VERSION,
+            "source": "https://models.dev/api.json",
+            "fetched_at": "2026-10-20T08:00:00Z",
+            "models": {"deepseek-flash": {
+                "input_cache_miss": 0.2, "input_cache_hit": 0.004, "output": 0.8,
+                "updated": updated
+            }}
+        });
+        if add_model {
+            value["models"]["deepseek-v5-flash"] = serde_json::json!({
+                "input_cache_miss": 0.5, "input_cache_hit": 0.01, "output": 2.0,
+                "updated": updated
+            });
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn recent_fetch_of_old_content_keeps_newer_builtin_prices() {
+        let book = merge(Some(&content_dated_cache("2026-10-18", false)));
+        assert_eq!(book.rates_for(FLASH_MODEL), FLASH_RATES);
+        assert!(matches!(book.source, PriceSource::Builtin { .. }));
+    }
+
+    #[test]
+    fn content_updated_on_or_after_builtin_date_wins() {
+        for updated in ["2026-10-19", "2026-10-20"] {
+            let book = merge(Some(&content_dated_cache(updated, false)));
+            assert_eq!(book.rates_for(FLASH_MODEL), FETCHED_FLASH);
+            assert!(matches!(book.source, PriceSource::Fetched { .. }));
+        }
+    }
+
+    #[test]
+    fn old_content_adding_a_model_counts_as_fetched_prices() {
+        let book = merge(Some(&content_dated_cache("2026-10-18", true)));
+        assert_eq!(book.rates_for(FLASH_MODEL), FLASH_RATES);
+        assert_eq!(book.rates_for("deepseek-v5-flash"), NEW_MODEL);
+        assert!(matches!(book.source, PriceSource::Fetched { .. }));
+    }
+
+    #[test]
+    fn version_one_cache_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CACHE_FILE);
+        std::fs::write(&path, r#"{"version":1,"source":"https://models.dev/api.json","fetched_at":"2026-10-20T08:00:00Z","models":{"deepseek-flash":{"input_cache_miss":0.2,"input_cache_hit":0.004,"output":0.8}}}"#).unwrap();
+        assert!(read_cache(&path).is_none());
     }
 
     #[test]
@@ -251,7 +323,7 @@ mod tests {
         let book = merge(Some(&cache("2026-09-01T08:00:00Z")));
         assert_eq!(book.rates_for(FLASH_MODEL), FLASH_RATES);
         assert_eq!(book.rates_for("deepseek-v5-flash"), NEW_MODEL);
-        assert!(matches!(book.source, PriceSource::Builtin { .. }));
+        assert!(matches!(book.source, PriceSource::Fetched { .. }));
     }
 
     #[test]
@@ -313,9 +385,12 @@ mod tests {
         let mut implausible = cache("2026-10-20T08:00:00Z");
         implausible.models = BTreeMap::from([(
             FLASH_MODEL.to_string(),
-            Rates {
-                output: 0.6e-6,
-                ..FLASH_RATES
+            CachedRates {
+                rates: Rates {
+                    output: 0.6e-6,
+                    ..FLASH_RATES
+                },
+                updated: rates::builtin_as_of(),
             },
         )]);
         std::fs::write(&path, serde_json::to_vec(&implausible).unwrap()).unwrap();
@@ -324,14 +399,20 @@ mod tests {
         let mut partly = cache("2026-10-20T08:00:00Z");
         partly.models.insert(
             PRO_MODEL.to_string(),
-            Rates {
-                input_cache_miss: 660.0,
-                ..PRO_RATES
+            CachedRates {
+                rates: Rates {
+                    input_cache_miss: 660.0,
+                    ..PRO_RATES
+                },
+                updated: rates::builtin_as_of(),
             },
         );
         std::fs::write(&path, serde_json::to_vec(&partly).unwrap()).unwrap();
         let read = read_cache(&path).expect("plausible entries survive");
         assert!(!read.models.contains_key(PRO_MODEL));
-        assert_eq!(read.models.get(FLASH_MODEL), Some(&FETCHED_FLASH));
+        assert_eq!(
+            read.models.get(FLASH_MODEL).map(|entry| entry.rates),
+            Some(FETCHED_FLASH)
+        );
     }
 }

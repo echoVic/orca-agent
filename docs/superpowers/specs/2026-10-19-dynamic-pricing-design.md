@@ -56,13 +56,13 @@
 - 总超时 15 秒。解压后的内容超过 32 MiB 就放弃。
 - 工作区的 reqwest 没开 `gzip` feature，也不为这一个请求打开（打开会影响所有客户端）。这里自己用 `flate2` 解压；`flate2` 已经在依赖树里。
 
-**解析：** 只读取 `deepseek.models.<id>.cost` 中的三个字段，其余字段一律忽略：
+**解析：** 读取 `deepseek.models.<id>.cost` 中的三个字段，以及模型的 `last_updated`：
 
 - `input` → 输入未命中价
 - `cache_read` → 输入命中价
 - `output` → 输出价
 
-三个数都当作空闲价使用。模型 id 先经过 `canonical_model_name` 归一；归一后出现重复时，以 canonical id 那条为准。
+`last_updated` 按 `YYYY-MM-DD` 解析；缺失、格式错误或晚于抓取日期时，使用抓取日期（UTC）。三个价格都当作空闲价使用。模型 id 先经过 `canonical_model_name` 归一；归一后出现重复时，以 canonical id 那条为准。
 
 **校验：** 按模型逐个检查，任何一项不通过就丢弃这个模型。
 
@@ -82,18 +82,18 @@
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "source": "https://models.dev/api.json",
   "fetched_at": "2026-10-19T08:00:00Z",
   "etag": "W/\"657a51e5a18b7553c44cdb8fd04fc5e4\"",
   "models": {
-    "deepseek-flash": { "input_cache_miss": 0.15, "input_cache_hit": 0.003, "output": 0.6 },
-    "deepseek-v4-pro": { "input_cache_miss": 0.66, "input_cache_hit": 0.022, "output": 1.98 }
+    "deepseek-flash": { "input_cache_miss": 0.15, "input_cache_hit": 0.003, "output": 0.6, "updated": "2026-10-18" },
+    "deepseek-v4-pro": { "input_cache_miss": 0.66, "input_cache_hit": 0.022, "output": 1.98, "updated": "2026-08-13" }
   }
 }
 ```
 
-- 只存解析出来的价格，不存 models.dev 的原始文件。
+- 只存解析出来的价格和每个模型的内容日期 `updated`，不存 models.dev 的原始文件。v1 缓存没有内容日期，忽略并重新抓取。
 - 读缓存时重新做一遍 1.2 的校验。文件损坏、版本不认识、或校验不通过，都当作没有缓存。
 - 多个 Orca 进程可能同时刷新。写入是原子的，最后写的那个生效，没有问题。
 
@@ -102,8 +102,8 @@
 进程内有一张全局价格表，第一次计价时懒加载，规则如下：
 
 1. 以内置表为底。
-2. 缓存有效，并且 `fetched_at` 的日期不早于 `BUILTIN_AS_OF`：缓存里的模型逐个覆盖内置表的同名模型；缓存里有、内置表里没有的模型也加进来。这样 DeepSeek 出新型号时，models.dev 一收录就能计价。
-3. 缓存比内置表旧（比如升级了 Orca 但一直离线）：内置表优先，缓存只补充内置表里没有的模型。
+2. 缓存有效时逐个比较模型的 `updated` 和 `BUILTIN_AS_OF`：内容日期不早于内置日期的模型覆盖同名内置模型；更旧的内容保留内置价。缓存里有、内置表里没有的模型始终加入。
+3. 至少一个缓存模型生效（覆盖内置模型或补充新模型）时，来源是 `Fetched`；否则是 `Builtin`。`fetched_at` 只用于刷新时效和 doctor 的抓取时间，不决定价格优先级；304 或重复下载旧内容都不会让旧价格重新覆盖内置价。
 4. 刷新成功后，按同样的规则重建这张表，然后整张替换（`RwLock<Arc<…>>`）。
 
 ### 1.5 什么时候刷新
