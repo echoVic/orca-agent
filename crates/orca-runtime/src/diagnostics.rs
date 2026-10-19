@@ -303,7 +303,8 @@ fn check_model(cwd: &Path, config_is_usable: bool) -> DiagnosticCheck {
 fn check_pricing(cwd: &Path, config_is_usable: bool) -> DiagnosticCheck {
     use crate::pricing::book::{self, PriceSource};
 
-    let cache = book::cache_path().and_then(|path| book::read_cache(&path));
+    let now = chrono::Utc::now();
+    let cache = book::cache_path().and_then(|path| book::read_cache(&path, now));
     let source = match book::merge(cache.as_ref()).source {
         PriceSource::Builtin { as_of } => format!("built-in prices as of {as_of}"),
         PriceSource::Fetched { source, fetched_at } => format!(
@@ -321,7 +322,7 @@ fn check_pricing(cwd: &Path, config_is_usable: bool) -> DiagnosticCheck {
     } else {
         "refresh off"
     };
-    let tier = if crate::pricing::rates::is_peak(chrono::Utc::now()) {
+    let tier = if crate::pricing::rates::is_peak(now) {
         "peak"
     } else {
         "off-peak"

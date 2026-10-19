@@ -222,14 +222,23 @@ fn doctor_reports_which_prices_estimates_use() {
 
     fs::write(
         home.join("pricing-cache.json"),
-        r#"{"version":2,"source":"https://models.dev/api.json","fetched_at":"2026-10-20T00:00:00Z","models":{"deepseek-flash":{"input_cache_miss":0.2,"input_cache_hit":0.004,"output":0.8,"updated":"2026-10-20"}}}"#,
+        serde_json::json!({
+            "version": 2,
+            "source": "https://models.dev/api.json",
+            "fetched_at": "2026-10-19T00:00:00Z",
+            "models": {"deepseek-flash": {
+                "input_cache_miss": 0.2, "input_cache_hit": 0.004, "output": 0.8,
+                "updated": "2026-10-19"
+            }}
+        })
+        .to_string(),
     )
     .unwrap();
     fs::write(home.join("config.toml"), "[pricing]\nrefresh = false\n").unwrap();
     let fetched = pricing(run_doctor(&home, &cwd, &["--format", "json"]));
     let detail = fetched["detail"].as_str().unwrap();
     assert!(
-        detail.starts_with("https://models.dev/api.json prices fetched 2026-10-20T00:00:00Z; refresh off; DeepSeek "),
+        detail.starts_with("https://models.dev/api.json prices fetched 2026-10-19T00:00:00Z; refresh off; DeepSeek "),
         "{detail}"
     );
 }

@@ -64,7 +64,16 @@ fn exec_prices_usage_from_a_current_cache() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
         home.path().join("pricing-cache.json"),
-        r#"{"version":2,"source":"https://models.dev/api.json","fetched_at":"2026-10-20T00:00:00Z","models":{"deepseek-flash":{"input_cache_miss":0.2,"input_cache_hit":0.004,"output":0.8,"updated":"2026-10-20"}}}"#,
+        serde_json::json!({
+            "version": 2,
+            "source": "https://models.dev/api.json",
+            "fetched_at": "2026-10-19T00:00:00Z",
+            "models": {"deepseek-flash": {
+                "input_cache_miss": 0.2, "input_cache_hit": 0.004, "output": 0.8,
+                "updated": "2026-10-19"
+            }}
+        })
+        .to_string(),
     )
     .unwrap();
     let off_peak = (110.0 * 0.2 + 10.0 * 0.004 + 30.0 * 0.8) / 1_000_000.0;

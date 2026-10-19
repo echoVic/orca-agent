@@ -210,7 +210,8 @@ pub fn refresh_url(
     }
     let url = url_override.unwrap_or_else(|| DEFAULT_URL.to_string());
     if cached.is_some_and(|cache| {
-        cache.source == url && now.signed_duration_since(cache.fetched_at) < refresh_after()
+        let age = now.signed_duration_since(cache.fetched_at);
+        cache.source == url && age >= TimeDelta::zero() && age < refresh_after()
     }) {
         return None;
     }
@@ -241,13 +242,14 @@ pub(crate) fn ensure_background_refresh(enabled: bool) {
     let Some(path) = book::cache_path() else {
         return;
     };
-    let cached = book::read_cache(&path);
+    let now = Utc::now();
+    let cached = book::read_cache(&path, now);
     let Some(url) = refresh_url(
         true,
         std::env::var(URL_ENV).ok(),
         crate::update_check::is_dev_build_run(),
         cached.as_ref(),
-        Utc::now(),
+        now,
     ) else {
         return;
     };
@@ -600,9 +602,33 @@ mod tests {
         let heads = server.join().unwrap();
         assert!(!heads[0].contains("if-none-match"), "{heads:?}");
         assert!(matches!(outcome, RefreshOutcome::Updated(_)), "{outcome:?}");
-        let stored = read_cache(&path).unwrap();
+        let stored = read_cache(&path, now()).unwrap();
         assert_eq!(stored.source, url);
         assert_eq!(stored.etag.as_deref(), Some("new-source-etag"));
+    }
+
+    #[test]
+    fn freshness_requires_non_negative_age_less_than_one_day() {
+        for fetched_at in [
+            "2026-10-20T08:00:01Z",
+            "2026-10-21T08:00:00Z",
+            "2026-10-19T08:00:00Z",
+        ] {
+            let cached = cached(fetched_at, None);
+            assert_eq!(
+                refresh_url(true, None, false, Some(&cached), now()),
+                Some(DEFAULT_URL.into()),
+                "{fetched_at}"
+            );
+        }
+        for fetched_at in ["2026-10-20T08:00:00Z", "2026-10-19T08:00:01Z"] {
+            let cached = cached(fetched_at, None);
+            assert_eq!(
+                refresh_url(true, None, false, Some(&cached), now()),
+                None,
+                "{fetched_at}"
+            );
+        }
     }
 
     #[test]
@@ -638,13 +664,13 @@ mod tests {
         ]);
         let first = refresh_and_store(&url, &path, None, now());
         assert!(matches!(first, RefreshOutcome::Updated(_)));
-        let stored = read_cache(&path).expect("stored cache");
+        let stored = read_cache(&path, now()).expect("stored cache");
         assert_eq!(stored.etag.as_deref(), Some("\"v2\""));
 
         let later: DateTime<Utc> = "2026-10-21T09:00:00Z".parse().unwrap();
         let second = refresh_and_store(&url, &path, Some(&stored), later);
         assert!(matches!(second, RefreshOutcome::NotModified(_)));
-        assert_eq!(read_cache(&path).unwrap().fetched_at, later);
+        assert_eq!(read_cache(&path, later).unwrap().fetched_at, later);
         server.join().unwrap();
     }
 

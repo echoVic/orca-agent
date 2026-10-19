@@ -140,11 +140,13 @@ pub fn cache_path() -> Option<PathBuf> {
 }
 
 /// The cache at `path`, without its implausible entries; `None` when it is
-/// missing, unreadable, written by another cache version, or left with nothing.
-pub fn read_cache(path: &Path) -> Option<PricingCache> {
+/// missing, unreadable, from another version, over a day in the future, or empty.
+pub fn read_cache(path: &Path, now: DateTime<Utc>) -> Option<PricingCache> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut cache: PricingCache = serde_json::from_str(&text).ok()?;
-    if cache.version != CACHE_VERSION {
+    if cache.version != CACHE_VERSION
+        || cache.fetched_at.signed_duration_since(now) > chrono::TimeDelta::days(1)
+    {
         return None;
     }
     cache
@@ -184,7 +186,7 @@ pub fn user_overrides() -> Arc<BTreeMap<String, Rates>> {
 fn global() -> &'static RwLock<Arc<PriceBook>> {
     static BOOK: OnceLock<RwLock<Arc<PriceBook>>> = OnceLock::new();
     BOOK.get_or_init(|| {
-        let cache = cache_path().and_then(|path| read_cache(&path));
+        let cache = cache_path().and_then(|path| read_cache(&path, Utc::now()));
         RwLock::new(Arc::new(merge(cache.as_ref())))
     })
 }
@@ -221,6 +223,10 @@ mod tests {
         input_cache_hit: 0.01,
         output: 2.0,
     };
+
+    fn now() -> DateTime<Utc> {
+        "2026-10-20T08:00:00Z".parse().unwrap()
+    }
 
     fn cache(fetched_at: &str) -> PricingCache {
         PricingCache {
@@ -295,7 +301,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CACHE_FILE);
         std::fs::write(&path, r#"{"version":1,"source":"https://models.dev/api.json","fetched_at":"2026-10-20T08:00:00Z","models":{"deepseek-flash":{"input_cache_miss":0.2,"input_cache_hit":0.004,"output":0.8}}}"#).unwrap();
-        assert!(read_cache(&path).is_none());
+        assert!(read_cache(&path, now()).is_none());
     }
 
     #[test]
@@ -408,11 +414,11 @@ mod tests {
                 },
             )]);
             write_cache(&path, &cached).unwrap();
-            assert!(read_cache(&path).is_none(), "accepted {rates:?}");
+            assert!(read_cache(&path, now()).is_none(), "accepted {rates:?}");
         }
         cached.models.get_mut("deepseek-v4-pro-exp").unwrap().rates = NEW_MODEL;
         write_cache(&path, &cached).unwrap();
-        assert_eq!(read_cache(&path), Some(cached));
+        assert_eq!(read_cache(&path, now()), Some(cached));
     }
 
     #[test]
@@ -421,24 +427,38 @@ mod tests {
         let path = dir.path().join("nested").join(CACHE_FILE);
         let written = cache("2026-10-20T08:00:00Z");
         write_cache(&path, &written).unwrap();
-        assert_eq!(read_cache(&path), Some(written));
+        assert_eq!(read_cache(&path, now()), Some(written));
+    }
+
+    #[test]
+    fn cache_more_than_one_day_in_the_future_is_ignored() {
+        let current = now();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CACHE_FILE);
+        let mut future = cache("2026-10-20T08:00:00Z");
+        future.fetched_at = current + chrono::TimeDelta::days(1) + chrono::TimeDelta::seconds(1);
+        write_cache(&path, &future).unwrap();
+        assert!(read_cache(&path, now()).is_none());
+        future.fetched_at = current + chrono::TimeDelta::days(1);
+        write_cache(&path, &future).unwrap();
+        assert_eq!(read_cache(&path, now()), Some(future));
     }
 
     #[test]
     fn read_cache_ignores_corrupt_foreign_and_implausible_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CACHE_FILE);
-        assert_eq!(read_cache(&path), None); // missing
+        assert_eq!(read_cache(&path, now()), None); // missing
 
         let mut text = serde_json::to_string(&cache("2026-10-20T08:00:00Z")).unwrap();
         text.truncate(text.len() / 2);
         std::fs::write(&path, text).unwrap();
-        assert_eq!(read_cache(&path), None); // truncated by a crash
+        assert_eq!(read_cache(&path, now()), None); // truncated by a crash
 
         let mut foreign = cache("2026-10-20T08:00:00Z");
         foreign.version = CACHE_VERSION + 1;
         std::fs::write(&path, serde_json::to_vec(&foreign).unwrap()).unwrap();
-        assert_eq!(read_cache(&path), None); // written by a newer Orca
+        assert_eq!(read_cache(&path, now()), None); // written by a newer Orca
 
         let mut implausible = cache("2026-10-20T08:00:00Z");
         implausible.models = BTreeMap::from([(
@@ -452,7 +472,7 @@ mod tests {
             },
         )]);
         std::fs::write(&path, serde_json::to_vec(&implausible).unwrap()).unwrap();
-        assert_eq!(read_cache(&path), None); // nothing plausible left
+        assert_eq!(read_cache(&path, now()), None); // nothing plausible left
 
         let mut partly = cache("2026-10-20T08:00:00Z");
         partly.models.insert(
@@ -466,7 +486,7 @@ mod tests {
             },
         );
         std::fs::write(&path, serde_json::to_vec(&partly).unwrap()).unwrap();
-        let read = read_cache(&path).expect("plausible entries survive");
+        let read = read_cache(&path, now()).expect("plausible entries survive");
         assert!(!read.models.contains_key(PRO_MODEL));
         assert_eq!(
             read.models.get(FLASH_MODEL).map(|entry| entry.rates),
