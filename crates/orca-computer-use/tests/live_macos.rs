@@ -1,5 +1,12 @@
 #![cfg(target_os = "macos")]
 
+#[path = "support/live_cleanup.rs"]
+mod cleanup;
+use cleanup::{
+    CleanupAction, cleanup_pids, cleanup_with_probes, fixture_launch_conflicts,
+    fixture_started_pids,
+};
+
 // AppKit must deliver runningApplications updates on the actual main thread.
 pub fn run(cli: super::harness::Cli) -> i32 {
     use objc2_core_foundation::{CFRunLoop, kCFRunLoopDefaultMode};
@@ -322,6 +329,7 @@ struct Live {
     pointer: objc2_core_foundation::CGPoint,
     running: HashSet<i32>,
     launched: HashSet<i32>,
+    fixture_logs: Vec<PathBuf>,
     background_state: Option<(i32, objc2_core_foundation::CGPoint)>,
     esc_events: Arc<std::sync::atomic::AtomicUsize>,
     restore_state: bool,
@@ -366,6 +374,7 @@ impl Live {
             pointer,
             running,
             launched: HashSet::new(),
+            fixture_logs: vec![],
             background_state: None,
             esc_events,
             restore_state: false,
@@ -677,10 +686,24 @@ impl Live {
     }
 
     fn launch_fixture_with_flags(&mut self, flags: &[&str]) -> (i32, PathBuf) {
+        self.refresh_fixture_pids()
+            .expect("read private fixture receipts");
+        let conflicts = fixture_launch_conflicts(
+            &bundle_pids("dev.orca.cu-fixture"),
+            &self.launched,
+            process_is_alive,
+        )
+        .expect("probe existing CUFixture processes");
+        assert!(
+            conflicts.is_empty(),
+            "unowned or leftover CUFixture pids {conflicts:?} are still running; refusing ambiguous bundle-id operations; these processes will not be terminated"
+        );
         let log = self
             .directory
             .path()
-            .join(format!("fixture-{}.jsonl", self.launched.len()));
+            .join(format!("fixture-{}.jsonl", self.fixture_logs.len()));
+        // Arm receipt discovery before open, including launch/discovery failures.
+        self.fixture_logs.push(log.clone());
         assert!(
             Command::new("/usr/bin/open")
                 .arg("-n")
@@ -694,31 +717,85 @@ impl Live {
         );
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let pid = std::fs::read_to_string(&log).ok().and_then(|text| {
-                let event: serde_json::Value = serde_json::from_str(text.lines().next()?).ok()?;
-                (event["type"] == "started")
-                    .then(|| event["pid"].as_i64())?
-                    .and_then(|pid| i32::try_from(pid).ok())
-            });
-            if let Some(pid) = pid {
-                // The PID receipt comes from this invocation's private log, so
-                // cleanup remains exact even if app discovery fails afterwards.
-                self.launched.insert(pid);
-                if self.apps().into_iter().any(|app| {
-                    app.pid == Some(pid)
-                        && app
-                            .windows
-                            .iter()
-                            .any(|window| window.title == "Orca CU Fixture")
-                }) && NSWorkspace::sharedWorkspace()
+            let pids = std::fs::read_to_string(&log)
+                .map(|text| fixture_started_pids(&text))
+                .unwrap_or_default();
+            self.launched.extend(pids.iter().copied());
+            if !pids.is_empty() {
+                let apps = self.apps();
+                let frontmost = NSWorkspace::sharedWorkspace()
                     .frontmostApplication()
-                    .is_some_and(|app| app.processIdentifier() == pid)
-                {
+                    .map(|app| app.processIdentifier());
+                if let Some(pid) = pids.into_iter().find(|pid| {
+                    frontmost == Some(*pid)
+                        && apps.iter().any(|app| {
+                            app.pid == Some(*pid)
+                                && app
+                                    .windows
+                                    .iter()
+                                    .any(|window| window.title == "Orca CU Fixture")
+                        })
+                }) {
+                    eprintln!("fixture launch selected pid={pid}, log={}", log.display());
                     return (pid, log);
                 }
             }
             assert!(Instant::now() < deadline, "fixture did not open a window");
             thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn refresh_fixture_pids(&mut self) -> Result<(), String> {
+        for log in &self.fixture_logs {
+            let text = match std::fs::read_to_string(log) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!("read fixture receipts {}: {error}", log.display()));
+                }
+            };
+            for pid in fixture_started_pids(&text) {
+                if self.launched.insert(pid) {
+                    eprintln!(
+                        "fixture late started receipt: pid={pid}, log={}",
+                        log.display()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup_launched_processes(&mut self) {
+        let mut attempted = HashSet::new();
+        // Re-read after stopping processes to collect late receipts from open -n.
+        // Bound the rounds so an unexpected stream of starts cannot hang Drop.
+        for _ in 0..5 {
+            if let Err(error) = self.refresh_fixture_pids() {
+                record_cleanup_failure(error);
+            }
+            let pending: Vec<_> = cleanup_pids(&self.running, &self.launched)
+                .into_iter()
+                .filter(|pid| !attempted.contains(pid))
+                .collect();
+            if pending.is_empty() {
+                return;
+            }
+            for pid in pending {
+                attempted.insert(pid);
+                if let Err(error) = cleanup_owned_pid(pid) {
+                    record_cleanup_failure(format!("cleanup pid={pid}: {error}"));
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if let Err(error) = self.refresh_fixture_pids() {
+            record_cleanup_failure(error);
+        }
+        for pid in cleanup_pids(&self.running, &self.launched) {
+            if !attempted.contains(&pid) {
+                record_cleanup_failure(format!("late fixture pid={pid} exceeded cleanup rounds"));
+            }
         }
     }
 }
@@ -728,18 +805,7 @@ impl Drop for Live {
         if !self.restore_state {
             return;
         }
-        for pid in cleanup_pids(&self.running, &self.launched) {
-            if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
-                app.terminate();
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while !app.isTerminated() && Instant::now() < deadline {
-                    thread::sleep(Duration::from_millis(20));
-                }
-                if !app.isTerminated() {
-                    app.forceTerminate();
-                }
-            }
-        }
+        self.cleanup_launched_processes();
         record_restoration(self.frontmost, self.pointer);
     }
 }
@@ -759,10 +825,95 @@ fn register_launch_pids(
     registered.extend(after.difference(before).copied());
 }
 
-fn cleanup_pids(running: &HashSet<i32>, launched: &HashSet<i32>) -> Vec<i32> {
-    let mut pids: Vec<_> = launched.difference(running).copied().collect();
-    pids.sort_unstable();
-    pids
+fn record_cleanup_failure(message: String) {
+    eprintln!("live cleanup failed: {message}");
+    // Resource failures must fail even if the attempt otherwise saw user input.
+    RESTORATION_FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(message);
+}
+
+fn process_is_alive(pid: i32) -> Result<bool, String> {
+    if pid <= 1 || pid == std::process::id() as i32 {
+        return Err(format!("refusing unsafe cleanup pid={pid}"));
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(format!("probe pid={pid}: {error}")),
+    }
+}
+
+fn wait_for_process_exit(pid: i32, timeout: Duration) -> Result<bool, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !process_is_alive(pid)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn cleanup_owned_pid(pid: i32) -> Result<(), String> {
+    // Only cleanup_pids' attributed candidates reach this function. Never scan
+    // the global app list for extra processes to terminate.
+    let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid);
+    eprintln!(
+        "live cleanup pid={pid}: native_handle={}, isTerminated={:?}",
+        app.is_some(),
+        app.as_ref().map(|app| app.isTerminated())
+    );
+    let outcome = cleanup_with_probes(
+        app.is_some(),
+        || process_is_alive(pid),
+        |action| {
+            match action {
+                CleanupAction::Terminate => {
+                    eprintln!(
+                        "live cleanup pid={pid}: terminate returned {}",
+                        app.as_ref().unwrap().terminate()
+                    );
+                }
+                CleanupAction::ForceTerminate => {
+                    eprintln!(
+                        "live cleanup pid={pid}: forceTerminate returned {}",
+                        app.as_ref().unwrap().forceTerminate()
+                    );
+                }
+                CleanupAction::Sigterm | CleanupAction::Sigkill => {
+                    let signal = if action == CleanupAction::Sigkill {
+                        libc::SIGKILL
+                    } else {
+                        libc::SIGTERM
+                    };
+                    let result = unsafe { libc::kill(pid, signal) };
+                    eprintln!(
+                        "live cleanup pid={pid}: {action:?} returned {result}, error={:?}",
+                        (result != 0).then(std::io::Error::last_os_error)
+                    );
+                }
+            }
+            let timeout = match action {
+                CleanupAction::Terminate | CleanupAction::Sigterm => Duration::from_secs(3),
+                CleanupAction::ForceTerminate => Duration::from_secs(1),
+                CleanupAction::Sigkill => Duration::from_secs(2),
+            };
+            eprintln!(
+                "live cleanup pid={pid}: after {action:?}, exited={:?}",
+                wait_for_process_exit(pid, timeout)
+            );
+        },
+    )?;
+    eprintln!("live cleanup pid={pid}: process confirmed gone, final action={outcome:?}");
+    Ok(())
 }
 
 fn restore_app_if_needed(
