@@ -15,7 +15,7 @@ use super::rates::{self, Rates};
 
 pub const CACHE_FILE: &str = "pricing-cache.json";
 pub const CACHE_VERSION: u32 = 2;
-/// The highest price accepted from any source, in US dollars per million tokens.
+/// The highest fetched or cached price, in US dollars per million tokens.
 const MAX_PRICE: f64 = 100.0;
 /// How far a fetched price may move from the built-in one before it is taken
 /// for a unit error (per token, per thousand tokens).
@@ -75,8 +75,8 @@ impl PriceBook {
     }
 }
 
-/// Whether `rates` can be trusted for `model`: every price is a plausible
-/// amount, and none is ten times off the built-in price for the same model.
+/// Whether fetched or cached prices are plausible: within ten times the
+/// model's built-in prices, or the Flash/Pro range for a new model.
 pub fn rates_are_plausible(model: &str, rates: Rates) -> bool {
     let prices = [rates.input_cache_miss, rates.input_cache_hit, rates.output];
     if prices
@@ -85,19 +85,21 @@ pub fn rates_are_plausible(model: &str, rates: Rates) -> bool {
     {
         return false;
     }
-    let Some((_, builtin)) = rates::builtin_rates()
+    let (a, b) = rates::builtin_rates()
         .into_iter()
         .find(|(name, _)| *name == model)
-    else {
-        return true;
-    };
-    within_drift(builtin.input_cache_miss, rates.input_cache_miss)
-        && within_drift(builtin.input_cache_hit, rates.input_cache_hit)
-        && within_drift(builtin.output, rates.output)
+        .map(|(_, builtin)| (builtin, builtin))
+        .unwrap_or((rates::FLASH_RATES, rates::PRO_RATES));
+    within_drift(
+        a.input_cache_miss,
+        b.input_cache_miss,
+        rates.input_cache_miss,
+    ) && within_drift(a.input_cache_hit, b.input_cache_hit, rates.input_cache_hit)
+        && within_drift(a.output, b.output, rates.output)
 }
 
-fn within_drift(reference: f64, price: f64) -> bool {
-    price >= reference / MAX_DRIFT && price <= reference * MAX_DRIFT
+fn within_drift(a: f64, b: f64, price: f64) -> bool {
+    price >= a.min(b) / MAX_DRIFT && price <= a.max(b) * MAX_DRIFT
 }
 
 /// The built-in table overlaid by cached content updated on or after the
@@ -355,6 +357,62 @@ mod tests {
             }
         ));
         assert!(rates_are_plausible("unknown", NEW_MODEL));
+    }
+
+    #[test]
+    fn cached_unknown_models_require_plausible_prices_in_every_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CACHE_FILE);
+        let mut cached = content_dated_cache("2026-10-20", false);
+        for rates in [
+            Rates {
+                input_cache_miss: 0.0,
+                input_cache_hit: 0.0,
+                output: 0.0,
+            },
+            Rates {
+                input_cache_miss: 0.66e-6,
+                input_cache_hit: 0.022e-6,
+                output: 1.98e-6,
+            },
+            Rates {
+                input_cache_miss: 0.001,
+                ..NEW_MODEL
+            },
+            Rates {
+                input_cache_hit: 0.00001,
+                ..NEW_MODEL
+            },
+            Rates {
+                output: 0.001,
+                ..NEW_MODEL
+            },
+            Rates {
+                input_cache_miss: 7.0,
+                ..NEW_MODEL
+            },
+            Rates {
+                input_cache_hit: 0.3,
+                ..NEW_MODEL
+            },
+            Rates {
+                output: 20.0,
+                ..NEW_MODEL
+            },
+        ] {
+            cached.models = BTreeMap::from([(
+                "deepseek-v4-pro-exp".into(),
+                CachedRates {
+                    rates,
+                    updated: "2026-10-20".parse().unwrap(),
+                },
+            )]);
+            write_cache(&path, &cached).unwrap();
+            assert!(read_cache(&path).is_none(), "accepted {rates:?}");
+        }
+        cached.models.get_mut("deepseek-v4-pro-exp").unwrap().rates = NEW_MODEL;
+        write_cache(&path, &cached).unwrap();
+        assert_eq!(read_cache(&path), Some(cached));
     }
 
     #[test]

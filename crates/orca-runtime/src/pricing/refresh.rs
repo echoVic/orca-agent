@@ -457,6 +457,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_zero_and_per_token_prices_for_unknown_models() {
+        let body = br#"{"deepseek":{"models":{
+            "deepseek-v4-pro-exp":{"cost":{"input":0.0,"cache_read":0.0,"output":0.0}},
+            "deepseek-v5-scaled":{"cost":{"input":0.66e-6,"cache_read":0.022e-6,"output":1.98e-6}},
+            "deepseek-v5-flash":{"cost":{"input":0.5,"cache_read":0.01,"output":2.0}}
+        }}}"#;
+        let prices = parse_models_dev(body, now()).unwrap();
+        assert_eq!(
+            prices.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["deepseek-v5-flash"]
+        );
+    }
+
+    #[test]
     fn parse_skips_incomplete_or_implausible_entries_and_rejects_empty_results() {
         let body = r#"{"deepseek": {"models": {
           "deepseek-flash": {"cost": {"input": 0.15e-6, "output": 0.6e-6, "cache_read": 0.003e-6}},
