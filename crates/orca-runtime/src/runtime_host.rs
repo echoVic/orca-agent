@@ -23928,7 +23928,7 @@ mod tests {
         let prompt = conversation.messages[0]
             .content_str()
             .expect("side system prompt");
-        assert!(prompt.contains("### read_file"));
+        assert!(prompt.contains("`read_file`, `glob`, and `grep`"));
         assert!(!prompt.contains("### computer"));
         assert!(
             conversation
@@ -24028,7 +24028,9 @@ mod tests {
             let actual = body["messages"][0]["content"].as_str().unwrap();
             if condition == "advertised" {
                 assert!(!actual.contains("### computer"));
-                assert!(actual.contains("### read_file"));
+                assert!(
+                    actual.contains("For file inspection, prefer `read_file`, `glob`, and `grep`")
+                );
             } else {
                 assert!(
                     actual.as_bytes() == parent_prompt.as_bytes(),

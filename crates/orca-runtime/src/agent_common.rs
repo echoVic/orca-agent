@@ -560,7 +560,7 @@ mod tests {
             None,
         );
 
-        assert!(prompt.contains("### read_file"));
+        assert!(prompt.contains("`read_file`, `glob`, and `grep`"));
         assert!(!prompt.contains("### bash"));
         assert!(!prompt.contains("Every shell command goes through `bash`"));
         assert!(prompt.contains("This role has no shell or process execution tool"));

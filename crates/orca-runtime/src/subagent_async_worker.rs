@@ -1622,6 +1622,9 @@ fn spawn_async_subagent_worker(
     if activity_start_precommitted {
         worker_args.push("--activity-start-precommitted".to_string());
     }
+    if config.tools.headless_exec {
+        worker_args.push("--headless-exec".to_string());
+    }
     if let Some(model) = config.model.as_history_value() {
         worker_args.extend(["--model".to_string(), model.to_string()]);
     }

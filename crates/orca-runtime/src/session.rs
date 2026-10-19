@@ -973,7 +973,7 @@ mod tests {
             )
             .expect("session");
             let prompt = session.conversation.messages[0].content_str().unwrap();
-            assert!(prompt.contains("### read_file"));
+            assert!(prompt.contains("`read_file`, `glob`, and `grep`"));
             assert!(!prompt.contains("### computer"));
             cfg.computer_use.interactive = true;
             let session = InteractiveSession::new_with_preloaded_and_mcp_registry(
@@ -984,10 +984,7 @@ mod tests {
             )
             .expect("interactive session");
             let prompt = session.conversation.messages[0].content_str().unwrap();
-            assert_eq!(
-                prompt.contains("### computer"),
-                orca_computer_use::apps::host_supported()
-            );
+            assert!(!prompt.contains("### computer"));
         });
     }
 
@@ -1010,7 +1007,7 @@ mod tests {
             )
             .expect("session");
             let prompt = session.conversation.messages[0].content_str().unwrap();
-            assert!(prompt.contains("### read_file"));
+            assert!(prompt.contains("`read_file`, `glob`, and `grep`"));
             assert!(!prompt.contains("### computer"));
         });
     }
@@ -1037,7 +1034,7 @@ mod tests {
             )
             .expect("session");
             let prompt = session.conversation.messages[0].content_str().unwrap();
-            assert!(prompt.contains("### read_file"));
+            assert!(prompt.contains("`read_file`, `glob`, and `grep`"));
             assert!(!prompt.contains("### computer"));
             assert!(!prompt.contains("### bash"));
             assert!(prompt.contains("Report source findings."));

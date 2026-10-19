@@ -299,6 +299,9 @@ pub struct ToolConfig {
     /// user configuration.
     #[serde(skip)]
     pub shell_enforcement_decision: Option<crate::capability::SandboxEnforcementDecision>,
+    /// Advertisement only: an exec run without an interactive input transport.
+    #[serde(skip)]
+    pub headless_exec: bool,
 }
 
 impl Default for ToolConfig {
@@ -308,6 +311,7 @@ impl Default for ToolConfig {
             output_truncation: ToolOutputTruncation::default(),
             shell_timeout_secs: default_shell_timeout_secs(),
             shell_enforcement_decision: None,
+            headless_exec: false,
         }
     }
 }

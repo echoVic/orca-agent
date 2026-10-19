@@ -164,10 +164,15 @@ fn build_child_agent_loop_setup(
         external_tools: config.external_tools.clone(),
         max_output_tokens: None,
     };
-    if let Some(tools) = provider_config.tools_override.as_mut()
-        && !crate::workspace_git::is_git_work_tree(cwd)
-    {
-        tools.retain(|tool| tool.name != "git_status");
+    if let Some(tools) = provider_config.tools_override.as_mut() {
+        crate::tool_invocation::omit_unavailable_session_tools(
+            tools,
+            config,
+            request.workflow_ipc.is_some(),
+        );
+        if !crate::workspace_git::is_git_work_tree(cwd) {
+            tools.retain(|tool| tool.name != "git_status");
+        }
     }
 
     let budget_model = config.model.as_option();
@@ -332,6 +337,117 @@ mod tests {
     }
 
     #[test]
+    fn child_provider_keeps_workflow_ipc_only_with_context() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        for workflow_child in [false, true] {
+            let config = RunConfig {
+                cwd: Some(home.path().to_path_buf()),
+                ..RunConfig::default()
+            };
+            let mut request =
+                ChildAgentRequest::new("inspect".into(), SubagentType::General, None, 1, false);
+            request.allowed_tools = Some(
+                [
+                    "read_file",
+                    "workflow_send_message",
+                    "workflow_read_messages",
+                    "workflow_clear_messages",
+                    "workflow_create_task_list",
+                    "workflow_claim_task",
+                    "workflow_complete_task",
+                    "workflow_list_tasks",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            );
+            if workflow_child {
+                request.workflow_ipc = Some(crate::workflow::ipc::WorkflowIpcContext::new());
+            }
+            let setup = prepare_child_agent_loop(
+                &config,
+                &request,
+                home.path(),
+                &ProjectInstructions::default(),
+                &MemoryBlock::default(),
+            );
+            let tools = setup.provider_config.tools_override.unwrap();
+            for name in [
+                "workflow_send_message",
+                "workflow_read_messages",
+                "workflow_clear_messages",
+                "workflow_create_task_list",
+                "workflow_claim_task",
+                "workflow_complete_task",
+                "workflow_list_tasks",
+            ] {
+                assert_eq!(
+                    tools.iter().any(|tool| tool.name == name),
+                    workflow_child,
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn child_provider_applies_session_tool_availability() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        for available in [false, true] {
+            let mut config = RunConfig {
+                cwd: Some(home.path().to_path_buf()),
+                ..RunConfig::default()
+            };
+            config.tools.headless_exec = !available;
+            // A disabled configured server avoids startup side effects while testing advertisement.
+            if available {
+                config
+                    .mcp_servers
+                    .push(orca_core::mcp_types::McpServerConfig {
+                        name: "configured-server".into(),
+                        disabled: true,
+                        ..Default::default()
+                    });
+            }
+            let mut request =
+                ChildAgentRequest::new("inspect".into(), SubagentType::General, None, 1, false);
+            request.allowed_tools = Some(
+                [
+                    "list_mcp_resources",
+                    "list_mcp_resource_templates",
+                    "read_mcp_resource",
+                    "ask_user_question",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            );
+            let setup = prepare_child_agent_loop(
+                &config,
+                &request,
+                home.path(),
+                &ProjectInstructions::default(),
+                &MemoryBlock::default(),
+            );
+            let tools = setup.provider_config.tools_override.unwrap();
+            for name in [
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "read_mcp_resource",
+                "ask_user_question",
+            ] {
+                assert_eq!(
+                    tools.iter().any(|tool| tool.name == name),
+                    available,
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn child_git_status_catalog_matches_its_own_cwd() {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::history::redirect_test_orca_home(home.path());
@@ -359,7 +475,7 @@ mod tests {
                 &MemoryBlock::default(),
             );
             let prompt = setup.conversation.messages[0].content_str().unwrap();
-            assert_eq!(prompt.contains("### git_status\n"), is_repo);
+            assert!(!prompt.contains("### git_status\n"));
             assert_eq!(prompt.contains("- Git repository: no\n"), !is_repo);
             assert_eq!(
                 setup
@@ -401,7 +517,7 @@ mod tests {
         let prompt = conversation.messages[0]
             .content_str()
             .expect("system prompt");
-        assert!(prompt.contains("### read_file"));
+        assert!(prompt.contains("`read_file`, `glob`, and `grep`"));
         assert!(prompt.contains("Report source findings."));
         assert!(!prompt.contains("### computer"));
     }

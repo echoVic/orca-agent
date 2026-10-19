@@ -1571,12 +1571,13 @@ fn run_inner<W: io::Write>(
 }
 
 fn run_headless<W: io::Write>(
-    config: RunConfig,
+    mut config: RunConfig,
     mut writer: W,
     transport: Option<HeadlessInteractionTransport>,
     signals: &TerminationSignalHandler,
     interrupted: &AtomicI32,
 ) -> io::Result<i32> {
+    config.tools.headless_exec = transport.is_none();
     // The instruction is delivered byte-exact: trimming here silently rewrote every prompt
     // that ended with a newline (all Terminal-Bench instructions do). `orca exec` now rejects
     // a whitespace-only argument before this point, so the placeholder is only reachable for
@@ -2432,6 +2433,49 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(error.to_string(), "borrowed writer disconnected");
+    }
+
+    #[test]
+    fn headless_controller_hides_unanswerable_questions() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(home.path().to_path_buf());
+        config.prompt = "mock_offered_tools".into();
+        config.output_format = OutputFormat::Jsonl;
+        let mut output = Vec::new();
+        let status = run_to_writer(config, &mut output);
+        assert_eq!(status, 0);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Mock offered tools: "));
+        assert!(output.contains("read_file"));
+        assert!(!output.contains("ask_user_question"));
+    }
+
+    #[test]
+    fn headless_controller_keeps_questions_with_an_input_transport() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(home.path().to_path_buf());
+        config.prompt = "mock_offered_tools".into();
+        config.output_format = OutputFormat::Jsonl;
+        let transport = HeadlessInteractionTransport::new(|_: &HeadlessInteractionCheckpoint| {
+            Err(io::Error::other("no question expected"))
+        });
+        let mut output = Vec::new();
+        let status = run_to_writer_with_headless_transport(
+            config,
+            &mut output,
+            ControllerRunOptions::default(),
+            transport,
+        );
+        assert_eq!(status, 0);
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("ask_user_question")
+        );
     }
 
     #[test]

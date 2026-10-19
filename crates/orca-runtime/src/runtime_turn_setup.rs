@@ -88,7 +88,7 @@ mod tests {
             &McpRegistry::default(),
         );
 
-        assert!(prompt.contains("### git_status\n"));
+        assert!(!prompt.contains("### git_status\n"));
         assert!(
             setup
                 .provider_config

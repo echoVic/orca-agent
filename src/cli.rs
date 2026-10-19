@@ -669,6 +669,10 @@ struct SubagentWorkerArgs {
     #[arg(long, hide = true)]
     activity_start_precommitted: bool,
 
+    /// Preserve the parent's advertisement-only exec mode in a detached worker.
+    #[arg(long, hide = true)]
+    headless_exec: bool,
+
     /// Parent git repository root for isolated worktree cleanup.
     #[arg(long)]
     worktree_repo_root: Option<PathBuf>,
@@ -807,6 +811,7 @@ impl From<SubagentWorkerArgs> for orca_runtime::command::launch::SubagentWorkerL
             permission_response_public_key: args.permission_response_public_key,
             child_turn_id: args.child_turn_id,
             activity_start_precommitted: args.activity_start_precommitted,
+            headless_exec: args.headless_exec,
             worktree_repo_root: args.worktree_repo_root,
             worktree_path: args.worktree_path,
         }
@@ -1041,6 +1046,37 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use serde_json::Value;
+
+    #[test]
+    fn subagent_worker_accepts_headless_advertisement_signal() {
+        let parsed = Cli::try_parse_from([
+            "orca",
+            "subagent-worker",
+            "--cwd",
+            "/workspace",
+            "--child-cwd",
+            "/workspace",
+            "--session-id",
+            "session",
+            "--agent-id",
+            "agent",
+            "--subagent-depth",
+            "1",
+            "--request-json",
+            "{}",
+            "--permission-response-public-key",
+            "key",
+            "--child-turn-id",
+            "turn",
+            "--headless-exec",
+        ]);
+        let parsed = parsed.expect("headless worker flag");
+        let Some(Command::SubagentWorker(args)) = parsed.command else {
+            panic!("worker command");
+        };
+        let request: orca_runtime::command::launch::SubagentWorkerLaunchRequest = args.into();
+        assert!(request.headless_exec);
+    }
 
     fn parse_exec(args: &[&str]) -> ExecArgs {
         let mut argv = vec!["orca", "exec"];

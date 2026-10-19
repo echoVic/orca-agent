@@ -27,6 +27,7 @@ pub(crate) struct AgentToolPolicyContext<'a> {
     allowed_tools: Option<&'a [String]>,
     label: Option<&'a str>,
     goal_mode: bool,
+    workflow_child: bool,
     delegation: DelegationPolicy,
 }
 
@@ -42,6 +43,7 @@ impl<'a> AgentToolPolicyContext<'a> {
             allowed_tools,
             label,
             goal_mode: false,
+            workflow_child: false,
             delegation: DelegationPolicy::default(),
         }
     }
@@ -55,6 +57,7 @@ impl<'a> AgentToolPolicyContext<'a> {
             allowed_tools: None,
             label: None,
             goal_mode: true,
+            workflow_child: false,
             delegation: DelegationPolicy::default(),
         }
     }
@@ -65,13 +68,20 @@ impl<'a> AgentToolPolicyContext<'a> {
         self
     }
 
+    pub(crate) fn with_workflow_ipc(mut self, available: bool) -> Self {
+        self.workflow_child = available;
+        self
+    }
+
     pub(crate) fn replace_allowed_tools(
         self,
         allowed_tools: Option<&'a [String]>,
         label: &'a str,
     ) -> Self {
         if let Some(allowed_tools) = allowed_tools {
-            Self::new(Some(allowed_tools), Some(label)).with_delegation(self.delegation)
+            Self::new(Some(allowed_tools), Some(label))
+                .with_delegation(self.delegation)
+                .with_workflow_ipc(self.workflow_child)
         } else {
             self
         }
@@ -156,6 +166,7 @@ pub(crate) fn provider_config_for_agent_loop(
         &config.external_tools,
     );
     if let Some(tools) = tools_override.as_mut() {
+        omit_unavailable_session_tools(tools, config, tool_policy.workflow_child);
         omit_unavailable_shell_launch_tools(tools, &shell_readiness);
         if !crate::workspace_git::is_git_work_tree(cwd) {
             tools.retain(|tool| tool.name != "git_status");
@@ -190,6 +201,28 @@ pub(crate) fn provider_config_for_agent_loop(
         );
     }
     provider_config
+}
+
+/// Only the advertised schema changes; hidden tools remain registered and executable.
+pub(crate) fn omit_unavailable_session_tools(
+    tools: &mut Vec<ProviderToolDefinition>,
+    config: &RunConfig,
+    workflow_child: bool,
+) {
+    tools.retain(|tool| match tool.name.as_str() {
+        "workflow_send_message"
+        | "workflow_read_messages"
+        | "workflow_clear_messages"
+        | "workflow_create_task_list"
+        | "workflow_claim_task"
+        | "workflow_complete_task"
+        | "workflow_list_tasks" => workflow_child,
+        "list_mcp_resources" | "list_mcp_resource_templates" | "read_mcp_resource" => {
+            !config.mcp_servers.is_empty()
+        }
+        "ask_user_question" => !config.tools.headless_exec,
+        _ => true,
+    });
 }
 
 fn omit_unavailable_shell_launch_tools(
@@ -477,6 +510,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_keeps_computer_for_an_interactive_root() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let mut config = orca_core::config::RunConfig {
+            cwd: Some(home.path().to_path_buf()),
+            ..Default::default()
+        };
+        config.computer_use.interactive = true;
+        let provider = super::provider_config_for_agent_loop(
+            &config,
+            home.path(),
+            0,
+            &orca_core::subagent_types::SubagentType::General,
+            super::AgentToolPolicyContext::unrestricted(),
+            &orca_mcp::McpRegistry::default(),
+        );
+        assert_eq!(
+            provider
+                .tools_override
+                .unwrap()
+                .iter()
+                .any(|tool| tool.name == "computer"),
+            orca_computer_use::apps::host_supported()
+        );
+    }
+
     use orca_core::approval_rules::PermissionRules;
     use orca_core::approval_types::{ActionKind, ApprovalMode};
     use orca_core::config::{
@@ -614,7 +674,7 @@ mod tests {
             let prompt = prompt.unwrap_or_else(|| {
                 crate::system_prompt::build_system_prompt_for_config(cwd, &config, depth, None)
             });
-            assert_eq!(prompt.contains("### git_status\n"), is_repo);
+            assert!(!prompt.contains("### git_status\n"));
             assert_eq!(prompt.contains("- Git repository: no\n"), !is_repo);
             if !non_repo.path().join(".git").exists() {
                 std::fs::create_dir(non_repo.path().join(".git")).unwrap();
@@ -631,6 +691,123 @@ mod tests {
         );
         let invocation = prepare_tool_invocation(&requested, 0, &registry, &config);
         assert!(validate_tool_invocation(&invocation, &registry, &config).is_ok());
+    }
+
+    fn advertised_names(config: &RunConfig) -> Vec<String> {
+        provider_config_for_agent_loop(
+            config,
+            config.cwd.as_deref().unwrap(),
+            0,
+            &SubagentType::General,
+            AgentToolPolicyContext::unrestricted(),
+            &McpRegistry::default(),
+        )
+        .tools_override
+        .unwrap()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect()
+    }
+
+    #[test]
+    fn provider_hides_workflow_ipc_outside_workflow_children() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let mut config = config_with_external(Vec::new());
+        config.cwd = Some(home.path().to_path_buf());
+        let names = advertised_names(&config);
+        for name in [
+            "workflow_send_message",
+            "workflow_read_messages",
+            "workflow_clear_messages",
+            "workflow_create_task_list",
+            "workflow_claim_task",
+            "workflow_complete_task",
+            "workflow_list_tasks",
+        ] {
+            assert!(
+                !names.iter().any(|offered| offered == name),
+                "unexpected {name}"
+            );
+            let requested = request(ToolName::plain(name), ActionKind::Read, None, Some("{}"));
+            assert!(
+                prepare_tool_invocation(&requested, 0, &McpRegistry::default(), &config)
+                    .action
+                    .is_some()
+            );
+        }
+        assert!(names.iter().any(|name| name == "glob"));
+        assert!(!names.iter().any(|name| name == "list_files"));
+        let provider = provider_config_for_agent_loop(
+            &config,
+            home.path(),
+            1,
+            &SubagentType::General,
+            AgentToolPolicyContext::unrestricted()
+                .with_workflow_ipc(true)
+                .replace_allowed_tools(
+                    Some(&["workflow_send_message".to_string()]),
+                    "workflow child",
+                ),
+            &McpRegistry::default(),
+        );
+        assert_eq!(
+            schema_names(&provider.tools_override.unwrap()),
+            ["workflow_send_message"]
+        );
+    }
+
+    #[test]
+    fn provider_mcp_resource_tools_follow_configured_servers() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        for configured in [false, true] {
+            let mut config = config_with_external(Vec::new());
+            config.cwd = Some(home.path().to_path_buf());
+            if configured {
+                config
+                    .mcp_servers
+                    .push(orca_core::mcp_types::McpServerConfig {
+                        name: "configured-server".into(),
+                        ..Default::default()
+                    });
+            }
+            let names = advertised_names(&config);
+            for name in [
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "read_mcp_resource",
+            ] {
+                assert_eq!(
+                    names.iter().any(|offered| offered == name),
+                    configured,
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_ask_user_question_follows_headless_exec_signal() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        for (mode, headless) in [
+            ("exec", true),
+            ("TUI", false),
+            ("ACP", false),
+            ("server", false),
+        ] {
+            let mut config = config_with_external(Vec::new());
+            config.cwd = Some(home.path().to_path_buf());
+            config.tools.headless_exec = headless;
+            assert_eq!(
+                advertised_names(&config)
+                    .iter()
+                    .any(|name| name == "ask_user_question"),
+                !headless,
+                "{mode}"
+            );
+        }
     }
 
     #[test]
