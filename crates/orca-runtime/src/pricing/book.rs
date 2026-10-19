@@ -151,6 +151,25 @@ pub fn write_cache(path: &Path, cache: &PricingCache) -> io::Result<()> {
     atomic_write(path, &bytes, AtomicWritePolicy::NoFollow).map_err(io::Error::other)
 }
 
+fn global_user_overrides() -> &'static RwLock<Arc<BTreeMap<String, Rates>>> {
+    static OVERRIDES: OnceLock<RwLock<Arc<BTreeMap<String, Rates>>>> = OnceLock::new();
+    OVERRIDES.get_or_init(|| RwLock::new(Arc::default()))
+}
+
+pub(crate) fn set_user_overrides(overrides: BTreeMap<String, Rates>) {
+    *global_user_overrides()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(overrides);
+}
+
+/// A snapshot of fixed prices from the user config for newly created trackers.
+pub fn user_overrides() -> Arc<BTreeMap<String, Rates>> {
+    global_user_overrides()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 fn global() -> &'static RwLock<Arc<PriceBook>> {
     static BOOK: OnceLock<RwLock<Arc<PriceBook>>> = OnceLock::new();
     BOOK.get_or_init(|| {

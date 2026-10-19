@@ -23524,10 +23524,6 @@ fn provider_response_usage_totals(
 ) -> Option<UsageTotals> {
     let usage = response.usage.filter(|usage| !usage.is_empty())?;
     let mut tracker = crate::cost::CostTracker::new(model);
-    #[cfg(test)]
-    {
-        tracker = tracker.with_clock(crate::pricing::rates::off_peak_instant);
-    }
     Some(tracker.add_usage(usage))
 }
 
@@ -23902,6 +23898,37 @@ mod tests {
     // to publish its durable provider outcome, which turned the seed phase into
     // an intermittent failure.
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn provider_response_usage_totals_applies_process_user_override() {
+        crate::pricing::tests::with_isolated_user_overrides(|| {
+            let model = "provider-usage-override-probe";
+            crate::pricing::book::set_user_overrides(std::collections::BTreeMap::from([(
+                model.to_string(),
+                crate::pricing::rates::Rates {
+                    input_cache_miss: 1.0,
+                    input_cache_hit: 0.5,
+                    output: 2.0,
+                },
+            )]));
+            let response = ProviderResponse {
+                steps: Vec::new(),
+                assistant_content: Some("done".to_string()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: Some(orca_core::provider_types::Usage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                    cache_tokens: 500_000,
+                }),
+            };
+            let totals = provider_response_usage_totals(&response, Some(model)).expect("usage");
+            assert_eq!(totals.input_tokens, 1_000_000);
+            assert_eq!(totals.output_tokens, 1_000_000);
+            assert_eq!(totals.cache_tokens, 500_000);
+            assert!((totals.estimated_cost_usd - 2.75).abs() < 1e-12);
+        });
+    }
 
     #[test]
     fn attached_side_context_drops_interactive_computer_capability() {

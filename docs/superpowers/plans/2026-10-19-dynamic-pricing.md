@@ -2396,3 +2396,10 @@ git commit -m "docs: explain peak-hour cost estimates and the pricing settings" 
   - 用 `ORCA_PRICING_URL` 指向本地 fixture，`ORCA_HOME` 用临时目录，跑一次 `orca exec`，确认 `pricing-cache.json` 被写出；
   - 再用 release 构建，在真实网络下跑一次，确认能从 models.dev 拿到价格，`orca doctor` 显示 `https://models.dev/api.json prices fetched ...`；这一步会真实访问 models.dev。
 - 做一次只读的最终审查（Codex `-s read-only`）
+
+## 执行中的调整
+
+- Batch B：项目配置拒绝规则剥离 `pricing` 后，同时移除变空的模型别名定义，避免影响用户配置的别名合并。
+- `ceb82cf4`：models.dev 改为宽松解析，跳过字段缺失或格式错误的模型条目，其余有效价格仍可刷新。
+- 用户价格覆盖改为进程级保存，每个会话启动时写入，之后创建的所有 tracker（含子代理和挂起 / 后台结算）均使用其快照。
+- 库测试的空闲时钟统一由 `CostTracker::new` 的 `default_clock` 提供，移除会话和后台结算中的分散注入；集成测试继续显式固定时钟或接受两档价格。

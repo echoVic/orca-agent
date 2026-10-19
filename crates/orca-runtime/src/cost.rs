@@ -8,6 +8,7 @@ use orca_core::provider_types::Usage;
 
 use crate::pricing::book;
 use crate::pricing::rates::{self, Rates};
+use crate::pricing::rates_from_overrides;
 
 pub(crate) fn usd_to_micros(usd: f64) -> u64 {
     if usd.is_finite() && usd > 0.0 {
@@ -19,6 +20,18 @@ pub(crate) fn usd_to_micros(usd: f64) -> u64 {
 
 /// When usage is priced: DeepSeek's peak hours cost twice as much. Tests pin it.
 pub type PricingClock = fn() -> DateTime<Utc>;
+
+fn default_clock() -> PricingClock {
+    #[cfg(not(test))]
+    {
+        Utc::now
+    }
+    #[cfg(test)]
+    {
+        // Lib tests price at an off-peak instant so expectations do not depend on the hour.
+        rates::off_peak_instant
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CostTracker {
@@ -35,8 +48,8 @@ impl CostTracker {
         Self {
             totals: UsageTotals::default(),
             model: canonical(model),
-            overrides: Arc::default(),
-            clock: Utc::now,
+            overrides: book::user_overrides(),
+            clock: default_clock(),
         }
     }
 
@@ -45,21 +58,8 @@ impl CostTracker {
         model: Option<&str>,
         overrides: &BTreeMap<String, ModelPriceOverride>,
     ) -> Self {
-        let overrides = overrides
-            .iter()
-            .map(|(model, price)| {
-                (
-                    model.clone(),
-                    Rates {
-                        input_cache_miss: price.input_cache_miss.get(),
-                        input_cache_hit: price.input_cache_hit.get(),
-                        output: price.output.get(),
-                    },
-                )
-            })
-            .collect();
         Self {
-            overrides: Arc::new(overrides),
+            overrides: Arc::new(rates_from_overrides(overrides)),
             ..Self::new(model)
         }
     }
@@ -150,6 +150,37 @@ mod tests {
     fn cost(tracker: CostTracker, usage: Usage) -> f64 {
         let mut tracker = tracker;
         tracker.add_usage(usage).estimated_cost_usd
+    }
+
+    #[test]
+    fn new_tracker_uses_process_user_overrides_at_peak() {
+        crate::pricing::tests::with_isolated_user_overrides(|| {
+            let model = "user-override-probe";
+            book::set_user_overrides(BTreeMap::from([(
+                model.to_string(),
+                Rates {
+                    input_cache_miss: 1.0,
+                    input_cache_hit: 0.5,
+                    output: 2.0,
+                },
+            )]));
+            let tracker = CostTracker::new(Some(model)).with_clock(peak_instant);
+            let used = usage(1_000_000, 1_000_000, 500_000);
+            assert!((cost(tracker.clone(), used) - 2.75).abs() < 1e-12);
+
+            // Existing trackers retain their snapshot when a later session
+            // replaces the process-wide map.
+            book::set_user_overrides(BTreeMap::new());
+            assert!((cost(tracker, used) - 2.75).abs() < 1e-12);
+            assert!(book::user_overrides().is_empty());
+        });
+    }
+
+    #[test]
+    fn new_tracker_defaults_to_off_peak_in_lib_tests() {
+        let tracker = CostTracker::new(Some(FLASH_MODEL));
+        assert_eq!((tracker.clock)(), off_peak_instant());
+        assert!((cost(tracker, usage(1_000_000, 1_000_000, 100_000)) - 0.7353).abs() < 1e-12);
     }
 
     #[test]
