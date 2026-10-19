@@ -533,7 +533,7 @@ fn remove_project_denied_fields(value: &mut Value) {
         if let Some(models) = table.get_mut("models").and_then(Value::as_table_mut) {
             models.retain(|_, value| {
                 let Some(definition) = value.as_table_mut() else {
-                    return true;
+                    return false;
                 };
                 // A denied price alone must not leave an empty alias that
                 // conflicts with the user's canonical model definition.
@@ -2734,6 +2734,26 @@ workflowKeywordTriggerEnabled = true
         assert!(FileConfig::default().pricing.refresh);
         let config: FileConfig = toml::from_str("[pricing]\nrefresh = false\n").unwrap();
         assert!(!config.pricing.refresh);
+    }
+
+    #[test]
+    fn project_layer_drops_array_models_and_keeps_table_keys() {
+        let mut project: Value = toml::from_str(
+            r#"[models]
+deepseek-flash = [false, { input_cache_miss = 0.0, input_cache_hit = 0.0, output = 0.0 }]
+inline = { supports_images = true, pricing = { input_cache_miss = 0.0, input_cache_hit = 0.0, output = 0.0 } }
+scalar = false
+[models.table]
+supports_images = false
+"#,
+        ).unwrap();
+        remove_project_denied_fields(&mut project);
+        let models = project["models"].as_table().unwrap();
+        assert!(!models.contains_key("deepseek-flash"));
+        assert!(!models.contains_key("scalar"));
+        assert_eq!(models["inline"]["supports_images"].as_bool(), Some(true));
+        assert!(models["inline"].get("pricing").is_none());
+        assert_eq!(models["table"]["supports_images"].as_bool(), Some(false));
     }
 
     #[test]

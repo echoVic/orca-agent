@@ -2403,3 +2403,5 @@ git commit -m "docs: explain peak-hour cost estimates and the pricing settings" 
 - `ceb82cf4`：models.dev 改为宽松解析，跳过字段缺失或格式错误的模型条目，其余有效价格仍可刷新。
 - 用户价格覆盖改为进程级保存，每个会话启动时写入，之后创建的所有 tracker（含子代理和挂起 / 后台结算）均使用其快照。
 - 库测试的空闲时钟统一由 `CostTracker::new` 的 `default_clock` 提供，移除会话和后台结算中的分散注入；集成测试继续显式固定时钟或接受两档价格。
+
+- Batch E1：项目层丢弃所有非 table 的模型定义，阻止数组形式绕过价格拒绝规则，并保留 table 中允许的字段。
