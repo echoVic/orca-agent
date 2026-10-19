@@ -157,6 +157,29 @@ fn check_window(window: &AxElement, table: &ElementTable) -> Result<(), DriverEr
     }
 }
 
+fn preserve_foreground_type_selection(was_focused: bool, still_focused: bool) -> bool {
+    was_focused && still_focused
+}
+
+#[cfg(test)]
+#[test]
+fn foreground_type_selection_collapses_when_focus_was_lost_before_the_click() {
+    assert!(!preserve_foreground_type_selection(true, false));
+}
+
+#[cfg(test)]
+#[test]
+fn foreground_type_selection_collapses_when_background_just_focused_the_target() {
+    assert!(!preserve_foreground_type_selection(false, true));
+}
+
+#[cfg(test)]
+#[test]
+fn foreground_type_selection_is_preserved_only_with_original_and_current_focus() {
+    assert!(preserve_foreground_type_selection(true, true));
+    assert!(!preserve_foreground_type_selection(false, false));
+}
+
 pub(super) fn run(
     type_target_was_focused: bool,
     application: &AxElement,
@@ -286,6 +309,7 @@ pub(super) fn run(
                 } => hid.scroll(location.unwrap(), *direction, *amount)?,
                 Action::Type { text, .. } => {
                     super::events::check_foreground_text_budget(text, action_deadline)?;
+                    let mut focus_at_click = None;
                     if let Some(point) = location {
                         // AX may already have focused a sheet field whose system hit
                         // test is owned by its view service. Deliver to that exact
@@ -299,6 +323,7 @@ pub(super) fn run(
                             } else {
                                 false
                             };
+                        focus_at_click = Some(already_focused);
                         if !already_focused {
                             hid.click(point, Button::Left, 1, Default::default())?;
                         }
@@ -315,7 +340,17 @@ pub(super) fn run(
                         params.secure_approved,
                     )?;
                     if matches!(target_location(params), Some(Target::Element { .. })) {
-                        if actions::should_collapse_type_selection(type_target_was_focused) {
+                        let still_focused = match focus_at_click {
+                            Some(focused) => focused,
+                            None => actions::keyboard_target_is_focused(
+                                target_element.as_ref(),
+                                |target| actions::keyboard_recipient(application, target),
+                            )?,
+                        };
+                        if !preserve_foreground_type_selection(
+                            type_target_was_focused,
+                            still_focused,
+                        ) {
                             focused.collapse_selection_to_end();
                         }
                         actions::check_foreground_secure_approval(
