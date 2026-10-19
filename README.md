@@ -226,6 +226,18 @@ and normalize to `deepseek-flash`, including Flash pricing. DeepSeek thinking is
 enabled explicitly: set `reasoning_effort` to `low`, `high`, or `max` (the
 default) in `config.toml`, or use `ORCA_REASONING_EFFORT`.
 
+Cost estimates follow DeepSeek's published prices, including the peak rate
+that applies Monday to Friday from 01:00 to 04:00 and from 06:00 to 10:00 UTC
+(Chinese public holidays are off-peak all day). Orca ships with the prices
+current at release. At session startup, each process checks once whether cached
+prices are missing or at least 24 hours old and, if needed, refreshes them from
+[models.dev](https://models.dev) in the background. Set `refresh = false` under
+`[pricing]` in `~/.orca/config.toml` to disable pricing refresh. To price a model
+yourself, for example one served by another endpoint, set `input_cache_miss`,
+`input_cache_hit`, and `output` (US dollars per million tokens) under
+`[models."<name>".pricing]`; those prices apply at every hour. Both settings
+are read only from the user configuration.
+
 JPEG, PNG, GIF, and WebP inputs are accepted from ACP clients and the TUI with
 every model selection. Flash consumes images directly; Pro uses Flash for
 task-aware visual analysis before continuing with Pro. In the TUI, use `Ctrl+V`

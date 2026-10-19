@@ -140,6 +140,8 @@ Orca 会将其归一化为 `deepseek-flash`，并统一采用 Flash 计费和图
 Orca 会显式开启 DeepSeek 思考模式：可以在 `config.toml` 中将 `reasoning_effort` 设为 `low`、`high` 或 `max`（默认），
 也可以使用 `ORCA_REASONING_EFFORT`。
 
+成本估算按 DeepSeek 公布的价格计算，包括周一至周五北京时间 9:00–12:00 和 14:00–18:00 的高峰价（中国法定节假日全天按空闲价）。Orca 自带发布时的价格，每个进程在会话启动时检查一次：缓存缺失或已满 24 小时，就在后台从 [models.dev](https://models.dev) 刷新。在 `~/.orca/config.toml` 的 `[pricing]` 里设置 `refresh = false` 就不会联网刷新价格。要自己给某个模型定价（比如通过其他 endpoint 调用的模型），在 `[models."<名称>".pricing]` 里设置 `input_cache_miss`、`input_cache_hit` 和 `output`（美元 / 百万 tokens），这个价格不分时段。这两项都只在用户配置里生效。
+
 ACP 客户端和 TUI 都可以输入 JPEG、PNG、GIF 和 WebP 图片：Flash 直接读取图片，
 Pro 会先用 Flash 做面向任务的图片分析，再交给 Pro 继续。在 TUI 中用 `Ctrl+V` 粘贴剪贴板里的图片，
 也可以拖入或粘贴图片路径，或通过 `@` 选择图片文件。Orca 继续使用 Chat Completions，

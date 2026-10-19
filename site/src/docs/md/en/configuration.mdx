@@ -54,6 +54,27 @@ operation-scoped: set `--max-turns`, `--max-tool-calls`, `--max-cost-usd`, or
 stored budget default. The file uses integer microdollars and milliseconds;
 the CLI accepts USD and seconds.
 
+## Cost estimates
+
+Cost estimates follow DeepSeek's published peak and off-peak prices. Each
+process checks once at session startup and refreshes prices from models.dev in
+the background if the cache is missing or at least 24 hours old. Refresh is
+enabled by default. Both settings belong in the user configuration; project
+`.orca/config.toml` cannot set them:
+
+```toml
+[pricing]
+refresh = false            # do not contact models.dev for prices
+
+[models."my-model".pricing]
+input_cache_miss = 0.5     # US dollars per million tokens
+input_cache_hit = 0.05
+output = 1.5
+```
+
+A `[models."<name>".pricing]` table needs all three prices and applies at every
+hour. See [Models](models.md#cost-estimates) for how estimates are made.
+
 ## Computer use (macOS)
 
 The interactive TUI's main session can operate other apps on macOS 14 or
