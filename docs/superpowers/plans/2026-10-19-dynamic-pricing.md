@@ -2414,3 +2414,4 @@ git commit -m "docs: explain peak-hour cost estimates and the pricing settings" 
 
 - Batch F1：可信项目层导致合并配置解析失败时重试用户层，成功则告警并忽略项目配置，保留用户预算和价格覆盖；用户层也无效时仍告警并使用默认配置。
 - Batch F2：保留 `build_run_config` 的价格覆盖安装，并在 `InteractiveSession` 构造时安装同一用户配置映射，兼顾 detached worker 和直接传入 `RunConfig` 的库调用。
+- Batch F3：未知模型范围和内置模型 ±10 倍漂移共用相对容差 `1e-9`，接纳十进制端点的浮点舍入误差，并用三个字段上下界及越界 1% 的回归测试约束。

@@ -99,7 +99,11 @@ pub fn rates_are_plausible(model: &str, rates: Rates) -> bool {
 }
 
 fn within_drift(a: f64, b: f64, price: f64) -> bool {
-    price >= a.min(b) / MAX_DRIFT && price <= a.max(b) * MAX_DRIFT
+    // Decimal endpoint prices can round just outside bounds computed in f64.
+    const RELATIVE_TOLERANCE: f64 = 1e-9;
+    let lower = a.min(b) / MAX_DRIFT;
+    let upper = a.max(b) * MAX_DRIFT;
+    price >= lower * (1.0 - RELATIVE_TOLERANCE) && price <= upper * (1.0 + RELATIVE_TOLERANCE)
 }
 
 /// The built-in table overlaid by cached content updated on or after the
@@ -365,6 +369,59 @@ mod tests {
             }
         ));
         assert!(rates_are_plausible("unknown", NEW_MODEL));
+    }
+
+    fn assert_price_bounds(model: &str, baseline: Rates, bounds: [(f64, f64); 3]) {
+        for (field, (lower, upper)) in bounds.into_iter().enumerate() {
+            for (price, accepted) in [
+                (lower, true),
+                (upper, true),
+                (lower * 0.99, false),
+                (upper * 1.01, false),
+            ] {
+                let mut rates = baseline;
+                match field {
+                    0 => rates.input_cache_miss = price,
+                    1 => rates.input_cache_hit = price,
+                    2 => rates.output = price,
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    rates_are_plausible(model, rates),
+                    accepted,
+                    "{model}, field {field}, price {price}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_model_price_bounds_accept_endpoints_and_reject_one_percent_beyond() {
+        // Decimal literals express the documented bounds independently of the
+        // floating-point arithmetic used by within_drift.
+        assert_price_bounds(
+            "unknown-endpoint-price-probe",
+            NEW_MODEL,
+            [(0.015, 6.6), (0.0003, 0.22), (0.06, 19.8)],
+        );
+    }
+
+    #[test]
+    fn flash_price_bounds_accept_endpoints_and_reject_one_percent_beyond() {
+        assert_price_bounds(
+            FLASH_MODEL,
+            FLASH_RATES,
+            [(0.015, 1.5), (0.0003, 0.03), (0.06, 6.0)],
+        );
+    }
+
+    #[test]
+    fn pro_price_bounds_accept_endpoints_and_reject_one_percent_beyond() {
+        assert_price_bounds(
+            PRO_MODEL,
+            PRO_RATES,
+            [(0.066, 6.6), (0.0022, 0.22), (0.198, 19.8)],
+        );
     }
 
     #[test]
