@@ -23895,6 +23895,7 @@ mod tests {
         assert!(!side.config.computer_use.interactive);
         let provider = crate::tool_invocation::provider_config_for_agent_loop(
             &side.config,
+            &std::env::current_dir().expect("cwd"),
             0,
             &orca_core::subagent_types::SubagentType::General,
             crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
@@ -41978,6 +41979,7 @@ done
         let requested_mcp_tools = || {
             crate::tool_invocation::provider_config_for_agent_loop(
                 &config,
+                cwd.path(),
                 0,
                 &orca_core::subagent_types::SubagentType::General,
                 crate::tool_invocation::AgentToolPolicyContext::unrestricted(),

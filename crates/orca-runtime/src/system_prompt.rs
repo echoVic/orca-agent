@@ -42,7 +42,13 @@ fn build_system_prompt_with_shell_and_tools(
     allowed_tools: Option<&[String]>,
     computer_visible: bool,
 ) -> String {
-    let tools = render_tool_prompt_section(allowed_tools, computer_visible);
+    let git_repository = crate::workspace_git::is_git_work_tree(cwd);
+    let tools = render_tool_prompt_section(allowed_tools, computer_visible, git_repository);
+    let git_environment = if git_repository {
+        ""
+    } else {
+        "- Git repository: no\n"
+    };
     let shell_allowed = tool_allowed(allowed_tools, "bash");
     let shell_environment = if shell_allowed {
         render_shell_environment(shell)
@@ -61,7 +67,7 @@ fn build_system_prompt_with_shell_and_tools(
 - Operating system: {os}
 - {shell_environment}
 - Today's date: {today}
-
+{git_environment}
 # How you work
 
 ## Personality
@@ -218,13 +224,18 @@ fn tool_allowed(allowed_tools: Option<&[String]>, name: &str) -> bool {
     allowed_tools.is_none_or(|allowed| allowed.iter().any(|tool| tool == name))
 }
 
-fn render_tool_prompt_section(allowed_tools: Option<&[String]>, computer_visible: bool) -> String {
+fn render_tool_prompt_section(
+    allowed_tools: Option<&[String]>,
+    computer_visible: bool,
+    git_repository: bool,
+) -> String {
     let registry = orca_tools::registry::default_tool_registry();
     let mut output = String::new();
     for tool in canonical_tool_definitions(&ToolPolicy::base(), registry)
         .into_iter()
         .filter(|tool| tool_allowed(allowed_tools, &tool.name))
         .filter(|tool| tool.name != "computer" || computer_visible)
+        .filter(|tool| tool.name != "git_status" || git_repository)
     {
         output.push_str(&format!("\n### {}\n{}\n", tool.name, tool.description));
     }
@@ -245,6 +256,52 @@ mod tests {
         )
         .resolve(None)
         .expect("resolve Windows shell")
+    }
+
+    #[test]
+    fn non_repo_prompt_hides_git_status_and_reports_environment() {
+        let cwd = tempfile::tempdir().unwrap();
+        assert!(cwd.path().ancestors().all(|dir| !dir.join(".git").exists()));
+        let prompt = build_system_prompt_with_shell(cwd.path(), None);
+
+        assert!(!prompt.contains("### git_status\n"));
+        let environment = prompt.split("# How you work").next().unwrap();
+        assert!(environment.contains("- Git repository: no\n"));
+    }
+
+    #[test]
+    fn repo_prompt_preserves_existing_text_except_non_repo_git_context() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        let non_repo = tempfile::tempdir().unwrap();
+        assert!(
+            non_repo
+                .path()
+                .ancestors()
+                .all(|dir| !dir.join(".git").exists())
+        );
+        let repo_prompt = build_system_prompt_with_shell(repo.path(), None);
+        let non_repo_prompt = build_system_prompt_with_shell(non_repo.path(), None);
+
+        assert!(repo_prompt.contains("### git_status\n"));
+        assert!(!repo_prompt.contains("Git repository"));
+        let git_tool = canonical_tool_definitions(
+            &ToolPolicy::base(),
+            orca_tools::registry::default_tool_registry(),
+        )
+        .into_iter()
+        .find(|tool| tool.name == "git_status")
+        .unwrap();
+        let git_section = format!("\n### git_status\n{}\n", git_tool.description);
+        assert!(repo_prompt.contains(&git_section));
+        assert_eq!(
+            repo_prompt
+                .replace(&repo.path().display().to_string(), "<cwd>")
+                .replace(&git_section, ""),
+            non_repo_prompt
+                .replace(&non_repo.path().display().to_string(), "<cwd>")
+                .replace("- Git repository: no\n", "")
+        );
     }
 
     #[test]

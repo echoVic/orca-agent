@@ -377,6 +377,7 @@ pub mod tool_turn;
 pub mod update_check;
 pub mod workflow;
 pub mod workflow_execution;
+mod workspace_git;
 pub mod worktree;
 
 #[cfg(test)]

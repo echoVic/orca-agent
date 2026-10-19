@@ -2460,6 +2460,7 @@ mod tests {
 
         let setup = RuntimeTurnSetupStep::new().prepare(
             &config,
+            &std::env::current_dir().expect("cwd"),
             0,
             &SubagentType::General,
             AgentToolPolicyContext::unrestricted(),

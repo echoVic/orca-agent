@@ -141,6 +141,7 @@ pub(crate) fn provider_tool_schema_override(
 
 pub(crate) fn provider_config_for_agent_loop(
     config: &RunConfig,
+    cwd: &std::path::Path,
     subagent_depth: u32,
     subagent_type: &SubagentType,
     tool_policy: AgentToolPolicyContext<'_>,
@@ -156,6 +157,9 @@ pub(crate) fn provider_config_for_agent_loop(
     );
     if let Some(tools) = tools_override.as_mut() {
         omit_unavailable_shell_launch_tools(tools, &shell_readiness);
+        if !crate::workspace_git::is_git_work_tree(cwd) {
+            tools.retain(|tool| tool.name != "git_status");
+        }
         if !crate::computer_use::visibility::session_visible(config, subagent_depth)
             || tool_policy.allowed_tools().is_some()
         {
@@ -458,6 +462,7 @@ mod tests {
         let config = orca_core::config::RunConfig::default();
         let provider = super::provider_config_for_agent_loop(
             &config,
+            &std::env::current_dir().expect("cwd"),
             0,
             &orca_core::subagent_types::SubagentType::General,
             policy,
@@ -571,6 +576,64 @@ mod tests {
     }
 
     #[test]
+    fn provider_git_status_exposure_matches_prompt_and_stays_fixed_for_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let non_repo = tempfile::tempdir().unwrap();
+        assert!(
+            non_repo
+                .path()
+                .ancestors()
+                .all(|dir| !dir.join(".git").exists())
+        );
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(".git"), "gitdir: /unused/worktree\n").unwrap();
+        let registry = McpRegistry::default();
+
+        for (cwd, depth, is_repo) in [
+            (non_repo.path(), 0, false),
+            (repo.path(), 1, true),
+            (non_repo.path(), 0, false),
+        ] {
+            let mut config = config_with_external(Vec::new());
+            config.cwd = Some(cwd.to_path_buf());
+            // Exercise both call orders: the first decision must govern both consumers.
+            let prompt = (depth == 1).then(|| {
+                crate::system_prompt::build_system_prompt_for_config(cwd, &config, depth, None)
+            });
+            let provider = provider_config_for_agent_loop(
+                &config,
+                cwd,
+                depth,
+                &SubagentType::General,
+                AgentToolPolicyContext::unrestricted(),
+                &registry,
+            );
+            let tools = provider.tools_override.unwrap();
+            assert_eq!(schema_names(&tools).contains(&"git_status"), is_repo);
+            let prompt = prompt.unwrap_or_else(|| {
+                crate::system_prompt::build_system_prompt_for_config(cwd, &config, depth, None)
+            });
+            assert_eq!(prompt.contains("### git_status\n"), is_repo);
+            assert_eq!(prompt.contains("- Git repository: no\n"), !is_repo);
+            if !non_repo.path().join(".git").exists() {
+                std::fs::create_dir(non_repo.path().join(".git")).unwrap();
+            }
+        }
+
+        let mut config = config_with_external(Vec::new());
+        config.cwd = Some(non_repo.path().to_path_buf());
+        let requested = request(
+            ToolName::plain("git_status"),
+            ActionKind::Read,
+            None,
+            Some("{}"),
+        );
+        let invocation = prepare_tool_invocation(&requested, 0, &registry, &config);
+        assert!(validate_tool_invocation(&invocation, &registry, &config).is_ok());
+    }
+
+    #[test]
     fn an_approval_request_carries_the_invocation_preview() {
         let requested = request(
             ToolName::plain("computer"),
@@ -601,6 +664,7 @@ mod tests {
         let mcp = McpRegistry::default();
         let provider = provider_config_for_agent_loop(
             &config,
+            config.cwd.as_deref().unwrap(),
             0,
             &SubagentType::General,
             AgentToolPolicyContext::unrestricted(),
@@ -823,6 +887,7 @@ mod tests {
 
         let provider_config = provider_config_for_agent_loop(
             &config,
+            config.cwd.as_deref().unwrap(),
             1,
             &SubagentType::General,
             AgentToolPolicyContext::new(Some(&allowed), Some("test child")),
@@ -853,6 +918,7 @@ mod tests {
 
         let provider = provider_config_for_agent_loop(
             &config,
+            config.cwd.as_deref().unwrap(),
             0,
             &SubagentType::General,
             AgentToolPolicyContext::unrestricted(),

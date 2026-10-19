@@ -61,7 +61,7 @@ pub fn prepare_child_agent_loop(
 ) -> ChildAgentLoopSetup {
     let conversation =
         prepare_fresh_child_agent_conversation(config, request, cwd, instructions, memory);
-    build_child_agent_loop_setup(config, request, conversation, None, 0)
+    build_child_agent_loop_setup(config, request, cwd, conversation, None, 0)
 }
 
 /// Builds a production child setup. Fresh requests are exactly equivalent to
@@ -80,6 +80,7 @@ pub(crate) fn try_prepare_child_agent_loop(
     Ok(build_child_agent_loop_setup(
         config,
         request,
+        cwd,
         prepared.conversation,
         prepared.continuation,
         prepared.turn,
@@ -136,6 +137,7 @@ pub(crate) fn try_prepare_child_agent_conversation(
 fn build_child_agent_loop_setup(
     config: &RunConfig,
     request: &ChildAgentRequest,
+    cwd: &Path,
     conversation: Conversation,
     continuation: Option<ChildAgentContinuationRuntimeState>,
     turn: u32,
@@ -143,7 +145,7 @@ fn build_child_agent_loop_setup(
     let mcp_registry =
         orca_mcp::initialize_registry(&config.mcp_servers, config.mcp_credentials_path.clone());
     mcp_registry.wait_for_startup(&|| false);
-    let provider_config = ProviderConfig {
+    let mut provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: Some(orca_core::model::FLASH_MODEL.to_string()),
@@ -162,6 +164,11 @@ fn build_child_agent_loop_setup(
         external_tools: config.external_tools.clone(),
         max_output_tokens: None,
     };
+    if let Some(tools) = provider_config.tools_override.as_mut()
+        && !crate::workspace_git::is_git_work_tree(cwd)
+    {
+        tools.retain(|tool| tool.name != "git_status");
+    }
 
     let budget_model = config.model.as_option();
     let context_config = ContextConfig::for_model_with_runtime(
@@ -322,6 +329,48 @@ mod tests {
             continuation: None,
         };
         (config, request)
+    }
+
+    #[test]
+    fn child_git_status_catalog_matches_its_own_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let non_repo = tempfile::tempdir().unwrap();
+        assert!(
+            non_repo
+                .path()
+                .ancestors()
+                .all(|dir| !dir.join(".git").exists())
+        );
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        let (mut config, mut request) = computer_request();
+        config.cwd = Some(repo.path().to_path_buf());
+        config.subagents.effective_definition = None;
+        request.subagent_type = SubagentType::General;
+        request.allowed_tools = None;
+
+        for (cwd, is_repo) in [(non_repo.path(), false), (repo.path(), true)] {
+            let setup = prepare_child_agent_loop(
+                &config,
+                &request,
+                cwd,
+                &ProjectInstructions::default(),
+                &MemoryBlock::default(),
+            );
+            let prompt = setup.conversation.messages[0].content_str().unwrap();
+            assert_eq!(prompt.contains("### git_status\n"), is_repo);
+            assert_eq!(prompt.contains("- Git repository: no\n"), !is_repo);
+            assert_eq!(
+                setup
+                    .provider_config
+                    .tools_override
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool.name == "git_status"),
+                is_repo
+            );
+        }
     }
 
     #[test]

@@ -103,6 +103,7 @@ pub(crate) fn run_agent_loop(
     }
     let setup = RuntimeTurnSetupStep::new().prepare(
         config,
+        cwd,
         subagent_depth,
         subagent_type,
         loop_state.tool_policy(tool_policy),
