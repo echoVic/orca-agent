@@ -173,6 +173,7 @@ output = 1.5
 - 覆盖的价格是固定价，不乘高峰系数。覆盖多半用于第三方 endpoint，那里的规则与 DeepSeek 官方不同。
 - `ModelDefinition` 目前 derive 了 `Copy`/`Eq`，并参与别名冲突检查。价格字段要用一个在解析阶段就拒绝 NaN 的新类型（例如 `UsdPerMillion`）来保存，这样 `Eq` 依然成立；别名冲突检查会自然覆盖到价格字段。
 - 覆盖随会话的 `RunConfig` 传给该会话的 `CostTracker`，不放进全局状态，这样不同项目配置互不影响。
+- 项目级 `.orca/config.toml` 不能设置 `[pricing]`，也不能设置任何 `[models.*.pricing]`（`remove_project_denied_fields` 会删掉它们）。价格决定成本预算什么时候让运行停下，所以和 `budget` 一样只认用户配置。
 
 ```toml
 [pricing]

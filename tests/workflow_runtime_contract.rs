@@ -2398,6 +2398,7 @@ fn mock_run_config(cwd: &std::path::Path) -> RunConfig {
         vim_mode: false,
         vim_insert_escape: None,
         update_check: false,
+        pricing_refresh: false,
         desktop_notifications: false,
         terminal_notifications: false,
         auto_memory: false,

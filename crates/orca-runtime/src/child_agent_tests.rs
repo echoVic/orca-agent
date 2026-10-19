@@ -69,6 +69,7 @@ fn config(model: Option<&str>) -> RunConfig {
         vim_mode: false,
         vim_insert_escape: None,
         update_check: false,
+        pricing_refresh: false,
         desktop_notifications: false,
         terminal_notifications: false,
         auto_memory: false,
@@ -427,6 +428,7 @@ fn a_child_agent_on_a_custom_vision_model_gets_a_note_instead_of_tool_images() {
             CUSTOM_MODEL.to_string(),
             orca_core::model::ModelDefinition {
                 supports_images: Some(true),
+                ..orca_core::model::ModelDefinition::default()
             },
         )]),
     )

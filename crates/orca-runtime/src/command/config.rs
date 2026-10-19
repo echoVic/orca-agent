@@ -116,6 +116,7 @@ pub fn assemble_run_config(
         vim_mode: file.vim_mode,
         vim_insert_escape: file.vim_insert_escape,
         update_check: file.update_check,
+        pricing_refresh: file.pricing.refresh,
         desktop_notifications,
         terminal_notifications: file.terminal_notifications,
         auto_memory: file.auto_memory,
@@ -152,6 +153,7 @@ mod tests {
                 model.to_string(),
                 ModelDefinition {
                     supports_images: Some(true),
+                    ..ModelDefinition::default()
                 },
             )]),
             ..FileConfig::default()
@@ -295,5 +297,22 @@ mod tests {
         let config = assemble_run_config(request, file).unwrap();
 
         assert!(!config.desktop_notifications);
+    }
+
+    #[test]
+    fn run_config_carries_the_pricing_refresh_switch() {
+        let request = || RunConfigRequest::new("0.0.0", PathBuf::from("/workspace"));
+        assert!(
+            assemble_run_config(request(), FileConfig::default())
+                .unwrap()
+                .pricing_refresh
+        );
+        let mut file = FileConfig::default();
+        file.pricing.refresh = false;
+        assert!(
+            !assemble_run_config(request(), file)
+                .unwrap()
+                .pricing_refresh
+        );
     }
 }

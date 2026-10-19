@@ -1085,6 +1085,7 @@ fn test_config(cwd: PathBuf, history_mode: HistoryMode) -> RunConfig {
         vim_mode: false,
         vim_insert_escape: None,
         update_check: false,
+        pricing_refresh: false,
         desktop_notifications: false,
         terminal_notifications: false,
         auto_memory: false,
