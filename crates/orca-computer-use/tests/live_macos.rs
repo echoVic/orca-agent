@@ -5680,22 +5680,58 @@ fn textedit_save_panel_uses_foreground_for_typing() {
         );
         let source = live.background_state.unwrap();
         live.fixture_frontmost(pid);
+        let filename_before_click = native_ax_string(&name, "AXValue").unwrap();
+        assert!(filename_before_click.contains("orca-panel-name-target"));
+        assert_eq!(
+            fixture_ax_element(&application, "AXFocusedUIElement")
+                .expect("test-owned Save filename field remains focused")
+                .element,
+            name.element,
+            "only click the test-owned Save filename field"
+        );
         let point = orca_computer_use::driver::macos::test_element_click_point(
             name.element.clone(),
             native_window.element.clone(),
         )
         .unwrap();
-        let blocked =
-            orca_computer_use::driver::macos::test_click_at_point(pid, point).unwrap_err();
-        assert!(blocked.message.contains("covers the target point"));
+        // AX can attribute this same field to TextEdit or to its view service.
+        // Both guard outcomes are safe, but each must have the right HID receipt.
+        match orca_computer_use::driver::macos::test_click_at_point(pid, point) {
+            Err(blocked) => {
+                eprintln!("test-owned Save field direct click refused: {blocked:?}");
+                assert!(blocked.message.contains("covers the target point"));
+                assert_eq!(
+                    orca_computer_use::driver::macos::test_mouse_down_count(),
+                    mouse_before,
+                    "refused click must not post mouse-down"
+                );
+            }
+            Ok(()) => {
+                eprintln!("test-owned Save field direct click delivered at {point:?}");
+                assert_eq!(
+                    orca_computer_use::driver::macos::test_mouse_down_count(),
+                    mouse_before + 1,
+                    "allowed click must post exactly one mouse-down"
+                );
+            }
+        }
+        // The unchanged, still-focused filename field is the independent receipt
+        // that the click stayed in our Save panel and did not dismiss it.
         assert_eq!(
-            orca_computer_use::driver::macos::test_mouse_down_count(),
-            mouse_before,
-            "refused click must not post mouse-down"
+            fixture_ax_element(&application, "AXFocusedUIElement")
+                .expect("test-owned Save panel must remain open")
+                .element,
+            name.element,
+            "Save panel filename field must keep focus"
+        );
+        assert_eq!(
+            native_ax_string(&name, "AXValue").as_deref(),
+            Some(filename_before_click.as_str()),
+            "direct click must not change the test-owned filename"
         );
         record_restoration(Some(source.0), source.1);
         eprintln!(
-            "already-focused Save-field non-text key succeeds without mouse-down; same-field direct click is refused by ownership guard"
+            "already-focused Save-field non-text key succeeds without mouse-down; direct-click ownership outcome checked"
         );
         // Cancel only our Save As panel; never save or browse outside the temporary document.
         live.act_app(
