@@ -76,7 +76,8 @@ mod tests {
         assert!(parent_prompt.contains("- Git repository: no\n"));
 
         let child = tempfile::tempdir().unwrap();
-        std::fs::write(child.path().join(".git"), "gitdir: /unused/worktree\n").unwrap();
+        std::fs::create_dir(child.path().join("metadata")).unwrap();
+        std::fs::write(child.path().join(".git"), "gitdir: metadata\n").unwrap();
         let prompt =
             crate::system_prompt::build_system_prompt_for_config(child.path(), &config, 1, None);
         let setup = RuntimeTurnSetupStep::new().prepare(

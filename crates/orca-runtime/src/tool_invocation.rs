@@ -647,7 +647,8 @@ mod tests {
                 .all(|dir| !dir.join(".git").exists())
         );
         let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join(".git"), "gitdir: /unused/worktree\n").unwrap();
+        std::fs::create_dir(repo.path().join("metadata")).unwrap();
+        std::fs::write(repo.path().join(".git"), "gitdir: metadata\n").unwrap();
         let registry = McpRegistry::default();
 
         for (cwd, depth, is_repo) in [
@@ -678,6 +679,8 @@ mod tests {
             assert_eq!(prompt.contains("- Git repository: no\n"), !is_repo);
             if !non_repo.path().join(".git").exists() {
                 std::fs::create_dir(non_repo.path().join(".git")).unwrap();
+                std::fs::write(non_repo.path().join(".git/HEAD"), "ref: refs/heads/main\n")
+                    .unwrap();
             }
         }
 

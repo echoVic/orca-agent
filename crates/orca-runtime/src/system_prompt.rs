@@ -245,6 +245,7 @@ mod tests {
     fn repo_prompt_preserves_existing_text_except_non_repo_git_context() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::fs::write(repo.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let non_repo = tempfile::tempdir().unwrap();
         assert!(
             non_repo

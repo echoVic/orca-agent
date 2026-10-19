@@ -460,6 +460,7 @@ mod tests {
         );
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::fs::write(repo.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let (mut config, mut request) = computer_request();
         config.cwd = Some(repo.path().to_path_buf());
         config.subagents.effective_definition = None;
