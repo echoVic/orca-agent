@@ -118,9 +118,7 @@ fn point_is_uncovered(
         .any(|window| window.owner_pid == hit_pid && is_overlay(window))
         && windows
             .iter()
-            .find(|window| {
-                window.alpha != 0.0 && contains(window.bounds, point) && !is_overlay(window)
-            })
+            .find(|window| contains(window.bounds, point) && !is_overlay(window))
             .is_some_and(|window| window.owner_pid == target_pid)
 }
 
@@ -364,15 +362,38 @@ mod tests {
     }
 
     #[test]
-    fn transparent_and_off_point_windows_are_skipped_in_stack_order() {
+    fn a_transparent_window_over_the_target_is_refused() {
         let mut transparent = window(OTHER);
         transparent.alpha = 0.0;
+        assert!(!uncovered(
+            &[overlay(), transparent.clone(), window(TARGET)],
+            UU,
+        ));
+        assert!(!uncovered(&[transparent, overlay(), window(TARGET)], UU,));
+    }
+
+    #[test]
+    fn off_point_windows_are_skipped_in_stack_order() {
         let mut off_point = window(OTHER);
         off_point.bounds = [900.0, 100.0, 200.0, 200.0];
         assert!(uncovered(
-            &[transparent, overlay(), off_point, window(TARGET)],
+            &[off_point.clone(), overlay(), off_point, window(TARGET)],
             UU,
         ));
+    }
+
+    #[test]
+    fn invalid_window_alpha_and_bounds_are_refused() {
+        for alpha in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            let mut invalid = window(OTHER);
+            invalid.alpha = alpha;
+            assert!(!uncovered(&[overlay(), invalid, window(TARGET)], UU));
+        }
+        for bounds in [[f64::NAN, 0.0, 1.0, 1.0], [0.0, 0.0, -1.0, 1.0]] {
+            let mut invalid = window(OTHER);
+            invalid.bounds = bounds;
+            assert!(!uncovered(&[overlay(), invalid, window(TARGET)], UU));
+        }
     }
 
     #[test]
