@@ -5333,6 +5333,9 @@ fn native_ax_pid(element: &NativeAxElement) -> i32 {
 
 fn textedit_save_panel_uses_foreground_for_typing() {
     run_live_test(|| {
+        use objc2_application_services::{AXError, AXValue, AXValueType};
+        use objc2_core_foundation::{CFRange, CFString};
+
         let Some(mut live) = Live::start() else {
             return;
         };
@@ -5356,6 +5359,22 @@ fn textedit_save_panel_uses_foreground_for_typing() {
             .id;
         let native_window = native_window_named(pid, "orca-cu-save-panel.txt");
         let editor = fixture_ax_role(&native_window, "AXTextArea").unwrap();
+        // Element type preserves an already-focused editor's selection. Set a
+        // known caret instead of depending on TextEdit's initial selection.
+        set_fixture_ax_bool(&editor, "AXFocused", true);
+        let caret = CFRange::new(0, 0);
+        let selection =
+            unsafe { AXValue::new(AXValueType::CFRange, std::ptr::NonNull::from(&caret).cast()) }
+                .unwrap();
+        assert_eq!(
+            unsafe {
+                editor.set_attribute_value(
+                    &CFString::from_str("AXSelectedTextRange"),
+                    selection.as_ref(),
+                )
+            },
+            AXError::Success
+        );
         live.make_finder_frontmost();
         let observed = live.observe_window("com.apple.TextEdit", Some(window), None, 300, false);
         let area = observed
@@ -5378,7 +5397,7 @@ fn textedit_save_panel_uses_foreground_for_typing() {
         assert!(!control.foreground_used);
         assert_eq!(
             native_ax_string(&editor, "AXValue").as_deref(),
-            Some("Seed.Background control"),
+            Some("Background controlSeed."),
             "main-editor background positive control"
         );
         live.assert_frontmost_and_pointer_unchanged();
