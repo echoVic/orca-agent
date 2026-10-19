@@ -172,7 +172,7 @@ output = 1.5
 - 三个字段都必须写，都是有限数且 ≥ 0，不合法时配置加载报错。
 - 覆盖的价格是固定价，不乘高峰系数。覆盖多半用于第三方 endpoint，那里的规则与 DeepSeek 官方不同。
 - `ModelDefinition` 目前 derive 了 `Copy`/`Eq`，并参与别名冲突检查。价格字段要用一个在解析阶段就拒绝 NaN 的新类型（例如 `UsdPerMillion`）来保存，这样 `Eq` 依然成立；别名冲突检查会自然覆盖到价格字段。
-- 价格覆盖只来自用户配置，因此保存在进程级状态里；每个会话启动时写入，之后创建的所有 `CostTracker` 都应用这些覆盖，包括子代理和挂起 / 后台任务的成本结算。
+- 价格覆盖只来自用户配置，因此保存在进程级状态里；每个进程构建运行配置时写入，所有入口（包括 detached worker）都经过这里。长时间运行的进程使用最近一次加载的用户配置，之后创建的所有 `CostTracker` 都应用其快照，包括子代理和挂起 / 后台任务的成本结算。
 - 项目级 `.orca/config.toml` 不能设置 `[pricing]`，也不能设置任何 `[models.*.pricing]`（`remove_project_denied_fields` 会删掉它们）。价格决定成本预算什么时候让运行停下，所以和 `budget` 一样只认用户配置。
 
 ```toml
@@ -195,7 +195,7 @@ refresh = false   # 关闭每天一次的 models.dev 刷新；默认为 true
   - orca-core 中 `ModelDefinition` 增加可选的 `pricing`。
   - `FileConfig`/`RawFileConfig` 增加 `pricing: { refresh }`，并接入配置合并和 `RunConfig`。
   - orca-core 的 `format_config_show` 增加一行 `pricing_refresh = <bool>`，位置挨着 `update_check`。
-- `InteractiveSession` 的内部构造函数触发 1.5 的刷新检查，随后将用户配置的价格覆盖写入进程级状态，再通过 `CostTracker::new` 构造会话的 tracker。
+- `build_run_config` 在配置组装后将用户价格覆盖写入进程级状态；`InteractiveSession` 的内部构造函数触发 1.5 的刷新检查，再通过 `CostTracker::new` 构造会话的 tracker。
 - `orca doctor`：文本和 JSON 输出都增加 pricing 一项，包含：
   - 来源：内置（附日期），或 models.dev（附抓取时间）；
   - 刷新是否开启；

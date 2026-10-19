@@ -48,7 +48,11 @@ impl RunConfigRequest {
 
 pub fn build_run_config(request: RunConfigRequest) -> Result<RunConfig, String> {
     let file = load_effective_config(&request.config_cwd, request.overrides.clone())?;
-    assemble_run_config(request, file)
+    let config = assemble_run_config(request, file)?;
+    crate::pricing::book::set_user_overrides(crate::pricing::rates_from_overrides(
+        &config.model.price_overrides(),
+    ));
+    Ok(config)
 }
 
 pub fn assemble_run_config(
@@ -134,6 +138,49 @@ mod tests {
     use orca_core::model::ModelDefinition;
 
     use super::*;
+
+    #[test]
+    fn build_run_config_installs_latest_user_prices_for_every_tracker() {
+        crate::pricing::tests::with_isolated_user_overrides(|| {
+            let home = orca_core::home::orca_home().expect("isolated ORCA_HOME");
+            let cwd = tempfile::tempdir().unwrap();
+            let model = "build-run-config-user-price-probe";
+            std::fs::write(
+                home.join("config.toml"),
+                format!(
+                    r#"
+model = "{model}"
+[pricing]
+refresh = false
+[models."{model}".pricing]
+input_cache_miss = 1.0
+input_cache_hit = 0.5
+output = 2.0
+"#
+                ),
+            )
+            .unwrap();
+            let config = build_run_config(RunConfigRequest::new("test", cwd.path().into()))
+                .expect("build config without an interactive session");
+            assert_eq!(config.model.as_deref(), Some(model));
+            let mut tracker = crate::cost::CostTracker::new(Some(model))
+                .with_clock(crate::pricing::rates::peak_instant);
+            let totals = tracker.add_usage(orca_core::provider_types::Usage {
+                input_tokens: 1_000_000,
+                output_tokens: 1_000_000,
+                cache_tokens: 500_000,
+            });
+            assert!(
+                (totals.estimated_cost_usd - 2.75).abs() < 1e-12,
+                "{totals:?}"
+            );
+
+            // Loading a newer user config replaces the process map, including removals.
+            std::fs::write(home.join("config.toml"), "[pricing]\nrefresh = false\n").unwrap();
+            build_run_config(RunConfigRequest::new("test", cwd.path().into())).unwrap();
+            assert!(!crate::pricing::book::user_overrides().contains_key(model));
+        });
+    }
 
     #[test]
     fn missing_file_mode_defaults_to_auto_edit() {

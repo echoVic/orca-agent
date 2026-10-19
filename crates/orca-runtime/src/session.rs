@@ -240,9 +240,6 @@ impl InteractiveSession {
         runtime_thread_id: Option<String>,
     ) -> io::Result<Self> {
         crate::pricing::refresh::ensure_background_refresh(config.pricing_refresh);
-        crate::pricing::book::set_user_overrides(crate::pricing::rates_from_overrides(
-            &config.model.price_overrides(),
-        ));
         let cwd = config
             .cwd
             .clone()
@@ -965,56 +962,6 @@ mod tests {
         let _guard = history::lock_test_env();
         let home = history::isolated_test_orca_home_subdir("with-orca-home");
         history::with_test_orca_home(&home, f)
-    }
-
-    #[test]
-    fn session_installs_user_price_overrides_for_other_trackers() {
-        crate::pricing::tests::with_isolated_user_overrides(|| {
-            with_orca_home(|home| {
-                use orca_core::model::{ModelDefinition, ModelPriceOverride, UsdPerMillion};
-
-                let model = "session-user-override-probe";
-                let mut cfg = config(home.to_path_buf(), HistoryMode::Disabled);
-                cfg.model = ModelSelection::parse_with_models(
-                    Some(model.to_string()),
-                    std::collections::BTreeMap::from([(
-                        model.to_string(),
-                        ModelDefinition {
-                            pricing: Some(ModelPriceOverride {
-                                input_cache_miss: UsdPerMillion::new(1.0).unwrap(),
-                                input_cache_hit: UsdPerMillion::new(0.5).unwrap(),
-                                output: UsdPerMillion::new(2.0).unwrap(),
-                            }),
-                            ..ModelDefinition::default()
-                        },
-                    )]),
-                )
-                .expect("model override");
-                let _session = InteractiveSession::new_with_preloaded_and_mcp_registry(
-                    &cfg,
-                    "pricing override",
-                    None,
-                    McpRegistry::default(),
-                )
-                .expect("session");
-                assert_eq!(
-                    crate::pricing::book::user_overrides().get(model),
-                    Some(&crate::pricing::rates::Rates {
-                        input_cache_miss: 1.0,
-                        input_cache_hit: 0.5,
-                        output: 2.0,
-                    })
-                );
-                let mut tracker =
-                    CostTracker::new(Some(model)).with_clock(crate::pricing::rates::peak_instant);
-                let totals = tracker.add_usage(orca_core::provider_types::Usage {
-                    input_tokens: 1_000_000,
-                    output_tokens: 1_000_000,
-                    cache_tokens: 500_000,
-                });
-                assert!((totals.estimated_cost_usd - 2.75).abs() < 1e-12);
-            });
-        });
     }
 
     #[test]
