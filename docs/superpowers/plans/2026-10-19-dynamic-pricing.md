@@ -2411,3 +2411,5 @@ git commit -m "docs: explain peak-hour cost estimates and the pricing settings" 
 - Batch E5：缓存新鲜度和 ETag 仅用于相同 source URL，切换来源时无条件抓取且替换缓存。
 - Batch E6：未知模型的抓取与缓存价格按 Flash/Pro 每字段范围做 ±10 倍校验，拒绝零价和单位缩放错误，用户覆盖不受此校验影响。
 - Batch E7：读取缓存时传入当前时间并忽略超前一天以上的抓取时间，新鲜度限定为非负且不足 24 小时；规格记录 release 自定义 target-dir 的联网保护限制。
+
+- Batch F1：可信项目层导致合并配置解析失败时重试用户层，成功则告警并忽略项目配置，保留用户预算和价格覆盖；用户层也无效时仍告警并使用默认配置。

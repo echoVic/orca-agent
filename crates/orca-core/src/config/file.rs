@@ -405,19 +405,29 @@ fn load_layered_config_from_optional_paths(
     let project_is_trusted = user_path.and_then(Path::parent).is_some_and(|config_dir| {
         super::folder_trust::is_trusted_with_config_dir(project_root, config_dir)
     });
-    if project_is_trusted
-        && let Some(mut project) = load_toml_value(&project_root.join(".orca/config.toml"))
-    {
+    let project_path = project_root.join(".orca/config.toml");
+    let mut user_layer = None;
+    if project_is_trusted && let Some(mut project) = load_toml_value(&project_path) {
         remove_project_denied_fields(&mut project);
+        user_layer = Some(merged.clone());
         merge_toml_values(&mut merged, project);
     }
 
     let mut config = match file_config_from_value(merged) {
         Ok(config) => config,
-        Err(error) => {
-            eprintln!("orca: warning: config parse error, using defaults: {error}");
-            FileConfig::default()
-        }
+        Err(error) => match user_layer.and_then(|user| file_config_from_value(user).ok()) {
+            Some(config) => {
+                eprintln!(
+                    "orca: warning: project config parse error in {}, ignoring it: {error}",
+                    project_path.display()
+                );
+                config
+            }
+            None => {
+                eprintln!("orca: warning: config parse error, using defaults: {error}");
+                FileConfig::default()
+            }
+        },
     };
     if config.api_key.is_none() {
         if let Some(path) = user_path.and_then(Path::parent) {
@@ -2102,6 +2112,84 @@ vim_insert_escape = "jj"
     fn load_auth_key_missing_file() {
         let key = load_auth_key(Path::new("/nonexistent/auth.json"));
         assert!(key.is_none());
+    }
+
+    fn assert_broken_project_preserves_user_config(project_source: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_dir = dir.path().join("project");
+        fs::create_dir_all(project_dir.join(".orca")).unwrap();
+        fs::write(
+            &user_path,
+            r#"
+model = "x"
+theme = "dark"
+vim_mode = true
+[budget]
+max_cost_usd_micros = 12_500_000
+[models."x".pricing]
+input_cache_miss = 0.5
+input_cache_hit = 0.05
+output = 2.0
+"#,
+        )
+        .unwrap();
+        fs::write(project_dir.join(".orca/config.toml"), project_source).unwrap();
+        crate::config::folder_trust::set_trust_with_config_dir(
+            &project_dir,
+            dir.path(),
+            crate::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+
+        let config = load_layered_config_from_paths(&user_path, &project_dir);
+        assert_eq!(config.budget.max_cost_usd_micros, Some(12_500_000));
+        assert_eq!(config.model.as_deref(), Some("x"));
+        assert_eq!(config.theme, crate::config::ThemeName::Dark);
+        assert!(config.vim_mode);
+        let pricing = config.models["x"].pricing.unwrap();
+        assert_eq!(pricing.input_cache_miss.get(), 0.5);
+        assert_eq!(pricing.input_cache_hit.get(), 0.05);
+        assert_eq!(pricing.output.get(), 2.0);
+    }
+
+    #[test]
+    fn layered_config_broken_project_models_preserves_user_config() {
+        assert_broken_project_preserves_user_config("models = []\n");
+    }
+
+    #[test]
+    fn layered_config_broken_project_theme_preserves_user_config() {
+        assert_broken_project_preserves_user_config("theme = 5\nvim_mode = false\n");
+    }
+
+    #[test]
+    fn layered_config_invalid_user_still_falls_back_to_defaults() {
+        for project_source in [None, Some("models = []\n")] {
+            let dir = tempfile::tempdir().unwrap();
+            let user_path = dir.path().join("user.toml");
+            let project_dir = dir.path().join("project");
+            fs::create_dir_all(project_dir.join(".orca")).unwrap();
+            fs::write(
+                &user_path,
+                "theme = 5\nvim_mode = true\n[budget]\nmax_cost_usd_micros = 12_500_000\n",
+            )
+            .unwrap();
+            if let Some(source) = project_source {
+                fs::write(project_dir.join(".orca/config.toml"), source).unwrap();
+            }
+            crate::config::folder_trust::set_trust_with_config_dir(
+                &project_dir,
+                dir.path(),
+                crate::config::folder_trust::TrustLevel::Trusted,
+            )
+            .unwrap();
+
+            let config = load_layered_config_from_paths(&user_path, &project_dir);
+            assert_eq!(config.budget, FileConfig::default().budget);
+            assert_eq!(config.theme, FileConfig::default().theme);
+            assert_eq!(config.vim_mode, FileConfig::default().vim_mode);
+        }
     }
 
     #[test]
