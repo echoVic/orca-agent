@@ -11,7 +11,7 @@ use crate::pricing::rates::{self, Rates};
 use crate::pricing::rates_from_overrides;
 
 pub(crate) fn usd_to_micros(usd: f64) -> u64 {
-    if usd.is_finite() && usd > 0.0 {
+    if usd > 0.0 {
         (usd * 1_000_000.0).round().min(u64::MAX as f64) as u64
     } else {
         0
@@ -308,6 +308,14 @@ mod tests {
         let tracker =
             CostTracker::with_overrides(Some("my-model"), &overrides).with_clock(peak_instant);
         assert_eq!(cost(tracker, usage(5_000_000, 2_000_000, 1_000_000)), 0.0);
+    }
+
+    #[test]
+    fn usd_to_micros_saturates_positive_infinity() {
+        assert_eq!(usd_to_micros(f64::INFINITY), u64::MAX);
+        assert_eq!(usd_to_micros(f64::MAX), u64::MAX);
+        assert_eq!(usd_to_micros(f64::NEG_INFINITY), 0);
+        assert_eq!(usd_to_micros(f64::NAN), 0);
     }
 
     #[test]

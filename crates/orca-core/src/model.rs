@@ -12,7 +12,7 @@ pub const VISION_MODEL: &str = FLASH_MODEL;
 pub const PRO_MODEL: &str = "deepseek-v4-pro";
 pub const AUTO_MODEL: &str = "auto";
 
-/// A price in US dollars per million tokens: finite and not negative, so two
+/// A price in US dollars per million tokens: finite and in 0..=10,000, so two
 /// prices compare like integers do.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -22,7 +22,7 @@ impl Eq for UsdPerMillion {}
 
 impl UsdPerMillion {
     pub fn new(value: f64) -> Option<Self> {
-        (value.is_finite() && value >= 0.0).then_some(Self(value))
+        (value.is_finite() && (0.0..=10_000.0).contains(&value)).then_some(Self(value))
     }
 
     pub fn get(self) -> f64 {
@@ -38,7 +38,7 @@ impl<'de> Deserialize<'de> for UsdPerMillion {
         let value = f64::deserialize(deserializer)?;
         Self::new(value).ok_or_else(|| {
             serde::de::Error::custom(
-                "a price must be a finite, non-negative number of US dollars per million tokens",
+                "a price must be a finite number between 0 and 10,000 US dollars per million tokens",
             )
         })
     }
@@ -565,6 +565,15 @@ mod tests {
         assert_eq!(UsdPerMillion::new(1.5).map(UsdPerMillion::get), Some(1.5));
         for bad in [-0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(UsdPerMillion::new(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn usd_per_million_rejects_huge_finite_prices() {
+        assert_eq!(UsdPerMillion::new(10_000.0).unwrap().get(), 10_000.0);
+        for value in [10_000.01, 1e308] {
+            assert!(UsdPerMillion::new(value).is_none(), "{value}");
+            assert!(serde_json::from_str::<UsdPerMillion>(&value.to_string()).is_err());
         }
     }
 
