@@ -54,6 +54,10 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(windows))]
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 const WORKFLOW_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+// Background completion includes starting worker threads (and, for saved
+// workflows, Node), durable state publication and the fixture's provider work.
+// These are liveness waits; keep the shorter cancellation contracts separate.
+const BACKGROUND_WORK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct OneShotProviderSuspension {
@@ -1605,7 +1609,7 @@ fn an_agent_launched_after_a_finished_turn_starts_its_child_thread() {
             io::sink(),
         )
         .expect("start the agent turn");
-    let deadline = Instant::now() + TEST_TIMEOUT;
+    let deadline = Instant::now() + BACKGROUND_WORK_TIMEOUT;
     loop {
         let failed = thread
             .task_registry()
@@ -1634,11 +1638,7 @@ fn an_agent_launched_after_a_finished_turn_starts_its_child_thread() {
     std::fs::write(&release_marker, b"release").expect("release the agent");
     assert_eq!(
         operation
-            .wait_timeout(if cfg!(windows) {
-                Duration::from_secs(30)
-            } else {
-                Duration::from_secs(10)
-            })
+            .wait_timeout(BACKGROUND_WORK_TIMEOUT)
             .expect("agent turn terminal")
             .outcome(),
         &OperationOutcome::Completed(RunStatus::Success)
@@ -2739,7 +2739,7 @@ fn canonical_hosted_bash_streams_output_before_tool_terminal() {
         .expect("start canonical shell turn");
     assert_eq!(
         operation
-            .wait_timeout(TEST_TIMEOUT)
+            .wait_timeout(BACKGROUND_WORK_TIMEOUT)
             .expect("canonical shell terminal")
             .outcome(),
         &OperationOutcome::Completed(RunStatus::Success)
@@ -3841,7 +3841,7 @@ fn wait_until_task_status(
     task_id: &str,
     expected: TaskStatus,
 ) {
-    let deadline = Instant::now() + TEST_TIMEOUT;
+    let deadline = Instant::now() + BACKGROUND_WORK_TIMEOUT;
     loop {
         if thread
             .task_registry()
