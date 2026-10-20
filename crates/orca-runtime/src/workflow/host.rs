@@ -1306,6 +1306,10 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
 
     #[test]
     fn host_control_cancels_silent_workflow_promptly() {
+        // The Node-discovery tests temporarily replace ORCA_NODE_PATH/PATH.
+        // Keep discovery and launch in the same environment scope so this
+        // test cannot run a fake Node that exits instead of staying silent.
+        let _guard = crate::history::lock_test_env();
         if !WorkflowHost::node_available() {
             return;
         }
