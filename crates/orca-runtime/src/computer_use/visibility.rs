@@ -3,12 +3,10 @@ use orca_core::approval_types::Decision;
 use orca_core::config::RunConfig;
 
 pub(crate) fn session_visible(config: &RunConfig, subagent_depth: u32) -> bool {
-    tool_visible(
-        config,
-        subagent_depth,
-        configured_tools(config),
-        orca_computer_use::apps::host_supported(),
-    )
+    // Avoid native host probing when session policy already hides the tool.
+    // The first macOS version query can block while Foundation initializes.
+    tool_visible(config, subagent_depth, configured_tools(config), true)
+        && orca_computer_use::apps::host_supported()
 }
 
 pub(crate) fn configured_tools(config: &RunConfig) -> Option<&[String]> {

@@ -242,6 +242,7 @@ fn real_api_config(api_key: String, max_cost_usd_micros: u64) -> Result<RunConfi
         vim_mode: false,
         vim_insert_escape: None,
         update_check: false,
+        pricing_refresh: false,
         desktop_notifications: false,
         terminal_notifications: false,
         auto_memory: false,

@@ -32,6 +32,8 @@ pub use compaction::{
 mod acp_stall_trace;
 pub mod controller;
 pub mod cost;
+pub mod pricing;
+
 pub mod diagnostics;
 pub mod execution_broker;
 pub mod execution_journal;
@@ -377,6 +379,7 @@ pub mod tool_turn;
 pub mod update_check;
 pub mod workflow;
 pub mod workflow_execution;
+mod workspace_git;
 pub mod worktree;
 
 #[cfg(test)]

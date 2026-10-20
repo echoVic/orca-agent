@@ -239,6 +239,12 @@ impl InteractiveSession {
         prepared_record_meta: Option<SessionMeta>,
         runtime_thread_id: Option<String>,
     ) -> io::Result<Self> {
+        crate::pricing::refresh::ensure_background_refresh(config.pricing_refresh);
+        // Like build_run_config (also used by detached workers), install the
+        // user-config map for callers that supply a RunConfig directly.
+        crate::pricing::book::set_user_overrides(crate::pricing::rates_from_overrides(
+            &config.model.price_overrides(),
+        ));
         let cwd = config
             .cwd
             .clone()
@@ -418,6 +424,7 @@ impl InteractiveSession {
             && !matches!(config.history_mode, HistoryMode::Disabled))
         .then(memory::AutomaticMemoryWorker::start)
         .flatten();
+        let cost_tracker = CostTracker::new(None);
         let session = Self {
             store,
             conversation,
@@ -426,7 +433,7 @@ impl InteractiveSession {
             next_event_seq,
             completion_error: None,
             instructions,
-            cost_tracker: CostTracker::new(None),
+            cost_tracker,
             usage_baseline,
             mcp_registry,
             hooks,
@@ -944,6 +951,7 @@ mod tests {
             vim_mode: false,
             vim_insert_escape: None,
             update_check: false,
+            pricing_refresh: false,
             desktop_notifications: false,
             terminal_notifications: false,
             auto_memory: false,
@@ -962,6 +970,45 @@ mod tests {
     }
 
     #[test]
+    fn session_from_handmade_run_config_installs_user_price_overrides() {
+        crate::pricing::tests::with_isolated_user_overrides(|| {
+            use orca_core::model::{ModelDefinition, ModelPriceOverride, UsdPerMillion};
+
+            let cwd = tempdir().unwrap();
+            let model = "handmade-session-user-price-probe";
+            let mut cfg = config(cwd.path().into(), HistoryMode::Disabled);
+            cfg.model = ModelSelection::parse_with_models(
+                Some(model.into()),
+                std::collections::BTreeMap::from([(
+                    model.into(),
+                    ModelDefinition {
+                        pricing: Some(ModelPriceOverride {
+                            input_cache_miss: UsdPerMillion::new(1.0).unwrap(),
+                            input_cache_hit: UsdPerMillion::new(0.5).unwrap(),
+                            output: UsdPerMillion::new(2.0).unwrap(),
+                        }),
+                        ..ModelDefinition::default()
+                    },
+                )]),
+            )
+            .unwrap();
+            assert!(!crate::pricing::book::user_overrides().contains_key(model));
+
+            let _session = InteractiveSession::new_with_preloaded(&cfg, "price probe", None)
+                .expect("session from a hand-made RunConfig");
+
+            assert_eq!(
+                crate::pricing::book::user_overrides().get(model),
+                Some(&crate::pricing::rates::Rates {
+                    input_cache_miss: 1.0,
+                    input_cache_hit: 0.5,
+                    output: 2.0,
+                })
+            );
+        });
+    }
+
+    #[test]
     fn headless_main_session_prompt_does_not_advertise_computer() {
         with_computer_prompt_home(|home| {
             let mut cfg = config(home.to_path_buf(), HistoryMode::Disabled);
@@ -973,7 +1020,7 @@ mod tests {
             )
             .expect("session");
             let prompt = session.conversation.messages[0].content_str().unwrap();
-            assert!(prompt.contains("### read_file"));
+            assert!(prompt.contains("`read_file`, `glob`, and `grep`"));
             assert!(!prompt.contains("### computer"));
             cfg.computer_use.interactive = true;
             let session = InteractiveSession::new_with_preloaded_and_mcp_registry(
@@ -984,10 +1031,7 @@ mod tests {
             )
             .expect("interactive session");
             let prompt = session.conversation.messages[0].content_str().unwrap();
-            assert_eq!(
-                prompt.contains("### computer"),
-                orca_computer_use::apps::host_supported()
-            );
+            assert!(!prompt.contains("### computer"));
         });
     }
 
@@ -1010,7 +1054,7 @@ mod tests {
             )
             .expect("session");
             let prompt = session.conversation.messages[0].content_str().unwrap();
-            assert!(prompt.contains("### read_file"));
+            assert!(prompt.contains("`read_file`, `glob`, and `grep`"));
             assert!(!prompt.contains("### computer"));
         });
     }
@@ -1037,7 +1081,7 @@ mod tests {
             )
             .expect("session");
             let prompt = session.conversation.messages[0].content_str().unwrap();
-            assert!(prompt.contains("### read_file"));
+            assert!(prompt.contains("`read_file`, `glob`, and `grep`"));
             assert!(!prompt.contains("### computer"));
             assert!(!prompt.contains("### bash"));
             assert!(prompt.contains("Report source findings."));

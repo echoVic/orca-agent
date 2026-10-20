@@ -98,11 +98,19 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
     let mut runnable = Vec::new();
     let mut event_error = None;
 
+    let event_registry =
+        orca_tools::registry::tool_registry_with_mcp_and_external(Some(mcp_registry), &[]);
     for (idx, tool_request) in tool_requests.iter().enumerate() {
         if emit_deltas {
             retain_first_event_error(
                 &mut event_error,
-                sink.emit(events.tool_call_requested(tool_request)),
+                sink.emit(
+                    crate::lifecycle::RuntimeTaskActor::tool_call_requested_event_with_registry_for(
+                        events,
+                        tool_request,
+                        &event_registry,
+                    ),
+                ),
             );
         }
         if cancel.is_cancelled() {
@@ -379,6 +387,57 @@ mod tests {
     use crate::thread::RuntimeThread;
 
     use super::*;
+
+    #[test]
+    fn readonly_batch_requested_events_derive_provider_targets() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("notes.txt"), "hello").unwrap();
+        let requests = [ToolRequest {
+            id: "provider-read".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(r#"{"path":"notes.txt"}"#.to_string()),
+        }];
+        let mut events = EventFactory::new("readonly-target".to_string());
+        let mut bytes = Vec::new();
+        let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+            cwd: cwd.path(),
+            events: &mut events,
+            sink: &mut EventSink::new(&mut bytes, OutputFormat::Jsonl),
+            tool_requests: &requests,
+            emit_deltas: true,
+            mcp_registry: &McpRegistry::default(),
+            hooks: &HookRunner::default(),
+            cancel: &CancelToken::new(),
+            output_truncation: ToolOutputTruncation::default(),
+            max_parallel: 2,
+            provider_response_ingress: None,
+        })
+        .unwrap();
+        assert!(execution.event_error.is_none());
+        assert_eq!(
+            execution.results[0].status,
+            ToolStatus::Completed,
+            "{:?}",
+            execution.results[0]
+        );
+        let events = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let requested = events
+            .iter()
+            .find(|event| event["type"] == "tool.call.requested")
+            .unwrap();
+        assert_eq!(requested["payload"]["action"], "read");
+        assert_eq!(requested["payload"]["target"], "notes.txt");
+        assert_eq!(
+            requested["payload"]["raw_arguments"],
+            requests[0].raw_arguments.as_deref().unwrap()
+        );
+    }
 
     #[derive(Debug, Default)]
     struct RecordingReadonlyBatchIngress {
@@ -827,6 +886,7 @@ mod tests {
             vim_mode: false,
             vim_insert_escape: None,
             update_check: false,
+            pricing_refresh: false,
             desktop_notifications: false,
             terminal_notifications: false,
             auto_memory: false,

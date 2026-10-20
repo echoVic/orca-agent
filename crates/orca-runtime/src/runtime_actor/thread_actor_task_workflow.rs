@@ -47,7 +47,10 @@ impl ThreadActor {
         };
         observe_runtime_event(
             event_observer.as_deref(),
-            state.events.tool_call_requested(&tool_request),
+            crate::lifecycle::RuntimeTaskActor::tool_call_requested_event_for(
+                &mut state.events,
+                &tool_request,
+            ),
         );
 
         let config = config.unwrap_or_else(|| self.config.clone());

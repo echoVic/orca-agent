@@ -1031,6 +1031,7 @@ mod tests {
         )
         .expect("compaction should emit event");
 
+        drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         let emitted = output
             .lines()
@@ -1132,6 +1133,7 @@ mod tests {
         .compact_if_needed(&mut conversation)
         .expect("automatic compaction");
 
+        drop(sink);
         assert!(!writer.completed_before_persistence);
         let output = String::from_utf8(writer.output).expect("jsonl is utf8");
         let event_types = output
@@ -1217,6 +1219,7 @@ mod tests {
             assert_eq!(conversation.messages.len(), before);
             assert!(conversation.messages.iter().any(|message| matches!(message,
             Message::Tool { content, .. } if content.starts_with("[tool output micro-compact]"))));
+            drop(sink);
             assert!(output.is_empty());
             let transcript = crate::thread_store::JsonlThreadStore::new()
                 .load_session("context-recovery")
@@ -1395,6 +1398,7 @@ mod tests {
                 .matches_deepseek_prefix(&conversation, &provider)
                 .unwrap()
         );
+        drop(sink);
         assert!(
             !String::from_utf8(output)
                 .unwrap()
@@ -1512,6 +1516,7 @@ mod tests {
 
         assert!(pre_marker.exists(), "compaction hooks must run");
         assert!(!post_marker.exists(), "nothing was compacted");
+        drop(sink);
         let completions = String::from_utf8(output)
             .expect("jsonl is utf8")
             .lines()
@@ -1578,6 +1583,7 @@ mod tests {
             config.request_reply_budget(after).is_some(),
             "compacted {before} down to {after}"
         );
+        drop(sink);
         let started = String::from_utf8(output)
             .expect("jsonl is utf8")
             .lines()

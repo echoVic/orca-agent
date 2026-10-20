@@ -299,6 +299,9 @@ pub struct ToolConfig {
     /// user configuration.
     #[serde(skip)]
     pub shell_enforcement_decision: Option<crate::capability::SandboxEnforcementDecision>,
+    /// Advertisement only: an exec run without an interactive input transport.
+    #[serde(skip)]
+    pub headless_exec: bool,
 }
 
 impl Default for ToolConfig {
@@ -308,6 +311,7 @@ impl Default for ToolConfig {
             output_truncation: ToolOutputTruncation::default(),
             shell_timeout_secs: default_shell_timeout_secs(),
             shell_enforcement_decision: None,
+            headless_exec: false,
         }
     }
 }
@@ -474,6 +478,7 @@ pub struct RunConfig {
     pub vim_mode: bool,
     pub vim_insert_escape: Option<VimInsertEscapeSequence>,
     pub update_check: bool,
+    pub pricing_refresh: bool,
     pub desktop_notifications: bool,
     pub terminal_notifications: bool,
     pub auto_memory: bool,
@@ -521,6 +526,7 @@ impl Default for RunConfig {
             vim_mode: false,
             vim_insert_escape: None,
             update_check: false,
+            pricing_refresh: false,
             desktop_notifications: false,
             terminal_notifications: false,
             auto_memory: false,
@@ -844,6 +850,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "vim_mode = {}\n",
             "vim_insert_escape = {}\n",
             "update_check = {}\n",
+            "pricing_refresh = {}\n",
             "desktop_notifications = {}\n",
             "terminal_notifications = {}\n",
             "auto_memory = {}\n",
@@ -913,6 +920,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         config.vim_mode,
         vim_insert_escape,
         config.update_check,
+        config.pricing_refresh,
         config.desktop_notifications,
         config.terminal_notifications,
         config.auto_memory,
@@ -1151,12 +1159,15 @@ mod tests {
             vim_mode: true,
             vim_insert_escape: Some(VimInsertEscapeSequence::parse("j\\").unwrap()),
             update_check: false,
+            pricing_refresh: false,
             desktop_notifications: true,
             terminal_notifications: false,
             auto_memory: true,
         };
 
         let shown = format_config_show(&config);
+
+        assert!(shown.contains("pricing_refresh = false\n"), "{shown}");
 
         assert!(shown.contains("model = \"deepseek-flash\""));
         assert!(shown.contains("reasoning_effort = \"max\""));
@@ -1240,6 +1251,7 @@ mod tests {
             vim_mode: false,
             vim_insert_escape: None,
             update_check: false,
+            pricing_refresh: false,
             desktop_notifications: false,
             terminal_notifications: false,
             auto_memory: false,
@@ -1326,6 +1338,7 @@ mod tests {
             vim_mode: false,
             vim_insert_escape: None,
             update_check: false,
+            pricing_refresh: false,
             desktop_notifications: false,
             terminal_notifications: false,
             auto_memory: false,

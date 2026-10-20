@@ -193,3 +193,68 @@ fn doctor_reports_malformed_config_without_starting_the_tui() {
     assert!(!stdout.contains(secret));
     assert!(!stdout.contains("Welcome to Orca"));
 }
+
+#[test]
+fn doctor_reports_which_prices_estimates_use() {
+    let as_of = orca_runtime::pricing::rates::builtin_as_of();
+    let fetched_at = format!("{as_of}T00:00:00Z");
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    let pricing = |output: std::process::Output| -> Value {
+        let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "pricing")
+            .cloned()
+            .expect("pricing check")
+    };
+
+    let builtin = pricing(run_doctor(&home, &cwd, &["--format", "json"]));
+    assert_eq!(builtin["status"], "pass");
+    let detail = builtin["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with(&format!(
+            "built-in prices as of {as_of}; daily refresh on; DeepSeek "
+        )),
+        "{detail}"
+    );
+
+    let mut cache = serde_json::json!({
+        "version": 2,
+        "source": "https://models.dev/api.json",
+        "fetched_at": fetched_at,
+        "models": {"deepseek-flash": {
+            "input_cache_miss": 0.2, "input_cache_hit": 0.004, "output": 0.8,
+            "updated": as_of.to_string()
+        }}
+    });
+    fs::write(home.join("pricing-cache.json"), cache.to_string()).unwrap();
+    fs::write(home.join("config.toml"), "[pricing]\nrefresh = false\n").unwrap();
+    let fetched = pricing(run_doctor(&home, &cwd, &["--format", "json"]));
+    assert_eq!(fetched["status"], "pass");
+    let detail = fetched["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with(&format!(
+            "https://models.dev/api.json prices fetched {fetched_at}; refresh off; DeepSeek "
+        )),
+        "{detail}"
+    );
+
+    cache["models"]["deepseek-flash"]["updated"] =
+        serde_json::json!(as_of.pred_opt().unwrap().to_string());
+    fs::write(home.join("pricing-cache.json"), cache.to_string()).unwrap();
+    let stale = pricing(run_doctor(&home, &cwd, &["--format", "json"]));
+    assert_eq!(stale["status"], "pass");
+    let detail = stale["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with(&format!(
+            "built-in prices as of {as_of}; refresh off; DeepSeek "
+        )),
+        "{detail}"
+    );
+}

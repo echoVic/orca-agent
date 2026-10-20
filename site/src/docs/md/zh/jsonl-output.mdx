@@ -23,6 +23,8 @@ orca exec --output-format jsonl "检查仓库" > run.jsonl
 
 type 和 payload 是版本化协议。消费者应保留未知事件类型，而不是假定流只含当前示例中的事件。
 
+orca exec 可能合并同一条目中连续的 assistant.reasoning.delta 或 assistant.message.delta 事件。按顺序拼接 payload.text，得到的文本保持不变。合并后的事件保留首个事件的信封，因此 seq 可能跳号。model.response.completed 中的 assistant_reasoning 和 assistant_content 包含完整回复文本。
+
 ~~~bash
 orca exec --output-format jsonl "运行测试套件" |
   jq -c 'select(.type == "tool.call.completed")'

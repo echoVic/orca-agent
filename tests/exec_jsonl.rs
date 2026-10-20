@@ -38,8 +38,12 @@ fn exec_outputs_jsonl_contract_and_success_status() {
     assert_eq!(events.last().unwrap()["type"], "session.completed");
     assert_eq!(events.last().unwrap()["payload"]["status"], "success");
 
-    for (seq, event) in events.iter().enumerate() {
-        assert_eq!(event["seq"], seq);
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0]["seq"].as_u64() < pair[1]["seq"].as_u64())
+    );
+    for event in &events {
         let run_id = event["run_id"].as_str().expect("run id string");
         assert_eq!(
             uuid::Uuid::parse_str(run_id)

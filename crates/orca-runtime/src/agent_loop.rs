@@ -103,9 +103,12 @@ pub(crate) fn run_agent_loop(
     }
     let setup = RuntimeTurnSetupStep::new().prepare(
         config,
+        cwd,
         subagent_depth,
         subagent_type,
-        loop_state.tool_policy(tool_policy),
+        loop_state
+            .tool_policy(tool_policy)
+            .with_workflow_ipc(workflow_ipc.is_some()),
         turn_deps.mcp_registry,
     );
     let ctx_config = setup.context_config;
@@ -401,7 +404,7 @@ mod tests {
         );
         drop(observer);
         let prompt = captured_prompt.expect("real loop checkpoint prompt");
-        assert!(prompt.contains("### read_file"));
+        assert!(prompt.contains("`read_file`, `glob`, and `grep`"));
         assert!(!prompt.contains("### computer"));
         assert!(!prompt.contains("### bash"));
     }

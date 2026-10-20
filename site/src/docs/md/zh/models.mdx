@@ -16,6 +16,24 @@ DeepSeek-V4.1-Flash，支持图像理解并采用 Flash 价格。旧名称
 输入，但 Orca 会在路由、持久化、缓存标识和成本估算前将二者归一化为
 `deepseek-flash`，交互式选择器不再将其展示为独立模型。
 
+## 成本估算
+
+状态栏和 `usage.updated` 事件里的成本是按美元估算的，`--max-cost-usd` 也用这个值。估算按 DeepSeek 公布的价格：输入（缓存未命中）、输入（缓存命中）和输出分别计价；周一至周五北京时间 9:00–12:00 和 14:00–18:00 为高峰时段，价格是空闲时段的两倍，中国法定节假日除外。周末和节假日全天按空闲价。
+
+Orca 自带发布时的价格。进程中的第一个会话会检查缓存是否缺失或已满 24 小时，满足条件就在后台从 models.dev 刷新。刷新不阻塞启动，失败时继续使用已有价格。开发构建默认不刷新，除非设置了 `ORCA_PRICING_URL`。运行 `orca doctor`，可以在 `pricing` 行查看价格来源、刷新开关和当前 DeepSeek 高峰或空闲时段。不想联网刷新价格，或者想自己给模型定价，在用户配置里添加：
+
+~~~toml
+[pricing]
+refresh = false
+
+[models."my-model".pricing]
+input_cache_miss = 0.5   # 美元 / 百万 tokens
+input_cache_hit = 0.05
+output = 1.5
+~~~
+
+这样定价的模型不分时段。这两项都只在用户配置里生效，项目的 `.orca/config.toml` 不能修改。
+
 ## 默认模型
 
 没有配置模型，或模型为 `auto` 时，Orca 使用 `deepseek-flash`。

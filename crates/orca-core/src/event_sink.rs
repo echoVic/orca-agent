@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::config::OutputFormat;
 use crate::event_schema::{EventDraft, EventEnvelope, EventType};
@@ -17,10 +18,20 @@ where
     }
 }
 
+const DELTA_MAX_AGE: Duration = Duration::from_secs(1);
+const DELTA_MAX_BYTES: usize = 64 * 1024;
+
+struct PendingDelta {
+    event: EventEnvelope,
+    started_at: Instant,
+}
+
 pub struct EventSink<W: Write> {
     writer: W,
     format: OutputFormat,
     observer: Option<Arc<dyn EventObserver>>,
+    coalesce_jsonl_deltas: bool,
+    pending_delta: Option<PendingDelta>,
 }
 
 impl<W: Write> EventSink<W> {
@@ -29,7 +40,70 @@ impl<W: Write> EventSink<W> {
             writer,
             format,
             observer: None,
+            coalesce_jsonl_deltas: false,
+            pending_delta: None,
         }
+    }
+
+    /// Opt in only for exec stdout. Observers still receive every original event.
+    /// The first envelope survives a merge, so written sequence numbers may skip.
+    pub fn with_jsonl_delta_coalescing(mut self) -> Self {
+        self.coalesce_jsonl_deltas = self.format == OutputFormat::Jsonl;
+        self
+    }
+
+    /// Flush buffered deltas and report write errors before ending the stream.
+    pub fn finish(&mut self) -> io::Result<()> {
+        self.flush_pending_delta()?;
+        self.writer.flush()
+    }
+
+    fn flush_pending_delta(&mut self) -> io::Result<()> {
+        if let Some(pending) = self.pending_delta.take() {
+            self.write_jsonl(&pending.event)?;
+        }
+        Ok(())
+    }
+
+    fn write_jsonl(&mut self, event: &EventEnvelope) -> io::Result<()> {
+        serde_json::to_writer(&mut self.writer, event)?;
+        writeln!(self.writer)?;
+        self.writer.flush()
+    }
+
+    fn emit_jsonl(&mut self, event: &EventEnvelope) -> io::Result<()> {
+        let is_delta = matches!(
+            event.event_type,
+            EventType::AssistantReasoningDelta | EventType::AssistantMessageDelta
+        ) && event.payload["text"].is_string();
+        if !self.coalesce_jsonl_deltas || !is_delta {
+            self.flush_pending_delta()?;
+            return self.write_jsonl(event);
+        }
+
+        let now = Instant::now();
+        if let Some(pending) = &self.pending_delta
+            && (!same_delta_identity(&pending.event, event)
+                || now.duration_since(pending.started_at) >= DELTA_MAX_AGE)
+        {
+            self.flush_pending_delta()?;
+        }
+        if let Some(pending) = &mut self.pending_delta {
+            if let serde_json::Value::String(text) = &mut pending.event.payload["text"] {
+                text.push_str(event.payload["text"].as_str().unwrap());
+            }
+        } else {
+            self.pending_delta = Some(PendingDelta {
+                event: event.clone(),
+                started_at: now,
+            });
+        }
+        if self.pending_delta.as_ref().is_some_and(|pending| {
+            pending.event.payload["text"].as_str().unwrap().len() >= DELTA_MAX_BYTES
+        }) {
+            self.flush_pending_delta()?;
+        }
+        Ok(())
     }
 
     pub fn with_observer(mut self, observer: Arc<dyn EventObserver>) -> Self {
@@ -52,14 +126,12 @@ impl<W: Write> EventSink<W> {
                 observer.observe(event)?;
             }
             match self.format {
-                OutputFormat::Jsonl => {
-                    serde_json::to_writer(&mut self.writer, event)?;
-                    writeln!(self.writer)?;
+                OutputFormat::Jsonl => self.emit_jsonl(event),
+                OutputFormat::Text => {
+                    self.emit_text(event)?;
+                    self.writer.flush()
                 }
-                OutputFormat::Text => self.emit_text(event)?,
             }
-
-            self.writer.flush()
         })
     }
 
@@ -252,6 +324,30 @@ impl<W: Write> EventSink<W> {
     }
 }
 
+impl<W: Write> Drop for EventSink<W> {
+    fn drop(&mut self) {
+        if self.coalesce_jsonl_deltas {
+            // Best effort on early return/unwind; normal completion uses finish
+            // so a broken writer is reported to the caller.
+            let _ = self.finish();
+        }
+    }
+}
+
+fn same_delta_identity(first: &EventEnvelope, next: &EventEnvelope) -> bool {
+    if first.run_id != next.run_id || first.event_type != next.event_type {
+        return false;
+    }
+    let fields: &[&str] = match first.event_type {
+        EventType::AssistantReasoningDelta => &["turn_id", "item_id"],
+        EventType::AssistantMessageDelta => &["turn_id", "agent_message_item_id", "plan_item_id"],
+        _ => return false,
+    };
+    fields
+        .iter()
+        .all(|field| first.payload.get(field) == next.payload.get(field))
+}
+
 pub fn observe_event(observer: Option<&dyn EventObserver>, event: EventDraft) -> io::Result<()> {
     if observer.is_none() && !event.requires_publication_without_observer() {
         return Ok(());
@@ -303,6 +399,198 @@ mod tests {
         ModelResponseIdentity::new(TurnId::new())
     }
 
+    fn coalescing_sink(writer: &mut Vec<u8>) -> EventSink<&mut Vec<u8>> {
+        EventSink::new(writer, OutputFormat::Jsonl).with_jsonl_delta_coalescing()
+    }
+
+    fn jsonl_events(bytes: &[u8]) -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn coalescing_merges_both_delta_kinds_byte_exactly_and_keeps_first_envelope() {
+        for message in [false, true] {
+            let mut buf = Vec::new();
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let recorded = observed.clone();
+            let mut sink =
+                coalescing_sink(&mut buf).with_observer(Arc::new(move |event: &EventEnvelope| {
+                    recorded.lock().unwrap().push(event.clone());
+                    Ok(())
+                }));
+            let mut events = EventFactory::new("coalesced".into());
+            let identity = model_response_identity();
+            for text in [" ", "思考", "\n\t", "🦀", " tail "] {
+                let mut event = if message {
+                    events.assistant_message_delta(&identity, text)
+                } else {
+                    events.assistant_reasoning_delta(&identity, text)
+                };
+                event.payload["extra"] = serde_json::json!("keep first payload");
+                sink.emit(event).unwrap();
+            }
+            drop(sink);
+            let written = jsonl_events(&buf);
+            assert_eq!(written.len(), 1, "{written:?}");
+            let mut expected = serde_json::to_value(&observed.lock().unwrap()[0]).unwrap();
+            expected["payload"]["text"] = serde_json::json!(" 思考\n\t🦀 tail ");
+            assert_eq!(written[0], expected);
+            assert_eq!(observed.lock().unwrap().len(), 5);
+        }
+    }
+
+    #[test]
+    fn coalescing_flushes_before_other_events_without_reusing_absorbed_sequences() {
+        let mut buf = Vec::new();
+        let mut sink = coalescing_sink(&mut buf);
+        let mut events = EventFactory::new("ordered".into());
+        let identity = model_response_identity();
+        sink.emit(events.assistant_reasoning_delta(&identity, "a"))
+            .unwrap();
+        sink.emit(events.assistant_reasoning_delta(&identity, "b"))
+            .unwrap();
+        sink.emit(events.error("boundary")).unwrap();
+        sink.emit(events.assistant_reasoning_delta(&identity, "c"))
+            .unwrap();
+        drop(sink);
+        let written = jsonl_events(&buf);
+        assert_eq!(written.len(), 3);
+        assert_eq!(written[0]["payload"]["text"], "ab");
+        assert_eq!(written[1]["type"], "error");
+        assert_eq!(written[1]["seq"], 2);
+        assert_eq!(written[2]["payload"]["text"], "c");
+        assert_eq!(written[2]["seq"], 3);
+    }
+
+    #[test]
+    fn coalescing_never_merges_across_any_identity_field_or_delta_kind() {
+        for (message, field) in [
+            (false, "turn_id"),
+            (false, "item_id"),
+            (true, "turn_id"),
+            (true, "agent_message_item_id"),
+            (true, "plan_item_id"),
+        ] {
+            let mut buf = Vec::new();
+            let mut sink = coalescing_sink(&mut buf);
+            let mut events = EventFactory::new("identities".into());
+            let identity = model_response_identity();
+            let draft = |events: &mut EventFactory, text| {
+                if message {
+                    events.assistant_message_delta(&identity, text)
+                } else {
+                    events.assistant_reasoning_delta(&identity, text)
+                }
+            };
+            sink.emit(draft(&mut events, "a")).unwrap();
+            sink.emit(draft(&mut events, "b")).unwrap();
+            let mut changed = draft(&mut events, "c");
+            changed.payload[field] = serde_json::json!("different");
+            sink.emit(changed).unwrap();
+            // A different kind must also close the pending delta.
+            sink.emit(events.assistant_reasoning_delta(&identity, "d"))
+                .unwrap();
+            sink.emit(events.assistant_message_delta(&identity, "e"))
+                .unwrap();
+            drop(sink);
+            let written = jsonl_events(&buf);
+            assert_eq!(written.len(), 4, "{field}: {written:?}");
+            assert_eq!(written[0]["payload"]["text"], "ab");
+            assert_eq!(written[1]["payload"]["text"], "c");
+            assert_eq!(written[2]["payload"]["text"], "d");
+            assert_eq!(written[3]["payload"]["text"], "e");
+        }
+    }
+
+    #[test]
+    fn coalescing_flushes_on_age_limit_without_a_timer() {
+        let mut buf = Vec::new();
+        let mut sink = coalescing_sink(&mut buf);
+        let mut events = EventFactory::new("age".into());
+        let identity = model_response_identity();
+        sink.emit(events.assistant_reasoning_delta(&identity, "a"))
+            .unwrap();
+        assert!(sink.writer_mut().is_empty());
+        sink.pending_delta.as_mut().unwrap().started_at -= Duration::from_secs(1);
+        sink.emit(events.assistant_reasoning_delta(&identity, "b"))
+            .unwrap();
+        assert_eq!(jsonl_events(sink.writer_mut())[0]["payload"]["text"], "a");
+        sink.finish().unwrap();
+        drop(sink);
+        assert_eq!(jsonl_events(&buf)[1]["payload"]["text"], "b");
+    }
+
+    #[test]
+    fn coalescing_caps_utf8_bytes_and_flushes_an_oversized_delta() {
+        let mut buf = Vec::new();
+        let mut sink = coalescing_sink(&mut buf);
+        let mut events = EventFactory::new("size".into());
+        let identity = model_response_identity();
+        let text = "🦀".repeat(8192); // 32 KiB, not 8 KiB.
+        sink.emit(events.assistant_message_delta(&identity, &text))
+            .unwrap();
+        assert!(sink.writer_mut().is_empty());
+        sink.emit(events.assistant_message_delta(&identity, &text))
+            .unwrap();
+        assert_eq!(jsonl_events(sink.writer_mut()).len(), 1);
+        sink.emit(events.assistant_message_delta(&identity, &"x".repeat(65537)))
+            .unwrap();
+        assert_eq!(jsonl_events(sink.writer_mut()).len(), 2);
+        sink.emit(events.assistant_message_delta(&identity, "tail"))
+            .unwrap();
+        sink.finish().unwrap();
+        drop(sink);
+        let written = jsonl_events(&buf);
+        assert_eq!(written.len(), 3);
+        assert_eq!(written[0]["payload"]["text"], text.repeat(2));
+        assert_eq!(written[1]["payload"]["text"], "x".repeat(65537));
+        assert_eq!(written[2]["payload"]["text"], "tail");
+    }
+
+    #[test]
+    fn coalescing_finish_flushes_once_and_drop_flushes_pending_text() {
+        let mut events = EventFactory::new("finish".into());
+        let identity = model_response_identity();
+        let mut buf = Vec::new();
+        {
+            let mut sink = coalescing_sink(&mut buf);
+            sink.emit(events.assistant_reasoning_delta(&identity, "pending"))
+                .unwrap();
+            assert!(sink.writer_mut().is_empty());
+            sink.finish().unwrap();
+            assert_eq!(jsonl_events(sink.writer_mut()).len(), 1);
+            sink.finish().unwrap();
+            sink.emit(events.assistant_reasoning_delta(&identity, "on drop"))
+                .unwrap();
+        }
+        let written = jsonl_events(&buf);
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0]["payload"]["text"], "pending");
+        assert_eq!(written[1]["payload"]["text"], "on drop");
+    }
+
+    #[test]
+    fn coalescing_opt_in_leaves_text_mode_unchanged() {
+        let mut buf = Vec::new();
+        let mut sink = EventSink::new(&mut buf, OutputFormat::Text).with_jsonl_delta_coalescing();
+        let mut events = EventFactory::new("text".into());
+        let identity = model_response_identity();
+        sink.emit(events.assistant_reasoning_delta(&identity, "a"))
+            .unwrap();
+        sink.emit(events.assistant_reasoning_delta(&identity, "b"))
+            .unwrap();
+        sink.emit(events.assistant_message_delta(&identity, "c"))
+            .unwrap();
+        drop(sink);
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "thinking: a\nthinking: b\nassistant: c\n"
+        );
+    }
+
     #[test]
     fn jsonl_format_writes_one_line_per_event() {
         let mut buf = Vec::new();
@@ -314,6 +602,7 @@ mod tests {
         sink.emit(f.assistant_message_delta(&identity, "hello"))
             .unwrap();
 
+        drop(sink);
         let output = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = output.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -338,6 +627,7 @@ mod tests {
         sink.emit(f.assistant_message_delta(&identity, "hi"))
             .unwrap();
 
+        drop(sink);
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("error: something broke"));
         assert!(output.contains("assistant: hi"));
@@ -368,6 +658,7 @@ mod tests {
         ))
         .unwrap();
 
+        drop(sink);
         let output = String::from_utf8(buf).unwrap();
         assert_eq!(
             output.lines().collect::<Vec<_>>(),
@@ -405,6 +696,7 @@ mod tests {
         assert!(observed.timestamp_ms > 0);
         assert_eq!(observed.event_type, expected_event_type);
         assert_eq!(observed.payload, expected_payload);
+        drop(sink);
         let serialized: serde_json::Value =
             serde_json::from_str(String::from_utf8(buf).unwrap().trim()).unwrap();
         assert_eq!(serialized, serde_json::to_value(observed).unwrap());

@@ -70,6 +70,13 @@ workflow reuses that evidence instead of rerunning the same full suites. A
 manual `workflow_dispatch` remains the full release dry-run path and executes
 every gate above with framework retries disabled.
 
+Check the built-in prices before each release: compare `FLASH_RATES`,
+`PRO_RATES`, and the peak hours in `crates/orca-runtime/src/pricing/rates.rs`
+with https://api-docs.deepseek.com/quick_start/pricing, and move
+`builtin_as_of` to the day you checked. After the State Council publishes the
+next year's holiday schedule (usually in November), add that year's weekday
+days off to `WEEKDAY_HOLIDAYS`.
+
 ### 5. Update the website
 
 Edit `site/src/shared.ts`:

@@ -372,7 +372,8 @@ fn task_actor_routes_model_turn_and_updates_cost_model() {
     // Seeded with a different model than the auto route resolves to, so the
     // assertion below actually proves route_model_turn overrides the
     // tracker's pricing rather than merely leaving it unchanged.
-    let mut cost_tracker = CostTracker::new(Some(PRO_MODEL));
+    let mut cost_tracker = CostTracker::new(Some(PRO_MODEL))
+        .with_clock(orca_runtime::pricing::rates::off_peak_instant);
     let provider_config = ProviderConfig {
         api_key: None,
         base_url: None,
@@ -400,7 +401,7 @@ fn task_actor_routes_model_turn_and_updates_cost_model() {
         output_tokens: 50,
         cache_tokens: 0,
     });
-    let expected_flash_cost = (100.0 * 0.14 + 50.0 * 0.28) / 1_000_000.0;
+    let expected_flash_cost = (100.0 * 0.15 + 50.0 * 0.6) / 1_000_000.0;
     assert!((totals.estimated_cost_usd - expected_flash_cost).abs() < 1e-12);
 }
 
@@ -2443,6 +2444,7 @@ fn test_run_config() -> RunConfig {
         vim_mode: false,
         vim_insert_escape: None,
         update_check: false,
+        pricing_refresh: false,
         desktop_notifications: false,
         terminal_notifications: false,
         auto_memory: false,

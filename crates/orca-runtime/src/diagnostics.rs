@@ -172,6 +172,7 @@ pub fn collect_doctor_with_version(
     checks.push(config_check);
     checks.push(check_credentials(config_is_usable));
     checks.push(check_model(effective_cwd, config_is_usable));
+    checks.push(check_pricing(effective_cwd, config_is_usable));
     checks.push(check_folder_trust(effective_cwd));
     checks.push(check_sandbox(effective_cwd));
 
@@ -295,6 +296,41 @@ fn check_model(cwd: &Path, config_is_usable: bool) -> DiagnosticCheck {
             Some("fix configuration errors, then rerun `orca doctor`"),
         ),
     }
+}
+
+/// Which prices cost estimates use and whether they refresh. Read-only: it
+/// never fetches or writes the cache.
+fn check_pricing(cwd: &Path, config_is_usable: bool) -> DiagnosticCheck {
+    use crate::pricing::book::{self, PriceSource};
+
+    let now = chrono::Utc::now();
+    let cache = book::cache_path().and_then(|path| book::read_cache(&path, now));
+    let source = match book::merge(cache.as_ref()).source {
+        PriceSource::Builtin { as_of } => format!("built-in prices as of {as_of}"),
+        PriceSource::Fetched { source, fetched_at } => format!(
+            "{source} prices fetched {}",
+            fetched_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+    };
+    let refresh = if !config_is_usable {
+        "refresh not evaluated"
+    } else if file::load_effective_config(cwd, ConfigOverrides::default())
+        .map(|config| config.pricing.refresh)
+        .unwrap_or(true)
+    {
+        "daily refresh on"
+    } else {
+        "refresh off"
+    };
+    let tier = if crate::pricing::rates::is_peak(now) {
+        "peak"
+    } else {
+        "off-peak"
+    };
+    pass_check(
+        "pricing",
+        format!("{source}; {refresh}; DeepSeek {tier} hours now"),
+    )
 }
 
 fn check_folder_trust(cwd: &Path) -> DiagnosticCheck {

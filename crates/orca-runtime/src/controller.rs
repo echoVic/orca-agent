@@ -43,8 +43,9 @@ use crate::provider_stream::{RuntimeProviderSuspension, RuntimeProviderSuspensio
 use crate::runtime_conversation_bootstrap::AgentConversationContext;
 use crate::runtime_execution_policy::RuntimeExecutionPolicyHandle;
 use crate::runtime_host::{
-    HeadlessInteractionCheckpoint, HeadlessOperationHandle, HeadlessSurfaceSession, RuntimeHost,
-    RuntimeHostError, RuntimeThreadHandle, RuntimeThreadMutation, RuntimeThreadStartRequest,
+    HeadlessInteractionCheckpoint, HeadlessOperationHandle, HeadlessSurfaceSession,
+    HostedOperationWriter, RuntimeHost, RuntimeHostError, RuntimeThreadHandle,
+    RuntimeThreadMutation, RuntimeThreadStartRequest,
 };
 use crate::runtime_surface::{
     FailureClass as SurfaceFailureClass, OperationTerminal as SurfaceOperationTerminal,
@@ -118,6 +119,7 @@ impl HeadlessInteractionTransport {
 struct HostedEventRelayWriter {
     tx: mpsc::SyncSender<HostedEventChunk>,
     buffer: Vec<u8>,
+    coalesce_jsonl_deltas: bool,
 }
 
 struct HostedEventChunk {
@@ -178,6 +180,16 @@ impl io::Write for HostedEventRelayWriter {
                 )
             })?
             .map_err(HostedEventRelayError::into_io)
+    }
+}
+
+impl HostedOperationWriter for HostedEventRelayWriter {
+    fn coalesce_jsonl_deltas(&self) -> bool {
+        self.coalesce_jsonl_deltas
+    }
+
+    fn finish_generation(&mut self, _commit_terminal: bool) -> io::Result<()> {
+        self.flush()
     }
 }
 
@@ -334,6 +346,7 @@ pub struct ThreadTurnRequest {
     provider_response_ingress: Option<Arc<dyn RuntimeProviderResponseIngress>>,
     workflow_lifecycle_ingress: Option<Arc<dyn RuntimeWorkflowLifecycleIngress>>,
     defer_cancel_terminal: bool,
+    coalesce_jsonl_deltas: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1100,6 +1113,22 @@ impl ThreadTurnRequest {
             provider_response_ingress: None,
             workflow_lifecycle_ingress: None,
             defer_cancel_terminal: false,
+            coalesce_jsonl_deltas: false,
+        }
+    }
+
+    pub(crate) fn with_jsonl_delta_coalescing(mut self, enabled: bool) -> Self {
+        self.coalesce_jsonl_deltas = enabled;
+        self
+    }
+
+    fn event_sink<W: io::Write>(&self, writer: W, format: OutputFormat) -> EventSink<W> {
+        let sink =
+            EventSink::new(writer, format).with_optional_observer(self.event_observer().cloned());
+        if self.coalesce_jsonl_deltas {
+            sink.with_jsonl_delta_coalescing()
+        } else {
+            sink
         }
     }
 
@@ -1506,7 +1535,7 @@ fn interrupted_exit_code(interrupted: &AtomicI32) -> Option<i32> {
 pub fn run(config: RunConfig) -> i32 {
     let stdout = io::stdout();
     let options = ControllerRunOptions::for_run_config(&config);
-    match run_inner(config, stdout.lock(), options, None) {
+    match run_inner(config, stdout.lock(), options, None, true) {
         Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("orca: {error}");
@@ -1525,7 +1554,7 @@ pub fn run_to_writer_with_options<W: io::Write>(
     writer: W,
     options: ControllerRunOptions,
 ) -> i32 {
-    match run_inner(config, writer, options, None) {
+    match run_inner(config, writer, options, None, false) {
         Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("orca: {error}");
@@ -1542,7 +1571,7 @@ pub fn run_to_writer_with_headless_transport<W: io::Write>(
     options: ControllerRunOptions,
     transport: HeadlessInteractionTransport,
 ) -> i32 {
-    match run_inner(config, writer, options, Some(transport)) {
+    match run_inner(config, writer, options, Some(transport), false) {
         Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("orca: {error}");
@@ -1556,6 +1585,7 @@ fn run_inner<W: io::Write>(
     writer: W,
     _options: ControllerRunOptions,
     transport: Option<HeadlessInteractionTransport>,
+    coalesce_stdout_deltas: bool,
 ) -> io::Result<i32> {
     let interrupted = Arc::new(AtomicI32::new(0));
     let finished = Arc::new(AtomicBool::new(false));
@@ -1563,7 +1593,14 @@ fn run_inner<W: io::Write>(
     // here on stops the run through its cleanup, not the default disposition.
     let signals =
         TerminationSignalHandler::install(Arc::clone(&interrupted), Arc::clone(&finished));
-    let exit_code = run_headless(config, writer, transport, &signals, &interrupted);
+    let exit_code = run_headless(
+        config,
+        writer,
+        transport,
+        &signals,
+        &interrupted,
+        coalesce_stdout_deltas,
+    );
     // Its terminal record and output are committed, or past committing: the
     // grace period has nothing left to wait for, whichever way the run ended.
     finished.store(true, Ordering::SeqCst);
@@ -1571,12 +1608,14 @@ fn run_inner<W: io::Write>(
 }
 
 fn run_headless<W: io::Write>(
-    config: RunConfig,
+    mut config: RunConfig,
     mut writer: W,
     transport: Option<HeadlessInteractionTransport>,
     signals: &TerminationSignalHandler,
     interrupted: &AtomicI32,
+    coalesce_stdout_deltas: bool,
 ) -> io::Result<i32> {
+    config.tools.headless_exec = transport.is_none();
     // The instruction is delivered byte-exact: trimming here silently rewrote every prompt
     // that ended with a newline (all Terminal-Bench instructions do). `orca exec` now rejects
     // a whitespace-only argument before this point, so the placeholder is only reachable for
@@ -1635,11 +1674,14 @@ fn run_headless<W: io::Write>(
     }
     let mut headless = thread.attach_headless_surface(transport.is_some())?;
     let (relay_tx, relay_rx) = mpsc::sync_channel(HOSTED_EVENT_RELAY_CAPACITY);
-    let operation = headless.start_turn(
+    let operation = headless.start_turn_with_output(
         &prompt,
         HostedEventRelayWriter {
             tx: relay_tx,
             buffer: Vec::new(),
+            coalesce_jsonl_deltas: coalesce_stdout_deltas
+                && config.output_format == OutputFormat::Jsonl
+                && transport.is_none(),
         },
     )?;
     turn_stop.turn_started();
@@ -2034,10 +2076,9 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
     }
     let context = ThreadTurnContext::prepare(config, session, request)?;
     if let Some(events) = events {
-        let mut sink = EventSink::new(writer, config.output_format)
-            .with_optional_observer(request.event_observer().cloned());
+        let mut sink = request.event_sink(writer, config.output_format);
         let mut background_workflows = Vec::new();
-        return PreparedThreadTurn {
+        let outcome = PreparedThreadTurn {
             config,
             lifecycle,
             request,
@@ -2051,16 +2092,19 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
         }
         .execute()?
         .commit(config, session, request, &cancel, events, &mut sink);
+        if request.coalesce_jsonl_deltas {
+            sink.finish()?;
+        }
+        return outcome;
     }
 
-    let mut execution = ThreadTurnExecution::new_with_cancel_and_observer(
-        lifecycle,
-        writer,
-        config.output_format,
+    let mut execution = ThreadTurnExecution {
+        events: EventFactory::new(lifecycle.run_id().to_string()),
+        sink: request.event_sink(writer, config.output_format),
         cancel,
-        request.event_observer().cloned(),
-    );
-    PreparedThreadTurn {
+        background_workflows: Vec::new(),
+    };
+    let outcome = PreparedThreadTurn {
         config,
         lifecycle,
         request,
@@ -2080,7 +2124,11 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
         &execution.cancel,
         &mut execution.events,
         &mut execution.sink,
-    )
+    );
+    if request.coalesce_jsonl_deltas {
+        execution.sink.finish()?;
+    }
+    outcome
 }
 
 fn drain_terminal_notifications(
@@ -2337,9 +2385,51 @@ mod tests {
             vim_mode: false,
             vim_insert_escape: None,
             update_check: false,
+            pricing_refresh: false,
             desktop_notifications: false,
             terminal_notifications: false,
             auto_memory: false,
+        }
+    }
+
+    #[test]
+    fn exec_jsonl_delta_coalescing_is_explicit_and_preserves_observer_deltas() {
+        use orca_core::event_schema::EventEnvelope;
+        use orca_core::thread_item_projection::ModelResponseIdentity;
+        for enabled in [false, true] {
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let record = observed.clone();
+            let request = ThreadTurnRequest::new("test")
+                .with_jsonl_delta_coalescing(enabled)
+                .with_event_observer(Arc::new(move |event: &EventEnvelope| {
+                    record.lock().unwrap().push(event.clone());
+                    Ok(())
+                }));
+            let mut output = Vec::new();
+            let mut sink = request.event_sink(&mut output, OutputFormat::Jsonl);
+            let mut events = EventFactory::new("test".into());
+            let identity = ModelResponseIdentity::new(TurnId::new());
+            sink.emit(events.assistant_reasoning_delta(&identity, "a"))
+                .unwrap();
+            sink.emit(events.assistant_reasoning_delta(&identity, "b"))
+                .unwrap();
+            sink.finish().unwrap();
+            drop(sink);
+            let written: Vec<serde_json::Value> = String::from_utf8(output)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(written.len(), if enabled { 1 } else { 2 });
+            let text: String = written
+                .iter()
+                .map(|event| event["payload"]["text"].as_str().unwrap())
+                .collect();
+            assert_eq!(text, "ab");
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.len(), 2);
+            assert_eq!(observed[0].payload["text"], "a");
+            assert_eq!(observed[1].payload["text"], "b");
         }
     }
 
@@ -2427,11 +2517,83 @@ mod tests {
         let mut config = config(SubagentConfig::default());
         config.prompt = "inspect repo".to_string();
         config.output_format = OutputFormat::Jsonl;
-        let error = run_inner(config, BrokenWriter, ControllerRunOptions::default(), None)
-            .expect_err("borrowed writer failure");
+        let error = run_inner(
+            config,
+            BrokenWriter,
+            ControllerRunOptions::default(),
+            None,
+            false,
+        )
+        .expect_err("borrowed writer failure");
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(error.to_string(), "borrowed writer disconnected");
+    }
+
+    #[test]
+    fn headless_controller_hides_unanswerable_questions() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(home.path().to_path_buf());
+        config.prompt = "mock_offered_tools".into();
+        config.output_format = OutputFormat::Jsonl;
+        let mut output = Vec::new();
+        let status = run_to_writer(config, &mut output);
+        assert_eq!(status, 0);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Mock offered tools: "));
+        assert!(output.contains("read_file"));
+        assert!(!output.contains("ask_user_question"));
+    }
+
+    #[test]
+    fn headless_controller_keeps_questions_with_an_input_transport() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(home.path().to_path_buf());
+        config.prompt = "mock_offered_tools".into();
+        config.output_format = OutputFormat::Jsonl;
+        let transport = HeadlessInteractionTransport::new(|_: &HeadlessInteractionCheckpoint| {
+            Err(io::Error::other("no question expected"))
+        });
+        let mut output = Vec::new();
+        let status = run_to_writer_with_headless_transport(
+            config,
+            &mut output,
+            ControllerRunOptions::default(),
+            transport,
+        );
+        assert_eq!(status, 0);
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("ask_user_question")
+        );
+    }
+
+    #[test]
+    fn headless_run_to_writer_preserves_individual_deltas() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().to_path_buf());
+        config.prompt = "mock_stream_delay_ms 0".to_string();
+        config.output_format = OutputFormat::Jsonl;
+        let mut output = Vec::new();
+        assert_eq!(run_to_writer(config, &mut output), 0);
+        let written: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let deltas: Vec<_> = written
+            .iter()
+            .filter(|event| event["type"] == "assistant.message.delta")
+            .collect();
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0]["payload"]["text"], "Mock slow stream started.");
+        assert_eq!(deltas[1]["payload"]["text"], "Mock slow stream completed.");
     }
 
     #[test]
@@ -2441,8 +2603,14 @@ mod tests {
         config.output_format = OutputFormat::Jsonl;
         let mut output = Vec::new();
 
-        let status = run_inner(config, &mut output, ControllerRunOptions::default(), None)
-            .expect("headless controller run");
+        let status = run_inner(
+            config,
+            &mut output,
+            ControllerRunOptions::default(),
+            None,
+            false,
+        )
+        .expect("headless controller run");
 
         assert_eq!(status, RunStatus::Success.exit_code());
         let events = String::from_utf8(output)
@@ -2628,7 +2796,7 @@ mod tests {
         config.output_format = OutputFormat::Jsonl;
         config.history_mode = HistoryMode::Record;
         let mut output = Vec::new();
-        let exit_code = run_headless(config, &mut output, None, &handler, &interrupted);
+        let exit_code = run_headless(config, &mut output, None, &handler, &interrupted, false);
         finished.store(true, Ordering::SeqCst);
         drop(handler);
 
@@ -2698,8 +2866,15 @@ mod tests {
         config.prompt = "the first run".to_string();
         let mut first = Vec::new();
         assert_eq!(
-            run_headless(config.clone(), &mut first, None, &handler, &interrupted)
-                .expect("the first run"),
+            run_headless(
+                config.clone(),
+                &mut first,
+                None,
+                &handler,
+                &interrupted,
+                false
+            )
+            .expect("the first run"),
             0
         );
         let first = events(first);
@@ -2717,7 +2892,7 @@ mod tests {
         config.prompt = "a prompt the signal came before".to_string();
         config.history_mode = HistoryMode::Resume(session_id);
         let mut stopped = Vec::new();
-        let exit_code = run_headless(config, &mut stopped, None, &handler, &interrupted);
+        let exit_code = run_headless(config, &mut stopped, None, &handler, &interrupted, false);
         finished.store(true, Ordering::SeqCst);
         drop(handler);
 
@@ -2758,7 +2933,7 @@ mod tests {
         config.cwd = Some(workspace.path().to_path_buf());
         config.history_mode = HistoryMode::Record;
         let mut output = Vec::new();
-        let exit_code = run_headless(config, &mut output, None, &handler, &interrupted);
+        let exit_code = run_headless(config, &mut output, None, &handler, &interrupted, false);
         finished.store(true, Ordering::SeqCst);
         drop(handler);
 

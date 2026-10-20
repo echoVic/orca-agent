@@ -61,7 +61,7 @@ pub fn prepare_child_agent_loop(
 ) -> ChildAgentLoopSetup {
     let conversation =
         prepare_fresh_child_agent_conversation(config, request, cwd, instructions, memory);
-    build_child_agent_loop_setup(config, request, conversation, None, 0)
+    build_child_agent_loop_setup(config, request, cwd, conversation, None, 0)
 }
 
 /// Builds a production child setup. Fresh requests are exactly equivalent to
@@ -80,6 +80,7 @@ pub(crate) fn try_prepare_child_agent_loop(
     Ok(build_child_agent_loop_setup(
         config,
         request,
+        cwd,
         prepared.conversation,
         prepared.continuation,
         prepared.turn,
@@ -136,6 +137,7 @@ pub(crate) fn try_prepare_child_agent_conversation(
 fn build_child_agent_loop_setup(
     config: &RunConfig,
     request: &ChildAgentRequest,
+    cwd: &Path,
     conversation: Conversation,
     continuation: Option<ChildAgentContinuationRuntimeState>,
     turn: u32,
@@ -143,7 +145,7 @@ fn build_child_agent_loop_setup(
     let mcp_registry =
         orca_mcp::initialize_registry(&config.mcp_servers, config.mcp_credentials_path.clone());
     mcp_registry.wait_for_startup(&|| false);
-    let provider_config = ProviderConfig {
+    let mut provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: Some(orca_core::model::FLASH_MODEL.to_string()),
@@ -162,6 +164,16 @@ fn build_child_agent_loop_setup(
         external_tools: config.external_tools.clone(),
         max_output_tokens: None,
     };
+    if let Some(tools) = provider_config.tools_override.as_mut() {
+        crate::tool_invocation::omit_unavailable_session_tools(
+            tools,
+            config,
+            request.workflow_ipc.is_some(),
+        );
+        if !crate::workspace_git::is_git_work_tree(cwd) {
+            tools.retain(|tool| tool.name != "git_status");
+        }
+    }
 
     let budget_model = config.model.as_option();
     let context_config = ContextConfig::for_model_with_runtime(
@@ -325,6 +337,168 @@ mod tests {
     }
 
     #[test]
+    fn child_provider_keeps_workflow_ipc_only_with_context() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        for workflow_child in [false, true] {
+            let config = RunConfig {
+                cwd: Some(home.path().to_path_buf()),
+                ..RunConfig::default()
+            };
+            let mut request =
+                ChildAgentRequest::new("inspect".into(), SubagentType::General, None, 1, false);
+            request.allowed_tools = Some(
+                [
+                    "read_file",
+                    "workflow_send_message",
+                    "workflow_read_messages",
+                    "workflow_clear_messages",
+                    "workflow_create_task_list",
+                    "workflow_claim_task",
+                    "workflow_complete_task",
+                    "workflow_list_tasks",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            );
+            if workflow_child {
+                request.workflow_ipc = Some(crate::workflow::ipc::WorkflowIpcContext::new());
+            }
+            let setup = prepare_child_agent_loop(
+                &config,
+                &request,
+                home.path(),
+                &ProjectInstructions::default(),
+                &MemoryBlock::default(),
+            );
+            let tools = setup.provider_config.tools_override.unwrap();
+            for name in [
+                "workflow_send_message",
+                "workflow_read_messages",
+                "workflow_clear_messages",
+                "workflow_create_task_list",
+                "workflow_claim_task",
+                "workflow_complete_task",
+                "workflow_list_tasks",
+            ] {
+                assert_eq!(
+                    tools.iter().any(|tool| tool.name == name),
+                    workflow_child,
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn child_provider_applies_session_tool_availability() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        for (disabled_servers, interactive, mcp_available) in [
+            (vec![], false, false),
+            (vec![true], true, false),
+            (vec![false], true, true),
+            (vec![true, false], false, true),
+        ] {
+            let mut config = RunConfig {
+                cwd: Some(home.path().to_path_buf()),
+                ..RunConfig::default()
+            };
+            config.tools.headless_exec = !interactive;
+            // No command means enabled servers fail startup without launching a process.
+            for (index, disabled) in disabled_servers.into_iter().enumerate() {
+                config
+                    .mcp_servers
+                    .push(orca_core::mcp_types::McpServerConfig {
+                        name: format!("configured-server-{index}"),
+                        disabled,
+                        ..Default::default()
+                    });
+            }
+            let mut request =
+                ChildAgentRequest::new("inspect".into(), SubagentType::General, None, 1, false);
+            request.allowed_tools = Some(
+                [
+                    "list_mcp_resources",
+                    "list_mcp_resource_templates",
+                    "read_mcp_resource",
+                    "ask_user_question",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            );
+            let setup = prepare_child_agent_loop(
+                &config,
+                &request,
+                home.path(),
+                &ProjectInstructions::default(),
+                &MemoryBlock::default(),
+            );
+            let tools = setup.provider_config.tools_override.unwrap();
+            for name in [
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "read_mcp_resource",
+            ] {
+                assert_eq!(
+                    tools.iter().any(|tool| tool.name == name),
+                    mcp_available,
+                    "{name}"
+                );
+            }
+            assert_eq!(
+                tools.iter().any(|tool| tool.name == "ask_user_question"),
+                interactive
+            );
+        }
+    }
+
+    #[test]
+    fn child_git_status_catalog_matches_its_own_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let non_repo = tempfile::tempdir().unwrap();
+        assert!(
+            non_repo
+                .path()
+                .ancestors()
+                .all(|dir| !dir.join(".git").exists())
+        );
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::fs::write(repo.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let (mut config, mut request) = computer_request();
+        config.cwd = Some(repo.path().to_path_buf());
+        config.subagents.effective_definition = None;
+        request.subagent_type = SubagentType::General;
+        request.allowed_tools = None;
+
+        for (cwd, is_repo) in [(non_repo.path(), false), (repo.path(), true)] {
+            let setup = prepare_child_agent_loop(
+                &config,
+                &request,
+                cwd,
+                &ProjectInstructions::default(),
+                &MemoryBlock::default(),
+            );
+            let prompt = setup.conversation.messages[0].content_str().unwrap();
+            assert!(!prompt.contains("### git_status\n"));
+            assert_eq!(prompt.contains("- Git repository: no\n"), !is_repo);
+            assert_eq!(
+                setup
+                    .provider_config
+                    .tools_override
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool.name == "git_status"),
+                is_repo
+            );
+        }
+    }
+
+    #[test]
     fn a_sync_custom_child_cannot_offer_computer_even_when_its_definition_lists_it() {
         let (config, request) = computer_request();
         let setup = prepare_child_agent_loop(
@@ -352,7 +526,7 @@ mod tests {
         let prompt = conversation.messages[0]
             .content_str()
             .expect("system prompt");
-        assert!(prompt.contains("### read_file"));
+        assert!(prompt.contains("`read_file`, `glob`, and `grep`"));
         assert!(prompt.contains("Report source findings."));
         assert!(!prompt.contains("### computer"));
     }

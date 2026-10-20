@@ -12,10 +12,54 @@ pub const VISION_MODEL: &str = FLASH_MODEL;
 pub const PRO_MODEL: &str = "deepseek-v4-pro";
 pub const AUTO_MODEL: &str = "auto";
 
+/// A price in US dollars per million tokens: finite and in 0..=10,000, so two
+/// prices compare like integers do.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct UsdPerMillion(f64);
+
+impl Eq for UsdPerMillion {}
+
+impl UsdPerMillion {
+    pub fn new(value: f64) -> Option<Self> {
+        (value.is_finite() && (0.0..=10_000.0).contains(&value)).then_some(Self(value))
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for UsdPerMillion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = f64::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| {
+            serde::de::Error::custom(
+                "a price must be a finite number between 0 and 10,000 US dollars per million tokens",
+            )
+        })
+    }
+}
+
+/// `[models."<name>".pricing]`: fixed prices that replace DeepSeek's published
+/// ones for this model, at every hour.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPriceOverride {
+    pub input_cache_miss: UsdPerMillion,
+    pub input_cache_hit: UsdPerMillion,
+    pub output: UsdPerMillion,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelDefinition {
     #[serde(default)]
     pub supports_images: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPriceOverride>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +195,16 @@ impl ModelSelection {
             .unwrap_or(false)
     }
 
+    /// Fixed prices from `[models."<name>".pricing]`, by canonical model name.
+    pub fn price_overrides(&self) -> BTreeMap<String, ModelPriceOverride> {
+        self.models
+            .iter()
+            .filter_map(|(model, definition)| {
+                definition.pricing.map(|pricing| (model.clone(), pricing))
+            })
+            .collect()
+    }
+
     pub fn route(&self, context: ModelRouteContext<'_>) -> ModelRouteDecision {
         let (actual_model, reason) = if let Some(override_model) = context.subagent_model {
             (
@@ -187,7 +241,10 @@ pub fn builtin_model_definition(model: &str) -> ModelDefinition {
         AUTO_MODEL | PRO_MODEL => Some(false),
         _ => None,
     };
-    ModelDefinition { supports_images }
+    ModelDefinition {
+        supports_images,
+        pricing: None,
+    }
 }
 
 /// Whether `model`, the routed model a request goes to, may receive images
@@ -341,12 +398,14 @@ mod tests {
             custom_model.to_string(),
             ModelDefinition {
                 supports_images: Some(true),
+                ..ModelDefinition::default()
             },
         );
         models.insert(
             FLASH_MODEL.to_string(),
             ModelDefinition {
                 supports_images: Some(false),
+                ..ModelDefinition::default()
             },
         );
         let mut ctx = context();
@@ -376,6 +435,7 @@ mod tests {
             custom_model.to_string(),
             ModelDefinition {
                 supports_images: Some(true),
+                ..ModelDefinition::default()
             },
         );
         let selection = ModelSelection::parse_with_models(None, models)
@@ -416,6 +476,7 @@ mod tests {
             LEGACY_VISION_MODEL.to_string(),
             ModelDefinition {
                 supports_images: Some(false),
+                ..ModelDefinition::default()
             },
         );
         let selection =
@@ -429,12 +490,14 @@ mod tests {
             LEGACY_FLASH_MODEL.to_string(),
             ModelDefinition {
                 supports_images: Some(false),
+                ..ModelDefinition::default()
             },
         );
         conflicting.insert(
             FLASH_MODEL.to_string(),
             ModelDefinition {
                 supports_images: Some(true),
+                ..ModelDefinition::default()
             },
         );
         assert!(
@@ -494,5 +557,43 @@ mod tests {
         assert!(accepts_tool_images(LEGACY_FLASH_MODEL));
         assert!(!accepts_tool_images(PRO_MODEL));
         assert!(!accepts_tool_images("provider/multimodal-model"));
+    }
+
+    #[test]
+    fn usd_per_million_accepts_only_finite_non_negative_prices() {
+        assert_eq!(UsdPerMillion::new(0.0).map(UsdPerMillion::get), Some(0.0));
+        assert_eq!(UsdPerMillion::new(1.5).map(UsdPerMillion::get), Some(1.5));
+        for bad in [-0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(UsdPerMillion::new(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn usd_per_million_rejects_huge_finite_prices() {
+        assert_eq!(UsdPerMillion::new(10_000.0).unwrap().get(), 10_000.0);
+        for value in [10_000.01, 1e308] {
+            assert!(UsdPerMillion::new(value).is_none(), "{value}");
+            assert!(serde_json::from_str::<UsdPerMillion>(&value.to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn price_overrides_are_keyed_by_canonical_model_name() {
+        let price = |value| UsdPerMillion::new(value).unwrap();
+        let pricing = ModelPriceOverride {
+            input_cache_miss: price(1.0),
+            input_cache_hit: price(0.1),
+            output: price(2.0),
+        };
+        let models = BTreeMap::from([(
+            LEGACY_FLASH_MODEL.to_string(),
+            ModelDefinition {
+                pricing: Some(pricing),
+                ..ModelDefinition::default()
+            },
+        )]);
+        let selection = ModelSelection::parse_with_models(None, models).unwrap();
+        assert_eq!(selection.price_overrides().get(FLASH_MODEL), Some(&pricing));
+        assert_eq!(selection.price_overrides().len(), 1);
     }
 }

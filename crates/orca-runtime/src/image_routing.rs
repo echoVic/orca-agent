@@ -515,6 +515,7 @@ mod tests {
                 CUSTOM_MODEL.to_string(),
                 ModelDefinition {
                     supports_images: Some(true),
+                    ..ModelDefinition::default()
                 },
             )]),
         )

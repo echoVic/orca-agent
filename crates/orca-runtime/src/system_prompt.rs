@@ -3,7 +3,6 @@ use std::path::Path;
 use chrono::Local;
 use orca_core::config::RunConfig;
 use orca_platform::shell::{ShellKind, ShellResolver, ShellSpec};
-use orca_tools::schema::{ToolPolicy, canonical_tool_definitions};
 
 #[cfg(test)]
 pub fn build_system_prompt(cwd: &Path) -> String {
@@ -14,35 +13,37 @@ pub fn build_system_prompt_for_tools(cwd: &Path, allowed_tools: Option<&[String]
     let shell = ShellResolver::for_current_host()
         .resolve_from_environment()
         .ok();
-    build_system_prompt_with_shell_and_tools(cwd, shell.as_ref(), allowed_tools, false)
+    build_system_prompt_with_shell_and_tools(cwd, shell.as_ref(), allowed_tools)
 }
 
 pub(crate) fn build_system_prompt_for_config(
     cwd: &Path,
-    config: &RunConfig,
-    subagent_depth: u32,
+    _config: &RunConfig,
+    _subagent_depth: u32,
     allowed_tools: Option<&[String]>,
 ) -> String {
     let shell = ShellResolver::for_current_host()
         .resolve_from_environment()
         .ok();
-    let computer_visible = crate::computer_use::visibility::session_visible(config, subagent_depth)
-        && allowed_tools.is_none();
-    build_system_prompt_with_shell_and_tools(cwd, shell.as_ref(), allowed_tools, computer_visible)
+    build_system_prompt_with_shell_and_tools(cwd, shell.as_ref(), allowed_tools)
 }
 
 #[cfg(test)]
 pub fn build_system_prompt_with_shell(cwd: &Path, shell: Option<&ShellSpec>) -> String {
-    build_system_prompt_with_shell_and_tools(cwd, shell, None, false)
+    build_system_prompt_with_shell_and_tools(cwd, shell, None)
 }
 
 fn build_system_prompt_with_shell_and_tools(
     cwd: &Path,
     shell: Option<&ShellSpec>,
     allowed_tools: Option<&[String]>,
-    computer_visible: bool,
 ) -> String {
-    let tools = render_tool_prompt_section(allowed_tools, computer_visible);
+    let git_repository = crate::workspace_git::is_git_work_tree(cwd);
+    let git_environment = if git_repository {
+        ""
+    } else {
+        "- Git repository: no\n"
+    };
     let shell_allowed = tool_allowed(allowed_tools, "bash");
     let shell_environment = if shell_allowed {
         render_shell_environment(shell)
@@ -61,7 +62,7 @@ fn build_system_prompt_with_shell_and_tools(
 - Operating system: {os}
 - {shell_environment}
 - Today's date: {today}
-
+{git_environment}
 # How you work
 
 ## Personality
@@ -129,10 +130,6 @@ Start validation as specific as possible to the code you changed, then broaden:
 - If there's no test and the codebase has tests, add one in the logical location.
 - Do not attempt to fix unrelated broken tests.
 
-## Available Tools
-
-{tools}
-
 {command_guidance}
 {shell_guidance}
 
@@ -165,7 +162,6 @@ If there's a logical next step you can help with, suggest it briefly."#,
         cwd = cwd.display(),
         os = std::env::consts::OS,
         today = Local::now().format("%Y-%m-%d"),
-        tools = tools,
         command_guidance = command_guidance,
     )
 }
@@ -189,7 +185,7 @@ For file inspection, prefer `read_file`, `glob`, and `grep`."#
     } else {
         r#"## Inspecting files
 
-Use only the tools advertised above. This role has no shell or process execution tool. Use `read_file`, `glob`, and `grep` for source inspection and never attempt `bash` or another command tool."#
+Use only the tools provided for this role. This role has no shell or process execution tool. Use `read_file`, `glob`, and `grep` for source inspection and never attempt `bash` or another command tool."#
     }
 }
 
@@ -218,19 +214,6 @@ fn tool_allowed(allowed_tools: Option<&[String]>, name: &str) -> bool {
     allowed_tools.is_none_or(|allowed| allowed.iter().any(|tool| tool == name))
 }
 
-fn render_tool_prompt_section(allowed_tools: Option<&[String]>, computer_visible: bool) -> String {
-    let registry = orca_tools::registry::default_tool_registry();
-    let mut output = String::new();
-    for tool in canonical_tool_definitions(&ToolPolicy::base(), registry)
-        .into_iter()
-        .filter(|tool| tool_allowed(allowed_tools, &tool.name))
-        .filter(|tool| tool.name != "computer" || computer_visible)
-    {
-        output.push_str(&format!("\n### {}\n{}\n", tool.name, tool.description));
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,11 +231,46 @@ mod tests {
     }
 
     #[test]
-    fn prompt_recommends_glob_and_hides_list_files() {
+    fn non_repo_prompt_hides_git_status_and_reports_environment() {
+        let cwd = tempfile::tempdir().unwrap();
+        assert!(cwd.path().ancestors().all(|dir| !dir.join(".git").exists()));
+        let prompt = build_system_prompt_with_shell(cwd.path(), None);
+
+        assert!(!prompt.contains("### git_status\n"));
+        let environment = prompt.split("# How you work").next().unwrap();
+        assert!(environment.contains("- Git repository: no\n"));
+    }
+
+    #[test]
+    fn repo_prompt_preserves_existing_text_except_non_repo_git_context() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::fs::write(repo.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let non_repo = tempfile::tempdir().unwrap();
+        assert!(
+            non_repo
+                .path()
+                .ancestors()
+                .all(|dir| !dir.join(".git").exists())
+        );
+        let repo_prompt = build_system_prompt_with_shell(repo.path(), None);
+        let non_repo_prompt = build_system_prompt_with_shell(non_repo.path(), None);
+
+        assert!(!repo_prompt.contains("### git_status\n"));
+        assert!(!repo_prompt.contains("Git repository"));
+        assert_eq!(
+            repo_prompt.replace(&repo.path().display().to_string(), "<cwd>"),
+            non_repo_prompt
+                .replace(&non_repo.path().display().to_string(), "<cwd>")
+                .replace("- Git repository: no\n", "")
+        );
+    }
+
+    #[test]
+    fn prompt_recommends_glob_without_repeating_the_tool_catalog() {
         let prompt = build_system_prompt(std::path::Path::new("/repo"));
 
-        assert!(prompt.contains("### glob"));
-        assert!(!prompt.contains("### list_files"));
+        assert!(!prompt.contains("## Available Tools"));
         assert!(prompt.contains("prefer `read_file`, `glob`, and `grep`"));
     }
 
@@ -260,7 +278,7 @@ mod tests {
     fn prompt_does_not_inline_full_tool_json_schemas() {
         let prompt = build_system_prompt(std::path::Path::new("/repo"));
 
-        assert!(prompt.contains("### update_plan"));
+        assert!(!prompt.lines().any(|line| line.starts_with("### ")));
         assert!(!prompt.contains("Parameters: `"));
         assert!(!prompt.contains(r#""additionalProperties":false"#));
         assert!(prompt.contains(r#"{"plan":[{"step":"Inspect code","status":"in_progress"}]}"#));
@@ -280,14 +298,14 @@ mod tests {
     fn prompt_names_bash_as_the_single_command_entry_point() {
         let prompt = build_system_prompt(std::path::Path::new("/repo"));
 
-        assert!(prompt.contains("### bash"));
+        assert!(!prompt.contains("### bash"));
         assert!(prompt.contains("Every shell command goes through `bash`"));
         assert!(prompt.contains("`task_wait`"));
         assert!(prompt.contains("never start it a second time"));
     }
 
     #[test]
-    fn restricted_prompt_only_advertises_effective_tools() {
+    fn restricted_prompt_preserves_no_shell_guidance_without_tool_listing() {
         let allowed = vec![
             "read_file".to_string(),
             "glob".to_string(),
@@ -295,9 +313,8 @@ mod tests {
         ];
         let prompt = build_system_prompt_for_tools(std::path::Path::new("/repo"), Some(&allowed));
 
-        assert!(prompt.contains("### read_file"));
-        assert!(prompt.contains("### glob"));
-        assert!(prompt.contains("### grep"));
+        assert!(!prompt.lines().any(|line| line.starts_with("### ")));
+        assert!(!prompt.contains("advertised above"));
         assert!(!prompt.contains("### bash"));
         assert!(!prompt.contains("Every shell command goes through `bash`"));
         assert!(prompt.contains("This role has no shell or process execution tool"));

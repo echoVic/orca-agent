@@ -2605,6 +2605,7 @@ dependencies = [
  "chrono",
  "crossbeam-channel",
  "dirs",
+ "flate2",
  "futures",
  "globset",
  "hickory-resolver",

@@ -156,12 +156,21 @@ Every JSONL line is one event:
 }
 ```
 
+For `orca exec --output-format jsonl`, consecutive `assistant.reasoning.delta`
+events for the same `turn_id` and `item_id` may be merged. The same applies to
+`assistant.message.delta` events with the same `turn_id`, `agent_message_item_id`,
+and `plan_item_id`. Concatenating their `payload.text` preserves the exact text,
+including whitespace. A merged event keeps the first event's envelope, so `seq`
+values remain monotonic but may skip values. `model.response.completed` carries
+the full response text in `assistant_reasoning` and `assistant_content`.
+
 ## Event Types
 
 - `session.started`
 - `turn.started`
 - `assistant.reasoning.delta`
 - `assistant.message.delta`
+- `model.response.completed`
 - `provider.replay.updated`
 - `approval.requested`
 - `approval.resolved`

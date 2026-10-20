@@ -1088,12 +1088,22 @@ impl ToolExecutionActor {
             }
             Ok(()) => None,
         };
+        let event_request = tool_types::ToolRequest {
+            target: invocation.effective.target.clone(),
+            ..tool_request.clone()
+        };
         if let Some(result) = failure {
             let mut event_error = None;
             if emit_deltas {
                 retain_first_io_error(
                     &mut event_error,
-                    emit_tool_call_requested(events, sink, tool_request),
+                    emit_tool_call_requested(
+                        events,
+                        sink,
+                        &event_request,
+                        Some(mcp_registry),
+                        &config.external_tools,
+                    ),
                 );
             }
             retain_first_io_error(
@@ -1155,7 +1165,13 @@ impl ToolExecutionActor {
                     if emit_deltas {
                         retain_first_io_error(
                             &mut event_error,
-                            emit_tool_call_requested(events, sink, tool_request),
+                            emit_tool_call_requested(
+                                events,
+                                sink,
+                                &event_request,
+                                Some(mcp_registry),
+                                &config.external_tools,
+                            ),
                         );
                     }
                     retain_first_io_error(
@@ -1182,7 +1198,13 @@ impl ToolExecutionActor {
             let mut event_error = None;
             retain_first_io_error(
                 &mut event_error,
-                emit_tool_call_requested(events, sink, tool_request),
+                emit_tool_call_requested(
+                    events,
+                    sink,
+                    &event_request,
+                    Some(mcp_registry),
+                    &config.external_tools,
+                ),
             );
             if event_error.is_some() {
                 let result = tool_types::ToolResult::failed_before_start(
@@ -1380,6 +1402,12 @@ impl ToolExecutionActor {
             provider_response_ingress,
         } = context;
 
+        let event_request = tool_types::ToolRequest {
+            action: invocation.action.unwrap_or(invocation.effective.action),
+            target: invocation.effective.target.clone(),
+            ..tool_request.clone()
+        };
+
         if tool_request.name == tool_types::ToolName::RequestPermissions {
             return ApprovalGateExecution::default();
         }
@@ -1409,7 +1437,7 @@ impl ToolExecutionActor {
                         return failed_approval_gate_before_start(
                             events,
                             sink,
-                            tool_request,
+                            &event_request,
                             emit_deltas,
                             provider_response_ingress,
                             event_error,
@@ -1445,7 +1473,7 @@ impl ToolExecutionActor {
                         return failed_approval_gate_before_start(
                             events,
                             sink,
-                            tool_request,
+                            &event_request,
                             emit_deltas,
                             provider_response_ingress,
                             event_error,
@@ -1474,7 +1502,7 @@ impl ToolExecutionActor {
                             return finish_approval_gate_terminal(
                                 events,
                                 sink,
-                                tool_request,
+                                &event_request,
                                 emit_deltas,
                                 provider_response_ingress,
                                 event_error,
@@ -1486,7 +1514,7 @@ impl ToolExecutionActor {
                             return failed_approval_gate_before_start(
                                 events,
                                 sink,
-                                tool_request,
+                                &event_request,
                                 emit_deltas,
                                 provider_response_ingress,
                                 event_error,
@@ -1511,7 +1539,7 @@ impl ToolExecutionActor {
                             return finish_approval_gate_terminal(
                                 events,
                                 sink,
-                                tool_request,
+                                &event_request,
                                 emit_deltas,
                                 provider_response_ingress,
                                 event_error,
@@ -1528,7 +1556,7 @@ impl ToolExecutionActor {
                             return failed_approval_gate_before_start(
                                 events,
                                 sink,
-                                tool_request,
+                                &event_request,
                                 emit_deltas,
                                 provider_response_ingress,
                                 event_error,
@@ -1539,7 +1567,7 @@ impl ToolExecutionActor {
                             return failed_approval_gate_before_start(
                                 events,
                                 sink,
-                                tool_request,
+                                &event_request,
                                 emit_deltas,
                                 provider_response_ingress,
                                 event_error,
@@ -1558,7 +1586,7 @@ impl ToolExecutionActor {
                     return finish_approval_gate_terminal(
                         events,
                         sink,
-                        tool_request,
+                        &event_request,
                         emit_deltas,
                         provider_response_ingress,
                         event_error,
@@ -1571,7 +1599,7 @@ impl ToolExecutionActor {
                     return failed_approval_gate_before_start(
                         events,
                         sink,
-                        tool_request,
+                        &event_request,
                         emit_deltas,
                         provider_response_ingress,
                         event_error,
@@ -1751,7 +1779,7 @@ fn finish_approval_gate_terminal<W: io::Write>(
     if emit_deltas {
         retain_first_io_error(
             &mut event_error,
-            emit_tool_call_requested(events, sink, tool_request),
+            emit_tool_call_requested(events, sink, tool_request, None, &[]),
         );
     }
     retain_first_io_error(
@@ -1804,8 +1832,13 @@ fn emit_tool_call_requested(
     events: &mut EventFactory,
     sink: &mut EventSink<impl io::Write>,
     request: &tool_types::ToolRequest,
+    mcp_registry: Option<&McpRegistry>,
+    external_tools: &[orca_core::external_config::ExternalToolConfig],
 ) -> io::Result<()> {
-    let event = RuntimeTaskActor::tool_call_requested_event_for(events, request);
+    let registry =
+        orca_tools::registry::tool_registry_with_mcp_and_external(mcp_registry, external_tools);
+    let event =
+        RuntimeTaskActor::tool_call_requested_event_with_registry_for(events, request, &registry);
     sink.emit(event)
 }
 
@@ -1992,6 +2025,7 @@ mod tests {
             vim_mode: false,
             vim_insert_escape: None,
             update_check: false,
+            pricing_refresh: false,
             desktop_notifications: false,
             terminal_notifications: false,
             auto_memory: false,

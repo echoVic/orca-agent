@@ -600,8 +600,32 @@ impl<'a> RuntimeTaskActor<'a> {
         events: &mut EventFactory,
         request: &ToolRequest,
     ) -> EventDraft {
-        let event = events.tool_call_requested(request);
-        attach_shell_task_to_tool_event(event, request, RuntimeTaskStatus::Running)
+        Self::tool_call_requested_event_with_registry_for(
+            events,
+            request,
+            orca_tools::registry::default_tool_registry(),
+        )
+    }
+
+    pub(crate) fn tool_call_requested_event_with_registry_for(
+        events: &mut EventFactory,
+        request: &ToolRequest,
+        registry: &orca_tools::registry::ToolRegistry,
+    ) -> EventDraft {
+        // Providers only supply identity and arguments. Classify the event by
+        // the execution registry, while preserving the original wire payload.
+        let mut canonical = request.clone();
+        canonical.action = registry
+            .resolve(request.name.as_str())
+            .map(|resolved| resolved.spec.capabilities.action_kind())
+            .unwrap_or_else(|| orca_tools::canonical_action_kind(request));
+        canonical.target = orca_tools::schema::normalize_tool_request(registry, request)
+            .ok()
+            .and_then(|normalized| normalized.target)
+            .or_else(|| orca_tools::schema::tool_request_target(request))
+            .or_else(|| request.target.clone());
+        let event = events.tool_call_requested(&canonical);
+        attach_shell_task_to_tool_event(event, &canonical, RuntimeTaskStatus::Running)
     }
 
     pub fn tool_call_completed_event_for(
@@ -611,7 +635,9 @@ impl<'a> RuntimeTaskActor<'a> {
     ) -> EventDraft {
         let status = RuntimeTaskStatus::from_run_status(run_status_from_tool_status(result.status));
         let event = events.tool_call_completed(result);
-        attach_shell_task_to_tool_event(event, request, status)
+        let mut canonical = request.clone();
+        canonical.action = orca_tools::canonical_action_kind(request);
+        attach_shell_task_to_tool_event(event, &canonical, status)
     }
 
     pub fn run_pre_tool_hook(
@@ -1781,6 +1807,7 @@ impl RuntimeActorStartedTurn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::runtime_conversation_bootstrap::{
         AgentConversationContext, RuntimeConversationBootstrapStep,
     };
@@ -1808,6 +1835,150 @@ mod tests {
     use orca_core::mcp_types::McpServerConfig;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
+
+    #[test]
+    fn requested_event_classifies_provider_shaped_builtin_requests() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::tool_types::ToolName;
+
+        for (name, arguments, action, target) in [
+            (
+                ToolName::WriteFile,
+                r#"{"path":"snake.py","content":"pass"}"#,
+                "write",
+                "snake.py",
+            ),
+            (
+                ToolName::Bash,
+                r#"{"command":"printf hello"}"#,
+                "shell",
+                "printf hello",
+            ),
+            (
+                ToolName::Edit,
+                r#"{"path":"snake.py","old_text":"pass","new_text":"print(1)"}"#,
+                "write",
+                "snake.py",
+            ),
+        ] {
+            let request = ToolRequest {
+                id: "provider-call".to_string(),
+                name,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(arguments.to_string()),
+            };
+            let mut events = EventFactory::new("requested-event".to_string());
+            let event = RuntimeTaskActor::tool_call_requested_event_for(&mut events, &request);
+            assert_eq!(event.payload["action"], action, "{}", request.name.as_str());
+            assert_eq!(event.payload["target"], target);
+            assert_eq!(event.payload["id"], request.id);
+            assert_eq!(event.payload["name"], serde_json::json!(request.name));
+            assert_eq!(event.payload["raw_arguments"], arguments);
+        }
+    }
+
+    #[test]
+    fn provider_shaped_shell_events_carry_task_snapshots() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::tool_types::ToolName;
+
+        for (name, arguments, is_shell) in [
+            (ToolName::Bash, r#"{"command":"printf hello"}"#, true),
+            (ToolName::ReadFile, r#"{"path":"README.md"}"#, false),
+        ] {
+            let request = ToolRequest {
+                id: "provider-call".to_string(),
+                name,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(arguments.to_string()),
+            };
+            let mut events = EventFactory::new("shell-task".to_string());
+            let requested = RuntimeTaskActor::tool_call_requested_event_for(&mut events, &request);
+            let result = ToolResult::completed(&request, "done".to_string(), false);
+            let completed =
+                RuntimeTaskActor::tool_call_completed_event_for(&mut events, &request, &result);
+            for (event, status) in [(requested, "running"), (completed, "succeeded")] {
+                if is_shell {
+                    assert_eq!(
+                        event.payload["task"],
+                        serde_json::json!({
+                            "task_id": "shell-provider-call:task-1",
+                            "kind": "shell",
+                            "status": status,
+                            "turn": 1
+                        }),
+                        "{:?}",
+                        event.event_type
+                    );
+                } else {
+                    assert!(event.payload.get("task").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn requested_event_uses_mcp_and_external_registry_metadata() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::mcp_types::McpTool;
+        use orca_core::tool_types::ToolName;
+
+        let mcp_registry = McpRegistry::from_tools_for_test(vec![McpTool {
+            server: "local".to_string(),
+            name: "write".to_string(),
+            schema_name: "mcp__local__write".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only: false,
+        }]);
+        let external_tools = [ExternalToolConfig {
+            name: "deploy".to_string(),
+            description: "deploy".to_string(),
+            action_kind: ActionKind::Shell,
+            command: "echo deploy".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+        }];
+        let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+            Some(&mcp_registry),
+            &external_tools,
+        );
+        for (name, action, target) in [
+            (
+                ToolName::Mcp("mcp__local__write".to_string()),
+                "write",
+                "mcp__local__write",
+            ),
+            (ToolName::External("deploy".to_string()), "shell", "deploy"),
+        ] {
+            // Even calls rejected for invalid arguments must be classified by
+            // the registry rather than inheriting the provider's read action.
+            for arguments in ["{}", "invalid JSON"] {
+                let request = ToolRequest {
+                    id: "provider-call".to_string(),
+                    name: name.clone(),
+                    action: ActionKind::Read,
+                    target: None,
+                    raw_arguments: Some(arguments.to_string()),
+                };
+                let mut events = EventFactory::new("registry-event".to_string());
+                let event = RuntimeTaskActor::tool_call_requested_event_with_registry_for(
+                    &mut events,
+                    &request,
+                    &registry,
+                );
+                assert_eq!(event.payload["action"], action);
+                assert_eq!(event.payload.get("task").is_some(), action == "shell");
+                if arguments == "{}" {
+                    assert_eq!(event.payload["target"], target);
+                }
+                assert_eq!(event.payload["id"], "provider-call");
+                assert_eq!(event.payload["name"], serde_json::json!(name));
+                assert_eq!(event.payload["raw_arguments"], arguments);
+            }
+        }
+    }
 
     fn config() -> RunConfig {
         RunConfig {
@@ -1844,6 +2015,7 @@ mod tests {
             vim_mode: false,
             vim_insert_escape: None,
             update_check: false,
+            pricing_refresh: false,
             desktop_notifications: false,
             terminal_notifications: false,
             auto_memory: false,
@@ -1968,6 +2140,7 @@ mod tests {
             .expect("start turn");
 
         assert!(result.error.is_none());
+        drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"turn.started\""));
         assert!(output.contains("hello"));
@@ -2038,6 +2211,7 @@ mod tests {
             }
             RuntimeTurnOpeningResult::Return(_) => panic!("opening should continue"),
         }
+        drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"turn.started\""));
         assert!(output.contains("\"type\":\"model.routed\""));
@@ -2261,6 +2435,7 @@ mod tests {
             Some(orca_core::model::FLASH_MODEL)
         );
         assert_eq!(result.decision.actual_model, orca_core::model::FLASH_MODEL);
+        drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"model.routed\""));
         assert!(output.contains(orca_core::model::FLASH_MODEL));
@@ -2313,6 +2488,7 @@ mod tests {
             Some(orca_core::model::FLASH_MODEL)
         );
         assert_eq!(result.decision.actual_model, orca_core::model::FLASH_MODEL);
+        drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains(orca_core::model::FLASH_MODEL));
     }
@@ -2333,6 +2509,7 @@ mod tests {
 
         let setup = RuntimeTurnSetupStep::new().prepare(
             &config,
+            &std::env::current_dir().expect("cwd"),
             0,
             &SubagentType::General,
             AgentToolPolicyContext::unrestricted(),

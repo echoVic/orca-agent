@@ -913,6 +913,7 @@ mod tests {
                 "deepseek-flash".into(),
                 orca_core::model::ModelDefinition {
                     supports_images: Some(false),
+                    ..orca_core::model::ModelDefinition::default()
                 },
             )]),
         )

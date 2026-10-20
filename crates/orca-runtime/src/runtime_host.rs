@@ -200,6 +200,11 @@ fn take_passthrough_finish_failure() -> bool {
 }
 
 pub trait HostedOperationWriter: io::Write + Send + 'static {
+    /// Only the exec stdout relay opts in; internal and server writers stay lossless.
+    fn coalesce_jsonl_deltas(&self) -> bool {
+        false
+    }
+
     fn finish_generation(&mut self, commit_terminal: bool) -> io::Result<()>;
 }
 
@@ -499,6 +504,7 @@ pub struct HostedTurnRequest {
     root_task_id: Option<String>,
     generation_handler_factory: Option<Arc<HostedGenerationHandlerFactory>>,
     usage_credit: UsageTotals,
+    coalesce_jsonl_deltas: bool,
     surface_goal_owned: bool,
     surface_goal_turn: Option<crate::goal_actor::GoalTurnContext>,
 }
@@ -662,6 +668,7 @@ impl HostedTurnRequest {
             root_task_id: None,
             generation_handler_factory: None,
             usage_credit: UsageTotals::default(),
+            coalesce_jsonl_deltas: false,
             surface_goal_owned: false,
             surface_goal_turn: None,
         }
@@ -895,6 +902,7 @@ impl HostedTurnRequest {
             ThreadTurnToolMode::Standard
         };
         let mut request = ThreadTurnRequest::new(self.prompt.clone())
+            .with_jsonl_delta_coalescing(self.coalesce_jsonl_deltas)
             .with_images(self.images.clone())
             .with_turn_id(self.turn_id.clone())
             .with_prompt_placement(prompt_placement)
@@ -3285,6 +3293,17 @@ impl HeadlessSurfaceSession {
     where
         W: io::Write + Send + 'static,
     {
+        self.start_turn_with_output(prompt, PassthroughHostedOperationWriter::new(writer))
+    }
+
+    pub(crate) fn start_turn_with_output<W>(
+        &self,
+        prompt: &str,
+        writer: W,
+    ) -> io::Result<HeadlessOperationHandle>
+    where
+        W: HostedOperationWriter,
+    {
         let intent = surface::OperationRequestIntent {
             correlation: surface::OperationIngressCorrelation::Headless,
             kind: surface::OperationKind::UserTurn,
@@ -3314,7 +3333,7 @@ impl HeadlessSurfaceSession {
                     surface::SurfaceRequestId::new(),
                     reserved.operation_id.clone(),
                     reserved.lease.lease_id,
-                    PassthroughHostedOperationWriter::new(writer),
+                    writer,
                 )
                 .map_err(headless_surface_error)?,
             "admit",
@@ -21217,6 +21236,7 @@ impl ThreadActor {
         let executor = Arc::clone(&self.executor);
         let mut task_request = request.clone();
         task_request.surface_goal_turn = goal_turn;
+        task_request.coalesce_jsonl_deltas = writer.coalesce_jsonl_deltas();
         let cancel = CancelToken::new();
         if let Some(factory) = request.generation_handler_factory.as_ref() {
             context.handlers = factory(context.fence(), cancel.clone());
@@ -23880,6 +23900,37 @@ mod tests {
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[test]
+    fn provider_response_usage_totals_applies_process_user_override() {
+        crate::pricing::tests::with_isolated_user_overrides(|| {
+            let model = "provider-usage-override-probe";
+            crate::pricing::book::set_user_overrides(std::collections::BTreeMap::from([(
+                model.to_string(),
+                crate::pricing::rates::Rates {
+                    input_cache_miss: 1.0,
+                    input_cache_hit: 0.5,
+                    output: 2.0,
+                },
+            )]));
+            let response = ProviderResponse {
+                steps: Vec::new(),
+                assistant_content: Some("done".to_string()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: Some(orca_core::provider_types::Usage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                    cache_tokens: 500_000,
+                }),
+            };
+            let totals = provider_response_usage_totals(&response, Some(model)).expect("usage");
+            assert_eq!(totals.input_tokens, 1_000_000);
+            assert_eq!(totals.output_tokens, 1_000_000);
+            assert_eq!(totals.cache_tokens, 500_000);
+            assert!((totals.estimated_cost_usd - 2.75).abs() < 1e-12);
+        });
+    }
+
+    #[test]
     fn attached_side_context_drops_interactive_computer_capability() {
         let mut config = RunConfig::default();
         config.computer_use.interactive = true;
@@ -23895,6 +23946,7 @@ mod tests {
         assert!(!side.config.computer_use.interactive);
         let provider = crate::tool_invocation::provider_config_for_agent_loop(
             &side.config,
+            &std::env::current_dir().expect("cwd"),
             0,
             &orca_core::subagent_types::SubagentType::General,
             crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
@@ -23927,7 +23979,7 @@ mod tests {
         let prompt = conversation.messages[0]
             .content_str()
             .expect("side system prompt");
-        assert!(prompt.contains("### read_file"));
+        assert!(prompt.contains("`read_file`, `glob`, and `grep`"));
         assert!(!prompt.contains("### computer"));
         assert!(
             conversation
@@ -24027,7 +24079,9 @@ mod tests {
             let actual = body["messages"][0]["content"].as_str().unwrap();
             if condition == "advertised" {
                 assert!(!actual.contains("### computer"));
-                assert!(actual.contains("### read_file"));
+                assert!(
+                    actual.contains("For file inspection, prefer `read_file`, `glob`, and `grep`")
+                );
             } else {
                 assert!(
                     actual.as_bytes() == parent_prompt.as_bytes(),
@@ -26686,6 +26740,7 @@ mod tests {
             vim_mode: false,
             vim_insert_escape: None,
             update_check: false,
+            pricing_refresh: false,
             desktop_notifications: false,
             terminal_notifications: false,
             auto_memory: false,
@@ -40546,7 +40601,7 @@ mod tests {
                 assistant_content: Some("finished".to_string()),
                 assistant_reasoning: None,
                 tool_calls: Vec::new(),
-                // V4-Flash pricing: 100k in + 10k out = 14,000 + 2,800 micros.
+                // Off-peak flash: 100k in + 10k out = 15,000 + 6,000 micros.
                 usage: Some(Usage {
                     input_tokens: 100_000,
                     output_tokens: 10_000,
@@ -40589,7 +40644,7 @@ mod tests {
             "tool accounting resumed from the snapshot"
         );
         assert_eq!(
-            usage.cost_usd_micros, 20_800,
+            usage.cost_usd_micros, 25_000,
             "the response delta is added exactly once to the pre-suspension cost"
         );
 
@@ -41978,6 +42033,7 @@ done
         let requested_mcp_tools = || {
             crate::tool_invocation::provider_config_for_agent_loop(
                 &config,
+                cwd.path(),
                 0,
                 &orca_core::subagent_types::SubagentType::General,
                 crate::tool_invocation::AgentToolPolicyContext::unrestricted(),

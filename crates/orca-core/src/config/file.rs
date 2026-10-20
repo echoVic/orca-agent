@@ -22,6 +22,19 @@ pub use crate::home::ORCA_HOME_ENV;
 pub const USER_CONFIG_FILE: &str = "config.toml";
 pub const AUTH_FILE: &str = "auth.json";
 
+/// `[pricing]`: whether Orca refreshes DeepSeek's prices from models.dev.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct PricingFileConfig {
+    #[serde(default = "default_true")]
+    pub refresh: bool,
+}
+
+impl Default for PricingFileConfig {
+    fn default() -> Self {
+        Self { refresh: true }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(from = "RawFileConfig")]
 pub struct FileConfig {
@@ -60,6 +73,8 @@ pub struct FileConfig {
     pub vim_insert_escape: Option<crate::config::VimInsertEscapeSequence>,
     #[serde(default = "default_true")]
     pub update_check: bool,
+    #[serde(default)]
+    pub pricing: PricingFileConfig,
     #[serde(default)]
     pub desktop_notifications: bool,
     #[serde(default = "default_true")]
@@ -113,6 +128,8 @@ struct RawFileConfig {
     #[serde(default = "default_true")]
     pub update_check: bool,
     #[serde(default)]
+    pub pricing: PricingFileConfig,
+    #[serde(default)]
     pub desktop_notifications: bool,
     #[serde(default = "default_true")]
     pub terminal_notifications: bool,
@@ -143,6 +160,7 @@ impl Default for FileConfig {
             vim_mode: false,
             vim_insert_escape: None,
             update_check: true,
+            pricing: PricingFileConfig::default(),
             desktop_notifications: false,
             terminal_notifications: true,
             auto_memory: true,
@@ -180,6 +198,7 @@ impl From<RawFileConfig> for FileConfig {
             vim_mode: raw.vim_mode,
             vim_insert_escape: raw.vim_insert_escape,
             update_check: raw.update_check,
+            pricing: raw.pricing,
             desktop_notifications: raw.desktop_notifications,
             terminal_notifications: raw.terminal_notifications,
             auto_memory: raw.auto_memory,
@@ -386,19 +405,29 @@ fn load_layered_config_from_optional_paths(
     let project_is_trusted = user_path.and_then(Path::parent).is_some_and(|config_dir| {
         super::folder_trust::is_trusted_with_config_dir(project_root, config_dir)
     });
-    if project_is_trusted
-        && let Some(mut project) = load_toml_value(&project_root.join(".orca/config.toml"))
-    {
+    let project_path = project_root.join(".orca/config.toml");
+    let mut user_layer = None;
+    if project_is_trusted && let Some(mut project) = load_toml_value(&project_path) {
         remove_project_denied_fields(&mut project);
+        user_layer = Some(merged.clone());
         merge_toml_values(&mut merged, project);
     }
 
     let mut config = match file_config_from_value(merged) {
         Ok(config) => config,
-        Err(error) => {
-            eprintln!("orca: warning: config parse error, using defaults: {error}");
-            FileConfig::default()
-        }
+        Err(error) => match user_layer.and_then(|user| file_config_from_value(user).ok()) {
+            Some(config) => {
+                eprintln!(
+                    "orca: warning: project config parse error in {}, ignoring it: {error}",
+                    project_path.display()
+                );
+                config
+            }
+            None => {
+                eprintln!("orca: warning: config parse error, using defaults: {error}");
+                FileConfig::default()
+            }
+        },
     };
     if config.api_key.is_none() {
         if let Some(path) = user_path.and_then(Path::parent) {
@@ -505,8 +534,22 @@ fn remove_project_denied_fields(value: &mut Value) {
             "tools",
             "computer_use",
             "budget",
+            "pricing",
         ] {
             table.remove(key);
+        }
+        // Prices decide when a cost budget stops a run, so like `budget` they
+        // stay user-owned.
+        if let Some(models) = table.get_mut("models").and_then(Value::as_table_mut) {
+            models.retain(|_, value| {
+                let Some(definition) = value.as_table_mut() else {
+                    return false;
+                };
+                // A denied price alone must not leave an empty alias that
+                // conflicts with the user's canonical model definition.
+                let had_pricing = definition.remove("pricing").is_some();
+                !had_pricing || !definition.is_empty()
+            });
         }
     }
 }
@@ -2071,6 +2114,84 @@ vim_insert_escape = "jj"
         assert!(key.is_none());
     }
 
+    fn assert_broken_project_preserves_user_config(project_source: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_dir = dir.path().join("project");
+        fs::create_dir_all(project_dir.join(".orca")).unwrap();
+        fs::write(
+            &user_path,
+            r#"
+model = "x"
+theme = "dark"
+vim_mode = true
+[budget]
+max_cost_usd_micros = 12_500_000
+[models."x".pricing]
+input_cache_miss = 0.5
+input_cache_hit = 0.05
+output = 2.0
+"#,
+        )
+        .unwrap();
+        fs::write(project_dir.join(".orca/config.toml"), project_source).unwrap();
+        crate::config::folder_trust::set_trust_with_config_dir(
+            &project_dir,
+            dir.path(),
+            crate::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+
+        let config = load_layered_config_from_paths(&user_path, &project_dir);
+        assert_eq!(config.budget.max_cost_usd_micros, Some(12_500_000));
+        assert_eq!(config.model.as_deref(), Some("x"));
+        assert_eq!(config.theme, crate::config::ThemeName::Dark);
+        assert!(config.vim_mode);
+        let pricing = config.models["x"].pricing.unwrap();
+        assert_eq!(pricing.input_cache_miss.get(), 0.5);
+        assert_eq!(pricing.input_cache_hit.get(), 0.05);
+        assert_eq!(pricing.output.get(), 2.0);
+    }
+
+    #[test]
+    fn layered_config_broken_project_models_preserves_user_config() {
+        assert_broken_project_preserves_user_config("models = []\n");
+    }
+
+    #[test]
+    fn layered_config_broken_project_theme_preserves_user_config() {
+        assert_broken_project_preserves_user_config("theme = 5\nvim_mode = false\n");
+    }
+
+    #[test]
+    fn layered_config_invalid_user_still_falls_back_to_defaults() {
+        for project_source in [None, Some("models = []\n")] {
+            let dir = tempfile::tempdir().unwrap();
+            let user_path = dir.path().join("user.toml");
+            let project_dir = dir.path().join("project");
+            fs::create_dir_all(project_dir.join(".orca")).unwrap();
+            fs::write(
+                &user_path,
+                "theme = 5\nvim_mode = true\n[budget]\nmax_cost_usd_micros = 12_500_000\n",
+            )
+            .unwrap();
+            if let Some(source) = project_source {
+                fs::write(project_dir.join(".orca/config.toml"), source).unwrap();
+            }
+            crate::config::folder_trust::set_trust_with_config_dir(
+                &project_dir,
+                dir.path(),
+                crate::config::folder_trust::TrustLevel::Trusted,
+            )
+            .unwrap();
+
+            let config = load_layered_config_from_paths(&user_path, &project_dir);
+            assert_eq!(config.budget, FileConfig::default().budget);
+            assert_eq!(config.theme, FileConfig::default().theme);
+            assert_eq!(config.vim_mode, FileConfig::default().vim_mode);
+        }
+    }
+
     #[test]
     fn layered_config_merges_user_and_project_with_project_security_deny_list() {
         let dir = tempfile::tempdir().unwrap();
@@ -2668,5 +2789,145 @@ workflowKeywordTriggerEnabled = true
         unsafe {
             std::env::remove_var(ORCA_HOME_ENV);
         }
+    }
+
+    #[test]
+    fn model_pricing_overrides_parse_and_reject_invalid_prices() {
+        let config: FileConfig = toml::from_str(
+            "[models.\"my-model\".pricing]\ninput_cache_miss = 0.5\ninput_cache_hit = 0.05\noutput = 2\n",
+        )
+        .unwrap();
+        let pricing = config.models["my-model"].pricing.expect("pricing");
+        assert_eq!(pricing.input_cache_miss.get(), 0.5);
+        assert_eq!(pricing.input_cache_hit.get(), 0.05);
+        assert_eq!(pricing.output.get(), 2.0);
+
+        for bad in [
+            "input_cache_miss = -1.0",
+            "input_cache_miss = nan",
+            "input_cache_miss = inf",
+        ] {
+            let source =
+                format!("[models.\"m\".pricing]\n{bad}\ninput_cache_hit = 0.1\noutput = 0.2\n");
+            assert!(toml::from_str::<FileConfig>(&source).is_err(), "{bad}");
+        }
+        let missing = "[models.\"m\".pricing]\ninput_cache_miss = 0.1\noutput = 0.2\n";
+        assert!(toml::from_str::<FileConfig>(missing).is_err());
+        let unknown = "[models.\"m\".pricing]\ninput_cache_miss = 0.1\ninput_cache_hit = 0.1\noutput = 0.2\ninput = 0.1\n";
+        assert!(toml::from_str::<FileConfig>(unknown).is_err());
+    }
+
+    #[test]
+    fn pricing_refresh_defaults_on_and_can_be_disabled() {
+        assert!(FileConfig::default().pricing.refresh);
+        let config: FileConfig = toml::from_str("[pricing]\nrefresh = false\n").unwrap();
+        assert!(!config.pricing.refresh);
+    }
+
+    #[test]
+    fn project_layer_drops_array_models_and_keeps_table_keys() {
+        let mut project: Value = toml::from_str(
+            r#"[models]
+deepseek-flash = [false, { input_cache_miss = 0.0, input_cache_hit = 0.0, output = 0.0 }]
+inline = { supports_images = true, pricing = { input_cache_miss = 0.0, input_cache_hit = 0.0, output = 0.0 } }
+scalar = false
+[models.table]
+supports_images = false
+"#,
+        ).unwrap();
+        remove_project_denied_fields(&mut project);
+        let models = project["models"].as_table().unwrap();
+        assert!(!models.contains_key("deepseek-flash"));
+        assert!(!models.contains_key("scalar"));
+        assert_eq!(models["inline"]["supports_images"].as_bool(), Some(true));
+        assert!(models["inline"].get("pricing").is_none());
+        assert_eq!(models["table"]["supports_images"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn project_layer_drops_pricing_settings() {
+        let mut project: Value = toml::from_str(
+            r#"
+model = "deepseek-v4-pro"
+
+[pricing]
+refresh = false
+
+[models."deepseek-flash"]
+supports_images = true
+
+[models."deepseek-flash".pricing]
+input_cache_miss = 0.0
+input_cache_hit = 0.0
+output = 0.0
+"#,
+        )
+        .unwrap();
+
+        remove_project_denied_fields(&mut project);
+
+        assert!(project.get("pricing").is_none());
+        assert!(project["models"]["deepseek-flash"].get("pricing").is_none());
+        assert_eq!(
+            project["models"]["deepseek-flash"]["supports_images"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(project["model"].as_str(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn project_pricing_only_alias_does_not_conflict_with_user_prices() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_dir = dir.path().join("project");
+        fs::create_dir_all(project_dir.join(".orca")).unwrap();
+        fs::write(
+            &user_path,
+            r#"
+[models."deepseek-flash".pricing]
+input_cache_miss = 0.5
+input_cache_hit = 0.05
+output = 2.0
+"#,
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join(".orca/config.toml"),
+            r#"
+model = "deepseek-v4-pro"
+
+[pricing]
+refresh = false
+
+[models."deepseek-v4-flash".pricing]
+input_cache_miss = 0.0
+input_cache_hit = 0.0
+output = 0.0
+
+[models."custom-model"]
+supports_images = true
+"#,
+        )
+        .unwrap();
+        crate::config::folder_trust::set_trust_with_config_dir(
+            &project_dir,
+            dir.path(),
+            crate::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+
+        let config = load_layered_config_from_paths(&user_path, &project_dir);
+        assert!(config.pricing.refresh);
+        let selection =
+            crate::model::ModelSelection::parse_with_models(config.model, config.models)
+                .expect("denied project prices must not introduce an alias conflict");
+        assert_eq!(selection.as_deref(), Some("deepseek-v4-pro"));
+        assert!(selection.supports_images("custom-model"));
+        let overrides = selection.price_overrides();
+        assert_eq!(overrides.len(), 1);
+        let pricing = overrides["deepseek-flash"];
+        assert_eq!(pricing.input_cache_miss.get(), 0.5);
+        assert_eq!(pricing.input_cache_hit.get(), 0.05);
+        assert_eq!(pricing.output.get(), 2.0);
     }
 }

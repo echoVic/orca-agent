@@ -402,11 +402,16 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             .as_ref()
             .map(|_| crate::tool_execution::policy_for_tool_execution(config));
         let policy = current_policy.as_ref().unwrap_or(initial_policy);
+        let event_registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+            Some(mcp_registry),
+            &config.external_tools,
+        );
 
         if cancel.is_cancelled() {
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
+                &event_registry,
                 events,
                 sink,
                 conversation,
@@ -431,6 +436,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 events,
                 sink,
                 tool_request,
+                &event_registry,
                 &result,
                 emit_deltas,
                 provider_response_ingress,
@@ -464,6 +470,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 events,
                 sink,
                 tool_request,
+                &event_registry,
                 &result,
                 emit_deltas,
                 provider_response_ingress,
@@ -487,6 +494,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
+                &event_registry,
                 events,
                 sink,
                 conversation,
@@ -517,6 +525,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
+                &event_registry,
                 events,
                 sink,
                 conversation,
@@ -547,6 +556,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
+                &event_registry,
                 events,
                 sink,
                 conversation,
@@ -598,6 +608,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 close_unstarted_tool_requests(
                     sampling_state,
                     tool_requests,
+                    &event_registry,
                     events,
                     sink,
                     conversation,
@@ -687,6 +698,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                         close_unstarted_tool_requests(
                             sampling_state,
                             tool_requests,
+                            &event_registry,
                             events,
                             sink,
                             conversation,
@@ -777,6 +789,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     close_unstarted_tool_requests(
                         sampling_state,
                         tool_requests,
+                        &event_registry,
                         events,
                         sink,
                         conversation,
@@ -809,6 +822,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 close_unstarted_tool_requests(
                     sampling_state,
                     tool_requests,
+                    &event_registry,
                     events,
                     sink,
                     conversation,
@@ -864,6 +878,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     close_unstarted_tool_requests(
                         sampling_state,
                         tool_requests,
+                        &event_registry,
                         events,
                         sink,
                         conversation,
@@ -889,6 +904,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 close_unstarted_tool_requests(
                     sampling_state,
                     tool_requests,
+                    &event_registry,
                     events,
                     sink,
                     conversation,
@@ -959,6 +975,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     close_unstarted_tool_requests(
                         sampling_state,
                         tool_requests,
+                        &event_registry,
                         events,
                         sink,
                         conversation,
@@ -1078,6 +1095,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     close_unstarted_tool_requests(
                         sampling_state,
                         tool_requests,
+                        &event_registry,
                         events,
                         sink,
                         conversation,
@@ -1098,6 +1116,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     events,
                     sink,
                     tool_request,
+                    &event_registry,
                     &result,
                     emit_deltas,
                     provider_response_ingress,
@@ -1120,6 +1139,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 close_unstarted_tool_requests(
                     sampling_state,
                     tool_requests,
+                    &event_registry,
                     events,
                     sink,
                     conversation,
@@ -1141,6 +1161,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
+                &event_registry,
                 events,
                 sink,
                 conversation,
@@ -1169,6 +1190,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
+                &event_registry,
                 events,
                 sink,
                 conversation,
@@ -1257,6 +1279,7 @@ fn tool_status_label(status: &orca_core::tool_types::ToolStatus) -> &'static str
 fn close_unstarted_tool_requests<W: io::Write>(
     sampling_state: &mut RuntimeSamplingRequestState,
     tool_requests: &[ToolRequest],
+    event_registry: &orca_tools::registry::ToolRegistry,
     events: &mut EventFactory,
     sink: &mut EventSink<W>,
     conversation: &mut Conversation,
@@ -1282,9 +1305,15 @@ fn close_unstarted_tool_requests<W: io::Write>(
     }
     let mut first_error = None;
     for (tool_request, result) in pending.iter().zip(results.iter()) {
-        if let Err(error) =
-            emit_tool_terminal_events(events, sink, tool_request, result, emit_deltas, None)
-            && first_error.is_none()
+        if let Err(error) = emit_tool_terminal_events(
+            events,
+            sink,
+            tool_request,
+            event_registry,
+            result,
+            emit_deltas,
+            None,
+        ) && first_error.is_none()
         {
             first_error = Some(error);
         }
@@ -1321,6 +1350,7 @@ fn emit_tool_terminal_events<W: io::Write>(
     events: &mut EventFactory,
     sink: &mut EventSink<W>,
     request: &ToolRequest,
+    event_registry: &orca_tools::registry::ToolRegistry,
     result: &ToolResult,
     emit_deltas: bool,
     provider_response_ingress: Option<&dyn RuntimeProviderResponseIngress>,
@@ -1333,9 +1363,13 @@ fn emit_tool_terminal_events<W: io::Write>(
     if !emit_deltas {
         return Ok(());
     }
-    let requested = sink.emit(RuntimeTaskActor::tool_call_requested_event_for(
-        events, request,
-    ));
+    let requested = sink.emit(
+        RuntimeTaskActor::tool_call_requested_event_with_registry_for(
+            events,
+            request,
+            event_registry,
+        ),
+    );
     let completed = sink.emit(RuntimeTaskActor::tool_call_completed_event_for(
         events, request, result,
     ));
@@ -1400,11 +1434,16 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         provider_response_ingress,
     } = interactions;
     if let Some(error) = subagent_budget_exhaustion_error(config, tool_request, cost_tracker) {
+        let event_registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+            Some(mcp_registry),
+            &config.external_tools,
+        );
         let result = ToolResult::failed_before_start(tool_request, error.clone(), None);
         let event_error = emit_tool_terminal_events(
             events,
             sink,
             tool_request,
+            &event_registry,
             &result,
             emit_deltas,
             provider_response_ingress,
@@ -1660,6 +1699,7 @@ mod tests {
         let error = close_unstarted_tool_requests(
             &mut sampling_state,
             std::slice::from_ref(&request),
+            orca_tools::registry::default_tool_registry(),
             &mut events,
             &mut sink,
             &mut conversation,
@@ -1693,6 +1733,7 @@ mod tests {
         close_unstarted_tool_requests(
             &mut sampling_state,
             std::slice::from_ref(&request),
+            orca_tools::registry::default_tool_registry(),
             &mut events,
             &mut sink,
             &mut conversation,
@@ -1721,6 +1762,7 @@ mod tests {
 
         let summary = registry.summary(&task.id).expect("root task summary");
         assert!(summary.output_truncated);
+        drop(sink);
         assert!(
             String::from_utf8(output)
                 .expect("event output")
@@ -1766,6 +1808,7 @@ mod tests {
             vim_mode: false,
             vim_insert_escape: None,
             update_check: false,
+            pricing_refresh: false,
             desktop_notifications: false,
             terminal_notifications: false,
             auto_memory: false,

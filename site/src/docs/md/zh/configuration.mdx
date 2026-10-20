@@ -49,6 +49,22 @@ max_wall_time_ms = 1800000
 `--max-tool-calls`、`--max-cost-usd` 或 `--max-wall-time-secs`。
 配置文件使用整数微美元和毫秒；CLI 分别使用美元和秒。
 
+## 成本估算
+
+成本估算按 DeepSeek 公布的高峰和空闲价格计算，默认开启后台刷新。每个进程在会话启动时检查一次，缓存缺失或已满 24 小时，就在后台从 models.dev 刷新。这两项只能写在用户配置里，项目的 `.orca/config.toml` 不能设置：
+
+```toml
+[pricing]
+refresh = false            # 不访问 models.dev 刷新价格
+
+[models."my-model".pricing]
+input_cache_miss = 0.5     # 美元 / 百万 tokens
+input_cache_hit = 0.05
+output = 1.5
+```
+
+`[models."<名称>".pricing]` 必须写全三个价格，且不分时段。估算方法见[模型](models.md#成本估算)。
+
 ## Computer use（macOS）
 
 在 macOS 14 及以上，交互式 TUI 的主会话可以操作其他应用。唯一的配置项写在

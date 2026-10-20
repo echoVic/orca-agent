@@ -68,6 +68,7 @@ pub struct SubagentWorkerLaunchRequest {
     pub permission_response_public_key: String,
     pub child_turn_id: String,
     pub activity_start_precommitted: bool,
+    pub headless_exec: bool,
 }
 
 pub fn prepare_interactive(request: InteractiveLaunchRequest) -> Result<RunConfig, String> {
@@ -234,6 +235,7 @@ fn run_subagent_worker_with_reader(request: SubagentWorkerLaunchRequest, reader:
     if let Some(snapshot) = subagent_request.delegation.as_ref() {
         snapshot.apply_to(&mut config, subagent_request.model.clone());
     }
+    config.tools.headless_exec = request.headless_exec;
 
     subagent_async_worker::run_async_subagent_worker(AsyncSubagentWorkerInput {
         config,

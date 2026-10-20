@@ -341,6 +341,10 @@ fn execute_subagent_batch(
     );
     let batch_id = uuid::Uuid::now_v7().to_string();
 
+    let event_registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(mcp_registry),
+        &config.external_tools,
+    );
     for (idx, tool_request) in tool_requests.iter().enumerate() {
         if event_error.is_some() {
             let result = tool_types::ToolResult::failed_before_start(
@@ -351,7 +355,11 @@ fn execute_subagent_batch(
             if emit_deltas {
                 emit_batch_event(
                     sink,
-                    events.tool_call_requested(tool_request),
+                    crate::lifecycle::RuntimeTaskActor::tool_call_requested_event_with_registry_for(
+                        events,
+                        tool_request,
+                        &event_registry,
+                    ),
                     &mut event_error,
                 );
                 emit_batch_event(sink, events.tool_call_completed(&result), &mut event_error);
@@ -360,7 +368,12 @@ fn execute_subagent_batch(
             continue;
         }
         if emit_deltas {
-            let requested = events.tool_call_requested(tool_request);
+            let requested =
+                crate::lifecycle::RuntimeTaskActor::tool_call_requested_event_with_registry_for(
+                    events,
+                    tool_request,
+                    &event_registry,
+                );
             if !emit_batch_event(sink, requested, &mut event_error) {
                 let result = tool_types::ToolResult::failed_before_start(
                     tool_request,
@@ -1047,6 +1060,7 @@ mod tests {
             vim_mode: false,
             vim_insert_escape: None,
             update_check: false,
+            pricing_refresh: false,
             desktop_notifications: false,
             terminal_notifications: false,
             auto_memory: false,
@@ -1138,7 +1152,8 @@ mod tests {
     fn sync_subagent_receives_only_remaining_aggregate_budget() {
         let mut config = config(SubagentConfig::default());
         config.budget.max_cost_usd_micros = Some(500_000);
-        let mut cost_tracker = CostTracker::new(None);
+        let mut cost_tracker =
+            CostTracker::new(None).with_clock(crate::pricing::rates::off_peak_instant);
         cost_tracker.add_usage(Usage {
             input_tokens: 1_000_000,
             output_tokens: 0,
@@ -1148,12 +1163,12 @@ mod tests {
         let child_config =
             super::config_for_remaining_subagent_budget(&config, &cost_tracker, None);
 
-        // 1M flash input tokens ≈ $0.14, leaving ≈ $0.36 of the $0.50 budget.
+        // 1M flash input tokens cost $0.15 off-peak, leaving $0.35 of the $0.50 budget.
         let remaining = child_config
             .budget
             .max_cost_usd_micros
             .expect("remaining budget");
-        assert!((remaining as f64 - 360_000.0).abs() < 2_000.0);
+        assert!((remaining as f64 - 350_000.0).abs() < 2_000.0);
         assert_eq!(config.budget.max_cost_usd_micros, Some(500_000));
     }
 

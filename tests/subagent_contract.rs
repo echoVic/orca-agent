@@ -58,7 +58,7 @@ fn synchronous_worker_runs_child_agent_and_emits_events() {
     let events = parse_jsonl(&output.stdout);
     let requested = find_event(&events, "tool.call.requested");
     assert_eq!(requested["payload"]["name"], "subagent");
-    assert_eq!(requested["payload"]["action"], "read");
+    assert_eq!(requested["payload"]["action"], "agent");
     assert_eq!(requested["payload"]["target"], "inspect repo");
 
     let completed = find_subagent_task(&events, "inspect repo");

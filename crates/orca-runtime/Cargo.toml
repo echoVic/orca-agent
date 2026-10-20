@@ -19,6 +19,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 toml = { workspace = true }
 dirs = { workspace = true }
+flate2 = { workspace = true }
 zstd = { workspace = true }
 reqwest = { workspace = true }
 rusqlite = { workspace = true }

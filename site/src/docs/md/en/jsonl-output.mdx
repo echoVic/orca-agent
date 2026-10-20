@@ -28,6 +28,11 @@ Treat type and payload as a versioned protocol. Consumers should retain unknown
 event types rather than assuming that a stream contains only the examples they
 currently recognize.
 
+orca exec may merge consecutive assistant.reasoning.delta or
+assistant.message.delta events for the same item. Concatenated payload.text is
+unchanged. Merged events retain the first envelope, so seq may skip values.
+model.response.completed carries the full assistant_reasoning and assistant_content.
+
 ~~~bash
 orca exec --output-format jsonl "Run the test suite" |
   jq -c 'select(.type == "tool.call.completed")'

@@ -45,7 +45,7 @@
                 "Succeeded": {
                   "usage": {
                     "cache_tokens": 10,
-                    "estimated_cost_usd_micros": 24,
+                    "estimated_cost_usd_micros": 35,
                     "input_tokens": 120,
                     "output_tokens": 30
                   }
