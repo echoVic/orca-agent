@@ -286,6 +286,25 @@ fn exec_deepseek_requested_events_report_canonical_action_and_target() {
         assert_eq!(payload["target"], target, "{name}");
         assert_eq!(payload["raw_arguments"], arguments);
     }
+    for (event_type, status) in [
+        ("tool.call.requested", "running"),
+        ("tool.call.completed", "succeeded"),
+    ] {
+        let event = events
+            .iter()
+            .find(|event| event["type"] == event_type && event["payload"]["id"] == "call-bash")
+            .expect("bash event");
+        assert_eq!(
+            event["payload"]["task"],
+            json!({
+                "task_id": "shell-call-bash:task-1",
+                "kind": "shell",
+                "status": status,
+                "turn": 1
+            }),
+            "{event_type}"
+        );
+    }
     assert_eq!(
         std::fs::read_to_string(cwd.path().join("snake.py")).unwrap(),
         "print(1)\n"

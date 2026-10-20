@@ -625,7 +625,7 @@ impl<'a> RuntimeTaskActor<'a> {
             .or_else(|| orca_tools::schema::tool_request_target(request))
             .or_else(|| request.target.clone());
         let event = events.tool_call_requested(&canonical);
-        attach_shell_task_to_tool_event(event, request, RuntimeTaskStatus::Running)
+        attach_shell_task_to_tool_event(event, &canonical, RuntimeTaskStatus::Running)
     }
 
     pub fn tool_call_completed_event_for(
@@ -635,7 +635,9 @@ impl<'a> RuntimeTaskActor<'a> {
     ) -> EventDraft {
         let status = RuntimeTaskStatus::from_run_status(run_status_from_tool_status(result.status));
         let event = events.tool_call_completed(result);
-        attach_shell_task_to_tool_event(event, request, status)
+        let mut canonical = request.clone();
+        canonical.action = orca_tools::canonical_action_kind(request);
+        attach_shell_task_to_tool_event(event, &canonical, status)
     }
 
     pub fn run_pre_tool_hook(
@@ -1877,6 +1879,47 @@ mod tests {
     }
 
     #[test]
+    fn provider_shaped_shell_events_carry_task_snapshots() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::tool_types::ToolName;
+
+        for (name, arguments, is_shell) in [
+            (ToolName::Bash, r#"{"command":"printf hello"}"#, true),
+            (ToolName::ReadFile, r#"{"path":"README.md"}"#, false),
+        ] {
+            let request = ToolRequest {
+                id: "provider-call".to_string(),
+                name,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(arguments.to_string()),
+            };
+            let mut events = EventFactory::new("shell-task".to_string());
+            let requested = RuntimeTaskActor::tool_call_requested_event_for(&mut events, &request);
+            let result = ToolResult::completed(&request, "done".to_string(), false);
+            let completed =
+                RuntimeTaskActor::tool_call_completed_event_for(&mut events, &request, &result);
+            for (event, status) in [(requested, "running"), (completed, "succeeded")] {
+                if is_shell {
+                    assert_eq!(
+                        event.payload["task"],
+                        serde_json::json!({
+                            "task_id": "shell-provider-call:task-1",
+                            "kind": "shell",
+                            "status": status,
+                            "turn": 1
+                        }),
+                        "{:?}",
+                        event.event_type
+                    );
+                } else {
+                    assert!(event.payload.get("task").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn requested_event_uses_mcp_and_external_registry_metadata() {
         use orca_core::approval_types::ActionKind;
         use orca_core::mcp_types::McpTool;
@@ -1926,6 +1969,7 @@ mod tests {
                     &registry,
                 );
                 assert_eq!(event.payload["action"], action);
+                assert_eq!(event.payload.get("task").is_some(), action == "shell");
                 if arguments == "{}" {
                     assert_eq!(event.payload["target"], target);
                 }
