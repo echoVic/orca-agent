@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.13":
+        "DeepSeek pricing, computer input, and smaller requests. Cost estimates now follow current DeepSeek rates and double during weekday peak hours in Beijing, so max_cost_usd budgets may stop sooner. Prices can refresh from models.dev in the background; user-only settings can disable refresh or set fixed model prices. Fixed request prefixes are about 24% smaller after removing duplicate tool descriptions and hiding unavailable tools. The measured first request fell from 10,517 to 8,094 prompt tokens. Element-targeted typing preserves an existing selection and caret; targets that need refocusing still receive text at the end. Exec JSONL batches consecutive text deltas without changing their combined text, but seq may skip values; exec and server tool.call.requested events gain action/target metadata. Invalid project configuration now preserves user settings. macOS tests run on stable Rust, confirm fixture process exit, and accept safe Save panel hit-test outcomes. UU overlay handling authenticates the process and refuses other covers, including transparent windows; active UU sessions remain untested. README badges and a first-run terminal demo complete this release.",
       "v0.5.12":
         "Fewer computer-use prompts. In full-auto, app calls no longer ask for app approval; typing into a password field still asks every time, deny and prompt rules still apply, and blocked apps stay blocked. The approval panel adds Allow all apps this session and Always allow all apps (saved), which saves pattern = \"*\"; neither covers password entry. Outside full-auto, terminals and IDEs still need approval for the app itself, and wildcard or whole-tool allow rules no longer cover them. The key action also accepts a separate modifiers array.",
       "v0.5.11":
@@ -700,6 +702,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.13":
+        "DeepSeek 定价、computer use 和请求前缀优化。费用估算改用官方现价，按北京时间工作日高峰翻倍，max_cost_usd 预算可能更早停止。价格过期时默认后台从 models.dev 刷新；用户配置可关闭刷新或设置全天固定价。移除重复工具说明并隐藏不可用工具后，固定请求前缀约小 24%；实测首个请求从 10,517 降到 8,094 个 prompt token。按元素输入保留已有选区和光标，重新聚焦的目标仍在末尾追加。exec JSONL 会合并连续文字增量，拼接文本不变但 seq 可能跳号；exec 和 server 的 tool.call.requested 都补充 action、target。项目配置无效时保留用户配置。macOS 真机测试支持 stable Rust，清理会确认自有进程退出，保存面板测试接受安全的命中结果。UU 浮层逻辑带签名校验，其他遮挡包括透明窗口仍会阻止点击，尚未在连接 UU 的会话里实测。README 新增徽章与首次运行终端演示。",
       "v0.5.12":
         "computer use 的审批少了。full-auto 下应用调用不再请求应用授权；往密码框输入仍然每次询问，deny 和 prompt 规则仍然生效，默认禁止的应用仍然禁止。审批面板新增“本会话允许所有应用”和“总是允许所有应用（保存）”，后者保存 pattern = \"*\"，两者都不覆盖密码输入。在 full-auto 之外，终端和 IDE 仍需要针对该应用本身的授权，通配符和整个工具的 allow 规则不再覆盖它们。key 动作也接受单独的 modifiers 数组。",
       "v0.5.11":

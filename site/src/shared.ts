@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.12";
+export const releaseVersion = "v0.5.13";
 
 export const releases = [
+  {
+    version: "v0.5.13",
+    date: "2026-10-20",
+    title: "DeepSeek pricing, computer input, and smaller requests",
+    body: "Cost estimates now use DeepSeek's current prices and weekday peak rates, with background price refresh and user overrides; fixed request prefixes are about 24% smaller. Computer input keeps focused selections, exec JSONL batches streamed deltas and includes tool action/target metadata, and the README adds a first-run terminal demo.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.13",
+  },
   {
     version: "v0.5.12",
     date: "2026-10-15",

@@ -62,7 +62,7 @@ const WEEKDAY_HOLIDAYS: &[(i32, u32, u32)] = &[
 
 /// The day the built-in prices were checked against DeepSeek's pricing page.
 pub fn builtin_as_of() -> NaiveDate {
-    NaiveDate::from_ymd_opt(2026, 10, 19).expect("valid built-in date")
+    NaiveDate::from_ymd_opt(2026, 10, 20).expect("valid built-in date")
 }
 
 /// The built-in prices, by canonical model name.
@@ -206,7 +206,7 @@ mod tests {
     fn builtin_table_matches_the_published_off_peak_prices() {
         assert_eq!(
             builtin_as_of(),
-            NaiveDate::from_ymd_opt(2026, 10, 19).unwrap()
+            NaiveDate::from_ymd_opt(2026, 10, 20).unwrap()
         );
         let table = builtin_rates();
         assert_eq!(
