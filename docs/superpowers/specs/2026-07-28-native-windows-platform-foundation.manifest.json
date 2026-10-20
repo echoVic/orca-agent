@@ -92,6 +92,13 @@
   ],
   "deferred_boundaries": [
     [
+      "computer-use-live-macos-process-cleanup",
+      "crates/orca-computer-use/tests/live_macos.rs",
+      "unix_libc_process",
+      4,
+      "windows-test-portability"
+    ],
+    [
       "acp-tui-client-socket-permissions-fixture",
       "crates/orca-tui/src/acp_client.rs",
       "unix_std_api",

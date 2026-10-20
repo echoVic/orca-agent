@@ -249,6 +249,120 @@ impl AxElement {
         )
     }
 
+    // The delivery-time scan never uses optional metadata's Failure-as-absence policy.
+    // Cap every native read by the remaining scan budget, then restore the usual timeout.
+    fn security_attribute_until(
+        &self,
+        name: &str,
+        deadline: Instant,
+    ) -> Result<(AXError, Option<CFRetained<CFType>>), DriverError> {
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs_f32();
+        if remaining <= 0.0 {
+            return Err(error(ErrorKind::Failed, "Security scan timed out"));
+        }
+        check(
+            unsafe { self.0.set_messaging_timeout(remaining) },
+            "set scan timeout",
+        )?;
+        let mut value = std::ptr::null();
+        let result = unsafe {
+            self.0
+                .copy_attribute_value(&CFString::from_str(name), NonNull::from(&mut value))
+        };
+        let value =
+            NonNull::new(value.cast_mut()).map(|value| unsafe { CFRetained::from_raw(value) });
+        check(
+            unsafe { self.0.set_messaging_timeout(2.0) },
+            "restore message timeout",
+        )?;
+        if Instant::now() >= deadline {
+            return Err(error(ErrorKind::Failed, "Security scan timed out"));
+        }
+        Ok((result, value))
+    }
+
+    pub(super) fn security_string_until(
+        &self,
+        name: &str,
+        deadline: Instant,
+    ) -> Result<Option<String>, DriverError> {
+        let (result, value) = self.security_attribute_until(name, deadline)?;
+        if !attribute_result(result, name, FailurePolicy::Required)? {
+            return Ok(None);
+        }
+        value
+            .map(|value| {
+                value
+                    .downcast_ref::<CFString>()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| error(ErrorKind::Failed, format!("Unreadable {name} metadata")))
+            })
+            .transpose()
+    }
+
+    pub(super) fn security_subrole_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<SubroleRead, DriverError> {
+        let (result, value) = self.security_attribute_until("AXSubrole", deadline)?;
+        if result != AXError::Success {
+            return classify_subrole(result, None);
+        }
+        let subrole = value
+            .map(|value| {
+                value
+                    .downcast_ref::<CFString>()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| error(ErrorKind::Failed, "Unreadable AXSubrole metadata"))
+            })
+            .transpose()?;
+        classify_subrole(result, subrole)
+    }
+
+    pub(super) fn security_children_until(
+        &self,
+        deadline: Instant,
+        max_elements: usize,
+    ) -> Result<Vec<Self>, DriverError> {
+        let (result, value) = self.security_attribute_until("AXChildren", deadline)?;
+        if !attribute_result(result, "AXChildren", FailurePolicy::Required)? {
+            return Ok(vec![]);
+        }
+        let Some(value) = value else {
+            return Ok(vec![]);
+        };
+        let array = value
+            .downcast_ref::<CFArray>()
+            .ok_or_else(|| error(ErrorKind::Failed, "Unreadable AXChildren metadata"))?;
+        if array.len() >= max_elements {
+            return Err(error(
+                ErrorKind::Failed,
+                "Security scan element limit reached",
+            ));
+        }
+        let mut children = Vec::with_capacity(array.len());
+        for index in 0..array.len() {
+            if Instant::now() >= deadline {
+                return Err(error(ErrorKind::Failed, "Security scan timed out"));
+            }
+            // AX arrays retain CF objects; unlike observations, reject every unreadable child.
+            let child = unsafe {
+                array
+                    .value_at_index(index as isize)
+                    .cast::<CFType>()
+                    .as_ref()
+            }
+            .and_then(|value| value.downcast_ref::<AXUIElement>())
+            .ok_or_else(|| error(ErrorKind::Failed, "Unreadable AXChildren element"))?;
+            children.push(Self::from_owned(unsafe {
+                CFRetained::retain(NonNull::from(child))
+            })?);
+        }
+        Ok(children)
+    }
+
     pub(super) fn is_secure(&self) -> Result<bool, DriverError> {
         let Some(role) = self.optional_attribute_string("AXRole")? else {
             return Ok(true); // An unclassifiable keyboard recipient fails closed.

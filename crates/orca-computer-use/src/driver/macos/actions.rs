@@ -18,6 +18,29 @@ pub(super) fn stale() -> DriverError {
         "the window changed since the last observe; observe again",
     )
 }
+
+pub(super) fn should_collapse_type_selection(was_focused: bool) -> bool {
+    !was_focused
+}
+
+fn type_target_is_still_focused<T: PartialEq>(
+    was_focused: bool,
+    target: &T,
+    recipient: Option<&T>,
+) -> bool {
+    was_focused && recipient == Some(target)
+}
+
+pub(super) fn keyboard_target_is_focused<T: PartialEq>(
+    target: Option<&T>,
+    read_recipient: impl FnOnce(Option<&T>) -> Result<Option<T>, DriverError>,
+) -> Result<bool, DriverError> {
+    let Some(target) = target else {
+        return Ok(false);
+    };
+    Ok(read_recipient(Some(target))?.as_ref() == Some(target))
+}
+
 fn foreground(message: impl Into<String>) -> DriverError {
     error(ErrorKind::NeedsForeground, message)
 }
@@ -282,6 +305,20 @@ impl MacDriver {
         {
             return Err(stale());
         }
+        // Keep original focus for fallback unless a fresh recipient check
+        // proves the target lost it before the background attempt.
+        let mut type_target_was_focused = if let Action::Type {
+            target: Some(target @ Target::Element { .. }),
+            ..
+        } = &params.action
+        {
+            let target = target_element(table, &application, *target)?;
+            keyboard_target_is_focused(Some(&target), |target| {
+                keyboard_recipient(&application, target)
+            })?
+        } else {
+            false
+        };
         let mut outcome = ActOutcome {
             foreground_used: false,
             note: None,
@@ -354,14 +391,33 @@ impl MacDriver {
                     }
                 }
                 Action::Type { text, target } => {
-                    let element = focus(table, &application, *target)?;
+                    // Setting AXFocused again can replace an intentional selection.
+                    let element = match target {
+                        Some(target) if type_target_was_focused => {
+                            let element = target_element(table, &application, *target)?;
+                            let recipient = keyboard_recipient(&application, Some(&element))?;
+                            type_target_was_focused = type_target_is_still_focused(
+                                type_target_was_focused,
+                                &element,
+                                recipient.as_ref(),
+                            );
+                            if type_target_was_focused {
+                                element
+                            } else {
+                                focus(table, &application, Some(*target))?
+                            }
+                        }
+                        _ => focus(table, &application, *target)?,
+                    };
                     check_type_recipient(&element, text)?;
                     check_background_keyboard(pid, &application, &element, action_deadline)?;
                     check_secure_approval(&application, Some(&element), params.secure_approved)?;
                     if target.is_some() {
                         let focused = keyboard_recipient(&application, Some(&element))?
                             .ok_or_else(|| foreground("The app has no focused element"))?;
-                        focused.collapse_selection_to_end();
+                        if should_collapse_type_selection(type_target_was_focused) {
+                            focused.collapse_selection_to_end();
+                        }
                         check_secure_approval(
                             &application,
                             Some(&element),
@@ -417,7 +473,7 @@ impl MacDriver {
                 return Err(failure);
             }
             outcome.note = Some(foreground::run(
-                pid,
+                type_target_was_focused,
                 &application,
                 &ax_window,
                 table,
@@ -640,7 +696,7 @@ fn focused_or_verified_target<T: Clone>(
     Ok(None)
 }
 
-fn keyboard_recipient(
+pub(super) fn keyboard_recipient(
     application: &AxElement,
     target: Option<&AxElement>,
 ) -> Result<Option<AxElement>, DriverError> {
@@ -810,6 +866,73 @@ fn scroll(
 mod tests {
     use super::*;
     use crate::geometry::CaptureGeometry;
+
+    #[test]
+    fn typing_into_an_already_focused_element_keeps_its_selection() {
+        assert!(!should_collapse_type_selection(true));
+    }
+
+    #[test]
+    fn typing_into_an_unfocused_element_collapses_its_selection() {
+        assert!(should_collapse_type_selection(false));
+    }
+
+    #[test]
+    fn type_focus_recheck_requires_refocus_and_collapse_after_focus_moves() {
+        for recipient in [None, Some(7)] {
+            let keep_selection = type_target_is_still_focused(true, &42, recipient.as_ref());
+            assert!(
+                !keep_selection,
+                "initial focus alone cannot skip refocusing"
+            );
+            assert!(should_collapse_type_selection(keep_selection));
+        }
+    }
+
+    #[test]
+    fn type_focus_recheck_preserves_selection_only_for_continuous_target_focus() {
+        assert!(type_target_is_still_focused(true, &42, Some(&42)));
+        // Newly acquired focus must still collapse any selection made by Cocoa.
+        assert!(!type_target_is_still_focused(false, &42, Some(&42)));
+        assert!(!type_target_is_still_focused(false, &42, None));
+    }
+
+    #[test]
+    fn a_target_focus_flag_preserves_selection_when_app_focus_is_missing() {
+        for (flag, expected) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let focused = keyboard_target_is_focused(Some(&42), |target| {
+                focused_or_verified_target(None, target, |_| Ok(flag))
+            })
+            .unwrap();
+            assert_eq!(focused, expected);
+            assert_eq!(should_collapse_type_selection(focused), !expected);
+        }
+    }
+
+    #[test]
+    fn another_app_recipient_prevents_skipping_target_focus_or_click() {
+        for (recipient, expected) in [(42, true), (7, false)] {
+            assert_eq!(
+                keyboard_target_is_focused(Some(&42), |target| {
+                    focused_or_verified_target(Some(recipient), target, |_| {
+                        panic!("the application recipient must take precedence")
+                    })
+                })
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn keyboard_focus_shortcuts_require_a_target_and_preserve_read_errors() {
+        assert!(!keyboard_target_is_focused::<u32>(None, |_| panic!("no element target")).unwrap());
+        let failure = stale();
+        assert_eq!(
+            keyboard_target_is_focused(Some(&42), |_| Err(failure.clone())).unwrap_err(),
+            failure
+        );
+    }
 
     fn offscreen_target_with_stale_read(stage: &str) -> Result<u32, DriverError> {
         nearest_offscreen_scroll_target(
