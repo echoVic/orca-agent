@@ -218,7 +218,7 @@ pub(crate) fn omit_unavailable_session_tools(
         | "workflow_complete_task"
         | "workflow_list_tasks" => workflow_child,
         "list_mcp_resources" | "list_mcp_resource_templates" | "read_mcp_resource" => {
-            !config.mcp_servers.is_empty()
+            config.mcp_servers.iter().any(|server| !server.disabled)
         }
         "ask_user_question" => !config.tools.headless_exec,
         _ => true,
@@ -762,17 +762,23 @@ mod tests {
     }
 
     #[test]
-    fn provider_mcp_resource_tools_follow_configured_servers() {
+    fn provider_mcp_resource_tools_require_an_enabled_server() {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::history::redirect_test_orca_home(home.path());
-        for configured in [false, true] {
+        for (disabled_servers, available) in [
+            (vec![], false),
+            (vec![true], false),
+            (vec![false], true),
+            (vec![true, false], true),
+        ] {
             let mut config = config_with_external(Vec::new());
             config.cwd = Some(home.path().to_path_buf());
-            if configured {
+            for (index, disabled) in disabled_servers.into_iter().enumerate() {
                 config
                     .mcp_servers
                     .push(orca_core::mcp_types::McpServerConfig {
-                        name: "configured-server".into(),
+                        name: format!("configured-server-{index}"),
+                        disabled,
                         ..Default::default()
                     });
             }
@@ -784,7 +790,7 @@ mod tests {
             ] {
                 assert_eq!(
                     names.iter().any(|offered| offered == name),
-                    configured,
+                    available,
                     "{name}"
                 );
             }

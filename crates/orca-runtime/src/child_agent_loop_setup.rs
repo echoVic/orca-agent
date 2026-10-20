@@ -395,19 +395,24 @@ mod tests {
     fn child_provider_applies_session_tool_availability() {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::history::redirect_test_orca_home(home.path());
-        for available in [false, true] {
+        for (disabled_servers, interactive, mcp_available) in [
+            (vec![], false, false),
+            (vec![true], true, false),
+            (vec![false], true, true),
+            (vec![true, false], false, true),
+        ] {
             let mut config = RunConfig {
                 cwd: Some(home.path().to_path_buf()),
                 ..RunConfig::default()
             };
-            config.tools.headless_exec = !available;
-            // A disabled configured server avoids startup side effects while testing advertisement.
-            if available {
+            config.tools.headless_exec = !interactive;
+            // No command means enabled servers fail startup without launching a process.
+            for (index, disabled) in disabled_servers.into_iter().enumerate() {
                 config
                     .mcp_servers
                     .push(orca_core::mcp_types::McpServerConfig {
-                        name: "configured-server".into(),
-                        disabled: true,
+                        name: format!("configured-server-{index}"),
+                        disabled,
                         ..Default::default()
                     });
             }
@@ -436,14 +441,17 @@ mod tests {
                 "list_mcp_resources",
                 "list_mcp_resource_templates",
                 "read_mcp_resource",
-                "ask_user_question",
             ] {
                 assert_eq!(
                     tools.iter().any(|tool| tool.name == name),
-                    available,
+                    mcp_available,
                     "{name}"
                 );
             }
+            assert_eq!(
+                tools.iter().any(|tool| tool.name == "ask_user_question"),
+                interactive
+            );
         }
     }
 
