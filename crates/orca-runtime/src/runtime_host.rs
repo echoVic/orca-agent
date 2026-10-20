@@ -35387,17 +35387,26 @@ mod tests {
         );
         let interaction = collect_requested_surface_interaction(&mut subscription);
 
-        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failure_once(transcript_path);
+        // The fault must outlive observation of the pending batch; otherwise
+        // the automatic retry can finish before this test thread is scheduled.
+        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failures(
+            transcript_path.clone(),
+            usize::MAX,
+        );
+        let cancelled = attachment
+            .client
+            .cancel_operation(surface_request_id(), operation_id.clone());
+        let waiter_woke = answer_rx.try_recv().is_ok();
+        let retained = thread.surface_actor_probe_for_test(operation_id.clone());
+        // Release the fault before assertions so a failing test can still
+        // shut down the host instead of leaving it retrying forever.
+        surface::JsonlSurfaceCommitLedger::clear_terminal_checkpoint_failures(transcript_path);
         assert!(matches!(
-            attachment
-                .client
-                .cancel_operation(surface_request_id(), operation_id.clone()),
+            cancelled,
             Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
         ));
-        assert!(answer_rx.try_recv().is_err());
-        let retained = thread
-            .surface_actor_probe_for_test(operation_id.clone())
-            .expect("probe retained terminalization");
+        assert!(!waiter_woke);
+        let retained = retained.expect("probe retained terminalization");
         assert!(retained.interaction_admission_closed);
         assert_eq!(retained.resident_interaction_count, 1);
         let retained = retained
@@ -35566,7 +35575,13 @@ mod tests {
         );
         let interaction = collect_requested_surface_interaction(&mut subscription);
 
-        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failure_once(transcript_path);
+        // Keep the checkpoint unavailable until this process exits. A one-shot
+        // failure lets the actor's automatic retry win before the test thread
+        // can inspect the prepared batch, especially on a busy CI runner.
+        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failures(
+            transcript_path.clone(),
+            usize::MAX,
+        );
         if !matches!(
             attachment
                 .client
@@ -35574,6 +35589,15 @@ mod tests {
             Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
         ) {
             std::process::exit(101);
+        }
+        for _ in 0..2 {
+            assert!(
+                surface::JsonlSurfaceCommitLedger::wait_for_terminal_checkpoint_failure(
+                    transcript_path.clone(),
+                    SURFACE_TEST_TIMEOUT,
+                ),
+                "checkpoint fault did not remain active through the actor's automatic retry"
+            );
         }
         let pending = thread
             .surface_actor_probe_for_test(operation_id.clone())

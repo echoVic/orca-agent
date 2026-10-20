@@ -3903,7 +3903,7 @@ fn detach_route_append_failure_keeps_fallback_transition_retryable() {
         let origin = fresh_interaction_attachment(&surface);
         let fallback = fresh_interaction_attachment(&surface);
         let mut origin_subscription = surface.claim_subscription(&origin.subscription).unwrap();
-        let _fallback_subscription = surface.claim_subscription(&fallback.subscription).unwrap();
+        let mut fallback_subscription = surface.claim_subscription(&fallback.subscription).unwrap();
         let reserved = committed_value(
             origin
                 .client
@@ -3933,8 +3933,9 @@ fn detach_route_append_failure_keeps_fallback_transition_retryable() {
         let waiter_woke_on_failure = answer_rx.try_recv().ok();
         let after_failure = snapshot_interaction(&surface, &interaction.interaction_id);
 
-        fs::remove_dir(&ledger).unwrap();
-        fs::rename(&backup, &ledger).unwrap();
+        // Keep the storage fault active until every rejection invariant has
+        // been observed. Restoring it here races the actor's automatic retry.
+        let failed_retry = surface.detach(&origin.client, detach_request.clone());
         let intervening_response = origin.client.respond_interaction_by_id(
             request_id(),
             interaction.interaction_id.clone(),
@@ -3953,12 +3954,18 @@ fn detach_route_append_failure_keeps_fallback_transition_retryable() {
             .cancel_operation(request_id(), operation_id.clone());
         let waiter_woke_on_intervening_cancel = answer_rx.try_recv().ok();
         let after_intervening_cancel = snapshot_interaction(&surface, &interaction.interaction_id);
+        fs::remove_dir(&ledger).unwrap();
+        fs::rename(&backup, &ledger).unwrap();
+        let after_retry = wait_for_interaction_revision(
+            &surface,
+            &interaction.interaction_id,
+            InteractionRevision::try_new(2).unwrap(),
+        );
         let retried = surface.detach(&origin.client, detach_request.clone());
         let detached_receipt = match &retried {
-            DetachResult::Detached { receipt } => Some(receipt.clone()),
+            DetachResult::AlreadyDetached { receipt } => Some(receipt.clone()),
             _ => None,
         };
-        let after_retry = snapshot_interaction(&surface, &interaction.interaction_id);
         let replayed = surface.detach(&origin.client, detach_request);
         let response = fallback.client.respond_interaction_by_id(
             request_id(),
@@ -3982,6 +3989,10 @@ fn detach_route_append_failure_keeps_fallback_transition_retryable() {
             matches!(failed, DetachResult::StaleAttachment { .. }),
             "the failed detach returned {}",
             detach_outcome(&failed)
+        );
+        assert!(
+            matches!(failed_retry, DetachResult::StaleAttachment { .. }),
+            "retry while storage is unavailable must retain the pending detach"
         );
         assert_eq!(waiter_woke_on_failure, None);
         assert!(matches!(
@@ -4020,7 +4031,7 @@ fn detach_route_append_failure_keeps_fallback_transition_retryable() {
         ));
         let receipt = detached_receipt.unwrap_or_else(|| {
             panic!(
-                "retry must complete the detach, got {} (interaction at revision {})",
+                "automatic recovery must retain the original detach receipt, got {} (interaction at revision {})",
                 detach_outcome(&retried),
                 after_retry.revision.get()
             )
@@ -4056,6 +4067,11 @@ fn detach_route_append_failure_keeps_fallback_transition_retryable() {
         );
         assert!(matches!(response, Ok(MutationReply::Committed { .. })));
         assert_eq!(answer, Some(Some("fallback".to_string())));
+        assert_single_detach_route_commit(
+            &mut fallback_subscription,
+            &interaction.interaction_id,
+            &receipt,
+        );
     });
 }
 
@@ -4074,6 +4090,10 @@ fn detach_cancellation_append_failure_keeps_no_fallback_settlement_retryable() {
             .unwrap();
         let surface = thread.surface();
         let origin = fresh_interaction_attachment(&surface);
+        // Observe recovery through a separate, non-interactive attachment:
+        // the origin's subscription is revoked by the successful detach.
+        let observer = fresh_control_attachment(&surface);
+        let mut observer_subscription = surface.claim_subscription(&observer.subscription).unwrap();
         let mut origin_subscription = surface.claim_subscription(&origin.subscription).unwrap();
         let reserved = committed_value(
             origin
@@ -4104,17 +4124,21 @@ fn detach_cancellation_append_failure_keeps_no_fallback_settlement_retryable() {
         let waiter_woke_on_failure = answer_rx.try_recv().ok();
         let after_failure = snapshot_interaction(&surface, &interaction.interaction_id);
 
+        let failed_retry = surface.detach(&origin.client, detach_request.clone());
         fs::remove_dir(&ledger).unwrap();
         fs::rename(&backup, &ledger).unwrap();
+        let after_retry = wait_for_interaction_revision(
+            &surface,
+            &interaction.interaction_id,
+            InteractionRevision::try_new(3).unwrap(),
+        );
         let retried = surface.detach(&origin.client, detach_request.clone());
         let detached_receipt = match &retried {
-            DetachResult::Detached { receipt } => Some(receipt.clone()),
+            DetachResult::AlreadyDetached { receipt } => Some(receipt.clone()),
             _ => None,
         };
-        let after_retry = snapshot_interaction(&surface, &interaction.interaction_id);
         let replayed = surface.detach(&origin.client, detach_request);
         let waiter_after_retry = answer_rx.recv_timeout(Duration::from_millis(250)).ok();
-        let observer = fresh_control_attachment(&surface);
         if waiter_after_retry.is_none() {
             let _ = observer
                 .client
@@ -4127,6 +4151,7 @@ fn detach_cancellation_append_failure_keeps_no_fallback_settlement_retryable() {
         host.shutdown().unwrap();
 
         assert!(matches!(failed, DetachResult::StaleAttachment { .. }));
+        assert!(matches!(failed_retry, DetachResult::StaleAttachment { .. }));
         assert_eq!(waiter_woke_on_failure, None);
         assert_eq!(
             after_failure.revision,
@@ -4140,11 +4165,12 @@ fn detach_cancellation_append_failure_keeps_no_fallback_settlement_retryable() {
             } if epoch == ResponseRouteEpoch::try_new(1).unwrap()
                 && attachment_id == &origin.attachment_id
         ));
-        let receipt = detached_receipt.expect("retry must complete the detach");
+        let receipt =
+            detached_receipt.expect("automatic recovery must retain the original detach receipt");
         assert_eq!(
             receipt.affected_route_epochs,
             vec![(
-                interaction.interaction_id,
+                interaction.interaction_id.clone(),
                 ResponseRouteEpoch::try_new(2).unwrap(),
             )]
         );
@@ -4169,6 +4195,11 @@ fn detach_cancellation_append_failure_keeps_no_fallback_settlement_retryable() {
             replayed,
             DetachResult::AlreadyDetached { receipt: replayed } if replayed == receipt
         ));
+        assert_single_detach_route_commit(
+            &mut observer_subscription,
+            &interaction.interaction_id,
+            &receipt,
+        );
         assert_eq!(waiter_after_retry, Some(None));
         assert!(matches!(
             terminal,
@@ -4536,6 +4567,67 @@ fn find_only_jsonl(root: &Path) -> PathBuf {
     visit(root, &mut found);
     assert_eq!(found.len(), 1, "expected one recorded session ledger");
     found.pop().unwrap()
+}
+
+// Wait for an observable recovery milestone instead of racing the actor's
+// automatic detach retry with a second client request.
+fn wait_for_interaction_revision(
+    surface: &RuntimeSurfaceHandle,
+    interaction_id: &SurfaceInteractionId,
+    revision: InteractionRevision,
+) -> SurfaceInteractionView {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        let current = snapshot_interaction(surface, interaction_id);
+        if current.revision >= revision {
+            return current;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "interaction did not recover to revision {} (still at {})",
+            revision.get(),
+            current.revision.get(),
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn assert_single_detach_route_commit(
+    receiver: &mut SurfaceSubscriptionReceiver,
+    interaction_id: &SurfaceInteractionId,
+    receipt: &DetachRevocationReceipt,
+) {
+    let mut route_commits = Vec::new();
+    while let Some(item) = receiver.try_recv() {
+        let SurfaceSubscriptionItem::Batch { batch } = item else {
+            continue;
+        };
+        for event in batch.events.as_slice() {
+            if matches!(
+                &event.event,
+                SurfaceEvent::Interaction(InteractionPatch::RouteChanged {
+                    interaction_id: candidate,
+                    ..
+                }) if candidate == interaction_id
+            ) {
+                let CommitClass::Recorded { commit_id, .. } = &batch.commit_class else {
+                    panic!("detach recovery must remain recorded");
+                };
+                route_commits.push((commit_id.clone(), batch.cursor_after.clone()));
+            }
+        }
+    }
+    assert_eq!(
+        route_commits,
+        vec![(
+            receipt
+                .route_commit_id
+                .clone()
+                .expect("detach route commit"),
+            receipt.route_cursor.clone().expect("detach route cursor"),
+        )],
+        "detach retries and replays must publish the same route exactly once",
+    );
 }
 
 fn snapshot_interaction(
