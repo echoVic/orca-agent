@@ -287,8 +287,9 @@ mod tests {
 
     #[test]
     fn content_updated_on_or_after_builtin_date_wins() {
-        for updated in ["2026-10-19", "2026-10-20"] {
-            let book = merge(Some(&content_dated_cache(updated, false)));
+        let as_of = rates::builtin_as_of();
+        for updated in [as_of, as_of.succ_opt().unwrap()] {
+            let book = merge(Some(&content_dated_cache(&updated.to_string(), false)));
             assert_eq!(book.rates_for(FLASH_MODEL), FETCHED_FLASH);
             assert!(matches!(book.source, PriceSource::Fetched { .. }));
         }
