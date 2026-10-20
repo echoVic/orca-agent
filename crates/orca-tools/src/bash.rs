@@ -758,6 +758,9 @@ mod tests {
             .expect("resolve host test shell");
         let mut command = process::shell_command(&shell, script);
         command.current_dir(cwd);
+        // Match the production sandbox command builders. Inheriting a test
+        // runner's terminal (or an open pipe) makes read wait for runner input.
+        process::prepare_non_interactive_command(&mut command);
         command
     }
 
@@ -874,6 +877,72 @@ mod tests {
     }
 
     #[test]
+    fn host_bash_fixture_does_not_inherit_open_stdin() {
+        const CHILD_ENV: &str = "ORCA_BASH_STDIN_FIXTURE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let shell = orca_platform::shell::ShellResolver::for_current_host()
+                .resolve_from_environment()
+                .expect("resolve stdin probe shell");
+            let script = match shell.kind() {
+                ShellKind::Posix | ShellKind::GitBash => {
+                    "if read line; then printf inherited-stdin; else printf done; fi"
+                }
+                ShellKind::PowerShell(_) => {
+                    "if ($null -eq [Console]::In.ReadLine()) { [Console]::Out.Write('done') } else { [Console]::Out.Write('inherited-stdin') }"
+                }
+                ShellKind::Cmd => {
+                    "set /p \"orca_stdin_probe=\" >nul & if errorlevel 1 (<nul set /p \"=done\") else (<nul set /p \"=inherited-stdin\") & exit /b 0"
+                }
+            };
+            // Unlike Command::output(), spawn does not silently close an
+            // unspecified stdin. Exercise the fixture's actual stdin policy.
+            let output = host_test_command(script, dir.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn shell with the host fixture's stdin policy")
+                .wait_with_output()
+                .expect("wait for the stdin probe");
+            assert!(output.status.success(), "stdin probe: {output:?}");
+            assert_eq!(output.stdout, b"done", "the shell inherited parent stdin");
+            return;
+        }
+
+        use std::io::Write as _;
+
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "--exact",
+                    "bash::tests::host_bash_fixture_does_not_inherit_open_stdin",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn the stdin fixture test with an open parent pipe");
+        let mut stdin = child.stdin.take().expect("parent owns the stdin pipe");
+        stdin
+            .write_all(b"parent stdin must not reach the shell\n")
+            .expect("supply distinguishable parent input");
+        // Keep the writer open: inherited stdin must not obtain EOF just
+        // because the parent starts waiting for the child.
+        let output = child
+            .wait_with_output()
+            .expect("wait for stdin fixture test");
+        drop(stdin);
+        assert!(
+            output.status.success(),
+            "stdin fixture child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn bash_commands_receive_eof_on_stdin_instead_of_inheriting_terminal() {
         if !sandbox_enforcement_available() {
             return;
@@ -884,19 +953,15 @@ mod tests {
             "$null = [Console]::In.ReadLine(); [Console]::Out.Write('done')",
         );
         let request = bash_request(&command);
-        let start = Instant::now();
-
         let result = execute_host_test_with_policy_or_cancel(
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
-            platform_test_deadline(2, 5),
+            // This bounds shell startup and process I/O under load. The
+            // open-parent-stdin fixture above proves EOF independently of
+            // host scheduling; elapsed wall time cannot prove that policy.
+            platform_test_deadline(15, 30),
             || false,
-        );
-
-        assert!(
-            start.elapsed() < platform_test_deadline(1, 4),
-            "stdin should be closed without waiting for timeout"
         );
         assert_eq!(result.status, ToolStatus::Completed);
         assert_eq!(result.output.as_deref(), Some("done"));
