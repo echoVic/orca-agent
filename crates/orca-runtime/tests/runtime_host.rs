@@ -3859,20 +3859,26 @@ fn wait_until_task_status(
 }
 
 static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
-static ORCA_HOME_TEST_HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+static ORCA_HOME_TEST_HOME: OnceLock<()> = OnceLock::new();
+
+#[test]
+fn test_home_uses_the_same_directory_as_runtime_startup() {
+    // RuntimeHost::start can resolve the fallback before test_config runs.
+    // Both initializers must publish the same process-wide directory.
+    assert_eq!(isolated_orca_home(), orca_core::home::process_temp_home());
+}
 
 fn isolated_orca_home() -> &'static std::path::Path {
-    ORCA_HOME_TEST_HOME
-        .get_or_init(|| {
-            let home = tempfile::tempdir().expect("create process-wide test ORCA_HOME");
-            // Every runtime_host test constructs its RunConfig through test_config,
-            // so initialization completes before that test can resolve task storage.
-            unsafe {
-                std::env::set_var("ORCA_HOME", home.path());
-            }
-            home
-        })
-        .path()
+    let home = orca_core::home::process_temp_home();
+    ORCA_HOME_TEST_HOME.get_or_init(|| {
+        // A host can start before test_config, concurrently adopting the core
+        // test fallback as ORCA_HOME. Publish that same directory here rather
+        // than racing it with a second home for trust, goals and task storage.
+        unsafe {
+            std::env::set_var("ORCA_HOME", home);
+        }
+    });
+    home
 }
 
 fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
