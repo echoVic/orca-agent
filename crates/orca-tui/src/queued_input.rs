@@ -81,6 +81,17 @@ impl QueuedSubmissionState {
         snapshot: orca_runtime::prompt_queue::PromptQueueSnapshot,
         confirmed_delete: Option<&orca_runtime::prompt_queue::QueuedSubmissionId>,
     ) {
+        let snapshot = if snapshot.revision < self.projection.revision {
+            if confirmed_delete.is_none() {
+                return;
+            }
+            // A late command reply can still confirm an edit already seen
+            // by the watcher. Settle that acknowledgement against the newest
+            // contents, without restoring the command's older queue.
+            self.projection.clone()
+        } else {
+            snapshot
+        };
         for item in &snapshot.items {
             let is_new = !self
                 .projection

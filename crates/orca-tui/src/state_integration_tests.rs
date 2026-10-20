@@ -1433,6 +1433,143 @@ fn queue_with(text: &str) -> orca_runtime::prompt_queue::PromptQueueSnapshot {
     }
 }
 
+fn assert_queue_snapshot_cannot_restart_its_completed_turn(
+    control_reply: bool,
+    settlement_observed: bool,
+) {
+    use orca_runtime::prompt_queue::QueueRevision;
+
+    let mut state = state();
+    let running = crate::test_support::runtime_queue_running_the_first(&["first", "second"]);
+    let first_turn = running.items[0]
+        .client_user_message_id
+        .turn_id()
+        .to_string();
+    state.update(TuiEvent::PromptQueueUpdated(running.clone()));
+    state.update(TuiEvent::RuntimeTurnStarted {
+        turn_id: first_turn,
+    });
+    state.update(TuiEvent::SessionCompleted {
+        status: "cancelled".to_string(),
+    });
+    assert_eq!(state.status, AppStatus::Idle);
+
+    let mut settled = running.clone();
+    settled.revision = QueueRevision::from_u64(running.revision.get() + 1);
+    settled.items.remove(0);
+    settled.dispatch = None;
+    if settlement_observed {
+        state.update(TuiEvent::PromptQueueUpdated(settled.clone()));
+    }
+    let event = if control_reply {
+        TuiEvent::PromptQueueControlUpdated {
+            deleted_id: None,
+            snapshot: running.clone(),
+        }
+    } else {
+        TuiEvent::PromptQueueUpdated(running.clone())
+    };
+    state.update(event);
+
+    assert_eq!(
+        state.status,
+        AppStatus::Idle,
+        "a completed turn was revived"
+    );
+    assert_eq!(
+        state.runtime_queue_revision(),
+        if settlement_observed {
+            settled.revision
+        } else {
+            running.revision
+        },
+        "an older ordering domain replaced the current queue"
+    );
+
+    // Suppressing the old turn must not suppress a real successor, even
+    // when the queue snapshot arrives before RuntimeTurnStarted does.
+    let mut successor = crate::test_support::runtime_queue_running_the_first(&["second"]);
+    successor.revision = QueueRevision::from_u64(settled.revision.get() + 1);
+    let successor_turn = successor.items[0]
+        .client_user_message_id
+        .turn_id()
+        .to_string();
+    state.update(TuiEvent::PromptQueueUpdated(successor));
+    assert_eq!(state.status, AppStatus::Running);
+    state.update(TuiEvent::RuntimeTurnStarted {
+        turn_id: successor_turn,
+    });
+    assert_eq!(state.status, AppStatus::Running);
+}
+
+#[test]
+fn late_queue_snapshots_do_not_revive_their_completed_turn() {
+    for control_reply in [false, true] {
+        assert_queue_snapshot_cannot_restart_its_completed_turn(control_reply, false);
+    }
+}
+
+#[test]
+fn stale_queue_snapshots_cannot_replace_terminal_settlement() {
+    for control_reply in [false, true] {
+        assert_queue_snapshot_cannot_restart_its_completed_turn(control_reply, true);
+    }
+}
+
+#[test]
+fn a_late_queue_delete_reply_restores_the_editor_without_rolling_back_the_queue() {
+    use orca_runtime::prompt_queue::{PromptQueueAction, QueueRevision};
+
+    let mut state = state();
+    let running = crate::test_support::runtime_queue_running_the_first(&["sent", "edit me"]);
+    state.update(TuiEvent::PromptQueueUpdated(running.clone()));
+    let Some(PromptQueueAction::Delete { id, .. }) = state.begin_latest_queued_edit() else {
+        panic!("edit removes the latest pending item");
+    };
+    let mut deleted = running.clone();
+    deleted.items.retain(|item| item.id != id);
+    deleted.revision = QueueRevision::from_u64(running.revision.get() + 1);
+    let mut newest = deleted.clone();
+    newest.revision = QueueRevision::from_u64(deleted.revision.get() + 1);
+    newest.paused = true;
+    state.update(TuiEvent::PromptQueueUpdated(newest.clone()));
+
+    state.update(TuiEvent::PromptQueueControlUpdated {
+        deleted_id: Some(id),
+        snapshot: deleted,
+    });
+
+    assert_eq!(state.runtime_queue_revision(), newest.revision);
+    assert_eq!(
+        state
+            .take_ready_queued_composer_state()
+            .expect("the confirmed edit restores its composer")
+            .visible_text,
+        "edit me"
+    );
+}
+
+#[test]
+fn resetting_the_session_resets_its_queue_revision_and_turn_identity() {
+    let mut state = state();
+    let mut running = crate::test_support::runtime_queue_running_the_first(&["previous thread"]);
+    running.revision = orca_runtime::prompt_queue::QueueRevision::from_u64(100);
+    let turn_id = running.items[0]
+        .client_user_message_id
+        .turn_id()
+        .to_string();
+    state.update(TuiEvent::PromptQueueUpdated(running));
+    state.update(TuiEvent::RuntimeTurnStarted { turn_id });
+
+    state.reset_session_projection();
+    let next_thread = crate::test_support::runtime_queue_running_the_first(&["new thread"]);
+    state.update(TuiEvent::PromptQueueUpdated(next_thread.clone()));
+
+    assert!(state.runtime_turn_id.is_none());
+    assert_eq!(state.runtime_queue_revision(), next_thread.revision);
+    assert_eq!(state.status, AppStatus::Running);
+}
+
 #[test]
 fn a_queued_message_the_runtime_starts_reads_as_its_own_turn() {
     let mut state = state();
