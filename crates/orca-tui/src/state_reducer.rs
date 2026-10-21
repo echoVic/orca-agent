@@ -246,7 +246,17 @@ impl AppState {
                 self.enter_running();
             }
             TuiEvent::PromptQueueUpdated(snapshot) => {
-                if snapshot.running_item().is_some() {
+                // Queue watches and command replies are separate delivery
+                // domains. Neither may roll the queue back, or reactivate a
+                // turn whose ordered RuntimeTurnStarted/SessionCompleted
+                // events we have already consumed.
+                if snapshot.revision < self.runtime_queue_revision() {
+                    return;
+                }
+                if snapshot.running_item().is_some_and(|item| {
+                    self.runtime_turn_id.as_deref()
+                        != Some(item.client_user_message_id.turn_id().as_str())
+                }) {
                     self.enter_running();
                 }
                 self.replace_runtime_queue_projection(snapshot);
@@ -262,7 +272,12 @@ impl AppState {
                 deleted_id,
                 snapshot,
             } => {
-                if snapshot.running_item().is_some() {
+                if snapshot.revision >= self.runtime_queue_revision()
+                    && snapshot.running_item().is_some_and(|item| {
+                        self.runtime_turn_id.as_deref()
+                            != Some(item.client_user_message_id.turn_id().as_str())
+                    })
+                {
                     self.enter_running();
                 }
                 self.replace_runtime_queue_control_projection(snapshot, deleted_id.as_ref());

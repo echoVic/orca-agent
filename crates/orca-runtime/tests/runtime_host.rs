@@ -54,6 +54,10 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(windows))]
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 const WORKFLOW_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+// Background completion includes starting worker threads (and, for saved
+// workflows, Node), durable state publication and the fixture's provider work.
+// These are liveness waits; keep the shorter cancellation contracts separate.
+const BACKGROUND_WORK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct OneShotProviderSuspension {
@@ -1605,7 +1609,7 @@ fn an_agent_launched_after_a_finished_turn_starts_its_child_thread() {
             io::sink(),
         )
         .expect("start the agent turn");
-    let deadline = Instant::now() + TEST_TIMEOUT;
+    let deadline = Instant::now() + BACKGROUND_WORK_TIMEOUT;
     loop {
         let failed = thread
             .task_registry()
@@ -1634,11 +1638,7 @@ fn an_agent_launched_after_a_finished_turn_starts_its_child_thread() {
     std::fs::write(&release_marker, b"release").expect("release the agent");
     assert_eq!(
         operation
-            .wait_timeout(if cfg!(windows) {
-                Duration::from_secs(30)
-            } else {
-                Duration::from_secs(10)
-            })
+            .wait_timeout(BACKGROUND_WORK_TIMEOUT)
             .expect("agent turn terminal")
             .outcome(),
         &OperationOutcome::Completed(RunStatus::Success)
@@ -2739,7 +2739,7 @@ fn canonical_hosted_bash_streams_output_before_tool_terminal() {
         .expect("start canonical shell turn");
     assert_eq!(
         operation
-            .wait_timeout(TEST_TIMEOUT)
+            .wait_timeout(BACKGROUND_WORK_TIMEOUT)
             .expect("canonical shell terminal")
             .outcome(),
         &OperationOutcome::Completed(RunStatus::Success)
@@ -3841,7 +3841,7 @@ fn wait_until_task_status(
     task_id: &str,
     expected: TaskStatus,
 ) {
-    let deadline = Instant::now() + TEST_TIMEOUT;
+    let deadline = Instant::now() + BACKGROUND_WORK_TIMEOUT;
     loop {
         if thread
             .task_registry()
@@ -3859,20 +3859,26 @@ fn wait_until_task_status(
 }
 
 static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
-static ORCA_HOME_TEST_HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+static ORCA_HOME_TEST_HOME: OnceLock<()> = OnceLock::new();
+
+#[test]
+fn test_home_uses_the_same_directory_as_runtime_startup() {
+    // RuntimeHost::start can resolve the fallback before test_config runs.
+    // Both initializers must publish the same process-wide directory.
+    assert_eq!(isolated_orca_home(), orca_core::home::process_temp_home());
+}
 
 fn isolated_orca_home() -> &'static std::path::Path {
-    ORCA_HOME_TEST_HOME
-        .get_or_init(|| {
-            let home = tempfile::tempdir().expect("create process-wide test ORCA_HOME");
-            // Every runtime_host test constructs its RunConfig through test_config,
-            // so initialization completes before that test can resolve task storage.
-            unsafe {
-                std::env::set_var("ORCA_HOME", home.path());
-            }
-            home
-        })
-        .path()
+    let home = orca_core::home::process_temp_home();
+    ORCA_HOME_TEST_HOME.get_or_init(|| {
+        // A host can start before test_config, concurrently adopting the core
+        // test fallback as ORCA_HOME. Publish that same directory here rather
+        // than racing it with a second home for trust, goals and task storage.
+        unsafe {
+            std::env::set_var("ORCA_HOME", home);
+        }
+    });
+    home
 }
 
 fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {

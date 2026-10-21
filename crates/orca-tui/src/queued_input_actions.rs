@@ -674,30 +674,41 @@ mod tests {
     #[test]
     fn restore_latest_waits_for_runtime_delete_snapshot_before_restoring() {
         let mut state = state();
-        state.enqueue_user_message(queued("first")).unwrap();
-        state.enqueue_user_message(queued("latest")).unwrap();
+        let mut queue = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
+            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
+        );
+        for (index, text) in ["first", "latest"].into_iter().enumerate() {
+            let snapshot = queue
+                .apply(
+                    orca_runtime::prompt_queue::PromptQueueAction::Add { input: text.into() },
+                    index as i64 + 1,
+                )
+                .unwrap();
+            state.update(crate::protocol::TuiEvent::PromptQueueUpdated(snapshot));
+        }
         let (action_tx, action_rx) = mpsc::unbounded();
 
         assert!(restore_latest_queued_message(&mut state, &action_tx));
         assert!(state.take_ready_queued_composer_state().is_none());
-        let deleted_id = match action_rx.try_recv() {
-            Ok(UserAction::PromptQueueControl(
-                orca_runtime::prompt_queue::PromptQueueAction::Delete { id, .. },
-            )) => id,
+        let (deleted_id, delete) = match action_rx.try_recv() {
+            Ok(UserAction::PromptQueueControl(action)) => {
+                let orca_runtime::prompt_queue::PromptQueueAction::Delete { id, .. } = &action
+                else {
+                    panic!("unexpected queue control action: {action:?}");
+                };
+                (id.clone(), action)
+            }
             other => panic!("unexpected queue edit action: {other:?}"),
         };
 
-        let mut queue = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
-            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
+        // The reply must come from the same runtime queue and apply the
+        // actual requested deletion, preserving both its identity and fence.
+        let snapshot = queue.apply(delete, 3).unwrap();
+        assert_eq!(
+            snapshot.revision,
+            orca_runtime::prompt_queue::QueueRevision::from_u64(3)
         );
-        let snapshot = queue
-            .apply(
-                orca_runtime::prompt_queue::PromptQueueAction::Add {
-                    input: "first".into(),
-                },
-                1,
-            )
-            .unwrap();
+        assert!(!snapshot.items.iter().any(|item| item.id == deleted_id));
         state.update(crate::protocol::TuiEvent::PromptQueueControlUpdated {
             deleted_id: Some(deleted_id),
             snapshot,

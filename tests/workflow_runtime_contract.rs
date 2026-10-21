@@ -21,6 +21,18 @@ use orca_runtime::workflow::{WorkflowDraftStore, WorkflowLaunchRequest, Workflow
 use serde_json::json;
 use tempfile::tempdir;
 
+// These waits include starting Node, loading its VM and publishing state to
+// disk. Their bound is a liveness guard, not a cancellation-latency contract.
+const WORKFLOW_START_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn wait_for_workflow_condition(description: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + WORKFLOW_START_TIMEOUT;
+    while !ready() {
+        assert!(Instant::now() < deadline, "{description}");
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[test]
 fn workflow_runner_executes_agent_and_writes_state() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
@@ -1879,18 +1891,17 @@ fn workflow_runner_streams_running_phase_progress_to_state() {
 
     let temp = tempdir().unwrap();
     let script = temp.path().join("workflow.js");
+    let release_marker = temp.path().join("release-agent");
     fs::write(
         &script,
-        "export const meta = { name: 'live-state', description: 'Live state test', phases: ['scan'] };\nconst result = await phase('scan', async () => agent('inspect repo'));\nexport default result;",
+        format!(
+            "export const meta = {{ name: 'live-state', description: 'Live state test', phases: ['scan'] }};\nconst result = await phase('scan', async () => agent({}));\nexport default result;",
+            json!(format!("mock_stream_release_marker {}", release_marker.display()))
+        ),
     )
     .unwrap();
 
-    let mut config = mock_run_config(temp.path());
-    config.hooks = vec![HookConfig {
-        event: HookEvent::PreModelCall,
-        command: "sleep 1.0".to_string(),
-        tool: None,
-    }];
+    let config = mock_run_config(temp.path());
     let tasks = TaskRegistry::new("session-1".to_string());
     let session_dir = temp.path().join("session");
     let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
@@ -1903,7 +1914,7 @@ fn workflow_runner_streams_running_phase_progress_to_state() {
 
     let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
     let run_id = launch.output.run_id.as_deref().expect("run id");
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + WORKFLOW_START_TIMEOUT;
     let mut live_state = None;
     let mut live_task = None;
     while std::time::Instant::now() < deadline {
@@ -1940,6 +1951,7 @@ fn workflow_runner_streams_running_phase_progress_to_state() {
     assert!(live_agent.started_at_ms.is_some());
     assert_eq!(live_agent.completed_at_ms, None);
 
+    fs::write(release_marker, b"release").expect("release observed agent");
     launch.join().unwrap().unwrap();
 
     let completed_task = tasks.get(&task_id).expect("completed task");
@@ -2069,17 +2081,13 @@ fn workflow_runner_stops_during_agent_min_hold() {
     let run_id = launch.output.run_id.as_deref().unwrap().to_string();
     let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if tasks.get(&launch.task_id).is_some_and(|task| {
+    wait_for_workflow_condition("held workflow agent never started", || {
+        tasks.get(&launch.task_id).is_some_and(|task| {
             task.workflow_agents
                 .iter()
                 .any(|agent| agent.status == WorkflowAgentStatus::Running)
-        }) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
+        })
+    });
     let started = Instant::now();
     store.request_stop(&run_id).expect("request held stop");
     let result = launch.join().unwrap().unwrap();
@@ -2096,9 +2104,13 @@ fn workflow_runner_task_stop_interrupts_paused_agent() {
 
     let temp = tempdir().unwrap();
     let script = temp.path().join("workflow.js");
+    let release_marker = temp.path().join("release-first-agent");
     fs::write(
         &script,
-        "export const meta = { name: 'paused-stop', description: 'Paused stop test', phases: [] };\nexport default await agent('paused');",
+        format!(
+            "export const meta = {{ name: 'paused-stop', description: 'Paused stop test', phases: [] }};\nawait agent({});\nexport default await agent('paused');",
+            json!(format!("mock_stream_release_marker {}", release_marker.display()))
+        ),
     )
     .unwrap();
 
@@ -2114,18 +2126,21 @@ fn workflow_runner_task_stop_interrupts_paused_agent() {
     let task_id = launch.task_id.clone();
     let run_id = launch.output.run_id.as_deref().unwrap().to_string();
     let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    wait_for_workflow_condition("first workflow agent never started", || {
+        tasks.get(&task_id).is_some_and(|task| {
+            task.workflow_agents
+                .iter()
+                .any(|agent| agent.status == WorkflowAgentStatus::Running)
+        })
+    });
     store.request_pause(&run_id).expect("request pause");
+    fs::write(release_marker, b"release").expect("release first agent after pause request");
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if store
+    wait_for_workflow_condition("workflow did not enter paused state", || {
+        store
             .load_run(&run_id)
             .is_ok_and(|state| state.status == WorkflowRunStatus::Paused)
-        {
-            break;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
+    });
     assert_eq!(
         store.load_run(&run_id).expect("paused state").status,
         WorkflowRunStatus::Paused
@@ -2184,18 +2199,17 @@ fn workflow_runner_pauses_and_resumes_from_control_file() {
 
     let temp = tempdir().unwrap();
     let script = temp.path().join("workflow.js");
+    let release_marker = temp.path().join("release-first-agent");
     fs::write(
         &script,
-        "export const meta = { name: 'pause-control', description: 'Pause control test', phases: [] };\nawait agent('first');\nexport default await agent('second');",
+        format!(
+            "export const meta = {{ name: 'pause-control', description: 'Pause control test', phases: [] }};\nawait agent({});\nexport default await agent('second');",
+            json!(format!("mock_stream_release_marker {}", release_marker.display()))
+        ),
     )
     .unwrap();
 
-    let mut config = mock_run_config(temp.path());
-    config.hooks = vec![HookConfig {
-        event: HookEvent::PreModelCall,
-        command: "sleep 0.7".to_string(),
-        tool: None,
-    }];
+    let config = mock_run_config(temp.path());
     let tasks = TaskRegistry::new("session-1".to_string());
     let session_dir = temp.path().join("session");
     let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
@@ -2209,25 +2223,29 @@ fn workflow_runner_pauses_and_resumes_from_control_file() {
     let run_id = launch.output.run_id.as_deref().unwrap().to_string();
     let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
 
-    thread::sleep(Duration::from_millis(150));
+    // Hold the first agent until the pause request is durable. A fixed sleep
+    // could miss both short agents if the test thread was descheduled, and a
+    // three-second deadline also included Node's unrelated cold start.
+    wait_for_workflow_condition("first workflow agent never started", || {
+        tasks.get(&task_id).is_some_and(|task| {
+            task.workflow_agents
+                .iter()
+                .any(|agent| agent.status == WorkflowAgentStatus::Running)
+        })
+    });
     store.request_pause(&run_id).expect("request pause");
+    fs::write(release_marker, b"release").expect("release first agent after pause request");
 
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
+    wait_for_workflow_condition("workflow did not enter paused state", || {
         let state = store.load_run(&run_id).expect("run state");
         let task = tasks.get(&task_id).expect("task record");
-        if state.status == WorkflowRunStatus::Paused && task.status == TaskStatus::Paused {
-            store.request_resume(&run_id).expect("request resume");
-            let result = launch.join().unwrap().unwrap();
-            assert_eq!(result.output.status, "completed");
-            let completed_state = store.load_run(&run_id).expect("completed state");
-            assert_eq!(completed_state.status, WorkflowRunStatus::Completed);
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-
-    panic!("workflow did not enter paused state");
+        state.status == WorkflowRunStatus::Paused && task.status == TaskStatus::Paused
+    });
+    store.request_resume(&run_id).expect("request resume");
+    let result = launch.join().unwrap().unwrap();
+    assert_eq!(result.output.status, "completed");
+    let completed_state = store.load_run(&run_id).expect("completed state");
+    assert_eq!(completed_state.status, WorkflowRunStatus::Completed);
 }
 
 #[test]

@@ -1465,6 +1465,10 @@ impl AppState {
 
     pub(crate) fn reset_session_projection(&mut self) {
         self.pending_tool_image_call_id = None;
+        // Queue revisions and queued turn identities belong to the thread
+        // being projected, and start afresh when its session is replaced.
+        self.queued_submission = QueuedSubmissionState::default();
+        self.runtime_turn_id = None;
         self.surface_session.reset();
         self.task_transcript = None;
         self.clear_messages();

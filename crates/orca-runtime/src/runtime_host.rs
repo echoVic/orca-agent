@@ -177,26 +177,28 @@ fn surface_subagent_continuation(
 }
 
 #[cfg(test)]
-static PASSTHROUGH_FINISH_FAILURES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static PASSTHROUGH_FINISH_FAILURES: std::sync::OnceLock<Mutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
-fn inject_passthrough_finish_failure_once() {
-    PASSTHROUGH_FINISH_FAILURES.store(1, std::sync::atomic::Ordering::SeqCst);
+fn inject_passthrough_finish_failure_once(thread_id: &str) {
+    PASSTHROUGH_FINISH_FAILURES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(thread_id.to_owned());
 }
 
-/// Takes one of the injected passthrough finish failures, when one is left.
+/// Only a writer belonging to the injected runtime thread may take its fault.
 #[cfg(test)]
-fn take_passthrough_finish_failure() -> bool {
-    use std::sync::atomic::Ordering::SeqCst;
-    let mut remaining = PASSTHROUGH_FINISH_FAILURES.load(SeqCst);
-    while let Some(next) = remaining.checked_sub(1) {
-        match PASSTHROUGH_FINISH_FAILURES.compare_exchange_weak(remaining, next, SeqCst, SeqCst) {
-            Ok(_) => return true,
-            Err(current) => remaining = current,
-        }
-    }
-    false
+fn take_passthrough_finish_failure(thread_id: Option<&str>) -> bool {
+    thread_id.is_some_and(|thread_id| {
+        PASSTHROUGH_FINISH_FAILURES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(thread_id)
+    })
 }
 
 pub trait HostedOperationWriter: io::Write + Send + 'static {
@@ -205,16 +207,26 @@ pub trait HostedOperationWriter: io::Write + Send + 'static {
         false
     }
 
+    /// Give test-only writer faults the owning runtime thread's identity.
+    #[cfg(test)]
+    fn set_test_thread_id(&mut self, _thread_id: &str) {}
+
     fn finish_generation(&mut self, commit_terminal: bool) -> io::Result<()>;
 }
 
 struct PassthroughHostedOperationWriter<W> {
     writer: W,
+    #[cfg(test)]
+    test_thread_id: Option<String>,
 }
 
 impl<W> PassthroughHostedOperationWriter<W> {
     fn new(writer: W) -> Self {
-        Self { writer }
+        Self {
+            writer,
+            #[cfg(test)]
+            test_thread_id: None,
+        }
     }
 }
 
@@ -229,9 +241,14 @@ impl<W: io::Write> io::Write for PassthroughHostedOperationWriter<W> {
 }
 
 impl<W: io::Write + Send + 'static> HostedOperationWriter for PassthroughHostedOperationWriter<W> {
+    #[cfg(test)]
+    fn set_test_thread_id(&mut self, thread_id: &str) {
+        self.test_thread_id = Some(thread_id.to_owned());
+    }
+
     fn finish_generation(&mut self, _commit_terminal: bool) -> io::Result<()> {
         #[cfg(test)]
-        if take_passthrough_finish_failure() {
+        if take_passthrough_finish_failure(self.test_thread_id.as_deref()) {
             return Err(io::Error::other(
                 "injected passthrough generation finish failure",
             ));
@@ -21228,6 +21245,8 @@ impl ThreadActor {
         mut writer: Box<dyn HostedOperationWriter>,
         mut context: GenerationContext,
     ) -> ActiveGeneration {
+        #[cfg(test)]
+        writer.set_test_thread_id(self.handle.thread_id());
         let tool_images = state
             .thread
             .session_mut()
@@ -23898,6 +23917,42 @@ mod tests {
     // to publish its durable provider outcome, which turned the seed phase into
     // an intermittent failure.
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn passthrough_finish_fault_cannot_be_consumed_by_another_runtime_thread() {
+        let target_thread = uuid::Uuid::new_v4().to_string();
+        let other_thread = uuid::Uuid::new_v4().to_string();
+        let mut target = PassthroughHostedOperationWriter::new(io::sink());
+        target.set_test_thread_id(&target_thread);
+        let mut other = PassthroughHostedOperationWriter::new(io::sink());
+        other.set_test_thread_id(&other_thread);
+        inject_passthrough_finish_failure_once(&target_thread);
+
+        // Finish an unrelated writer while the target writer is ready on a
+        // separate worker. The unrelated writer must not consume its fault.
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let target_worker = thread::spawn(move || {
+            finished_rx.recv().expect("unrelated writer finished");
+            let injected = target.finish_generation(true);
+            let next = target.finish_generation(true);
+            (injected, next)
+        });
+        let other_worker = thread::spawn(move || {
+            let result = other.finish_generation(true);
+            finished_tx.send(()).expect("release target writer");
+            result
+        });
+        let other_result = other_worker.join().expect("unrelated writer worker");
+        let (injected, next) = target_worker.join().expect("target writer worker");
+        assert!(other_result.is_ok(), "unrelated writer consumed the fault");
+        assert_eq!(
+            injected
+                .expect_err("target writer must consume its own fault")
+                .to_string(),
+            "injected passthrough generation finish failure",
+        );
+        assert!(next.is_ok(), "the target fault must fire exactly once");
+    }
 
     #[test]
     fn provider_response_usage_totals_applies_process_user_override() {
@@ -35387,17 +35442,26 @@ mod tests {
         );
         let interaction = collect_requested_surface_interaction(&mut subscription);
 
-        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failure_once(transcript_path);
+        // The fault must outlive observation of the pending batch; otherwise
+        // the automatic retry can finish before this test thread is scheduled.
+        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failures(
+            transcript_path.clone(),
+            usize::MAX,
+        );
+        let cancelled = attachment
+            .client
+            .cancel_operation(surface_request_id(), operation_id.clone());
+        let waiter_woke = answer_rx.try_recv().is_ok();
+        let retained = thread.surface_actor_probe_for_test(operation_id.clone());
+        // Release the fault before assertions so a failing test can still
+        // shut down the host instead of leaving it retrying forever.
+        surface::JsonlSurfaceCommitLedger::clear_terminal_checkpoint_failures(transcript_path);
         assert!(matches!(
-            attachment
-                .client
-                .cancel_operation(surface_request_id(), operation_id.clone()),
+            cancelled,
             Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
         ));
-        assert!(answer_rx.try_recv().is_err());
-        let retained = thread
-            .surface_actor_probe_for_test(operation_id.clone())
-            .expect("probe retained terminalization");
+        assert!(!waiter_woke);
+        let retained = retained.expect("probe retained terminalization");
         assert!(retained.interaction_admission_closed);
         assert_eq!(retained.resident_interaction_count, 1);
         let retained = retained
@@ -35566,7 +35630,13 @@ mod tests {
         );
         let interaction = collect_requested_surface_interaction(&mut subscription);
 
-        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failure_once(transcript_path);
+        // Keep the checkpoint unavailable until this process exits. A one-shot
+        // failure lets the actor's automatic retry win before the test thread
+        // can inspect the prepared batch, especially on a busy CI runner.
+        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failures(
+            transcript_path.clone(),
+            usize::MAX,
+        );
         if !matches!(
             attachment
                 .client
@@ -35574,6 +35644,15 @@ mod tests {
             Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
         ) {
             std::process::exit(101);
+        }
+        for _ in 0..2 {
+            assert!(
+                surface::JsonlSurfaceCommitLedger::wait_for_terminal_checkpoint_failure(
+                    transcript_path.clone(),
+                    SURFACE_TEST_TIMEOUT,
+                ),
+                "checkpoint fault did not remain active through the actor's automatic retry"
+            );
         }
         let pending = thread
             .surface_actor_probe_for_test(operation_id.clone())
@@ -39918,7 +39997,7 @@ mod tests {
                 surface::SurfaceCapability::ManageGoal,
             ]),
         );
-        inject_passthrough_finish_failure_once();
+        inject_passthrough_finish_failure_once(&session_id);
         let output = committed_surface_value(
             attachment
                 .client

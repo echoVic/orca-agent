@@ -804,7 +804,7 @@ mod tests {
     use std::io::{self, Cursor};
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use orca_core::approval_types::{ActionKind, ApprovalMode};
     use orca_core::config::{
@@ -813,7 +813,7 @@ mod tests {
     use orca_core::event_schema::EventFactory;
     use orca_core::event_sink::EventSink;
     use orca_core::model::ModelSelection;
-    use orca_core::tool_types::{ToolName, ToolRequest, ToolStatus};
+    use orca_core::tool_types::{ToolName, ToolRequest, ToolResult, ToolStatus};
     use orca_core::workflow_types::{WorkflowDraftActionOutput, WorkflowInput, WorkflowOutput};
 
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
@@ -831,8 +831,9 @@ mod tests {
     };
 
     use super::{
-        BackgroundWorkflowRun, WorkflowDraftStore, execute_workflow_draft_action_tool,
-        execute_workflow_tool, observe_background_workflows,
+        BackgroundWorkflowRun, WorkflowDraftStore, WorkflowStartupStatus,
+        execute_workflow_draft_action_tool, execute_workflow_tool, observe_background_workflows,
+        wait_for_workflow_startup,
     };
 
     #[derive(Clone, Debug, PartialEq)]
@@ -975,6 +976,205 @@ export const meta = {
 "#
     }
 
+    fn observe_test_background_workflows(
+        events: &mut EventFactory,
+        sink: &mut EventSink<Cursor<Vec<u8>>>,
+        background_workflows: &mut Vec<BackgroundWorkflowRun>,
+        registry: &TaskRegistry,
+        ingress: Option<&dyn RuntimeWorkflowLifecycleIngress>,
+    ) {
+        // Node startup and script loading can outlast the product's short
+        // health check. Wait for completion with a separate liveness bound.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let cancel = orca_core::cancel::CancelToken::new();
+        while background_workflows
+            .iter()
+            .any(|workflow| !workflow.handle.is_finished())
+        {
+            if Instant::now() >= deadline {
+                cancel.cancel();
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        observe_background_workflows(
+            true,
+            events,
+            sink,
+            background_workflows,
+            registry,
+            &cancel,
+            ingress,
+        )
+        .unwrap();
+        assert!(!cancel.is_cancelled(), "workflow did not finish within 30s");
+        assert!(background_workflows.is_empty());
+    }
+
+    fn assert_startup_failure_reported(
+        result: &ToolResult,
+        events: &mut EventFactory,
+        sink: &mut EventSink<Cursor<Vec<u8>>>,
+        background_workflows: &mut Vec<BackgroundWorkflowRun>,
+        registry: &TaskRegistry,
+        ingress: Option<&dyn RuntimeWorkflowLifecycleIngress>,
+    ) {
+        let background_ids = background_workflows
+            .iter()
+            .map(|workflow| (workflow.task_id.clone(), workflow.run_id.clone()))
+            .collect::<Vec<_>>();
+        observe_test_background_workflows(events, sink, background_workflows, registry, ingress);
+
+        match background_ids.as_slice() {
+            [] => {
+                assert_eq!(result.status, ToolStatus::Failed);
+                assert!(
+                    result
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("startup boom")),
+                    "expected synchronous startup failure details, got {result:?}"
+                );
+            }
+            [(task_id, run_id)] => {
+                // Completed here acknowledges background launch, not a
+                // successful workflow. Its eventual failure is checked below.
+                assert_eq!(result.status, ToolStatus::Completed);
+                let output: serde_json::Value =
+                    serde_json::from_str(result.output.as_deref().unwrap()).unwrap();
+                assert_eq!(output["status"], "async_launched");
+                assert_eq!(output["taskId"], task_id.as_str());
+                assert_eq!(output["runId"], run_id.as_str());
+                assert!(result.error.is_none());
+            }
+            _ => panic!("one workflow launch must own at most one background run"),
+        }
+
+        let emitted = String::from_utf8(sink.writer_mut().get_ref().clone()).unwrap();
+        let emitted = emitted
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let failures = emitted
+            .iter()
+            .filter(|event| event["type"] == "workflow.failed")
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 1, "expected one failure event: {emitted:?}");
+        assert!(
+            failures[0]["payload"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("startup boom")),
+            "expected final startup failure details: {failures:?}"
+        );
+        assert!(
+            emitted
+                .iter()
+                .all(|event| event["type"] != "workflow.completed"),
+            "a failed startup must not publish successful completion: {emitted:?}"
+        );
+        assert_eq!(
+            registry
+                .get(failures[0]["payload"]["taskId"].as_str().unwrap())
+                .unwrap()
+                .status,
+            orca_core::task_types::TaskStatus::Failed
+        );
+    }
+
+    #[test]
+    fn finished_workflow_startup_failure_is_reported_synchronously() {
+        let launch = WorkflowBackgroundLaunch::for_test(
+            "finished-task".to_string(),
+            "finished-run".to_string(),
+            "finished-workflow".to_string(),
+            Vec::new(),
+            thread::spawn(|| Err(io::Error::other("startup boom"))),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !launch.is_finished() {
+            assert!(Instant::now() < deadline, "startup worker did not finish");
+            thread::yield_now();
+        }
+
+        match wait_for_workflow_startup(launch) {
+            WorkflowStartupStatus::Failed { error } => assert_eq!(error, "startup boom"),
+            _ => panic!("an already-finished startup failure must be reported synchronously"),
+        }
+    }
+
+    #[test]
+    fn workflow_startup_failure_after_health_check_is_reported_in_background() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let registry = TaskRegistry::new("held-startup-failure".to_string());
+        let task = registry.create_workflow(
+            "held-run".to_string(),
+            "held-workflow".to_string(),
+            "held workflow".to_string(),
+            1,
+        );
+        registry.mark_running(&task.id).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let launch = WorkflowBackgroundLaunch::for_test(
+            task.id.clone(),
+            "held-run".to_string(),
+            "held-workflow".to_string(),
+            Vec::new(),
+            thread::spawn(move || {
+                release_rx
+                    .recv()
+                    .expect("release startup after health check");
+                Err(io::Error::other("startup boom"))
+            }),
+        );
+        let ingress = RecordingWorkflowIngress::default();
+        let receipt =
+            super::commit_workflow_started(Some(&ingress), &launch, "held-tool-call", &registry)
+                .unwrap();
+
+        // The worker cannot fail until the health check has returned, even
+        // when the test thread is descheduled during that check.
+        let startup = wait_for_workflow_startup(launch);
+        release_tx.send(()).unwrap();
+        let WorkflowStartupStatus::StillRunning(launch) = startup else {
+            panic!("a held startup must transfer to the background");
+        };
+        assert!(matches!(
+            ingress.events().as_slice(),
+            [RecordedWorkflowIngress::Started(_)]
+        ));
+        let mut background_workflows = vec![BackgroundWorkflowRun::new_with_ingress(
+            launch,
+            Some("held-tool-call".to_string()),
+            receipt,
+        )];
+        let mut events = EventFactory::new("held-startup-failure".to_string());
+        let mut sink = EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl);
+        observe_test_background_workflows(
+            &mut events,
+            &mut sink,
+            &mut background_workflows,
+            &registry,
+            Some(&ingress),
+        );
+
+        let recorded = ingress.events();
+        assert!(matches!(
+            recorded.as_slice(),
+            [
+                RecordedWorkflowIngress::Started(_),
+                RecordedWorkflowIngress::Finished(RuntimeWorkflowFinished {
+                    receipt,
+                    outcome: RuntimeWorkflowOutcome::Failed { error },
+                    ..
+                }),
+            ] if receipt.tool_call_id.as_str() == "held-tool-call"
+                && receipt.task.task_id.as_str() == task.id
+                && receipt.workflow.workflow_run_id.as_str() == "held-run"
+                && error.as_str().contains("startup boom")
+        ));
+    }
+
     #[test]
     fn workflow_tool_reports_immediate_startup_failure() {
         let _guard = crate::history::lock_test_env();
@@ -1010,15 +1210,14 @@ export const meta = {
         )
         .unwrap();
 
-        assert_eq!(result.status, ToolStatus::Failed);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("startup boom")),
-            "expected startup failure details, got {result:?}"
+        assert_startup_failure_reported(
+            &result,
+            &mut events,
+            &mut sink,
+            &mut background_workflows,
+            &registry,
+            None,
         );
-        assert!(background_workflows.is_empty());
     }
 
     #[test]
@@ -1066,15 +1265,14 @@ export const meta = {
         )
         .unwrap();
 
-        assert_eq!(result.status, ToolStatus::Failed);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("startup boom")),
-            "expected startup failure details, got {result:?}"
+        assert_startup_failure_reported(
+            &result,
+            &mut events,
+            &mut sink,
+            &mut background_workflows,
+            &registry,
+            None,
         );
-        assert!(background_workflows.is_empty());
     }
 
     #[test]
@@ -1180,16 +1378,13 @@ export const meta = {
             None,
         )
         .unwrap();
-        observe_background_workflows(
-            true,
+        observe_test_background_workflows(
             &mut events,
             &mut sink,
             &mut background_workflows,
             &registry,
-            &orca_core::cancel::CancelToken::new(),
             Some(&ingress),
-        )
-        .unwrap();
+        );
 
         assert_eq!(result.status, ToolStatus::Completed);
         let recorded = ingress.events();
@@ -1247,19 +1442,39 @@ export const meta = {
         )
         .unwrap();
 
-        assert_eq!(result.status, ToolStatus::Failed);
+        assert_startup_failure_reported(
+            &result,
+            &mut events,
+            &mut sink,
+            &mut background_workflows,
+            &registry,
+            Some(&ingress),
+        );
         let recorded = ingress.events();
+        let [
+            RecordedWorkflowIngress::Started(started),
+            progress @ ..,
+            RecordedWorkflowIngress::Finished(finished),
+        ] = recorded.as_slice()
+        else {
+            panic!("startup failure must record Started then Finished: {recorded:?}");
+        };
+        assert!(progress.iter().all(|event| matches!(
+            event,
+            RecordedWorkflowIngress::Progress(progress)
+                if progress.task_id == started.task_id
+                    && progress.workflow_run_id == started.workflow_run_id
+        )));
         assert!(matches!(
-            recorded.first(),
-            Some(RecordedWorkflowIngress::Started(_))
+            &finished.outcome,
+            RuntimeWorkflowOutcome::Failed { error } if error.as_str().contains("startup boom")
         ));
-        assert!(matches!(
-            recorded.last(),
-            Some(RecordedWorkflowIngress::Finished(RuntimeWorkflowFinished {
-                outcome: RuntimeWorkflowOutcome::Failed { .. },
-                ..
-            }))
-        ));
+        assert_eq!(finished.receipt.task.task_id, started.task_id);
+        assert_eq!(finished.receipt.tool_call_id, started.tool_call_id);
+        assert_eq!(
+            finished.receipt.workflow.workflow_run_id,
+            started.workflow_run_id
+        );
     }
 
     #[test]

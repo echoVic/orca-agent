@@ -232,13 +232,14 @@ fn a_queued_message_leaves_the_strip_once_it_is_sent() {
     loop {
         let screen = reconstruct_screen(&output);
         let lines = screen.lines().collect::<Vec<_>>();
-        if let Some(header) = lines.iter().position(|line| line.contains("Queued 1")) {
-            assert!(
-                lines
-                    .get(header + 1)
-                    .is_some_and(|line| line.contains("third waits")),
-                "the strip still lists the message sent; reconstructed screen=\n{screen}"
-            );
+        // A PTY read can end between the changed queue header and the row
+        // below it. Wait for the complete expected screen, rather than
+        // asserting against a half-painted frame with the previous row.
+        if let Some(header) = lines.iter().position(|line| line.contains("Queued 1"))
+            && lines
+                .get(header + 1)
+                .is_some_and(|line| line.contains("third waits"))
+        {
             break;
         }
         assert!(
