@@ -165,7 +165,6 @@ if op == "state" {
         if app.processIdentifier == Int32(args[3]) { emit(["terminated": app.terminate(), "pid": app.processIdentifier]) }
         else { emit(["error": "PID changed before cleanup"]) }
     } else if op == "new-browser" {
-        let old = Set(children(root, "AXWindows").map { windowID($0) })
         _ = app.activate(options: [.activateAllWindows])
         if !waitFocused(app.processIdentifier, 1.5) {
             // LaunchServices activation still works when a background helper's request is ignored.
@@ -177,15 +176,18 @@ if op == "state" {
             emit(["error": "Browser activation did not complete", "focused_pid": focusedPid()]); exit(1)
         }
         pump(0.5)
+        // Snapshot after activation; activation can raise status bubbles and popups,
+        // which are AX windows too. Only a new standard window is the task window.
+        let old = Set(children(root, "AXWindows").map { windowID($0) })
+        func standard() -> [AXUIElement] {
+            children(root, "AXWindows").filter { string($0, "AXSubrole") == "AXStandardWindow" }
+        }
         var added: [AXUIElement] = []
         for _ in 0..<2 {
-            // A reopen event from `open` may already have created the window.
-            if children(root, "AXWindows").allSatisfy({ old.contains(windowID($0)) }) {
-                key(45, [.maskCommand]) // Cmd+N; prove creation before navigating.
-            }
+            key(45, [.maskCommand]) // Cmd+N; prove creation before navigating.
             let end = Date().addingTimeInterval(3)
             repeat {
-                added = children(root, "AXWindows").filter { !old.contains(windowID($0)) }
+                added = standard().filter { !old.contains(windowID($0)) }
                 if added.count == 1 { break }
                 pump(0.05)
             } while Date() < end
@@ -228,20 +230,24 @@ if op == "state" {
         guard title.contains("about:blank") else {
             emit(["error": "New browser window did not navigate to about:blank", "window_id": id]); exit(1)
         }
-        emit(["window_id": id, "blank_navigation": true, "title": title])
+        emit(["window_id": id, "blank_navigation": true, "title": title,
+              "standard_window_ids": standard().map { windowID($0) }])
     } else {
         let id = UInt32(args[3])!
         let windows = children(root, "AXWindows").filter {
             var current: CGWindowID = 0; _ = axWindow($0, &current); return current == id
         }
-        if windows.count != 1 { emit(["error": "Expected exactly one matching AX window"]) }
+        if op == "close" && windows.count != 1 {
+            // Bubbles and popups have no AX window to close; they go with their owner.
+            emit(["window": id, "transient": true, "reason": "no matching AX window"])
+        } else if windows.count != 1 { emit(["error": "Expected exactly one matching AX window"]) }
         else if op == "close" {
             if let button = get(windows[0], "AXCloseButton") {
                 let code = AXUIElementPerformAction(button as! AXUIElement, "AXPress" as CFString)
                 Thread.sleep(forTimeInterval: 0.2)
                 if args[4] == "discard" { discard(windows[0]) }
                 emit(["window": id, "close_error": code.rawValue])
-            } else { emit(["error": "AXCloseButton absent"]) }
+            } else { emit(["window": id, "transient": true, "reason": "AXCloseButton absent"]) }
         } else {
             let nodes = walk(windows[0], 0, op == "buttons")
             if op == "settings" {

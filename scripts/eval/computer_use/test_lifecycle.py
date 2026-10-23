@@ -44,6 +44,19 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(result['ok'], result)
         self.assertEqual([c for c in calls if c[0] != 'state'], [('close', 'com.apple.calculator', '7', 'keep')])
 
+    def test_cleanup_leaves_status_bubbles_of_user_windows_alone(self):
+        native = object.__new__(Native)
+        before = {'apps': [{'pid': 5, 'bundle': 'com.google.Chrome'}],
+                  'windows': [{'id': 1, 'pid': 5, 'layer': 0, 'on_screen': True}]}
+        bubble = {'id': 9, 'pid': 5, 'layer': 0, 'on_screen': True}
+        state = {'apps': before['apps'], 'windows': before['windows'] + [bubble]}
+        def call(op, *args):
+            return state if op == 'state' else {'window': int(args[1]), 'transient': True, 'reason': 'AXCloseButton absent'}
+        with patch.object(native, 'call', side_effect=call):
+            result = native.cleanup({'allowed_apps': ['com.google.Chrome']}, before, settle_seconds=0)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['transient_windows'], [9])
+
     def test_cleanup_records_quit_races_and_fails_on_a_closed_visible_original(self):
         native = object.__new__(Native)
         before = {'apps': [{'pid': 1, 'bundle': 'com.example.user'}],
@@ -68,6 +81,12 @@ class PreflightTests(unittest.TestCase):
                              {'id': 4, 'pid': 5, 'layer': 0, 'on_screen': False}]}
         # A new off-screen helper window does not make the visible task window ambiguous.
         self.assertEqual(browser_window(before, after, 'com.apple.Safari', 2), 2)
+        # Nor does a visible status bubble, which is not a standard AX window.
+        after['windows'].append({'id': 5, 'pid': 5, 'layer': 0, 'on_screen': True})
+        with self.assertRaises(RuntimeError):
+            browser_window(before, after, 'com.apple.Safari', 2)
+        self.assertEqual(browser_window(before, after, 'com.apple.Safari', 2, standard=[1, 2]), 2)
+        after['windows'].pop()
         for claimed in (1, 3):
             with self.assertRaises(RuntimeError):
                 browser_window(before, after, 'com.apple.Safari', claimed)

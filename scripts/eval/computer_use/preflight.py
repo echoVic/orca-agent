@@ -29,12 +29,13 @@ def restoration_check(initial, actual):
             'pointer_distance_points': distance}
 
 
-def browser_window(before, after, app, claimed):
+def browser_window(before, after, app, claimed, standard=None):
     old = {w['id'] for w in before['windows']}
     pids = {a['pid'] for a in after['apps'] if a['bundle'] == app}
     # Every app owns off-screen layer-0 helper windows; only a visible one is the task window.
+    # Visible status bubbles and popups are not standard AX windows.
     owned = [w['id'] for w in after['windows'] if w['id'] not in old and w['pid'] in pids
-             and w['layer'] == 0 and w.get('on_screen')]
+             and w['layer'] == 0 and w.get('on_screen') and (standard is None or w['id'] in standard)]
     if after['frontmost'] != app or owned != [claimed]:
         raise RuntimeError('Browser setup did not prove a single new task window; refusing prompt submission')
     return claimed
@@ -96,13 +97,22 @@ class Native:
         def launched(state):
             return [a for a in state['apps'] if a['bundle'] in allowed and a['pid'] not in initial_pids]
 
-        actions = []
-        for app, wid in owned(self.call('state')):
-            try:
-                actions.append(self.call('close', app, str(wid), 'discard' if app == 'com.apple.TextEdit' else 'keep'))
-            except RuntimeError as error:
-                # Apps such as Calculator quit with their last window; the final state decides.
-                actions.append({'window': wid, 'error': str(error)})
+        actions, transient = [], set()
+
+        def close(state):
+            for app, wid in owned(state):
+                if wid in transient or any(a.get('window') == wid for a in actions):
+                    continue
+                try:
+                    result = self.call('close', app, str(wid), 'discard' if app == 'com.apple.TextEdit' else 'keep')
+                    if result.get('transient'):
+                        transient.add(wid)
+                    actions.append(result)
+                except RuntimeError as error:
+                    # Apps such as Calculator quit with their last window; the final state decides.
+                    actions.append({'window': wid, 'error': str(error)})
+
+        close(self.call('state'))
         time.sleep(min(.5, settle_seconds))
         for a in launched(self.call('state')):
             try:
@@ -112,15 +122,17 @@ class Native:
         deadline = time.monotonic() + settle_seconds
         while True:
             final = self.call('state')
-            remaining = [wid for _, wid in owned(final)]
+            remaining = [wid for _, wid in owned(final) if wid not in transient]
             remaining_apps = [a['pid'] for a in launched(final)]
             if not (remaining or remaining_apps) or time.monotonic() >= deadline:
                 break
+            close(final)  # Windows the task opened late, e.g. while quitting.
             time.sleep(.25)
         # Only visible originals count: background apps recreate helper windows on their own.
         regular_pids = {a['pid'] for a in before['apps']}
         original_regular = {w['id'] for w in before['windows'] if w['layer'] == 0 and w.get('on_screen') and w['pid'] in regular_pids}
         missing = sorted(original_regular - {w['id'] for w in final['windows']})
         return {'actions': actions, 'remaining_owned_windows': remaining,
+                'transient_windows': sorted(transient),
                 'remaining_launched_apps': remaining_apps,
                 'missing_original_window_ids': missing, 'ok': not remaining and not missing and not remaining_apps}
