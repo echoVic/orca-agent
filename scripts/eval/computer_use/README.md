@@ -65,9 +65,17 @@ task and while polling. State snapshots contain bundle IDs/PIDs, pointer positio
 CG window IDs/layers/bounds and display bounds, **no window titles**. Layer-1000
 windows covering at least 90% of a display are recorded per task and do not cause
 a skip (the UU look-through branch remains a live-only check). Preflight never
-requests TCC access. Browser setup creates a new window; cleanup closes only new
-windows of allowed task apps, and quits only allowed app PIDs absent at task start.
-Final restoration uses the original app PID and pointer coordinates.
+requests TCC access. Browser setup creates a new window and navigates it to
+about:blank, proven by the window title: a start page can list the user's
+favorites and history, so setup fails rather than leave one. The task window must
+be the only new standard AX window; status bubbles and popups are not. Cleanup
+closes only new visible windows of allowed task apps (bubbles without a close
+button are left to their owner), and quits only allowed app PIDs absent at task
+start. A user window that disappears fails cleanup only if it was visible and at
+least 120×60 pt; background apps' helper windows and toasts come and go on their
+own. Calculator restores its last display, so the harness presses AC before S1/M4
+and those tasks need real input. Final restoration uses the original app PID and
+pointer coordinates.
 
 Approval detection reads the current rendered box and the task-bound session
 JSONL. Ordinary `Approve · <tool>` comes from `ui.rs`; risk titles are derived
@@ -107,11 +115,14 @@ Each task has a file/AX/defaults/sysctl/form-log verifier. Read-task answers mus
 match independent facts. Appearance requires the selected AX control to agree
 with defaults. GUI acceptance also requires successful computer calls with the
 right canonical app and task-window identity. M1/M7 require typing, AX document
-content matching the saved file, and no direct shell/file-writing substitution;
-M6 requires three successful GUI clicks. Screenshots
+content matching the saved file, and no file-tool or shell write to that file
+(read-only checks such as `cat` are fine); M1's saved lines must have been typed
+into the task window. M6 requires three successful GUI clicks. Screenshots
 of new task windows supplement AX evidence (System Settings and Cherry Studio
-use scoped AX evidence to avoid account/chat screenshots); absence of usable AX is a failure,
-not inferred visual success. S7 additionally fails click/type/key/scroll calls.
+use scoped AX evidence to avoid account/chat screenshots). Chrome shows no web
+content to this AX reader, so S2/S8 also OCR the task window screenshot with
+Vision and record only whether the expected string appeared. Absence of AX or OCR
+evidence is a failure, not inferred visual success. S7 additionally fails click/type/key/scroll calls.
 The JSON input to each verifier is retained for review. A model's “done” never
 proves success.
 
