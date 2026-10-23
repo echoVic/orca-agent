@@ -1,0 +1,198 @@
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from preflight import check_state, overlays, Native, restoration_check, browser_window
+from tui import bind_session, pending_approvals
+from run import run_task, retry_task_cleanup
+from types import SimpleNamespace
+from services import FormHandler
+from http.server import ThreadingHTTPServer
+from threading import Thread
+from urllib.request import urlopen, Request
+
+
+class PreflightTests(unittest.TestCase):
+    def test_cleanup_checks_launched_apps_even_without_windows(self):
+        native = object.__new__(Native)
+        before = {'apps': [], 'windows': []}
+        state = {'apps': [{'pid': 42, 'bundle': 'com.apple.TextEdit'}], 'windows': []}
+        with patch.object(native, 'call', side_effect=lambda op, *args: state if op == 'state' else {'terminated': False}):
+            result = native.cleanup({'allowed_apps': ['com.apple.TextEdit']}, before)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['remaining_launched_apps'], [42])
+
+    def test_browser_setup_requires_new_owned_window(self):
+        before = {'windows': [{'id': 1}]}
+        after = {'frontmost': 'com.apple.Safari', 'apps': [{'bundle': 'com.apple.Safari', 'pid': 5}],
+                 'windows': [{'id': 1, 'pid': 5, 'layer': 0}, {'id': 2, 'pid': 5, 'layer': 0}]}
+        self.assertEqual(browser_window(before, after, 'com.apple.Safari', 2), 2)
+        for claimed in (1, 3):
+            with self.assertRaises(RuntimeError):
+                browser_window(before, after, 'com.apple.Safari', claimed)
+        after['frontmost'] = 'com.example.terminal'
+        with self.assertRaises(RuntimeError):
+            browser_window(before, after, 'com.apple.Safari', 2)
+
+    def test_restore_checks_actual_pid_and_pointer_tolerance(self):
+        initial = {'front_pid': 1, 'pointer': [100.5, 200.5]}
+        self.assertTrue(restoration_check(initial, {'front_pid': 1, 'pointer': [100, 200]})['ok'])
+        self.assertFalse(restoration_check(initial, {'front_pid': 2, 'pointer': [100, 200]})['ok'])
+        self.assertFalse(restoration_check(initial, {'front_pid': 1, 'pointer': [110, 200]})['ok'])
+
+    def test_dry_preflight_records_lock_without_requiring_desktop(self):
+        native = object.__new__(Native)
+        state = {'frontmost': 'com.apple.loginwindow', 'windows': [], 'displays': []}
+        with patch.object(native, 'call', return_value=state), patch('preflight.subprocess.run') as run:
+            run.return_value.stdout = '"CGSSessionScreenIsLocked" = Yes'
+            recorded = native.preflight(live=False)
+            self.assertFalse(recorded['gui_ready'])
+            with self.assertRaises(RuntimeError):
+                native.preflight(live=True)
+
+    def test_locked_and_loginwindow_stop(self):
+        for lock, front in [('"CGSSessionScreenIsLocked" = Yes', 'com.apple.finder'), ('', 'com.apple.loginwindow')]:
+            with self.assertRaises(RuntimeError):
+                check_state({'frontmost': front}, lock)
+        check_state({'frontmost': 'com.example.terminal'}, 'CGSSessionScreenIsLocked absent')
+
+    def test_layer1000_fullscreen_on_any_display(self):
+        s = {'displays': [{'X': 0, 'Y': 0, 'Width': 1000, 'Height': 800}],
+             'windows': [{'id': 1, 'layer': 1000, 'on_screen': True,
+                          'bounds': {'X': 0, 'Y': 0, 'Width': 1000, 'Height': 800}},
+                         {'id': 2, 'layer': 1000, 'on_screen': True,
+                          'bounds': {'X': 0, 'Y': 0, 'Width': 10, 'Height': 10}}]}
+        self.assertEqual([w['id'] for w in overlays(s)], [1])
+
+
+class SessionTests(unittest.TestCase):
+    def test_exact_fresh_session_not_latest(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            old = root / 'old.jsonl'
+            old.write_text(json.dumps({'type': 'session.meta', 'title': 'prompt', 'provider': 'mock', 'session_id': 'old'}) + '\n' + json.dumps({'type': 'conversation.message', 'message': {'role': 'user', 'content': 'prompt'}}) + '\n')
+            new = root / 'new.jsonl'
+            new.write_text(json.dumps({'type': 'session.meta', 'title': 'prompt', 'provider': 'mock', 'session_id': 'new'}) + '\n' + json.dumps({'type': 'conversation.message', 'message': {'role': 'user', 'content': 'prompt'}}) + '\n')
+            self.assertEqual(bind_session(root, {old}, 'prompt', 'mock'), new)
+            extra = root / 'extra.jsonl'
+            extra.write_text(new.read_text())
+            with self.assertRaises(RuntimeError):
+                bind_session(root, {old}, 'prompt', 'mock')
+            self.assertIsNone(bind_session(root, {old, new, extra}, 'prompt', 'mock'))
+
+    def test_long_prompt_binds_full_user_message_not_truncated_title(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); path = root / 's.jsonl'
+            prompt = 'test ' * 30
+            path.write_text(json.dumps({'type': 'session.meta', 'title': 'test', 'provider': 'mock', 'session_id': 'new'}) + '\n')
+            self.assertIsNone(bind_session(root, set(), prompt, 'mock'))
+            with path.open('a') as f:
+                f.write(json.dumps({'type': 'conversation.message', 'message': {'role': 'user', 'content': prompt}}) + '\n')
+            self.assertEqual(bind_session(root, set(), prompt, 'mock'), path)
+            self.assertIsNone(bind_session(root, set(), 'test', 'mock'))
+
+    def test_pending_permission_uses_committed_interaction_identity(self):
+        interaction = {'interaction_id': 'id1', 'request': {'PermissionRequest': {'tool_call_id': 'call1'}}}
+        records = [{'type': 'runtime.surface_commit.prepared', 'commit_id': 'commit1', 'batch': {'events': [
+            {'event': {'Interaction': {'Requested': {'interaction': interaction}}}}]}}]
+        self.assertEqual(pending_approvals(records), [])
+        records.append({'type': 'runtime.surface_commit.committed', 'commit_id': 'commit1'})
+        self.assertEqual(pending_approvals(records)[0]['id'], 'id1')
+        records.extend([{'type': 'runtime.surface_commit.prepared', 'commit_id': 'commit2', 'batch': {'events': [
+            {'event': {'Interaction': {'Resolved': {'interaction_id': 'id1'}}}}]}},
+            {'type': 'runtime.surface_commit.committed', 'commit_id': 'commit2'}])
+        self.assertEqual(pending_approvals(records), [])
+
+
+class RunnerLifecycleTests(unittest.TestCase):
+    def test_failed_stop_cleanup_is_retried_only_after_pid_exit(self):
+        class Native:
+            called = False
+            def cleanup(self, task, before):
+                self.called = True
+                return {'ok': True}
+        with tempfile.TemporaryDirectory() as d:
+            evidence = Path(d); native = Native()
+            with patch('run.os.kill', side_effect=ProcessLookupError):
+                result = retry_task_cleanup({}, {}, evidence, native, 123)
+            self.assertTrue(native.called)
+            self.assertTrue(result['ok'])
+            self.assertTrue((evidence / 'cleanup-recovery.json').exists())
+            native.called = False
+            with patch('run.os.kill', return_value=None):
+                result = retry_task_cleanup({}, {}, evidence, native, 123)
+            self.assertFalse(native.called)
+            self.assertFalse(result['ok'])
+
+    def test_startup_failure_keeps_evidence_and_waits_for_exit(self):
+        order = []
+        class FakeTUI:
+            submitted = None
+            approvals = []
+            def __init__(self, *args): pass
+            def start(self):
+                order.append('start')
+                raise RuntimeError('startup failed')
+            def stop(self):
+                order.append('exited')
+                return {'exited': True, 'records': []}
+        class Native:
+            def preflight(self, live): return {'windows': [], 'apps': []}
+            def cleanup(self, task, before):
+                order.append('cleanup')
+                return {'ok': True}
+        class Services:
+            port = 1234
+            def health(self): return {'http': 200}
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d); (base / 'out').mkdir(); (base / 'fixtures').mkdir()
+            task = {'id': 'M7', 'kind': 'multi', 'allowed_apps': ['com.apple.TextEdit'], 'prompt': 'prompt', 'verifier': 'draft'}
+            with patch('run.TUI', FakeTUI), patch('run.collect', return_value={'passed': False}):
+                row = run_task(task, SimpleNamespace(dry_run=False), base, base / 'report', None, Services(), Native())
+            self.assertTrue(row['harness_error'])
+            self.assertEqual(order, ['start', 'exited', 'cleanup'])
+            self.assertTrue((base / 'report/evidence/M7/metrics.json').is_file())
+
+    def test_verifier_failure_still_cleans_and_retains_started_task(self):
+        class FakeTUI:
+            submitted = 0
+            approvals = []
+            def __init__(self, *args): pass
+            def start(self): pass
+            def run(self, *args): return 'completed'
+            def stop(self): return {'exited': True, 'records': []}
+        class Native:
+            def preflight(self, live): return {'windows': [], 'apps': []}
+            def cleanup(self, task, before): return {'ok': True}
+        class Services:
+            port = 1234
+            def health(self): return {}
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d); (base / 'out').mkdir(); (base / 'fixtures').mkdir()
+            task = {'id': 'M7', 'kind': 'multi', 'allowed_apps': ['com.apple.TextEdit'], 'prompt': 'prompt', 'verifier': 'draft'}
+            with patch('run.TUI', FakeTUI), patch('run.collect', side_effect=RuntimeError('AX failed')):
+                row = run_task(task, SimpleNamespace(dry_run=False), base, base / 'report', None, Services(), Native())
+            self.assertTrue(row['harness_error'])
+            self.assertTrue(row['cleanup']['ok'])
+
+
+class FormTests(unittest.TestCase):
+    def test_server_health_form_and_post(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            (base / 'fixtures').mkdir(); (base / 'out').mkdir()
+            (base / 'fixtures/form.html').write_text('<form>Name</form>')
+            handler = type('BoundHandler', (FormHandler,), {'base': base})
+            server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+            thread = Thread(target=server.serve_forever); thread.start()
+            try:
+                origin = f'http://127.0.0.1:{server.server_port}'
+                with urlopen(origin + '/health') as r:
+                    self.assertEqual(r.read(), b'orca-cu-eval')
+                with urlopen(Request(origin + '/form.html', data=b'name=Orca&agree=yes')) as r:
+                    self.assertIn(b'Thanks, Orca', r.read())
+                self.assertEqual((base / 'out/form-posts.log').read_text(), 'name=Orca&agree=yes\n')
+            finally:
+                server.shutdown(); server.server_close(); thread.join()

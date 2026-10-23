@@ -1,0 +1,152 @@
+[
+  {
+    "id": "S1",
+    "kind": "single",
+    "prompt": "用计算器 App 算 1234 × 5678，告诉我显示的结果。",
+    "allowed_apps": [
+      "com.apple.calculator"
+    ],
+    "timeout": 360,
+    "verifier": "calculator"
+  },
+  {
+    "id": "S2",
+    "kind": "single",
+    "prompt": "用 Safari 打开 /tmp/orca-cu-baseline/fixtures/page.html，告诉我页面的大标题是什么。",
+    "allowed_apps": [
+      "com.apple.Safari"
+    ],
+    "timeout": 360,
+    "verifier": "heading"
+  },
+  {
+    "id": "S3",
+    "kind": "single",
+    "prompt": "在 Finder 里打开 /tmp/orca-cu-baseline/fixtures/files120，告诉我按名称排序时最后一个文件叫什么。",
+    "allowed_apps": [
+      "com.apple.finder"
+    ],
+    "timeout": 360,
+    "verifier": "last_file"
+  },
+  {
+    "id": "S4",
+    "kind": "single",
+    "prompt": "打开系统设置，看一下外观现在是浅色、深色还是自动，告诉我。",
+    "allowed_apps": [
+      "com.apple.systempreferences"
+    ],
+    "timeout": 360,
+    "verifier": "appearance"
+  },
+  {
+    "id": "S5",
+    "kind": "single",
+    "prompt": "打开文本编辑新建一个纯文本文档，输入 Hello from Orca baseline，不用保存。",
+    "allowed_apps": [
+      "com.apple.TextEdit"
+    ],
+    "timeout": 360,
+    "verifier": "textedit"
+  },
+  {
+    "id": "S6",
+    "kind": "single",
+    "prompt": "用预览打开 /tmp/orca-cu-baseline/fixtures/two-pages.pdf，告诉我它有几页。",
+    "allowed_apps": [
+      "com.apple.Preview"
+    ],
+    "timeout": 360,
+    "verifier": "pdf"
+  },
+  {
+    "id": "S7",
+    "kind": "single",
+    "prompt": "看一下 Cherry Studio 主窗口左侧边栏有哪些入口，列出来，不要点击或输入。",
+    "allowed_apps": [
+      "com.kangfenmao.CherryStudio"
+    ],
+    "timeout": 360,
+    "verifier": "sidebar"
+  },
+  {
+    "id": "S8",
+    "kind": "single",
+    "prompt": "用 Chrome 打开 /tmp/orca-cu-baseline/fixtures/page.html，点一下页面上的 Press me 按钮，告诉我按钮下面出现了什么文字。",
+    "allowed_apps": [
+      "com.google.Chrome"
+    ],
+    "timeout": 360,
+    "verifier": "button"
+  },
+  {
+    "id": "M1",
+    "kind": "multi",
+    "prompt": "用文本编辑写一个三行的待办清单，存成纯文本到 /tmp/orca-cu-baseline/out/todo.txt。",
+    "allowed_apps": [
+      "com.apple.TextEdit"
+    ],
+    "timeout": 360,
+    "verifier": "todo"
+  },
+  {
+    "id": "M2",
+    "kind": "multi",
+    "prompt": "用 Safari 打开 http://127.0.0.1:{port}/form.html，在 Name 填 Orca，勾选 Agree，然后点 Submit，告诉我页面显示的结果。",
+    "allowed_apps": [
+      "com.apple.Safari"
+    ],
+    "timeout": 360,
+    "verifier": "form"
+  },
+  {
+    "id": "M3",
+    "kind": "multi",
+    "prompt": "在 Finder 里，在 /tmp/orca-cu-baseline/out 下新建一个文件夹叫 reports，然后把它重命名为 reports-2026。",
+    "allowed_apps": [
+      "com.apple.finder"
+    ],
+    "timeout": 360,
+    "verifier": "rename"
+  },
+  {
+    "id": "M4",
+    "kind": "multi",
+    "prompt": "用计算器算 (12 + 34) × 56，再把结果除以 7，告诉我最终结果。",
+    "allowed_apps": [
+      "com.apple.calculator"
+    ],
+    "timeout": 360,
+    "verifier": "arithmetic"
+  },
+  {
+    "id": "M5",
+    "kind": "multi",
+    "prompt": "在系统设置里打开 通用 → 关于本机，告诉我这台 Mac 的芯片型号。",
+    "allowed_apps": [
+      "com.apple.systempreferences"
+    ],
+    "timeout": 360,
+    "verifier": "chip"
+  },
+  {
+    "id": "M6",
+    "kind": "multi",
+    "prompt": "在工作区写一个 counter.html：页面有一个 + 按钮和一个从 0 开始的数字，点一下加一。写完用 Safari 打开，点 3 次按钮，确认数字变成 3，然后告诉我结果。",
+    "allowed_apps": [
+      "com.apple.Safari"
+    ],
+    "timeout": 360,
+    "verifier": "counter"
+  },
+  {
+    "id": "M7",
+    "kind": "multi",
+    "prompt": "用文本编辑打开 /tmp/orca-cu-baseline/fixtures/draft.txt，把第一行的 teh 改成 the，保存。",
+    "allowed_apps": [
+      "com.apple.TextEdit"
+    ],
+    "timeout": 360,
+    "verifier": "draft"
+  }
+]
