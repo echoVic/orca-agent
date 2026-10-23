@@ -271,6 +271,15 @@ fn tool_target(name: &ToolName, arguments: &Value) -> Option<String> {
         ToolName::UpdatePlan => arguments["plan"]
             .as_array()
             .map(|plan| format!("{} items", plan.len())),
+        ToolName::ReadMcpResource => arguments["uri"].as_str().map(|uri| {
+            arguments["server"]
+                .as_str()
+                .map_or_else(|| uri.to_string(), |server| format!("{server}:{uri}"))
+        }),
+        ToolName::ReadSkill => arguments["id"].as_str().map(String::from),
+        ToolName::Workflow => ["name", "scriptPath", "draftId"]
+            .into_iter()
+            .find_map(|key| arguments[key].as_str().map(String::from)),
         ToolName::Mcp(name) | ToolName::External(name) => Some(name.clone()),
         _ => None,
     }
@@ -279,6 +288,72 @@ fn tool_target(name: &ToolName, arguments: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_targets_identify_resources_skills_and_workflows() {
+        for (name, arguments, expected) in [
+            (
+                ToolName::ReadMcpResource,
+                serde_json::json!({"server":"docs","uri":"file:///guide"}),
+                Some("docs:file:///guide"),
+            ),
+            (
+                ToolName::ReadMcpResource,
+                serde_json::json!({"uri":"file:///guide"}),
+                Some("file:///guide"),
+            ),
+            (
+                ToolName::ReadMcpResource,
+                serde_json::json!({"server":"docs"}),
+                None,
+            ),
+            (
+                ToolName::ReadSkill,
+                serde_json::json!({"id":"review"}),
+                Some("review"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"name":"audit","scriptPath":"./audit.ts","draftId":"draft-1"}),
+                Some("audit"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"scriptPath":"./audit.ts","draftId":"draft-1"}),
+                Some("./audit.ts"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"draftId":"draft-1"}),
+                Some("draft-1"),
+            ),
+            (ToolName::Workflow, serde_json::json!({}), None),
+            (
+                ToolName::ReadFile,
+                serde_json::json!({"path":"src/main.rs"}),
+                Some("src/main.rs"),
+            ),
+            (
+                ToolName::Bash,
+                serde_json::json!({"command":"git status"}),
+                Some("git status"),
+            ),
+        ] {
+            let request = ToolRequest {
+                id: "target-1".into(),
+                name,
+                action: orca_core::approval_types::ActionKind::Read,
+                target: None,
+                raw_arguments: Some(arguments.to_string()),
+            };
+            assert_eq!(
+                tool_request_target(&request).as_deref(),
+                expected,
+                "{}: {arguments}",
+                request.name.as_str()
+            );
+        }
+    }
 
     fn external_tool(name: &str) -> orca_core::external_config::ExternalToolConfig {
         orca_core::external_config::ExternalToolConfig {

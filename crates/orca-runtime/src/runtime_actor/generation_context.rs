@@ -989,7 +989,7 @@ fn tools_match(
 /// Whether `recorded` is the committed form of `expected`. The action is left
 /// out: it comes from the tool, and older builds recorded the provider's
 /// placeholder, so a response replayed after an upgrade must still find the
-/// call it committed.
+/// call it committed. Older builds also omitted targets derived from arguments.
 fn same_tool_call(
     recorded: &surface::SurfaceToolRequest,
     expected: &surface::SurfaceToolRequest,
@@ -997,6 +997,11 @@ fn same_tool_call(
     *recorded
         == surface::SurfaceToolRequest {
             action: recorded.action,
+            target: if recorded.target.is_none() {
+                None
+            } else {
+                expected.target.clone()
+            },
             ..expected.clone()
         }
 }
@@ -1231,7 +1236,7 @@ mod tests {
         let normalized = normalize_provider_response(
             &response,
             "provider response",
-            &orca_tools::registry::default_tool_registry(),
+            orca_tools::registry::default_tool_registry(),
         )
         .unwrap();
 
@@ -1311,7 +1316,7 @@ mod tests {
         let normalized = normalize_provider_response(
             &response,
             "provider response",
-            &orca_tools::registry::default_tool_registry(),
+            orca_tools::registry::default_tool_registry(),
         )
         .unwrap();
 
@@ -1328,6 +1333,72 @@ mod tests {
                 surface::SurfaceToolAction::Read,
             ]
         );
+    }
+
+    #[test]
+    fn replay_matches_legacy_requests_without_resource_skill_or_workflow_targets() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::tool_types::{ToolName, ToolRequest};
+        for (name, arguments, target) in [
+            (
+                ToolName::ReadMcpResource,
+                serde_json::json!({"server":"docs","uri":"file:///guide"}),
+                "docs:file:///guide",
+            ),
+            (
+                ToolName::ReadSkill,
+                serde_json::json!({"id":"review"}),
+                "review",
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"name":"audit"}),
+                "audit",
+            ),
+        ] {
+            let arguments = arguments.to_string();
+            let request = ToolRequest {
+                id: "call-1".into(),
+                name: name.clone(),
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(arguments.clone()),
+            };
+            let response = crate::model_response::RuntimeModelResponse::new(
+                orca_core::provider_types::ProviderResponse {
+                    steps: vec![orca_core::provider_types::ProviderStep::ToolCall(
+                        request.clone(),
+                    )],
+                    assistant_content: None,
+                    assistant_reasoning: None,
+                    tool_calls: vec![orca_core::conversation::RawToolCall {
+                        id: request.id.clone(),
+                        function_name: name.as_str().into(),
+                        arguments,
+                    }],
+                    usage: None,
+                },
+                orca_core::thread_identity::TurnId::new(),
+            );
+            let registry = orca_tools::registry::default_tool_registry();
+            let normalized =
+                normalize_provider_response(&response, "provider response", registry).unwrap();
+            let typed = &normalized.tool_requests[0];
+            assert_eq!(typed.target.as_ref().unwrap().as_str(), target);
+            let legacy = surface::SurfaceToolRequest {
+                target: None,
+                ..typed.clone()
+            };
+            assert!(records_request_action_and_target(
+                &legacy, &request, registry
+            ));
+            assert!(same_tool_call(&legacy, typed), "{}", name.as_str());
+            let different = surface::SurfaceToolRequest {
+                target: Some(surface::DisplayText::new("another target")),
+                ..typed.clone()
+            };
+            assert!(!same_tool_call(&different, typed));
+        }
     }
 
     #[test]
@@ -1461,28 +1532,28 @@ mod tests {
         assert!(records_request_action_and_target(
             &committed(Write, Some("notes.txt")),
             &request,
-            &orca_tools::registry::default_tool_registry()
+            orca_tools::registry::default_tool_registry()
         ));
         assert!(records_request_action_and_target(
             &committed(Read, Some("notes.txt")),
             &request,
-            &orca_tools::registry::default_tool_registry()
+            orca_tools::registry::default_tool_registry()
         ));
         assert!(records_request_action_and_target(
             &committed(Read, None),
             &request,
-            &orca_tools::registry::default_tool_registry()
+            orca_tools::registry::default_tool_registry()
         ));
         // Neither the tool nor the provider gave these, so it is another call.
         assert!(!records_request_action_and_target(
             &committed(Write, Some("other.txt")),
             &request,
-            &orca_tools::registry::default_tool_registry()
+            orca_tools::registry::default_tool_registry()
         ));
         assert!(!records_request_action_and_target(
             &committed(Shell, Some("notes.txt")),
             &request,
-            &orca_tools::registry::default_tool_registry()
+            orca_tools::registry::default_tool_registry()
         ));
     }
 
@@ -1502,7 +1573,7 @@ mod tests {
             normalize_provider_response(
                 &response,
                 "provider response",
-                &orca_tools::registry::default_tool_registry(),
+                orca_tools::registry::default_tool_registry(),
             )
             .unwrap()
             .completed_response
