@@ -241,6 +241,10 @@ fn explicit_policy_never_delegates_proactively() {
     assert!(!policy.is_proactive());
     let prompt = orca_runtime::agent_common::format_subagent_guidance(policy);
     assert!(prompt.contains("only on explicit user request"));
+    assert!(prompt.contains("Decision rules once the user authorizes delegation:"));
+    assert!(!prompt.contains("delegate useful independent branches before reading everything"));
+    assert!(!prompt.contains("\n- Delegate broad exploration"));
+    assert!(prompt.contains("Once authorized, delegate broad exploration"));
 }
 
 #[test]

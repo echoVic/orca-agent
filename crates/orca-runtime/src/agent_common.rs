@@ -209,18 +209,20 @@ fn inferred_role_tools(subagent_depth: u32, subagent_type: &SubagentType) -> Opt
 /// Delegation guidance for the main agent, selected by the effective policy.
 /// Role selection and call mechanics live in the subagent schema.
 pub fn format_subagent_guidance(delegation: DelegationPolicy) -> String {
-    let (permission, context_rule) = match delegation {
+    let (permission, exploration_rule, context_rule) = match delegation {
         DelegationPolicy::Off => {
             return String::from(
                 "## Delegation\n\nDelegation is off: do not start children. Existing children: task_list/task_wait for progress, task_stop to cancel. If parallel work is needed, ask the user; do not bypass this setting.",
             );
         }
         DelegationPolicy::Explicit => (
-            "Delegate only on explicit user request for delegation, parallel work, or another agent; otherwise work locally. Keep these rules for later authorization.",
-            "Delegate broad exploration, judgement, or large raw output to preserve your context.",
+            "Delegate only on explicit user request for delegation, parallel work, or another agent; otherwise work locally. Decision rules once the user authorizes delegation:",
+            "Once authorized, map modules, dependencies, next local step; delegate independent branches within that scope.",
+            "Once authorized, delegate broad exploration, judgement, or large raw output within that scope to preserve context.",
         ),
         DelegationPolicy::Adaptive => (
             "Delegate authorized independent work for correctness and speed, never agent count.",
+            "Map modules, dependencies, next local step; delegate useful independent branches before reading everything.",
             "Without parallel local work, delegate large one-off output if preserving context outweighs launch/briefing cost.",
         ),
     };
@@ -228,7 +230,7 @@ pub fn format_subagent_guidance(delegation: DelegationPolicy) -> String {
         r#"## Delegation
 
 {permission}
-- Map modules, dependencies, next local step; delegate useful independent branches before reading everything.
+- {exploration_rule}
 - Scope children to one subsystem or call chain and a few entry files, not repo-wide audits. Give each user-named independent branch its own child when capacity allows; do not bundle unrelated branches to reduce count.
 - {context_rule}
 - Keep single-file work, small lookups, coupled changes, and live user input local.
