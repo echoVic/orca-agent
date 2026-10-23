@@ -75,11 +75,21 @@ func find(_ e: AXUIElement, _ names: Set<String>, _ depth: Int = 0) -> [AXUIElem
 }
 // NSWorkspace/NSRunningApplication state only refreshes while the run loop runs.
 func pump(_ seconds: Double) { RunLoop.current.run(until: Date().addingTimeInterval(seconds)) }
+func capture(_ tool: String, _ arguments: [String]) -> String {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: tool); process.arguments = arguments
+    process.standardOutput = pipe
+    guard (try? process.run()) != nil else { return "" }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return String(data: data, encoding: .utf8) ?? ""
+}
+// LaunchServices' front app, read fresh: NSWorkspace stays stale in a CLI and
+// the AX system-wide focused application read fails while Chrome is in front.
 func focusedPid() -> pid_t {
-    guard let app = get(AXUIElementCreateSystemWide(), "AXFocusedApplication") else { return 0 }
-    var pid: pid_t = 0
-    _ = AXUIElementGetPid(app as! AXUIElement, &pid)
-    return pid
+    let asn = capture("/usr/bin/lsappinfo", ["front"]).trimmingCharacters(in: .whitespacesAndNewlines)
+    let info = capture("/usr/bin/lsappinfo", ["info", "-only", "pid", asn])
+    return pid_t(info.split(separator: "=").last.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? "") ?? 0
 }
 func waitFocused(_ pid: pid_t, _ seconds: Double) -> Bool {
     let end = Date().addingTimeInterval(seconds)
@@ -159,7 +169,9 @@ if op == "state" {
         _ = app.activate(options: [.activateAllWindows])
         if !waitFocused(app.processIdentifier, 1.5) {
             // LaunchServices activation still works when a background helper's request is ignored.
+            // Its reopen event may create the window itself, so give that a moment.
             run("/usr/bin/open", ["-b", args[2]])
+            pump(1)
         }
         guard waitFocused(app.processIdentifier, 3) else {
             emit(["error": "Browser activation did not complete", "focused_pid": focusedPid()]); exit(1)
@@ -194,15 +206,29 @@ if op == "state" {
             emit(["error": "New browser window is not focused", "focused_window": focusedID, "focused_pid": focusedPid()]); exit(1)
         }
         key(37, [.maskCommand]) // Cmd+L, confined to the newly proven window.
-        let chars = Array("about:blank".utf16)
-        for down in [true, false] {
-            let event = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down)!
-            event.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: chars)
-            event.post(tap: .cghidEventTap)
+        pump(0.3)
+        // One character per event: Chrome's omnibox drops a multi-character
+        // event, which left the start page (and its suggestion list) open.
+        for var unit in Array("about:blank".utf16) {
+            for down in [true, false] {
+                let event = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down)!
+                event.keyboardSetUnicodeString(stringLength: 1, unicodeString: &unit)
+                // A nil event source keeps Cmd from the Cmd+L above; "n" would open a window.
+                event.flags = []
+                event.post(tap: .cghidEventTap)
+            }
+            pump(0.01)
         }
+        pump(0.3)
         key(36)
-        Thread.sleep(forTimeInterval: 0.4)
-        emit(["window_id": id, "blank_navigation_requested": true])
+        // Prove the start page is gone; it can list the user's favorites and history.
+        let navigationEnd = Date().addingTimeInterval(3)
+        var title = string(added[0], "AXTitle")
+        while !title.contains("about:blank") && Date() < navigationEnd { pump(0.1); title = string(added[0], "AXTitle") }
+        guard title.contains("about:blank") else {
+            emit(["error": "New browser window did not navigate to about:blank", "window_id": id]); exit(1)
+        }
+        emit(["window_id": id, "blank_navigation": true, "title": title])
     } else {
         let id = UInt32(args[3])!
         let windows = children(root, "AXWindows").filter {
