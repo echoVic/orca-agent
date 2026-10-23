@@ -78,6 +78,8 @@ pub(crate) struct RuntimeSubagentBatchToolTurnServices<'a> {
 }
 
 pub(crate) struct RuntimeSubagentBatchToolTurnRuntime<'a> {
+    pub(crate) agent_catalog:
+        Option<Arc<orca_core::subagent_types::agent_definition::AgentCatalog>>,
     pub(crate) cancel: &'a CancelToken,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) root_task_id: Option<&'a str>,
@@ -222,6 +224,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         hooks,
     } = services;
     let RuntimeSubagentBatchToolTurnRuntime {
+        agent_catalog,
         cancel,
         task_registry,
         root_task_id,
@@ -232,6 +235,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         agent_controller,
     } = runtime;
     let execution = execute_subagent_batch(
+        agent_catalog,
         config,
         cwd,
         events,
@@ -295,6 +299,7 @@ fn is_batchable_subagent_request(tool_request: &tool_types::ToolRequest) -> bool
 
 #[allow(clippy::too_many_arguments)]
 fn execute_subagent_batch(
+    agent_catalog: Option<Arc<orca_core::subagent_types::agent_definition::AgentCatalog>>,
     config: &RunConfig,
     cwd: &Path,
     events: &mut EventFactory,
@@ -485,7 +490,7 @@ fn execute_subagent_batch(
             Some(Some(spec)) => apply_child_budget_spec(config, spec),
             _ => config.clone(),
         };
-        let invocation = RuntimeSubagentInvocation::snapshot(
+        let mut invocation = RuntimeSubagentInvocation::snapshot(
             effective,
             request,
             &child_config,
@@ -505,6 +510,7 @@ fn execute_subagent_batch(
             batch_id.clone(),
             u32::try_from(tool_requests.len()).unwrap_or(u32::MAX),
         );
+        invocation.agent_catalog = agent_catalog.clone();
         let admission = runtime.admit(idx, invocation, |task| {
             if !emit_deltas || agent_controller.is_some() {
                 return Ok(());
@@ -614,6 +620,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
     #[cfg(not(test))]
     let test_ingress = None;
     execute_subagent_tool_with_activity_ingress(
+        None,
         config,
         cwd,
         events,
@@ -641,6 +648,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
+    agent_catalog: Option<Arc<orca_core::subagent_types::agent_definition::AgentCatalog>>,
     config: &RunConfig,
     cwd: &Path,
     events: &mut EventFactory,
@@ -753,7 +761,9 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
             }
         }
     }
-    if let Err(error) = subagent::freeze_agent_request(config, cwd, mcp_registry, &mut request) {
+    if let Err(error) =
+        subagent::freeze_agent_request(agent_catalog, config, cwd, mcp_registry, &mut request)
+    {
         return Ok((
             tool_types::ToolResult::failed_before_start(tool_request, error, None),
             None,
@@ -1366,6 +1376,7 @@ mod tests {
                     hooks: &hooks,
                 },
                 runtime: super::RuntimeSubagentBatchToolTurnRuntime {
+                    agent_catalog: None,
                     cancel: &cancel,
                     task_registry: &task_registry,
                     root_task_id: None,
@@ -1548,6 +1559,7 @@ mod tests {
         let hooks = HookRunner::default();
         let mut cost_tracker = CostTracker::new(None);
         super::execute_subagent_batch(
+            None,
             &config,
             &cwd,
             &mut events,
@@ -1749,6 +1761,7 @@ mod tests {
                     hooks: &hooks,
                 },
                 runtime: super::RuntimeSubagentBatchToolTurnRuntime {
+                    agent_catalog: None,
                     cancel: &cancel,
                     task_registry: &task_registry,
                     root_task_id: None,
@@ -1826,6 +1839,7 @@ mod tests {
                     hooks: &hooks,
                 },
                 runtime: super::RuntimeSubagentBatchToolTurnRuntime {
+                    agent_catalog: None,
                     cancel: &cancel,
                     task_registry: &task_registry,
                     root_task_id: None,
@@ -1905,6 +1919,7 @@ mod tests {
                     hooks: &hooks,
                 },
                 runtime: super::RuntimeSubagentBatchToolTurnRuntime {
+                    agent_catalog: None,
                     cancel: &cancel,
                     task_registry: &task_registry,
                     root_task_id: None,
@@ -2172,6 +2187,7 @@ mod tests {
                     hooks: &hooks,
                 },
                 runtime: super::RuntimeSubagentBatchToolTurnRuntime {
+                    agent_catalog: None,
                     cancel: &cancel,
                     task_registry: &task_registry,
                     root_task_id: None,
@@ -2295,6 +2311,7 @@ mod tests {
         let activity_ingress = Arc::new(CapturingActivityIngress::default());
 
         let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            None,
             &config,
             cwd.path(),
             &mut events,
@@ -2354,6 +2371,7 @@ mod tests {
         let mut event_error = None;
 
         let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            None,
             &config,
             cwd.path(),
             &mut events,
@@ -2427,6 +2445,7 @@ mod tests {
         let mut event_error = None;
 
         let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            None,
             &config,
             cwd.path(),
             &mut events,
@@ -2509,6 +2528,7 @@ mod tests {
         let mut event_error = None;
 
         let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            None,
             &config,
             cwd.path(),
             &mut events,
@@ -2595,6 +2615,7 @@ mod tests {
             let mut cost_tracker = CostTracker::new(None);
             let mut event_error = None;
             let result = super::execute_subagent_tool_with_activity_ingress(
+                None,
                 &config,
                 &cwd_path,
                 &mut events,
@@ -3116,6 +3137,7 @@ mod tests {
         let mut event_error = None;
 
         let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            None,
             &config,
             cwd.path(),
             &mut events,
@@ -3205,6 +3227,7 @@ mod tests {
         let mut event_error = None;
 
         let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            None,
             &config,
             cwd.path(),
             &mut events,
@@ -3272,6 +3295,7 @@ mod tests {
         let mut event_error = None;
 
         let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            None,
             &config,
             cwd.path(),
             &mut events,
@@ -3348,6 +3372,7 @@ mod tests {
         let mut event_error = None;
 
         let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            None,
             &config,
             cwd.path(),
             &mut events,
@@ -3421,6 +3446,7 @@ mod tests {
         let mut event_error = None;
 
         let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            None,
             &config,
             cwd.path(),
             &mut events,
@@ -4139,6 +4165,7 @@ mod tests {
                     hooks: &hooks,
                 },
                 runtime: super::RuntimeSubagentBatchToolTurnRuntime {
+                    agent_catalog: None,
                     cancel: &cancel,
                     task_registry: &task_registry,
                     root_task_id: None,

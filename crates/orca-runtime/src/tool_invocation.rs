@@ -195,8 +195,8 @@ pub(crate) fn provider_config_for_agent_loop(
     {
         // A thread owns this store across turns; the first advertised subagent
         // tool freezes its catalog. MCP reconnects still rebuild their own tools.
-        let catalog = session_tools
-            .get_or_init(|| crate::subagent::discover_agents(config, cwd, mcp_registry));
+        let catalog =
+            crate::subagent::session_agent_catalog(config, cwd, mcp_registry, session_tools);
         orca_tools::schema::apply_subagent_catalog(
             &mut tool.description,
             &mut tool.input_schema,

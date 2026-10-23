@@ -751,6 +751,14 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     hooks,
                 },
                 runtime: RuntimeSubagentBatchToolTurnRuntime {
+                    agent_catalog: extensions.map(|context| {
+                        crate::subagent::session_agent_catalog(
+                            config,
+                            cwd,
+                            mcp_registry,
+                            context.stores().thread_store(),
+                        )
+                    }),
                     cancel,
                     task_registry,
                     root_task_id,
