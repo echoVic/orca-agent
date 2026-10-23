@@ -55,6 +55,7 @@ pub struct InteractiveSession {
     auto_memory_turn_starts: HashMap<String, usize>,
     task_registry: TaskRegistry,
     last_manual_compaction: Option<ManualCompactionOutcome>,
+    runtime_extensions: Option<std::sync::Arc<crate::extension::ExtensionData>>,
 }
 
 pub(crate) struct InteractiveSessionRuntimeParts<'a> {
@@ -194,6 +195,16 @@ pub(crate) fn record_plan_state_for_agent(
 }
 
 impl InteractiveSession {
+    /// Shared by hosted threads and the public session turn entry points.
+    pub(crate) fn runtime_extensions(
+        &mut self,
+        id: &str,
+    ) -> std::sync::Arc<crate::extension::ExtensionData> {
+        self.runtime_extensions
+            .get_or_insert_with(|| std::sync::Arc::new(crate::extension::ExtensionData::new(id)))
+            .clone()
+    }
+
     pub fn new_with_preloaded(
         config: &RunConfig,
         prompt_for_title: &str,
@@ -442,6 +453,7 @@ impl InteractiveSession {
             auto_memory_turn_starts: HashMap::new(),
             task_registry,
             last_manual_compaction: None,
+            runtime_extensions: None,
         };
         if let (Some(worker), Some(work)) = (
             session.auto_memory_worker.as_ref(),

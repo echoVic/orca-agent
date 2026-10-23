@@ -24045,6 +24045,7 @@ mod tests {
             &orca_core::subagent_types::SubagentType::General,
             crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
             &McpRegistry::default(),
+            &crate::extension::ExtensionData::new("schema-test"),
         );
         let tools = provider.tools_override.expect("side schemas");
         assert!(tools.iter().any(|tool| tool.name == "read_file"));
@@ -42219,6 +42220,7 @@ done
                 &orca_core::subagent_types::SubagentType::General,
                 crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
                 &registry,
+                &crate::extension::ExtensionData::new("schema-test"),
             )
             .tools_override
             .expect("the provider gets a tool list")

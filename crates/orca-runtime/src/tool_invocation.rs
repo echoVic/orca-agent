@@ -156,6 +156,7 @@ pub(crate) fn provider_config_for_agent_loop(
     subagent_type: &SubagentType,
     tool_policy: AgentToolPolicyContext<'_>,
     mcp_registry: &McpRegistry,
+    session_tools: &crate::extension::ExtensionData,
 ) -> ProviderConfig {
     let shell_readiness = crate::shell_readiness::ShellReadiness::for_config(config);
     let mut tools_override = provider_tool_schema_override(
@@ -191,9 +192,11 @@ pub(crate) fn provider_config_for_agent_loop(
         .tools_override
         .as_mut()
         .and_then(|tools| tools.iter_mut().find(|tool| tool.name == "subagent"))
-        && let Some(cwd) = config.cwd.clone().or_else(|| std::env::current_dir().ok())
     {
-        let catalog = crate::subagent::discover_agents(config, &cwd, mcp_registry);
+        // A thread owns this store across turns; the first advertised subagent
+        // tool freezes its catalog. MCP reconnects still rebuild their own tools.
+        let catalog = session_tools
+            .get_or_init(|| crate::subagent::discover_agents(config, cwd, mcp_registry));
         orca_tools::schema::apply_subagent_catalog(
             &mut tool.description,
             &mut tool.input_schema,
@@ -500,6 +503,7 @@ mod tests {
             &orca_core::subagent_types::SubagentType::General,
             policy,
             &registry,
+            &crate::extension::ExtensionData::new("schema-test"),
         );
         assert!(
             !provider
@@ -526,6 +530,7 @@ mod tests {
             &orca_core::subagent_types::SubagentType::General,
             super::AgentToolPolicyContext::unrestricted(),
             &orca_mcp::McpRegistry::default(),
+            &crate::extension::ExtensionData::new("schema-test"),
         );
         assert_eq!(
             provider
@@ -670,6 +675,7 @@ mod tests {
                 &SubagentType::General,
                 AgentToolPolicyContext::unrestricted(),
                 &registry,
+                &crate::extension::ExtensionData::new("schema-test"),
             );
             let tools = provider.tools_override.unwrap();
             assert_eq!(schema_names(&tools).contains(&"git_status"), is_repo);
@@ -705,6 +711,7 @@ mod tests {
             &SubagentType::General,
             AgentToolPolicyContext::unrestricted(),
             &McpRegistry::default(),
+            &crate::extension::ExtensionData::new("schema-test"),
         )
         .tools_override
         .unwrap()
@@ -754,6 +761,7 @@ mod tests {
                     "workflow child",
                 ),
             &McpRegistry::default(),
+            &crate::extension::ExtensionData::new("schema-test"),
         );
         assert_eq!(
             schema_names(&provider.tools_override.unwrap()),
@@ -856,6 +864,7 @@ mod tests {
             &SubagentType::General,
             AgentToolPolicyContext::unrestricted(),
             &mcp,
+            &crate::extension::ExtensionData::new("schema-test"),
         );
         let definitions = provider.tools_override.unwrap();
         let subagent = definitions
@@ -1079,6 +1088,7 @@ mod tests {
             &SubagentType::General,
             AgentToolPolicyContext::new(Some(&allowed), Some("test child")),
             &registry,
+            &crate::extension::ExtensionData::new("schema-test"),
         );
 
         assert_eq!(provider_config.api_key.as_deref(), Some("test-key"));
@@ -1110,6 +1120,7 @@ mod tests {
             &SubagentType::General,
             AgentToolPolicyContext::unrestricted(),
             &registry,
+            &crate::extension::ExtensionData::new("schema-test"),
         );
         let definitions = provider.tools_override.expect("tool override");
         let names = schema_names(&definitions);
