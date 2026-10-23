@@ -13,7 +13,6 @@ use serde_json::Value;
 fn mock_usage_cost(home: &Path) -> f64 {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env("ORCA_HOME", home)
-        .env_remove("ORCA_PRICING_URL")
         .args([
             "exec",
             "--output-format",
@@ -47,6 +46,27 @@ fn at_either_tier(cost: f64, off_peak: f64) {
         (cost - off_peak).abs() < 1e-12 || (cost - 2.0 * off_peak).abs() < 1e-12,
         "cost {cost} is neither {off_peak} nor its peak double"
     );
+}
+
+#[test]
+fn cargo_spawned_exec_inherits_offline_pricing_without_writing_a_cache() {
+    // Assert before spawning: a missing Cargo default must fail without ever
+    // permitting a release binary to fall back to models.dev.
+    assert_eq!(std::env::var("ORCA_PRICING_URL").as_deref(), Ok("off"));
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(home.path())
+        .args(["exec", "--provider", "mock", "mock_usage"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!home.path().join("pricing-cache.json").exists());
 }
 
 #[test]
