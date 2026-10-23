@@ -1266,7 +1266,7 @@ impl ThreadActor {
                             | surface::OperationOrigin::JsonlThreadTurn { .. }
                     )
                 });
-            let tool = Self::surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
+            let tool = self.surface_tool_for_runtime_request(snapshot, &fence, &request)?;
             let authority = Self::surface_authority_for_tool(&snapshot, &fence, &tool)?;
             let interaction_request = surface::SurfaceInteractionRequest::ToolApproval {
                 tool: tool.clone(),

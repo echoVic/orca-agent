@@ -596,6 +596,10 @@ impl ThreadActor {
                         self.resident_surface.coordinator.state().snapshot(),
                         &typed.fence,
                         response,
+                        &orca_tools::registry::tool_registry_with_mcp_and_external(
+                            Some(&self.handle.mcp_registry),
+                            &self.config.external_tools,
+                        ),
                     )
             })
             .transpose()
