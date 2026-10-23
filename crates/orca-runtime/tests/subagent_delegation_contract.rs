@@ -109,7 +109,7 @@ fn every_role_selection_contract_is_visible_to_the_model() {
         .clone();
     orca_tools::schema::apply_subagent_catalog(&mut description, &mut schema, &Default::default());
 
-    assert!(description.contains("Built-in roles (use the identifier verbatim)"));
+    assert!(description.contains("Built-in roles (verbatim ids)"));
     for descriptor in builtin_agents() {
         assert!(
             description.contains(descriptor.when_to_use),
@@ -240,7 +240,7 @@ fn explicit_policy_never_delegates_proactively() {
     assert!(policy.allows_new_children());
     assert!(!policy.is_proactive());
     let prompt = orca_runtime::agent_common::format_subagent_guidance(policy);
-    assert!(prompt.contains("only when the user explicitly asked"));
+    assert!(prompt.contains("only on explicit user request"));
 }
 
 #[test]
@@ -258,10 +258,10 @@ fn adaptive_prompt_states_critical_path_and_no_quota_rules() {
 
     assert!(prompt.contains("## Delegation"));
     assert!(prompt.contains("next local step"));
-    assert!(prompt.contains("Do not repeat the same searches"));
-    assert!(prompt.contains("Never delegate just to fill a quota"));
-    assert!(prompt.contains("`explorer`"));
-    // The capsule lists roles without dumping every full role prompt.
+    assert!(prompt.contains("do not repeat searches/reread cited files"));
+    assert!(prompt.contains("Capacity is a ceiling, not a target/quota"));
+    assert!(prompt.contains("Roles, tool ceilings, reports: see `subagent`"));
+    // The tool catalog above verifies every role without repeating them here.
     assert!(!prompt.contains("## Explorer Role"));
 }
 
@@ -269,7 +269,7 @@ fn adaptive_prompt_states_critical_path_and_no_quota_rules() {
 fn explicit_prompt_requires_an_explicit_user_request() {
     let prompt = orca_runtime::agent_common::format_subagent_guidance(DelegationPolicy::Explicit);
 
-    assert!(prompt.contains("only when the user explicitly asked"));
+    assert!(prompt.contains("only on explicit user request"));
     assert!(!prompt.contains("## Explorer Role"));
 }
 
@@ -277,8 +277,8 @@ fn explicit_prompt_requires_an_explicit_user_request() {
 fn off_prompt_forbids_new_children_and_keeps_existing_ones_reachable() {
     let prompt = orca_runtime::agent_common::format_subagent_guidance(DelegationPolicy::Off);
 
-    assert!(prompt.contains("Delegation is turned off"));
-    assert!(prompt.contains("Do not start new child agents"));
+    assert!(prompt.contains("Delegation is off: do not start children"));
+    assert!(prompt.contains("do not start children"));
     assert!(prompt.contains("task_list"));
     assert!(prompt.contains("task_wait"));
     assert!(prompt.contains("task_stop"));

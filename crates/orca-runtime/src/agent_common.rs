@@ -4,7 +4,7 @@ use orca_core::approval_types::{ActionKind, ApprovalMode};
 use orca_core::config::RunConfig;
 use orca_core::goal_types::ThreadGoal;
 use orca_core::subagent_config::DelegationPolicy;
-use orca_core::subagent_types::{SubagentType, builtin_agents};
+use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::ToolResult;
 use orca_tools::skills;
 
@@ -206,83 +206,37 @@ fn inferred_role_tools(subagent_depth: u32, subagent_type: &SubagentType) -> Opt
         })
 }
 
-/// The role catalog, one line per built-in role. The full selection contract
-/// (avoid-when, tool ceiling, required report) lives in the `subagent` tool
-/// description so the stable prompt prefix stays small.
-fn format_role_catalog_capsule() -> String {
-    let mut output = String::new();
-    for descriptor in builtin_agents() {
-        output.push_str(&format!(
-            "\n- `{}`: {}",
-            descriptor.name, descriptor.when_to_use
-        ));
-    }
-    output
-}
-
 /// Delegation guidance for the main agent, selected by the effective policy.
+/// Role selection and call mechanics live in the subagent schema.
 pub fn format_subagent_guidance(delegation: DelegationPolicy) -> String {
-    let roles = format_role_catalog_capsule();
-    let header = match delegation {
+    let (permission, context_rule) = match delegation {
         DelegationPolicy::Off => {
             return String::from(
-                r#"## Delegation
-
-Delegation is turned off for this task. Do not start new child agents.
-
-Existing children remain visible: `task_list` and `task_wait` report their progress and `task_stop` can stop one. If a task genuinely needs parallel work, say so and ask the user instead of working around the setting."#,
+                "## Delegation\n\nDelegation is off: do not start children. Existing children: task_list/task_wait for progress, task_stop to cancel. If parallel work is needed, ask the user; do not bypass this setting.",
             );
         }
-        DelegationPolicy::Explicit => {
-            r#"## Delegation
-
-Start a child agent only when the user explicitly asked you to delegate, use parallel work, or hand a piece of this task to another agent. Otherwise complete the task yourself and keep the delegation guidance below as a fallback if the task later turns out to be much wider than it first appeared."#
-        }
-        DelegationPolicy::Adaptive => {
-            r#"## Delegation
-
-You may split independent work off to child agents inside the scope the user already authorized. Delegation is a tool, not a goal: the measure is whether the task finishes correctly and sooner, never how many agents ran."#
-        }
-    };
-
-    let rules = match delegation {
-        DelegationPolicy::Off => String::new(),
-        DelegationPolicy::Explicit => format!(
-            r#"
-Decision rules when you do delegate:
-1. Determine which modules the task touches, what must be solved first, and what your next local step is.
-2. Delegate a branch that can be answered on its own and matters to the result. Do not wait until you have read everything.
-3. Give each child the smallest useful evidence scope: normally one subsystem or call chain and a few entry files. Do not turn every branch into a repository-wide audit.
-4. When the user names independent branches and capacity is available, give each branch its own child. Do not bundle unrelated branches merely to reduce the child count.
-5. Judgement is required, exploration is broad, or the raw output would be large: delegate to keep your own context for the work only you can do.
-6. Keep single-file work, small targeted lookups, tightly coupled changes, and anything needing live user input local.
-7. After delegating, keep working on a non-overlapping part. Do not repeat the same searches or reread cited files after successful children return. Treat exact child evidence, including a direct missing-file error, as the delegated result; verify only a concrete inconsistency, then integrate it.
-8. Do not attach an output `schema` to an ordinary evidence report for a human reader. Use one only when a downstream machine consumer requires that exact structure.
-9. One launch owns each named branch. When that child returns complete, partial, failed, or uncertain, integrate that outcome and its open questions. Do not launch a replacement child for the same branch unless the user explicitly asks for exhaustive completion or the result exposes one new, independently bounded question that blocks the task.
-
-Built-in roles (pass the identifier in `subagent_type`):{roles}
-"#
+        DelegationPolicy::Explicit => (
+            "Delegate only on explicit user request for delegation, parallel work, or another agent; otherwise work locally. Keep these rules for later authorization.",
+            "Delegate broad exploration, judgement, or large raw output to preserve your context.",
         ),
-        DelegationPolicy::Adaptive => format!(
-            r#"
-Decision rules:
-1. Determine which modules the task touches, what must be solved first, and what your next local step is.
-2. Delegate a branch that can be answered on its own and matters to the result. Do not wait until you have read everything.
-3. Give each child the smallest useful evidence scope: normally one subsystem or call chain and a few entry files. Do not turn every branch into a repository-wide audit.
-4. When the user names independent branches and capacity is available, give each branch its own child. Do not bundle unrelated branches merely to reduce the child count.
-5. No parallel local work is available, but one line of investigation will produce a large amount of one-off output: delegate it to keep your own context for the work only you can do. Weigh this against the cost of starting and briefing a child.
-6. Keep single-file work, small targeted lookups, tightly coupled changes, and anything needing live user input local. Never delegate just to fill a quota. The capacity limit is a ceiling, not a target.
-7. After delegating, keep working on a non-overlapping part. Do not repeat the same searches or reread cited files after successful children return. Treat exact child evidence, including a direct missing-file error, as the delegated result; verify only a concrete inconsistency, then integrate it.
-8. Do not attach an output `schema` to an ordinary evidence report for a human reader. Use one only when a downstream machine consumer requires that exact structure.
-9. One launch owns each named branch. When that child returns complete, partial, failed, or uncertain, integrate that outcome and its open questions. Do not launch a replacement child for the same branch unless the user explicitly asks for exhaustive completion or the result exposes one new, independently bounded question that blocks the task.
-
-Built-in roles (pass the identifier in `subagent_type`):{roles}
-
-Scope discipline: delegate only work inside what the user asked for, and do not keep spawning children after the remaining work is smaller than the cost of briefing one."#
+        DelegationPolicy::Adaptive => (
+            "Delegate authorized independent work for correctness and speed, never agent count.",
+            "Without parallel local work, delegate large one-off output if preserving context outweighs launch/briefing cost.",
         ),
     };
+    format!(
+        r#"## Delegation
 
-    format!("{header}{rules}")
+{permission}
+- Map modules, dependencies, next local step; delegate useful independent branches before reading everything.
+- Scope children to one subsystem or call chain and a few entry files, not repo-wide audits. Give each user-named independent branch its own child when capacity allows; do not bundle unrelated branches to reduce count.
+- {context_rule}
+- Keep single-file work, small lookups, coupled changes, and live user input local.
+- Continue non-overlapping work. Integrate exact evidence, including missing-file errors; do not repeat searches/reread cited files unless verifying a concrete inconsistency.
+- One launch per named branch: integrate complete/partial/failed/uncertain results and questions. Replace only for explicit exhaustive completion or a new independently bounded blocking question.
+- Stay in scope; stop when briefing costs exceed remaining work. Capacity is a ceiling, not a target/quota.
+Roles, tool ceilings, reports: see `subagent`."#
+    )
 }
 
 /// The contract for a child agent: what it must produce and what it must not do.
@@ -571,18 +525,29 @@ mod tests {
     fn adaptive_guidance_sizes_children_without_treating_capacity_as_a_target() {
         let guidance = format_subagent_guidance(DelegationPolicy::Adaptive);
 
-        assert!(guidance.contains("smallest useful evidence scope"));
-        assert!(guidance.contains("one subsystem or call chain"));
-        assert!(guidance.contains("give each branch its own child"));
-        assert!(guidance.contains("Do not bundle unrelated branches"));
-        assert!(guidance.contains("capacity limit is a ceiling, not a target"));
-        assert!(guidance.contains("Do not wait until you have read everything"));
-        assert!(guidance.contains("Do not repeat the same searches or reread cited files"));
-        assert!(guidance.contains("verify only a concrete inconsistency"));
-        assert!(guidance.contains("including a direct missing-file error"));
-        assert!(guidance.contains("Do not attach an output `schema`"));
-        assert!(guidance.contains("One launch owns each named branch"));
-        assert!(guidance.contains("Do not launch a replacement child for the same branch"));
+        for rule in [
+            "one subsystem or call chain",
+            "each user-named independent branch its own child",
+            "do not bundle unrelated branches",
+            "Capacity is a ceiling, not a target/quota",
+            "before reading everything",
+            "do not repeat searches/reread cited files",
+            "verifying a concrete inconsistency",
+            "including missing-file errors",
+            "One launch per named branch",
+            "complete/partial/failed/uncertain",
+            "explicit exhaustive completion",
+            "new independently bounded blocking question",
+        ] {
+            assert!(guidance.contains(rule), "missing delegation rule: {rule}");
+        }
+        let registry = orca_tools::registry::default_tool_registry();
+        let subagent = registry.get("subagent").unwrap();
+        let schema = subagent.spec().input_schema["properties"]["schema"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(schema.contains("Only for a downstream machine"));
+        assert!(schema.contains("omit for ordinary human-readable evidence reports"));
     }
 
     #[test]

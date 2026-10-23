@@ -26,11 +26,11 @@ pub fn render_builtin_role_catalog(capsule: bool) -> String {
             "\n- `{}`: {}",
             descriptor.name, descriptor.when_to_use
         ));
-        output.push_str(&format!("\n  Avoid when: {}", descriptor.avoid_when));
-        output.push_str(&format!("\n  Tools: {}", descriptor.tools.join(", ")));
+        output.push_str(&format!("\n  Avoid: {}", descriptor.avoid_when));
+        output.push_str(&format!("\n  Tools: {}", descriptor.tools.join(",")));
         output.push_str(&format!(
             "\n  Report: {}",
-            descriptor.deliverables.join("; ")
+            descriptor.deliverables.join(";")
         ));
     }
     output
@@ -50,17 +50,16 @@ pub fn apply_subagent_catalog(
     let mut names = builtin_role_names();
     names.extend(catalog.agents.keys().map(String::as_str));
     input_schema["properties"]["subagent_type"]["enum"] = serde_json::json!(names);
-    description.push_str("\n\nBuilt-in roles (use the identifier verbatim):");
+    description.push_str("\n\nBuilt-in roles (verbatim ids):");
     description.push_str(&render_builtin_role_catalog(false));
     if !catalog.agents.is_empty() {
-        description.push_str("\n\nAvailable custom agents (identifier: description):");
+        description.push_str("\n\nCustom agents (id: description):");
         for agent in catalog.agents.values() {
             description.push_str(&format!("\n- {}: {}", agent.name, agent.description));
         }
     }
     if !catalog.diagnostics.is_empty() {
-        description
-            .push_str("\n\nSome agent definitions were invalid or ambiguous and were excluded.");
+        description.push_str("\n\nInvalid/ambiguous definitions excluded.");
     }
     description.push_str(
         "\n\nAccepted aliases: explore/scout=explorer, reviewer=code_reviewer, tester=test_writer, debug=debugger, docs=documenter.",

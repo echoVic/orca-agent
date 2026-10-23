@@ -137,15 +137,7 @@ When using `web_search` for requests about latest news, recent updates, current 
 
 ## Dynamic workflows
 
-For requests that explicitly ask for a workflow, ultracode, a reusable orchestration, or a multi-phase process whose later phases depend on earlier results, call WorkflowDraft first unless the user already provided an explicit script, scriptPath, name, or draftId. Do not route an ordinary parallel investigation, code review, or handful of independent branches through Workflow; use direct `subagent` calls for those. The draft script must include export const meta with name, description, and phases, and should keep intermediate data inside workflow state/script variables instead of flooding the main conversation. Show the generated preview to the user. Then launch the approved draft with Workflow using draftId, or use Workflow directly for explicit script/scriptPath/name/draftId launches. Saved workflows can be launched with Workflow using name and args.
-
-Valid workflow scripts use exactly one of these shapes:
-- Auto mode: `export const meta = {{ name, description, phases: [{{ name, tasks: [{{ prompt: "..." }}] }}] }}`. Every task must be an object with a non-empty `prompt`.
-- Hand-written mode: `export const meta = {{ name, description, phases: ["phase-name"] }}` plus top-level `await phase("phase-name", async () => agent("prompt"))`, then `export default result`.
-
-Do not export `run`, `async function run`, helper functions, or arbitrary symbols. The workflow host only supports `export const meta`, `export const phases`, `export const args`, and `export default`.
-
-For delegated work outside Workflow, `subagent` accepts a bounded task and quickly returns its `task_id`. There is no mode parameter. A queued response means the task was accepted; do not submit it again. While it runs, continue independent work. Use `task_wait` when its result is needed, `task_read_output` to retrieve evidence, `subagent_message` for new guidance, and `task_stop` to cancel it. A wait timeout does not stop execution. Workflow runs may set `tokenBudget`; the final notification reports `total`, `spent`, and `remaining`, and each child reserves available run capacity before it starts so concurrent launches cannot claim the same tokens.
+Explicit workflow/ultracode, reusable orchestration, or dependent phases: WorkflowDraft first unless user supplied script/scriptPath/name/draftId. Show preview; launch approved draft with Workflow(draftId). Ordinary parallel investigation/code review/independent branches: direct `subagent` calls. Keep intermediates in workflow state/script variables. Saved workflows: Workflow(name,args).
 
 ## Safety Rules
 1. NEVER execute destructive commands (rm -rf /, rm -rf ~, mkfs, dd if=/dev/zero, etc.).
@@ -379,19 +371,81 @@ mod tests {
     }
 
     #[test]
+    fn default_request_prefix_stays_within_the_reviewed_character_budget() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = orca_core::config::RunConfig {
+            cwd: Some(cwd.path().to_path_buf()),
+            approval_mode: orca_core::approval_types::ApprovalMode::FullAuto,
+            ..Default::default()
+        };
+        config.tools.headless_exec = true;
+        let prompt = crate::agent_common::build_agent_system_prompt_for_config(
+            cwd.path(),
+            &config,
+            0,
+            &orca_core::subagent_types::SubagentType::General,
+            None,
+            None,
+            None,
+        );
+        let provider = crate::tool_invocation::provider_config_for_agent_loop(
+            &config,
+            cwd.path(),
+            0,
+            &orca_core::subagent_types::SubagentType::General,
+            crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
+            &orca_mcp::McpRegistry::default(),
+            &crate::extension::ExtensionData::new("prefix-budget"),
+        );
+        let tools =
+            orca_provider::tool_schema::deepseek_tools_schema(&provider.tools_override.unwrap());
+        let prefix =
+            prompt.chars().count() + serde_json::to_string(&tools).unwrap().chars().count();
+        // The measured #143 prefix was 32.9k chars. Leave room for request
+        // framing while protecting a further 15% reduction in total size.
+        assert!(
+            prefix <= 27_800,
+            "system + tool prefix is {prefix} chars (limit 27800)"
+        );
+    }
+
+    #[test]
     fn prompt_routes_dynamic_workflows_through_preview_drafts() {
         let prompt = build_system_prompt(std::path::Path::new("/repo"));
 
-        assert!(prompt.contains("explicitly ask for a workflow"));
-        assert!(prompt.contains("call WorkflowDraft first"));
-        assert!(prompt.contains("Do not route an ordinary parallel investigation"));
-        assert!(prompt.contains("use direct `subagent` calls"));
-        assert!(prompt.contains("Then launch the approved draft with Workflow using draftId"));
-        assert!(prompt.contains("Do not export `run`"));
-        assert!(prompt.contains("tasks: [{ prompt:"));
-        assert!(prompt.contains("quickly returns its `task_id`"));
-        assert!(!prompt.contains(r#""mode":"async""#));
-        assert!(prompt.contains("do not submit it again"));
+        for rule in [
+            "Explicit workflow/ultracode",
+            "dependent phases",
+            "WorkflowDraft first",
+            "unless user supplied script/scriptPath/name/draftId",
+            "Show preview",
+            "approved draft with Workflow(draftId)",
+            "Ordinary parallel investigation/code review/independent branches: direct `subagent` calls",
+            "Keep intermediates in workflow state/script variables",
+            "Workflow(name,args)",
+        ] {
+            assert!(
+                prompt.contains(rule),
+                "missing workflow routing rule: {rule}"
+            );
+        }
+        // Script syntax belongs to the tool used to write it, submission
+        // mechanics to subagent; the system prompt only selects the route.
+        let registry = orca_tools::registry::default_tool_registry();
+        let workflow = registry.get("Workflow").unwrap();
+        let script = workflow.spec().input_schema["properties"]["script"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(script.contains("Do not export `run`"));
+        assert!(script.contains("tasks: [{ prompt:"));
+        assert!(script.contains("non-empty prompt"));
+        assert!(script.contains("await phase("));
+        let subagent = registry.get("subagent").unwrap();
+        assert!(subagent.description().contains("quickly returns task_id"));
+        assert!(subagent.description().contains("No mode parameter"));
+        assert!(subagent.description().contains("do not resubmit"));
     }
 
     #[test]
