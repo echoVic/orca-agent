@@ -162,9 +162,9 @@ pub(crate) fn ensure_visible(
     service: Option<&ComputerUseService>,
 ) -> Result<(), String> {
     let host_supported = orca_computer_use::apps::host_supported();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     let host_supported = service.map_or(host_supported, ComputerUseService::test_host_supported);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-utils")))]
     let _ = service;
     if !super::visibility::tool_visible(
         config,

@@ -3,6 +3,9 @@ name = "orca-runtime"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+test-utils = ["orca-computer-use/test-utils"]
+
 [dependencies]
 orca-computer-use = { path = "../orca-computer-use" }
 orca-core = { path = "../orca-core" }

@@ -1508,6 +1508,16 @@ fn mock_flaky_once_should_fail(key: &str) -> bool {
 fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
     let prompt = prompt.trim();
 
+    if let Some(arguments) = prompt.strip_prefix("computer ") {
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::Computer,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(arguments.to_string()),
+        });
+    }
+
     if let Some(rest) = prompt.strip_prefix("read ") {
         let path = rest.to_string();
         return Some(ToolRequest {

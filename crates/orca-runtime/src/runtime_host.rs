@@ -13698,8 +13698,8 @@ pub(crate) fn surface_tool_action(
         orca_core::approval_types::ActionKind::Write => surface::SurfaceToolAction::Write,
         orca_core::approval_types::ActionKind::Network => surface::SurfaceToolAction::Network,
         orca_core::approval_types::ActionKind::Agent => surface::SurfaceToolAction::Agent,
-        orca_core::approval_types::ActionKind::Shell
-        | orca_core::approval_types::ActionKind::Computer => surface::SurfaceToolAction::Shell,
+        orca_core::approval_types::ActionKind::Shell => surface::SurfaceToolAction::Shell,
+        orca_core::approval_types::ActionKind::Computer => surface::SurfaceToolAction::Computer,
     }
 }
 
@@ -23876,6 +23876,10 @@ mod relay_poll_tests {
         );
     }
 }
+
+#[cfg(any(test, feature = "test-utils"))]
+#[path = "test_support/computer_use.rs"]
+pub mod test_support;
 
 #[cfg(test)]
 mod tests {
@@ -39046,6 +39050,236 @@ mod tests {
             })
         ));
         host.shutdown().expect("shutdown cost-budget Goal runtime");
+    }
+
+    #[test]
+    fn computer_surface_approval_projects_resolved_bundle_without_mutating_provider_identity() {
+        crate::history::with_redirected_orca_home("computer-surface-approval", |_| {
+            let cwd = tempfile::tempdir().unwrap();
+            let executor = test_support::FakeComputerExecutor::new(
+                orca_computer_use::fake::FakeDesktop::with_textedit(),
+            );
+            let host = RuntimeHost::start_with_executor(Arc::new(executor)).unwrap();
+            let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+            config.approval_mode = ApprovalMode::AutoEdit;
+            config.computer_use.interactive = true;
+            let thread = host
+                .start_thread(config, "computer surface approval")
+                .unwrap();
+            let handle = thread.surface();
+            let attachment = fresh_surface_goal_approval_attachment(&handle);
+            let mut subscription = handle.claim_subscription(&attachment.subscription).unwrap();
+            let reserved = committed_surface_value(
+                attachment
+                    .client
+                    .reserve_operation(
+                        surface_request_id(),
+                        surface_user_turn_intent(
+                            &attachment.baseline.snapshot,
+                            r#"computer {"action":"observe","app":"TextEdit"}"#,
+                        ),
+                    )
+                    .unwrap(),
+            );
+            let operation_id = reserved.operation_id.clone();
+            committed_surface_value(
+                attachment
+                    .client
+                    .admit_reserved(
+                        surface_request_id(),
+                        operation_id.clone(),
+                        reserved.lease.lease_id,
+                    )
+                    .unwrap(),
+            );
+            let interaction = collect_requested_surface_interaction(&mut subscription);
+            let surface::SurfaceInteractionRequest::ToolApproval { tool, .. } =
+                &interaction.request
+            else {
+                panic!("expected computer tool approval");
+            };
+            assert_eq!(
+                tool.target.as_ref().map(surface::DisplayText::as_str),
+                Some("com.apple.TextEdit")
+            );
+            assert_eq!(serde_json::to_value(tool.action).unwrap(), "Computer");
+            let snapshot = fresh_surface_attachment(&handle).baseline.snapshot;
+            let committed = snapshot
+                .tools
+                .iter()
+                .find(|entry| entry.request.tool_call_id == tool.tool_call_id)
+                .unwrap();
+            assert_eq!(committed.request.target, None);
+            assert_eq!(committed.request.raw_arguments, tool.raw_arguments);
+            let mut replay_snapshot = (*snapshot).clone();
+            replay_snapshot.interactions.clear();
+            let reduce = |view: surface::SurfaceInteractionView| {
+                let batch = runtime_surface_event_batch(
+                    &replay_snapshot,
+                    vec![(
+                        surface::SurfaceScope::Generation {
+                            fence: view.fence.clone(),
+                        },
+                        surface::SurfaceEvent::Interaction(surface::InteractionPatch::Requested {
+                            interaction: view,
+                        }),
+                    )],
+                    None,
+                );
+                surface::reduce_batch(
+                    surface::SurfaceReduceMode::Rematerialization,
+                    &surface::SurfaceReducerState::new(replay_snapshot.clone()),
+                    &batch,
+                )
+            };
+            assert!(matches!(
+                reduce(interaction.clone()),
+                surface::SurfaceReduceResult::Applied { .. }
+            ));
+            for change in [
+                "app",
+                "secure",
+                "arguments",
+                "id",
+                "turn",
+                "response",
+                "action",
+                "capsule",
+            ] {
+                let mut tampered = interaction.clone();
+                let surface::SurfaceInteractionRequest::ToolApproval { tool, .. } =
+                    &mut tampered.request
+                else {
+                    unreachable!()
+                };
+                match change {
+                    "app" => tool.target = Some(surface::DisplayText::new("com.apple.calculator")),
+                    "secure" => {
+                        tool.target = Some(surface::DisplayText::new("com.apple.TextEdit#secure"))
+                    }
+                    "arguments" => tool.raw_arguments = surface::DisplayText::new("{}"),
+                    "id" => {
+                        tool.tool_call_id =
+                            surface::SurfaceToolCallId::try_new("different-call").unwrap()
+                    }
+                    "turn" => tool.turn_id = surface::SurfaceTurnId::new(),
+                    "response" => tool.source_response_id = None,
+                    "action" => tool.action = surface::SurfaceToolAction::Shell,
+                    "capsule" => {
+                        tampered.recovery_disposition =
+                            surface::InteractionUnavailableDisposition::FailOperation
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    matches!(
+                        reduce(tampered),
+                        surface::SurfaceReduceResult::Rejected { .. }
+                    ),
+                    "{change}"
+                );
+            }
+            // Replay a serialized prechange checkpoint: both the provider
+            // identity and approval presentation recorded Shell/None.
+            let capsule = interaction
+                .recovery_disposition
+                .restartable_tool_approval_capsule()
+                .unwrap()
+                .unwrap();
+            let surface::DurableInteractionContinuationIntent::ToolInvocation(current_intent) =
+                capsule.intent().unwrap()
+            else {
+                unreachable!()
+            };
+            let mut legacy_snapshot = replay_snapshot.clone();
+            let legacy_tool = &mut legacy_snapshot
+                .tools
+                .iter_mut()
+                .find(|entry| entry.request.tool_call_id == tool.tool_call_id)
+                .unwrap()
+                .request;
+            legacy_tool.action = surface::SurfaceToolAction::Shell;
+            let legacy_tool = legacy_tool.clone();
+            let legacy_authority = ThreadActor::surface_authority_for_tool(
+                &legacy_snapshot,
+                &interaction.fence,
+                &legacy_tool,
+            )
+            .unwrap();
+            let mut legacy = interaction.clone();
+            let surface::SurfaceInteractionRequest::ToolApproval {
+                tool, authority, ..
+            } = &mut legacy.request
+            else {
+                unreachable!()
+            };
+            *tool = legacy_tool.clone();
+            *authority = legacy_authority.clone();
+            let legacy_intent =
+                surface::ToolInvocationIntent::before_invocation(legacy_tool, legacy_authority)
+                    .with_computer_approval(current_intent.computer_approval().unwrap().clone());
+            let legacy_capsule =
+                surface::DurableInteractionContinuationCapsule::try_new_restartable(
+                    legacy.interaction_id.clone(),
+                    legacy.fence.clone(),
+                    legacy.request.clone(),
+                    surface::Sha256Digest::new([1; 32]),
+                    surface::DurableInteractionContinuationIntent::ToolInvocation(legacy_intent),
+                )
+                .unwrap();
+            let legacy_capsule = surface::DurableInteractionContinuationCapsule::decode(
+                &legacy_capsule.encode().unwrap(),
+            )
+            .unwrap();
+            legacy_capsule.validate().unwrap();
+            legacy.request = legacy_capsule.request().to_surface_request();
+            legacy.recovery_disposition =
+                surface::InteractionUnavailableDisposition::restartable_tool_approval(
+                    &legacy_capsule,
+                )
+                .unwrap();
+            let legacy_batch = runtime_surface_event_batch(
+                &legacy_snapshot,
+                vec![(
+                    surface::SurfaceScope::Generation {
+                        fence: legacy.fence.clone(),
+                    },
+                    surface::SurfaceEvent::Interaction(surface::InteractionPatch::Requested {
+                        interaction: legacy,
+                    }),
+                )],
+                None,
+            );
+            assert!(matches!(
+                surface::reduce_batch(
+                    surface::SurfaceReduceMode::Rematerialization,
+                    &surface::SurfaceReducerState::new(legacy_snapshot),
+                    &legacy_batch
+                ),
+                surface::SurfaceReduceResult::Applied { .. }
+            ));
+            committed_surface_value(
+                attachment
+                    .client
+                    .respond_interaction_by_id(
+                        surface_request_id(),
+                        interaction.interaction_id,
+                        surface::SurfaceClientInteractionAnswer::ToolApproval {
+                            decision: surface::SurfaceAllowDeny::Allow,
+                        },
+                    )
+                    .unwrap(),
+            );
+            let terminal = attachment
+                .client
+                .wait_operation_terminal(surface_request_id(), operation_id)
+                .unwrap();
+            assert!(
+                matches!(terminal, surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. }))
+            );
+            host.shutdown().unwrap();
+        });
     }
 
     #[test]

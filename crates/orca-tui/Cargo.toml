@@ -53,6 +53,8 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+orca-runtime = { path = "../orca-runtime", features = ["test-utils"] }
+orca-computer-use = { path = "../orca-computer-use", features = ["test-utils"] }
 tempfile = { workspace = true }
 orca-core = { path = "../orca-core", features = ["test-utils"] }
 orca-mcp = { path = "../orca-mcp", features = ["test-utils"] }
