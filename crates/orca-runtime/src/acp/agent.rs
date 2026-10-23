@@ -2257,6 +2257,18 @@ fn build_interaction_request(
         }
     };
     let mut fields = ToolCallUpdateFields::new().title(title);
+    if let SurfaceInteractionRequest::ToolApproval { tool, .. } = &interaction.request
+        && tool.name.as_str() == "computer"
+    {
+        fields = fields
+            .title(tool_call_title(tool))
+            .kind(tool_kind(tool.action))
+            .raw_input(serde_json::json!({
+                "tool": tool.name.as_str(),
+                "action": "computer",
+                "target": tool.target.as_ref().map(DisplayText::as_str),
+            }));
+    }
     if let Some(raw_input) = raw_input {
         fields = fields.raw_input(raw_input);
     }
@@ -2974,6 +2986,7 @@ fn tool_kind(action: SurfaceToolAction) -> ToolKind {
         SurfaceToolAction::Network => ToolKind::Fetch,
         SurfaceToolAction::Agent => ToolKind::Think,
         SurfaceToolAction::Shell => ToolKind::Execute,
+        SurfaceToolAction::Computer => ToolKind::Other,
     }
 }
 
@@ -3850,6 +3863,26 @@ mod tests {
             }),
             Ok(StopReason::Cancelled)
         );
+    }
+
+    #[test]
+    fn computer_approval_wire_request_names_the_resolved_app_and_non_shell_kind() {
+        for target in ["com.apple.TextEdit", "com.apple.TextEdit#secure"] {
+            let view = crate::runtime_host::test_support::computer_approval_view(target);
+            let (wire, _) = build_interaction_request(&SessionId::new("computer"), &view).unwrap();
+            let AcpInteractionWireRequest::Permission(request) = wire else {
+                panic!("permission request")
+            };
+            let value = serde_json::to_value(request).unwrap();
+            assert_eq!(value["toolCall"]["kind"], "other");
+            assert_eq!(value["toolCall"]["rawInput"]["target"], target);
+            assert!(
+                value["toolCall"]["title"]
+                    .as_str()
+                    .unwrap()
+                    .contains(target)
+            );
+        }
     }
 
     #[test]

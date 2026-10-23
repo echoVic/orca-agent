@@ -1268,8 +1268,13 @@ impl ThreadActor {
                 });
             let tool = self.surface_tool_for_runtime_request(snapshot, &fence, &request)?;
             let authority = Self::surface_authority_for_tool(&snapshot, &fence, &tool)?;
+            let intent = surface::ToolInvocationIntent::before_invocation(tool, authority.clone())
+                .with_computer_approval(approval.clone());
+            let approval_tool = intent
+                .approval_tool()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             let interaction_request = surface::SurfaceInteractionRequest::ToolApproval {
-                tool: tool.clone(),
+                tool: approval_tool,
                 description: surface::DisplayText::new(approval.description.clone()),
                 preview: approval.preview.clone().map(surface::DisplayText::new),
                 authority: authority.clone(),
@@ -1284,10 +1289,7 @@ impl ThreadActor {
                 fence.clone(),
                 interaction_request.clone(),
                 execution_context_fingerprint,
-                surface::DurableInteractionContinuationIntent::ToolInvocation(
-                    surface::ToolInvocationIntent::before_invocation(tool, authority)
-                        .with_computer_approval(approval.clone()),
-                ),
+                surface::DurableInteractionContinuationIntent::ToolInvocation(intent),
             )
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             let recovery_disposition =

@@ -2063,6 +2063,7 @@ fn tool_action(action: orca_runtime::surface::SurfaceToolAction) -> ActionKind {
         orca_runtime::surface::SurfaceToolAction::Network => ActionKind::Network,
         orca_runtime::surface::SurfaceToolAction::Agent => ActionKind::Agent,
         orca_runtime::surface::SurfaceToolAction::Shell => ActionKind::Shell,
+        orca_runtime::surface::SurfaceToolAction::Computer => ActionKind::Computer,
     }
 }
 

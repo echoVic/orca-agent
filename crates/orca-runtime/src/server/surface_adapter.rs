@@ -1995,6 +1995,7 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                 SurfaceToolAction::Network => ActionKind::Network,
                 SurfaceToolAction::Agent => ActionKind::Agent,
                 SurfaceToolAction::Shell => ActionKind::Shell,
+                SurfaceToolAction::Computer => ActionKind::Computer,
             };
             projector
                 .tools
@@ -2198,7 +2199,12 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                 serialized_id(&interaction.interaction_id)
             );
             match &interaction.request {
-                SurfaceInteractionRequest::ToolApproval { description, .. } => {
+                SurfaceInteractionRequest::ToolApproval {
+                    tool,
+                    description,
+                    preview,
+                    ..
+                } => {
                     let Some(request_id) = register_or_settle_unavailable(
                         transport.permissions.register(
                             request_id.clone(),
@@ -2223,6 +2229,17 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                         "turn_id": projector.turn_id.to_string(),
                         "reason": description.as_str(),
                         "permissions": {},
+                        "tool": tool.name.as_str(),
+                        "action": match tool.action {
+                            SurfaceToolAction::Read => ActionKind::Read,
+                            SurfaceToolAction::Write => ActionKind::Write,
+                            SurfaceToolAction::Network => ActionKind::Network,
+                            SurfaceToolAction::Agent => ActionKind::Agent,
+                            SurfaceToolAction::Shell => ActionKind::Shell,
+                            SurfaceToolAction::Computer => ActionKind::Computer,
+                        },
+                        "target": tool.target.as_ref().map(DisplayText::as_str),
+                        "preview": preview.as_ref().map(DisplayText::as_str),
                     });
                     let frame_digest =
                         super::opaque_permission_router::jsonl_response_digest(&payload)?;
@@ -2866,6 +2883,62 @@ mod tests {
     use crate::thread::RuntimeThread;
 
     const PROJECTION_FAILURE: &str = "injected JSONL projection disconnect";
+
+    #[test]
+    fn computer_approval_jsonl_projection_carries_resolved_target_and_action() {
+        crate::history::with_redirected_orca_home("computer-jsonl-approval", |_| {
+            let host = RuntimeHost::start().unwrap();
+            let cwd = tempdir().unwrap();
+            let mut config = test_run_config(cwd.path().to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let thread = host.start_thread(config, "computer projection").unwrap();
+            let surface = thread.surface();
+            let AttachResult::FreshAttached { attachment } =
+                surface.attach_fresh(FreshAttachRequest {
+                    request_id: SurfaceRequestId::new(),
+                    role: SurfaceAttachmentRole::Tui,
+                    requested_capabilities: BTreeSet::from([
+                        SurfaceCapability::ReadSnapshot,
+                        SurfaceCapability::RespondGrantedInteraction,
+                    ]),
+                    interaction_capabilities: BTreeSet::from([
+                        SurfaceInteractionKind::ToolApproval,
+                    ]),
+                })
+            else {
+                panic!("attach projection")
+            };
+            let mut interaction =
+                crate::runtime_host::test_support::computer_approval_view("com.apple.TextEdit");
+            interaction.route = SurfaceInteractionRoute::Exclusive {
+                epoch: crate::surface::ResponseRouteEpoch::try_new(1).unwrap(),
+                attachment_id: attachment.client.attachment_id().clone(),
+            };
+            let mut projector = JsonlSurfaceProjector::new(
+                surface,
+                thread.thread_id().to_string(),
+                TurnId::new(),
+                interaction.fence.operation_id.clone(),
+                attachment.client,
+                Some(test_interactions()),
+                vec![cwd.path().to_path_buf()],
+            );
+            let mut output = SharedTurnOutput::default();
+            project_surface_event(
+                &mut projector,
+                &SurfaceEvent::Interaction(InteractionPatch::Requested { interaction }),
+                &mut output,
+            )
+            .unwrap();
+            let approval: serde_json::Value = serde_json::from_slice(&output.bytes()).unwrap();
+            host.shutdown().unwrap();
+            assert_eq!(
+                approval["payload"]["target"], "com.apple.TextEdit",
+                "{approval}"
+            );
+            assert_eq!(approval["payload"]["action"], "computer", "{approval}");
+        });
+    }
 
     #[test]
     fn server_turn_attachments_declare_four_interaction_capabilities() {

@@ -310,3 +310,6 @@ mod tests {
             .expect("runtime shutdown");
     }
 }
+
+#[cfg(test)]
+mod computer_approval_tests;
