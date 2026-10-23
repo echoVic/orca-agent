@@ -150,6 +150,27 @@ class VerifierTests(unittest.TestCase):
         typed['target'] = 'com.apple.TextEdit'; typed['arguments']['window'] = 999
         self.assertFalse(gui_coverage(task, {'calls': [typed, key]}, d))
 
+    def test_gui_document_allows_read_only_shell_checks_but_not_shell_writes(self):
+        task = {'id': 'M1', 'allowed_apps': ['com.apple.TextEdit']}
+        todo = '- one\n- two\n- three'
+        typed = {'name': 'computer', 'target': 'com.apple.TextEdit', 'status': 'completed', 'arguments': {'action': 'type', 'window': 10, 'text': todo}}
+        check = {'name': 'bash', 'arguments': {'command': "file /tmp/orca-cu-baseline/out/todo.txt && python3 -c 'print(open(\"/tmp/orca-cu-baseline/out/todo.txt\").read())'"}}
+        mkdir = {'name': 'bash', 'arguments': {'command': 'mkdir -p /tmp/orca-cu-baseline/out 2>/dev/null'}}
+        d = {'windows': [10], 'todo': todo, 'ax': [{'role': 'AXTextArea', 'AXValue': todo}]}
+        ask = {'name': 'request_permissions', 'arguments': {'reason': 'save /tmp/orca-cu-baseline/out/todo.txt'}}
+        self.assertTrue(gui_coverage(task, {'calls': [ask, mkdir, typed, check]}, d))
+        for write in ("printf '%s' x > /tmp/orca-cu-baseline/out/todo.txt", 'cp /tmp/x /tmp/orca-cu-baseline/out/todo.txt'):
+            self.assertFalse(gui_coverage(task, {'calls': [typed, {'name': 'bash', 'arguments': {'command': write}}]}, d))
+        self.assertFalse(gui_coverage(task, {'calls': [typed, {'name': 'write_file', 'arguments': {'path': '/tmp/orca-cu-baseline/out/todo.txt'}}]}, d))
+        # Lines that were never typed in the window were not written through the GUI.
+        typed['arguments']['text'] = '- one'
+        self.assertFalse(gui_coverage(task, {'calls': [typed]}, d))
+
+    def test_ocr_of_the_task_window_counts_only_for_the_expected_string(self):
+        answer = 'Orca button confirmed: blue lantern'
+        self.assertTrue(evaluate('button', {'ax': [], 'ocr_found': [answer], 'answer': answer})['passed'])
+        self.assertFalse(evaluate('button', {'ax': [], 'ocr_found': [], 'answer': answer})['passed'])
+
     def test_calculator_requires_input_not_a_restored_display(self):
         task = {'id': 'S1', 'allowed_apps': ['com.apple.calculator']}
         observe = {'name': 'computer', 'target': 'com.apple.calculator', 'status': 'completed', 'arguments': {'action': 'observe', 'window': 10}}

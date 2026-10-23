@@ -25,7 +25,8 @@ def ax_values(ax):
 
 
 def contains(data, value):
-    return any(value in s for s in ax_values(data.get('ax', [])))
+    # OCR of the task window only reports which expected strings it saw.
+    return any(value in s for s in ax_values(data.get('ax', []))) or value in data.get('ocr_found', [])
 
 
 def number(data, expected):
@@ -104,6 +105,23 @@ def answer_matches(name, data):
     return True
 
 
+def wrote_outside_gui(metrics, path):
+    """Whether a non-GUI call wrote `path`; read-only checks such as `cat` or `file` are fine."""
+    name = re.escape(Path(path).name)
+    writes = [rf'>>?\s*["\']?[^\s"\'|;&]*{name}', rf'\btee\b[^|;&]*{name}', rf'\b(cp|mv|install|ln|touch|truncate)\b[^|;&]*{name}',
+              rf'\bsed\s+-[a-zA-Z]*i[^|;&]*{name}', rf'\bperl\s+-[a-zA-Z]*i[^|;&]*{name}',
+              rf'(write_text|write_bytes)', rf'open\([^)]*{name}[^)]*["\'][wax+]']
+    for call in metrics['calls']:
+        if Path(path).name not in json.dumps(call['arguments'], ensure_ascii=False):
+            continue
+        # File tools write directly; other tools (permission requests, reads) only name the file.
+        if call['name'] in ('write_file', 'edit'):
+            return True
+        if call['name'] == 'bash' and any(re.search(w, call['arguments'].get('command', '')) for w in writes):
+            return True
+    return False
+
+
 def gui_coverage(task, metrics, data):
     app = task['allowed_apps'][0]
     calls = [c for c in metrics['calls'] if c['name'] == 'computer' and c.get('status') == 'completed'
@@ -122,8 +140,13 @@ def gui_coverage(task, metrics, data):
         if not text or not any(text.strip() == s.strip() for s in ax_values(data.get('ax', []))):
             return False
         # A direct file/shell mutation cannot substitute for the requested GUI edit.
-        if any(c['name'] not in ('computer', 'read_file', 'list_files', 'search', 'glob', 'grep') for c in metrics['calls']):
+        if wrote_outside_gui(metrics, 'todo.txt' if task['id'] == 'M1' else 'draft.txt'):
             return False
+        if task['id'] == 'M1':
+            # The saved lines must have been typed into the task window.
+            typed = '\n'.join(c['arguments'].get('text', '') for c in calls if c['arguments'].get('action') == 'type')
+            if not all(line.strip() in typed for line in text.splitlines() if line.strip()):
+                return False
     if task['id'] == 'M6':
         return sum(c['arguments'].get('count', 1) for c in calls if c['arguments'].get('action') == 'click') >= 3
     return True
@@ -152,7 +175,11 @@ def collect(task, native, base, before, evidence, metrics):
         data['ax'].extend(ax)
         # No screenshots of pre-existing user windows. AX exceptions above are scoped.
         if w['id'] not in original and task['id'] != 'S7' and app != 'com.apple.systempreferences':
-            command_value(['screencapture', '-x', '-l', str(w['id']), str(evidence / f'window-{w["id"]}.png')])
+            shot = evidence / f'window-{w["id"]}.png'
+            command_value(['screencapture', '-x', '-l', str(w['id']), str(shot)])
+            if task['verifier'] in ('heading', 'button'):
+                needle = HEADING if task['verifier'] == 'heading' else BUTTON
+                data.setdefault('ocr_found', []).extend(native.call('ocr-find', str(shot), needle)['found'])
     paths = {'todo': 'out/todo.txt', 'draft': 'fixtures/draft.txt', 'counter': 'ws/counter.html'}
     for key, rel in paths.items():
         p = base / rel

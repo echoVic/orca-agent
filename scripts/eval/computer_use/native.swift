@@ -2,6 +2,7 @@
 import AppKit
 import ApplicationServices
 import PDFKit
+import Vision
 
 @_silgen_name("_AXUIElementGetWindow")
 func axWindow(_ element: AXUIElement, _ id: UnsafeMutablePointer<CGWindowID>) -> AXError
@@ -123,6 +124,16 @@ if op == "state" {
     if let p = snapshot["pointer"] as? [Double] { CGWarpMouseCursorPosition(CGPoint(x: p[0], y: p[1])) }
     Thread.sleep(forTimeInterval: 0.3)
     emit(state())
+} else if op == "ocr-find" {
+    // Chrome hides web content from AX readers it does not trust, so read the
+    // task window's pixels. Only the expected strings are reported, never other text.
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = false
+    do { try VNImageRequestHandler(url: URL(fileURLWithPath: args[2])).perform([request]) }
+    catch { emit(["error": "OCR failed: \(error)"]); exit(1) }
+    let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+    emit(["found": Array(args.dropFirst(3)).filter { needle in lines.contains { $0.contains(needle) } }])
 } else if op == "calculator-reset" {
     // Calculator restores its last display, so a stale result could answer the next task.
     let bundle = "com.apple.calculator"
@@ -249,6 +260,10 @@ if op == "state" {
                 emit(["window": id, "close_error": code.rawValue])
             } else { emit(["window": id, "transient": true, "reason": "AXCloseButton absent"]) }
         } else {
+            // Electron builds its web accessibility tree only for a client that asks.
+            if AXUIElementSetAttributeValue(root, "AXManualAccessibility" as CFString, kCFBooleanTrue) == .success {
+                pump(1)
+            }
             let nodes = walk(windows[0], 0, op == "buttons")
             if op == "settings" {
                 // Persist only the task's appearance/chip fields, not account/sidebar data.
