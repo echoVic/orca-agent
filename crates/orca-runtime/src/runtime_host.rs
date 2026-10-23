@@ -14645,6 +14645,7 @@ struct TypedProviderBackground {
     fence: surface::SurfaceBackgroundFence,
     task_id: surface::SurfaceTaskId,
     task_registry: TaskRegistry,
+    external_tools: Vec<orca_core::external_config::ExternalToolConfig>,
     outcome: Arc<Mutex<Option<TypedProviderBackgroundOutcome>>>,
 }
 
@@ -21553,6 +21554,7 @@ impl ThreadActor {
                 fence: pending.background_fence.clone(),
                 task_id: pending.surface_task_id,
                 task_registry: pending.task_registry.clone(),
+                external_tools: pending.active.config.external_tools.clone(),
                 outcome: Arc::new(Mutex::new(None)),
             }),
         )
@@ -23936,6 +23938,8 @@ mod tests {
     use std::time::Instant;
 
     use crate::model_response::RuntimeModelResponse;
+
+    include!("runtime_actor_turn_config_tests.rs");
 
     const TERMINAL_FAILURE_CHILD_ENV: &str = "ORCA_RUNTIME_HOST_TERMINAL_FAILURE_CHILD";
     const PREPARED_TERMINAL_CHILD_ENV: &str = "ORCA_RUNTIME_HOST_PREPARED_TERMINAL_CHILD";

@@ -2049,7 +2049,7 @@ impl ThreadActor {
                 &response,
                 &orca_tools::registry::tool_registry_with_mcp_and_external(
                     Some(&self.handle.mcp_registry),
-                    &self.config.external_tools,
+                    &active.config.external_tools,
                 ),
             )?;
         if events.is_empty() {
