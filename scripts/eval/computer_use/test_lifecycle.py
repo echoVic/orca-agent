@@ -59,8 +59,9 @@ class PreflightTests(unittest.TestCase):
 
     def test_cleanup_records_quit_races_and_fails_on_a_closed_visible_original(self):
         native = object.__new__(Native)
+        toast = {'id': 3, 'pid': 1, 'layer': 0, 'on_screen': True, 'bounds': {'Width': 138, 'Height': 22}}
         before = {'apps': [{'pid': 1, 'bundle': 'com.example.user'}],
-                  'windows': [{'id': 1, 'pid': 1, 'layer': 0, 'on_screen': True}]}
+                  'windows': [{'id': 1, 'pid': 1, 'layer': 0, 'on_screen': True, 'bounds': {'Width': 800, 'Height': 600}}, toast]}
         running = {'apps': before['apps'] + [{'pid': 42, 'bundle': 'com.apple.TextEdit'}], 'windows': before['windows']}
         states = [running, running]
         def call(op, *args):
@@ -71,6 +72,7 @@ class PreflightTests(unittest.TestCase):
             result = native.cleanup({'allowed_apps': ['com.apple.TextEdit']}, before, settle_seconds=0)
         self.assertEqual(result['actions'], [{'pid': 42, 'error': 'Native quit: Task application is not running'}])
         self.assertEqual(result['remaining_launched_apps'], [])
+        # The user's real window counts; their toast vanishing on its own does not.
         self.assertEqual(result['missing_original_window_ids'], [1])
         self.assertFalse(result['ok'])
 

@@ -128,9 +128,11 @@ class Native:
                 break
             close(final)  # Windows the task opened late, e.g. while quitting.
             time.sleep(.25)
-        # Only visible originals count: background apps recreate helper windows on their own.
+        # Only visible document-sized originals count: background apps recreate helper
+        # windows, and toasts or status bubbles (22 pt tall) vanish on their own.
         regular_pids = {a['pid'] for a in before['apps']}
-        original_regular = {w['id'] for w in before['windows'] if w['layer'] == 0 and w.get('on_screen') and w['pid'] in regular_pids}
+        original_regular = {w['id'] for w in before['windows'] if w['layer'] == 0 and w.get('on_screen') and w['pid'] in regular_pids
+                            and w.get('bounds', {}).get('Width', 0) >= 120 and w.get('bounds', {}).get('Height', 0) >= 60}
         missing = sorted(original_regular - {w['id'] for w in final['windows']})
         return {'actions': actions, 'remaining_owned_windows': remaining,
                 'transient_windows': sorted(transient),
