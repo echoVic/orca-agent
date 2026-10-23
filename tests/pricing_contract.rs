@@ -49,10 +49,45 @@ fn at_either_tier(cost: f64, off_peak: f64) {
 }
 
 #[test]
+fn offline_pricing_contract_accepts_case_and_whitespace_but_requires_a_value() {
+    for (value, accepted) in [
+        (Some("off"), true),
+        (Some(" OFF "), true),
+        (Some("\tOfF\n"), true),
+        (None, false),
+        (Some(""), false),
+        (Some("on"), false),
+    ] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "cargo_spawned_exec_inherits_offline_pricing_without_writing_a_cache",
+        ]);
+        if let Some(value) = value {
+            command.env("ORCA_PRICING_URL", value);
+        } else {
+            command.env_remove("ORCA_PRICING_URL");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            accepted,
+            "ORCA_PRICING_URL={value:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+#[test]
 fn cargo_spawned_exec_inherits_offline_pricing_without_writing_a_cache() {
     // Assert before spawning: a missing Cargo default must fail without ever
     // permitting a release binary to fall back to models.dev.
-    assert_eq!(std::env::var("ORCA_PRICING_URL").as_deref(), Ok("off"));
+    assert!(
+        std::env::var("ORCA_PRICING_URL")
+            .is_ok_and(|value| value.trim().eq_ignore_ascii_case("off")),
+        "ORCA_PRICING_URL must be set to off for offline pricing tests"
+    );
     let home = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env("ORCA_HOME", home.path())
