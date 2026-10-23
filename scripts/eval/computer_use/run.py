@@ -38,6 +38,19 @@ def select_tasks(tasks, selection):
     return [t for t in tasks if t['id'] in ids]
 
 
+def settled_browser_window(native, before, app, claimed, timeout=3.0):
+    """Prove the claimed window once transient popups (Chrome's omnibox list) have closed."""
+    deadline = time.monotonic() + timeout
+    while True:
+        after = native.call('state')
+        try:
+            return browser_window(before, after, app, claimed), after
+        except RuntimeError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(.25)
+
+
 def interrupted(signum, frame):
     raise InterruptedError(f'Interrupted by signal {signum}')
 
@@ -94,8 +107,7 @@ def run_task(task, args, base, out, tmux, services, native):
                 dump(evidence / 'browser-restored-state.json', launched)
             browser_before = native.call('state')
             created = native.call('new-browser', app)
-            browser_after = native.call('state')
-            wid = browser_window(browser_before, browser_after, app, created['window_id'])
+            wid, browser_after = settled_browser_window(native, browser_before, app, created['window_id'])
             dump(evidence / 'browser-window.json', {'window': wid, 'before': browser_before, 'after': browser_after})
         tui.start()
         def health():

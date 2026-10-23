@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from preflight import check_state, overlays, Native, restoration_check, browser_window
 from tui import bind_session, pending_approvals
-from run import run_task, retry_task_cleanup
+from run import run_task, retry_task_cleanup, settled_browser_window
 from types import SimpleNamespace
 from services import FormHandler
 from http.server import ThreadingHTTPServer
@@ -74,6 +74,19 @@ class PreflightTests(unittest.TestCase):
         after['frontmost'] = 'com.example.terminal'
         with self.assertRaises(RuntimeError):
             browser_window(before, after, 'com.apple.Safari', 2)
+
+    def test_browser_setup_waits_for_transient_popups_to_close(self):
+        before = {'windows': [{'id': 1}]}
+        base = {'frontmost': 'com.google.Chrome', 'apps': [{'bundle': 'com.google.Chrome', 'pid': 5}]}
+        task = {'id': 2, 'pid': 5, 'layer': 0, 'on_screen': True}
+        popup = {'id': 3, 'pid': 5, 'layer': 0, 'on_screen': True}
+        states = [{**base, 'windows': [task]}, {**base, 'windows': [task, popup]}]
+        native = SimpleNamespace(call=lambda op: states.pop())
+        with patch('run.time.sleep'):
+            self.assertEqual(settled_browser_window(native, before, 'com.google.Chrome', 2)[0], 2)
+        native = SimpleNamespace(call=lambda op: {**base, 'windows': [task, popup]})
+        with self.assertRaises(RuntimeError):
+            settled_browser_window(native, before, 'com.google.Chrome', 2, timeout=0)
 
     def test_restore_checks_actual_pid_and_pointer_tolerance(self):
         initial = {'front_pid': 1, 'pointer': [100.5, 200.5]}
