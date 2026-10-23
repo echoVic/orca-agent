@@ -150,6 +150,13 @@ class VerifierTests(unittest.TestCase):
         typed['target'] = 'com.apple.TextEdit'; typed['arguments']['window'] = 999
         self.assertFalse(gui_coverage(task, {'calls': [typed, key]}, d))
 
+    def test_calculator_requires_input_not_a_restored_display(self):
+        task = {'id': 'S1', 'allowed_apps': ['com.apple.calculator']}
+        observe = {'name': 'computer', 'target': 'com.apple.calculator', 'status': 'completed', 'arguments': {'action': 'observe', 'window': 10}}
+        click = {'name': 'computer', 'target': 'com.apple.calculator', 'status': 'completed', 'arguments': {'action': 'click', 'window': 10}}
+        self.assertFalse(gui_coverage(task, {'calls': [observe]}, {'windows': [10]}))
+        self.assertTrue(gui_coverage(task, {'calls': [observe, click]}, {'windows': [10]}))
+
     def test_file_verifiers_reject_false_claims(self):
         self.assertFalse(evaluate('todo', {'todo': 'done'})['passed'])
         self.assertTrue(evaluate('todo', {'todo': 'one\ntwo\nthree\n'})['passed'])

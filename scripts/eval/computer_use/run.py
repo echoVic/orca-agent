@@ -70,6 +70,12 @@ def retry_task_cleanup(task, before, evidence, native, pid):
 def run_task(task, args, base, out, tmux, services, native):
     evidence = out / 'evidence' / task['id']; evidence.mkdir(parents=True)
     reset_outputs(base, evidence / 'previous-outputs')
+    if not args.dry_run and 'com.apple.calculator' in task['allowed_apps']:
+        try:
+            dump(evidence / 'calculator-reset.json', native.call('calculator-reset'))
+        except RuntimeError as error:
+            # The verifier still demands real input, so a failed reset cannot pass a task.
+            dump(evidence / 'calculator-reset.json', {'error': str(error)})
     before = native.preflight(live=not args.dry_run)
     dump(evidence / 'preflight.json', before)
     dump(evidence / 'service-health.json', services.health())

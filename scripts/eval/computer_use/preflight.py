@@ -51,7 +51,7 @@ class Native:
     def call(self, *args):
         r = subprocess.run([str(self.binary), *map(str, args)], capture_output=True, text=True, timeout=20)
         if r.returncode:
-            raise RuntimeError(f'Native {args[0]} failed: {r.stderr.strip()}')
+            raise RuntimeError(f'Native {args[0]} failed: {(r.stdout + r.stderr).strip()}')
         data = json.loads(r.stdout)
         if isinstance(data, dict) and data.get('error'):
             raise RuntimeError(f'Native {args[0]}: {data["error"]}')
@@ -82,7 +82,7 @@ class Native:
         proof = restoration_check(json.loads(snapshot.read_text()), actual)
         return {**proof, 'state': actual}
 
-    def cleanup(self, task, before, settle_seconds=5.0):
+    def cleanup(self, task, before, settle_seconds=10.0):
         old_ids = {w['id'] for w in before['windows']}
         initial_pids = {a['pid'] for a in before['apps']}
         allowed = set(task['allowed_apps'])

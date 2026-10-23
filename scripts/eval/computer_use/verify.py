@@ -114,6 +114,9 @@ def gui_coverage(task, metrics, data):
                 'M3': {'type'}, 'M6': {'click'}, 'M7': {'type'}}.get(task['id'], {'observe'})
     if not required <= actions:
         return False
+    # Calculator restores its last display; reading a stale result is not a computation.
+    if task['id'] in ('S1', 'M4') and not actions & {'click', 'type', 'key'}:
+        return False
     if task['id'] in ('M1', 'M7'):
         text = data.get('todo' if task['id'] == 'M1' else 'draft', '')
         if not text or not any(text.strip() == s.strip() for s in ax_values(data.get('ax', []))):
