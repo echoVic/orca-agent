@@ -276,9 +276,14 @@ fn tool_target(name: &ToolName, arguments: &Value) -> Option<String> {
                 .map_or_else(|| uri.to_string(), |server| format!("{server}:{uri}"))
         }),
         ToolName::ReadSkill => arguments["id"].as_str().map(String::from),
-        ToolName::Workflow => ["name", "scriptPath", "draftId"]
+        ToolName::Workflow => ["scriptPath", "name", "draftId"]
             .into_iter()
-            .find_map(|key| arguments[key].as_str().map(String::from)),
+            .find_map(|key| {
+                arguments[key]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(String::from)
+            }),
         ToolName::Mcp(name) | ToolName::External(name) => Some(name.clone()),
         _ => None,
     }
@@ -314,6 +319,21 @@ mod tests {
             (
                 ToolName::Workflow,
                 serde_json::json!({"name":"audit","scriptPath":"./audit.ts","draftId":"draft-1"}),
+                Some("./audit.ts"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"name":"audit","draftId":"draft-1"}),
+                Some("audit"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"scriptPath":"", "name":"audit"}),
+                Some("audit"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"scriptPath":" \t", "name":"audit"}),
                 Some("audit"),
             ),
             (
