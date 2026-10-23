@@ -22,7 +22,7 @@ pub(crate) mod visibility;
 pub(crate) struct ComputerUseService {
     launcher: Arc<dyn DriverLauncher>,
     state: Arc<Mutex<ServiceState>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     host_supported: bool,
 }
 
@@ -98,19 +98,19 @@ impl ComputerUseService {
         Self {
             launcher,
             state: Arc::new(Mutex::new(ServiceState::default())),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-utils"))]
             host_supported: orca_computer_use::apps::host_supported(),
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn new_for_test(launcher: Arc<dyn DriverLauncher>) -> Self {
         let mut service = Self::new(launcher);
         service.host_supported = true;
         service
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn test_host_supported(&self) -> bool {
         self.host_supported
     }

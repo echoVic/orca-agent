@@ -5302,9 +5302,36 @@ fn interaction_request_matches_snapshot(
         SurfaceInteractionRequest::ToolApproval {
             tool, authority, ..
         } => {
-            interaction_tool_matches(snapshot, &interaction.fence, tool)
-                && interaction_authority_matches(snapshot, &interaction.fence, authority)
+            if !interaction_authority_matches(snapshot, &interaction.fence, authority) {
+                return false;
+            }
+            if interaction_tool_matches(snapshot, &interaction.fence, tool)
                 && interaction_tool_authority_matches(tool, authority)
+            {
+                return true;
+            }
+            // A resolved computer target is presentation, not a replacement
+            // provider identity. Only the private, validated checkpoint can
+            // bind that descriptor to the committed call and its authority.
+            let Ok(Some(capsule)) = interaction
+                .recovery_disposition
+                .restartable_tool_approval_capsule()
+            else {
+                return false;
+            };
+            let Some(super::interaction::DurableInteractionContinuationIntent::ToolInvocation(
+                intent,
+            )) = capsule.intent()
+            else {
+                return false;
+            };
+            capsule.interaction_id() == &interaction.interaction_id
+                && capsule.fence() == &interaction.fence
+                && capsule.request().to_surface_request() == interaction.request
+                && intent.authority() == authority
+                && intent.approval_tool().as_ref() == Ok(tool)
+                && interaction_tool_matches(snapshot, &interaction.fence, intent.request())
+                && interaction_tool_authority_matches(intent.request(), authority)
         }
         SurfaceInteractionRequest::PermissionRequest {
             tool_call_id,

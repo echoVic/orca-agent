@@ -917,6 +917,9 @@ fn runtime_tool_request_from_surface(
         crate::runtime_surface::SurfaceToolAction::Shell => {
             orca_core::approval_types::ActionKind::Shell
         }
+        crate::runtime_surface::SurfaceToolAction::Computer => {
+            orca_core::approval_types::ActionKind::Computer
+        }
     };
     Ok(tool_types::ToolRequest {
         id: request.tool_call_id.as_str().to_string(),

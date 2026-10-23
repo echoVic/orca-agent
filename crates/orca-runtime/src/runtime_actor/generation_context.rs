@@ -765,7 +765,11 @@ pub(crate) fn records_request_action_and_target(
 ) -> bool {
     let target = tool.target.as_ref().map(surface::DisplayText::as_str);
     (tool.action == surface_request_action(request)
-        || tool.action == surface_tool_action(request.action))
+        || tool.action == surface_tool_action(request.action)
+        // Computer calls were classified as Shell before a dedicated action
+        // existed. Retain that recorded identity when replaying old sessions.
+        || (request.name == orca_core::tool_types::ToolName::Computer
+            && tool.action == surface::SurfaceToolAction::Shell))
         && (target == surface_request_target(request).as_deref()
             || target == request.target.as_deref())
 }
@@ -1382,6 +1386,36 @@ mod tests {
             &committed(Shell, Some("notes.txt")),
             &request
         ));
+    }
+
+    #[test]
+    fn computer_replay_accepts_legacy_shell_action_but_not_a_different_target() {
+        let arguments = r#"{"action":"observe","app":"TextEdit"}"#;
+        let request = orca_core::tool_types::ToolRequest {
+            id: "computer-1".into(),
+            name: orca_core::tool_types::ToolName::Computer,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: Some(arguments.into()),
+        };
+        let recorded = surface::SurfaceToolRequest {
+            tool_call_id: surface::SurfaceToolCallId::try_new("computer-1").unwrap(),
+            source_response_id: None,
+            turn_id: surface::SurfaceTurnId::new(),
+            name: surface::NonEmptyText::try_new("computer").unwrap(),
+            action: surface::SurfaceToolAction::Shell,
+            target: None,
+            raw_arguments: surface::DisplayText::new(arguments),
+            arguments_digest: surface::Sha256Digest::digest(arguments),
+        };
+        let decoded: surface::SurfaceToolRequest =
+            serde_json::from_value(serde_json::to_value(&recorded).unwrap()).unwrap();
+        assert!(records_request_action_and_target(&decoded, &request));
+        let changed = surface::SurfaceToolRequest {
+            target: Some(surface::DisplayText::new("com.apple.calculator")),
+            ..decoded
+        };
+        assert!(!records_request_action_and_target(&changed, &request));
     }
 
     #[test]

@@ -546,6 +546,7 @@ pub enum SurfaceToolAction {
     Network,
     Agent,
     Shell,
+    Computer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -774,6 +775,28 @@ impl ToolInvocationIntent {
 
     pub(crate) fn computer_approval(&self) -> Option<&orca_core::approval_types::ApprovalRequest> {
         self.computer_approval.as_ref()
+    }
+
+    /// Approval presentation may name a resolved app/field; execution stays
+    /// bound to the immutable provider request and its authority fingerprint.
+    pub(crate) fn approval_tool(&self) -> Result<SurfaceToolRequest, &'static str> {
+        let mut tool = self.request.clone();
+        if let Some(approval) = &self.computer_approval {
+            if tool.name.as_str() != "computer"
+                || approval.tool.as_deref() != Some("computer")
+                || approval.action != orca_core::approval_types::ActionKind::Computer
+                || approval.id != format!("approval-{}", tool.tool_call_id.as_str())
+                || approval
+                    .target
+                    .as_ref()
+                    .is_none_or(|target| target.is_empty())
+            {
+                return Err("computer approval does not match its invocation");
+            }
+            tool.action = SurfaceToolAction::Computer;
+            tool.target = approval.target.clone().map(DisplayText::new);
+        }
+        Ok(tool)
     }
 
     pub fn invocation_id(&self) -> &SurfaceToolCallId {
@@ -1507,7 +1530,11 @@ impl DurableInteractionContinuationCapsule {
                         },
                     );
                 }
-                if intent.request != *tool || intent.authority != *authority {
+                // Exact equality also accepts checkpoints recorded before resolved
+                // computer approval descriptors were projected to the surface.
+                if (intent.request != *tool && intent.approval_tool().as_ref() != Ok(tool))
+                    || intent.authority != *authority
+                {
                     return Err(
                         DurableInteractionContinuationCapsuleError::RequestIntentMismatch {
                             kind: SurfaceInteractionKind::ToolApproval,
