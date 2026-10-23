@@ -20,14 +20,53 @@ class PreflightTests(unittest.TestCase):
         before = {'apps': [], 'windows': []}
         state = {'apps': [{'pid': 42, 'bundle': 'com.apple.TextEdit'}], 'windows': []}
         with patch.object(native, 'call', side_effect=lambda op, *args: state if op == 'state' else {'terminated': False}):
-            result = native.cleanup({'allowed_apps': ['com.apple.TextEdit']}, before)
+            result = native.cleanup({'allowed_apps': ['com.apple.TextEdit']}, before, settle_seconds=0)
         self.assertFalse(result['ok'])
         self.assertEqual(result['remaining_launched_apps'], [42])
+
+    def test_cleanup_tolerates_apps_that_quit_with_their_last_window(self):
+        native = object.__new__(Native)
+        user = [{'id': 1, 'pid': 1, 'layer': 0, 'on_screen': True}]
+        before = {'apps': [{'pid': 1, 'bundle': 'com.example.user'}],
+                  'windows': user + [{'id': 2, 'pid': 1, 'layer': 0, 'on_screen': False}]}
+        running = {'apps': before['apps'] + [{'pid': 42, 'bundle': 'com.apple.calculator'}],
+                   'windows': user + [{'id': 7, 'pid': 42, 'layer': 0, 'on_screen': True},
+                                      {'id': 8, 'pid': 42, 'layer': 0, 'on_screen': False}]}
+        # Closing window 7 quits Calculator; the user's helper window 2 also went away on its own.
+        states, calls = [running], []
+        def call(op, *args):
+            calls.append((op, *args))
+            if op == 'state':
+                return states.pop() if states else {'apps': before['apps'], 'windows': user}
+            return {'window': int(args[1]), 'close_error': 0}
+        with patch.object(native, 'call', side_effect=call):
+            result = native.cleanup({'allowed_apps': ['com.apple.calculator']}, before, settle_seconds=0)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual([c for c in calls if c[0] != 'state'], [('close', 'com.apple.calculator', '7', 'keep')])
+
+    def test_cleanup_records_quit_races_and_fails_on_a_closed_visible_original(self):
+        native = object.__new__(Native)
+        before = {'apps': [{'pid': 1, 'bundle': 'com.example.user'}],
+                  'windows': [{'id': 1, 'pid': 1, 'layer': 0, 'on_screen': True}]}
+        running = {'apps': before['apps'] + [{'pid': 42, 'bundle': 'com.apple.TextEdit'}], 'windows': before['windows']}
+        states = [running, running]
+        def call(op, *args):
+            if op == 'state':
+                return states.pop() if states else {'apps': before['apps'], 'windows': []}
+            raise RuntimeError('Native quit: Task application is not running')
+        with patch.object(native, 'call', side_effect=call):
+            result = native.cleanup({'allowed_apps': ['com.apple.TextEdit']}, before, settle_seconds=0)
+        self.assertEqual(result['actions'], [{'pid': 42, 'error': 'Native quit: Task application is not running'}])
+        self.assertEqual(result['remaining_launched_apps'], [])
+        self.assertEqual(result['missing_original_window_ids'], [1])
+        self.assertFalse(result['ok'])
 
     def test_browser_setup_requires_new_owned_window(self):
         before = {'windows': [{'id': 1}]}
         after = {'frontmost': 'com.apple.Safari', 'apps': [{'bundle': 'com.apple.Safari', 'pid': 5}],
-                 'windows': [{'id': 1, 'pid': 5, 'layer': 0}, {'id': 2, 'pid': 5, 'layer': 0}]}
+                 'windows': [{'id': 1, 'pid': 5, 'layer': 0, 'on_screen': True}, {'id': 2, 'pid': 5, 'layer': 0, 'on_screen': True},
+                             {'id': 4, 'pid': 5, 'layer': 0, 'on_screen': False}]}
+        # A new off-screen helper window does not make the visible task window ambiguous.
         self.assertEqual(browser_window(before, after, 'com.apple.Safari', 2), 2)
         for claimed in (1, 3):
             with self.assertRaises(RuntimeError):

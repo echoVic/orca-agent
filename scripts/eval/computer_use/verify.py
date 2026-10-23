@@ -3,18 +3,24 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import unicodedata
 from urllib.parse import parse_qs
 
 from fixtures import HEADING, BUTTON, DRAFT
 
 
+def visible(text):
+    """Drop format characters such as the LRM marks Calculator wraps around values."""
+    return ''.join(ch for ch in text if unicodedata.category(ch) != 'Cf')
+
+
 def ax_values(ax):
     if isinstance(ax, str):
-        return [ax]
+        return [visible(ax)]
     if isinstance(ax, list):
         return [v for item in ax for v in ax_values(item)]
     if isinstance(ax, dict):
-        return [str(v) for k, v in ax.items() if k in ('AXTitle', 'AXValue', 'AXDescription')] + ax_values(ax.get('elements', []))
+        return [visible(str(v)) for k, v in ax.items() if k in ('AXTitle', 'AXValue', 'AXDescription')] + ax_values(ax.get('elements', []))
     return []
 
 
@@ -80,7 +86,7 @@ def evaluate(name, data):
 
 
 def answer_matches(name, data):
-    answer = data['answer']
+    answer = visible(data['answer'])
     expected = {'heading': HEADING, 'button': BUTTON, 'last_file': 'file-120.txt', 'chip': data.get('chip', ''), 'form': 'Thanks, Orca'}
     if name in expected:
         return bool(expected[name]) and expected[name] in answer
@@ -133,7 +139,8 @@ def collect(task, native, base, before, evidence, metrics):
     state = native.call('state')
     original = {w['id'] for w in before['windows']}
     pids = {a['pid'] for a in state['apps'] if a['bundle'] == app}
-    windows = [w for w in state['windows'] if w['pid'] in pids and w['layer'] == 0
+    # Off-screen layer-0 windows are helpers without an AX window to read.
+    windows = [w for w in state['windows'] if w['pid'] in pids and w['layer'] == 0 and w.get('on_screen')
                and (w['id'] not in original or task['id'] in ('S4', 'S7', 'M5', 'S1', 'M4'))]
     data = {'ax': [], 'windows': [w['id'] for w in windows], 'actions': metrics['actions'], 'answer': metrics['final_answer']}
     for w in windows:

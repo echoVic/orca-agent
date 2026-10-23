@@ -32,7 +32,9 @@ def restoration_check(initial, actual):
 def browser_window(before, after, app, claimed):
     old = {w['id'] for w in before['windows']}
     pids = {a['pid'] for a in after['apps'] if a['bundle'] == app}
-    owned = [w['id'] for w in after['windows'] if w['id'] not in old and w['pid'] in pids and w['layer'] == 0]
+    # Every app owns off-screen layer-0 helper windows; only a visible one is the task window.
+    owned = [w['id'] for w in after['windows'] if w['id'] not in old and w['pid'] in pids
+             and w['layer'] == 0 and w.get('on_screen')]
     if after['frontmost'] != app or owned != [claimed]:
         raise RuntimeError('Browser setup did not prove a single new task window; refusing prompt submission')
     return claimed
@@ -80,27 +82,45 @@ class Native:
         proof = restoration_check(json.loads(snapshot.read_text()), actual)
         return {**proof, 'state': actual}
 
-    def cleanup(self, task, before):
-        state = self.call('state')
+    def cleanup(self, task, before, settle_seconds=5.0):
         old_ids = {w['id'] for w in before['windows']}
         initial_pids = {a['pid'] for a in before['apps']}
-        apps = {a['pid']: a['bundle'] for a in state['apps']}
+        allowed = set(task['allowed_apps'])
+
+        def owned(state):
+            # Off-screen layer-0 windows are app helpers with no AX window to close.
+            apps = {a['pid']: a['bundle'] for a in state['apps']}
+            return [(apps[w['pid']], w['id']) for w in state['windows'] if apps.get(w['pid']) in allowed
+                    and w['layer'] == 0 and w.get('on_screen') and w['id'] not in old_ids]
+
+        def launched(state):
+            return [a for a in state['apps'] if a['bundle'] in allowed and a['pid'] not in initial_pids]
+
         actions = []
-        for w in state['windows']:
-            app = apps.get(w['pid'])
-            if app in task['allowed_apps'] and w['layer'] == 0 and w['id'] not in old_ids:
-                actions.append(self.call('close', app, str(w['id']), 'discard' if app == 'com.apple.TextEdit' else 'keep'))
-        for a in state['apps']:
-            if a['bundle'] in task['allowed_apps'] and a['pid'] not in initial_pids:
+        for app, wid in owned(self.call('state')):
+            try:
+                actions.append(self.call('close', app, str(wid), 'discard' if app == 'com.apple.TextEdit' else 'keep'))
+            except RuntimeError as error:
+                # Apps such as Calculator quit with their last window; the final state decides.
+                actions.append({'window': wid, 'error': str(error)})
+        time.sleep(min(.5, settle_seconds))
+        for a in launched(self.call('state')):
+            try:
                 actions.append(self.call('quit', a['bundle'], str(a['pid'])))
-        time.sleep(.2)
-        final = self.call('state')
-        remaining = [w['id'] for w in final['windows'] if w['id'] not in old_ids and w['layer'] == 0
-                     and any(a['pid'] == w['pid'] and a['bundle'] in task['allowed_apps'] for a in final['apps'])]
+            except RuntimeError as error:
+                actions.append({'pid': a['pid'], 'error': str(error)})
+        deadline = time.monotonic() + settle_seconds
+        while True:
+            final = self.call('state')
+            remaining = [wid for _, wid in owned(final)]
+            remaining_apps = [a['pid'] for a in launched(final)]
+            if not (remaining or remaining_apps) or time.monotonic() >= deadline:
+                break
+            time.sleep(.25)
+        # Only visible originals count: background apps recreate helper windows on their own.
         regular_pids = {a['pid'] for a in before['apps']}
-        original_regular = {w['id'] for w in before['windows'] if w['layer'] == 0 and w['pid'] in regular_pids}
+        original_regular = {w['id'] for w in before['windows'] if w['layer'] == 0 and w.get('on_screen') and w['pid'] in regular_pids}
         missing = sorted(original_regular - {w['id'] for w in final['windows']})
-        remaining_apps = [a['pid'] for a in final['apps'] if a['bundle'] in task['allowed_apps'] and a['pid'] not in initial_pids]
         return {'actions': actions, 'remaining_owned_windows': remaining,
                 'remaining_launched_apps': remaining_apps,
                 'missing_original_window_ids': missing, 'ok': not remaining and not missing and not remaining_apps}

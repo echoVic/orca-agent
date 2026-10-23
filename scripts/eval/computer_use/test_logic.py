@@ -166,6 +166,9 @@ class VerifierTests(unittest.TestCase):
     def test_values_are_read_from_ax_not_model_text(self):
         self.assertFalse(evaluate('calculator', {'answer': '7006652'})['passed'])
         self.assertTrue(evaluate('calculator', {'ax': [{'role': 'AXStaticText', 'AXValue': '7,006,652'}]})['passed'])
+        # Calculator wraps values in left-to-right marks.
+        marked = {'ax': [{'role': 'AXStaticText', 'AXValue': '\u200e7,006,652\u200e'}], 'answer': '结果：\u200e7,006,652'}
+        self.assertTrue(evaluate('calculator', marked)['passed'])
         self.assertFalse(evaluate('counter', {'counter': '<p>3</p>', 'ax': '0'})['passed'])
         self.assertTrue(evaluate('counter', {'counter': '<button>+</button>', 'ax': [{'role': 'AXStaticText', 'AXValue': '3'}]})['passed'])
 
