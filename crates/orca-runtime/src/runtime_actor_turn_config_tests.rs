@@ -56,13 +56,23 @@ fn turn_config_actor(cwd: &std::path::Path) -> ThreadActor {
 
 fn admit_turn_config_operation(actor: &mut ThreadActor, action: ActionKind) -> ActiveOperation {
     let attachment = fresh_surface_attachment(&actor.handle.surface());
+    let intent = surface_user_turn_intent(&attachment.baseline.snapshot, "override");
+    admit_turn_config_operation_with_attachment(actor, action, &attachment, intent)
+}
+
+fn admit_turn_config_operation_with_attachment(
+    actor: &mut ThreadActor,
+    action: ActionKind,
+    attachment: &surface::FreshSurfaceAttachment,
+    intent: surface::OperationRequestIntent,
+) -> ActiveOperation {
     let reserved = committed_surface_value(
         actor
             .reserve_surface_operation(
                 surface_request_id(),
-                surface_user_turn_intent(&attachment.baseline.snapshot, "override"),
+                intent,
                 attachment.client.attachment_id().clone(),
-                None,
+                attachment.client.connection_id().cloned(),
             )
             .unwrap(),
     );
@@ -134,6 +144,186 @@ async fn foreground_response_classifies_external_tools_with_turn_override() {
         assert_eq!(snapshot.tools.last().unwrap().request.action, expected);
         active.generation.join.await.unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_approval_validates_external_tools_with_turn_override() {
+    for (action, expected) in [
+        (ActionKind::Write, surface::SurfaceToolAction::Write),
+        (ActionKind::Shell, surface::SurfaceToolAction::Shell),
+    ] {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut actor = turn_config_actor(cwd.path());
+        let attachment = fresh_surface_goal_approval_attachment(&actor.handle.surface());
+        let _subscription = actor
+            .handle
+            .surface()
+            .claim_subscription(&attachment.subscription)
+            .unwrap();
+        let intent = surface_user_turn_intent(&attachment.baseline.snapshot, "approve override");
+        let mut active =
+            admit_turn_config_operation_with_attachment(&mut actor, action, &attachment, intent);
+        let response = turn_config_response(&active);
+        let fence = active.surface_operation.clone().unwrap();
+        let response = actor
+            .commit_surface_provider_response(&mut active, fence.clone(), &response)
+            .unwrap();
+        let ProviderStep::ToolCall(request) = &response.response.steps[0] else {
+            panic!("expected provider tool call");
+        };
+        let (reply, resolution) = mpsc::sync_channel(1);
+        actor.request_surface_tool_approval(
+            &mut active,
+            fence,
+            orca_core::approval_types::ApprovalRequest {
+                id: "turn-tool-approval".into(),
+                action,
+                description: "Approve turn-only external tool".into(),
+                tool: Some("turn_tool".into()),
+                target: None,
+                preview: None,
+            },
+            request.clone(),
+            reply,
+        );
+        match resolution.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            result => panic!("approval should wait for an answer, got {result:?}"),
+        }
+        let interaction = actor
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .interactions
+            .last()
+            .expect("turn-only tool approval was requested")
+            .clone();
+        let surface::SurfaceInteractionRequest::ToolApproval { tool, .. } = &interaction.request
+        else {
+            panic!("expected tool approval");
+        };
+        assert_eq!(tool.action, expected);
+        committed_surface_value(
+            actor
+                .respond_surface_interaction_by_id(
+                    &attachment.client,
+                    surface_request_id(),
+                    interaction.interaction_id,
+                    surface::SurfaceClientInteractionAnswer::ToolApproval {
+                        decision: surface::SurfaceAllowDeny::Allow,
+                    },
+                )
+                .unwrap(),
+        );
+        let resolution = resolution.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap().unwrap();
+        assert_eq!(resolution.id, "turn-tool-approval");
+        assert_eq!(
+            resolution.decision,
+            orca_core::approval_types::ApprovalDecision::Allow
+        );
+        active.generation.join.await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn acp_read_validates_external_tools_with_turn_override() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut actor = turn_config_actor(cwd.path());
+    let surface = actor
+        .handle
+        .acp_surface_for_connection(
+            surface::SurfaceConnectionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+        )
+        .unwrap();
+    let attachment = match surface.attach_acp_fresh(
+        surface::FreshAttachRequest {
+            request_id: surface_request_id(),
+            role: surface::SurfaceAttachmentRole::Acp,
+            requested_capabilities: BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+            ]),
+            interaction_capabilities: BTreeSet::new(),
+        },
+        surface::AcpAttachmentCapabilityProfile {
+            revision: surface::CapabilityRevision::try_new(1).unwrap(),
+            standard: surface::AcpStandardCapabilitySet {
+                file_read: true,
+                ..surface::AcpStandardCapabilitySet::default()
+            },
+        },
+    ) {
+        surface::AttachResult::FreshAttached { attachment } => attachment,
+        _ => panic!("attach ACP read client"),
+    };
+    let _subscription = surface.claim_subscription(&attachment.subscription).unwrap();
+    let dispatches = surface
+        .claim_acp_read_text_file_dispatch(&attachment.client)
+        .unwrap();
+    let intent = surface_acp_turn_intent(&attachment.baseline.snapshot, "turn-config", "read");
+    let mut active = admit_turn_config_operation_with_attachment(
+        &mut actor,
+        ActionKind::Shell,
+        &attachment,
+        intent,
+    );
+    let response = turn_config_response(&active);
+    let fence = active.surface_operation.clone().unwrap();
+    let response = actor
+        .commit_surface_provider_response(&mut active, fence.clone(), &response)
+        .unwrap();
+    let ProviderStep::ToolCall(request) = &response.response.steps[0] else {
+        panic!("expected provider tool call");
+    };
+    let path = fs::canonicalize(cwd.path()).unwrap().join("turn-tool.txt");
+    let (reply, result) = mpsc::sync_channel(1);
+    actor.request_surface_acp_read_text_file(
+        &mut active,
+        fence,
+        request.clone(),
+        path.clone(),
+        None,
+        None,
+        reply,
+    );
+    match result.try_recv() {
+        Err(mpsc::TryRecvError::Empty) => {}
+        result => panic!("ACP read should wait for client content, got {result:?}"),
+    }
+    let dispatch = dispatches.try_recv().expect("turn-only tool dispatches ACP read");
+    assert_eq!(dispatch.path.as_path(), path);
+    assert_eq!(dispatch.acp_session_id.as_str(), "turn-config");
+    actor
+        .claim_surface_acp_read_text_file_write(
+            &attachment.client,
+            dispatch.call_id.clone(),
+            dispatch.capability_revision,
+        )
+        .unwrap();
+    actor
+        .mark_surface_acp_read_text_file_written(
+            &attachment.client,
+            dispatch.call_id.clone(),
+            dispatch.capability_revision,
+        )
+        .unwrap();
+    actor
+        .settle_surface_acp_read_text_file(
+            &attachment.client,
+            dispatch.call_id,
+            dispatch.capability_revision,
+            surface::AcpReadTextFileSettlement::Completed {
+                content: "turn-only tool content".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        result.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap().unwrap(),
+        "turn-only tool content"
+    );
+    active.generation.join.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

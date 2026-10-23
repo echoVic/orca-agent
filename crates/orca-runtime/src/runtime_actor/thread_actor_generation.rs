@@ -3336,6 +3336,7 @@ impl ThreadActor {
         snapshot: &surface::SurfaceSnapshot,
         fence: &surface::SurfaceOperationFence,
         request: &orca_core::tool_types::ToolRequest,
+        external_tools: &[orca_core::external_config::ExternalToolConfig],
     ) -> io::Result<surface::SurfaceToolRequest> {
         let tool_call_id = surface::SurfaceToolCallId::try_new(request.id.clone())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool call id"))?;
@@ -3366,7 +3367,7 @@ impl ThreadActor {
                 request,
                 &orca_tools::registry::tool_registry_with_mcp_and_external(
                     Some(&self.handle.mcp_registry),
-                    &self.config.external_tools,
+                    external_tools,
                 ),
             )
             || tool.raw_arguments.as_str() != raw_arguments
@@ -3690,7 +3691,12 @@ impl ThreadActor {
                 ));
             }
             let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-            let tool = self.surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
+            let tool = self.surface_tool_for_runtime_request(
+                &snapshot,
+                &fence,
+                &request,
+                &active.config.external_tools,
+            )?;
             let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation missing"))?;
             let surface::OperationOrigin::AcpPrompt { session_id, .. } = &operation.intent.origin
@@ -4002,7 +4008,12 @@ impl ThreadActor {
                 ));
             }
             let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-            let tool = self.surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
+            let tool = self.surface_tool_for_runtime_request(
+                &snapshot,
+                &fence,
+                &request,
+                &active.config.external_tools,
+            )?;
             let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation missing"))?;
             let surface::OperationOrigin::AcpPrompt { session_id, .. } = &operation.intent.origin
@@ -4300,7 +4311,12 @@ impl ThreadActor {
                 ));
             }
             let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-            let tool = self.surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
+            let tool = self.surface_tool_for_runtime_request(
+                &snapshot,
+                &fence,
+                &request,
+                &active.config.external_tools,
+            )?;
             let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation missing"))?;
             let surface::OperationOrigin::AcpPrompt { session_id, .. } = &operation.intent.origin
@@ -4622,7 +4638,12 @@ impl ThreadActor {
                     io::Error::new(io::ErrorKind::InvalidInput, "invalid ACP terminal identity")
                 })?;
             let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-            let tool = self.surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
+            let tool = self.surface_tool_for_runtime_request(
+                &snapshot,
+                &fence,
+                &request,
+                &active.config.external_tools,
+            )?;
             let has_live_lease = snapshot
                 .tools
                 .iter()
@@ -5077,7 +5098,12 @@ impl ThreadActor {
                     )
                 })?;
             let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-            let tool = self.surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
+            let tool = self.surface_tool_for_runtime_request(
+                &snapshot,
+                &fence,
+                &request,
+                &active.config.external_tools,
+            )?;
             let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation missing"))?;
             let surface::OperationOrigin::AcpPrompt { session_id, .. } = &operation.intent.origin
