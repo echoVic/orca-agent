@@ -405,9 +405,11 @@ mod tests {
             prompt.chars().count() + serde_json::to_string(&tools).unwrap().chars().count();
         // The measured #143 prefix was 32.9k chars. Leave room for request
         // framing while protecting a further 15% reduction in total size.
+        // Windows adds its native-shell guidance and a longer temp path.
+        let limit = if cfg!(windows) { 28_500 } else { 27_800 };
         assert!(
-            prefix <= 27_800,
-            "system + tool prefix is {prefix} chars (limit 27800)"
+            prefix <= limit,
+            "system + tool prefix is {prefix} chars (limit {limit})"
         );
     }
 

@@ -1017,7 +1017,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                 "properties": {
                     "script": {
                         "type": "string",
-                        "description": "Self-contained script stored without execution; launch with Workflow(draftId)."
+                        "description": "Self-contained script to preview without running; launch with Workflow(draftId)."
                     }
                 },
                 "required": ["script"]
