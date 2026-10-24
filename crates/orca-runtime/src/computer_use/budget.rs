@@ -26,10 +26,21 @@ impl FailureBudget {
     /// Remembers that a name resolved to a bundle ID, so either spelling
     /// shares one count and a stopped app is refused before resolving again.
     pub(crate) fn alias(&self, name: &str, bundle_id: &str) {
+        let (name, bundle_id) = (name.to_lowercase(), bundle_id.to_lowercase());
+        if name == bundle_id {
+            return;
+        }
+        // Failures counted under the name (validation failures before it
+        // resolved) belong to the app it now names.
+        let mut failures = self.failures.lock().expect("failure budget lock poisoned");
+        if let Some(count) = failures.remove(&name) {
+            *failures.entry(bundle_id.clone()).or_default() += count;
+        }
+        drop(failures);
         self.aliases
             .lock()
             .expect("failure budget lock poisoned")
-            .insert(name.to_lowercase(), bundle_id.to_lowercase());
+            .insert(name, bundle_id);
     }
 
     fn key(&self, app: &str) -> String {
@@ -131,6 +142,23 @@ mod tests {
             "Orca stopped computer use on com.apple.systempreferences for this turn after 6 failures in a row. Tell the user what failed and what you tried."
         );
         assert_eq!(budget.stopped("com.apple.systempreferences"), Some(stop));
+    }
+
+    #[test]
+    fn failures_under_a_name_carry_over_when_it_resolves() {
+        let budget = FailureBudget::default();
+        // Five calls that failed validation before the name ever resolved.
+        for _ in 0..5 {
+            budget.record("TextEdit", true);
+        }
+        budget.alias("TextEdit", "com.apple.TextEdit");
+        let stop = budget.record("com.apple.TextEdit", true);
+        assert!(
+            stop.as_deref().is_some_and(
+                |stop| stop.starts_with("Orca stopped computer use on com.apple.TextEdit")
+            ),
+            "{stop:?}"
+        );
     }
 
     #[test]

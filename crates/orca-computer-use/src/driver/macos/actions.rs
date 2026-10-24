@@ -560,6 +560,15 @@ impl MacDriver {
                         "The window was minimized again after the action; observe again.",
                     );
                 }
+                // The action was delivered: a failure here must not look like
+                // one, or the caller could send it again.
+                Err(failure) if failure.kind == ErrorKind::WindowNotFound => {
+                    let note = outcome.note.get_or_insert_with(String::new);
+                    if !note.is_empty() {
+                        note.push_str("; ");
+                    }
+                    note.push_str(crate::messages::WINDOW_UNUSABLE_AFTER_ACTION);
+                }
                 Err(failure) => return Err(failure),
             }
         }

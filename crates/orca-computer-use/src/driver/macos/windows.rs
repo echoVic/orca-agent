@@ -145,6 +145,37 @@ pub(super) fn choose_window(
     Ok((index, capture))
 }
 
+/// Reads each candidate's facts while the deadline lasts. `read` gets the
+/// seconds left and returns (frame, subrole, minimized). A candidate whose
+/// frame cannot be read is dropped with its entry, so the lists stay aligned;
+/// an unreadable subrole is absent and an unreadable minimized flag is false.
+pub(super) fn gather_facts<W>(
+    candidates: Vec<W>,
+    deadline: std::time::Instant,
+    mut read: impl FnMut(&W, f32) -> (Option<[f64; 4]>, Option<String>, Option<bool>),
+) -> (Vec<W>, Vec<AxWindowFacts>) {
+    let mut kept = Vec::with_capacity(candidates.len());
+    let mut facts = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let Some(left) = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|left| !left.is_zero())
+        else {
+            break;
+        };
+        let (frame, subrole, minimized) = read(&candidate, left.as_secs_f32());
+        if let Some(frame) = frame {
+            kept.push(candidate);
+            facts.push(AxWindowFacts {
+                frame,
+                subrole,
+                minimized: minimized.unwrap_or(false),
+            });
+        }
+    }
+    (kept, facts)
+}
+
 /// An app has a window when AX lists one or names a main window.
 pub(super) fn has_window(ax_windows: usize, main_window: bool) -> bool {
     ax_windows > 0 || main_window
@@ -317,6 +348,35 @@ mod tests {
         );
         let none = choose_window(None, 7, "App", &[], &[], None).unwrap_err();
         assert_eq!(none.message, crate::messages::no_window("App"));
+    }
+
+    #[test]
+    fn unreadable_windows_are_skipped_and_the_lists_stay_aligned() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (kept, facts) = gather_facts(vec![1, 2, 3], deadline, |window, _| match window {
+            // A helper whose frame cannot be read must not block the others.
+            2 => (None, Some("AXStandardWindow".into()), Some(false)),
+            // Unreadable subrole and minimized state read as absent and false.
+            _ => (Some([0.0, 0.0, 800.0, 600.0]), None, None),
+        });
+        assert_eq!(kept, vec![1, 3]);
+        assert_eq!(facts.len(), 2);
+        assert!(
+            facts
+                .iter()
+                .all(|facts| facts.subrole.is_none() && !facts.minimized)
+        );
+    }
+
+    #[test]
+    fn window_reads_stop_at_the_resolution_deadline() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+        let (kept, _) = gather_facts(vec![1, 2, 3, 4], deadline, |_, timeout| {
+            assert!(timeout > 0.0 && timeout <= 0.04);
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            (Some([0.0, 0.0, 800.0, 600.0]), None, Some(false))
+        });
+        assert_eq!(kept, vec![1, 2]);
     }
 
     #[test]

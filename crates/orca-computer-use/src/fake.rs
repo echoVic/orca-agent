@@ -34,6 +34,8 @@ pub struct FakeDesktop {
     pub turn_active: bool,
     pub last_observe: Option<ObserveParams>,
     pub launch_reply_override: Option<AppInfo>,
+    /// The observation after a delivered action finds the window unusable.
+    pub post_act_observe_fails: bool,
     apps: Vec<FakeApp>,
 }
 
@@ -111,6 +113,7 @@ impl FakeDesktop {
             turn_active: false,
             last_observe: None,
             launch_reply_override: None,
+            post_act_observe_fails: false,
             apps: vec![FakeApp {
                 info: AppInfo {
                     bundle_id: bundle_id.into(),
@@ -422,21 +425,38 @@ impl FakeDesktop {
         }
         app.actions += 1;
         let scroll_position = matches!(params.action, Action::Scroll { .. }).then_some(app.scroll);
+        let mut note = None;
         let observation = if params.observe_after {
-            Some(self.observe(&ObserveParams {
-                app: params.app,
-                window: params.window,
-                query: None,
-                max_elements: 300,
-                include_screenshot: params.include_screenshot,
-            })?)
+            let observed = if self.post_act_observe_fails {
+                Err(error(
+                    ErrorKind::WindowNotFound,
+                    crate::messages::not_usable_window(params.window.unwrap_or(0), &params.app),
+                ))
+            } else {
+                self.observe(&ObserveParams {
+                    app: params.app,
+                    window: params.window,
+                    query: None,
+                    max_elements: 300,
+                    include_screenshot: params.include_screenshot,
+                })
+            };
+            match observed {
+                Ok(observation) => Some(observation),
+                // As in the driver: the action happened, so report it, not a failure.
+                Err(failure) if failure.kind == ErrorKind::WindowNotFound => {
+                    note = Some(crate::messages::WINDOW_UNUSABLE_AFTER_ACTION.to_string());
+                    None
+                }
+                Err(failure) => return Err(failure),
+            }
         } else {
             None
         };
         Ok(Reply::Acted {
             outcome: ActOutcome {
                 foreground_used: self.background_fails,
-                note: None,
+                note,
                 scroll_position,
                 observation,
             },

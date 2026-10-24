@@ -3,6 +3,10 @@
 
 pub const NO_WINDOW_NEXT_STEP: &str = "For an app-level shortcut such as cmd+n, use key without window; to open a file or URL, use launch_app with open.";
 
+/// A note, not an error: the action already happened, so it must not be retried.
+pub const WINDOW_UNUSABLE_AFTER_ACTION: &str =
+    "The action was delivered, but its window is no longer usable; observe again.";
+
 pub fn not_usable_window(id: u32, app: &str) -> String {
     format!(
         "Window {id} is not a window of {app} that Orca can use. Call list_apps for its usable windows, or omit window to use the main window."

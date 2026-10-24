@@ -728,6 +728,56 @@ mod tests {
     }
 
     #[test]
+    fn a_delivered_action_is_not_repeated_when_its_window_is_unusable_afterwards() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let stores = RuntimeExtensionStores::new(&thread_store, &turn_store);
+        let observed = execute(
+            &observe_request("com.apple.TextEdit"),
+            &flash_config(),
+            0,
+            stores,
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            observed.status,
+            ToolStatus::Completed,
+            "{:?}",
+            observed.error
+        );
+        launcher.desktop(|desktop| desktop.post_act_observe_fails = true);
+        // The click inherits the observed window and lands; only the follow-up observation fails.
+        let clicked = execute(
+            &request(
+                json!({"action":"click", "app":"TextEdit", "target":{"element":1}}),
+                Some("com.apple.TextEdit"),
+            ),
+            &flash_config(),
+            0,
+            stores,
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            launcher.desktop(|desktop| desktop.actions_on("com.apple.TextEdit")),
+            1,
+            "the click must not be sent twice"
+        );
+        assert_eq!(clicked.status, ToolStatus::Completed, "{:?}", clicked.error);
+        assert!(
+            clicked
+                .output
+                .as_deref()
+                .unwrap()
+                .contains(orca_computer_use::messages::WINDOW_UNUSABLE_AFTER_ACTION),
+            "{:?}",
+            clicked.output
+        );
+    }
+
+    #[test]
     fn a_shortcut_after_the_last_window_closed_reaches_the_app() {
         let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
         let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));

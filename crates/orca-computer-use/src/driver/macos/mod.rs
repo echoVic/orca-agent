@@ -304,20 +304,26 @@ fn resolve_window<'a>(
     {
         candidates.push(main.clone());
     }
-    let mut facts = Vec::with_capacity(candidates.len());
-    for candidate in &candidates {
-        facts.push(windows::AxWindowFacts {
-            frame: candidate.position_size()?,
-            subrole: candidate.attribute_string("AXSubrole")?,
-            minimized: candidate.attribute_bool("AXMinimized")?.unwrap_or(false),
-        });
-    }
+    // One unreadable helper window must not block the app, and a hung app
+    // must not hold observe/act past this budget.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let (mut candidates, facts) = windows::gather_facts(candidates, deadline, |candidate, left| {
+        let _ = unsafe { candidate.0.set_messaging_timeout(left.min(2.0)) };
+        (
+            candidate.position_size().ok(),
+            candidate.attribute_string("AXSubrole").ok().flatten(),
+            candidate.attribute_bool("AXMinimized").ok().flatten(),
+        )
+    });
     let main_index = main
         .as_ref()
         .and_then(|main| candidates.iter().position(|candidate| candidate == main));
     let (ax_index, capture_index) =
         windows::choose_window(id, pid, app_name, windows, &facts, main_index)?;
-    Ok((candidates.swap_remove(ax_index), &windows[capture_index]))
+    let chosen = candidates.swap_remove(ax_index);
+    // The budget may have shortened this handle's timeout; observe/act need the usual one.
+    let _ = unsafe { chosen.0.set_messaging_timeout(2.0) };
+    Ok((chosen, &windows[capture_index]))
 }
 
 #[cfg(test)]
