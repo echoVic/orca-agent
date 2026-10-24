@@ -100,7 +100,8 @@ impl MacDriver {
             let _ = application.set_bool("AXManualAccessibility", true);
         }
         let windows = capture::windows()?;
-        let (ax_window, window) = resolve_window(&application, pid, &windows, params.window)?;
+        let (ax_window, window) =
+            resolve_window(&application, pid, &app.name, &windows, params.window)?;
         let window_frame = ax_window.position_size()?;
         if window_frame.iter().any(|v| !v.is_finite())
             || window_frame[2] <= 0.0
@@ -284,54 +285,83 @@ pub(super) fn frames_match(ax: [f64; 4], capture: [f64; 4]) -> bool {
 fn resolve_window<'a>(
     application: &AxElement,
     pid: i32,
+    app_name: &str,
     windows: &'a [capture::Window],
     id: Option<u32>,
 ) -> Result<(AxElement, &'a capture::Window), DriverError> {
     let ax_windows = application.elements("AXWindows")?;
-    let resolved = if let Some(id) = id {
+    if let Some(id) = id {
+        let not_usable = || {
+            error(
+                ErrorKind::WindowNotFound,
+                crate::messages::not_usable_window(id, app_name),
+            )
+        };
         let window = windows
             .iter()
             .find(|w| w.id == id && w.pid == pid)
-            .ok_or_else(|| error(ErrorKind::WindowNotFound, "Window not found for this app"))?;
-        let mut matching = None;
+            .ok_or_else(not_usable)?;
         for candidate in ax_windows {
             if frames_match(candidate.position_size()?, window.frame) {
-                matching = Some(candidate);
-                break;
+                return Ok((candidate, window));
             }
         }
-        (
-            matching.ok_or_else(|| {
-                error(
-                    ErrorKind::WindowNotFound,
-                    "No accessibility window matches the capture window",
-                )
-            })?,
-            window,
-        )
-    } else {
-        let window = application
-            .attribute_element("AXMainWindow")?
-            .or_else(|| ax_windows.into_iter().next())
-            .ok_or_else(|| {
-                error(
-                    ErrorKind::WindowNotFound,
-                    "The app has no accessibility window",
-                )
-            })?;
-        let frame = window.position_size()?;
+        return Err(not_usable());
+    }
+    let main = application.attribute_element("AXMainWindow")?;
+    if ax_windows.is_empty() && main.is_none() {
+        return Err(error(
+            ErrorKind::WindowNotFound,
+            crate::messages::no_window(app_name),
+        ));
+    }
+    let mut choices = Vec::with_capacity(ax_windows.len());
+    let mut captures = Vec::with_capacity(ax_windows.len());
+    for candidate in &ax_windows {
+        let frame = candidate.position_size()?;
         let capture = windows
             .iter()
-            .find(|w| w.pid == pid && frames_match(frame, w.frame))
-            .ok_or_else(|| {
-                error(
-                    ErrorKind::WindowNotFound,
-                    "No capture window matches the accessibility window",
+            .find(|w| w.pid == pid && frames_match(frame, w.frame));
+        let minimized = candidate.attribute_bool("AXMinimized")?.unwrap_or(false);
+        let subrole = candidate.attribute_string("AXSubrole")?;
+        choices.push(windows::WindowChoice {
+            is_main: main.as_ref() == Some(candidate),
+            usable: capture.is_some_and(|capture| {
+                windows::usable(
+                    capture.on_screen,
+                    capture.frame,
+                    subrole.as_deref(),
+                    minimized,
                 )
-            })?;
-        (window, capture)
-    };
-    Ok(resolved)
+            }),
+            minimized,
+        });
+        captures.push(capture);
+    }
+    if let Some(index) = windows::default_window(&choices) {
+        let capture = captures[index].expect("a usable window has a capture window");
+        return Ok((ax_windows[index].clone(), capture));
+    }
+    // No window passes the usable rule: keep the earlier behavior (main, else first).
+    let window = main
+        .or_else(|| ax_windows.into_iter().next())
+        .ok_or_else(|| {
+            error(
+                ErrorKind::WindowNotFound,
+                crate::messages::no_window(app_name),
+            )
+        })?;
+    let frame = window.position_size()?;
+    let capture = windows
+        .iter()
+        .find(|w| w.pid == pid && frames_match(frame, w.frame))
+        .ok_or_else(|| {
+            error(
+                ErrorKind::WindowNotFound,
+                "No capture window matches the accessibility window",
+            )
+        })?;
+    Ok((window, capture))
 }
 
 #[cfg(test)]

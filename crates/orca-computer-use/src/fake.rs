@@ -207,7 +207,7 @@ impl FakeDesktop {
         {
             return Err(error(
                 ErrorKind::WindowNotFound,
-                format!("Window not found: {window}"),
+                crate::messages::not_usable_window(window, &self.apps[index].info.name),
             ));
         }
         Ok(index)
@@ -215,6 +215,12 @@ impl FakeDesktop {
 
     fn observe(&self, params: &ObserveParams) -> Result<Observation, DriverError> {
         let app = &self.apps[self.running_app(&params.app, params.window)?];
+        if params.window.is_none() && app.info.windows.is_empty() {
+            return Err(error(
+                ErrorKind::WindowNotFound,
+                crate::messages::no_window(&app.info.name),
+            ));
+        }
         let mut elements = params.query.as_ref().map_or_else(
             || app.elements.clone(),
             |query| filter_elements(&app.elements, query),
@@ -542,6 +548,27 @@ impl DriverLauncher for FakeLauncher {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    #[test]
+    fn fake_window_errors_use_the_shared_messages() {
+        let mut desktop = FakeDesktop::with_textedit();
+        let observe = |window| ObserveParams {
+            app: "com.apple.TextEdit".into(),
+            window,
+            query: None,
+            max_elements: 10,
+            include_screenshot: false,
+        };
+        let error = desktop.observe(&observe(Some(999))).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::WindowNotFound);
+        assert_eq!(
+            error.message,
+            crate::messages::not_usable_window(999, "TextEdit")
+        );
+        desktop.apps[0].info.windows.clear();
+        let error = desktop.observe(&observe(None)).unwrap_err();
+        assert_eq!(error.message, crate::messages::no_window("TextEdit"));
+    }
 
     #[test]
     fn secure_fields_gate_text_keys_but_not_tab() {

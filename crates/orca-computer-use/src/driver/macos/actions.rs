@@ -287,16 +287,13 @@ impl MacDriver {
             .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
         let application = AxElement::application(pid)?;
         let windows = capture::windows()?;
-        let (ax_window, window) = resolve_window(&application, pid, &windows, params.window)
-            .map_err(|failure| {
-                if failure.kind == ErrorKind::WindowNotFound {
-                    stale()
-                } else {
-                    failure
-                }
-            })?;
+        let (ax_window, window) =
+            resolve_window(&application, pid, &app.name, &windows, params.window)?;
         let id = window.id;
-        let table = self.element_tables.get(&(pid, id)).ok_or_else(stale)?;
+        let table = self
+            .element_tables
+            .get(&(pid, id))
+            .ok_or_else(|| error(ErrorKind::Stale, crate::messages::not_observed(id)))?;
         let frame = ax_window.position_size()?;
         if !frame
             .into_iter()
