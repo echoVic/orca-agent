@@ -2507,14 +2507,15 @@ mod tests {
         };
         let mcp_registry = McpRegistry::default();
 
-        let setup = RuntimeTurnSetupStep::new().prepare(
-            &config,
-            &std::env::current_dir().expect("cwd"),
-            0,
-            &SubagentType::General,
-            AgentToolPolicyContext::unrestricted(),
-            &mcp_registry,
-        );
+        let setup = RuntimeTurnSetupStep::new(&crate::extension::ExtensionData::new("test"))
+            .prepare(
+                &config,
+                &std::env::current_dir().expect("cwd"),
+                0,
+                &SubagentType::General,
+                AgentToolPolicyContext::unrestricted(),
+                &mcp_registry,
+            );
 
         assert_eq!(setup.context_config.max_tokens, 128_000);
         assert_eq!(setup.context_config.effective_limit(), 96_000);

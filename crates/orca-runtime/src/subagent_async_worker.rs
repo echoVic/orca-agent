@@ -1149,7 +1149,7 @@ fn launch_admitted_async_subagent(
             request.frozen_agent = frozen;
         })
     } else {
-        subagent::freeze_agent_request(config, cwd, &mcp_registry, &mut request)
+        subagent::freeze_agent_request(None, config, cwd, &mcp_registry, &mut request)
     };
     if let Err(error) = freeze_result {
         let _ = task_registry.fail(&agent_id, error.clone());
@@ -2016,6 +2016,7 @@ mod tests {
             }).to_string()),
         });
         subagent::freeze_agent_request(
+            None,
             &config,
             cwd.path(),
             &orca_mcp::McpRegistry::default(),
@@ -2169,6 +2170,7 @@ mod tests {
             ),
         });
         subagent::freeze_agent_request(
+            None,
             &config,
             cwd,
             &orca_mcp::McpRegistry::default(),

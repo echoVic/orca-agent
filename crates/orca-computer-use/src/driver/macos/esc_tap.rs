@@ -299,7 +299,10 @@ mod tests {
             Err(e) => panic!("{e:?}"),
         };
         tap.trigger.send(()).unwrap();
-        let entered_write = writing.recv_timeout(Duration::from_secs(2)).is_ok();
+        // The first Foundation/native call after a rebuild can take seconds.
+        // This only establishes the positive control; stopping must still
+        // finish within the independent 300 ms bound below.
+        let entered_write = writing.recv_timeout(Duration::from_secs(15)).is_ok();
         let (stopped, stopping) = mpsc::channel();
         let worker = thread::spawn(move || {
             drop(tap);

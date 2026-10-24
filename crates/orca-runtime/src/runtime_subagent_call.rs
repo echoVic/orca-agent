@@ -59,6 +59,8 @@ use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 pub(crate) struct RuntimeSubagentInvocation {
     pub(crate) tool_request: ToolRequest,
     pub(crate) request: SubagentRequest,
+    pub(crate) agent_catalog:
+        Option<Arc<orca_core::subagent_types::agent_definition::AgentCatalog>>,
     pub(crate) config: RunConfig,
     pub(crate) cwd: PathBuf,
     pub(crate) instructions: ProjectInstructions,
@@ -245,6 +247,7 @@ impl RuntimeSubagentInvocation {
         Self {
             tool_request,
             request,
+            agent_catalog: None,
             config: config.clone(),
             cwd: cwd.to_path_buf(),
             instructions: instructions.clone(),
@@ -615,6 +618,7 @@ impl RuntimeSubagentBatch {
             };
         }
         if let Err(error) = crate::subagent::freeze_agent_request(
+            invocation.agent_catalog.clone(),
             &invocation.config,
             &invocation.cwd,
             &invocation.mcp_registry,
@@ -1621,6 +1625,7 @@ fn run_subagent_worker(
         task_registry,
         root_task_id,
         agent_controller: _,
+        agent_catalog: _,
         batch_id: _,
         batch_size: _,
         submitted_task_id,

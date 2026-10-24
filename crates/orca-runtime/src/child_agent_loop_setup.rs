@@ -145,35 +145,20 @@ fn build_child_agent_loop_setup(
     let mcp_registry =
         orca_mcp::initialize_registry(&config.mcp_servers, config.mcp_credentials_path.clone());
     mcp_registry.wait_for_startup(&|| false);
-    let mut provider_config = ProviderConfig {
-        api_key: config.api_key.clone(),
-        base_url: config.base_url.clone(),
-        model: Some(orca_core::model::FLASH_MODEL.to_string()),
-        reasoning_effort: config.reasoning_effort,
-        tools_override: crate::tool_invocation::provider_tool_schema_override(
-            request.depth,
-            &request.subagent_type,
-            crate::tool_invocation::AgentToolPolicyContext::new(
-                request.allowed_tools.as_deref(),
-                request.tool_policy_label.as_deref(),
-            ),
-            &mcp_registry,
-            &config.external_tools,
-        ),
-        mcp_registry: Some(mcp_registry.clone()),
-        external_tools: config.external_tools.clone(),
-        max_output_tokens: None,
-    };
-    if let Some(tools) = provider_config.tools_override.as_mut() {
-        crate::tool_invocation::omit_unavailable_session_tools(
-            tools,
-            config,
-            request.workflow_ipc.is_some(),
-        );
-        if !crate::workspace_git::is_git_work_tree(cwd) {
-            tools.retain(|tool| tool.name != "git_status");
-        }
-    }
+    let mut provider_config = crate::tool_invocation::provider_config_for_agent_loop(
+        config,
+        cwd,
+        request.depth,
+        &request.subagent_type,
+        crate::tool_invocation::AgentToolPolicyContext::new(
+            request.allowed_tools.as_deref(),
+            request.tool_policy_label.as_deref(),
+        )
+        .with_workflow_ipc(request.workflow_ipc.is_some()),
+        &mcp_registry,
+        &crate::extension::ExtensionData::new("child-session"),
+    );
+    provider_config.model = Some(orca_core::model::FLASH_MODEL.to_string());
 
     let budget_model = config.model.as_option();
     let context_config = ContextConfig::for_model_with_runtime(

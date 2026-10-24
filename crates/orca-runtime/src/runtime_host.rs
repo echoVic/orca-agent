@@ -5607,6 +5607,23 @@ fn prepare_and_start_runtime_thread(
         .map_err(|error| RuntimeHostError::ThreadStartFailed {
             message: error.to_string(),
         })?;
+    // Surface recovery runs on the host supervisor. Wait on this preparation
+    // worker only when a durable response needs the asynchronously loaded MCP
+    // catalog, so unrelated host commands stay responsive.
+    let tasks = thread.session().task_registry();
+    if tasks.list().iter().any(|task| {
+        tasks
+            .typed_provider_outcome(&task.id)
+            .and_then(|outcome| outcome.response)
+            .is_some_and(|response| {
+                response.response.steps.iter().any(|step| {
+                    matches!(step, orca_core::provider_types::ProviderStep::ToolCall(request)
+                    if matches!(request.name, orca_core::tool_types::ToolName::Mcp(_)))
+                })
+            })
+    }) {
+        thread.session().mcp_registry().wait_for_startup(&|| false);
+    }
     if let Some(replacement) = resume_scope_replacement {
         let owner = surface_owner
             .as_ref()
@@ -7853,10 +7870,12 @@ fn reconcile_durable_workflow_outcomes_on_start(
 
 fn reconcile_durable_provider_outcomes_on_start(
     thread: &RuntimeThread,
+    config: &RunConfig,
     coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
     host_incarnation: &surface::HostIncarnation,
 ) -> Result<(), RuntimeHostError> {
     let task_registry = thread.session().task_registry();
+    let registry = std::cell::OnceCell::new();
     loop {
         let snapshot = coordinator.state().snapshot().clone();
         let durable = snapshot.tasks.iter().find_map(|task| {
@@ -7908,6 +7927,12 @@ fn reconcile_durable_provider_outcomes_on_start(
         let Some((task, background_fence, operation, mut outcome)) = durable else {
             return Ok(());
         };
+        let registry = registry.get_or_init(|| {
+            orca_tools::registry::tool_registry_with_mcp_and_external(
+                Some(thread.session().mcp_registry()),
+                &config.external_tools,
+            )
+        });
         // Recorded before the completion named its tool calls: name them the
         // way the completion commits (or committed) them.
         if let Some(response) = outcome.response.as_mut() {
@@ -7959,13 +7984,17 @@ fn reconcile_durable_provider_outcomes_on_start(
                 .map_err(|_| RuntimeHostError::ThreadStartFailed {
                     message: "recovered background approval task revision is invalid".to_string(),
                 })?;
-            let mut suspension_events =
-                build_background_provider_response_events(&snapshot, &background_fence, response)
-                    .map_err(|error| RuntimeHostError::ThreadStartFailed {
-                    message: format!(
-                        "failed to rebuild recovered background approval response: {error}"
-                    ),
-                })?;
+            let mut suspension_events = build_background_provider_response_events(
+                &snapshot,
+                &background_fence,
+                response,
+                registry,
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!(
+                    "failed to rebuild recovered background approval response: {error}"
+                ),
+            })?;
             let tool = suspension_events
                 .iter()
                 .find_map(|(_, event)| match event {
@@ -8197,7 +8226,12 @@ fn reconcile_durable_provider_outcomes_on_start(
             .response
             .as_ref()
             .map(|response| {
-                build_background_provider_response_events(&snapshot, &background_fence, response)
+                build_background_provider_response_events(
+                    &snapshot,
+                    &background_fence,
+                    response,
+                    registry,
+                )
             })
             .transpose()
             .map_err(|error| RuntimeHostError::ThreadStartFailed {
@@ -10027,6 +10061,22 @@ fn cold_recovery_thread_config_fingerprint(
     surface::Sha256Digest::new(hasher.finalize().into())
 }
 
+/// New ToolApproval checkpoints also attest that recording verified the
+/// actor can restore the approved tool definition and that it is not MCP.
+/// Older approvals lack that proof (v2 admitted MCP and absent definitions)
+/// and must fail closed even with an unchanged app version
+/// and actor config. Keep this epoch separate from permission/continuation
+/// fingerprints so only old ToolApproval checkpoints become stale.
+fn cold_recovery_tool_approval_config_fingerprint(
+    config: &RunConfig,
+    snapshot: &surface::SurfaceSnapshot,
+) -> surface::Sha256Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"orca-cold-recovery-tool-approval-definition-v3\0");
+    hasher.update(cold_recovery_thread_config_fingerprint(config, snapshot).as_bytes());
+    surface::Sha256Digest::new(hasher.finalize().into())
+}
+
 /// Rebuild only restartable ToolApproval owners. Every malformed, stale,
 /// started, non-tool, or fingerprint-mismatched capsule is intentionally left
 /// for the existing fail-closed recovery path.
@@ -10042,7 +10092,7 @@ fn recover_cold_tool_approval_owners_on_start(
     RuntimeHostError,
 > {
     let observed_fingerprint =
-        cold_recovery_thread_config_fingerprint(config, coordinator.state().snapshot());
+        cold_recovery_tool_approval_config_fingerprint(config, coordinator.state().snapshot());
     let cold_owner_epoch = coordinator.state().snapshot().thread.owner_epoch;
     let candidates = coordinator
         .state()
@@ -10769,7 +10819,12 @@ fn bootstrap_recorded_surface(
         )?;
         reconcile_main_session_task_mirrors_on_start(thread, coordinator.state().snapshot());
         reconcile_durable_workflow_outcomes_on_start(thread, config, &mut coordinator)?;
-        reconcile_durable_provider_outcomes_on_start(thread, &mut coordinator, &host_incarnation)?;
+        reconcile_durable_provider_outcomes_on_start(
+            thread,
+            config,
+            &mut coordinator,
+            &host_incarnation,
+        )?;
         let operation_ids = coordinator
             .state()
             .snapshot()
@@ -14606,6 +14661,7 @@ struct TypedProviderBackground {
     fence: surface::SurfaceBackgroundFence,
     task_id: surface::SurfaceTaskId,
     task_registry: TaskRegistry,
+    external_tools: Vec<orca_core::external_config::ExternalToolConfig>,
     outcome: Arc<Mutex<Option<TypedProviderBackgroundOutcome>>>,
 }
 
@@ -21514,6 +21570,7 @@ impl ThreadActor {
                 fence: pending.background_fence.clone(),
                 task_id: pending.surface_task_id,
                 task_registry: pending.task_registry.clone(),
+                external_tools: pending.active.config.external_tools.clone(),
                 outcome: Arc::new(Mutex::new(None)),
             }),
         )
@@ -23902,6 +23959,8 @@ mod tests {
 
     use crate::model_response::RuntimeModelResponse;
 
+    include!("runtime_actor_turn_config_tests.rs");
+
     const TERMINAL_FAILURE_CHILD_ENV: &str = "ORCA_RUNTIME_HOST_TERMINAL_FAILURE_CHILD";
     const PREPARED_TERMINAL_CHILD_ENV: &str = "ORCA_RUNTIME_HOST_PREPARED_TERMINAL_CHILD";
     const PREPARED_TERMINALIZATION_RESTART_CHILD_ENV: &str =
@@ -24010,6 +24069,7 @@ mod tests {
             &orca_core::subagent_types::SubagentType::General,
             crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
             &McpRegistry::default(),
+            &crate::extension::ExtensionData::new("schema-test"),
         );
         let tools = provider.tools_override.expect("side schemas");
         assert!(tools.iter().any(|tool| tool.name == "read_file"));
@@ -29617,7 +29677,7 @@ mod tests {
             "completed" => {
                 "mock_stream_delay_ms 100 test_provider_completion_notify_delay_ms=30000"
             }
-            "approval" | "approval-reused-id" => {
+            "approval" | "approval-reused-id" | "approval-mcp" => {
                 "mock_stream_tool_delay_ms 100 task_list test_provider_completion_notify_delay_ms=30000"
             }
             "approval-finalizing" => "mock_stream_tool_delay_ms 500 task_list",
@@ -29714,6 +29774,23 @@ mod tests {
                 "provider outcome did not become durable before crash"
             );
             std::thread::sleep(Duration::from_millis(10));
+        }
+        #[cfg(unix)]
+        if mode == "approval-mcp" {
+            let registry = thread.task_registry();
+            let mut outcome = registry.typed_provider_outcome(task_id.as_str()).unwrap();
+            let response = outcome.response.as_mut().unwrap();
+            for step in &mut response.response.steps {
+                if let orca_core::provider_types::ProviderStep::ToolCall(request) = step {
+                    request.name = orca_core::tool_types::ToolName::Mcp("mcp__slow__wait".into());
+                }
+            }
+            for call in &mut response.response.tool_calls {
+                call.function_name = "mcp__slow__wait".into();
+            }
+            registry
+                .record_typed_provider_outcome(task_id.as_str(), outcome)
+                .unwrap();
         }
         if mode == "approval-finalizing" {
             let snapshot = fresh_surface_attachment_with_capabilities(
@@ -29866,12 +29943,54 @@ mod tests {
         assert_eq!(fixture_mode, mode);
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start durable provider outcome recovery host");
-        let thread = host
-            .start_thread(
-                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id)),
-                "recover durable provider outcome",
-            )
-            .expect("resume durable provider outcome thread");
+        let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id));
+        #[cfg(unix)]
+        let config = if mode == "approval-mcp" {
+            RunConfig {
+                mcp_servers: vec![slow_mcp_server("slow", cwd.path(), Some(2))],
+                ..config
+            }
+        } else {
+            config
+        };
+        let thread = if mode == "approval-mcp" {
+            #[cfg(unix)]
+            {
+                let other = host
+                    .start_thread(
+                        surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
+                        "unrelated thread",
+                    )
+                    .unwrap();
+                let handle = host.handle();
+                let recovering = std::thread::spawn(move || {
+                    handle
+                        .start_thread(config, "recover durable provider outcome")
+                        .unwrap()
+                });
+                let marker =
+                    catalog_mcp_server_dir("slow", cwd.path()).join("server.sh.initializing");
+                let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+                while !marker.exists() {
+                    assert!(Instant::now() < deadline, "slow MCP never started");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let started = Instant::now();
+                host.handle()
+                    .resolve_live_thread(other.thread_id())
+                    .unwrap();
+                assert!(
+                    started.elapsed() < Duration::from_millis(300),
+                    "MCP recovery blocked the host supervisor"
+                );
+                recovering.join().unwrap()
+            }
+            #[cfg(not(unix))]
+            unreachable!("MCP recovery fixture requires Unix");
+        } else {
+            host.start_thread(config, "recover durable provider outcome")
+                .expect("resume durable provider outcome thread")
+        };
         let snapshot = fresh_surface_attachment_with_capabilities(
             &thread.surface(),
             BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
@@ -29906,7 +30025,7 @@ mod tests {
                     )
                 }));
             }
-            "approval" | "approval-finalizing" => {
+            "approval" | "approval-finalizing" | "approval-mcp" => {
                 assert!(
                     snapshot
                         .background_operations
@@ -29932,11 +30051,13 @@ mod tests {
                                 .any(|turn| turn.turn_id == tool.request.turn_id)
                     })
                     .expect("approval recovery keeps its typed provider tool request");
-                assert_eq!(pending_tool.request.name.as_str(), "task_list");
-                assert_eq!(
-                    pending_tool.request.action,
-                    surface::SurfaceToolAction::Read
-                );
+                let (name, action) = if mode == "approval-mcp" {
+                    ("mcp__slow__wait", surface::SurfaceToolAction::Write)
+                } else {
+                    ("task_list", surface::SurfaceToolAction::Read)
+                };
+                assert_eq!(pending_tool.request.name.as_str(), name);
+                assert_eq!(pending_tool.request.action, action);
                 assert_eq!(pending_tool.request.raw_arguments.as_str(), "{}");
                 assert!(pending_tool.result.is_none());
                 let interaction = snapshot
@@ -30182,6 +30303,8 @@ mod tests {
             "approval-resolved",
             "approval-denied",
             "approval-reused-id",
+            #[cfg(unix)]
+            "approval-mcp",
         ] {
             for phase in ["seed", "recover"] {
                 let phase = format!("{phase}-{mode}");
@@ -42351,6 +42474,7 @@ done
                 &orca_core::subagent_types::SubagentType::General,
                 crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
                 &registry,
+                &crate::extension::ExtensionData::new("schema-test"),
             )
             .tools_override
             .expect("the provider gets a tool list")
@@ -42617,6 +42741,7 @@ while IFS= read -r line; do
   id=${{id%%,*}}
   case "$line" in
     *'"method":"initialize"'*)
+      : > "$0.initializing"
       if [ "$delay" != never ]; then
         sleep "$delay"
         printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"slow","version":"1"}}}}}}\n' "$id"

@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 use crate::approval_types::Decision;
 use crate::mcp_types::{canonical_mcp_name, mcp_tool_server};
 
+/// Reserved Workflow target for inline code. `None` is matched as an empty
+/// string and would newly match an explicit empty permission pattern. This
+/// marker is excluded from every pattern rule, including `*` and `**`; only
+/// whole-tool rules can authorize inline code without a workflow path.
+pub const INLINE_WORKFLOW_TARGET: &str = "<inline workflow>";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PermissionRule {
     pub tool: String,
@@ -141,6 +147,9 @@ impl CompiledPermissionRule {
         }
         self.matches_tool(tool)
             && self.pattern.as_ref().is_none_or(|pattern| {
+                if tool == "Workflow" && target == Some(INLINE_WORKFLOW_TARGET) {
+                    return false;
+                }
                 let target = target.unwrap_or("");
                 pattern.matches(target)
                         // App denies and prompts also cover the secure-input subtarget.

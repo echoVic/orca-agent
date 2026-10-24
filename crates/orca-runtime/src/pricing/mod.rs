@@ -48,7 +48,6 @@ pub(crate) mod tests {
             .args(["--exact", name, "--nocapture", "--test-threads=1"])
             .env(CHILD_ENV, name)
             .env("ORCA_HOME", home.path())
-            .env_remove("ORCA_PRICING_URL")
             .output()
             .expect("isolated pricing test");
         assert!(

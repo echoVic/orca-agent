@@ -116,7 +116,7 @@ impl RuntimeThread {
         Ok(Self::from_session(session, runtime_thread_id))
     }
 
-    fn from_session(session: InteractiveSession, runtime_thread_id: Option<String>) -> Self {
+    fn from_session(mut session: InteractiveSession, runtime_thread_id: Option<String>) -> Self {
         let thread_id = runtime_thread_id.unwrap_or_else(|| {
             session
                 .session_id()
@@ -127,7 +127,7 @@ impl RuntimeThread {
         lifecycle.start_task(RuntimeTaskKind::Agent);
 
         Self {
-            thread_extensions: Arc::new(ExtensionData::new(thread_id.clone())),
+            thread_extensions: session.runtime_extensions(&thread_id),
             thread_id,
             session,
             lifecycle,

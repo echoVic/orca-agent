@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::io;
 
+use orca_tools::registry::ToolRegistry;
+
 use orca_core::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
 use orca_core::provider_types::ProviderStep;
 use orca_core::thread_item_projection::{CompletedModelItem, ModelResponseIdentity};
@@ -220,8 +222,9 @@ impl GenerationContextController {
         snapshot: &surface::SurfaceSnapshot,
         fence: &surface::SurfaceOperationFence,
         response: &RuntimeModelResponse,
+        registry: &ToolRegistry,
     ) -> io::Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>> {
-        let normalized = normalize_provider_response(response, "provider response")?;
+        let normalized = normalize_provider_response(response, "provider response", registry)?;
         self.clear_item_ids(normalized.response_item_ids());
         self.pending_plan_splits
             .remove(&response.identity.item_ids.conversation_item_id);
@@ -261,9 +264,10 @@ impl GenerationContextController {
         snapshot: &surface::SurfaceSnapshot,
         fence: &surface::SurfaceBackgroundFence,
         response: &RuntimeModelResponse,
+        registry: &ToolRegistry,
     ) -> io::Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>> {
         self.clear_response_items(response);
-        build_background_provider_response_events(snapshot, fence, response)
+        build_background_provider_response_events(snapshot, fence, response, registry)
     }
 
     pub(crate) fn provider_attempt_failure_events(
@@ -545,6 +549,7 @@ pub(crate) fn build_background_provider_response_events(
     snapshot: &surface::SurfaceSnapshot,
     fence: &surface::SurfaceBackgroundFence,
     response: &RuntimeModelResponse,
+    registry: &ToolRegistry,
 ) -> io::Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>> {
     validated_response_id(response, "background provider response")?;
     let completed = response.completed();
@@ -565,7 +570,8 @@ pub(crate) fn build_background_provider_response_events(
             response.response.usage,
         ));
     }
-    let normalized = normalize_provider_response(response, "background provider response")?;
+    let normalized =
+        normalize_provider_response(response, "background provider response", registry)?;
     Ok(completion_events(
         snapshot,
         &fence.operation_fence,
@@ -604,6 +610,7 @@ impl NormalizedProviderResponse {
 fn normalize_provider_response(
     response: &RuntimeModelResponse,
     label: &str,
+    registry: &ToolRegistry,
 ) -> io::Result<NormalizedProviderResponse> {
     let completed = response.completed();
     let response_id = validated_response_id(response, label)?;
@@ -718,7 +725,7 @@ fn normalize_provider_response(
             source_response_id: Some(response_id.clone()),
             turn_id: completed.identity.turn_id.clone(),
             name,
-            action: surface_request_action(request),
+            action: surface_request_action(request, registry),
             target: surface_request_target(request).map(surface::DisplayText::new),
             raw_arguments: surface::DisplayText::new(raw_call.arguments.clone()),
             arguments_digest,
@@ -743,8 +750,14 @@ fn normalize_provider_response(
 /// exit code and diff to this action, so it comes from the tool.
 fn surface_request_action(
     request: &orca_core::tool_types::ToolRequest,
+    registry: &ToolRegistry,
 ) -> surface::SurfaceToolAction {
-    surface_tool_action(orca_tools::canonical_action_kind(request))
+    surface_tool_action(
+        registry
+            .resolve(request.name.as_str())
+            .map(|resolved| resolved.spec.capabilities.action_kind())
+            .unwrap_or(request.action),
+    )
 }
 
 /// The target a committed request records: the provider's, else the one the
@@ -762,9 +775,11 @@ fn surface_request_target(request: &orca_core::tool_types::ToolRequest) -> Optio
 pub(crate) fn records_request_action_and_target(
     tool: &surface::SurfaceToolRequest,
     request: &orca_core::tool_types::ToolRequest,
+    registry: &ToolRegistry,
 ) -> bool {
     let target = tool.target.as_ref().map(surface::DisplayText::as_str);
-    (tool.action == surface_request_action(request)
+    (tool.action == surface_request_action(request, registry)
+        || tool.action == surface_tool_action(orca_tools::canonical_action_kind(request))
         || tool.action == surface_tool_action(request.action)
         // Computer calls were classified as Shell before a dedicated action
         // existed. Retain that recorded identity when replaying old sessions.
@@ -978,7 +993,7 @@ fn tools_match(
 /// Whether `recorded` is the committed form of `expected`. The action is left
 /// out: it comes from the tool, and older builds recorded the provider's
 /// placeholder, so a response replayed after an upgrade must still find the
-/// call it committed.
+/// call it committed. Older builds also omitted targets derived from arguments.
 fn same_tool_call(
     recorded: &surface::SurfaceToolRequest,
     expected: &surface::SurfaceToolRequest,
@@ -986,6 +1001,11 @@ fn same_tool_call(
     *recorded
         == surface::SurfaceToolRequest {
             action: recorded.action,
+            target: if recorded.target.is_none() {
+                None
+            } else {
+                expected.target.clone()
+            },
             ..expected.clone()
         }
 }
@@ -1217,7 +1237,12 @@ mod tests {
             orca_core::thread_identity::TurnId::new(),
         );
 
-        let normalized = normalize_provider_response(&response, "provider response").unwrap();
+        let normalized = normalize_provider_response(
+            &response,
+            "provider response",
+            orca_tools::registry::default_tool_registry(),
+        )
+        .unwrap();
 
         let targets = normalized
             .tool_requests
@@ -1292,7 +1317,12 @@ mod tests {
             orca_core::thread_identity::TurnId::new(),
         );
 
-        let normalized = normalize_provider_response(&response, "provider response").unwrap();
+        let normalized = normalize_provider_response(
+            &response,
+            "provider response",
+            orca_tools::registry::default_tool_registry(),
+        )
+        .unwrap();
 
         let actions = normalized
             .tool_requests
@@ -1307,6 +1337,144 @@ mod tests {
                 surface::SurfaceToolAction::Read,
             ]
         );
+    }
+
+    #[test]
+    fn replay_matches_legacy_requests_without_resource_skill_or_workflow_targets() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::tool_types::{ToolName, ToolRequest};
+        for (name, arguments, target) in [
+            (
+                ToolName::ReadMcpResource,
+                serde_json::json!({"server":"docs","uri":"file:///guide"}),
+                "docs:file:///guide",
+            ),
+            (
+                ToolName::ReadSkill,
+                serde_json::json!({"id":"review"}),
+                "review",
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"name":"audit"}),
+                "audit",
+            ),
+        ] {
+            let arguments = arguments.to_string();
+            let request = ToolRequest {
+                id: "call-1".into(),
+                name: name.clone(),
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(arguments.clone()),
+            };
+            let response = crate::model_response::RuntimeModelResponse::new(
+                orca_core::provider_types::ProviderResponse {
+                    steps: vec![orca_core::provider_types::ProviderStep::ToolCall(
+                        request.clone(),
+                    )],
+                    assistant_content: None,
+                    assistant_reasoning: None,
+                    tool_calls: vec![orca_core::conversation::RawToolCall {
+                        id: request.id.clone(),
+                        function_name: name.as_str().into(),
+                        arguments,
+                    }],
+                    usage: None,
+                },
+                orca_core::thread_identity::TurnId::new(),
+            );
+            let registry = orca_tools::registry::default_tool_registry();
+            let normalized =
+                normalize_provider_response(&response, "provider response", registry).unwrap();
+            let typed = &normalized.tool_requests[0];
+            assert_eq!(typed.target.as_ref().unwrap().as_str(), target);
+            let legacy = surface::SurfaceToolRequest {
+                target: None,
+                ..typed.clone()
+            };
+            assert!(records_request_action_and_target(
+                &legacy, &request, registry
+            ));
+            assert!(same_tool_call(&legacy, typed), "{}", name.as_str());
+            let different = surface::SurfaceToolRequest {
+                target: Some(surface::DisplayText::new("another target")),
+                ..typed.clone()
+            };
+            assert!(!same_tool_call(&different, typed));
+        }
+    }
+
+    #[test]
+    fn typed_requests_classify_registered_mcp_and_external_tools() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::tool_types::{ToolName, ToolRequest};
+        let mcp = orca_mcp::McpRegistry::from_tools_for_test(vec![orca_core::mcp_types::McpTool {
+            server: "local".into(),
+            name: "write".into(),
+            schema_name: "mcp__local__write".into(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only: false,
+        }]);
+        let external = vec![orca_core::external_config::ExternalToolConfig {
+            name: "deploy".into(),
+            description: "deploy".into(),
+            action_kind: ActionKind::Shell,
+            command: "true".into(),
+            schema: serde_json::json!({"type": "object"}),
+        }];
+        let registry =
+            orca_tools::registry::tool_registry_with_mcp_and_external(Some(&mcp), &external);
+        for (name, expected) in [
+            (
+                ToolName::Mcp("mcp__local__write".into()),
+                surface::SurfaceToolAction::Write,
+            ),
+            (
+                ToolName::External("deploy".into()),
+                surface::SurfaceToolAction::Shell,
+            ),
+        ] {
+            let request = ToolRequest {
+                id: "call-1".into(),
+                name: name.clone(),
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some("{}".into()),
+            };
+            let response = crate::model_response::RuntimeModelResponse::new(
+                orca_core::provider_types::ProviderResponse {
+                    steps: vec![orca_core::provider_types::ProviderStep::ToolCall(
+                        request.clone(),
+                    )],
+                    assistant_content: None,
+                    assistant_reasoning: None,
+                    tool_calls: vec![orca_core::conversation::RawToolCall {
+                        id: request.id.clone(),
+                        function_name: name.as_str().into(),
+                        arguments: "{}".into(),
+                    }],
+                    usage: None,
+                },
+                orca_core::thread_identity::TurnId::new(),
+            );
+            let normalized =
+                normalize_provider_response(&response, "provider response", &registry).unwrap();
+            let typed = &normalized.tool_requests[0];
+            assert_eq!(typed.action, expected, "{}", name.as_str());
+            assert!(records_request_action_and_target(
+                typed, &request, &registry
+            ));
+            let legacy = surface::SurfaceToolRequest {
+                action: surface::SurfaceToolAction::Read,
+                ..typed.clone()
+            };
+            assert!(records_request_action_and_target(
+                &legacy, &request, &registry
+            ));
+            assert!(same_tool_call(&legacy, typed));
+        }
     }
 
     #[test]
@@ -1367,24 +1535,29 @@ mod tests {
 
         assert!(records_request_action_and_target(
             &committed(Write, Some("notes.txt")),
-            &request
+            &request,
+            orca_tools::registry::default_tool_registry()
         ));
         assert!(records_request_action_and_target(
             &committed(Read, Some("notes.txt")),
-            &request
+            &request,
+            orca_tools::registry::default_tool_registry()
         ));
         assert!(records_request_action_and_target(
             &committed(Read, None),
-            &request
+            &request,
+            orca_tools::registry::default_tool_registry()
         ));
         // Neither the tool nor the provider gave these, so it is another call.
         assert!(!records_request_action_and_target(
             &committed(Write, Some("other.txt")),
-            &request
+            &request,
+            orca_tools::registry::default_tool_registry()
         ));
         assert!(!records_request_action_and_target(
             &committed(Shell, Some("notes.txt")),
-            &request
+            &request,
+            orca_tools::registry::default_tool_registry()
         ));
     }
 
@@ -1410,12 +1583,17 @@ mod tests {
         };
         let decoded: surface::SurfaceToolRequest =
             serde_json::from_value(serde_json::to_value(&recorded).unwrap()).unwrap();
-        assert!(records_request_action_and_target(&decoded, &request));
+        let registry = orca_tools::registry::default_tool_registry();
+        assert!(records_request_action_and_target(
+            &decoded, &request, registry
+        ));
         let changed = surface::SurfaceToolRequest {
             target: Some(surface::DisplayText::new("com.apple.calculator")),
             ..decoded
         };
-        assert!(!records_request_action_and_target(&changed, &request));
+        assert!(!records_request_action_and_target(
+            &changed, &request, registry
+        ));
     }
 
     #[test]
@@ -1431,13 +1609,17 @@ mod tests {
                 },
                 orca_core::thread_identity::TurnId::new(),
             );
-            normalize_provider_response(&response, "provider response")
-                .unwrap()
-                .completed_response
-                .plan_item
-                .expect("plan item")
-                .message_offset
-                .map(surface::ByteOffset::get)
+            normalize_provider_response(
+                &response,
+                "provider response",
+                orca_tools::registry::default_tool_registry(),
+            )
+            .unwrap()
+            .completed_response
+            .plan_item
+            .expect("plan item")
+            .message_offset
+            .map(surface::ByteOffset::get)
         };
         let plan = "<proposed_plan>\n# Plan\n</proposed_plan>";
 

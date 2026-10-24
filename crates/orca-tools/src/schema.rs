@@ -26,11 +26,11 @@ pub fn render_builtin_role_catalog(capsule: bool) -> String {
             "\n- `{}`: {}",
             descriptor.name, descriptor.when_to_use
         ));
-        output.push_str(&format!("\n  Avoid when: {}", descriptor.avoid_when));
-        output.push_str(&format!("\n  Tools: {}", descriptor.tools.join(", ")));
+        output.push_str(&format!("\n  Avoid: {}", descriptor.avoid_when));
+        output.push_str(&format!("\n  Tools: {}", descriptor.tools.join(",")));
         output.push_str(&format!(
             "\n  Report: {}",
-            descriptor.deliverables.join("; ")
+            descriptor.deliverables.join(";")
         ));
     }
     output
@@ -50,17 +50,16 @@ pub fn apply_subagent_catalog(
     let mut names = builtin_role_names();
     names.extend(catalog.agents.keys().map(String::as_str));
     input_schema["properties"]["subagent_type"]["enum"] = serde_json::json!(names);
-    description.push_str("\n\nBuilt-in roles (use the identifier verbatim):");
+    description.push_str("\n\nBuilt-in roles (verbatim ids):");
     description.push_str(&render_builtin_role_catalog(false));
     if !catalog.agents.is_empty() {
-        description.push_str("\n\nAvailable custom agents (identifier: description):");
+        description.push_str("\n\nCustom agents (id: description):");
         for agent in catalog.agents.values() {
             description.push_str(&format!("\n- {}: {}", agent.name, agent.description));
         }
     }
     if !catalog.diagnostics.is_empty() {
-        description
-            .push_str("\n\nSome agent definitions were invalid or ambiguous and were excluded.");
+        description.push_str("\n\nInvalid/ambiguous definitions excluded.");
     }
     description.push_str(
         "\n\nAccepted aliases: explore/scout=explorer, reviewer=code_reviewer, tester=test_writer, debug=debugger, docs=documenter.",
@@ -271,6 +270,28 @@ fn tool_target(name: &ToolName, arguments: &Value) -> Option<String> {
         ToolName::UpdatePlan => arguments["plan"]
             .as_array()
             .map(|plan| format!("{} items", plan.len())),
+        ToolName::ReadMcpResource => arguments["uri"].as_str().map(|uri| {
+            arguments["server"]
+                .as_str()
+                .map_or_else(|| uri.to_string(), |server| format!("{server}:{uri}"))
+        }),
+        ToolName::ReadSkill => arguments["id"].as_str().map(String::from),
+        ToolName::Workflow => arguments["scriptPath"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(String::from)
+            .or_else(|| {
+                if arguments["script"].as_str().is_some() {
+                    Some(orca_core::approval_rules::INLINE_WORKFLOW_TARGET.to_string())
+                } else {
+                    ["name", "draftId"].into_iter().find_map(|key| {
+                        arguments[key]
+                            .as_str()
+                            .filter(|value| !value.trim().is_empty())
+                            .map(String::from)
+                    })
+                }
+            }),
         ToolName::Mcp(name) | ToolName::External(name) => Some(name.clone()),
         _ => None,
     }
@@ -279,6 +300,139 @@ fn tool_target(name: &ToolName, arguments: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_targets_identify_resources_skills_and_workflows() {
+        for (name, arguments, expected) in [
+            (
+                ToolName::ReadMcpResource,
+                serde_json::json!({"server":"docs","uri":"file:///guide"}),
+                Some("docs:file:///guide"),
+            ),
+            (
+                ToolName::ReadMcpResource,
+                serde_json::json!({"uri":"file:///guide"}),
+                Some("file:///guide"),
+            ),
+            (
+                ToolName::ReadMcpResource,
+                serde_json::json!({"server":"docs"}),
+                None,
+            ),
+            (
+                ToolName::ReadSkill,
+                serde_json::json!({"id":"review"}),
+                Some("review"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"name":"audit","scriptPath":"./audit.ts","draftId":"draft-1"}),
+                Some("./audit.ts"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"name":"audit","draftId":"draft-1"}),
+                Some("audit"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"scriptPath":"", "name":"audit"}),
+                Some("audit"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"scriptPath":" \t", "name":"audit"}),
+                Some("audit"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"scriptPath":"./audit.ts","draftId":"draft-1"}),
+                Some("./audit.ts"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"draftId":"draft-1"}),
+                Some("draft-1"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"script":"inline code", "name":"audit"}),
+                Some("<inline workflow>"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"script":"inline code", "name":"audit", "scriptPath":"./audit.ts"}),
+                Some("./audit.ts"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"script":"", "name":"audit", "scriptPath":" \t"}),
+                Some("<inline workflow>"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"script":"inline code", "draftId":"draft-1"}),
+                Some("<inline workflow>"),
+            ),
+            (ToolName::Workflow, serde_json::json!({}), None),
+            (
+                ToolName::ReadFile,
+                serde_json::json!({"path":"src/main.rs"}),
+                Some("src/main.rs"),
+            ),
+            (
+                ToolName::Bash,
+                serde_json::json!({"command":"git status"}),
+                Some("git status"),
+            ),
+        ] {
+            let request = ToolRequest {
+                id: "target-1".into(),
+                name,
+                action: orca_core::approval_types::ActionKind::Read,
+                target: None,
+                raw_arguments: Some(arguments.to_string()),
+            };
+            assert_eq!(
+                tool_request_target(&request).as_deref(),
+                expected,
+                "{}: {arguments}",
+                request.name.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn inline_workflow_target_cannot_match_permission_patterns() {
+        use orca_core::approval_rules::{CompiledPermissionRules, PermissionRule, PermissionRules};
+        use orca_core::approval_types::Decision;
+
+        let target = Some("<inline workflow>");
+        for pattern in [
+            "audit",
+            "./audit.ts",
+            "draft-1",
+            "",
+            "*",
+            "**",
+            "<inline workflow>",
+        ] {
+            let rules = CompiledPermissionRules::from_rules(PermissionRules {
+                rules: vec![PermissionRule::new("Workflow", pattern, Decision::Allow)],
+            });
+            assert_eq!(
+                rules.matching_decision("Workflow", target),
+                None,
+                "{pattern}"
+            );
+        }
+        for decision in [Decision::Allow, Decision::Prompt, Decision::Deny] {
+            let rules = CompiledPermissionRules::from_rules(PermissionRules {
+                rules: vec![PermissionRule::whole_tool("Workflow", decision)],
+            });
+            assert_eq!(rules.matching_decision("Workflow", target), Some(decision));
+        }
+    }
 
     fn external_tool(name: &str) -> orca_core::external_config::ExternalToolConfig {
         orca_core::external_config::ExternalToolConfig {

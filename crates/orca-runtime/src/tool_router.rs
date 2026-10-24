@@ -254,6 +254,14 @@ impl<'a> RuntimeToolRouter<'a> {
             ),
             RuntimeSpecialToolDispatch::Subagent => {
                 let (result, child_budget_usage) = execute_subagent_tool_with_activity_ingress(
+                    Some(crate::subagent::session_agent_catalog(
+                        config,
+                        cwd,
+                        mcp_registry,
+                        extension_stores
+                            .map(|stores| stores.thread_store())
+                            .unwrap_or(&self.runtime.thread_extensions),
+                    )),
                     config,
                     cwd,
                     events,
@@ -566,6 +574,192 @@ mod tests {
                 assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
                 assert_eq!(launcher.launches(), 1);
             }
+        }
+    }
+    fn catalog_child_executor<W: io::Write>(
+        config: &RunConfig,
+        _request: &crate::agent_child::ChildAgentRequest,
+        _runtime: &mut crate::agent_child::ChildAgentRuntime<'_, W>,
+        _cost: &mut CostTracker,
+    ) -> io::Result<crate::agent_child::ChildAgentResult> {
+        let definition = config.subagents.effective_definition.as_ref().unwrap();
+        Ok(crate::agent_child::ChildAgentResult {
+            status: orca_core::event_schema::RunStatus::Success,
+            final_message: Some(serde_json::to_string(definition).unwrap()),
+            error: None,
+            budget_usage: None,
+        })
+    }
+
+    #[test]
+    fn custom_agent_launch_uses_advertised_session_definition_after_file_edit() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let agents = home.path().join("agents");
+        std::fs::create_dir(&agents).unwrap();
+        let write_agent = |version: &str, tool: &str| {
+            std::fs::write(agents.join("audit.md"), format!(
+                "---\nname: audit\ndescription: {version}\ntools: [{tool}]\n---\n{version} instructions.\n"
+            )).unwrap();
+        };
+        let config = RunConfig {
+            cwd: Some(cwd.path().to_path_buf()),
+            ..RunConfig::default()
+        };
+        let first_session = ExtensionData::new("catalog-session-1");
+        let new_session = ExtensionData::new("catalog-session-2");
+        let advertise = |store: &ExtensionData| {
+            crate::runtime_turn_setup::RuntimeTurnSetupStep::new(store)
+                .prepare(
+                    &config,
+                    cwd.path(),
+                    0,
+                    &orca_core::subagent_types::SubagentType::General,
+                    crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
+                    &McpRegistry::default(),
+                )
+                .provider_config
+        };
+        write_agent("Before edit", "read_file");
+        advertise(&first_session);
+        write_agent("After edit", "glob");
+        // A later turn must both advertise and execute the original definition.
+        for (thread_store, expected, other, tool) in [
+            (&first_session, "Before edit", "After edit", "read_file"),
+            (&new_session, "After edit", "Before edit", "glob"),
+        ] {
+            let advertised = advertise(thread_store);
+            assert!(
+                serde_json::to_string(&orca_provider::tool_schema::deepseek_tools_schema(
+                    &advertised.tools_override.unwrap()
+                ))
+                .unwrap()
+                .contains(expected)
+            );
+            let turn_store = ExtensionData::new("catalog-turn");
+            let request = tool_types::ToolRequest {
+                id: "catalog-launch".into(), name: ToolName::Subagent, action: ActionKind::Agent,
+                target: None, raw_arguments: Some(serde_json::json!({
+                    "description": "Audit", "prompt": "Inspect", "subagent_type": "audit", "mode": "sync"
+                }).to_string()),
+            };
+            let mut runtime = RuntimeToolActorContext::new("catalog-turn");
+            let mut events = EventFactory::new("catalog-turn".into());
+            let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+            let instructions = ProjectInstructions::default();
+            let memory = MemoryBlock::default();
+            let registry = McpRegistry::default();
+            let hooks = HookRunner::default();
+            let mut cost = CostTracker::new(None);
+            let cancel = CancelToken::new();
+            let tasks = TaskRegistry::new("catalog-turn".into());
+            let mut workflows = Vec::new();
+            let mut overlay = TurnPermissionOverlay::default();
+            let mut event_error = None;
+            let result = RuntimeToolRouter::new(&mut runtime)
+                .dispatch(RuntimeToolInvocationContext {
+                    config: &config,
+                    cwd: cwd.path(),
+                    events: &mut events,
+                    sink: &mut sink,
+                    execution_request: &request,
+                    goal_mode: false,
+                    subagent_depth: 0,
+                    instructions: &instructions,
+                    memory: &memory,
+                    mcp_registry: &registry,
+                    hooks: &hooks,
+                    emit_deltas: false,
+                    cost_tracker: &mut cost,
+                    cancel: &cancel,
+                    task_registry: &tasks,
+                    background_workflows: &mut workflows,
+                    workflow_ipc: None,
+                    permission_overlay: &mut overlay,
+                    permission_handler: None,
+                    permission_handler_owned: None,
+                    user_input_handler: None,
+                    mcp_elicitation_handler: None,
+                    extension_stores: Some(RuntimeExtensionStores::new(thread_store, &turn_store)),
+                    goal_runtime: None,
+                    goal_turn: None,
+                    event_error: &mut event_error,
+                    subagent_child_executor: catalog_child_executor,
+                    workflow_child_executor: unused_child_executor,
+                    workflow_lifecycle_ingress: None,
+                    wait_for_background_workflows: false,
+                    root_task_id: None,
+                    child_budget: None,
+                })
+                .unwrap()
+                .result;
+
+            assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+            let output = result.output.unwrap();
+            assert!(
+                output.contains(&format!("{expected} instructions.")),
+                "{output}"
+            );
+            assert!(!output.contains(other), "{output}");
+            assert!(
+                output.contains(&format!("\"allowed_tools\":[\"{tool}\"]")),
+                "{output}"
+            );
+            let batch_request = tool_types::ToolRequest {
+                id: "catalog-batch".into(),
+                ..request
+            };
+            let mut conversation = orca_core::conversation::Conversation::new();
+            let (batch_result, _) = crate::subagent_execution::run_subagent_batch_tool_turn(
+                crate::subagent_execution::RuntimeSubagentBatchToolTurnContext {
+                    request: crate::subagent_execution::RuntimeSubagentBatchToolTurnRequest {
+                        config: &config,
+                        cwd: cwd.path(),
+                        tool_requests: &[batch_request],
+                        subagent_depth: 0,
+                        emit_deltas: false,
+                        child_budgets: Vec::new(),
+                    },
+                    io: crate::subagent_execution::RuntimeSubagentBatchToolTurnIo {
+                        events: &mut events,
+                        sink: &mut sink,
+                        conversation: &mut conversation,
+                        history_writer: None,
+                        cost_tracker: &mut cost,
+                    },
+                    services: crate::subagent_execution::RuntimeSubagentBatchToolTurnServices {
+                        instructions: &instructions,
+                        memory: &memory,
+                        mcp_registry: &registry,
+                        hooks: &hooks,
+                    },
+                    runtime: crate::subagent_execution::RuntimeSubagentBatchToolTurnRuntime {
+                        agent_catalog: thread_store
+                            .get::<orca_core::subagent_types::agent_definition::AgentCatalog>(
+                        ),
+                        cancel: &cancel,
+                        task_registry: &tasks,
+                        root_task_id: None,
+                        parent_task_id: None,
+                        workflow_ipc: None,
+                        activity_ingress: None,
+                        permission_handler: None,
+                        agent_controller: None,
+                    },
+                    child_executor: catalog_child_executor::<io::Sink>,
+                },
+            );
+            assert!(matches!(
+                batch_result.unwrap(),
+                crate::tool_turn::ToolTurnOutcome::Continue
+            ));
+            let batch_output = conversation.messages.last().unwrap().content_str().unwrap();
+            assert!(
+                batch_output.contains(&format!("{expected} instructions.")),
+                "{batch_output}"
+            );
+            assert!(!batch_output.contains(other), "{batch_output}");
         }
     }
 }
