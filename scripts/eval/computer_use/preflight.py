@@ -49,8 +49,11 @@ class Native:
         if r.returncode:
             raise RuntimeError('Native helper compilation failed:\n' + r.stderr)
 
-    def call(self, *args):
-        r = subprocess.run([str(self.binary), *map(str, args)], capture_output=True, text=True, timeout=20)
+    def call(self, *args, timeout=20):
+        try:
+            r = subprocess.run([str(self.binary), *map(str, args)], capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f'Native {args[0]} timed out after {timeout} s') from None
         if r.returncode:
             raise RuntimeError(f'Native {args[0]} failed: {(r.stdout + r.stderr).strip()}')
         data = json.loads(r.stdout)
@@ -101,7 +104,8 @@ class Native:
 
         def close(state):
             for app, wid in owned(state):
-                if wid in transient or any(a.get('window') == wid for a in actions):
+                # A save sheet can appear after the discard attempt; retry a few times.
+                if wid in transient or sum(a.get('window') == wid for a in actions) >= 3:
                     continue
                 try:
                     result = self.call('close', app, str(wid), 'discard' if app == 'com.apple.TextEdit' else 'keep')

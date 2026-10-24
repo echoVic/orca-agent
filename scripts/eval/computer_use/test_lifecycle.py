@@ -57,6 +57,28 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(result['ok'], result)
         self.assertEqual(result['transient_windows'], [9])
 
+    def test_cleanup_retries_a_window_whose_save_sheet_was_late(self):
+        native = object.__new__(Native)
+        before = {'apps': [{'pid': 42, 'bundle': 'com.apple.TextEdit'}], 'windows': []}
+        doc = {'id': 7, 'pid': 42, 'layer': 0, 'on_screen': True}
+        closes = []
+        def call(op, *args):
+            if op == 'state':
+                return {'apps': before['apps'], 'windows': [] if len(closes) >= 2 else [doc]}
+            closes.append(args)
+            return {'window': 7, 'close_error': 0}
+        with patch.object(native, 'call', side_effect=call), patch('preflight.time.sleep'):
+            result = native.cleanup({'allowed_apps': ['com.apple.TextEdit']}, before, settle_seconds=1)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(len(closes), 2)
+
+    def test_native_timeouts_become_runtime_errors(self):
+        native = object.__new__(Native)
+        native.binary = Path('/usr/bin/true')
+        with patch('preflight.subprocess.run', side_effect=__import__('subprocess').TimeoutExpired('x', 20)):
+            with self.assertRaisesRegex(RuntimeError, 'calculator-reset timed out after 40 s'):
+                native.call('calculator-reset', timeout=40)
+
     def test_cleanup_records_quit_races_and_fails_on_a_closed_visible_original(self):
         native = object.__new__(Native)
         toast = {'id': 3, 'pid': 1, 'layer': 0, 'on_screen': True, 'bounds': {'Width': 138, 'Height': 22}}
@@ -249,6 +271,30 @@ class RunnerLifecycleTests(unittest.TestCase):
                 row = run_task(task, SimpleNamespace(dry_run=False), base, base / 'report', None, Services(), Native())
             self.assertTrue(row['harness_error'])
             self.assertTrue(row['cleanup']['ok'])
+
+    def test_calculator_task_fails_when_the_reset_left_a_stale_display(self):
+        class FakeTUI:
+            submitted = 0
+            approvals = []
+            def __init__(self, *args): pass
+            def start(self): pass
+            def run(self, *args): return 'completed'
+            def stop(self): return {'exited': True, 'records': []}
+        class Native:
+            def __init__(self, display): self.display = display
+            def call(self, op, timeout=20): return {'pressed': [], 'display': self.display}
+            def preflight(self, live): return {'windows': [], 'apps': []}
+            def cleanup(self, task, before): return {'ok': True}
+        class Services:
+            port = 1234
+            def health(self): return {}
+        task = {'id': 'S1', 'kind': 'single', 'allowed_apps': ['com.apple.calculator'], 'prompt': 'prompt', 'verifier': 'calculator'}
+        for display, passed in ((['\u200e7,006,652'], False), (['\u200e0'], True)):
+            with tempfile.TemporaryDirectory() as d:
+                base = Path(d); (base / 'out').mkdir(); (base / 'fixtures').mkdir()
+                with patch('run.TUI', FakeTUI), patch('run.collect', return_value={'passed': True}):
+                    row = run_task(task, SimpleNamespace(dry_run=False), base, base / 'report', None, Services(), Native(display))
+                self.assertEqual(row['passed'], passed, display)
 
 
 class FormTests(unittest.TestCase):

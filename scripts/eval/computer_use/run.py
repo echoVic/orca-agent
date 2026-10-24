@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -83,12 +84,17 @@ def retry_task_cleanup(task, before, evidence, native, pid):
 def run_task(task, args, base, out, tmux, services, native):
     evidence = out / 'evidence' / task['id']; evidence.mkdir(parents=True)
     reset_outputs(base, evidence / 'previous-outputs')
+    reset_failed = None
     if not args.dry_run and 'com.apple.calculator' in task['allowed_apps']:
         try:
-            dump(evidence / 'calculator-reset.json', native.call('calculator-reset'))
+            # Launch, clear and quit wait up to 8 s each.
+            reset = native.call('calculator-reset', timeout=40)
         except RuntimeError as error:
-            # The verifier still demands real input, so a failed reset cannot pass a task.
-            dump(evidence / 'calculator-reset.json', {'error': str(error)})
+            reset = {'error': str(error)}
+        dump(evidence / 'calculator-reset.json', reset)
+        if not any(re.sub(r'[\s\u200e\u200f]', '', value) == '0' for value in reset.get('display', [])):
+            # A display left from an earlier run could otherwise answer the task.
+            reset_failed = 'Calculator reset did not show a cleared display; GUI result cannot be trusted'
     before = native.preflight(live=not args.dry_run)
     dump(evidence / 'preflight.json', before)
     dump(evidence / 'service-health.json', services.health())
@@ -133,6 +139,8 @@ def run_task(task, args, base, out, tmux, services, native):
         try:
             if not args.dry_run and exit_proof.get('exited') and reason != 'harness_error':
                 verification = collect(task, native, base, before, evidence, metrics)
+                if reset_failed:
+                    verification = {**verification, 'passed': False, 'reason': reset_failed}
         except Exception as error:
             errors.append(f'verification: {error}')
             verification = {'passed': False, 'error': str(error)}
