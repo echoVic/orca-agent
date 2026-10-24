@@ -60,6 +60,7 @@ fn trials() -> Vec<libtest_mimic::Trial> {
         launch_app_opens_a_file_in_textedit,
         list_apps_shows_only_windows_observe_can_use,
         a_shortcut_reaches_textedit_before_it_has_a_window,
+        a_system_settings_click_survives_an_unsupported_raise,
         opening_a_nonexistent_file_in_already_running_textedit_returns_an_error,
         cleanup_only_selects_explicitly_launched_processes,
         cleanup_preserves_an_app_launched_by_another_live_session,
@@ -1242,6 +1243,85 @@ fn a_shortcut_reaches_textedit_before_it_has_a_window() {
         assert!(
             outcome.observation.is_some(),
             "Cmd+N should open an observable document window"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+fn a_system_settings_click_survives_an_unsupported_raise() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        if !bundle_pids("com.apple.systempreferences").is_empty() {
+            eprintln!(
+                "skipped: System Settings is already open; the test must not change the user's pane"
+            );
+            return;
+        }
+        let before = bundle_pids("com.apple.systempreferences");
+        let launched = live.client.call(
+            Request::LaunchApp {
+                app: "com.apple.systempreferences".into(),
+                open: vec![],
+            },
+            Duration::from_secs(60),
+        );
+        register_launch_pids(
+            &mut live.launched,
+            &before,
+            &bundle_pids("com.apple.systempreferences"),
+        );
+        launched.unwrap();
+        let Reply::Observed { observation } = live
+            .client
+            .call(
+                Request::Observe(ObserveParams {
+                    app: "com.apple.systempreferences".into(),
+                    window: None,
+                    query: Some("General".into()),
+                    max_elements: 50,
+                    include_screenshot: false,
+                }),
+                Duration::from_secs(30),
+            )
+            .unwrap()
+        else {
+            panic!("expected observation")
+        };
+        let general = observation
+            .elements
+            .iter()
+            .find(|element| {
+                element
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label == "General" || label == "通用")
+            })
+            .expect("the sidebar lists General");
+        // A double click always takes the foreground path, which raises the window.
+        let acted = live.client.call(
+            Request::Act(ActParams {
+                app: "com.apple.systempreferences".into(),
+                window: Some(observation.window.id),
+                action: Action::Click {
+                    target: Target::Element {
+                        element: general.id,
+                    },
+                    button: Button::Left,
+                    count: 2,
+                    modifiers: vec![],
+                },
+                foreground_fallback: true,
+                observe_after: false,
+                include_screenshot: false,
+                secure_approved: false,
+            }),
+            Duration::from_secs(30),
+        );
+        assert!(
+            acted.is_ok(),
+            "a foreground click in System Settings must not fail on AXRaise: {acted:?}"
         );
         live.assert_frontmost_and_pointer_unchanged();
     });

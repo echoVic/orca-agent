@@ -320,6 +320,7 @@ pub(super) fn run(
             .then(|| window.clone()),
     };
     let mut unfocused_key = false;
+    let mut raise_note: Option<&'static str> = None;
     let result = (|| {
         check_abort(aborted)?;
         let target = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
@@ -329,7 +330,16 @@ pub(super) fn run(
         }
         activate(&target, crate::timing::ACTIVATION_WAIT_LIMIT)?;
         check_abort(aborted)?;
-        window.perform("AXRaise")?;
+        let app_name = target
+            .localizedName()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| pid.to_string());
+        raise_note = raise_with_fallback(
+            || window.perform("AXRaise"),
+            || window_in_front(window, application),
+            || thread::sleep(Duration::from_millis(150)),
+            &app_name,
+        )?;
         check_abort(aborted)?;
         // Activation/raise can precede AppKit's key-window transition.
         // Keep this pause short and check abort again before any HID post.
@@ -486,12 +496,62 @@ pub(super) fn run(
     let restored = restore.finish();
     // Preserve successful delivery, and disclose any restoration failure.
     finish_foreground(result, restored, &name).map(|note| {
-        if unfocused_key {
+        let note = if unfocused_key {
             format!("{note}; sent key to an app that reports no focused element")
         } else {
             note
+        };
+        match raise_note {
+            Some(raise) => format!("{note}; {raise}"),
+            None => note,
         }
     })
+}
+
+pub(super) const ALREADY_IN_FRONT: &str = "window already in front (raise unsupported)";
+
+/// System Settings refuses AXRaise (-25205) even for its frontmost window. A
+/// failed raise is acceptable only for a window that is already in front;
+/// otherwise retry once, then fail. Every later foreground check still runs.
+pub(super) fn raise_with_fallback(
+    mut raise: impl FnMut() -> Result<(), DriverError>,
+    mut in_front: impl FnMut() -> bool,
+    mut pause: impl FnMut(),
+    app_name: &str,
+) -> Result<Option<&'static str>, DriverError> {
+    match raise() {
+        Ok(()) => return Ok(None),
+        Err(failure) if failure.kind == ErrorKind::Stale => return Err(failure),
+        Err(_) => {}
+    }
+    if in_front() {
+        return Ok(Some(ALREADY_IN_FRONT));
+    }
+    pause();
+    let failure = match raise() {
+        Ok(()) => return Ok(None),
+        Err(retry) if retry.kind == ErrorKind::Stale => return Err(retry),
+        Err(retry) => retry,
+    };
+    if in_front() {
+        return Ok(Some(ALREADY_IN_FRONT));
+    }
+    Err(error(
+        ErrorKind::Failed,
+        format!(
+            "Could not bring {app_name}'s window to the front ({}). Call observe again; if it keeps failing, tell the user.",
+            failure.message.trim_start_matches("Accessibility ")
+        ),
+    ))
+}
+
+fn window_in_front(window: &AxElement, application: &AxElement) -> bool {
+    window.attribute_bool("AXMain").ok().flatten() == Some(true)
+        || application
+            .attribute_element("AXFocusedWindow")
+            .ok()
+            .flatten()
+            .is_some_and(|focused| focused == *window)
 }
 fn finish_foreground(
     result: Result<(), DriverError>,
@@ -670,4 +730,103 @@ pub fn test_element_click_point(
     let element = AxElement::from_owned(element)?;
     let window = AxElement::from_owned(window)?;
     element_click_point(&element, &window)
+}
+
+#[cfg(test)]
+mod raise_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn failed() -> Result<(), DriverError> {
+        Err(error(
+            ErrorKind::Failed,
+            "Accessibility AXRaise failed: AXError(-25205)",
+        ))
+    }
+
+    #[test]
+    fn a_raised_window_needs_no_fallback() {
+        let raises = Cell::new(0);
+        let note = raise_with_fallback(
+            || {
+                raises.set(raises.get() + 1);
+                Ok(())
+            },
+            || false,
+            || {},
+            "System Settings",
+        )
+        .unwrap();
+        assert_eq!((note, raises.get()), (None, 1));
+    }
+
+    #[test]
+    fn an_unsupported_raise_is_fine_for_a_window_already_in_front() {
+        let raises = Cell::new(0);
+        let note = raise_with_fallback(
+            || {
+                raises.set(raises.get() + 1);
+                failed()
+            },
+            || true,
+            || {},
+            "System Settings",
+        )
+        .unwrap();
+        assert_eq!((note, raises.get()), (Some(ALREADY_IN_FRONT), 1));
+    }
+
+    #[test]
+    fn a_failed_raise_is_retried_once_after_a_pause() {
+        let raises = Cell::new(0);
+        let paused = Cell::new(false);
+        let note = raise_with_fallback(
+            || {
+                raises.set(raises.get() + 1);
+                if raises.get() == 1 { failed() } else { Ok(()) }
+            },
+            || false,
+            || paused.set(true),
+            "System Settings",
+        )
+        .unwrap();
+        assert_eq!((note, raises.get(), paused.get()), (None, 2, true));
+    }
+
+    #[test]
+    fn two_failed_raises_fail_unless_the_window_reached_the_front() {
+        let checks = Cell::new(0);
+        let note = raise_with_fallback(
+            failed,
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() == 2
+            },
+            || {},
+            "System Settings",
+        )
+        .unwrap();
+        assert_eq!(note, Some(ALREADY_IN_FRONT));
+        let error = raise_with_fallback(failed, || false, || {}, "System Settings").unwrap_err();
+        assert_eq!(
+            error.message,
+            "Could not bring System Settings's window to the front (AXRaise failed: AXError(-25205)). Call observe again; if it keeps failing, tell the user."
+        );
+    }
+
+    #[test]
+    fn a_stale_window_is_not_retried() {
+        let raises = Cell::new(0);
+        let error = raise_with_fallback(
+            || {
+                raises.set(raises.get() + 1);
+                Err(actions::stale())
+            },
+            || true,
+            || {},
+            "System Settings",
+        )
+        .unwrap_err();
+        assert_eq!((error.kind, raises.get()), (ErrorKind::Stale, 1));
+    }
 }
