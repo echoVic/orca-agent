@@ -14,6 +14,7 @@ use orca_core::config::RunConfig;
 
 use crate::extension::ExtensionData;
 
+pub(crate) mod budget;
 pub(crate) mod execute;
 pub(crate) mod prepare;
 pub(crate) mod turn;

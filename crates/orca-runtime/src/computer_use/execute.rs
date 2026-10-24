@@ -12,8 +12,9 @@ use orca_core::config::RunConfig;
 use orca_core::conversation::ImageInput;
 use orca_core::model::{FLASH_MODEL, accepts_tool_images};
 use orca_core::tool_images::tool_image;
-use orca_core::tool_types::{ToolRequest, ToolResult};
+use orca_core::tool_types::{ToolRequest, ToolResult, ToolStatus};
 
+use super::budget::FailureBudget;
 use super::{ComputerUseService, service, turn::begin_turn};
 use crate::extension::RuntimeExtensionStores;
 
@@ -47,6 +48,45 @@ pub(crate) fn execute(
 }
 
 fn execute_with_timeout(
+    request: &ToolRequest,
+    config: &RunConfig,
+    subagent_depth: u32,
+    stores: RuntimeExtensionStores<'_>,
+    cwd: &Path,
+    cancel: &CancelToken,
+    timeout: Duration,
+) -> ToolResult {
+    let target = request.target.as_deref().unwrap_or_default();
+    let app = target.strip_suffix("#secure").unwrap_or(target);
+    // list_apps has no app; every other call counts toward its app's budget.
+    let budget = (!app.is_empty()).then(|| FailureBudget::for_turn(stores.turn_store()));
+    if let Some(stop) = budget.as_ref().and_then(|budget| budget.stopped(app)) {
+        return ToolResult::failed_before_start(request, stop, None);
+    }
+    let mut result = run_call(
+        request,
+        config,
+        subagent_depth,
+        stores,
+        cwd,
+        cancel,
+        timeout,
+    );
+    let failed = match result.status {
+        ToolStatus::Failed => Some(true),
+        ToolStatus::Completed => Some(false),
+        // A cancellation is the user's, not the app's failure.
+        _ => None,
+    };
+    if let (Some(budget), Some(failed)) = (budget, failed)
+        && let Some(note) = budget.record(app, failed)
+    {
+        result.append_error_note(&note);
+    }
+    result
+}
+
+fn run_call(
     request: &ToolRequest,
     config: &RunConfig,
     subagent_depth: u32,
@@ -473,6 +513,143 @@ mod tests {
         assert_eq!(results[1].status, ToolStatus::Completed);
         let output = results[1].output.as_deref().unwrap();
         assert!(!output.contains("warning:"), "{output}");
+    }
+
+    fn run_turn_call(
+        thread_store: &ExtensionData,
+        turn_store: &ExtensionData,
+        args: Value,
+        cancel: &CancelToken,
+    ) -> ToolResult {
+        let service = thread_store.get::<ComputerUseService>().unwrap();
+        let budget = crate::computer_use::budget::FailureBudget::for_turn(turn_store);
+        let call = request(args, None);
+        let mut invocation = crate::tool_invocation::ToolInvocation {
+            requested: call.clone(),
+            effective: call,
+            action: Some(ActionKind::Computer),
+            approval_preview: None,
+        };
+        if let Err(error) = crate::computer_use::prepare::prepare_invocation_with_budget(
+            &mut invocation,
+            &flash_config(),
+            &service,
+            Some(&budget),
+        ) {
+            return ToolResult::failed_before_start(&invocation.effective, error, None);
+        }
+        execute(
+            &invocation.effective,
+            &flash_config(),
+            0,
+            RuntimeExtensionStores::new(thread_store, turn_store),
+            Path::new("/"),
+            cancel,
+        )
+    }
+
+    #[test]
+    fn a_stopped_app_is_refused_without_reaching_the_driver_until_the_next_turn() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let bad_click = json!({"action":"click", "app":"TextEdit", "target":{"element":999}});
+        let turn = ExtensionData::new("turn-1");
+        let results: Vec<_> = (0..6)
+            .map(|_| run_turn_call(&thread_store, &turn, bad_click.clone(), &CancelToken::new()))
+            .collect();
+        assert!(
+            results[2]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("has failed 3 times in a row"),
+            "{:?}",
+            results[2].error
+        );
+        assert!(
+            results[5]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Orca stopped computer use on com.apple.TextEdit"),
+            "{:?}",
+            results[5].error
+        );
+        let actions_before = launcher.desktop(|desktop| desktop.actions_on("com.apple.TextEdit"));
+        // A click that would succeed: if it reached the driver, the action count would grow.
+        let good_click = json!({"action":"click", "app":"TextEdit", "target":{"element":1}});
+        let refused = run_turn_call(&thread_store, &turn, good_click, &CancelToken::new());
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Orca stopped computer use"),
+            "{:?}",
+            refused.error
+        );
+        assert_eq!(
+            launcher.desktop(|desktop| desktop.actions_on("com.apple.TextEdit")),
+            actions_before
+        );
+        drop(turn);
+        let next = ExtensionData::new("turn-2");
+        let observed = run_turn_call(
+            &thread_store,
+            &next,
+            json!({"action":"observe", "app":"TextEdit"}),
+            &CancelToken::new(),
+        );
+        assert_eq!(observed.status, ToolStatus::Completed);
+    }
+
+    #[test]
+    fn budget_counts_each_app_separately_and_ignores_cancellation() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit_and_calculator());
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let turn = ExtensionData::new("turn");
+        let bad = |app: &str| json!({"action":"click", "app":app, "target":{"element":999}});
+        for _ in 0..2 {
+            run_turn_call(&thread_store, &turn, bad("TextEdit"), &CancelToken::new());
+            run_turn_call(&thread_store, &turn, bad("Calculator"), &CancelToken::new());
+        }
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        let skipped = run_turn_call(&thread_store, &turn, bad("TextEdit"), &cancelled);
+        assert_eq!(skipped.status, ToolStatus::Cancelled);
+        let third = run_turn_call(&thread_store, &turn, bad("TextEdit"), &CancelToken::new());
+        assert!(
+            third
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("com.apple.TextEdit has failed 3 times"),
+            "{:?}",
+            third.error
+        );
+    }
+
+    #[test]
+    fn a_failure_before_the_app_resolves_counts_under_the_name_the_model_used() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let turn = ExtensionData::new("turn");
+        let missing = json!({"action":"observe", "app":"TextEditt"});
+        let results: Vec<_> = (0..3)
+            .map(|_| run_turn_call(&thread_store, &turn, missing.clone(), &CancelToken::new()))
+            .collect();
+        assert!(
+            results[2]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("texteditt has failed 3 times"),
+            "{:?}",
+            results[2].error
+        );
     }
 
     #[test]
@@ -916,6 +1093,9 @@ mod tests {
             json!({"action":"type", "app":"TextEdit", "target":{"element":14}, "text":"secret"}),
             Some("com.apple.TextEdit"),
         );
+        // A new turn: a third failure in a row would carry the failure budget's hint.
+        let next_turn = ExtensionData::new("turn-2");
+        let stores = RuntimeExtensionStores::new(&thread_store, &next_turn);
         let result = execute(&secure, &config, 0, stores, Path::new("/"), &cancel);
         assert_eq!(
             result.error.as_deref(),

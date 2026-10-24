@@ -1069,10 +1069,14 @@ impl ToolExecutionActor {
                 )
                 .and_then(|()| crate::computer_use::service(thread_store, cwd, config))
                 .and_then(|service| {
-                    crate::computer_use::prepare::prepare_invocation(
+                    let budget = extension_stores.map(|stores| {
+                        crate::computer_use::budget::FailureBudget::for_turn(stores.turn_store())
+                    });
+                    crate::computer_use::prepare::prepare_invocation_with_budget(
                         &mut invocation,
                         config,
                         &service,
+                        budget.as_deref(),
                     )
                 })
                 .and_then(|()| {
