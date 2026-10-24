@@ -10062,8 +10062,9 @@ fn cold_recovery_thread_config_fingerprint(
 }
 
 /// New ToolApproval checkpoints also attest that recording verified the
-/// actor can restore the approved external-tool definition. Older approvals
-/// lack that proof and must fail closed even with an unchanged app version
+/// actor can restore the approved tool definition and that it is not MCP.
+/// Older approvals lack that proof (v2 admitted MCP and absent definitions)
+/// and must fail closed even with an unchanged app version
 /// and actor config. Keep this epoch separate from permission/continuation
 /// fingerprints so only old ToolApproval checkpoints become stale.
 fn cold_recovery_tool_approval_config_fingerprint(
@@ -10071,7 +10072,7 @@ fn cold_recovery_tool_approval_config_fingerprint(
     snapshot: &surface::SurfaceSnapshot,
 ) -> surface::Sha256Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"orca-cold-recovery-tool-approval-definition-v2\0");
+    hasher.update(b"orca-cold-recovery-tool-approval-definition-v3\0");
     hasher.update(cold_recovery_thread_config_fingerprint(config, snapshot).as_bytes());
     surface::Sha256Digest::new(hasher.finalize().into())
 }

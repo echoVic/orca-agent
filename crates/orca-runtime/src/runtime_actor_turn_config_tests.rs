@@ -234,6 +234,7 @@ fn record_legacy_turn_tool_approval(
     active: &mut ActiveOperation,
     fence: surface::SurfaceOperationFence,
     request: &ToolRequest,
+    fingerprint: surface::Sha256Digest,
 ) {
     let snapshot = actor.resident_surface.coordinator.state().snapshot();
     let tool = actor
@@ -253,7 +254,7 @@ fn record_legacy_turn_tool_approval(
         interaction_id.clone(),
         fence.clone(),
         interaction_request.clone(),
-        cold_recovery_thread_config_fingerprint(&actor.config, snapshot),
+        fingerprint,
         surface::DurableInteractionContinuationIntent::ToolInvocation(intent),
     )
     .unwrap();
@@ -288,8 +289,34 @@ async fn cold_recovery_settles_approval_when_actor_cannot_restore_turn_tool_defi
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cold_recovery_fails_closed_for_mcp_tool_approvals() {
+    assert_cold_recovery_turn_tool_approval(&[
+        ("deploy", "mcp"),
+        ("ops__deploy", "mcp"),
+        ("mcp__ops__deploy", "mcp"),
+        ("mcp__my_server__delete_repo", "mcp identical external"),
+    ])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_recovery_fails_closed_when_external_definition_is_missing_from_both_configs() {
+    assert_cold_recovery_turn_tool_approval(&[("unknown_tool", "absent from both")]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_recovery_keeps_builtin_tool_approvals_restartable() {
+    assert_cold_recovery_turn_tool_approval(&[("bash", "builtin")]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cold_recovery_rejects_legacy_approval_without_turn_tool_definition_proof() {
     assert_cold_recovery_turn_tool_approval(&[("turn_tool", "legacy different command")]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_recovery_rejects_legacy_mcp_approval_without_definition_proof() {
+    assert_cold_recovery_turn_tool_approval(&[("mcp__ops__deploy", "legacy mcp")]).await;
 }
 
 async fn assert_cold_recovery_turn_tool_approval(cases: &[(&str, &str)]) {
@@ -314,7 +341,7 @@ async fn assert_cold_recovery_turn_tool_approval(cases: &[(&str, &str)]) {
         active.config.external_tools[0].name = tool_name.into();
         // Keep the same name and action: those alone cannot prove that cold
         // recovery would run the definition whose approval was requested.
-        if actor_definition != "missing" {
+        if !matches!(actor_definition, "missing" | "mcp" | "legacy mcp" | "absent from both" | "builtin") {
             let mut definition = active.config.external_tools[0].clone();
             match actor_definition {
                 "different command" | "legacy different command" => {
@@ -323,13 +350,28 @@ async fn assert_cold_recovery_turn_tool_approval(cases: &[(&str, &str)]) {
                 "different schema" => {
                     definition.schema = serde_json::json!({"type": "object", "properties": {"other": {"type": "string"}}})
                 }
-                "identical" => {}
+                "identical" | "mcp identical external" => {}
                 _ => unreachable!(),
             }
             actor.config.external_tools = vec![definition];
         }
         let mut recovery_config = actor.config.clone();
         let response = turn_config_response(&active);
+        if actor_definition.contains("mcp") {
+            actor.handle.mcp_registry = orca_mcp::McpRegistry::from_tools_for_test(vec![
+                orca_core::mcp_types::McpTool {
+                    server: "ops".into(),
+                    name: "deploy".into(),
+                    schema_name: tool_name.into(),
+                    description: Some("Definition supplied by the connected server".into()),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                    read_only: false,
+                },
+            ]);
+        }
+        if matches!(actor_definition, "mcp" | "legacy mcp" | "absent from both" | "builtin") {
+            active.config.external_tools.clear();
+        }
         let fence = active.surface_operation.clone().unwrap();
         let response = actor
             .commit_surface_provider_response(&mut active, fence.clone(), &response)
@@ -338,8 +380,23 @@ async fn assert_cold_recovery_turn_tool_approval(cases: &[(&str, &str)]) {
             panic!("expected provider tool call");
         };
         let (reply, resolution) = mpsc::sync_channel(1);
-        if actor_definition == "legacy different command" {
-            record_legacy_turn_tool_approval(&mut actor, &mut active, fence.clone(), request);
+        if actor_definition.starts_with("legacy") {
+            let snapshot = actor.resident_surface.coordinator.state().snapshot();
+            let mut fingerprint = cold_recovery_thread_config_fingerprint(&actor.config, snapshot);
+            if actor_definition == "legacy mcp" {
+                // PR #146's v2 writer incorrectly attested MCP definitions.
+                let mut hasher = Sha256::new();
+                hasher.update(b"orca-cold-recovery-tool-approval-definition-v2\0");
+                hasher.update(fingerprint.as_bytes());
+                fingerprint = surface::Sha256Digest::new(hasher.finalize().into());
+            }
+            record_legacy_turn_tool_approval(
+                &mut actor,
+                &mut active,
+                fence.clone(),
+                request,
+                fingerprint,
+            );
         } else {
             actor.request_surface_tool_approval(
                 &mut active,
@@ -360,6 +417,16 @@ async fn assert_cold_recovery_turn_tool_approval(cases: &[(&str, &str)]) {
             resolution.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
+        let recorded_disposition = actor
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .interactions
+            .last()
+            .unwrap()
+            .recovery_disposition
+            .clone();
         let interaction_id = actor
             .resident_surface
             .coordinator
@@ -371,6 +438,17 @@ async fn assert_cold_recovery_turn_tool_approval(cases: &[(&str, &str)]) {
             .interaction_id
             .clone();
         recovery_config.history_mode = HistoryMode::Resume(actor.handle.thread_id.clone());
+        let mut recovery_request =
+            RuntimeThreadStartRequest::new(recovery_config, "recover turn approval");
+        if actor_definition.contains("mcp") {
+            // A reconnect may advertise a changed definition under the same
+            // runtime name without changing any part of the actor config.
+            let mut tools = actor.handle.mcp_registry.tools();
+            tools[0].description = Some("Changed after reconnect".into());
+            tools[0].input_schema = serde_json::json!({"type": "object", "properties": {"changed": {"type": "boolean"}}});
+            recovery_request = recovery_request
+                .with_mcp_registry(orca_mcp::McpRegistry::from_tools_for_test(tools));
+        }
         active.generation.join.await.unwrap();
         // Drop the live owner without answering or committing a terminal;
         // resume the recorded ledger with a new cold owner below.
@@ -379,7 +457,7 @@ async fn assert_cold_recovery_turn_tool_approval(cases: &[(&str, &str)]) {
         drop(actor);
         let host = RuntimeHost::start_with_executor(Arc::new(OutputWriterExecutor)).unwrap();
         let recovered = host
-            .start_thread(recovery_config, "recover turn approval")
+            .start_thread_with_request(recovery_request)
             .unwrap();
         let snapshot = fresh_surface_attachment(&recovered.surface())
             .baseline
@@ -391,12 +469,13 @@ async fn assert_cold_recovery_turn_tool_approval(cases: &[(&str, &str)]) {
             .unwrap();
         let operation =
             ThreadActor::surface_operation_record(&snapshot, &fence.operation_id).unwrap();
-        if actor_definition == "identical" {
+        if matches!(actor_definition, "identical" | "builtin") {
             assert!(matches!(
                 interaction.lifecycle,
                 surface::SurfaceInteractionLifecycle::Requested
             ));
             assert!(operation.terminal.is_none());
+            assert!(recorded_disposition.restartable_tool_approval_capsule().unwrap().is_some());
         } else {
             assert!(
                 matches!(
@@ -421,6 +500,14 @@ async fn assert_cold_recovery_turn_tool_approval(cases: &[(&str, &str)]) {
                 "{tool_name} / {actor_definition}: {:?}",
                 operation.terminal
             );
+        }
+        if !actor_definition.starts_with("legacy")
+            && !matches!(actor_definition, "identical" | "builtin")
+        {
+            assert!(matches!(
+                recorded_disposition,
+                surface::InteractionUnavailableDisposition::FailOperation
+            ));
         }
         let tool = snapshot
             .tools

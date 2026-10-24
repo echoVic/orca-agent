@@ -1287,24 +1287,28 @@ impl ThreadActor {
             let interaction_id =
                 surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                     .expect("generated UUID is v7");
-            // The capsule stores the call, not its external-tool definition.
-            // Cold dispatch and its fingerprint use the actor config, so only
-            // restart when that config resolves the same approved definition.
-            // Like the tool registry, the first external definition wins.
+            // The capsule stores the call, not its tool definition. MCP
+            // definitions can change on reconnect without changing the config
+            // fingerprint, so any name resolved by that registry is live-only.
+            // Cold external dispatch uses the actor config's first definition;
+            // it must exist and match the executing turn's first definition.
             let name = request.name.as_str();
-            let can_restore_tool_definition = orca_tools::registry::default_tool_registry()
-                .resolve(name)
-                .is_some()
-                || active
-                    .config
-                    .external_tools
-                    .iter()
-                    .find(|tool| tool.name == name)
-                    == self
+            let can_restore_tool_definition = self.handle.mcp_registry.resolve_tool(name).is_none()
+                && (orca_tools::registry::default_tool_registry()
+                    .resolve(name)
+                    .is_some()
+                    || active
                         .config
                         .external_tools
                         .iter()
-                        .find(|tool| tool.name == name);
+                        .find(|tool| tool.name == name)
+                        .is_some_and(|turn_tool| {
+                            self.config
+                                .external_tools
+                                .iter()
+                                .find(|tool| tool.name == name)
+                                == Some(turn_tool)
+                        }));
             let recovery_disposition = if can_restore_tool_definition {
                 let execution_context_fingerprint =
                     cold_recovery_tool_approval_config_fingerprint(&self.config, &snapshot);
