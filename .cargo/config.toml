@@ -1,0 +1,4 @@
+[env]
+# Tests and the binaries they spawn stay offline, including release builds.
+# A test-specific local URL or an explicit caller setting overrides this default.
+ORCA_PRICING_URL = "off"

@@ -101,7 +101,15 @@ pub(crate) fn run_agent_loop(
             cancelled_agent_loop(),
         );
     }
-    let setup = RuntimeTurnSetupStep::new().prepare(
+    let setup = RuntimeTurnSetupStep::new(
+        loop_state
+            .runtime
+            .extensions
+            .extension_context()
+            .stores()
+            .thread_store(),
+    )
+    .prepare(
         config,
         cwd,
         subagent_depth,

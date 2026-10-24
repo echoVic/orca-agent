@@ -137,8 +137,18 @@ pub(crate) fn discover_agents(config: &RunConfig, cwd: &Path, mcp: &McpRegistry)
     AgentCatalog::discover(cwd, &tools, &models)
 }
 
+pub(crate) fn session_agent_catalog(
+    config: &RunConfig,
+    cwd: &Path,
+    mcp: &McpRegistry,
+    session_tools: &crate::extension::ExtensionData,
+) -> std::sync::Arc<AgentCatalog> {
+    session_tools.get_or_init(|| discover_agents(config, cwd, mcp))
+}
+
 /// Called on the admitting thread, before detached/threaded execution can observe changed files.
 pub(crate) fn freeze_agent_request(
+    catalog: Option<std::sync::Arc<AgentCatalog>>,
     config: &RunConfig,
     cwd: &Path,
     mcp: &McpRegistry,
@@ -154,7 +164,7 @@ pub(crate) fn freeze_agent_request(
         return Ok(()); // Resume obtains its snapshot exclusively from the continuation.
     }
     validate_name(name)?;
-    let catalog = discover_agents(config, cwd, mcp);
+    let catalog = catalog.unwrap_or_else(|| std::sync::Arc::new(discover_agents(config, cwd, mcp)));
     let mut definition = catalog.agents.get(name).cloned().ok_or_else(|| {
         let diagnostics = catalog
             .diagnostics

@@ -111,7 +111,7 @@
 
 - 一个进程第一次创建会话时（`InteractiveSession` 的内部构造函数，所有入口都经过这里），会检查一次是否需要刷新，用进程级 `Once` 保证只检查一次。
 - 只有同时满足以下条件才刷新：配置 `pricing.refresh` 为 true（默认就是 true）；当前 URL 没有缓存，或年龄不在 `[0, 24 小时)` 内（未来时间戳也必须刷新）。不同来源的缓存不影响新 URL 的刷新时效，也不向新来源发送旧 ETag。
-- 开发构建不刷新，判断方式和 update check 的 `is_dev_build_run()` 相同（debug 构建，或可执行文件在 `target/` 下）。例外是设置了 `ORCA_PRICING_URL`：测试用它把请求指到本地 fixture。因此测试永远不会访问外网，也不会写 `~/.orca`。
+- 开发构建不刷新，判断方式和 update check 的 `is_dev_build_run()` 相同（debug 构建，或可执行文件在 `target/` 下）。例外是 `ORCA_PRICING_URL` 指定了刷新 URL：测试用它请求本地 fixture。`ORCA_PRICING_URL=off`（大小写不敏感）在任何构建中都禁止刷新，详见 §7。
 - 刷新在后台线程里进行，不阻塞启动，也不阻塞任何 turn。进程在刷新完成前退出也没关系，下次再试。
 - 子代理 worker 也会走到这里。缓存通常已经被父进程刷新过，所以 worker 一般不会去拉。
 
@@ -268,4 +268,4 @@ refresh = false   # 关闭每天一次的 models.dev 刷新；默认为 true
 - 人民币计费账户实际按人民币价格表扣费，美元价格表按汇率换算后大约贵 5%。本次只估算美元。
 - 自定义 endpoint 在没有配置覆盖时，仍按 DeepSeek 官方价估算，与现在的行为相同。
 
-- release 模式测试若使用不在 `target/` 下的自定义 `--target-dir`，开发构建保护可能无法阻止访问 models.dev；CI 使用 `target/` 下的 debug 构建。
+- `ORCA_PRICING_URL=off`（大小写不敏感）在 debug、release 和自定义 `--target-dir` 构建中都禁止刷新。仓库 `.cargo/config.toml` 的 `[env]` 默认设置为 `off`，cargo test、cargo nextest 及它们启动的 `orca` 子进程继承该值；不会依赖可执行文件是否位于 `target/`。测试若需刷新，显式设置自己的本地 `ORCA_PRICING_URL` 即可覆盖默认值。用户安装的 release 二进制仍按配置刷新；需要离线运行时也可设置该开关。

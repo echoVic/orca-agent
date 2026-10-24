@@ -18,7 +18,8 @@ use super::rates::Rates;
 
 pub const DEFAULT_URL: &str = "https://models.dev/api.json";
 /// Replaces [`DEFAULT_URL`]; also lets a development build refresh, which is
-/// how tests point it at a local fixture.
+/// how tests point it at a local fixture. `off` (case-insensitive) disables
+/// refresh in every build; repository Cargo processes default to `off`.
 pub const URL_ENV: &str = "ORCA_PRICING_URL";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_BODY_BYTES: u64 = 32 * 1024 * 1024;
@@ -202,6 +203,12 @@ pub fn refresh_url(
     now: DateTime<Utc>,
 ) -> Option<String> {
     if !enabled {
+        return None;
+    }
+    if url_override
+        .as_deref()
+        .is_some_and(|url| url.trim().eq_ignore_ascii_case("off"))
+    {
         return None;
     }
     let url_override = url_override.filter(|url| !url.trim().is_empty());
@@ -628,6 +635,19 @@ mod tests {
                 None,
                 "{fetched_at}"
             );
+        }
+    }
+
+    #[test]
+    fn off_override_disables_refresh_in_every_build() {
+        for value in ["off", "OFF", "Off", "oFf"] {
+            for dev in [false, true] {
+                assert_eq!(
+                    refresh_url(true, Some(value.into()), dev, None, now()),
+                    None,
+                    "{value}, dev={dev}"
+                );
+            }
         }
     }
 

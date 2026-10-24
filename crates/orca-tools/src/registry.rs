@@ -756,21 +756,21 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
             "subagent",
-            "Launch or resume a child agent for a complex, multi-step subtask. A resumed call appends the new prompt to the same child conversation and inherits the source subagent type, model, isolation, cwd, and worktree; explicitly conflicting overrides fail closed. Completion returns a concise result summary with a resume hint for continuing the child conversation.",
+            "Launch/resume a bounded multi-step child; quickly returns task_id (queued means accepted: do not resubmit). Continue independent work; task_wait for needed results, task_read_output for evidence, subagent_message for guidance, task_stop to cancel. Wait timeouts do not stop execution. Completion: concise summary and resume hint. No mode parameter.",
             json!({
                 "type": "object",
                 "properties": {
                     "description": {
                         "type": "string",
-                        "description": "Short 3-8 word label for the delegated task"
+                        "description": "3-8 word task label."
                     },
                     "prompt": {
                         "type": "string",
-                        "description": "Full standalone instructions for the child agent: the goal, the context it cannot infer, the scope, what it may do, and what to return."
+                        "description": "Standalone goal, context, scope, permissions, and expected report."
                     },
                     "subagent_type": {
                         "type": "string",
-                        "description": "Built-in role identifier (see the built-in roles list in this description) or an ASCII custom identifier from the available agent catalog. Aliases are accepted. Unknown or invalid custom agents fail closed. Omit when resuming to inherit the frozen source definition."
+                        "description": "Catalog role/alias or ASCII custom id; invalid/unknown agents fail closed. Omit on resume to inherit the frozen definition."
                     },
                     "model": {
                         "type": "string",
@@ -779,25 +779,25 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                             "deepseek-flash",
                             "deepseek-v4-pro"
                         ],
-                        "description": "Optional model override for this child agent. auto uses Orca's router, flash is faster, pro is stronger for deep reasoning."
+                        "description": "Override: auto routes, flash favors speed, pro deep reasoning."
                     },
                     "isolation": {
                         "type": "string",
                         "enum": ["none", "worktree"],
-                        "description": "none uses the current checkout. worktree runs the child in a detached git worktree and preserves it if the child leaves file changes."
+                        "description": "none: current checkout. worktree: detached git worktree, preserved if files change."
                     },
                     "schema": {
                         "type": "object",
-                        "description": "Optional JSON Schema subset for validating the child agent's final output. Supports type, required, and properties."
+                        "description": "Final-output validation: type, required, properties. Only for a downstream machine requiring this structure; omit for ordinary human-readable evidence reports."
                     },
                     "resume_from": {
                         "type": "string",
-                        "description": "Optional continuation id returned by a prior subagent completion, or a compatible agent_id. Resuming appends prompt to the same child conversation and inherits the source subagent_type, model, isolation, cwd, and worktree; explicitly conflicting values fail closed."
+                        "description": "Prior continuation id/compatible agent_id: append prompt to same conversation, inherit subagent_type/model/isolation/cwd/worktree; conflicting overrides fail closed."
                     },
                     "deadline_ms": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Optional absolute execution deadline in milliseconds from now. Unlike a wait, it includes queueing and suspension time, it is never reset by a resume, and descendants cannot outlive it. Omit for no deadline."
+                        "description": "Deadline in ms from now, including queueing/suspension; never reset by a resume. Descendants cannot outlive it; omit for no deadline."
                     }
                 },
                 "required": ["description", "prompt"]
@@ -1011,13 +1011,13 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
             "WorkflowDraft",
-            "Create a previewable dynamic workflow draft from a JavaScript workflow script without launching it. Use this before Workflow when the user should review phases and raw script first.",
+            "Preview phases and raw JavaScript before launch; use Workflow.script syntax.",
             json!({
                 "type": "object",
                 "properties": {
                     "script": {
                         "type": "string",
-                        "description": "Self-contained workflow script to store as a preview draft. The draft is not executed until launched through Workflow with draftId."
+                        "description": "Self-contained script to preview without running; launch with Workflow(draftId)."
                     }
                 },
                 "required": ["script"]
@@ -1032,40 +1032,40 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
             "WorkflowDraftAction",
-            "Apply a preview decision to a workflow draft. Use run to launch an approved draft, edit to replace the draft script and re-render metadata, save to persist it as a reusable workflow command, or cancel to discard it.",
+            "Decide a preview: run approved draft; edit script and re-render metadata; save reusable command; cancel/discard.",
             json!({
                 "type": "object",
                 "properties": {
                     "draftId": {
                         "type": "string",
-                        "description": "Identifier returned by WorkflowDraft."
+                        "description": "WorkflowDraft id."
                     },
                     "action": {
                         "type": "string",
                         "enum": ["run", "edit", "save", "cancel"],
-                        "description": "Decision to apply to the draft preview."
+                        "description": "Preview decision."
                     },
                     "script": {
                         "type": "string",
-                        "description": "Replacement JavaScript workflow script for action=edit."
+                        "description": "edit: replacement JavaScript."
                     },
                     "saveAs": {
                         "type": "string",
-                        "description": "Reusable workflow name for action=save. Defaults to the draft meta name."
+                        "description": "save: reusable name; defaults to meta.name."
                     },
                     "scope": {
                         "type": "string",
                         "enum": ["project", "user"],
-                        "description": "Where to save reusable workflows. Project writes .orca/workflows; user writes the workflows directory of the Orca home (~/.orca/workflows unless ORCA_HOME is set)."
+                        "description": "Save scope: project=.orca/workflows; user=Orca home/workflows (~/.orca/workflows; ORCA_HOME overrides)."
                     },
                     "args": {
                         "type": "object",
-                        "description": "Structured args passed when action=run."
+                        "description": "run: structured args."
                     },
                     "tokenBudget": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Optional run-level token budget passed to the workflow."
+                        "description": "Run token budget; see Workflow.tokenBudget."
                     }
                 },
                 "required": ["draftId", "action"]
@@ -1080,46 +1080,46 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
             "Workflow",
-            "Launch a dynamic workflow: a JavaScript script that orchestrates many subagents in the background. The tool returns task metadata immediately; the final report is delivered later as a task notification.",
+            "Run background JavaScript orchestration. Returns task metadata immediately; final report arrives as a task notification.",
             json!({
                 "type": "object",
                 "properties": {
                     "script": {
                         "type": "string",
-                        "description": "Self-contained workflow script. Auto mode uses export const meta = { name, description, phases: [{ name, tasks: [{ prompt: \"...\" }] }] }; every task must be an object with prompt. Hand-written mode uses string phase names plus top-level phase()/agent() calls and export default. Do not export `run` or helper functions; only export const meta, phases, args, or default."
+                        "description": "Self-contained script with export const meta = { name, description, phases }. Exactly one shape: auto phases: [{ name, tasks: [{ prompt: \"...\" }] }] (each task an object with non-empty prompt); or hand-written phases: [\"phase-name\"] plus top-level await phase(\"phase-name\", async () => agent(\"prompt\")), then export default result. Do not export `run`, `async function run`, helper functions, or arbitrary symbols; only export const meta, phases, args, or default."
                     },
                     "name": {
                         "type": "string",
-                        "description": "Name of a predefined workflow from .orca/workflows/ or the user workflow directory."
+                        "description": "Saved name in .orca/workflows/ or user workflow directory."
                     },
                     "description": {
                         "type": "string",
-                        "description": "Compatibility field ignored by the runtime; use meta.description in the script."
+                        "description": "Ignored compatibility field; use meta.description."
                     },
                     "title": {
                         "type": "string",
-                        "description": "Compatibility field ignored by the runtime; use meta.name in the script."
+                        "description": "Ignored compatibility field; use meta.name."
                     },
                     "args": {
                         "type": "object",
-                        "description": "Structured input exposed to the workflow script as the global args value."
+                        "description": "Structured input; script global args."
                     },
                     "tokenBudget": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Optional run-level token budget. Each child reserves available capacity before it starts, settled usage is reconciled after completion, and the result reports total, spent, and remaining."
+                        "description": "Run token budget: each child reserves available capacity before starting (no double claims), reconciles settled usage on completion. Report: total, spent, remaining."
                     },
                     "draftId": {
                         "type": "string",
-                        "description": "Identifier of a previewed workflow draft to launch."
+                        "description": "Previewed draft to launch."
                     },
                     "scriptPath": {
                         "type": "string",
-                        "description": "Path to a workflow script file. Takes precedence over script and name."
+                        "description": "Script file; precedes script/name."
                     },
                     "resumeFromRunId": {
                         "type": "string",
-                        "description": "Run id of a prior same-session workflow invocation to resume from."
+                        "description": "Resume a prior same-session run id."
                     }
                 },
                 "required": []

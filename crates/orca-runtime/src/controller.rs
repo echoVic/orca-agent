@@ -369,11 +369,12 @@ impl<'a> ThreadTurnExecutor<'a> {
         session: &'a mut InteractiveSession,
         lifecycle: &'a mut RuntimeSessionLifecycle,
     ) -> Self {
+        let thread_extensions = session.runtime_extensions(lifecycle.run_id());
         Self {
             config,
             session,
             lifecycle,
-            thread_extensions: None,
+            thread_extensions: Some(thread_extensions),
             turn_extension_id: None,
         }
     }
@@ -2066,6 +2067,10 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
     thread_extensions: Option<Arc<ExtensionData>>,
     turn_extension_id: Option<String>,
 ) -> io::Result<ThreadTurnOutcome> {
+    let thread_extensions =
+        Some(thread_extensions.unwrap_or_else(|| session.runtime_extensions(lifecycle.run_id())));
+    let turn_extension_id =
+        Some(turn_extension_id.unwrap_or_else(|| request.turn_id().as_str().to_string()));
     drain_terminal_notifications(session, thread_extensions.as_deref());
     if thread_extensions
         .as_ref()
@@ -2389,6 +2394,42 @@ mod tests {
             desktop_notifications: false,
             terminal_notifications: false,
             auto_memory: false,
+        }
+    }
+
+    #[test]
+    fn public_session_turns_keep_the_first_advertised_agent_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("agents")).unwrap();
+        let agent = home.path().join("agents/audit.md");
+        let write_agent = |description| {
+            std::fs::write(&agent, format!(
+            "---\nname: audit\ndescription: {description}\ntools: [read_file]\n---\nReview.\n"
+        )).unwrap()
+        };
+        write_agent("Before edit");
+        let config = RunConfig {
+            cwd: Some(cwd.path().to_path_buf()),
+            ..RunConfig::default()
+        };
+        let mut session = InteractiveSession::new_with_preloaded(&config, "catalog", None).unwrap();
+        let mut lifecycle = RuntimeSessionLifecycle::new("public-session");
+        for description in ["Before edit", "After edit"] {
+            write_agent(description);
+            let mut executor = ThreadTurnExecutor::new(&config, &mut session, &mut lifecycle);
+            assert_eq!(
+                executor.run("hello", Vec::new()).unwrap(),
+                RunStatus::Success
+            );
+            let catalog = executor
+                .thread_extensions
+                .as_ref()
+                .expect("session turns own a persistent tool catalog")
+                .get::<orca_core::subagent_types::agent_definition::AgentCatalog>()
+                .expect("the real agent loop advertised a catalog");
+            assert_eq!(catalog.agents["audit"].description, "Before edit");
         }
     }
 

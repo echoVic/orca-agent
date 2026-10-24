@@ -1266,7 +1266,12 @@ impl ThreadActor {
                             | surface::OperationOrigin::JsonlThreadTurn { .. }
                     )
                 });
-            let tool = Self::surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
+            let tool = self.surface_tool_for_runtime_request(
+                snapshot,
+                &fence,
+                &request,
+                &active.config.external_tools,
+            )?;
             let authority = Self::surface_authority_for_tool(&snapshot, &fence, &tool)?;
             let intent = surface::ToolInvocationIntent::before_invocation(tool, authority.clone())
                 .with_computer_approval(approval.clone());
@@ -1282,19 +1287,44 @@ impl ThreadActor {
             let interaction_id =
                 surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                     .expect("generated UUID is v7");
-            let execution_context_fingerprint =
-                cold_recovery_thread_config_fingerprint(&self.config, &snapshot);
-            let capsule = surface::DurableInteractionContinuationCapsule::try_new_restartable(
-                interaction_id.clone(),
-                fence.clone(),
-                interaction_request.clone(),
-                execution_context_fingerprint,
-                surface::DurableInteractionContinuationIntent::ToolInvocation(intent),
-            )
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            let recovery_disposition =
+            // The capsule stores the call, not its tool definition. MCP
+            // definitions can change on reconnect without changing the config
+            // fingerprint, so any name resolved by that registry is live-only.
+            // Cold external dispatch uses the actor config's first definition;
+            // it must exist and match the executing turn's first definition.
+            let name = request.name.as_str();
+            let can_restore_tool_definition = self.handle.mcp_registry.resolve_tool(name).is_none()
+                && (orca_tools::registry::default_tool_registry()
+                    .resolve(name)
+                    .is_some()
+                    || active
+                        .config
+                        .external_tools
+                        .iter()
+                        .find(|tool| tool.name == name)
+                        .is_some_and(|turn_tool| {
+                            self.config
+                                .external_tools
+                                .iter()
+                                .find(|tool| tool.name == name)
+                                == Some(turn_tool)
+                        }));
+            let recovery_disposition = if can_restore_tool_definition {
+                let execution_context_fingerprint =
+                    cold_recovery_tool_approval_config_fingerprint(&self.config, &snapshot);
+                let capsule = surface::DurableInteractionContinuationCapsule::try_new_restartable(
+                    interaction_id.clone(),
+                    fence.clone(),
+                    interaction_request.clone(),
+                    execution_context_fingerprint,
+                    surface::DurableInteractionContinuationIntent::ToolInvocation(intent),
+                )
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 surface::InteractionUnavailableDisposition::restartable_tool_approval(&capsule)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            } else {
+                surface::InteractionUnavailableDisposition::FailOperation
+            };
             let Some((interaction_id, record, route, revision)) = self
                 .commit_surface_effect_interaction_request(
                     active,
