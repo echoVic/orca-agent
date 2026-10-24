@@ -243,7 +243,7 @@ pub(super) fn run_app_shortcut(
         thread::sleep(crate::timing::ACTIVATION_SETTLE);
         check_abort(aborted)?;
         // A window that appeared meanwhile has an unobserved focus: observe it first.
-        if !application.elements("AXWindows")?.is_empty() {
+        if super::app_has_window(application)? {
             return Err(error(
                 ErrorKind::Stale,
                 format!("{app_name} now has a window; observe it before sending keys"),
@@ -545,13 +545,21 @@ pub(super) fn raise_with_fallback(
     ))
 }
 
+/// Only the focused window counts as in front: a main window can sit behind a
+/// focused dialog of the same app, which would then receive the input.
+fn accepts_unraised(_is_main: bool, is_focused: bool) -> bool {
+    is_focused
+}
+
 fn window_in_front(window: &AxElement, application: &AxElement) -> bool {
-    window.attribute_bool("AXMain").ok().flatten() == Some(true)
-        || application
+    accepts_unraised(
+        window.attribute_bool("AXMain").ok().flatten() == Some(true),
+        application
             .attribute_element("AXFocusedWindow")
             .ok()
             .flatten()
-            .is_some_and(|focused| focused == *window)
+            .is_some_and(|focused| focused == *window),
+    )
 }
 fn finish_foreground(
     result: Result<(), DriverError>,
@@ -742,6 +750,14 @@ mod raise_tests {
             ErrorKind::Failed,
             "Accessibility AXRaise failed: AXError(-25205)",
         ))
+    }
+
+    #[test]
+    fn a_main_window_behind_a_focused_dialog_is_not_in_front() {
+        // Same-app dialog B is focused over observed main window A: input would reach B.
+        assert!(!accepts_unraised(true, false));
+        assert!(accepts_unraised(false, true));
+        assert!(accepts_unraised(true, true));
     }
 
     #[test]

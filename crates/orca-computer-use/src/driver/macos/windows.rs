@@ -1,6 +1,6 @@
 //! Which windows the model can use: the rule `list_apps`, `launch_app` and the
 //! default-window choice share.
-use crate::protocol::WindowInfo;
+use crate::protocol::{DriverError, ErrorKind, WindowInfo};
 
 /// A layer-0 window as ScreenCaptureKit reports it.
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +68,86 @@ pub(super) struct WindowChoice {
     pub is_main: bool,
     pub usable: bool,
     pub minimized: bool,
+}
+
+/// Picks the AX window (and its capture window) observe and act use: an
+/// explicit id must be a usable window of this app; without one, the usable
+/// main window, else the first usable one, else (nothing usable) the main or
+/// first window as before. Returns (AX index, capture index).
+pub(super) fn choose_window(
+    id: Option<u32>,
+    pid: i32,
+    app_name: &str,
+    captures: &[super::capture::Window],
+    ax: &[AxWindowFacts],
+    main: Option<usize>,
+) -> Result<(usize, usize), DriverError> {
+    let capture_of = |facts: &AxWindowFacts| {
+        captures
+            .iter()
+            .position(|c| c.pid == pid && super::frames_match(facts.frame, c.frame))
+    };
+    if let Some(id) = id {
+        let not_usable = || {
+            super::error(
+                ErrorKind::WindowNotFound,
+                crate::messages::not_usable_window(id, app_name),
+            )
+        };
+        let capture = captures
+            .iter()
+            .position(|c| c.id == id && c.pid == pid)
+            .ok_or_else(not_usable)?;
+        let index = ax
+            .iter()
+            .position(|facts| super::frames_match(facts.frame, captures[capture].frame))
+            .ok_or_else(not_usable)?;
+        let (window, facts) = (&captures[capture], &ax[index]);
+        if !usable(
+            window.on_screen,
+            window.frame,
+            facts.subrole.as_deref(),
+            facts.minimized,
+        ) {
+            return Err(not_usable());
+        }
+        return Ok((index, capture));
+    }
+    if ax.is_empty() {
+        return Err(super::error(
+            ErrorKind::WindowNotFound,
+            crate::messages::no_window(app_name),
+        ));
+    }
+    let choices: Vec<_> = ax
+        .iter()
+        .enumerate()
+        .map(|(index, facts)| WindowChoice {
+            is_main: main == Some(index),
+            usable: capture_of(facts).is_some_and(|c| {
+                usable(
+                    captures[c].on_screen,
+                    captures[c].frame,
+                    facts.subrole.as_deref(),
+                    facts.minimized,
+                )
+            }),
+            minimized: facts.minimized,
+        })
+        .collect();
+    let index = default_window(&choices).unwrap_or(main.unwrap_or(0));
+    let capture = capture_of(&ax[index]).ok_or_else(|| {
+        super::error(
+            ErrorKind::WindowNotFound,
+            "No capture window matches the accessibility window",
+        )
+    })?;
+    Ok((index, capture))
+}
+
+/// An app has a window when AX lists one or names a main window.
+pub(super) fn has_window(ax_windows: usize, main_window: bool) -> bool {
+    ax_windows > 0 || main_window
 }
 
 pub(super) fn default_window(choices: &[WindowChoice]) -> Option<usize> {
@@ -170,6 +250,80 @@ mod tests {
             Some("AXStandardWindow"),
             true
         ));
+    }
+
+    fn window(id: u32, frame: [f64; 4], on_screen: bool) -> super::super::capture::Window {
+        super::super::capture::Window {
+            id,
+            pid: 7,
+            title: format!("w{id}"),
+            frame,
+            scale: 2.0,
+            on_screen,
+        }
+    }
+
+    const DOC: [f64; 4] = [0.0, 0.0, 800.0, 600.0];
+    const BUBBLE: [f64; 4] = [10.0, 1090.0, 138.0, 22.0];
+    const MINI: [f64; 4] = [100.0, 100.0, 500.0, 400.0];
+
+    #[test]
+    fn an_explicit_window_must_be_usable() {
+        let captures = [
+            window(1, DOC, true),
+            window(3, BUBBLE, true),
+            window(4, MINI, false),
+        ];
+        let facts = [
+            ax(DOC, "AXStandardWindow", false),
+            ax(BUBBLE, "AXUnknown", false),
+            ax(MINI, "AXStandardWindow", true),
+        ];
+        assert_eq!(
+            choose_window(Some(1), 7, "App", &captures, &facts, None).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            choose_window(Some(4), 7, "App", &captures, &facts, None).unwrap(),
+            (2, 2)
+        );
+        let bubble = choose_window(Some(3), 7, "App", &captures, &facts, None).unwrap_err();
+        assert_eq!(bubble.message, crate::messages::not_usable_window(3, "App"));
+        let missing = choose_window(Some(9), 7, "App", &captures, &facts, None).unwrap_err();
+        assert_eq!(
+            missing.message,
+            crate::messages::not_usable_window(9, "App")
+        );
+    }
+
+    #[test]
+    fn the_default_window_skips_bubbles_and_falls_back_only_when_nothing_is_usable() {
+        let captures = [window(3, BUBBLE, true), window(1, DOC, true)];
+        let facts = [
+            ax(BUBBLE, "AXUnknown", false),
+            ax(DOC, "AXStandardWindow", false),
+        ];
+        // The bubble is AX's main window, but the document is usable.
+        assert_eq!(
+            choose_window(None, 7, "App", &captures, &facts, Some(0)).unwrap(),
+            (1, 1)
+        );
+        // Only a small window: keep it usable as before rather than refuse the app.
+        let only = [window(5, [0.0, 0.0, 100.0, 40.0], true)];
+        let small = [ax([0.0, 0.0, 100.0, 40.0], "AXUnknown", false)];
+        assert_eq!(
+            choose_window(None, 7, "App", &only, &small, None).unwrap(),
+            (0, 0)
+        );
+        let none = choose_window(None, 7, "App", &[], &[], None).unwrap_err();
+        assert_eq!(none.message, crate::messages::no_window("App"));
+    }
+
+    #[test]
+    fn a_main_window_alone_counts_as_a_window() {
+        assert!(has_window(0, true));
+        assert!(has_window(1, false));
+        assert!(!has_window(0, false));
     }
 
     #[test]

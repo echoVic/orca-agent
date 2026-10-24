@@ -294,6 +294,16 @@ impl ComputerUseService {
             .then_some(warning)
     }
 
+    /// Drops a remembered window that no longer exists, so a call without a
+    /// window falls back to the app's own window choice.
+    pub(crate) fn forget_window(&self, bundle_id: &str) {
+        self.state
+            .lock()
+            .expect("computer-use service lock poisoned")
+            .latest_window
+            .remove(bundle_id);
+    }
+
     pub(crate) fn latest_window(&self, bundle_id: &str) -> Option<u32> {
         self.state
             .lock()

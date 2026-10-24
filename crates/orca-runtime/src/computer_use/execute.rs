@@ -126,6 +126,11 @@ fn run_call(
     }
     let model = config.model.as_deref().unwrap_or(FLASH_MODEL);
     let include_screenshot = config.model.supports_images(model) && accepts_tool_images(model);
+    // An act without a window inherits the latest observed one.
+    let inherited = match &call {
+        ComputerCall::Act { window: None, .. } => service.latest_window(app),
+        _ => None,
+    };
     let driver_request = match &call {
         ComputerCall::ListApps => Request::ListApps,
         ComputerCall::LaunchApp { open, .. } => Request::LaunchApp {
@@ -151,7 +156,7 @@ fn run_call(
             ..
         } => Request::Act(ActParams {
             app: app.into(),
-            window: window.or_else(|| service.latest_window(app)),
+            window: window.or(inherited),
             action: action.clone(),
             foreground_fallback: config.computer_use.foreground_fallback,
             observe_after: *observe_after,
@@ -163,7 +168,22 @@ fn run_call(
     if cancel.is_cancelled() {
         return ToolResult::cancelled_before_start(request, "the turn was cancelled");
     }
-    let reply = service.call(driver_request, timeout);
+    let retry = inherited.map(|_| match &driver_request {
+        Request::Act(params) => Request::Act(ActParams {
+            window: None,
+            ..params.clone()
+        }),
+        other => other.clone(),
+    });
+    let mut reply = service.call(driver_request, timeout);
+    // The inherited window is gone (the app's last window closed): forget it
+    // and let the driver choose, which also reaches app-level shortcuts.
+    if let (Some(retry), Err(CallError::Driver(error))) = (retry, &reply)
+        && error.kind == ErrorKind::WindowNotFound
+    {
+        service.forget_window(app);
+        reply = service.call(retry, timeout);
+    }
     // An app's first result this session carries its risk warning, whatever
     // the outcome, so calls approved without a panel (full-auto, rules,
     // session grants) show it too.
@@ -646,9 +666,114 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap()
-                .contains("texteditt has failed 3 times"),
+                .contains("TextEditt has failed 3 times"),
             "{:?}",
             results[2].error
+        );
+    }
+
+    #[test]
+    fn a_call_that_fails_validation_counts_under_the_app_it_names() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let turn = ExtensionData::new("turn");
+        // list_apps takes no app: ComputerCall::parse refuses it before resolution.
+        let invalid = json!({"action":"list_apps", "app":"TextEdit"});
+        let results: Vec<_> = (0..3)
+            .map(|_| run_turn_call(&thread_store, &turn, invalid.clone(), &CancelToken::new()))
+            .collect();
+        assert!(
+            results[2]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("TextEdit has failed 3 times"),
+            "{:?}",
+            results[2].error
+        );
+    }
+
+    #[test]
+    fn a_stopped_app_is_refused_before_the_driver_resolves_it() {
+        let (started, requests) = std::sync::mpsc::channel();
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.request_started = Some(started);
+        let launcher = FakeLauncher::new(desktop);
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let turn = ExtensionData::new("turn");
+        let bad_click = json!({"action":"click", "app":"TextEdit", "target":{"element":999}});
+        for _ in 0..6 {
+            run_turn_call(&thread_store, &turn, bad_click.clone(), &CancelToken::new());
+        }
+        while requests.try_recv().is_ok() {}
+        let refused = run_turn_call(
+            &thread_store,
+            &turn,
+            json!({"action":"observe", "app":"TextEdit"}),
+            &CancelToken::new(),
+        );
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Orca stopped computer use on TextEdit"),
+            "{:?}",
+            refused.error
+        );
+        let sent: Vec<_> = requests.try_iter().collect();
+        assert!(sent.is_empty(), "the driver saw {sent:?}");
+    }
+
+    #[test]
+    fn a_shortcut_after_the_last_window_closed_reaches_the_app() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let stores = RuntimeExtensionStores::new(&thread_store, &turn_store);
+        let observed = execute(
+            &observe_request("com.apple.TextEdit"),
+            &flash_config(),
+            0,
+            stores,
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            observed.status,
+            ToolStatus::Completed,
+            "{:?}",
+            observed.error
+        );
+        launcher.desktop(|desktop| desktop.close_windows("com.apple.TextEdit"));
+        // The model omits window; the observed window it would inherit is gone.
+        let shortcut = execute(
+            &request(
+                json!({"action":"key", "app":"TextEdit", "keys":["cmd", "n"]}),
+                Some("com.apple.TextEdit"),
+            ),
+            &flash_config(),
+            0,
+            stores,
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            shortcut.status,
+            ToolStatus::Completed,
+            "{:?}",
+            shortcut.error
+        );
+        assert!(
+            shortcut
+                .output
+                .as_deref()
+                .unwrap()
+                .contains("used the foreground"),
+            "{:?}",
+            shortcut.output
         );
     }
 

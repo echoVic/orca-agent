@@ -155,6 +155,17 @@ impl FakeDesktop {
             .push(window);
     }
 
+    /// The user closed every window; the app keeps running.
+    pub fn close_windows(&mut self, bundle_id: &str) {
+        for app in self
+            .apps
+            .iter_mut()
+            .filter(|app| app.info.bundle_id == bundle_id)
+        {
+            app.info.windows.clear();
+        }
+    }
+
     pub fn quit_app(&mut self, bundle_id: &str) {
         if let Some(app) = self
             .apps

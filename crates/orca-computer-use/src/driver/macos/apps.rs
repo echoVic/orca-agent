@@ -148,36 +148,51 @@ fn list_with_timeout(timeout: Duration, verify_windows: bool) -> Result<Vec<AppI
     }))
 }
 
-fn ax_window_facts(pid: i32, deadline: Instant) -> Option<Vec<AxWindowFacts>> {
+/// This app's share of what is left of the listing budget; None once it is spent.
+fn share_of(deadline: Instant) -> Option<f32> {
     let remaining = deadline.checked_duration_since(Instant::now())?;
-    if remaining.is_zero() {
-        return None;
-    }
-    let timeout = remaining.as_secs_f32().min(APP_AX_TIMEOUT_SECS);
-    let application = AxElement::application(pid).ok()?;
-    if unsafe { application.0.set_messaging_timeout(timeout) } != AXError::Success {
-        return None;
-    }
-    application
-        .elements("AXWindows")
-        .ok()?
-        .iter()
-        .map(|window| {
-            // Window handles start with the 2 s default; keep them within this app's share.
-            if unsafe { window.0.set_messaging_timeout(timeout) } != AXError::Success {
-                return None;
-            }
-            Some(AxWindowFacts {
-                frame: window.position_size().ok()?,
-                subrole: window.attribute_string("AXSubrole").ok().flatten(),
-                minimized: window
-                    .attribute_bool("AXMinimized")
-                    .ok()
-                    .flatten()
-                    .unwrap_or(false),
-            })
-        })
+    (!remaining.is_zero()).then(|| remaining.as_secs_f32().min(APP_AX_TIMEOUT_SECS))
+}
+
+/// Reads windows while the budget lasts; an app that runs out falls back to
+/// the visible document-sized rule (None) instead of extending the listing.
+fn read_within<W>(
+    deadline: Instant,
+    windows: impl IntoIterator<Item = W>,
+    mut read: impl FnMut(W, f32) -> Option<AxWindowFacts>,
+) -> Option<Vec<AxWindowFacts>> {
+    windows
+        .into_iter()
+        .map(|window| read(window, share_of(deadline)?))
         .collect()
+}
+
+fn with_timeout(element: &AxElement, seconds: f32) -> Option<()> {
+    (unsafe { element.0.set_messaging_timeout(seconds) } == AXError::Success).then_some(())
+}
+
+fn ax_window_facts(pid: i32, deadline: Instant) -> Option<Vec<AxWindowFacts>> {
+    let application = AxElement::application(pid).ok()?;
+    with_timeout(&application, share_of(deadline)?)?;
+    let windows = application.elements("AXWindows").ok()?;
+    read_within(deadline, windows, |window, timeout| {
+        // Every read gets only what is left, so slow answers cannot add up.
+        with_timeout(&window, timeout)?;
+        let frame = window.position_size().ok()?;
+        with_timeout(&window, share_of(deadline)?)?;
+        let subrole = window.attribute_string("AXSubrole").ok().flatten();
+        with_timeout(&window, share_of(deadline)?)?;
+        let minimized = window
+            .attribute_bool("AXMinimized")
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        Some(AxWindowFacts {
+            frame,
+            subrole,
+            minimized,
+        })
+    })
 }
 
 fn wait_for_launch(
@@ -1555,6 +1570,28 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn slow_window_reads_stop_at_the_listing_deadline() {
+        // Five windows whose reads each take 30 ms, with 50 ms left: the app is
+        // abandoned at the deadline instead of finishing all five reads.
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(50);
+        let mut reads = 0;
+        let facts = read_within(deadline, 0..5, |_, timeout| {
+            assert!(timeout <= APP_AX_TIMEOUT_SECS);
+            reads += 1;
+            std::thread::sleep(Duration::from_millis(30));
+            Some(AxWindowFacts {
+                frame: [0.0, 0.0, 800.0, 600.0],
+                subrole: None,
+                minimized: false,
+            })
+        });
+        assert_eq!(facts, None);
+        assert!(reads <= 2, "{reads} reads");
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]

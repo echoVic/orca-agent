@@ -28,11 +28,23 @@ pub(crate) fn prepare_invocation_with_budget(
     service: &ComputerUseService,
     budget: Option<&FailureBudget>,
 ) -> Result<(), String> {
-    let mut app_key = None;
+    let raw = super::budget::raw_app(invocation.effective.raw_arguments.as_deref());
+    // A known name of a stopped app is refused before the driver resolves it.
+    if let (Some(budget), Some(raw)) = (budget, raw.as_deref())
+        && let Some(stop) = budget.stopped(raw)
+    {
+        return Err(stop);
+    }
+    let mut app_key = raw.clone();
     let result = prepare(invocation, config, service, &mut app_key);
     let (Some(budget), Some(app)) = (budget, app_key.as_deref()) else {
         return result;
     };
+    if let Some(raw) = raw.as_deref()
+        && raw != app
+    {
+        budget.alias(raw, app);
+    }
     if let Some(stop) = budget.stopped(app) {
         return Err(stop);
     }
@@ -63,7 +75,7 @@ fn prepare(
     )
     .map_err(|error| error.to_string())?;
     let call = ComputerCall::parse(&arguments)?;
-    *app_key = call.app().map(str::to_lowercase);
+    *app_key = call.app().map(str::to_owned).or(app_key.take());
     if config.approval_mode == ApprovalMode::Plan
         && !matches!(call, ComputerCall::ListApps | ComputerCall::Observe { .. })
     {

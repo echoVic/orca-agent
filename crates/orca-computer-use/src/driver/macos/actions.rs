@@ -287,10 +287,7 @@ impl MacDriver {
             .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
         let application = AxElement::application(pid)?;
         let windows = capture::windows()?;
-        if params.window.is_none()
-            && application.elements("AXWindows")?.is_empty()
-            && application.attribute_element("AXMainWindow")?.is_none()
-        {
+        if params.window.is_none() && !super::app_has_window(&application)? {
             let Action::Key { keys, target: None } = &params.action else {
                 return Err(error(
                     ErrorKind::WindowNotFound,

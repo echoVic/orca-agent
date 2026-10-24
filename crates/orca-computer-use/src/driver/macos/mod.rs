@@ -281,6 +281,14 @@ pub(super) fn frames_match(ax: [f64; 4], capture: [f64; 4]) -> bool {
         .all(|(a, b)| (a - b).abs() <= 2.0)
 }
 
+/// Whether the app shows any window; unreadable AX state fails closed as an error.
+pub(super) fn app_has_window(application: &AxElement) -> Result<bool, DriverError> {
+    Ok(windows::has_window(
+        application.elements("AXWindows")?.len(),
+        application.attribute_element("AXMainWindow")?.is_some(),
+    ))
+}
+
 /// Act and observe resolve the same live window, including apps with no main window.
 fn resolve_window<'a>(
     application: &AxElement,
@@ -289,79 +297,27 @@ fn resolve_window<'a>(
     windows: &'a [capture::Window],
     id: Option<u32>,
 ) -> Result<(AxElement, &'a capture::Window), DriverError> {
-    let ax_windows = application.elements("AXWindows")?;
-    if let Some(id) = id {
-        let not_usable = || {
-            error(
-                ErrorKind::WindowNotFound,
-                crate::messages::not_usable_window(id, app_name),
-            )
-        };
-        let window = windows
-            .iter()
-            .find(|w| w.id == id && w.pid == pid)
-            .ok_or_else(not_usable)?;
-        for candidate in ax_windows {
-            if frames_match(candidate.position_size()?, window.frame) {
-                return Ok((candidate, window));
-            }
-        }
-        return Err(not_usable());
-    }
+    let mut candidates = application.elements("AXWindows")?;
     let main = application.attribute_element("AXMainWindow")?;
-    if ax_windows.is_empty() && main.is_none() {
-        return Err(error(
-            ErrorKind::WindowNotFound,
-            crate::messages::no_window(app_name),
-        ));
+    if candidates.is_empty()
+        && let Some(main) = &main
+    {
+        candidates.push(main.clone());
     }
-    let mut choices = Vec::with_capacity(ax_windows.len());
-    let mut captures = Vec::with_capacity(ax_windows.len());
-    for candidate in &ax_windows {
-        let frame = candidate.position_size()?;
-        let capture = windows
-            .iter()
-            .find(|w| w.pid == pid && frames_match(frame, w.frame));
-        let minimized = candidate.attribute_bool("AXMinimized")?.unwrap_or(false);
-        let subrole = candidate.attribute_string("AXSubrole")?;
-        choices.push(windows::WindowChoice {
-            is_main: main.as_ref() == Some(candidate),
-            usable: capture.is_some_and(|capture| {
-                windows::usable(
-                    capture.on_screen,
-                    capture.frame,
-                    subrole.as_deref(),
-                    minimized,
-                )
-            }),
-            minimized,
+    let mut facts = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        facts.push(windows::AxWindowFacts {
+            frame: candidate.position_size()?,
+            subrole: candidate.attribute_string("AXSubrole")?,
+            minimized: candidate.attribute_bool("AXMinimized")?.unwrap_or(false),
         });
-        captures.push(capture);
     }
-    if let Some(index) = windows::default_window(&choices) {
-        let capture = captures[index].expect("a usable window has a capture window");
-        return Ok((ax_windows[index].clone(), capture));
-    }
-    // No window passes the usable rule: keep the earlier behavior (main, else first).
-    let window = main
-        .or_else(|| ax_windows.into_iter().next())
-        .ok_or_else(|| {
-            error(
-                ErrorKind::WindowNotFound,
-                crate::messages::no_window(app_name),
-            )
-        })?;
-    let frame = window.position_size()?;
-    let capture = windows
-        .iter()
-        .find(|w| w.pid == pid && frames_match(frame, w.frame))
-        .ok_or_else(|| {
-            error(
-                ErrorKind::WindowNotFound,
-                "No capture window matches the accessibility window",
-            )
-        })?;
-    Ok((window, capture))
+    let main_index = main
+        .as_ref()
+        .and_then(|main| candidates.iter().position(|candidate| candidate == main));
+    let (ax_index, capture_index) =
+        windows::choose_window(id, pid, app_name, windows, &facts, main_index)?;
+    Ok((candidates.swap_remove(ax_index), &windows[capture_index]))
 }
 
 #[cfg(test)]
