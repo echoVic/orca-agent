@@ -256,6 +256,9 @@ fn app_line(app: &AppInfo) -> String {
 fn append_windows(text: &mut String, app: &AppInfo) {
     for window in &app.windows {
         text.push_str(&format!("\n  window {}: \"{}\"", window.id, window.title));
+        if window.minimized {
+            text.push_str(" (minimized)");
+        }
     }
 }
 
@@ -466,6 +469,35 @@ mod tests {
         assert_eq!(results[1].status, ToolStatus::Completed);
         let output = results[1].output.as_deref().unwrap();
         assert!(!output.contains("warning:"), "{output}");
+    }
+
+    #[test]
+    fn list_apps_marks_minimized_windows() {
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.add_window(
+            "com.apple.TextEdit",
+            orca_computer_use::protocol::WindowInfo {
+                id: 812,
+                title: "draft.txt".into(),
+                minimized: true,
+            },
+        );
+        let launcher = FakeLauncher::new(desktop);
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let result = execute(
+            &request(json!({"action":"list_apps"}), None),
+            &flash_config(),
+            0,
+            RuntimeExtensionStores::new(&thread_store, &turn_store),
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        let output = result.output.as_deref().unwrap();
+        assert!(
+            output.contains("window 812: \"draft.txt\" (minimized)"),
+            "{output}"
+        );
     }
 
     #[test]
@@ -963,6 +995,7 @@ mod tests {
             orca_computer_use::protocol::WindowInfo {
                 id: 2,
                 title: "B".into(),
+                minimized: false,
             },
         );
         let launcher = FakeLauncher::new(desktop);

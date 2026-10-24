@@ -124,6 +124,7 @@ impl FakeDesktop {
                         } else {
                             name.into()
                         },
+                        minimized: false,
                     }],
                 },
                 elements,
@@ -578,6 +579,7 @@ mod regression_tests {
             WindowInfo {
                 id: 2,
                 title: "B".into(),
+                minimized: false,
             },
         );
         let observation = desktop

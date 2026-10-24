@@ -555,6 +555,7 @@ mod tests {
             orca_computer_use::protocol::WindowInfo {
                 id: 2,
                 title: "B".into(),
+                minimized: false,
             },
         );
         let (service, mut invocation) = setup(

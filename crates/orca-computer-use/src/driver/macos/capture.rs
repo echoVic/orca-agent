@@ -27,6 +27,7 @@ pub(super) struct Window {
     pub title: String,
     pub frame: [f64; 4],
     pub scale: f64,
+    pub on_screen: bool,
 }
 
 pub(super) fn check_unlocked() -> Result<(), DriverError> {
@@ -79,6 +80,7 @@ pub(super) fn windows() -> Result<Vec<Window>, DriverError> {
                             ],
                             // This is the window display's backing scale, as reported by SCK.
                             scale: f64::from(filter.pointPixelScale()),
+                            on_screen: window.isOnScreen(),
                         })
                     })
                     .collect())

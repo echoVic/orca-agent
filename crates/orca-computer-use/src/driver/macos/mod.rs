@@ -22,6 +22,7 @@ mod foreground;
 mod occlusion;
 mod permissions;
 mod tree;
+mod windows;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -160,6 +161,7 @@ impl MacDriver {
             window: WindowInfo {
                 id: window.id,
                 title: window.title.clone(),
+                minimized: false,
             },
             elements,
             omitted,
@@ -225,7 +227,7 @@ impl DriverHandler for MacDriver {
                 })
             }
             Request::ListApps => Ok(Reply::Apps {
-                apps: apps::list()?,
+                apps: apps::list_verified()?,
             }),
             Request::ResolveApp {
                 app,
@@ -272,7 +274,7 @@ impl DriverHandler for MacDriver {
     }
 }
 
-fn frames_match(ax: [f64; 4], capture: [f64; 4]) -> bool {
+pub(super) fn frames_match(ax: [f64; 4], capture: [f64; 4]) -> bool {
     ax.into_iter()
         .zip(capture)
         .all(|(a, b)| (a - b).abs() <= 2.0)

@@ -58,6 +58,7 @@ fn trials() -> Vec<libtest_mimic::Trial> {
         list_and_resolve_find_the_fixture_by_name_and_bundle_id,
         a_second_driver_finds_the_session_lock_held,
         launch_app_opens_a_file_in_textedit,
+        list_apps_shows_only_windows_observe_can_use,
         opening_a_nonexistent_file_in_already_running_textedit_returns_an_error,
         cleanup_only_selects_explicitly_launched_processes,
         cleanup_preserves_an_app_launched_by_another_live_session,
@@ -274,7 +275,7 @@ use objc2_core_graphics::{
     CGEvent, CGEventSource, CGEventSourceStateID, CGEventType, CGWarpMouseCursorPosition,
 };
 use objc2_foundation::NSString;
-use orca_computer_use::client::{DriverClient, HelloInfo};
+use orca_computer_use::client::{CallError, DriverClient, HelloInfo};
 use orca_computer_use::driver::macos::MacDriver;
 use orca_computer_use::inprocess::InProcessLauncher;
 use orca_computer_use::protocol::{
@@ -1148,6 +1149,42 @@ fn launch_app_opens_a_file_in_textedit() {
             !app.windows.is_empty(),
             "TextEdit opened the temporary file"
         );
+    });
+}
+
+fn list_apps_shows_only_windows_observe_can_use() {
+    run_live_test(|| {
+        let Some(live) = Live::start() else {
+            return;
+        };
+        let Reply::Apps { apps } = live
+            .client
+            .call(Request::ListApps, Duration::from_secs(30))
+            .unwrap()
+        else {
+            panic!("expected apps")
+        };
+        // Every listed, non-minimized window of a running app must be observable.
+        for app in apps.iter().filter(|app| app.pid.is_some()) {
+            for window in app.windows.iter().filter(|window| !window.minimized) {
+                let observed = live.client.call(
+                    Request::Observe(ObserveParams {
+                        app: app.bundle_id.clone(),
+                        window: Some(window.id),
+                        query: Some("\u{0}no-match".into()),
+                        max_elements: 1,
+                        include_screenshot: false,
+                    }),
+                    Duration::from_secs(30),
+                );
+                assert!(
+                    !matches!(&observed, Err(CallError::Driver(error)) if error.message.contains("that Orca can use")),
+                    "{} window {} was listed but is not usable: {observed:?}",
+                    app.bundle_id,
+                    window.id
+                );
+            }
+        }
     });
 }
 

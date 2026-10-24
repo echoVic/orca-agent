@@ -115,6 +115,7 @@ mod tests {
             window: WindowInfo {
                 id: 1,
                 title: "probe.rtf".into(),
+                minimized: false,
             },
             elements: vec![
                 Element {
