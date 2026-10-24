@@ -1287,19 +1287,40 @@ impl ThreadActor {
             let interaction_id =
                 surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                     .expect("generated UUID is v7");
-            let execution_context_fingerprint =
-                cold_recovery_thread_config_fingerprint(&self.config, &snapshot);
-            let capsule = surface::DurableInteractionContinuationCapsule::try_new_restartable(
-                interaction_id.clone(),
-                fence.clone(),
-                interaction_request.clone(),
-                execution_context_fingerprint,
-                surface::DurableInteractionContinuationIntent::ToolInvocation(intent),
-            )
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            let recovery_disposition =
+            // The capsule stores the call, not its external-tool definition.
+            // Cold dispatch and its fingerprint use the actor config, so only
+            // restart when that config resolves the same approved definition.
+            // Like the tool registry, the first external definition wins.
+            let name = request.name.as_str();
+            let can_restore_tool_definition = orca_tools::registry::default_tool_registry()
+                .resolve(name)
+                .is_some()
+                || active
+                    .config
+                    .external_tools
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    == self
+                        .config
+                        .external_tools
+                        .iter()
+                        .find(|tool| tool.name == name);
+            let recovery_disposition = if can_restore_tool_definition {
+                let execution_context_fingerprint =
+                    cold_recovery_tool_approval_config_fingerprint(&self.config, &snapshot);
+                let capsule = surface::DurableInteractionContinuationCapsule::try_new_restartable(
+                    interaction_id.clone(),
+                    fence.clone(),
+                    interaction_request.clone(),
+                    execution_context_fingerprint,
+                    surface::DurableInteractionContinuationIntent::ToolInvocation(intent),
+                )
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 surface::InteractionUnavailableDisposition::restartable_tool_approval(&capsule)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            } else {
+                surface::InteractionUnavailableDisposition::FailOperation
+            };
             let Some((interaction_id, record, route, revision)) = self
                 .commit_surface_effect_interaction_request(
                     active,

@@ -10061,6 +10061,21 @@ fn cold_recovery_thread_config_fingerprint(
     surface::Sha256Digest::new(hasher.finalize().into())
 }
 
+/// New ToolApproval checkpoints also attest that recording verified the
+/// actor can restore the approved external-tool definition. Older approvals
+/// lack that proof and must fail closed even with an unchanged app version
+/// and actor config. Keep this epoch separate from permission/continuation
+/// fingerprints so only old ToolApproval checkpoints become stale.
+fn cold_recovery_tool_approval_config_fingerprint(
+    config: &RunConfig,
+    snapshot: &surface::SurfaceSnapshot,
+) -> surface::Sha256Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"orca-cold-recovery-tool-approval-definition-v2\0");
+    hasher.update(cold_recovery_thread_config_fingerprint(config, snapshot).as_bytes());
+    surface::Sha256Digest::new(hasher.finalize().into())
+}
+
 /// Rebuild only restartable ToolApproval owners. Every malformed, stale,
 /// started, non-tool, or fingerprint-mismatched capsule is intentionally left
 /// for the existing fail-closed recovery path.
@@ -10076,7 +10091,7 @@ fn recover_cold_tool_approval_owners_on_start(
     RuntimeHostError,
 > {
     let observed_fingerprint =
-        cold_recovery_thread_config_fingerprint(config, coordinator.state().snapshot());
+        cold_recovery_tool_approval_config_fingerprint(config, coordinator.state().snapshot());
     let cold_owner_epoch = coordinator.state().snapshot().thread.owner_epoch;
     let candidates = coordinator
         .state()

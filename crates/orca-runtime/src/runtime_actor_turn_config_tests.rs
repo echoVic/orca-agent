@@ -104,11 +104,12 @@ fn admit_turn_config_operation_with_attachment(
 }
 
 fn turn_config_response(active: &ActiveOperation) -> RuntimeModelResponse {
+    let tool_name = &active.config.external_tools[0].name;
     RuntimeModelResponse::new(
         ProviderResponse {
             steps: vec![ProviderStep::ToolCall(ToolRequest {
                 id: "turn-tool-call".into(),
-                name: ToolName::External("turn_tool".into()),
+                name: ToolName::from_str(tool_name).unwrap(),
                 action: ActionKind::Read,
                 target: None,
                 raw_arguments: Some("{}".into()),
@@ -117,7 +118,7 @@ fn turn_config_response(active: &ActiveOperation) -> RuntimeModelResponse {
             assistant_reasoning: None,
             tool_calls: vec![orca_core::conversation::RawToolCall {
                 id: "turn-tool-call".to_string(),
-                function_name: "turn_tool".to_string(),
+                function_name: tool_name.clone(),
                 arguments: "{}".to_string(),
             }],
             usage: None,
@@ -223,6 +224,214 @@ async fn tool_approval_validates_external_tools_with_turn_override() {
             orca_core::approval_types::ApprovalDecision::Allow
         );
         active.generation.join.await.unwrap();
+    }
+}
+
+// Reproduce the pre-fix durable checkpoint: its fingerprint covered the
+// actor config without proving that it matched the executing turn's tool.
+fn record_legacy_turn_tool_approval(
+    actor: &mut ThreadActor,
+    active: &mut ActiveOperation,
+    fence: surface::SurfaceOperationFence,
+    request: &ToolRequest,
+) {
+    let snapshot = actor.resident_surface.coordinator.state().snapshot();
+    let tool = actor
+        .surface_tool_for_runtime_request(snapshot, &fence, request, &active.config.external_tools)
+        .unwrap();
+    let authority = ThreadActor::surface_authority_for_tool(snapshot, &fence, &tool).unwrap();
+    let intent = surface::ToolInvocationIntent::before_invocation(tool.clone(), authority.clone());
+    let interaction_request = surface::SurfaceInteractionRequest::ToolApproval {
+        tool,
+        description: surface::DisplayText::new("legacy turn-tool approval"),
+        preview: None,
+        authority,
+    };
+    let interaction_id =
+        surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+    let capsule = surface::DurableInteractionContinuationCapsule::try_new_restartable(
+        interaction_id.clone(),
+        fence.clone(),
+        interaction_request.clone(),
+        cold_recovery_thread_config_fingerprint(&actor.config, snapshot),
+        surface::DurableInteractionContinuationIntent::ToolInvocation(intent),
+    )
+    .unwrap();
+    let disposition =
+        surface::InteractionUnavailableDisposition::restartable_tool_approval(&capsule).unwrap();
+    actor
+        .commit_surface_effect_interaction_request(
+            active,
+            fence,
+            interaction_id,
+            surface::SurfaceInteractionKind::ToolApproval,
+            interaction_request,
+            disposition,
+        )
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_recovery_settles_approval_when_actor_cannot_restore_turn_tool_definition() {
+    assert_cold_recovery_turn_tool_approval(&[
+        ("turn_tool", "missing"),
+        ("turn_tool", "different command"),
+        ("turn_tool", "different schema"),
+        ("turn_tool", "identical"),
+        ("ops__deploy", "missing"),
+        ("ops__deploy", "different command"),
+        ("mcp__ops__deploy", "missing"),
+        ("mcp__ops__deploy", "different command"),
+    ])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_recovery_rejects_legacy_approval_without_turn_tool_definition_proof() {
+    assert_cold_recovery_turn_tool_approval(&[("turn_tool", "legacy different command")]).await;
+}
+
+async fn assert_cold_recovery_turn_tool_approval(cases: &[(&str, &str)]) {
+    let home = tempfile::tempdir().unwrap();
+    let _home = crate::history::redirect_test_orca_home(home.path());
+    for &(tool_name, actor_definition) in cases {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut actor = turn_config_actor(cwd.path());
+        let attachment = fresh_surface_goal_approval_attachment(&actor.handle.surface());
+        let subscription = actor
+            .handle
+            .surface()
+            .claim_subscription(&attachment.subscription)
+            .unwrap();
+        let intent = surface_user_turn_intent(&attachment.baseline.snapshot, "approve override");
+        let mut active = admit_turn_config_operation_with_attachment(
+            &mut actor,
+            ActionKind::Shell,
+            &attachment,
+            intent,
+        );
+        active.config.external_tools[0].name = tool_name.into();
+        // Keep the same name and action: those alone cannot prove that cold
+        // recovery would run the definition whose approval was requested.
+        if actor_definition != "missing" {
+            let mut definition = active.config.external_tools[0].clone();
+            match actor_definition {
+                "different command" | "legacy different command" => {
+                    definition.command = "different-command".into()
+                }
+                "different schema" => {
+                    definition.schema = serde_json::json!({"type": "object", "properties": {"other": {"type": "string"}}})
+                }
+                "identical" => {}
+                _ => unreachable!(),
+            }
+            actor.config.external_tools = vec![definition];
+        }
+        let mut recovery_config = actor.config.clone();
+        let response = turn_config_response(&active);
+        let fence = active.surface_operation.clone().unwrap();
+        let response = actor
+            .commit_surface_provider_response(&mut active, fence.clone(), &response)
+            .unwrap();
+        let ProviderStep::ToolCall(request) = &response.response.steps[0] else {
+            panic!("expected provider tool call");
+        };
+        let (reply, resolution) = mpsc::sync_channel(1);
+        if actor_definition == "legacy different command" {
+            record_legacy_turn_tool_approval(&mut actor, &mut active, fence.clone(), request);
+        } else {
+            actor.request_surface_tool_approval(
+                &mut active,
+                fence.clone(),
+                orca_core::approval_types::ApprovalRequest {
+                    id: "turn-tool-approval".into(),
+                    action: ActionKind::Shell,
+                    description: "Approve executing turn definition".into(),
+                    tool: Some(tool_name.into()),
+                    target: None,
+                    preview: None,
+                },
+                request.clone(),
+                reply,
+            );
+        }
+        assert!(matches!(
+            resolution.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let interaction_id = actor
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .interactions
+            .last()
+            .unwrap()
+            .interaction_id
+            .clone();
+        recovery_config.history_mode = HistoryMode::Resume(actor.handle.thread_id.clone());
+        active.generation.join.await.unwrap();
+        // Drop the live owner without answering or committing a terminal;
+        // resume the recorded ledger with a new cold owner below.
+        drop(subscription);
+        drop(attachment);
+        drop(actor);
+        let host = RuntimeHost::start_with_executor(Arc::new(OutputWriterExecutor)).unwrap();
+        let recovered = host
+            .start_thread(recovery_config, "recover turn approval")
+            .unwrap();
+        let snapshot = fresh_surface_attachment(&recovered.surface())
+            .baseline
+            .snapshot;
+        let interaction = snapshot
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == interaction_id)
+            .unwrap();
+        let operation =
+            ThreadActor::surface_operation_record(&snapshot, &fence.operation_id).unwrap();
+        if actor_definition == "identical" {
+            assert!(matches!(
+                interaction.lifecycle,
+                surface::SurfaceInteractionLifecycle::Requested
+            ));
+            assert!(operation.terminal.is_none());
+        } else {
+            assert!(
+                matches!(
+                    interaction.lifecycle,
+                    surface::SurfaceInteractionLifecycle::Cancelled {
+                        reason: surface::InteractionCancelReason::CapabilityUnavailable,
+                    }
+                ),
+                "{tool_name} / {actor_definition}: approval must be cancelled after cold recovery"
+            );
+            assert!(
+                matches!(
+                    operation
+                        .terminal
+                        .as_ref()
+                        .map(|terminal| &terminal.terminal),
+                    Some(surface::OperationTerminal::Failed {
+                        class: surface::FailureClass::RuntimeInvariant,
+                        ..
+                    })
+                ),
+                "{tool_name} / {actor_definition}: {:?}",
+                operation.terminal
+            );
+        }
+        let tool = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id.as_str() == "turn-tool-call")
+            .unwrap();
+        assert!(
+            tool.invocation_started.is_none(),
+            "{tool_name} / {actor_definition}: recovered dispatch must not start"
+        );
+        host.shutdown().unwrap();
     }
 }
 
