@@ -276,13 +276,21 @@ fn tool_target(name: &ToolName, arguments: &Value) -> Option<String> {
                 .map_or_else(|| uri.to_string(), |server| format!("{server}:{uri}"))
         }),
         ToolName::ReadSkill => arguments["id"].as_str().map(String::from),
-        ToolName::Workflow => ["scriptPath", "name", "draftId"]
-            .into_iter()
-            .find_map(|key| {
-                arguments[key]
-                    .as_str()
-                    .filter(|value| !value.trim().is_empty())
-                    .map(String::from)
+        ToolName::Workflow => arguments["scriptPath"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(String::from)
+            .or_else(|| {
+                if arguments["script"].as_str().is_some() {
+                    Some(orca_core::approval_rules::INLINE_WORKFLOW_TARGET.to_string())
+                } else {
+                    ["name", "draftId"].into_iter().find_map(|key| {
+                        arguments[key]
+                            .as_str()
+                            .filter(|value| !value.trim().is_empty())
+                            .map(String::from)
+                    })
+                }
             }),
         ToolName::Mcp(name) | ToolName::External(name) => Some(name.clone()),
         _ => None,
@@ -346,6 +354,26 @@ mod tests {
                 serde_json::json!({"draftId":"draft-1"}),
                 Some("draft-1"),
             ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"script":"inline code", "name":"audit"}),
+                Some("<inline workflow>"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"script":"inline code", "name":"audit", "scriptPath":"./audit.ts"}),
+                Some("./audit.ts"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"script":"", "name":"audit", "scriptPath":" \t"}),
+                Some("<inline workflow>"),
+            ),
+            (
+                ToolName::Workflow,
+                serde_json::json!({"script":"inline code", "draftId":"draft-1"}),
+                Some("<inline workflow>"),
+            ),
             (ToolName::Workflow, serde_json::json!({}), None),
             (
                 ToolName::ReadFile,
@@ -371,6 +399,38 @@ mod tests {
                 "{}: {arguments}",
                 request.name.as_str()
             );
+        }
+    }
+
+    #[test]
+    fn inline_workflow_target_cannot_match_permission_patterns() {
+        use orca_core::approval_rules::{CompiledPermissionRules, PermissionRule, PermissionRules};
+        use orca_core::approval_types::Decision;
+
+        let target = Some("<inline workflow>");
+        for pattern in [
+            "audit",
+            "./audit.ts",
+            "draft-1",
+            "",
+            "*",
+            "**",
+            "<inline workflow>",
+        ] {
+            let rules = CompiledPermissionRules::from_rules(PermissionRules {
+                rules: vec![PermissionRule::new("Workflow", pattern, Decision::Allow)],
+            });
+            assert_eq!(
+                rules.matching_decision("Workflow", target),
+                None,
+                "{pattern}"
+            );
+        }
+        for decision in [Decision::Allow, Decision::Prompt, Decision::Deny] {
+            let rules = CompiledPermissionRules::from_rules(PermissionRules {
+                rules: vec![PermissionRule::whole_tool("Workflow", decision)],
+            });
+            assert_eq!(rules.matching_decision("Workflow", target), Some(decision));
         }
     }
 
