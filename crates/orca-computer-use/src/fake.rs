@@ -136,6 +136,15 @@ impl FakeDesktop {
     }
 
     /// Adds another window to the fixture's app for window-binding tests.
+    /// A running app with no window yet, like TextEdit showing only its Open panel.
+    pub fn with_windowless_app(bundle_id: &str, name: &str) -> Self {
+        let mut desktop = Self::with_app(bundle_id, name);
+        for app in &mut desktop.apps {
+            app.info.windows.clear();
+        }
+        desktop
+    }
+
     pub fn add_window(&mut self, bundle_id: &str, window: WindowInfo) {
         self.apps
             .iter_mut()
@@ -263,6 +272,41 @@ impl FakeDesktop {
     }
 
     fn act(&mut self, params: ActParams) -> Result<Reply, DriverError> {
+        if params.window.is_none()
+            && let Some(app) = self.apps.iter_mut().find(|app| {
+                app.info.bundle_id == params.app
+                    && app.info.pid.is_some()
+                    && app.info.windows.is_empty()
+            })
+        {
+            let shortcut = match &params.action {
+                Action::Key { keys, target: None } => crate::keys::parse_combo(keys)
+                    .map_err(|message| error(ErrorKind::Failed, message))?
+                    .is_app_shortcut(),
+                _ => false,
+            };
+            if !shortcut {
+                return Err(error(
+                    ErrorKind::WindowNotFound,
+                    crate::messages::no_window(&app.info.name),
+                ));
+            }
+            if !params.foreground_fallback {
+                return Err(error(
+                    ErrorKind::NeedsForeground,
+                    "A shortcut for an app without a window needs the foreground; the foreground fallback is turned off",
+                ));
+            }
+            app.actions += 1;
+            return Ok(Reply::Acted {
+                outcome: ActOutcome {
+                    foreground_used: true,
+                    note: Some("sent to the app, which has no window".into()),
+                    scroll_position: None,
+                    observation: None,
+                },
+            });
+        }
         // Never resolve an action by display name or redirect it to another app.
         let index = self.running_app(&params.app, params.window)?;
         let target = match &params.action {
@@ -548,6 +592,35 @@ impl DriverLauncher for FakeLauncher {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    #[test]
+    fn a_windowless_app_accepts_only_an_app_shortcut_without_a_window() {
+        let mut desktop = FakeDesktop::with_windowless_app("com.apple.TextEdit", "TextEdit");
+        let key = |keys: &[&str], window| ActParams {
+            app: "com.apple.TextEdit".into(),
+            window,
+            action: Action::Key {
+                keys: keys.iter().map(|k| k.to_string()).collect(),
+                target: None,
+            },
+            foreground_fallback: true,
+            observe_after: false,
+            include_screenshot: false,
+            secure_approved: false,
+        };
+        let Ok(Reply::Acted { outcome }) = desktop.act(key(&["cmd", "n"], None)) else {
+            panic!("cmd+n should reach a windowless app")
+        };
+        assert!(outcome.foreground_used);
+        let error = desktop.act(key(&["a"], None)).unwrap_err();
+        assert_eq!(error.message, crate::messages::no_window("TextEdit"));
+        let mut off = key(&["cmd", "n"], None);
+        off.foreground_fallback = false;
+        assert_eq!(
+            desktop.act(off).unwrap_err().kind,
+            ErrorKind::NeedsForeground
+        );
+    }
 
     #[test]
     fn fake_window_errors_use_the_shared_messages() {

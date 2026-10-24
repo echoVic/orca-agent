@@ -24,6 +24,12 @@ impl KeyStroke {
         }
         matches!(self.keycode, 0..=50) && !matches!(self.keycode, 36 | 48)
     }
+
+    /// A shortcut that can go to an app with no window: Command or Control
+    /// combinations that cannot enter text, or Escape.
+    pub fn is_app_shortcut(self) -> bool {
+        !self.enters_text() && (self.modifiers.cmd || self.modifiers.ctrl || self.keycode == 53)
+    }
 }
 
 fn modifier(name: &str) -> Option<Modifiers> {
@@ -198,6 +204,22 @@ pub fn parse_combo(keys: &[String]) -> Result<KeyStroke, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn combo(keys: &[&str]) -> KeyStroke {
+        parse_combo(&keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn shortcut_without_a_window_is_only_for_windowless_apps() {
+        assert!(combo(&["cmd", "n"]).is_app_shortcut());
+        assert!(combo(&["ctrl", "a"]).is_app_shortcut());
+        assert!(combo(&["escape"]).is_app_shortcut());
+        // Without an observed focus, nothing that can enter text may be sent.
+        assert!(!combo(&["cmd", "v"]).is_app_shortcut());
+        assert!(!combo(&["a"]).is_app_shortcut());
+        assert!(!combo(&["shift", "right"]).is_app_shortcut());
+        assert!(!combo(&["return"]).is_app_shortcut());
+    }
 
     #[test]
     fn cmd_s_is_keycode_1_with_command() {

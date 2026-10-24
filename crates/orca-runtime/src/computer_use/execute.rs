@@ -203,6 +203,10 @@ fn execute_with_timeout(
             }
             let app = launched;
             let mut text = format!("launched {} ({})", app.name, app.bundle_id);
+            if app.windows.is_empty() {
+                text.push_str("; no window yet. ");
+                text.push_str(orca_computer_use::messages::NO_WINDOW_NEXT_STEP);
+            }
             append_windows(&mut text, &app);
             text
         }
@@ -469,6 +473,34 @@ mod tests {
         assert_eq!(results[1].status, ToolStatus::Completed);
         let output = results[1].output.as_deref().unwrap();
         assert!(!output.contains("warning:"), "{output}");
+    }
+
+    #[test]
+    fn launching_an_app_without_a_window_says_what_to_do_next() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_windowless_app(
+            "com.apple.TextEdit",
+            "TextEdit",
+        ));
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let result = execute(
+            &request(
+                json!({"action":"launch_app", "app":"TextEdit"}),
+                Some("com.apple.TextEdit"),
+            ),
+            &flash_config(),
+            0,
+            RuntimeExtensionStores::new(&thread_store, &turn_store),
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            result.output.as_deref().unwrap(),
+            format!(
+                "launched TextEdit (com.apple.TextEdit); no window yet. {}",
+                orca_computer_use::messages::NO_WINDOW_NEXT_STEP
+            )
+        );
     }
 
     #[test]

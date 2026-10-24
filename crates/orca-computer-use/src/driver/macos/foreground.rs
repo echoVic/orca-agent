@@ -17,7 +17,7 @@ use super::{
     events::HidEvents,
     tree::{self, ElementTable, SecurityScan},
 };
-use crate::keys::parse_combo;
+use crate::keys::{KeyStroke, parse_combo};
 use crate::protocol::{ActParams, Action, Button, DriverError, ErrorKind, Target};
 
 pub(super) fn check_abort(aborted: &AtomicBool) -> Result<(), DriverError> {
@@ -180,16 +180,8 @@ fn foreground_type_selection_is_preserved_only_with_original_and_current_focus()
     assert!(!preserve_foreground_type_selection(false, false));
 }
 
-pub(super) fn run(
-    type_target_was_focused: bool,
-    application: &AxElement,
-    window: &AxElement,
-    table: &ElementTable,
-    params: &ActParams,
-    aborted: &AtomicBool,
-    action_deadline: Instant,
-) -> Result<String, DriverError> {
-    let pid = application.pid()?;
+/// Waits until the user has been idle for half a second, within the action's deadline.
+fn wait_for_user_idle(aborted: &AtomicBool, action_deadline: Instant) -> Result<(), DriverError> {
     let deadline = (Instant::now() + crate::timing::IDLE_WAIT_LIMIT).min(action_deadline);
     loop {
         check_abort(aborted)?;
@@ -204,7 +196,7 @@ pub(super) fn run(
             CGEventType(u32::MAX),
         ) >= 0.5
         {
-            break;
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(error(
@@ -214,6 +206,69 @@ pub(super) fn run(
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Sends an app-level shortcut (Cmd+N while only a system Open panel shows) to
+/// an app with no window, then restores the previous app and pointer.
+pub(super) fn run_app_shortcut(
+    application: &AxElement,
+    app_name: &str,
+    stroke: KeyStroke,
+    aborted: &AtomicBool,
+    action_deadline: Instant,
+) -> Result<String, DriverError> {
+    let pid = application.pid()?;
+    wait_for_user_idle(aborted, action_deadline)?;
+    let old = NSWorkspace::new()
+        .frontmostApplication()
+        .ok_or_else(|| error(ErrorKind::Failed, "Could not read the frontmost app"))?;
+    let name = old
+        .localizedName()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| old.processIdentifier().to_string());
+    let pointer_event =
+        CGEvent::new(None).ok_or_else(|| error(ErrorKind::Failed, "Could not read the pointer"))?;
+    let mut restore = Restore {
+        application: old,
+        pointer: CGEvent::location(Some(&pointer_event)),
+        restored: false,
+        minimized_window: None,
+    };
+    let result = (|| {
+        check_abort(aborted)?;
+        let target = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
+        activate(&target, crate::timing::ACTIVATION_WAIT_LIMIT)?;
+        check_abort(aborted)?;
+        thread::sleep(crate::timing::ACTIVATION_SETTLE);
+        check_abort(aborted)?;
+        // A window that appeared meanwhile has an unobserved focus: observe it first.
+        if !application.elements("AXWindows")?.is_empty() {
+            return Err(error(
+                ErrorKind::Stale,
+                format!("{app_name} now has a window; observe it before sending keys"),
+            ));
+        }
+        let mut hid = HidEvents::new_until(pid, aborted, action_deadline)?;
+        let sent = hid.key(stroke);
+        hid.release();
+        sent
+    })();
+    let restored = restore.finish();
+    finish_foreground(result, restored, &name)
+}
+
+pub(super) fn run(
+    type_target_was_focused: bool,
+    application: &AxElement,
+    window: &AxElement,
+    table: &ElementTable,
+    params: &ActParams,
+    aborted: &AtomicBool,
+    action_deadline: Instant,
+) -> Result<String, DriverError> {
+    let pid = application.pid()?;
+    wait_for_user_idle(aborted, action_deadline)?;
     // The user may have moved the window while we waited for idle.
     check_window(window, table)?;
     let enters_text = match &params.action {

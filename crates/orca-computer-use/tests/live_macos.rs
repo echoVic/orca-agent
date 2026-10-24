@@ -59,6 +59,7 @@ fn trials() -> Vec<libtest_mimic::Trial> {
         a_second_driver_finds_the_session_lock_held,
         launch_app_opens_a_file_in_textedit,
         list_apps_shows_only_windows_observe_can_use,
+        a_shortcut_reaches_textedit_before_it_has_a_window,
         opening_a_nonexistent_file_in_already_running_textedit_returns_an_error,
         cleanup_only_selects_explicitly_launched_processes,
         cleanup_preserves_an_app_launched_by_another_live_session,
@@ -1185,6 +1186,64 @@ fn list_apps_shows_only_windows_observe_can_use() {
                 );
             }
         }
+    });
+}
+
+fn a_shortcut_reaches_textedit_before_it_has_a_window() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        if !bundle_pids("com.apple.TextEdit").is_empty() {
+            eprintln!(
+                "skipped: TextEdit is already running; the test must not touch the user's documents"
+            );
+            return;
+        }
+        let before = bundle_pids("com.apple.TextEdit");
+        let launched = live.client.call(
+            Request::LaunchApp {
+                app: "com.apple.TextEdit".into(),
+                open: vec![],
+            },
+            Duration::from_secs(60),
+        );
+        register_launch_pids(
+            &mut live.launched,
+            &before,
+            &bundle_pids("com.apple.TextEdit"),
+        );
+        let Reply::Launched { app } = launched.unwrap() else {
+            panic!("expected launched")
+        };
+        if !app.windows.is_empty() {
+            eprintln!("skipped: TextEdit opened a window at launch on this Mac");
+            return;
+        }
+        let acted = live.client.call(
+            Request::Act(ActParams {
+                app: "com.apple.TextEdit".into(),
+                window: None,
+                action: Action::Key {
+                    keys: vec!["cmd".into(), "n".into()],
+                    target: None,
+                },
+                foreground_fallback: true,
+                observe_after: true,
+                include_screenshot: false,
+                secure_approved: false,
+            }),
+            Duration::from_secs(30),
+        );
+        let Reply::Acted { outcome } = acted.unwrap() else {
+            panic!("expected acted")
+        };
+        assert!(outcome.foreground_used);
+        assert!(
+            outcome.observation.is_some(),
+            "Cmd+N should open an observable document window"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
     });
 }
 
