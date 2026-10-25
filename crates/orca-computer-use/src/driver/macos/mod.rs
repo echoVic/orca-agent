@@ -343,19 +343,18 @@ fn app_window_facts(application: &AxElement) -> Result<Vec<windows::AxWindowFact
     Ok(facts)
 }
 
-/// A fresh capture and required AX read share the same pure classification as act.
+/// An unreadable AX state may contain a window, so the post-activation
+/// check must return Stale rather than authorize a general shortcut.
 fn app_has_window(
     application: &AxElement,
     captures: &[capture::Window],
     user_windows: &[u32],
-) -> Result<bool, DriverError> {
-    let facts = app_window_facts(application)?;
-    Ok(!windows::windowless(
-        application.pid()?,
-        captures,
-        &facts,
-        user_windows,
-    ))
+) -> bool {
+    let Ok(pid) = application.pid() else {
+        return true;
+    };
+    let facts = app_window_facts(application).ok();
+    !windows::windowless(pid, captures, facts.as_deref(), user_windows)
 }
 
 /// Act and observe resolve the same live window, including apps with no main window.

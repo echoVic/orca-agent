@@ -5,7 +5,7 @@ use super::{
     tree::ElementTable,
 };
 use crate::{
-    keys::parse_combo,
+    keys::{KeyStroke, parse_combo},
     protocol::{
         ActOutcome, ActParams, Action, Button, Direction, DriverError, ErrorKind, ObserveParams,
         Target,
@@ -418,16 +418,21 @@ impl MacDriver {
             .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
         let application = AxElement::application(pid)?;
         let windows = capture::windows()?;
-        // An app with no window takes an app-level shortcut. If only the user's
-        // windows remain, only lone Cmd+N is allowed, with app-dependent effects.
-        // Neither path has an AX window of Orca's own to resolve.
+        // General shortcuts require proven AX emptiness and no real user windows.
+        // A failed probe is inconclusive: let the normal resolver skip unreadable
+        // candidates. With no usable window, only lone Cmd+N can recover.
         let ax_windows = if params.window.is_none() {
-            super::app_window_facts(&application)?
+            super::app_window_facts(&application).ok()
         } else {
-            vec![]
+            None
         };
         let windowless = params.window.is_none()
-            && super::windows::windowless(pid, &windows, &ax_windows, &params.user_windows);
+            && super::windows::windowless(
+                pid,
+                &windows,
+                ax_windows.as_deref(),
+                &params.user_windows,
+            );
         let resolved = if windowless {
             None
         } else {
@@ -440,31 +445,13 @@ impl MacDriver {
                 &params.user_windows,
             ) {
                 Ok(resolved) => Some(resolved),
-                Err(error)
-                    if error.kind == ErrorKind::UserWindow
-                        && params.window.is_none()
-                        && opens_new_window(&params.action) =>
-                {
+                Err(error) if recover_with_app_shortcut(params.window, &params.action, &error) => {
                     None
                 }
                 Err(error) => return Err(error),
             }
         };
         let Some((ax_window, window)) = resolved else {
-            let windowless = if windowless {
-                // AX can omit windows on other Spaces; captured user windows
-                // still require lone Cmd+N before the app is activated.
-                super::windows::app_shortcut_windowless(
-                    pid,
-                    &app.name,
-                    &windows,
-                    &ax_windows,
-                    &params.user_windows,
-                    &params.action,
-                )?
-            } else {
-                false
-            };
             return self.app_shortcut(params, &application, &app.name, windowless, action_deadline);
         };
         let id = window.id;
@@ -719,8 +706,8 @@ impl MacDriver {
         Ok(outcome)
     }
 
-    /// Sends an app-level shortcut to an app with no window of its own to
-    /// use: none at all, or (Cmd+N alone, checked by the caller) only the user's.
+    /// General shortcuts require no AX window and no real user windows.
+    /// Otherwise only lone Cmd+N may reach the user-window/desktop recovery path.
     fn app_shortcut(
         &mut self,
         params: ActParams,
@@ -736,7 +723,7 @@ impl MacDriver {
             ));
         };
         let stroke = parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
-        if !stroke.is_app_shortcut() {
+        if !app_shortcut_allowed(stroke, windowless) {
             return Err(error(
                 ErrorKind::WindowNotFound,
                 crate::messages::no_window(app_name),
@@ -791,6 +778,19 @@ impl MacDriver {
         }
         Ok(outcome)
     }
+}
+
+fn app_shortcut_allowed(stroke: KeyStroke, windowless: bool) -> bool {
+    stroke.is_app_shortcut() && (windowless || stroke.opens_new_window())
+}
+
+fn recover_with_app_shortcut(window: Option<u32>, action: &Action, failure: &DriverError) -> bool {
+    window.is_none()
+        && matches!(
+            failure.kind,
+            ErrorKind::UserWindow | ErrorKind::WindowNotFound
+        )
+        && opens_new_window(action)
 }
 
 /// Lone untargeted Cmd+N is allowed when only user windows remain;
@@ -1153,6 +1153,101 @@ fn scroll(
 mod tests {
     use super::*;
     use crate::geometry::CaptureGeometry;
+
+    fn shortcut(keys: &[&str]) -> Action {
+        Action::Key {
+            keys: keys.iter().map(|key| (*key).into()).collect(),
+            target: None,
+        }
+    }
+
+    #[test]
+    fn an_unusable_ax_window_allows_only_lone_cmd_n_recovery() {
+        let missing = error(
+            ErrorKind::WindowNotFound,
+            crate::messages::no_window("Finder"),
+        );
+        let new_window = shortcut(&["cmd", "n"]);
+        assert!(recover_with_app_shortcut(None, &new_window, &missing));
+        assert!(app_shortcut_allowed(
+            parse_combo(&["cmd".into(), "n".into()]).unwrap(),
+            false
+        ));
+        for keys in [
+            &["cmd", "shift", "n"][..],
+            &["cmd", "delete"],
+            &["cmd", "a"],
+            &["cmd", "o"],
+            &["cmd", "down"],
+            &["cmd", "d"],
+            &["cmd", "l"],
+            &["escape"],
+            &["ctrl", "a"],
+        ] {
+            let action = shortcut(keys);
+            assert!(
+                !recover_with_app_shortcut(None, &action, &missing),
+                "{keys:?}"
+            );
+            let Action::Key { keys: combo, .. } = action else {
+                unreachable!()
+            };
+            assert!(
+                !app_shortcut_allowed(parse_combo(&combo).unwrap(), false),
+                "{keys:?}"
+            );
+        }
+        assert!(!recover_with_app_shortcut(Some(45), &new_window, &missing));
+        let targeted = Action::Key {
+            keys: vec!["cmd".into(), "n".into()],
+            target: Some(Target::Element { element: 1 }),
+        };
+        assert!(!recover_with_app_shortcut(None, &targeted, &missing));
+        assert!(!recover_with_app_shortcut(
+            None,
+            &new_window,
+            &error(ErrorKind::Failed, "AX read failed")
+        ));
+    }
+
+    #[test]
+    fn a_genuinely_windowless_app_keeps_general_shortcuts() {
+        // TextEdit's system Open panel belongs to another process; its AX
+        // application lists no window and there are no real user captures.
+        assert!(super::super::windows::windowless(7, &[], Some(&[]), &[]));
+        for keys in [
+            &["cmd", "n"][..],
+            &["cmd", "o"],
+            &["ctrl", "a"],
+            &["escape"],
+        ] {
+            let combo = keys.iter().map(|key| (*key).into()).collect::<Vec<_>>();
+            assert!(
+                app_shortcut_allowed(parse_combo(&combo).unwrap(), true),
+                "{keys:?}"
+            );
+        }
+        assert!(!app_shortcut_allowed(
+            parse_combo(&["cmd".into(), "v".into()]).unwrap(),
+            true
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_windowless_probe_leaves_cmd_n_recovery_to_the_resolver() {
+        assert!(!super::super::windows::windowless(7, &[], None, &[]));
+        let theirs = error(ErrorKind::UserWindow, "only user windows remain");
+        assert!(recover_with_app_shortcut(
+            None,
+            &shortcut(&["cmd", "n"]),
+            &theirs
+        ));
+        assert!(!recover_with_app_shortcut(
+            None,
+            &shortcut(&["cmd", "a"]),
+            &theirs
+        ));
+    }
 
     #[test]
     fn typing_into_an_already_focused_element_keeps_its_selection() {

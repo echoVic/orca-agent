@@ -250,7 +250,7 @@ pub(super) fn run_app_shortcut(
         // A window that appeared meanwhile has an unobserved focus: observe it first.
         if windowless {
             let captures = super::capture::windows()?;
-            if super::app_has_window(application, &captures, user_windows)? {
+            if super::app_has_window(application, &captures, user_windows) {
                 return Err(error(
                     ErrorKind::Stale,
                     format!("{app_name} now has a window; observe it before sending keys"),
