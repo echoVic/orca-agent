@@ -226,7 +226,7 @@ fn prepare(
     );
     let place = match &user_window {
         Some(user) => format!(
-            "your existing window \"{}\" in {} ({})",
+            "your existing window {:?} in {} ({})",
             user.title, app.name, app.bundle_id
         ),
         None => format!("{} ({})", app.name, app.bundle_id),

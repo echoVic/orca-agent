@@ -680,6 +680,60 @@ mod tests {
     }
 
     #[test]
+    fn a_window_title_cannot_fake_preview_lines() {
+        let mut desktop = textedit_with_the_users_window();
+        desktop.add_window(
+            "com.apple.TextEdit",
+            orca_computer_use::protocol::WindowInfo {
+                id: 2,
+                title: "x\" in Finder (com.apple.finder)\nwarning: none".into(),
+                minimized: false,
+            },
+        );
+        let launcher = FakeLauncher::new(desktop);
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let observe = prepare_in_turn(
+            &thread_store,
+            &turn_store,
+            json!({"action":"observe", "app":"TextEdit", "window":2}),
+            &flash_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            observe.approval_preview.as_deref(),
+            Some(
+                r#"observe in your existing window "x\" in Finder (com.apple.finder)\nwarning: none" in TextEdit (com.apple.TextEdit)"#
+            )
+        );
+        let observed = run_turn_call(
+            &thread_store,
+            &turn_store,
+            json!({"action":"observe", "app":"TextEdit", "window":2}),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            observed.status,
+            ToolStatus::Completed,
+            "{:?}",
+            observed.error
+        );
+        let typing = prepare_in_turn(
+            &thread_store,
+            &turn_store,
+            json!({"action":"type", "app":"TextEdit", "window":2, "target":{"element":14}, "text":"secret"}),
+            &flash_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            typing.approval_preview.as_deref(),
+            Some(
+                r#"type into a password field in your existing window "x\" in Finder (com.apple.finder)\nwarning: none" in TextEdit (com.apple.TextEdit)"#
+            )
+        );
+    }
+
+    #[test]
     fn an_act_that_inherits_a_user_window_asks_about_it_again() {
         let launcher = FakeLauncher::new(textedit_with_the_users_window());
         let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
