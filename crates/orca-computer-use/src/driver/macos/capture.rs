@@ -23,6 +23,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(super) struct Window {
     pub id: u32,
+    pub layer: isize,
     pub pid: i32,
     pub title: String,
     pub frame: [f64; 4],
@@ -70,6 +71,7 @@ pub(super) fn windows() -> Result<Vec<Window>, DriverError> {
                         );
                         Some(Window {
                             id: window.windowID(),
+                            layer: window.windowLayer(),
                             pid: app.processID(),
                             title: window.title().map(|s| s.to_string()).unwrap_or_default(),
                             frame: [
