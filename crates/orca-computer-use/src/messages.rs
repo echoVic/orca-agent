@@ -31,6 +31,12 @@ pub fn app_wide_key(app: &str) -> String {
     )
 }
 
+pub fn window_kept(title: &str) -> String {
+    format!(
+        "The user kept their window {title:?} to themselves. Leave it alone: open a new window instead (for example with key cmd+n, or launch_app with open), or ask the user."
+    )
+}
+
 pub fn user_window(id: u32, title: &str) -> String {
     format!(
         "Window {id} (\"{title}\") is the user's own window. Call again with window {id} so Orca can ask the user, or open a new window."
@@ -51,6 +57,14 @@ pub fn user_window_only(app: &str, windows: &[(u32, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_kept_names_the_window_and_the_next_step() {
+        assert_eq!(
+            window_kept("probe.rtf"),
+            "The user kept their window \"probe.rtf\" to themselves. Leave it alone: open a new window instead (for example with key cmd+n, or launch_app with open), or ask the user."
+        );
+    }
 
     #[test]
     fn opened_in_user_window_note_is_exact() {

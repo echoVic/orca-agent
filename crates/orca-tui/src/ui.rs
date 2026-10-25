@@ -6609,6 +6609,12 @@ fn approval_option_detail(
         ApprovalOption::AlwaysServerSaved => {
             "save an allow rule covering every tool on this server"
         }
+        ApprovalOption::Deny
+            if is_existing_window(tool, target)
+                && !target.is_some_and(|target| target.ends_with("#secure")) =>
+        {
+            "keep the window to yourself; Orca opens its own"
+        }
         ApprovalOption::Deny => "ask Orca for another way",
     }
 }
@@ -9210,6 +9216,7 @@ mod tests {
             "Allow this window this session",
             "skip approval for this window until you quit",
             "Deny",
+            "keep the window to yourself; Orca opens its own",
         ] {
             assert!(frame.contains(text), "missing {text:?}: {frame}");
         }

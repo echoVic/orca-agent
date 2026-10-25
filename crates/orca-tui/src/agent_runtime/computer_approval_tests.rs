@@ -67,12 +67,22 @@ impl ComputerTui {
     }
 
     fn until(&mut self, done: impl Fn(&TuiEvent) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        self.until_with_timeout(Duration::from_secs(15), done);
+    }
+
+    #[track_caller]
+    fn until_with_timeout(&mut self, timeout: Duration, done: impl Fn(&TuiEvent) -> bool) {
+        let deadline = Instant::now() + timeout;
         loop {
             let event = self
                 .events
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .expect("computer TUI event");
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "computer TUI event: {error}; transcript: {:?}",
+                        self.state.transcript.messages
+                    )
+                });
             let Ok(Some(event)) =
                 crate::attachment_routing::accept_attached_tui_event(&mut self.state, event)
             else {
@@ -288,4 +298,37 @@ fn computer_surface_existing_window_dialog_offers_this_window_once_or_this_sessi
     }
     tui.launcher
         .desktop(|desktop| assert_eq!(desktop.actions_on("com.apple.TextEdit"), 1));
+}
+
+#[test]
+fn computer_surface_denied_window_completes_without_approval_required() {
+    let _home = crate::test_support::isolate_orca_home();
+    let mut desktop = FakeDesktop::with_textedit();
+    desktop.snapshots_see_windows = true;
+    let mut tui = ComputerTui::start(desktop);
+    tui.send(serde_json::json!({"action":"observe","app":"TextEdit","window":1}));
+    // Cold hosted startup can exceed the existing helper's 15 s bound. Give
+    // the first panel time to arrive; keep the post-Deny wait at 15 s.
+    tui.until_with_timeout(Duration::from_secs(30), |event| {
+        matches!(event, TuiEvent::ApprovalNeeded { .. })
+    });
+    assert!(tui.state.approval_dialog.is_some());
+    tui.answer('4');
+    tui.until(|event| {
+        if let TuiEvent::SessionCompleted { status } = event {
+            assert_ne!(status, "approval_required");
+            assert_eq!(status, "success");
+            true
+        } else {
+            false
+        }
+    });
+    assert!(tui.state.approval_dialog.is_none());
+    tui.launcher.desktop(|desktop| {
+        assert_eq!(desktop.actions_on("com.apple.TextEdit"), 0);
+        assert!(
+            desktop.last_observe.is_none(),
+            "the denied window must not be observed"
+        );
+    });
 }

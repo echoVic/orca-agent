@@ -4329,6 +4329,7 @@ mod tests {
             sink: &mut sink,
             tool_request: &request,
             invocation: &invocation,
+            turn_store: None,
             policy: &policy,
             permission_overlay: &mut permission_overlay,
             approval_handler: None,
