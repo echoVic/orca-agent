@@ -23,6 +23,12 @@ pub fn no_window(app: &str) -> String {
     format!("{app} has no window yet. {NO_WINDOW_NEXT_STEP}")
 }
 
+pub fn app_wide_key(app: &str) -> String {
+    format!(
+        "That shortcut acts on every window of {app}, including the user's own, so Orca does not send it while they are open. Ask the user instead."
+    )
+}
+
 pub fn user_window(id: u32, title: &str) -> String {
     format!(
         "Window {id} (\"{title}\") is the user's own window. Call again with window {id} so Orca can ask the user, or open a new window."
@@ -43,6 +49,14 @@ pub fn user_window_only(app: &str, windows: &[(u32, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_wide_shortcut_message_names_the_app_and_user_boundary() {
+        assert_eq!(
+            app_wide_key("TextEdit"),
+            "That shortcut acts on every window of TextEdit, including the user's own, so Orca does not send it while they are open. Ask the user instead."
+        );
+    }
 
     #[test]
     fn cmd_n_without_a_new_window_warns_of_possible_user_window_action() {

@@ -375,6 +375,17 @@ impl MacDriver {
 
         capture::check_unlocked()?;
         let app = apps::resolve_approved(&params.app)?;
+        if !params.user_windows.is_empty()
+            && let Action::Key { keys, .. } = &params.action
+            && parse_combo(keys)
+                .map_err(|message| error(ErrorKind::Failed, message))?
+                .acts_on_every_window()
+        {
+            return Err(error(
+                ErrorKind::UserWindow,
+                crate::messages::app_wide_key(&app.name),
+            ));
+        }
         let pid = app
             .pid
             .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;

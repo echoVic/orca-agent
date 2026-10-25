@@ -334,6 +334,18 @@ impl FakeDesktop {
     }
 
     fn act(&mut self, params: ActParams) -> Result<Reply, DriverError> {
+        if !params.user_windows.is_empty()
+            && let Action::Key { keys, .. } = &params.action
+            && crate::keys::parse_combo(keys)
+                .map_err(|message| error(ErrorKind::Failed, message))?
+                .acts_on_every_window()
+        {
+            let index = self.running_app(&params.app, params.window)?;
+            return Err(error(
+                ErrorKind::UserWindow,
+                crate::messages::app_wide_key(&self.apps[index].info.name),
+            ));
+        }
         // No window of the app's own: none at all, or only the user's. Any
         // app-level shortcut reaches the first; only Cmd+N, which opens a new
         // window, reaches the second.
@@ -778,6 +790,42 @@ mod regression_tests {
                 &[(1, "probe.rtf".into()), (2, "Untitled".into())]
             )
         );
+    }
+
+    #[test]
+    fn app_wide_shortcuts_are_refused_only_while_user_windows_remain() {
+        for keys in [
+            vec!["cmd", "q"],
+            vec!["cmd", "option", "w"],
+            vec!["cmd", "option", "m"],
+        ] {
+            let mut desktop = FakeDesktop::with_textedit();
+            desktop.observe(&observe_params(Some(1), vec![])).unwrap();
+            let params = ActParams {
+                app: "com.apple.TextEdit".into(),
+                window: Some(1),
+                action: Action::Key {
+                    keys: keys.into_iter().map(String::from).collect(),
+                    target: None,
+                },
+                foreground_fallback: true,
+                observe_after: false,
+                include_screenshot: false,
+                secure_approved: false,
+                user_windows: vec![2],
+            };
+            let failure = desktop.act(params.clone()).unwrap_err();
+            assert_eq!(failure.kind, ErrorKind::UserWindow);
+            assert_eq!(failure.message, crate::messages::app_wide_key("TextEdit"));
+            assert_eq!(desktop.actions_on("com.apple.TextEdit"), 0);
+            desktop
+                .act(ActParams {
+                    user_windows: vec![],
+                    ..params
+                })
+                .unwrap();
+            assert_eq!(desktop.actions_on("com.apple.TextEdit"), 1);
+        }
     }
 
     #[test]
