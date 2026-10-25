@@ -166,8 +166,9 @@ def collect(task, native, base, before, evidence, metrics):
     original = {w['id'] for w in before['windows']}
     pids = {a['pid'] for a in state['apps'] if a['bundle'] == app}
     # Off-screen layer-0 windows are helpers without an AX window to read.
+    # Tasks about an app's one main window read its existing windows too.
     windows = [w for w in state['windows'] if w['pid'] in pids and w['layer'] == 0 and w.get('on_screen')
-               and (w['id'] not in original or task['id'] in ('S4', 'S7', 'M5', 'S1', 'M4'))]
+               and (w['id'] not in original or task.get('existing_windows') == 'approve')]
     data = {'ax': [], 'windows': [w['id'] for w in windows], 'actions': metrics['actions'], 'answer': metrics['final_answer']}
     for w in windows:
         op = 'buttons' if task['id'] == 'S7' else ('settings' if app == 'com.apple.systempreferences' else 'ax')

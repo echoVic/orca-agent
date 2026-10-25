@@ -87,9 +87,19 @@ tool, canonical target, options, selected label/key and interaction identity.
 - Allowed computer app: **Allow this app this session**. If absent, Allow once
   and `session_option_missing=true` (the baseline's null surface target issue is
   retained as a measured product limitation).
+- An existing window of an allowed app (`#window:<id>`): **Allow this window this
+  session** for the windows the task provides — the browser window the harness
+  opens for S2/S8/M2/M6, and every window of the app in S1/S4/S7/M4/M5
+  (`"existing_windows": "approve"`; these tasks are about the app's one main
+  window) — otherwise Deny. A window denial is not a boundary event: the task
+  continues and the model can open a window of its own.
 - Allowed secure-field app: Allow typing this once / Allow once.
 - Unknown or disallowed computer app: Deny, record a boundary event, stop that task.
 - Other tools and permissions: Allow once. No saved/global grants.
+
+`user_window_touches` lists windows that were open before the task and that a
+successful computer call used without an approved window panel; acceptance
+needs none. `window_panels` counts the window panels shown.
 
 Canonical targets come from the committed interaction/semantic request, with
 panel preview fallback for the known null-target baseline. Committed typed
@@ -102,8 +112,8 @@ Only persisted session.completed, semantic terminal, or a committed typed
 Operation.Terminal proves turn completion.
 
 The app allowlist is an approval policy, **not an OS sandbox** for shell tools or
-individual windows. Session grants intentionally reduce repeat approvals and
-cannot prevent the model selecting a different window inside the same app.
+individual windows. Orca itself asks before the model uses any window that was
+open before the turn; the harness answers those panels as above.
 Do not run against apps containing sensitive material without an appropriately
 isolated desktop. This harness does not replace Orca's tool/permission boundaries.
 It never intentionally verifies pre-existing document/browser windows. Independent

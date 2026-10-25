@@ -296,6 +296,42 @@ class RunnerLifecycleTests(unittest.TestCase):
                     row = run_task(task, SimpleNamespace(dry_run=False), base, base / 'report', None, Services(), Native(display))
                 self.assertEqual(row['passed'], passed, display)
 
+    def test_the_windows_a_task_provides_reach_the_approval_policy(self):
+        seen = []
+        class FakeTUI:
+            submitted = 0
+            approvals = []
+            def __init__(self, *args): pass
+            def start(self): pass
+            def run(self, task, prompt, health, task_windows=()):
+                seen.append(task_windows)
+                return 'completed'
+            def stop(self): return {'exited': True, 'records': []}
+        class Native:
+            def __init__(self): self.states = 0
+            def preflight(self, live): return {'windows': [], 'apps': [{'bundle': 'com.apple.Safari', 'pid': 9}]}
+            def call(self, op, *args, timeout=20):
+                if op == 'new-browser':
+                    return {'window_id': 77, 'standard_window_ids': [77]}
+                self.states += 1
+                windows = [{'id': 77, 'pid': 9, 'layer': 0, 'on_screen': True}] if self.states > 1 else []
+                return {'frontmost': 'com.apple.Safari', 'apps': [{'bundle': 'com.apple.Safari', 'pid': 9}], 'windows': windows}
+            def cleanup(self, task, before): return {'ok': True}
+        class Services:
+            port = 1234
+            def health(self): return {}
+        tasks = [
+            {'id': 'S7', 'kind': 'single', 'allowed_apps': ['com.kangfenmao.CherryStudio'], 'prompt': 'p', 'verifier': 'sidebar', 'existing_windows': 'approve'},
+            {'id': 'S3', 'kind': 'single', 'allowed_apps': ['com.apple.finder'], 'prompt': 'p', 'verifier': 'last_file'},
+            {'id': 'S2', 'kind': 'single', 'allowed_apps': ['com.apple.Safari'], 'prompt': 'p', 'verifier': 'heading'},
+        ]
+        for task in tasks:
+            with tempfile.TemporaryDirectory() as d:
+                base = Path(d); (base / 'out').mkdir(); (base / 'fixtures').mkdir()
+                with patch('run.TUI', FakeTUI), patch('run.collect', return_value={'passed': True}):
+                    run_task(task, SimpleNamespace(dry_run=False), base, base / 'report', None, Services(), Native())
+        self.assertEqual(seen, ['all', set(), {77}])
+
 
 class FormTests(unittest.TestCase):
     def test_server_health_form_and_post(self):

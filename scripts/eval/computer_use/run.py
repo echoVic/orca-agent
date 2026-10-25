@@ -21,7 +21,7 @@ if str(HERE) not in sys.path:
 from approvals import detector_self_test
 from fixtures import BASE, archive_previous, prepare, reset_outputs
 from launch import environment as child_environment
-from metrics import extract, read_jsonl
+from metrics import extract, read_jsonl, user_window_touches
 from preflight import Native, browser_window
 from report import dump, write_report
 from services import Tmux, Services
@@ -102,6 +102,8 @@ def run_task(task, args, base, out, tmux, services, native):
     tui = TUI(tmux, REPO / 'target/release/orca', base, evidence, 'mock' if args.dry_run else 'deepseek')
     verification = {'passed': None, 'reason': 'dry run; GUI verification skipped'}
     reason, exit_proof, cleanup, errors = 'not_started', {}, {}, []
+    # Existing windows the task provides: Orca asks about them, and the harness approves.
+    task_windows = 'all' if task.get('existing_windows') == 'approve' else set()
     try:
         if not args.dry_run and task['allowed_apps'][0] in ('com.apple.Safari', 'com.google.Chrome'):
             app = task['allowed_apps'][0]
@@ -116,12 +118,14 @@ def run_task(task, args, base, out, tmux, services, native):
             wid, browser_after = settled_browser_window(native, browser_before, app, created['window_id'],
                                                         standard=created.get('standard_window_ids'))
             dump(evidence / 'browser-window.json', {'window': wid, 'before': browser_before, 'after': browser_after})
+            # The harness's window predates Orca's turn, so Orca asks before using it.
+            task_windows = {wid}
         tui.start()
         def health():
             services.health()
             if not args.dry_run:
                 native.preflight(live=True)
-        reason = tui.run(task, prompt, health)
+        reason = tui.run(task, prompt, health, task_windows)
     except (Exception, KeyboardInterrupt) as error:
         reason = 'harness_error'
         errors.append(f'{type(error).__name__}: {error}')
@@ -135,6 +139,9 @@ def run_task(task, args, base, out, tmux, services, native):
             errors.append(f'process stop: {error}')
         records = exit_proof.pop('records', [])
         metrics = extract(records, tui.approvals, tui.submitted, time.time())
+        metrics['user_window_touches'] = user_window_touches(
+            metrics['calls'], {w['id'] for w in before['windows']}, tui.approvals)
+        metrics['window_panels'] = sum(bool(a.get('window_panel')) for a in tui.approvals)
         dump(evidence / 'metrics.json', metrics)
         try:
             if not args.dry_run and exit_proof.get('exited') and reason != 'harness_error':

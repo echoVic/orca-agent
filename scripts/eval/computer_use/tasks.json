@@ -7,7 +7,8 @@
       "com.apple.calculator"
     ],
     "timeout": 360,
-    "verifier": "calculator"
+    "verifier": "calculator",
+    "existing_windows": "approve"
   },
   {
     "id": "S2",
@@ -37,7 +38,8 @@
       "com.apple.systempreferences"
     ],
     "timeout": 360,
-    "verifier": "appearance"
+    "verifier": "appearance",
+    "existing_windows": "approve"
   },
   {
     "id": "S5",
@@ -67,7 +69,8 @@
       "com.kangfenmao.CherryStudio"
     ],
     "timeout": 360,
-    "verifier": "sidebar"
+    "verifier": "sidebar",
+    "existing_windows": "approve"
   },
   {
     "id": "S8",
@@ -117,7 +120,8 @@
       "com.apple.calculator"
     ],
     "timeout": 360,
-    "verifier": "arithmetic"
+    "verifier": "arithmetic",
+    "existing_windows": "approve"
   },
   {
     "id": "M5",
@@ -127,7 +131,8 @@
       "com.apple.systempreferences"
     ],
     "timeout": 360,
-    "verifier": "chip"
+    "verifier": "chip",
+    "existing_windows": "approve"
   },
   {
     "id": "M6",

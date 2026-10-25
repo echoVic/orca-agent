@@ -106,7 +106,7 @@ class TUI:
             time.sleep(.15)
         raise RuntimeError('Orca TUI did not become ready')
 
-    def run(self, task, prompt, health):
+    def run(self, task, prompt, health, task_windows=()):
         self.submitted = time.time()
         (self.evidence / 'submission.json').write_text(json.dumps({'time': self.submitted, 'prompt': prompt, 'provider': self.provider}))
         self.key(prompt, literal=True)
@@ -134,7 +134,7 @@ class TUI:
                     or r['tool'] == 'permissions' and panel['tool'] in ('permissions', r['call_id'], 'request_permissions'))), None)
                 if req:
                     # Canonical semantic target repairs the known null surface target.
-                    decision = answer_panel(panel, req, task['allowed_apps'])
+                    decision = answer_panel(panel, req, task['allowed_apps'], task_windows)
                     record = {'time': time.time(), **panel, **decision, 'interaction_id': req['id']}
                     self.approvals.append(record)
                     (self.evidence / f'approval-{len(self.approvals):03}.txt').write_text(pane)

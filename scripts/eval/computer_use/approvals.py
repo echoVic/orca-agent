@@ -4,6 +4,7 @@ import re
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
+WINDOW = re.compile(r'#window:(\d+)(?=#secure$|$)')
 
 
 def source_titles(repo=REPO):
@@ -48,16 +49,24 @@ def parse_panel(pane, titles=None):
     return None
 
 
-def decide(panel, allowed_apps, target=None):
+def decide(panel, allowed_apps, target=None, task_windows=()):
+    """`task_windows` holds the existing windows this task provides ('all' for
+    every window of its app). Other existing-window panels are denied without
+    a boundary event: the model can still open a window of its own."""
     target = target or panel['target']
     options = {o['label']: o['key'] for o in panel['options']}
     boundary = False
     missing = False
+    window = WINDOW.search(target or '') if panel['tool'] == 'computer' else None
     if panel['tool'] == 'computer':
         if not target or target.split('#', 1)[0] not in allowed_apps:
             chosen, boundary = 'Deny', True
+        elif window and not (task_windows == 'all' or int(window[1]) in task_windows):
+            chosen = 'Deny'
         elif target.endswith('#secure') or 'Allow typing this once' in options:
             chosen = 'Allow typing this once' if 'Allow typing this once' in options else 'Allow once'
+        elif window:
+            chosen = 'Allow this window this session'
         elif 'Allow this app this session' in options:
             chosen = 'Allow this app this session'
         else:
@@ -67,11 +76,12 @@ def decide(panel, allowed_apps, target=None):
     if chosen not in options:
         chosen, boundary = 'Deny', True
     return {'chosen': chosen, 'key': options[chosen], 'target': target,
-            'boundary_event': boundary, 'session_option_missing': missing}
+            'boundary_event': boundary, 'session_option_missing': missing,
+            'window_panel': bool(window)}
 
 
-def answer_panel(panel, request, allowed_apps):
-    decision = decide(panel, allowed_apps, request['target'])
+def answer_panel(panel, request, allowed_apps, task_windows=()):
+    decision = decide(panel, allowed_apps, request['target'], task_windows)
     if panel['target'] and request['target'] and panel['target'].split('#')[0] != request['target'].split('#')[0]:
         decision.update(chosen='Deny', key=next(o['key'] for o in panel['options'] if o['label'] == 'Deny'), boundary_event=True)
     return decision

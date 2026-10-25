@@ -14,6 +14,8 @@ def load_tasks(path=HERE / 'tasks.json'):
     if not isinstance(tasks, list) or [t.get('id') for t in tasks] != expected:
         raise ValueError('Expected exactly S1–S8, M1–M7 in order')
     for t in tasks:
+        if t.get('existing_windows', 'deny') not in ('approve', 'deny'):
+            raise ValueError(f'Invalid existing_windows: {t.get("id")}')
         if (t.get('kind') != ('single' if t['id'][0] == 'S' else 'multi')
                 or not isinstance(t.get('prompt'), str) or not t['prompt']
                 or type(t.get('timeout')) is not int or not 0 < t['timeout'] <= 360

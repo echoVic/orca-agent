@@ -14,6 +14,40 @@ DATA = Path(__file__).with_name('testdata')
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_existing_window_panels_follow_the_windows_the_task_provides(self):
+        text = (DATA / 'computer-once.txt').read_text().replace(
+            'launch_app in Calculator (com.apple.calculator)',
+            'observe in your existing window "Downloads" in Finder (com.apple.finder)',
+        ).replace('1  Allow once  run it now', '1  Allow this window once  run it now').replace(
+            '│   4  Deny', '│   2  Allow this window this session\n│   4  Deny')
+        panel = parse_panel(text)
+        target = 'com.apple.finder#window:24538'
+        denied = answer_panel(panel, {'target': target}, ['com.apple.finder'])
+        self.assertEqual((denied['chosen'], denied['boundary_event'], denied['window_panel']), ('Deny', False, True))
+        for provided in ('all', {24538}):
+            approved = answer_panel(panel, {'target': target}, ['com.apple.finder'], provided)
+            self.assertEqual((approved['chosen'], approved['key']), ('Allow this window this session', '2'))
+        self.assertEqual(answer_panel(panel, {'target': target}, ['com.apple.finder'], {1})['chosen'], 'Deny')
+        # Another app's window is still a boundary.
+        self.assertTrue(answer_panel(panel, {'target': 'com.apple.Safari#window:3'}, ['com.apple.finder'])['boundary_event'])
+
+    def test_non_numeric_window_parts_follow_app_policy(self):
+        text = (DATA / 'computer-once.txt').read_text().replace(
+            '│   4  Deny', '│   2  Allow this app this session\n│   4  Deny')
+        panel = parse_panel(text)
+        for suffix in ('abc', '24538abc', '24538.5', '24538abc#secure'):
+            with self.subTest(suffix=suffix):
+                decision = answer_panel(panel, {'target': 'com.apple.calculator#window:' + suffix},
+                                        ['com.apple.calculator'])
+                self.assertFalse(decision['window_panel'])
+                self.assertFalse(decision['boundary_event'])
+                expected = 'Allow once' if suffix.endswith('#secure') else 'Allow this app this session'
+                self.assertEqual(decision['chosen'], expected)
+
+    def test_tasks_about_an_apps_one_main_window_provide_its_existing_windows(self):
+        provided = [t['id'] for t in load_tasks() if t.get('existing_windows') == 'approve']
+        self.assertEqual(provided, ['S1', 'S4', 'S7', 'M4', 'M5'])
+
     def test_secure_canonical_target_matches_plain_preview(self):
         text = (DATA / 'computer-once.txt').read_text().replace('com.apple.calculator', 'com.apple.TextEdit')
         panel = parse_panel(text)
@@ -64,6 +98,34 @@ class ApprovalTests(unittest.TestCase):
 
 
 class MetricsTests(unittest.TestCase):
+    def test_user_window_touches_count_unapproved_use_of_preexisting_windows(self):
+        from metrics import user_window_touches
+        calls = [
+            {'name': 'computer', 'status': 'completed', 'arguments': {'action': 'observe', 'window': 24538}, 'window': 24538},
+            {'name': 'computer', 'status': 'completed', 'arguments': {'action': 'observe'}, 'window': 21631},
+            {'name': 'computer', 'status': 'completed', 'arguments': {'action': 'observe'}, 'window': 999},
+            {'name': 'computer', 'status': 'failed', 'arguments': {'action': 'click', 'window': 5}, 'window': 5},
+        ]
+        approvals = [{'target': 'com.apple.finder#window:24538', 'chosen': 'Allow this window this session'},
+                     {'target': 'com.apple.finder#window:5', 'chosen': 'Deny'}]
+        self.assertEqual(user_window_touches(calls, {24538, 21631, 5}, approvals), [21631])
+
+    def test_non_numeric_window_approval_does_not_exempt_a_touch(self):
+        from metrics import user_window_touches
+        calls = [{'name': 'computer', 'status': 'completed', 'window': 24538}]
+        approvals = [{'target': 'com.apple.finder#window:24538abc', 'chosen': 'Allow this app this session'}]
+        self.assertEqual(user_window_touches(calls, {24538}, approvals), [24538])
+
+    def test_the_window_a_computer_call_used_is_recorded(self):
+        rows = copy.deepcopy(read_jsonl(DATA / 'preview-session.jsonl'))
+        for row in rows:
+            e = row.get('event', {})
+            if e.get('type') == 'tool.call.completed':
+                e['payload'].update(output='Preview "two-pages.pdf" [window 812]: screenshot 1280x902')
+        computer = [c for c in extract(rows, [], None)['calls'] if c['name'] == 'computer']
+        self.assertTrue(computer)
+        self.assertEqual({c['window'] for c in computer}, {812, 47372})
+
     def test_recorded_usage_is_last_snapshot_not_sum(self):
         m = extract(read_jsonl(DATA / 'preview-session.jsonl'), [], 1792755824.99715)
         self.assertEqual(m['model_turns'], 3)
