@@ -100,8 +100,14 @@ impl MacDriver {
             let _ = application.set_bool("AXManualAccessibility", true);
         }
         let windows = capture::windows()?;
-        let (ax_window, window) =
-            resolve_window(&application, pid, &app.name, &windows, params.window)?;
+        let (ax_window, window) = resolve_window(
+            &application,
+            pid,
+            &app.name,
+            &windows,
+            params.window,
+            &params.user_windows,
+        )?;
         let window_frame = ax_window.position_size()?;
         if window_frame.iter().any(|v| !v.is_finite())
             || window_frame[2] <= 0.0
@@ -230,6 +236,9 @@ impl DriverHandler for MacDriver {
             Request::ListApps => Ok(Reply::Apps {
                 apps: apps::list_verified()?,
             }),
+            Request::WindowSnapshot => Ok(Reply::Apps {
+                apps: apps::snapshot()?,
+            }),
             Request::ResolveApp {
                 app,
                 allow_not_running,
@@ -296,6 +305,7 @@ fn resolve_window<'a>(
     app_name: &str,
     windows: &'a [capture::Window],
     id: Option<u32>,
+    user_windows: &[u32],
 ) -> Result<(AxElement, &'a capture::Window), DriverError> {
     let mut candidates = application.elements("AXWindows")?;
     let main = application.attribute_element("AXMainWindow")?;
@@ -319,7 +329,7 @@ fn resolve_window<'a>(
         .as_ref()
         .and_then(|main| candidates.iter().position(|candidate| candidate == main));
     let (ax_index, capture_index) =
-        windows::choose_window(id, pid, app_name, windows, &facts, main_index)?;
+        windows::choose_window(id, pid, app_name, windows, &facts, main_index, user_windows)?;
     let chosen = candidates.swap_remove(ax_index);
     // The budget may have shortened this handle's timeout; observe/act need the usual one.
     let _ = unsafe { chosen.0.set_messaging_timeout(2.0) };
@@ -343,8 +353,10 @@ mod tests {
                 query: None,
                 max_elements: 300,
                 include_screenshot: true,
+                user_windows: vec![],
             }),
             Request::ListApps,
+            Request::WindowSnapshot,
             Request::Act(crate::protocol::ActParams {
                 app: "dev.orca.not-installed".into(),
                 window: None,
@@ -356,6 +368,7 @@ mod tests {
                 observe_after: false,
                 include_screenshot: false,
                 secure_approved: false,
+                user_windows: vec![],
             }),
             Request::Turn { active: true },
             Request::LaunchApp {
@@ -414,6 +427,7 @@ fn stdin_stop_rejects_buffered_work_after_a_successful_hello() {
                 query: None,
                 max_elements: 300,
                 include_screenshot: false,
+                user_windows: vec![],
             }),
             &output,
         )

@@ -287,59 +287,35 @@ impl MacDriver {
             .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
         let application = AxElement::application(pid)?;
         let windows = capture::windows()?;
-        if params.window.is_none() && !super::app_has_window(&application)? {
-            let Action::Key { keys, target: None } = &params.action else {
-                return Err(error(
-                    ErrorKind::WindowNotFound,
-                    crate::messages::no_window(&app.name),
-                ));
-            };
-            let stroke = parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
-            if !stroke.is_app_shortcut() {
-                return Err(error(
-                    ErrorKind::WindowNotFound,
-                    crate::messages::no_window(&app.name),
-                ));
-            }
-            if !params.foreground_fallback {
-                return Err(error(
-                    ErrorKind::NeedsForeground,
-                    "A shortcut for an app without a window needs the foreground; the foreground fallback is turned off",
-                ));
-            }
-            let note = foreground::run_app_shortcut(
+        // An app with no window takes an app-level shortcut, and an app whose
+        // windows are all the user's takes Cmd+N, which opens a new one;
+        // neither has a window of its own to resolve.
+        let windowless = params.window.is_none() && !super::app_has_window(&application)?;
+        let resolved = if windowless {
+            None
+        } else {
+            match resolve_window(
                 &application,
+                pid,
                 &app.name,
-                stroke,
-                &self.aborted,
-                action_deadline,
-            )?;
-            let mut outcome = ActOutcome {
-                foreground_used: true,
-                note: Some(note),
-                scroll_position: None,
-                observation: None,
-            };
-            if params.observe_after {
-                // Cmd+N usually opens a window; show it, or say none appeared.
-                match self.observe(ObserveParams {
-                    app: params.app,
-                    window: None,
-                    query: None,
-                    max_elements: 300,
-                    include_screenshot: params.include_screenshot,
-                }) {
-                    Ok(observation) => outcome.observation = Some(observation),
-                    Err(_) => {
-                        let note = outcome.note.get_or_insert_with(String::new);
-                        note.push_str("; no window appeared yet; observe again");
-                    }
+                &windows,
+                params.window,
+                &params.user_windows,
+            ) {
+                Ok(resolved) => Some(resolved),
+                Err(error)
+                    if error.kind == ErrorKind::UserWindow
+                        && params.window.is_none()
+                        && opens_new_window(&params.action) =>
+                {
+                    None
                 }
+                Err(error) => return Err(error),
             }
-            return Ok(outcome);
-        }
-        let (ax_window, window) =
-            resolve_window(&application, pid, &app.name, &windows, params.window)?;
+        };
+        let Some((ax_window, window)) = resolved else {
+            return self.app_shortcut(params, &application, &app.name, windowless, action_deadline);
+        };
         let id = window.id;
         let table = self
             .element_tables
@@ -538,6 +514,7 @@ impl MacDriver {
                 query: None,
                 max_elements: 300,
                 include_screenshot: params.include_screenshot,
+                user_windows: params.user_windows.clone(),
             });
             match observation {
                 Ok(observation) => outcome.observation = Some(observation),
@@ -574,6 +551,75 @@ impl MacDriver {
         }
         Ok(outcome)
     }
+
+    /// Sends an app-level shortcut to an app with no window of its own to
+    /// use: none at all, or (Cmd+N alone, checked by the caller) only the user's.
+    fn app_shortcut(
+        &mut self,
+        params: ActParams,
+        application: &AxElement,
+        app_name: &str,
+        windowless: bool,
+        action_deadline: std::time::Instant,
+    ) -> Result<ActOutcome, DriverError> {
+        let Action::Key { keys, target: None } = &params.action else {
+            return Err(error(
+                ErrorKind::WindowNotFound,
+                crate::messages::no_window(app_name),
+            ));
+        };
+        let stroke = parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
+        if !stroke.is_app_shortcut() {
+            return Err(error(
+                ErrorKind::WindowNotFound,
+                crate::messages::no_window(app_name),
+            ));
+        }
+        if !params.foreground_fallback {
+            return Err(error(
+                ErrorKind::NeedsForeground,
+                "A shortcut for an app without a window needs the foreground; the foreground fallback is turned off",
+            ));
+        }
+        let note = foreground::run_app_shortcut(
+            application,
+            app_name,
+            stroke,
+            windowless,
+            &self.aborted,
+            action_deadline,
+        )?;
+        let mut outcome = ActOutcome {
+            foreground_used: true,
+            note: Some(note),
+            scroll_position: None,
+            observation: None,
+        };
+        if params.observe_after {
+            // Cmd+N usually opens a window; show it, or say none appeared.
+            match self.observe(ObserveParams {
+                app: params.app,
+                window: None,
+                query: None,
+                max_elements: 300,
+                include_screenshot: params.include_screenshot,
+                user_windows: params.user_windows.clone(),
+            }) {
+                Ok(observation) => outcome.observation = Some(observation),
+                Err(_) => {
+                    let note = outcome.note.get_or_insert_with(String::new);
+                    note.push_str("; no window appeared yet; observe again");
+                }
+            }
+        }
+        Ok(outcome)
+    }
+}
+
+/// Cmd+N alone, sent without a window: it opens a new window at the app level.
+fn opens_new_window(action: &Action) -> bool {
+    matches!(action, Action::Key { keys, target: None }
+        if parse_combo(keys).is_ok_and(|stroke| stroke.opens_new_window()))
 }
 
 fn window_gone(application: &AxElement, window: &AxElement, pid: i32) -> bool {

@@ -327,6 +327,7 @@ mod tests {
                     query: None,
                     max_elements: 300,
                     include_screenshot: false,
+                    user_windows: vec![],
                 }),
                 Duration::from_secs(30),
             )
@@ -562,6 +563,7 @@ mod tests {
                     query: None,
                     max_elements: 300,
                     include_screenshot: false,
+                    user_windows: vec![],
                 }),
                 Duration::from_secs(30),
             )
@@ -624,6 +626,7 @@ mod tests {
                         query: None,
                         max_elements: 300,
                         include_screenshot: false,
+                        user_windows: vec![],
                     }),
                     Duration::from_secs(30),
                 )
@@ -982,6 +985,7 @@ mod tests {
                         query: None,
                         max_elements: 300,
                         include_screenshot: false,
+                        user_windows: vec![],
                     }),
                     Duration::from_secs(30),
                 )
@@ -1050,6 +1054,7 @@ mod tests {
                         query: None,
                         max_elements: 300,
                         include_screenshot: false,
+                        user_windows: vec![],
                     }),
                     Duration::from_secs(30),
                 )

@@ -30,6 +30,17 @@ impl KeyStroke {
     pub fn is_app_shortcut(self) -> bool {
         !self.enters_text() && (self.modifiers.cmd || self.modifiers.ctrl || self.keycode == 53)
     }
+
+    /// Cmd+N alone: the app-level shortcut that opens a new window, the only
+    /// key Orca sends to an app whose windows are all the user's.
+    pub fn opens_new_window(self) -> bool {
+        self.keycode == 45
+            && self.modifiers
+                == Modifiers {
+                    cmd: true,
+                    ..Modifiers::default()
+                }
+    }
 }
 
 fn modifier(name: &str) -> Option<Modifiers> {
@@ -232,6 +243,20 @@ pub fn parse_combo(keys: &[String]) -> Result<KeyStroke, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_cmd_n_alone_opens_a_new_window() {
+        assert!(combo(&["cmd", "n"]).opens_new_window());
+        for keys in [
+            &["cmd", "shift", "n"][..],
+            &["cmd", "option", "n"],
+            &["ctrl", "n"],
+            &["cmd", "w"],
+            &["n"],
+        ] {
+            assert!(!combo(keys).opens_new_window(), "{keys:?}");
+        }
+    }
 
     fn combo(keys: &[&str]) -> KeyStroke {
         parse_combo(&keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()).unwrap()

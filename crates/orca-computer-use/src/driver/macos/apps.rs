@@ -15,7 +15,7 @@ use objc2_screen_capture_kit::SCShareableContent;
 
 use super::windows::{AxWindowFacts, CaptureWindowFacts, usable_windows};
 use super::{ax::AxElement, error};
-use crate::protocol::{AppInfo, DriverError, ErrorKind};
+use crate::protocol::{AppInfo, DriverError, ErrorKind, WindowInfo};
 
 fn info_string(bundle: &NSBundle, key: &str) -> Option<String> {
     bundle
@@ -132,14 +132,18 @@ fn merge_apps(
 const LIST_AX_BUDGET: Duration = Duration::from_secs(2);
 const APP_AX_TIMEOUT_SECS: f32 = 0.25;
 
-fn list_with_timeout(timeout: Duration, verify_windows: bool) -> Result<Vec<AppInfo>, DriverError> {
-    let capture = windows(timeout)?;
-    let running = NSWorkspace::sharedWorkspace()
+fn running_apps() -> Vec<AppInfo> {
+    NSWorkspace::sharedWorkspace()
         .runningApplications()
         .iter()
         .filter(|app| app.activationPolicy() == NSApplicationActivationPolicy::Regular)
         .filter_map(|app| running_info(&app))
-        .collect();
+        .collect()
+}
+
+fn list_with_timeout(timeout: Duration, verify_windows: bool) -> Result<Vec<AppInfo>, DriverError> {
+    let capture = windows(timeout)?;
+    let running = running_apps();
     let ax_deadline = Instant::now() + LIST_AX_BUDGET.min(timeout);
     Ok(merge_apps(running, capture, |pid| {
         verify_windows
@@ -212,6 +216,39 @@ pub(super) fn list() -> Result<Vec<AppInfo>, DriverError> {
 /// What `list_apps` shows the model: windows observe and act can use.
 pub(super) fn list_verified() -> Result<Vec<AppInfo>, DriverError> {
     list_with_timeout(Duration::from_secs(30), true)
+}
+
+/// Every regular app's windows by id and title, unfiltered and without
+/// accessibility reads: who owns which window, off-screen and minimized ones
+/// included, for telling the user's windows from Orca's.
+pub(super) fn snapshot() -> Result<Vec<AppInfo>, DriverError> {
+    let capture = windows(Duration::from_secs(10))?;
+    Ok(snapshot_apps(running_apps(), capture))
+}
+
+fn snapshot_apps(
+    running: Vec<AppInfo>,
+    mut capture: HashMap<i32, Vec<CaptureWindowFacts>>,
+) -> Vec<AppInfo> {
+    let mut apps: Vec<_> = running
+        .into_iter()
+        .map(|mut app| {
+            app.windows = app
+                .pid
+                .and_then(|pid| capture.remove(&pid))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|window| WindowInfo {
+                    id: window.id,
+                    title: window.title,
+                    minimized: false,
+                })
+                .collect();
+            app
+        })
+        .collect();
+    apps.sort_by(|a, b| a.bundle_id.cmp(&b.bundle_id).then(a.pid.cmp(&b.pid)));
+    apps
 }
 
 /// Observe/act receive an already approved bundle ID; names cannot widen it.
@@ -755,7 +792,48 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::WindowInfo;
+
+    #[test]
+    fn a_window_snapshot_keeps_every_window_unfiltered() {
+        let app = |pid: i32| AppInfo {
+            bundle_id: format!("dev.orca.{pid}"),
+            name: pid.to_string(),
+            pid: Some(pid),
+            category: None,
+            windows: vec![],
+        };
+        let facts = |id: u32, frame: [f64; 4], on_screen: bool| CaptureWindowFacts {
+            id,
+            title: format!("w{id}"),
+            frame,
+            on_screen,
+        };
+        // A document, an off-screen (minimized) one and a small helper all count.
+        let snapshot = snapshot_apps(
+            vec![app(2), app(1)],
+            HashMap::from([(
+                2,
+                vec![
+                    facts(9, [0.0, 0.0, 800.0, 600.0], true),
+                    facts(10, [0.0, 0.0, 800.0, 600.0], false),
+                    facts(11, [0.0, 0.0, 20.0, 10.0], true),
+                ],
+            )]),
+        );
+        assert_eq!(
+            snapshot.iter().map(|app| app.pid).collect::<Vec<_>>(),
+            vec![Some(1), Some(2)]
+        );
+        assert!(snapshot[0].windows.is_empty());
+        assert_eq!(
+            snapshot[1]
+                .windows
+                .iter()
+                .map(|window| window.id)
+                .collect::<Vec<_>>(),
+            vec![9, 10, 11]
+        );
+    }
 
     fn application_fixture(root: &std::path::Path, folder: &str, id: &str) {
         let contents = root.join(format!("{folder}.app/Contents"));

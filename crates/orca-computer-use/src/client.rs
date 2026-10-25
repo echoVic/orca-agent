@@ -395,6 +395,7 @@ mod tests {
             observe_after: false,
             include_screenshot: false,
             secure_approved: false,
+            user_windows: vec![],
         })
     }
 
@@ -702,6 +703,7 @@ mod tests {
             query: None,
             max_elements: 300,
             include_screenshot: true,
+            user_windows: vec![],
         };
         let Reply::Observed { observation } =
             call(&client, Request::Observe(params.clone())).unwrap()

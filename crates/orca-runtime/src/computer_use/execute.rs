@@ -148,6 +148,7 @@ fn run_call(
             query: query.clone(),
             max_elements: *max_elements,
             include_screenshot,
+            user_windows: vec![],
         }),
         ComputerCall::Act {
             window,
@@ -162,6 +163,7 @@ fn run_call(
             observe_after: *observe_after,
             include_screenshot,
             secure_approved,
+            user_windows: vec![],
         }),
     };
     begin_turn(&service, stores.turn_store(), cancel);
@@ -1535,6 +1537,7 @@ mod tests {
                     query: None,
                     max_elements: 300,
                     include_screenshot: false,
+                    user_windows: vec![],
                 }),
                 Duration::from_secs(30),
             )

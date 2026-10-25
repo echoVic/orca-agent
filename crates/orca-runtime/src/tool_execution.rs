@@ -2273,6 +2273,7 @@ mod tests {
                     query: None,
                     max_elements: 300,
                     include_screenshot: false,
+                    user_windows: vec![],
                 }),
                 std::time::Duration::from_secs(5),
             )
@@ -2385,6 +2386,7 @@ mod tests {
                         query: None,
                         max_elements: 300,
                         include_screenshot: false,
+                        user_windows: vec![],
                     }),
                     std::time::Duration::from_secs(5),
                 )
@@ -2502,6 +2504,7 @@ mod tests {
                         observe_after: false,
                         include_screenshot: false,
                         secure_approved: false,
+                        user_windows: vec![],
                     }),
                     std::time::Duration::from_secs(5),
                 )
@@ -2692,6 +2695,7 @@ mod tests {
                             query: None,
                             max_elements: 300,
                             include_screenshot: false,
+                            user_windows: vec![],
                         },
                     ),
                     std::time::Duration::from_secs(30),

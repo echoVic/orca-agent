@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RequestLine {
@@ -26,6 +26,9 @@ pub enum Request {
     },
     Observe(ObserveParams),
     Act(ActParams),
+    /// Every regular app's layer-0 windows, unfiltered and without accessibility
+    /// reads: which windows exist, for telling the user's from Orca's.
+    WindowSnapshot,
     Turn {
         active: bool,
     },
@@ -39,6 +42,10 @@ pub struct ObserveParams {
     pub query: Option<String>,
     pub max_elements: u32,
     pub include_screenshot: bool,
+    /// The user's existing windows this call must not use: neither named nor
+    /// chosen by default. The runtime leaves out a window the user approved.
+    #[serde(default)]
+    pub user_windows: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -50,6 +57,10 @@ pub struct ActParams {
     pub observe_after: bool,
     pub include_screenshot: bool,
     pub secure_approved: bool,
+    /// The user's existing windows this call must not use: neither named nor
+    /// chosen by default. The runtime leaves out a window the user approved.
+    #[serde(default)]
+    pub user_windows: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -237,6 +248,8 @@ pub enum ErrorKind {
     NeedsForeground,
     UserActive,
     NeedsSecureApproval,
+    /// The window is one of the user's own; Orca asks before using it.
+    UserWindow,
     ScreenLocked,
     Failed,
 }
@@ -245,6 +258,20 @@ pub enum ErrorKind {
 mod tests {
     use super::*;
     use serde::Serialize;
+
+    #[test]
+    fn params_without_user_windows_read_as_none() {
+        let observe: ObserveParams = serde_json::from_str(
+            r#"{"app":"x","window":null,"query":null,"max_elements":5,"include_screenshot":false}"#,
+        )
+        .unwrap();
+        assert!(observe.user_windows.is_empty());
+        let act: ActParams = serde_json::from_str(
+            r#"{"app":"x","window":null,"action":{"kind":"key","keys":["cmd","n"],"target":null},"foreground_fallback":true,"observe_after":false,"include_screenshot":false,"secure_approved":false}"#,
+        )
+        .unwrap();
+        assert!(act.user_windows.is_empty());
+    }
 
     fn round_trip<T>(value: T)
     where
@@ -264,6 +291,7 @@ mod tests {
                 query: None,
                 max_elements: 300,
                 include_screenshot: true,
+                user_windows: vec![],
             }),
         };
         let text = serde_json::to_string(&line).unwrap();
@@ -306,7 +334,7 @@ mod tests {
 
     #[test]
     fn every_request_and_action_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
         let actions = [
             Action::Click {
                 target: Target::Element { element: 12 },
@@ -339,12 +367,14 @@ mod tests {
                     observe_after: false,
                     include_screenshot: true,
                     secure_approved: false,
+                    user_windows: vec![4, 5],
                 }),
             });
         }
         for request in [
             Request::Hello { protocol: 1 },
             Request::ListApps,
+            Request::WindowSnapshot,
             Request::ResolveApp {
                 app: "x".into(),
                 allow_not_running: true,
@@ -445,6 +475,7 @@ mod tests {
             ErrorKind::NeedsForeground,
             ErrorKind::UserActive,
             ErrorKind::NeedsSecureApproval,
+            ErrorKind::UserWindow,
             ErrorKind::ScreenLocked,
             ErrorKind::Failed,
         ] {

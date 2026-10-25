@@ -36,6 +36,13 @@ pub struct FakeDesktop {
     pub launch_reply_override: Option<AppInfo>,
     /// The observation after a delivered action finds the window unusable.
     pub post_act_observe_fails: bool,
+    /// Window snapshots list the fixture's windows, so windows open before a
+    /// turn are the user's. Off by default: snapshots list none and every
+    /// window counts as one Orca opened, as tests from before the window
+    /// boundary assume.
+    pub snapshots_see_windows: bool,
+    /// Window snapshots fail, as when ScreenCaptureKit times out.
+    pub snapshot_fails: bool,
     apps: Vec<FakeApp>,
 }
 
@@ -114,6 +121,8 @@ impl FakeDesktop {
             last_observe: None,
             launch_reply_override: None,
             post_act_observe_fails: false,
+            snapshots_see_windows: false,
+            snapshot_fails: false,
             apps: vec![FakeApp {
                 info: AppInfo {
                     bundle_id: bundle_id.into(),
@@ -236,6 +245,48 @@ impl FakeDesktop {
         Ok(index)
     }
 
+    /// The window observe and act use: the named one unless it is the user's,
+    /// else the first that is not the user's.
+    fn own_window<'a>(
+        app: &'a FakeApp,
+        window: Option<u32>,
+        user_windows: &[u32],
+    ) -> Result<&'a WindowInfo, DriverError> {
+        let windows = &app.info.windows;
+        let theirs = || {
+            windows
+                .iter()
+                .map(|info| (info.id, info.title.clone()))
+                .collect::<Vec<_>>()
+        };
+        match window {
+            Some(id) => {
+                let info = windows.iter().find(|info| info.id == id).ok_or_else(|| {
+                    error(
+                        ErrorKind::WindowNotFound,
+                        crate::messages::not_usable_window(id, &app.info.name),
+                    )
+                })?;
+                if user_windows.contains(&id) {
+                    return Err(error(
+                        ErrorKind::UserWindow,
+                        crate::messages::user_window(id, &info.title),
+                    ));
+                }
+                Ok(info)
+            }
+            None => windows
+                .iter()
+                .find(|info| !user_windows.contains(&info.id))
+                .ok_or_else(|| {
+                    error(
+                        ErrorKind::UserWindow,
+                        crate::messages::user_window_only(&app.info.name, &theirs()),
+                    )
+                }),
+        }
+    }
+
     fn observe(&self, params: &ObserveParams) -> Result<Observation, DriverError> {
         let app = &self.apps[self.running_app(&params.app, params.window)?];
         if params.window.is_none() && app.info.windows.is_empty() {
@@ -244,6 +295,7 @@ impl FakeDesktop {
                 crate::messages::no_window(&app.info.name),
             ));
         }
+        let window = Self::own_window(app, params.window, &params.user_windows)?.clone();
         let mut elements = params.query.as_ref().map_or_else(
             || app.elements.clone(),
             |query| filter_elements(&app.elements, query),
@@ -268,11 +320,7 @@ impl FakeDesktop {
         Ok(Observation {
             bundle_id: app.info.bundle_id.clone(),
             app_name: app.info.name.clone(),
-            window: params
-                .window
-                .and_then(|id| app.info.windows.iter().find(|window| window.id == id))
-                .unwrap_or(&app.info.windows[0])
-                .clone(),
+            window,
             elements,
             omitted,
             no_element_tree: false,
@@ -286,24 +334,53 @@ impl FakeDesktop {
     }
 
     fn act(&mut self, params: ActParams) -> Result<Reply, DriverError> {
+        // No window of the app's own: none at all, or only the user's. Any
+        // app-level shortcut reaches the first; only Cmd+N, which opens a new
+        // window, reaches the second.
         if params.window.is_none()
             && let Some(app) = self.apps.iter_mut().find(|app| {
                 app.info.bundle_id == params.app
                     && app.info.pid.is_some()
-                    && app.info.windows.is_empty()
+                    && app
+                        .info
+                        .windows
+                        .iter()
+                        .all(|window| params.user_windows.contains(&window.id))
             })
         {
-            let shortcut = match &params.action {
-                Action::Key { keys, target: None } => crate::keys::parse_combo(keys)
-                    .map_err(|message| error(ErrorKind::Failed, message))?
-                    .is_app_shortcut(),
-                _ => false,
+            let windowless = app.info.windows.is_empty();
+            let stroke = match &params.action {
+                Action::Key { keys, target: None } => Some(
+                    crate::keys::parse_combo(keys)
+                        .map_err(|message| error(ErrorKind::Failed, message))?,
+                ),
+                _ => None,
             };
-            if !shortcut {
-                return Err(error(
-                    ErrorKind::WindowNotFound,
-                    crate::messages::no_window(&app.info.name),
-                ));
+            let reaches = stroke.is_some_and(|stroke| {
+                if windowless {
+                    stroke.is_app_shortcut()
+                } else {
+                    stroke.opens_new_window()
+                }
+            });
+            if !reaches {
+                return Err(if windowless {
+                    error(
+                        ErrorKind::WindowNotFound,
+                        crate::messages::no_window(&app.info.name),
+                    )
+                } else {
+                    let theirs: Vec<_> = app
+                        .info
+                        .windows
+                        .iter()
+                        .map(|window| (window.id, window.title.clone()))
+                        .collect();
+                    error(
+                        ErrorKind::UserWindow,
+                        crate::messages::user_window_only(&app.info.name, &theirs),
+                    )
+                });
             }
             if !params.foreground_fallback {
                 return Err(error(
@@ -315,7 +392,11 @@ impl FakeDesktop {
             return Ok(Reply::Acted {
                 outcome: ActOutcome {
                     foreground_used: true,
-                    note: Some("sent to the app, which has no window".into()),
+                    note: Some(if windowless {
+                        "sent to the app, which has no window".into()
+                    } else {
+                        "sent to the app, whose windows are all the user's".into()
+                    }),
                     scroll_position: None,
                     observation: None,
                 },
@@ -323,6 +404,7 @@ impl FakeDesktop {
         }
         // Never resolve an action by display name or redirect it to another app.
         let index = self.running_app(&params.app, params.window)?;
+        Self::own_window(&self.apps[index], params.window, &params.user_windows)?;
         let target = match &params.action {
             Action::Click { target, .. } | Action::Scroll { target, .. } => Some(*target),
             Action::Type { target, .. } | Action::Key { target, .. } => *target,
@@ -439,6 +521,7 @@ impl FakeDesktop {
                     query: None,
                     max_elements: 300,
                     include_screenshot: params.include_screenshot,
+                    user_windows: params.user_windows.clone(),
                 })
             };
             match observed {
@@ -521,6 +604,26 @@ impl DriverHandler for FakeDesktop {
                 })
             }
             Request::Act(params) => self.act(params),
+            Request::WindowSnapshot => {
+                if self.snapshot_fails {
+                    return Err(error(ErrorKind::Failed, "Window listing timed out"));
+                }
+                Ok(Reply::Apps {
+                    apps: self
+                        .apps
+                        .iter()
+                        .filter(|app| app.info.pid.is_some())
+                        .map(|app| AppInfo {
+                            windows: if self.snapshots_see_windows {
+                                app.info.windows.clone()
+                            } else {
+                                vec![]
+                            },
+                            ..app.info.clone()
+                        })
+                        .collect(),
+                })
+            }
             Request::Turn { active } => {
                 self.turn_active = active;
                 Ok(Reply::Done)
@@ -624,6 +727,105 @@ impl DriverLauncher for FakeLauncher {
 mod regression_tests {
     use super::*;
 
+    fn observe_params(window: Option<u32>, user_windows: Vec<u32>) -> ObserveParams {
+        ObserveParams {
+            app: "com.apple.TextEdit".into(),
+            window,
+            query: None,
+            max_elements: 10,
+            include_screenshot: false,
+            user_windows,
+        }
+    }
+
+    #[test]
+    fn the_fake_keeps_off_the_users_windows() {
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.add_window(
+            "com.apple.TextEdit",
+            WindowInfo {
+                id: 2,
+                title: "Untitled".into(),
+                minimized: false,
+            },
+        );
+        // Without a window, the first window that is not the user's.
+        assert_eq!(
+            desktop
+                .observe(&observe_params(None, vec![1]))
+                .unwrap()
+                .window
+                .id,
+            2
+        );
+        let named = desktop
+            .observe(&observe_params(Some(1), vec![1]))
+            .unwrap_err();
+        assert_eq!(
+            (named.kind, named.message),
+            (
+                ErrorKind::UserWindow,
+                crate::messages::user_window(1, "probe.rtf")
+            )
+        );
+        let only = desktop
+            .observe(&observe_params(None, vec![1, 2]))
+            .unwrap_err();
+        assert_eq!(
+            only.message,
+            crate::messages::user_window_only(
+                "TextEdit",
+                &[(1, "probe.rtf".into()), (2, "Untitled".into())]
+            )
+        );
+    }
+
+    #[test]
+    fn only_cmd_n_reaches_an_app_whose_windows_are_all_the_users() {
+        let mut desktop = FakeDesktop::with_textedit();
+        let key = |keys: &[&str]| ActParams {
+            app: "com.apple.TextEdit".into(),
+            window: None,
+            action: Action::Key {
+                keys: keys.iter().map(|k| k.to_string()).collect(),
+                target: None,
+            },
+            foreground_fallback: true,
+            observe_after: false,
+            include_screenshot: false,
+            secure_approved: false,
+            user_windows: vec![1],
+        };
+        let Ok(Reply::Acted { outcome }) = desktop.act(key(&["cmd", "n"])) else {
+            panic!("cmd+n should reach the app")
+        };
+        assert!(outcome.foreground_used);
+        assert_eq!(desktop.actions_on("com.apple.TextEdit"), 1);
+        let refused = desktop.act(key(&["cmd", "w"])).unwrap_err();
+        assert_eq!(refused.kind, ErrorKind::UserWindow);
+        assert_eq!(desktop.actions_on("com.apple.TextEdit"), 1);
+    }
+
+    #[test]
+    fn window_snapshots_list_windows_only_when_the_fixture_says_they_predate_the_turn() {
+        let mut desktop = FakeDesktop::with_textedit();
+        let output = LineWriter::new(std::io::sink());
+        let ids = |desktop: &mut FakeDesktop| match desktop.handle(Request::WindowSnapshot, &output)
+        {
+            Ok(Reply::Apps { apps }) => apps
+                .into_iter()
+                .flat_map(|app| app.windows)
+                .map(|window| window.id)
+                .collect::<Vec<_>>(),
+            other => panic!("expected a snapshot: {other:?}"),
+        };
+        assert!(ids(&mut desktop).is_empty());
+        desktop.snapshots_see_windows = true;
+        assert_eq!(ids(&mut desktop), vec![1]);
+        desktop.snapshot_fails = true;
+        assert!(desktop.handle(Request::WindowSnapshot, &output).is_err());
+    }
+
     #[test]
     fn a_windowless_app_accepts_only_an_app_shortcut_without_a_window() {
         let mut desktop = FakeDesktop::with_windowless_app("com.apple.TextEdit", "TextEdit");
@@ -638,6 +840,7 @@ mod regression_tests {
             observe_after: false,
             include_screenshot: false,
             secure_approved: false,
+            user_windows: vec![],
         };
         let Ok(Reply::Acted { outcome }) = desktop.act(key(&["cmd", "n"], None)) else {
             panic!("cmd+n should reach a windowless app")
@@ -662,6 +865,7 @@ mod regression_tests {
             query: None,
             max_elements: 10,
             include_screenshot: false,
+            user_windows: vec![],
         };
         let error = desktop.observe(&observe(Some(999))).unwrap_err();
         assert_eq!(error.kind, ErrorKind::WindowNotFound);
@@ -693,6 +897,7 @@ mod regression_tests {
                 observe_after: false,
                 include_screenshot: false,
                 secure_approved: false,
+                user_windows: vec![],
             });
             if approval_needed {
                 assert_eq!(result.unwrap_err().kind, ErrorKind::NeedsSecureApproval);
@@ -720,6 +925,7 @@ mod regression_tests {
                 query: None,
                 max_elements: 300,
                 include_screenshot: false,
+                user_windows: vec![],
             })
             .unwrap();
         assert_eq!(observation.window.id, 2);
