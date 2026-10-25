@@ -287,9 +287,9 @@ impl MacDriver {
             .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
         let application = AxElement::application(pid)?;
         let windows = capture::windows()?;
-        // An app with no window takes an app-level shortcut, and an app whose
-        // windows are all the user's takes Cmd+N, which opens a new one;
-        // neither has a window of its own to resolve.
+        // An app with no window takes an app-level shortcut. If only the user's
+        // windows remain, only lone Cmd+N is allowed, with app-dependent effects.
+        // Neither path has an AX window of Orca's own to resolve.
         let windowless = params.window.is_none() && !super::app_has_window(&application)?;
         let resolved = if windowless {
             None
@@ -314,6 +314,19 @@ impl MacDriver {
             }
         };
         let Some((ax_window, window)) = resolved else {
+            let windowless = if windowless {
+                // AX can omit windows on other Spaces; captured user windows
+                // still require lone Cmd+N before the app is activated.
+                super::windows::app_shortcut_windowless(
+                    pid,
+                    &app.name,
+                    &windows,
+                    &params.user_windows,
+                    &params.action,
+                )?
+            } else {
+                false
+            };
             return self.app_shortcut(params, &application, &app.name, windowless, action_deadline);
         };
         let id = window.id;
@@ -596,7 +609,7 @@ impl MacDriver {
             observation: None,
         };
         if params.observe_after {
-            // Cmd+N usually opens a window; show it, or say none appeared.
+            // Show a new window, or warn that Cmd+N may have acted in a user window.
             match self.observe(ObserveParams {
                 app: params.app,
                 window: None,
@@ -608,7 +621,12 @@ impl MacDriver {
                 Ok(observation) => outcome.observation = Some(observation),
                 Err(_) => {
                     let note = outcome.note.get_or_insert_with(String::new);
-                    note.push_str("; no window appeared yet; observe again");
+                    note.push_str("; ");
+                    note.push_str(if windowless {
+                        "no window appeared yet; observe again"
+                    } else {
+                        crate::messages::CMD_N_OPENED_NO_WINDOW
+                    });
                 }
             }
         }
@@ -616,7 +634,8 @@ impl MacDriver {
     }
 }
 
-/// Cmd+N alone, sent without a window: it opens a new window at the app level.
+/// Lone untargeted Cmd+N is allowed when only user windows remain;
+/// whether it opens a window depends on the app.
 fn opens_new_window(action: &Action) -> bool {
     matches!(action, Action::Key { keys, target: None }
         if parse_combo(keys).is_ok_and(|stroke| stroke.opens_new_window()))

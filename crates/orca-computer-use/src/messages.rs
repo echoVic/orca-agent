@@ -1,6 +1,8 @@
 //! Window errors shared by the macOS driver and the fake desktop, each with
 //! the step the model should take next.
 
+pub const CMD_N_OPENED_NO_WINDOW: &str = "Cmd+N opened no new window; the app may have acted in the user's window instead. Observe again before going on.";
+
 pub const NO_WINDOW_NEXT_STEP: &str = "For an app-level shortcut such as cmd+n, use key without window; to open a file or URL, use launch_app with open.";
 
 /// A note, not an error: the action already happened, so it must not be retried.
@@ -41,6 +43,14 @@ pub fn user_window_only(app: &str, windows: &[(u32, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmd_n_without_a_new_window_warns_of_possible_user_window_action() {
+        assert_eq!(
+            CMD_N_OPENED_NO_WINDOW,
+            "Cmd+N opened no new window; the app may have acted in the user's window instead. Observe again before going on."
+        );
+    }
 
     #[test]
     fn user_window_messages_name_the_windows_and_both_ways_on() {

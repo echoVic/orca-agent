@@ -236,9 +236,12 @@ impl DriverHandler for MacDriver {
             Request::ListApps => Ok(Reply::Apps {
                 apps: apps::list_verified()?,
             }),
-            Request::WindowSnapshot => Ok(Reply::Apps {
-                apps: apps::snapshot()?,
-            }),
+            Request::WindowSnapshot => {
+                capture::check_unlocked()?;
+                Ok(Reply::Apps {
+                    apps: apps::snapshot()?,
+                })
+            }
             Request::ResolveApp {
                 app,
                 allow_not_running,

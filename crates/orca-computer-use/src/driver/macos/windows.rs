@@ -1,6 +1,6 @@
 //! Which windows the model can use: the rule `list_apps`, `launch_app` and the
 //! default-window choice share.
-use crate::protocol::{DriverError, ErrorKind, WindowInfo};
+use crate::protocol::{Action, DriverError, ErrorKind, WindowInfo};
 
 /// A layer-0 window as ScreenCaptureKit reports it.
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +70,35 @@ pub(super) struct WindowChoice {
     pub minimized: bool,
 }
 
+/// Classifies the app-shortcut path when AX reports no window. Captured user
+/// windows still require lone Cmd+N; captures of Orca's own keep the old path.
+/// Returns whether the caller should use its existing windowless validation.
+pub(super) fn app_shortcut_windowless(
+    pid: i32,
+    app_name: &str,
+    captures: &[super::capture::Window],
+    user_windows: &[u32],
+    action: &Action,
+) -> Result<bool, DriverError> {
+    let theirs: Vec<_> = captures
+        .iter()
+        .filter(|capture| capture.pid == pid && user_windows.contains(&capture.id))
+        .map(|capture| (capture.id, capture.title.clone()))
+        .collect();
+    if theirs.is_empty() {
+        return Ok(true);
+    }
+    if matches!(action, Action::Key { keys, target: None }
+        if crate::keys::parse_combo(keys).is_ok_and(|stroke| stroke.opens_new_window()))
+    {
+        return Ok(false);
+    }
+    Err(super::error(
+        ErrorKind::UserWindow,
+        crate::messages::user_window_only(app_name, &theirs),
+    ))
+}
+
 /// Picks the AX window (and its capture window) observe and act use: an
 /// explicit id must be a usable window of this app; without one, the usable
 /// main window, else the first usable one, else (nothing usable) the main or
@@ -130,7 +159,13 @@ pub(super) fn choose_window(
         ));
     }
     let theirs = |facts: &AxWindowFacts| {
-        capture_of(facts).is_some_and(|c| user_windows.contains(&captures[c].id))
+        // Same-frame windows are ambiguous: any matching user capture makes
+        // this AX window unsafe, even if Orca's capture appears first.
+        captures.iter().any(|capture| {
+            capture.pid == pid
+                && user_windows.contains(&capture.id)
+                && super::frames_match(facts.frame, capture.frame)
+        })
     };
     let choices: Vec<_> = ax
         .iter()
@@ -153,11 +188,18 @@ pub(super) fn choose_window(
     let index = match default_window(&choices) {
         Some(index) => index,
         None => {
-            let listed: Vec<(u32, String)> = ax
+            let mut listed_ids = std::collections::HashSet::new();
+            let listed: Vec<(u32, String)> = captures
                 .iter()
-                .filter_map(&capture_of)
-                .filter(|&c| user_windows.contains(&captures[c].id))
-                .map(|c| (captures[c].id, captures[c].title.clone()))
+                .filter(|capture| {
+                    capture.pid == pid
+                        && user_windows.contains(&capture.id)
+                        && ax
+                            .iter()
+                            .any(|facts| super::frames_match(facts.frame, capture.frame))
+                })
+                .filter(|capture| listed_ids.insert(capture.id))
+                .map(|capture| (capture.id, capture.title.clone()))
                 .collect();
             if !listed.is_empty() {
                 return Err(super::error(
@@ -228,6 +270,87 @@ pub(super) fn default_window(choices: &[WindowChoice]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(keys: &[&str]) -> crate::protocol::Action {
+        crate::protocol::Action::Key {
+            keys: keys.iter().map(|key| key.to_string()).collect(),
+            target: None,
+        }
+    }
+
+    #[test]
+    fn ax_windowless_shortcuts_only_allow_cmd_n_when_user_captures_remain() {
+        let captures = [window(1, DOC, false)];
+        assert!(
+            !app_shortcut_windowless(7, "Finder", &captures, &[1], &key(&["cmd", "n"])).unwrap()
+        );
+        for keys in [
+            &["cmd", "w"][..],
+            &["cmd", "q"],
+            &["ctrl", "n"],
+            &["cmd", "shift", "n"],
+        ] {
+            let refused =
+                app_shortcut_windowless(7, "Finder", &captures, &[1], &key(keys)).unwrap_err();
+            assert_eq!(refused.kind, ErrorKind::UserWindow);
+            assert_eq!(
+                refused.message,
+                crate::messages::user_window_only("Finder", &[(1, "w1".into())])
+            );
+        }
+        let targeted = crate::protocol::Action::Key {
+            keys: vec!["cmd".into(), "n".into()],
+            target: Some(crate::protocol::Target::Element { element: 1 }),
+        };
+        assert_eq!(
+            app_shortcut_windowless(7, "Finder", &captures, &[1], &targeted)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UserWindow
+        );
+    }
+
+    #[test]
+    fn ax_windowless_without_user_captures_keeps_the_existing_shortcut_path() {
+        for keys in [&["cmd", "w"][..], &["cmd", "q"], &["ctrl", "n"]] {
+            assert!(app_shortcut_windowless(7, "Finder", &[], &[1], &key(keys)).unwrap());
+            // A capture of Orca's own that AX missed does not change the old path.
+            assert!(
+                app_shortcut_windowless(7, "Finder", &[window(2, DOC, false)], &[1], &key(keys))
+                    .unwrap()
+            );
+            // Another process's user window cannot restrict this app's shortcuts.
+            assert!(
+                app_shortcut_windowless(8, "Other", &[window(1, DOC, false)], &[1], &key(keys))
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn same_frame_captures_fail_closed_and_list_the_user_id_once() {
+        // Orca's capture comes first: the first frame match must not hide the user's.
+        let captures = [window(2, DOC, true), window(1, DOC, true)];
+        let facts = [ax(DOC, "AXStandardWindow", false)];
+        let refused =
+            choose_window(None, 7, "Finder", &captures, &facts, Some(0), &[1]).unwrap_err();
+        assert_eq!(refused.kind, ErrorKind::UserWindow);
+        assert_eq!(
+            refused.message,
+            crate::messages::user_window_only("Finder", &[(1, "w1".into())])
+        );
+        // Multiple AX entries with that frame must still list each user id once.
+        let repeated = [
+            ax(DOC, "AXStandardWindow", false),
+            ax(DOC, "AXStandardWindow", false),
+        ];
+        let refused =
+            choose_window(None, 7, "Finder", &captures, &repeated, Some(0), &[1]).unwrap_err();
+        assert_eq!(
+            refused.message,
+            crate::messages::user_window_only("Finder", &[(1, "w1".into())])
+        );
+    }
 
     #[test]
     fn the_default_window_never_falls_back_to_a_user_window() {

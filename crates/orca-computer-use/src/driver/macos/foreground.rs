@@ -211,7 +211,8 @@ fn wait_for_user_idle(aborted: &AtomicBool, action_deadline: Instant) -> Result<
 /// Sends an app-level shortcut to an app with no window of its own to use,
 /// then restores the previous app and pointer: any such shortcut to an app
 /// with no window (Cmd+N while only a system Open panel shows), or Cmd+N to
-/// an app whose windows are all the user's, which the app handles from its menu.
+/// an app whose windows are all the user's. Cmd+N's effect depends on the app
+/// and may act within the user's key window instead of opening a new window.
 pub(super) fn run_app_shortcut(
     application: &AxElement,
     app_name: &str,
