@@ -748,6 +748,10 @@ impl MacDriver {
                     });
                 }
             }
+        } else if !windowless {
+            let note = outcome.note.get_or_insert_with(String::new);
+            note.push_str("; ");
+            note.push_str(crate::messages::CMD_N_OPENED_NO_WINDOW);
         }
         Ok(outcome)
     }

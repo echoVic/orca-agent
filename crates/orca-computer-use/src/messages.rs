@@ -1,6 +1,8 @@
 //! Window errors shared by the macOS driver and the fake desktop, each with
 //! the step the model should take next.
 
+pub const OPENED_IN_USER_WINDOW: &str = "The file or URL may have opened inside one of the user's windows (for example as a tab); Orca did not look at it. Open a new window first to work with it.";
+
 pub const CMD_N_OPENED_NO_WINDOW: &str = "Cmd+N opened no new window; the app may have acted in the user's window instead. Observe again before going on.";
 
 pub const NO_WINDOW_NEXT_STEP: &str = "For an app-level shortcut such as cmd+n, use key without window; to open a file or URL, use launch_app with open.";
@@ -49,6 +51,14 @@ pub fn user_window_only(app: &str, windows: &[(u32, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opened_in_user_window_note_is_exact() {
+        assert_eq!(
+            OPENED_IN_USER_WINDOW,
+            "The file or URL may have opened inside one of the user's windows (for example as a tab); Orca did not look at it. Open a new window first to work with it."
+        );
+    }
 
     #[test]
     fn app_wide_shortcut_message_names_the_app_and_user_boundary() {

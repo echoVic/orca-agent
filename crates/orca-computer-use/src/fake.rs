@@ -407,7 +407,10 @@ impl FakeDesktop {
                     note: Some(if windowless {
                         "sent to the app, which has no window".into()
                     } else {
-                        "sent to the app, whose windows are all the user's".into()
+                        format!(
+                            "sent to the app, whose windows are all the user's; {}",
+                            crate::messages::CMD_N_OPENED_NO_WINDOW
+                        )
                     }),
                     scroll_position: None,
                     observation: None,
@@ -848,6 +851,13 @@ mod regression_tests {
             panic!("cmd+n should reach the app")
         };
         assert!(outcome.foreground_used);
+        assert!(outcome.observation.is_none());
+        assert_eq!(
+            outcome.note.as_deref(),
+            Some(
+                "sent to the app, whose windows are all the user's; Cmd+N opened no new window; the app may have acted in the user's window instead. Observe again before going on."
+            )
+        );
         assert_eq!(desktop.actions_on("com.apple.TextEdit"), 1);
         let refused = desktop.act(key(&["cmd", "w"])).unwrap_err();
         assert_eq!(refused.kind, ErrorKind::UserWindow);
