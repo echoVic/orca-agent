@@ -15,7 +15,8 @@ DATA = Path(__file__).with_name('testdata')
 
 class ApprovalTests(unittest.TestCase):
     def test_non_computer_panel_diff_does_not_supply_a_bundle_target(self):
-        for diff in ('+    return helper(self.state.value)', '+    import com.example.module'):
+        for diff in ('+    return helper(self.state.value)', '+    import com.example.module',
+                     'com.apple.finder#window:24538'):
             text = (
                 '╭ Approve · write_file ───────────────────────────╮\n'
                 '│ src/example.py                                 │\n'
@@ -27,6 +28,7 @@ class ApprovalTests(unittest.TestCase):
             panel = parse_panel(text)
             with self.subTest(diff=diff, result='bundle'):
                 self.assertIsNone(panel['target'])
+                self.assertIsNone(panel.get('canonical'))
             decision = answer_panel(panel, {'target': 'src/example.py'}, [])
             with self.subTest(diff=diff, result='approval'):
                 self.assertEqual((decision['chosen'], decision['boundary_event']),
@@ -59,12 +61,47 @@ class ApprovalTests(unittest.TestCase):
         from approvals import detector_self_test
         panel = parse_panel((DATA / 'computer-window.txt').read_text())
         self.assertEqual((panel['tool'], panel['target']), ('computer', 'com.apple.finder'))
+        self.assertEqual(panel.get('canonical'), 'com.apple.finder#window:24538')
         request = {'target': 'com.apple.finder#window:24538'}
         denied = answer_panel(panel, request, ['com.apple.finder'], set())
         self.assertEqual((denied['chosen'], denied['boundary_event']), ('Deny', False))
         allowed = answer_panel(panel, request, ['com.apple.finder'], {24538})
         self.assertEqual((allowed['chosen'], allowed['key'], allowed['boundary_event']), ('Allow this window this session', '2', False))
-        self.assertIn('computer-window.txt', {p['capture'] for p in detector_self_test()})
+        self.assertEqual({p['capture'] for p in detector_self_test()},
+                         {p.name for p in DATA.glob('*.txt')})
+
+    def test_window_panel_must_match_the_requests_window_even_when_task_allows_it(self):
+        panel = parse_panel((DATA / 'computer-window.txt').read_text())
+        for provided in ({99}, 'all'):
+            with self.subTest(task_windows=provided):
+                decision = answer_panel(panel, {'target': 'com.apple.finder#window:99'},
+                                        ['com.apple.finder'], provided)
+                self.assertEqual((decision['chosen'], decision['key'], decision['boundary_event']),
+                                 ('Deny', '4', True))
+
+    def test_secure_window_panel_must_match_the_requests_secure_suffix(self):
+        text = (DATA / 'computer-window.txt').read_text().replace(
+            'com.apple.finder#window:24538', 'com.apple.finder#window:24538#secure')
+        panel = parse_panel(text)
+        decision = answer_panel(panel, {'target': 'com.apple.finder#window:24538'},
+                                ['com.apple.finder'], {24538})
+        self.assertEqual((decision['chosen'], decision['key'], decision['boundary_event']),
+                         ('Deny', '4', True))
+
+    def test_canonical_target_requires_a_complete_bordered_computer_body_line(self):
+        capture = (DATA / 'computer-once.txt').read_text()
+        for target in ('com.apple.calculator', 'com.apple.calculator#secure',
+                       'com.apple.calculator#window:42', 'com.apple.calculator#window:42#secure',
+                       'jp.naver.line#window:77'):
+            with self.subTest(target=target):
+                text = capture.replace('\n', f'\n│ {target} │\n', 1)
+                self.assertEqual(parse_panel(text).get('canonical'), target)
+        for content in ('com.apple.calculator#window:abc', 'com.apple.calculator#window:42 extra',
+                        '│ com.apple.calculator#window:42', 'com.apple.calculator#secure#window:42'):
+            with self.subTest(content=content):
+                text = capture.replace('\n', f'\n│ {content} │\n', 1)
+                self.assertIsNone(parse_panel(text).get('canonical'))
+        self.assertIsNone(parse_panel(capture).get('canonical'))
 
     def test_target_first_window_preview_uses_a_non_com_bundle_despite_the_title(self):
         text = (DATA / 'computer-window.txt').read_text().replace(

@@ -45,7 +45,15 @@ def parse_panel(pane, titles=None):
         tool_match = re.search(r'(?:^|\n)\s*│\s*tool\s+(\S+)', body)
         tool = title.split('Approve · ', 1)[1] if title.startswith('Approve · ') else (tool_match[1] if tool_match else 'permissions')
         target = None
+        canonical = None
         if tool == 'computer':
+            # The TUI draws the canonical target as its own body line before the preview.
+            for line in preview_lines:
+                match = re.fullmatch(
+                    r'\s*│\s*([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,}(?:#window:\d+)?(?:#secure)?)\s*│\s*', line)
+                if match:
+                    canonical = match[1]
+                    break
             # The preview ends with the app bundle; its window title is user-controlled.
             preview = re.findall(r'\(([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,}(?:#secure)?)\)\s*│?\s*$',
                                  '\n'.join(preview_lines), re.MULTILINE)
@@ -55,7 +63,7 @@ def parse_panel(pane, titles=None):
                 # Older captures may show only a standalone canonical target.
                 bundles = re.findall(r'(?<![\w./-])([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,}(?:#secure)?)(?![\w./-])', body)
                 target = next((b for b in bundles if b.startswith(('com.', 'org.', 'net.', 'dev.', 'io.'))), None)
-        return {'title': title, 'tool': tool, 'target': target, 'options': options,
+        return {'title': title, 'tool': tool, 'target': target, 'canonical': canonical, 'options': options,
                 'known_title': title.startswith('Approve · ') or title in (titles if titles is not None else source_titles())}
     return None
 
@@ -93,7 +101,11 @@ def decide(panel, allowed_apps, target=None, task_windows=()):
 
 def answer_panel(panel, request, allowed_apps, task_windows=()):
     decision = decide(panel, allowed_apps, request['target'], task_windows)
-    if panel['target'] and request['target'] and panel['target'].split('#')[0] != request['target'].split('#')[0]:
+    if panel.get('canonical') and request['target']:
+        mismatch = panel['canonical'] != request['target']
+    else:
+        mismatch = panel['target'] and request['target'] and panel['target'].split('#')[0] != request['target'].split('#')[0]
+    if mismatch:
         decision.update(chosen='Deny', key=next(o['key'] for o in panel['options'] if o['label'] == 'Deny'), boundary_event=True)
     return decision
 
