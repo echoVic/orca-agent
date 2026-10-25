@@ -12,6 +12,8 @@ use super::budget::FailureBudget;
 use crate::tool_invocation::ToolInvocation;
 
 /// Resolve the app and apply authorization restrictions before asking approval.
+/// Tests that do not exercise the failure budget use this form.
+#[cfg(test)]
 pub(crate) fn prepare_invocation(
     invocation: &mut ToolInvocation,
     config: &RunConfig,
