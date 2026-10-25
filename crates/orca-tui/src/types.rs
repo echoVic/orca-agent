@@ -429,30 +429,37 @@ impl ApprovalDialog {
     /// Computer approvals offer session and saved grants for the app; grants
     /// for every app are only offered when the app cannot run commands.
     /// Missing app targets and secure-field input only offer a single approval
-    /// or denial.
+    /// or denial. One of the user's existing windows offers only this call or this session.
     /// For every other tool, `AlwaysTarget` is only shown when a target is
     /// present AND the tool is likely to be called again with the same
     /// target (e.g. reading a fixed file path).
     pub fn options_for(tool: &str, target: Option<&str>) -> Vec<ApprovalOption> {
         if tool == "computer" {
-            return if target.is_none_or(|target| target.ends_with("#secure")) {
-                vec![ApprovalOption::Once, ApprovalOption::Deny]
-            } else if target.is_some_and(orca_core::computer_apps::runs_commands) {
-                vec![
+            let target = target.map(orca_core::computer_apps::ComputerTarget::parse);
+            return match target {
+                None => vec![ApprovalOption::Once, ApprovalOption::Deny],
+                Some(target) if target.secure => vec![ApprovalOption::Once, ApprovalOption::Deny],
+                // One of the user's own windows: this call or this session; a
+                // window id does not outlive its app, so nothing is saved.
+                Some(target) if target.window.is_some() => vec![
+                    ApprovalOption::Once,
+                    ApprovalOption::AlwaysTarget,
+                    ApprovalOption::Deny,
+                ],
+                Some(target) if orca_core::computer_apps::runs_commands(&target.app) => vec![
                     ApprovalOption::Once,
                     ApprovalOption::AlwaysTarget,
                     ApprovalOption::AlwaysTargetSaved,
                     ApprovalOption::Deny,
-                ]
-            } else {
-                vec![
+                ],
+                Some(_) => vec![
                     ApprovalOption::Once,
                     ApprovalOption::AlwaysTarget,
                     ApprovalOption::AlwaysTool,
                     ApprovalOption::AlwaysTargetSaved,
                     ApprovalOption::AlwaysToolSaved,
                     ApprovalOption::Deny,
-                ]
+                ],
             };
         }
         if orca_core::mcp_types::mcp_tool_server(tool).is_some() {
@@ -1937,12 +1944,16 @@ impl AppState {
     /// True if a pending approval for this tool/target was already granted an
     /// "always allow" this session, whether by tool, by target, or (for an
     /// MCP tool) by its whole server. A grant for every app never covers
-    /// command-running apps, password entry, or a computer call without an app;
-    /// command-running apps can still be granted by their exact target.
+    /// command-running apps, password entry, one of the user's existing windows,
+    /// or a computer call without an app; command-running apps and windows can
+    /// still be granted by their exact target.
     pub fn approval_is_allowlisted(&self, tool: &str, target: Option<&str>) -> bool {
         let tool_grant_applies = tool != "computer"
             || target.is_some_and(|target| {
-                !target.ends_with("#secure") && !orca_core::computer_apps::runs_commands(target)
+                let target = orca_core::computer_apps::ComputerTarget::parse(target);
+                !target.secure
+                    && target.window.is_none()
+                    && !orca_core::computer_apps::runs_commands(&target.app)
             });
         if tool_grant_applies
             && self

@@ -659,4 +659,38 @@ mod tests {
             assert_eq!(resolution.decision, ApprovalDecision::Deny, "{path}");
         }
     }
+
+    #[test]
+    fn full_auto_uses_the_users_windows_and_other_modes_ask_despite_app_grants() {
+        let request = make_request(ActionKind::Computer);
+        let full_auto = ApprovalPolicy::new(ApprovalMode::FullAuto);
+        for (target, decision) in [
+            ("com.apple.finder#window:7", ApprovalDecision::Allow),
+            ("com.apple.finder#window:7#secure", ApprovalDecision::Ask),
+        ] {
+            assert_eq!(
+                full_auto
+                    .resolve_for_tool(&request, "computer", Some(target))
+                    .decision,
+                decision,
+                "{target}"
+            );
+        }
+        let granted = ApprovalPolicy::new(ApprovalMode::AutoEdit).with_rules(vec![
+            PermissionRule::whole_tool("computer", Decision::Allow),
+            PermissionRule::new("computer", "com.apple.finder", Decision::Allow),
+        ]);
+        assert_eq!(
+            granted
+                .resolve_for_tool(&request, "computer", Some("com.apple.finder"))
+                .decision,
+            ApprovalDecision::Allow
+        );
+        assert_eq!(
+            granted
+                .resolve_for_tool(&request, "computer", Some("com.apple.finder#window:7"))
+                .decision,
+            ApprovalDecision::Ask
+        );
+    }
 }

@@ -121,43 +121,51 @@ impl CompiledPermissionRule {
     /// A call without a target is matched as an empty one, so a pattern
     /// such as `src/**` never matches it.
     fn matches(&self, tool: &str, target: Option<&str>) -> bool {
-        // Command-running apps need an allow naming that exact app.
-        if tool == "computer"
-            && self.decision == Decision::Allow
-            && let Some(target) = target
+        let computer = (tool == "computer")
+            .then_some(target)
+            .flatten()
+            .map(crate::computer_apps::ComputerTarget::parse);
+        if self.decision == Decision::Allow
+            && let Some(computer) = &computer
         {
-            let app = target.strip_suffix("#secure").unwrap_or(target);
-            if crate::computer_apps::runs_commands(app)
+            // One of the user's existing windows is a boundary of its own: only
+            // an allow naming that exact window covers it, never an app,
+            // wildcard or whole-tool allow. Stricter than password entry on
+            // purpose: the user chose to approve their windows one by one.
+            if computer.window.is_some() {
+                return self.matches_tool(tool)
+                    && self.pattern.as_ref().is_some_and(|pattern| {
+                        target.is_some_and(|target| pattern.pattern == target.as_bytes())
+                    });
+            }
+            // Command-running apps need an allow naming that exact app.
+            if crate::computer_apps::runs_commands(&computer.app)
                 && self
                     .pattern
                     .as_ref()
-                    .is_none_or(|pattern| pattern.pattern != app.as_bytes())
+                    .is_none_or(|pattern| pattern.pattern != computer.app.as_bytes())
             {
                 return false;
             }
-        }
-        // App approval never preapproves password entry. Only an explicit
-        // whole-tool allow also covers the separate secure-input target.
-        if tool == "computer"
-            && self.decision == Decision::Allow
-            && self.pattern.is_some()
-            && target.is_some_and(|target| target.ends_with("#secure"))
-        {
-            return false;
+            // App approval never preapproves password entry. Only an explicit
+            // whole-tool allow also covers the separate secure-input target.
+            if computer.secure && self.pattern.is_some() {
+                return false;
+            }
         }
         self.matches_tool(tool)
             && self.pattern.as_ref().is_none_or(|pattern| {
                 if tool == "Workflow" && target == Some(INLINE_WORKFLOW_TARGET) {
                     return false;
                 }
-                let target = target.unwrap_or("");
-                pattern.matches(target)
-                        // App denies and prompts also cover the secure-input subtarget.
-                        || (tool == "computer"
-                            && matches!(self.decision, Decision::Deny | Decision::Prompt)
-                            && target
-                                .strip_suffix("#secure")
-                                .is_some_and(|app| pattern.matches(app)))
+                pattern.matches(target.unwrap_or(""))
+                    // App denies and prompts also cover the app's secure-input
+                    // and existing-window subtargets.
+                    || computer.as_ref().is_some_and(|computer| {
+                        matches!(self.decision, Decision::Deny | Decision::Prompt)
+                            && (computer.secure || computer.window.is_some())
+                            && pattern.matches(&computer.app)
+                    })
             })
     }
 
@@ -532,6 +540,74 @@ mod tests {
         assert_eq!(
             prompt.matching_decision("computer", Some("com.apple.Safari#secure")),
             Some(Decision::Prompt)
+        );
+    }
+
+    #[test]
+    fn only_an_exact_window_allow_covers_one_of_the_users_windows() {
+        let compile = |rules: Vec<PermissionRule>| {
+            CompiledPermissionRules::from_rules(PermissionRules { rules })
+        };
+        let window = Some("com.apple.finder#window:7");
+        for allow in [
+            PermissionRule::whole_tool("computer", Decision::Allow),
+            PermissionRule::new("computer", "com.apple.finder", Decision::Allow),
+            PermissionRule::new("computer", "com.apple.*", Decision::Allow),
+            PermissionRule::new("computer", "*", Decision::Allow),
+            PermissionRule::new("computer", "com.apple.finder#window:*", Decision::Allow),
+        ] {
+            assert_eq!(
+                compile(vec![allow.clone()]).matching_decision("computer", window),
+                None,
+                "{allow:?}"
+            );
+        }
+        let exact = compile(vec![PermissionRule::new(
+            "computer",
+            "com.apple.finder#window:7",
+            Decision::Allow,
+        )]);
+        assert_eq!(
+            exact.matching_decision("computer", window),
+            Some(Decision::Allow)
+        );
+        for other in [
+            "com.apple.finder#window:8",
+            "com.apple.finder#window:7#secure",
+            "com.apple.finder",
+        ] {
+            assert_eq!(
+                exact.matching_decision("computer", Some(other)),
+                None,
+                "{other}"
+            );
+        }
+        for decision in [Decision::Deny, Decision::Prompt] {
+            let app = compile(vec![PermissionRule::new(
+                "computer",
+                "com.apple.finder",
+                decision,
+            )]);
+            for target in [
+                "com.apple.finder#window:7",
+                "com.apple.finder#window:7#secure",
+            ] {
+                assert_eq!(
+                    app.matching_decision("computer", Some(target)),
+                    Some(decision),
+                    "{decision:?} {target}"
+                );
+            }
+        }
+        // A terminal's window also needs an allow for that exact window.
+        let terminal = compile(vec![PermissionRule::new(
+            "computer",
+            "com.apple.Terminal",
+            Decision::Allow,
+        )]);
+        assert_eq!(
+            terminal.matching_decision("computer", Some("com.apple.Terminal#window:3")),
+            None
         );
     }
 

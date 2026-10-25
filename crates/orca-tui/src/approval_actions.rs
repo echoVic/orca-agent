@@ -426,6 +426,72 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_window_offers_once_or_this_session_and_keeps_its_own_grant() {
+        let _home = crate::test_support::isolate_orca_home();
+        let window = "com.apple.Safari#window:7";
+        assert_eq!(
+            crate::types::ApprovalDialog::options_for("computer", Some(window)),
+            vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTarget,
+                ApprovalOption::Deny
+            ]
+        );
+        assert_eq!(
+            crate::types::ApprovalDialog::options_for(
+                "computer",
+                Some("com.apple.Safari#window:7#secure")
+            ),
+            vec![ApprovalOption::Once, ApprovalOption::Deny]
+        );
+        let mut state = state_awaiting_a_tool_approval();
+        let dialog = state.approval_dialog.as_mut().unwrap();
+        dialog.tool = "computer".into();
+        dialog.target = Some(window.into());
+        dialog.options = crate::types::ApprovalDialog::options_for("computer", Some(window));
+        let (action_tx, _action_rx) = mpsc::unbounded();
+
+        resolve_approval_option(&mut state, &action_tx, ApprovalOption::AlwaysTarget);
+
+        assert!(state.approval_is_allowlisted("computer", Some(window)));
+        for other in [
+            "com.apple.Safari#window:8",
+            "com.apple.Safari",
+            "com.apple.Safari#window:7#secure",
+        ] {
+            assert!(
+                !state.approval_is_allowlisted("computer", Some(other)),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_and_all_app_grants_leave_the_users_windows_to_ask() {
+        let _home = crate::test_support::isolate_orca_home();
+        for option in [ApprovalOption::AlwaysTarget, ApprovalOption::AlwaysTool] {
+            let mut state = state_awaiting_a_tool_approval();
+            let dialog = state.approval_dialog.as_mut().unwrap();
+            dialog.tool = "computer".into();
+            dialog.target = Some("com.apple.Safari".into());
+            dialog.options =
+                crate::types::ApprovalDialog::options_for("computer", Some("com.apple.Safari"));
+            let (action_tx, _action_rx) = mpsc::unbounded();
+
+            resolve_approval_option(&mut state, &action_tx, option);
+
+            assert!(
+                state.approval_is_allowlisted("computer", Some("com.apple.Safari")),
+                "{option:?}"
+            );
+            assert!(
+                !state.approval_is_allowlisted("computer", Some("com.apple.Safari#window:7")),
+                "{option:?}"
+            );
+        }
+    }
+
+    #[test]
     fn allowing_a_terminal_this_session_covers_only_that_app() {
         let mut state = state_awaiting_a_tool_approval();
         let dialog = state.approval_dialog.as_mut().unwrap();
