@@ -111,8 +111,9 @@ OS sandbox. Then type a task and press `Enter`.
   background.
 - **Approve tool calls.** A call that needs approval turns the input into an
   approval panel: allow once, allow this exact call, allow the tool for the
-  session, or deny. On a window panel, press `4` to keep a window and let
-  Orca continue (Esc can stop the whole turn). An MCP tool can also be always
+  session, or deny. `Esc` denies; once a computer call has run in the turn, it
+  stops the whole turn instead. On a window panel, press `4` to keep the
+  window and let Orca continue. An MCP tool can also be always
   allowed, alone or with its whole server, as a rule saved to your config. `Shift+Tab` cycles
   `suggest` → `auto-edit` → `full-auto` → `plan`. Entering `full-auto` asks for
   an explicit Full Access confirmation; the running task picks it up at its

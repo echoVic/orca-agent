@@ -130,11 +130,11 @@ panel:
 ╰──────────────────────────────────────────────────────────────────────────╯
 ~~~
 
-Press a number, or move with `↑`/`↓` and press `Enter`. On an ordinary
-existing-window panel, press `4` (Deny) to keep the window and let Orca
-continue. Esc can stop the whole turn instead: once a computer call has run
-in the turn, Orca's Esc listener stops the turn even while this panel is open.
-Other denials, including password entry, stop the turn.
+Press a number, or move with `↑`/`↓` and press `Enter`. `Esc` denies, except
+once a computer call has run in the turn: then Orca's Esc listener stops the
+whole turn, even while a panel is open. On an ordinary existing-window panel,
+press `4` (Deny) to keep the window and let Orca continue. Other denials,
+including password entry, stop the turn.
 When the call has no specific target (a search, for example), option 2 is not
 offered. If a preview is longer than the panel, `PgUp`/`PgDn` page through it.
 
