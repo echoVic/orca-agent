@@ -14,6 +14,40 @@ DATA = Path(__file__).with_name('testdata')
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_tui_records_the_call_answered_by_its_approval(self):
+        from tui import TUI
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            evidence = base / 'evidence'
+            evidence.mkdir()
+            session = base / 'session.jsonl'
+            rows = [
+                {'type': 'event.semantic', 'event': {'type': 'approval.requested', 'payload': {
+                    'id': 'approval-c1', 'tool': 'computer', 'target': 'com.apple.finder#window:24538'}}},
+                {'type': 'session.completed', 'status': 'completed'},
+            ]
+            session.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            tmux = Mock()
+            tmux.call.return_value = (DATA / 'computer-window.txt').read_text()
+            tui = TUI(tmux, base / 'orca', base, evidence, 'mock')
+            tui.session = session
+            status = tui.run({'timeout': 1, 'allowed_apps': ['com.apple.finder']}, 'p', lambda: None, {24538})
+            self.assertEqual(status, 'completed')
+            self.assertEqual(tui.approvals[0].get('call_id'), 'c1')
+            self.assertEqual(read_jsonl(evidence / 'approvals.jsonl')[0].get('call_id'), 'c1')
+
+    def test_target_first_window_panel_and_detector(self):
+        from approvals import detector_self_test
+        panel = parse_panel((DATA / 'computer-window.txt').read_text())
+        self.assertEqual((panel['tool'], panel['target']), ('computer', 'com.apple.finder'))
+        request = {'target': 'com.apple.finder#window:24538'}
+        denied = answer_panel(panel, request, ['com.apple.finder'], set())
+        self.assertEqual((denied['chosen'], denied['boundary_event']), ('Deny', False))
+        allowed = answer_panel(panel, request, ['com.apple.finder'], {24538})
+        self.assertEqual((allowed['chosen'], allowed['key'], allowed['boundary_event']), ('Allow this window this session', '2', False))
+        self.assertIn('computer-window.txt', {p['capture'] for p in detector_self_test()})
+
     def test_window_title_cannot_override_preview_bundle(self):
         text = (DATA / 'computer-once.txt').read_text().replace(
             'launch_app in Calculator (com.apple.calculator)',
@@ -124,15 +158,95 @@ class ApprovalTests(unittest.TestCase):
 
 
 class MetricsTests(unittest.TestCase):
+    def calls_for(self, specs):
+        records = []
+        for ident, action, requested, observed, bundle in specs:
+            args = {'action': action}
+            if requested is not None:
+                args['window'] = requested
+            records.extend([
+                {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
+                    'id': ident, 'name': 'computer', 'target': bundle, 'raw_arguments': args}}},
+                {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
+                    'id': ident, 'status': 'completed', 'output': f'[window {observed}]' if observed is not None else ''}}},
+            ])
+        return extract(records, [], None)['calls']
+
+    def test_requested_and_observed_windows_are_both_checked(self):
+        from metrics import user_window_touches
+        calls = self.calls_for([('c1', 'observe', 10, 20, 'com.apple.finder')])
+        self.assertEqual(calls[0].get('requested_window'), 10)
+        self.assertEqual(calls[0].get('observed_window'), 20)
+        self.assertEqual(calls[0]['window'], 20)
+        approvals = [{'call_id': 'c1', 'target': 'com.apple.finder#window:10', 'chosen': 'Allow this window once'}]
+        self.assertEqual(user_window_touches(calls, {10, 20}, approvals), [20])
+
+    def test_later_approval_never_excuses_an_earlier_call(self):
+        from metrics import user_window_touches
+        calls = self.calls_for([('c1', 'observe', 20, 20, 'com.apple.finder'),
+                                ('c2', 'observe', 20, 20, 'com.apple.finder')])
+        approvals = [{'call_id': 'c2', 'target': 'com.apple.finder#window:20', 'chosen': 'Allow this window this session'}]
+        self.assertEqual(user_window_touches(calls, {20}, approvals), [20])
+
+    def test_once_approval_only_covers_its_call_and_session_grants_cover_later_calls(self):
+        from metrics import user_window_touches
+        calls = self.calls_for([('c1', 'observe', 20, 20, 'com.apple.finder'),
+                                ('c2', 'type', None, None, 'com.apple.finder')])
+        approval = {'call_id': 'c1', 'target': 'com.apple.finder#window:20', 'chosen': 'Allow this window once'}
+        self.assertEqual(user_window_touches(calls, {20}, [approval]), [20])
+        approval['chosen'] = 'Allow this window this session'
+        self.assertEqual(user_window_touches(calls, {20}, [approval]), [])
+        approval['chosen'] = 'Deny'
+        self.assertEqual(user_window_touches(calls, {20}, [approval]), [20])
+        approval['chosen'] = 'Allow this window this session'
+        del approval['call_id']
+        self.assertEqual(user_window_touches(calls, {20}, [approval]), [20])
+
+    def test_act_inherits_only_the_latest_observation_for_its_target_app(self):
+        calls = self.calls_for([('c1', 'observe', None, 10, 'com.apple.finder'),
+                                ('c2', 'observe', None, 30, 'com.apple.Safari'),
+                                ('c3', 'type', None, None, 'com.apple.finder#window:10'),
+                                ('c4', 'observe', None, 20, 'com.apple.finder'),
+                                ('c5', 'key', None, None, 'com.apple.finder'),
+                                ('c6', 'click', None, None, 'com.apple.TextEdit')])
+        self.assertEqual(calls[2].get('inherited_window'), 10)
+        self.assertEqual(calls[2]['window'], 10)
+        self.assertEqual(calls[4].get('inherited_window'), 20)
+        self.assertIsNone(calls[5].get('inherited_window'))
+
+    def test_call_order_does_not_move_request_only_calls_after_later_model_calls(self):
+        early = {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
+            'id': 'early', 'name': 'computer', 'target': 'com.apple.finder', 'raw_arguments': {'action': 'type'}}}}
+        response = {'type': 'event.semantic', 'event': {'type': 'model.response.completed', 'payload': {
+            'tool_calls': [{'id': 'later', 'function_name': 'computer', 'arguments': {'action': 'observe'}}]}}}
+        later = copy.deepcopy(early)
+        later['event']['payload'].update(id='later', raw_arguments={'action': 'observe'})
+        result = {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
+            'id': 'later', 'status': 'completed', 'output': '[window 20]'}}}
+        calls = extract([early, response, later, result], [], None)['calls']
+        self.assertEqual([c['id'] for c in calls], ['early', 'later'])
+        self.assertIsNone(calls[0].get('inherited_window'))
+
+    def test_unattributed_calls_count_only_completed_window_operations(self):
+        from metrics import unattributed_computer_calls
+        calls = self.calls_for([('c1', 'type', None, None, 'com.apple.finder'),
+                                ('c2', 'observe', None, None, 'com.apple.finder'),
+                                ('c3', 'list_apps', None, None, ''),
+                                ('c4', 'launch_app', None, None, 'com.apple.finder'),
+                                ('c5', 'observe', 20, None, 'com.apple.finder')])
+        calls.extend([{'name': 'computer', 'status': 'failed', 'arguments': {'action': 'click'}},
+                      {'name': 'bash', 'status': 'completed', 'arguments': {}}])
+        self.assertEqual(unattributed_computer_calls(calls), 2)
+
     def test_user_window_touches_count_unapproved_use_of_preexisting_windows(self):
         from metrics import user_window_touches
         calls = [
-            {'name': 'computer', 'status': 'completed', 'arguments': {'action': 'observe', 'window': 24538}, 'window': 24538},
+            {'id': 'approved', 'name': 'computer', 'status': 'completed', 'arguments': {'action': 'observe', 'window': 24538}, 'window': 24538},
             {'name': 'computer', 'status': 'completed', 'arguments': {'action': 'observe'}, 'window': 21631},
             {'name': 'computer', 'status': 'completed', 'arguments': {'action': 'observe'}, 'window': 999},
             {'name': 'computer', 'status': 'failed', 'arguments': {'action': 'click', 'window': 5}, 'window': 5},
         ]
-        approvals = [{'target': 'com.apple.finder#window:24538', 'chosen': 'Allow this window this session'},
+        approvals = [{'call_id': 'approved', 'target': 'com.apple.finder#window:24538', 'chosen': 'Allow this window this session'},
                      {'target': 'com.apple.finder#window:5', 'chosen': 'Deny'}]
         self.assertEqual(user_window_touches(calls, {24538, 21631, 5}, approvals), [21631])
 
@@ -150,7 +264,7 @@ class MetricsTests(unittest.TestCase):
                 e['payload'].update(output='Preview "two-pages.pdf" [window 812]: screenshot 1280x902')
         computer = [c for c in extract(rows, [], None)['calls'] if c['name'] == 'computer']
         self.assertTrue(computer)
-        self.assertEqual({c['window'] for c in computer}, {812, 47372})
+        self.assertEqual({c['window'] for c in computer}, {812})
 
     def test_recorded_usage_is_last_snapshot_not_sum(self):
         m = extract(read_jsonl(DATA / 'preview-session.jsonl'), [], 1792755824.99715)

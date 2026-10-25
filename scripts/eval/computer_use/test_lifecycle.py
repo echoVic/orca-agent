@@ -333,7 +333,7 @@ class RunnerLifecycleTests(unittest.TestCase):
             {'id': 'S3', 'kind': 'single', 'allowed_apps': ['com.apple.finder'], 'prompt': 'p', 'verifier': 'last_file'},
             {'id': 'S2', 'kind': 'single', 'allowed_apps': ['com.apple.Safari'], 'prompt': 'p', 'verifier': 'heading'},
         ]
-        approved = [{'target': 'com.apple.Safari#window:77', 'chosen': 'Allow this window this session',
+        approved = [{'call_id': 'browser-observe', 'target': 'com.apple.Safari#window:77', 'chosen': 'Allow this window this session',
                      'window_panel': True}]
         cases = [(tasks[0], [], []), (tasks[1], [], []), (tasks[2], [], [77]), (tasks[2], approved, [])]
         for task, approvals, touches in cases:
@@ -345,6 +345,7 @@ class RunnerLifecycleTests(unittest.TestCase):
                 self.assertEqual(result['metrics']['user_window_touches'], touches)
                 saved = json.loads((base / 'report/evidence' / task['id'] / 'metrics.json').read_text())
                 self.assertEqual(saved['user_window_touches'], touches)
+                self.assertEqual(saved.get('unattributed_calls'), 0)
         self.assertEqual(seen, ['all', set(), {77}, {77}])
 
 

@@ -135,7 +135,7 @@ class TUI:
                 if req:
                     # Canonical semantic target repairs the known null surface target.
                     decision = answer_panel(panel, req, task['allowed_apps'], task_windows)
-                    record = {'time': time.time(), **panel, **decision, 'interaction_id': req['id']}
+                    record = {'time': time.time(), **panel, **decision, 'interaction_id': req['id'], 'call_id': req['call_id']}
                     self.approvals.append(record)
                     (self.evidence / f'approval-{len(self.approvals):03}.txt').write_text(pane)
                     with (self.evidence / 'approvals.jsonl').open('a') as f:

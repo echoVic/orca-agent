@@ -21,7 +21,7 @@ if str(HERE) not in sys.path:
 from approvals import detector_self_test
 from fixtures import BASE, archive_previous, prepare, reset_outputs
 from launch import environment as child_environment
-from metrics import extract, read_jsonl, user_window_touches
+from metrics import extract, read_jsonl, user_window_touches, unattributed_computer_calls
 from preflight import Native, browser_window
 from report import dump, write_report
 from services import Tmux, Services
@@ -145,6 +145,7 @@ def run_task(task, args, base, out, tmux, services, native):
             preexisting.update(task_windows)
         metrics['user_window_touches'] = user_window_touches(
             metrics['calls'], preexisting, tui.approvals)
+        metrics['unattributed_calls'] = unattributed_computer_calls(metrics['calls'])
         metrics['window_panels'] = sum(bool(a.get('window_panel')) for a in tui.approvals)
         dump(evidence / 'metrics.json', metrics)
         try:

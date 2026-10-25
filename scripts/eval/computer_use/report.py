@@ -33,10 +33,12 @@ def aggregate(rows, dry_run):
          'session_option_missing': sum(p.get('session_option_missing', False) for m in metrics for p in m['approvals']),
          'boundary_events': sum(p.get('boundary_event', False) for m in metrics for p in m['approvals']),
          'user_window_touches': sum(len(m.get('user_window_touches', [])) for m in metrics),
+         'unattributed_calls': sum(m.get('unattributed_calls', 0) for m in metrics),
          'window_panels': sum(m.get('window_panels', 0) for m in metrics),
          'tasks': {r['id']: {'passed': r['passed'], 'wall_seconds': r['metrics']['wall_seconds'],
                     'computer_calls': r['metrics']['computer_calls'], 'approvals': r['metrics']['approvals_shown'],
-                    'reason': r['reason'], 'user_window_touches': r['metrics'].get('user_window_touches', [])} for r in rows}}
+                    'reason': r['reason'], 'unattributed_calls': r['metrics'].get('unattributed_calls', 0),
+                    'user_window_touches': r['metrics'].get('user_window_touches', [])} for r in rows}}
     for kind, success_key, total_key in [('single', 'single_success', 'single_total'), ('multi', 'multi_outcome_success', 'multi_total')]:
         a[kind + '_success_rate'] = a[success_key] / a[total_key] if not dry_run and a[total_key] else None
     return a
