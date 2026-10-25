@@ -1260,6 +1260,7 @@ fn cmd_n_reaches_an_app_with_only_the_users_windows() {
         };
         let fixture = "dev.orca.cu-fixture";
         live.launch_fixture();
+        live.make_finder_frontmost();
         // Treat every fixture window open now as the user's.
         let Reply::Apps { apps } = live
             .client
