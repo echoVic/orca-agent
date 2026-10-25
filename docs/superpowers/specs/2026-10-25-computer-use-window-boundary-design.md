@@ -1,6 +1,6 @@
 # Orca Computer Use 阶段 3-2：窗口边界设计（macOS）
 
-> 状态：2026-10-25 设计确认（方案 A：运行时跟踪窗口归属 + 逐窗口审批 + 驱动兜底），待写实施计划。
+> 状态：2026-10-25 设计确认（方案 A：运行时跟踪窗口归属 + 逐窗口审批 + 驱动兜底）。实施计划：`docs/superpowers/plans/2026-10-25-computer-use-window-boundary.md`；写计划时补定的细节见 §0 的 harness 规则、§1 的回复类型、§2 的预览、§3 的 Cmd+N、§7 和 §9。
 > 来源：阶段 3 的第二个子项目（新顺序：可靠性 → 窗口边界 → 速度 → 界面）。
 > 依据：基线报告 `.superpowers/sdd/2026-10-24-computer-use-eval/report.md` 和可靠性验收报告 `.superpowers/sdd/2026-10-25-computer-use-reliability-eval/report.md`。
 
@@ -38,9 +38,10 @@
 - 关闭窗口的单独审批：用户的窗口在批准前根本不可操作，批准后关闭它也属于批准范围。
 - 速度和界面：留给子项目 3、4。
 
-**成功标准**（harness 两次完整运行，与 2026-10-25 的验收结果对比；harness 对已有窗口的面板一律选"拒绝"）：
+**成功标准**（harness 两次完整运行，与 2026-10-25 的验收结果对比）：
 
-- 两次运行中，没有任何 computer 调用在未经批准时作用到运行开始前就已打开的用户窗口。具体检查：preflight 快照里的窗口 id，在没有对应 `#window:` 批准的情况下，不得出现在成功的调用里。
+- **harness 怎么回答窗口面板**：只批准任务本身提供的窗口——S2/S8/M2/M6 里 harness 为任务新开的浏览器窗口（它在 Orca 的轮次开始前就存在，所以 Orca 会问），以及 S1/S4/S7/M4/M5 里该 app 的已有窗口（这几项本来就要用 app 唯一的主窗口）；其余窗口面板一律选"拒绝"。拒绝窗口面板不算越界，任务继续，模型可以自己新开窗口。
+- 两次运行中，没有任何 computer 调用在未经批准时作用到运行开始前就已打开的用户窗口。具体检查（`user_window_touches`）：preflight 快照里的窗口 id，在没有对应 `#window:` 批准的情况下，不得出现在成功的调用里。
 - S3、M3 两次都通过：模型被拒后改为新开窗口完成任务。
 - 其他各项不退步：单步 ≥ 7/8；多步 ≥ 6/7（新跑次的 M5 若因外部遮挡失败，照实说明）；每次工具错误 ≤ 15。
 - `list_apps` 输出里不出现本会话未使用过的 app 的窗口标题（单元测试固定，并在 harness 证据里核对）。
@@ -63,7 +64,7 @@
 | Orca 的窗口集合 | `ComputerUseService` 的状态 | 整个会话 |
 | 本轮开始快照 | 本轮 extension store，与失败预算放在一起 | 随本轮结束释放 |
 
-**新增驱动请求** `Request::WindowSnapshot`，回复 `Reply::Windows { apps: Vec<AppInfo> }`：
+**新增驱动请求** `Request::WindowSnapshot`，回复复用 `Reply::Apps { apps }`：
 
 - 只用 ScreenCaptureKit，不做 AX 查询，保证够快。
 - 记录常规 app 的全部 layer-0 窗口 id 和标题，不做可用性过滤。判断"是否用户窗口"按 id 精确匹配，用户已最小化的窗口和离屏窗口也不会漏掉。
@@ -84,7 +85,7 @@
 **审批面板（TUI）。**
 
 - 标题照常是 `Approve · computer`。
-- 预览写 `use your existing window "<标题>" in <应用名> (<bundle>)`。
+- 预览写 `<动作> in your existing window "<标题>" in <应用名> (<bundle>)`，与应用面板的 `<动作> in <应用名> (<bundle>)` 同形；往密码框打字时是 `<动作> into a password field in your existing window …`。
 - 选项：
   - 允许这一次（Allow this window once）；
   - 本会话允许这个窗口（Allow this window this session，即 `AlwaysTarget`，规则模式就是这个精确目标）；
@@ -123,14 +124,16 @@ pub user_windows: Vec<u32>,
 **驱动的处理**（`windows::choose_window`）：
 
 - **没给 `window` 时**，从候选里排除 `user_windows`，再按现有规则选：主窗口 → 第一个可用窗口 → 退回。
-  - 如果全部候选都是用户窗口，返回 `WindowNotFound`，消息是 `messages::user_window_only(app, &[(id, title)])`：
+  - 如果除用户窗口外没有可用的候选，返回新的错误类型 `ErrorKind::UserWindow`，消息是 `messages::user_window_only(app, &[(id, title)])`：
     > {app} only has the user's own windows: {id} "{title}", …. To use one, call again with its window number so Orca can ask the user; or open a new window (for example with key cmd+n, or launch_app with open).
   - 标题可以出现：调用能走到这一步，说明这个 app 已经批准过。
-- **显式给了 `window` 且它在 `user_windows` 里**，返回 `WindowNotFound`，消息是 `messages::user_window(id, title, app)`：
+  - 只有 app 根本没有用户窗口时，才沿用原来的退回规则（没有可用窗口时退回主窗口或第一个窗口），退回永远不会落到用户窗口上。
+- **显式给了 `window` 且它在 `user_windows` 里**，返回 `ErrorKind::UserWindow`，消息是 `messages::user_window(id, title)`：
   > Window {id} ("{title}") is the user's own window. Call again with window {id} so Orca can ask the user, or open a new window.
 
   正常流程里不会走到这里，因为 prepare 已经把它变成了审批目标；这是兜底。
-- **动作结束后的 observe**（`observe_after`）只观察动作所用的那个窗口，不受影响。
+- **只剩用户窗口时的 Cmd+N**：没给 `window`、除用户窗口外没有可用窗口，而动作是单独的 Cmd+N（没有其他修饰键）时，驱动像对没有窗口的 app 那样，把它作为 app 级快捷键发出（激活 app、按键、恢复前台和指针）。Cmd+N 由 app 的菜单处理，作用是新开窗口。只放行 Cmd+N：Cmd+W 等其他快捷键会作用在用户的窗口上，仍然返回 `user_window_only`。上面两条消息里的"open a new window (for example with key cmd+n)"就靠这一条兑现。
+- **动作结束后的 observe**（`observe_after`）同样带上 `user_windows`：普通动作只观察动作所用的窗口；Cmd+N 之后不带 `window`，于是看到新开的窗口。
 
 **运行时继承窗口时**：继承来的窗口只可能是之前 observe 过的。如果它是用户窗口，说明之前批准过（一次或本会话）。它和显式给的窗口一样，按 §2 成为审批目标：有会话授权就直接放行；当时只"允许一次"的，再弹一次面板。
 
@@ -141,7 +144,8 @@ pub user_windows: Vec<u32>,
   - 照常列出窗口和标题；
   - 用户的窗口后面加 `(yours)`；已最小化的加 `(minimized)`，两者可以同时出现。
 - **没用过的 app：**
-  - 只列一行：`<名称> — <bundle> (pid <n>) · <k> windows`，不列窗口 id，也不列标题。
+  - 只列一行：`<名称> — <bundle> (pid <n>) · <k> window(s)`，不列窗口 id，也不列标题。
+  - 驱动错误里附带的候选 app（名称有歧义或找不到时）也按同一规则列出。
   - 模型想用其中某个窗口，要先用这个 app，这会先触发应用审批。
 - **启动结果。** `launch_app` 的结果属于"用过的 app"，照常列出。
 
@@ -157,8 +161,9 @@ pub user_windows: Vec<u32>,
 | --- | --- |
 | `crates/orca-core/src/computer_apps.rs` | `ComputerTarget::parse`：把目标拆成应用、窗口、是否密码框，并负责格式化 |
 | `crates/orca-core/src/approval_rules.rs` | `#window:` 的匹配规则，与 `#secure` 对称且更严 |
-| `crates/orca-approval/src/policy.rs` | full-auto 放行 `#window:` |
-| `crates/orca-computer-use/src/protocol.rs` | `WindowSnapshot` 请求和回复；`user_windows` 参数；`PROTOCOL_VERSION = 3` |
+| `crates/orca-approval/src/policy.rs` | 不需改动：full-auto 本来就放行不以 `#secure` 结尾的目标；加测试固定 |
+| `crates/orca-computer-use/src/protocol.rs` | `WindowSnapshot` 请求；`user_windows` 参数；`ErrorKind::UserWindow`；`PROTOCOL_VERSION = 3` |
+| `crates/orca-computer-use/src/keys.rs`、`driver/macos/{actions,foreground}.rs` | 只剩用户窗口时放行单独的 Cmd+N |
 | `crates/orca-computer-use/src/messages.rs` | `user_window`、`user_window_only` |
 | `crates/orca-computer-use/src/driver/macos/{apps,mod,windows}.rs` | 快照；`choose_window` 排除用户窗口 |
 | `crates/orca-computer-use/src/fake.rs` | 快照；用户窗口；继承和排除 |
@@ -170,7 +175,8 @@ pub user_windows: Vec<u32>,
 
 ## 7. 失败和边界情况
 
-- **快照失败（驱动超时）：** 这一轮按"所有现有窗口都是用户的"处理（失败即关闭），并在结果里注明快照不可用。
+- **快照失败（驱动超时等）：** 非 full-auto 下这次调用失败，结果说明拿不到窗口列表、请重试；下一次调用再取快照。不会把任何窗口猜成 Orca 的（失败即关闭）。full-auto 不询问窗口，快照失败时只是没有 `(yours)` 标注。
+- **轮末快照失败，或驱动在轮中被重置：** 这一轮新开的窗口不会记成 Orca 的，下一轮它们算用户的。结果是多问一次，不会少问。
 - **审批后窗口关闭：** 下一次调用里该 id 已不存在，驱动报不可用（沿用可靠性子项目的消息）。
 - **同一窗口跨轮使用：** 会话授权按精确目标保留。下一轮这个窗口仍是用户的窗口，目标一致，规则直接放行，不再弹面板。
 - **用户在本轮中途关掉 Orca 的窗口：** 没有影响。
@@ -197,17 +203,19 @@ pub user_windows: Vec<u32>,
   - 快照失败时失败即关闭。
 - prepare：显式用户窗口 → 目标 `#window:`；继承来的用户窗口同样成为审批目标；预览带标题。
 - 驱动 `choose_window`：默认排除用户窗口；只剩用户窗口时给出带标题的消息；显式给的用户窗口被拒。
+- Cmd+N：只剩用户窗口时单独的 Cmd+N 到达 app，其他键被拒；fake 和运行时各一条。
 - `list_apps`：没用过的 app 不出现标题和 id；用过的 app 标注 `(yours)`。
 - TUI：`#window:` 的选项和文案；会话授权在同一窗口上不再询问，在别的窗口上仍然询问。
 
 **真机测试**（`--ignored`，需要用户离开电脑）：
 
-- 测试开始前先打开一个夹具窗口当作"用户窗口"。没给 `window` 时，observe 不会选中它，而且结果里有引导消息。
+- 测试开始前先打开一个夹具窗口当作"用户窗口"。没给 `window` 时，observe 不会选中它，而且结果里有引导消息；单独的 Cmd+N 让夹具新开一个窗口，动作后的观察看到的是新窗口。
 
-**验收：** harness 拒绝所有窗口面板，跑两次完整的 15 项，按 §0 的标准对比。
+**验收：** harness 按 §0 的规则回答窗口面板，跑两次完整的 15 项，按 §0 的标准对比。
 
 ## 9. 已知限制和假设
 
 - 本轮进行中用户自己新开的窗口会被当成 Orca 的（见 §1）。
+- 同理，Orca 在本轮启动某个 app 时，app 恢复的上次窗口（例如浏览器恢复的窗口）出现在 Orca 的轮次里，也会算作 Orca 的。
 - 同一个 app 的同一窗口在会话中途换了 id（极少见，比如重启了 app），需要重新审批。
 - 标题只对用过的 app 显示，但用户窗口的标题仍然会出现在审批预览（只给用户看）和"只剩用户窗口"的消息里。后者给模型看，前提是这个 app 已经批准过。
