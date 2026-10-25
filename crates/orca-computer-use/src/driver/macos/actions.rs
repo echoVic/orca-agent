@@ -35,6 +35,29 @@ fn recipient_delivery<T: PartialEq>(
     }
 }
 
+// Keep the keyboard guard testable without native AX reads.
+fn keyboard_recipient_delivery<T: PartialEq>(
+    target: Option<Target>,
+    selected_window: &T,
+    foreground_fallback: bool,
+    read_window: impl FnOnce() -> Result<Option<T>, DriverError>,
+) -> Result<RecipientDelivery, DriverError> {
+    // The target explains the request, but the app's actual focus receives keys.
+    // Even an observed element cannot exempt that recipient from the boundary.
+    let description = if matches!(target, Some(Target::Element { .. })) {
+        "focus for the element target"
+    } else {
+        "focus"
+    };
+    let window = read_window()?;
+    recipient_delivery(
+        window.as_ref(),
+        selected_window,
+        foreground_fallback,
+        description,
+    )
+}
+
 struct RecipientBoundary<'a> {
     selected: &'a AxElement,
     foreground_fallback: bool,
@@ -96,12 +119,16 @@ impl RecipientBoundary<'_> {
         element: &AxElement,
         target: Option<Target>,
     ) -> Result<(), DriverError> {
-        if !matches!(target, Some(Target::Element { .. })) {
+        match keyboard_recipient_delivery(target, self.selected, self.foreground_fallback, || {
             let focused = keyboard_recipient(application, Some(element))?
                 .ok_or_else(|| foreground("The app has no focused element"))?;
-            self.check(&focused, "focus")?;
+            self.window_of(&focused)
+        })? {
+            RecipientDelivery::Background => Ok(()),
+            RecipientDelivery::Foreground => {
+                Err(foreground("The focus is in another window of the app"))
+            }
         }
-        Ok(())
     }
 }
 
@@ -566,6 +593,7 @@ impl MacDriver {
                     if target.is_some() {
                         let focused = keyboard_recipient(&application, Some(&element))?
                             .ok_or_else(|| foreground("The app has no focused element"))?;
+                        boundary.check(&focused, "focus")?;
                         if should_collapse_type_selection(type_target_was_focused) {
                             focused.collapse_selection_to_end();
                         }
@@ -577,7 +605,7 @@ impl MacDriver {
                     }
                     let recipient = keyboard_recipient(&application, Some(&element))?
                         .ok_or_else(|| foreground("The app has no focused element"))?;
-                    boundary.keyboard(&application, &recipient, *target)?;
+                    boundary.check(&recipient, "focus")?;
                     check_type_recipient(&recipient, text)?;
                     events::post_unicode_text(pid, text, || {
                         verify_type_recipient(&application, &recipient, false)
@@ -1296,6 +1324,25 @@ mod tests {
                 assert!(failure.message.contains(description));
                 assert!(failure.message.contains("another window of the app"));
             }
+        }
+    }
+
+    #[test]
+    fn element_target_keyboard_uses_the_actual_recipients_window() {
+        let target = Some(Target::Element { element: 42 });
+        assert_eq!(
+            keyboard_recipient_delivery(target, &2, true, || Ok(Some(1))).unwrap(),
+            RecipientDelivery::Foreground
+        );
+        let failure = keyboard_recipient_delivery(target, &2, false, || Ok(Some(1))).unwrap_err();
+        assert_eq!(failure.kind, ErrorKind::NeedsForeground);
+        assert!(failure.message.contains("focus"));
+        assert!(failure.message.contains("another window of the app"));
+        for fallback in [false, true] {
+            assert_eq!(
+                keyboard_recipient_delivery(target, &2, fallback, || Ok(Some(2))).unwrap(),
+                RecipientDelivery::Background
+            );
         }
     }
 
