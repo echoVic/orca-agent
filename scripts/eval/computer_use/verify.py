@@ -179,6 +179,8 @@ def collect(task, native, base, before, evidence, metrics):
             if 'Expected exactly one matching AX window' not in str(error):
                 raise
             data.setdefault('skipped_windows', []).append(w['id'])
+            # No evidence there, so GUI coverage must not count actions on it either.
+            data['windows'].remove(w['id'])
             continue
         data['ax'].extend(ax)
         # No screenshots of pre-existing user windows. AX exceptions above are scoped.

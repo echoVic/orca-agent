@@ -192,6 +192,8 @@ class VerifierTests(unittest.TestCase):
             data = json.loads((base / 'evidence/verification-input.json').read_text())
         self.assertEqual(data['ax'], [{'role': 'AXTextArea', 'AXValue': 'one'}])
         self.assertEqual(data['skipped_windows'], [11])
+        # A skipped window holds no evidence, so actions on it cannot count either.
+        self.assertEqual(data['windows'], [10])
 
     def test_calculator_requires_input_not_a_restored_display(self):
         task = {'id': 'S1', 'allowed_apps': ['com.apple.calculator']}
