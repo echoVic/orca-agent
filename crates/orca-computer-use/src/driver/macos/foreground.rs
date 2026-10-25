@@ -218,6 +218,7 @@ pub(super) fn run_app_shortcut(
     app_name: &str,
     stroke: KeyStroke,
     windowless: bool,
+    user_windows: &[u32],
     aborted: &AtomicBool,
     action_deadline: Instant,
 ) -> Result<String, DriverError> {
@@ -247,11 +248,14 @@ pub(super) fn run_app_shortcut(
         thread::sleep(crate::timing::ACTIVATION_SETTLE);
         check_abort(aborted)?;
         // A window that appeared meanwhile has an unobserved focus: observe it first.
-        if windowless && super::app_has_window(application)? {
-            return Err(error(
-                ErrorKind::Stale,
-                format!("{app_name} now has a window; observe it before sending keys"),
-            ));
+        if windowless {
+            let captures = super::capture::windows()?;
+            if super::app_has_window(application, &captures, user_windows)? {
+                return Err(error(
+                    ErrorKind::Stale,
+                    format!("{app_name} now has a window; observe it before sending keys"),
+                ));
+            }
         }
         let mut hid = HidEvents::new_until(pid, aborted, action_deadline)?;
         let sent = hid.key(stroke);

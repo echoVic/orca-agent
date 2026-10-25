@@ -421,7 +421,13 @@ impl MacDriver {
         // An app with no window takes an app-level shortcut. If only the user's
         // windows remain, only lone Cmd+N is allowed, with app-dependent effects.
         // Neither path has an AX window of Orca's own to resolve.
-        let windowless = params.window.is_none() && !super::app_has_window(&application)?;
+        let ax_windows = if params.window.is_none() {
+            super::app_window_facts(&application)?
+        } else {
+            vec![]
+        };
+        let windowless = params.window.is_none()
+            && super::windows::windowless(pid, &windows, &ax_windows, &params.user_windows);
         let resolved = if windowless {
             None
         } else {
@@ -452,6 +458,7 @@ impl MacDriver {
                     pid,
                     &app.name,
                     &windows,
+                    &ax_windows,
                     &params.user_windows,
                     &params.action,
                 )?
@@ -746,6 +753,7 @@ impl MacDriver {
             app_name,
             stroke,
             windowless,
+            &params.user_windows,
             &self.aborted,
             action_deadline,
         )?;

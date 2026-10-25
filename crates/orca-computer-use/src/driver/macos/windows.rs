@@ -42,6 +42,54 @@ fn ax_index(ax: &[AxWindowFacts], id: u32, frame: [f64; 4]) -> Option<usize> {
 /// Document-sized: smaller unknown windows are status bubbles and popups.
 const MIN_USABLE: (f64, f64) = (120.0, 60.0);
 
+fn document_sized(frame: [f64; 4]) -> bool {
+    frame[2] >= MIN_USABLE.0 && frame[3] >= MIN_USABLE.1
+}
+
+/// A frame-only AX match is unsafe if the same app has a non-layer-0
+/// capture at that frame: it could be the desktop rather than the document.
+fn capture_index(
+    pid: i32,
+    captures: &[super::capture::Window],
+    facts: &AxWindowFacts,
+) -> Option<usize> {
+    if facts.id.is_none()
+        && captures.iter().any(|capture| {
+            capture.pid == pid && capture.layer != 0 && facts.matches(capture.id, capture.frame)
+        })
+    {
+        return None;
+    }
+    captures.iter().position(|capture| {
+        capture.layer == 0 && capture.pid == pid && facts.matches(capture.id, capture.frame)
+    })
+}
+
+/// The snapshot includes helpers; only AX-matched or document-sized user
+/// captures establish a real window boundary, including off-screen documents.
+fn real_user_windows(
+    pid: i32,
+    captures: &[super::capture::Window],
+    ax: &[AxWindowFacts],
+    user_windows: &[u32],
+) -> Vec<(u32, String)> {
+    let mut listed_ids = std::collections::HashSet::new();
+    captures
+        .iter()
+        .filter(|capture| {
+            capture.layer == 0
+                && capture.pid == pid
+                && user_windows.contains(&capture.id)
+                && (document_sized(capture.frame)
+                    || ax
+                        .iter()
+                        .any(|facts| facts.matches(capture.id, capture.frame)))
+        })
+        .filter(|capture| listed_ids.insert(capture.id))
+        .map(|capture| (capture.id, capture.title.clone()))
+        .collect()
+}
+
 pub(super) fn usable(
     on_screen: bool,
     frame: [f64; 4],
@@ -50,8 +98,7 @@ pub(super) fn usable(
 ) -> bool {
     minimized
         || (on_screen
-            && (matches!(subrole, Some("AXStandardWindow" | "AXDialog"))
-                || (frame[2] >= MIN_USABLE.0 && frame[3] >= MIN_USABLE.1)))
+            && (matches!(subrole, Some("AXStandardWindow" | "AXDialog")) || document_sized(frame)))
 }
 
 /// `ax` is `None` when the app did not answer accessibility in time; then only
@@ -88,23 +135,18 @@ pub(super) struct WindowChoice {
     pub minimized: bool,
 }
 
-/// Classifies the app-shortcut path when AX reports no window. Captured user
-/// windows still require lone Cmd+N; captures of Orca's own keep the old path.
+/// Classifies the app-shortcut path without a document to use. Real user
+/// windows still require lone Cmd+N; snapshot helpers do not create a boundary.
 /// Returns whether the caller should use its existing windowless validation.
 pub(super) fn app_shortcut_windowless(
     pid: i32,
     app_name: &str,
     captures: &[super::capture::Window],
+    ax: &[AxWindowFacts],
     user_windows: &[u32],
     action: &Action,
 ) -> Result<bool, DriverError> {
-    let theirs: Vec<_> = captures
-        .iter()
-        .filter(|capture| {
-            capture.layer == 0 && capture.pid == pid && user_windows.contains(&capture.id)
-        })
-        .map(|capture| (capture.id, capture.title.clone()))
-        .collect();
+    let theirs = real_user_windows(pid, captures, ax, user_windows);
     if theirs.is_empty() {
         return Ok(true);
     }
@@ -120,12 +162,13 @@ pub(super) fn app_shortcut_windowless(
 }
 
 /// Picks the AX window (and its capture window) observe and act use: an
-/// explicit id must be a usable layer-0 window of this app; without one, the usable
-/// main window, else the first usable one, else (nothing usable) the main or
-/// first window as before. Returns (AX index, capture index).
-/// It never uses one of `user_windows`: a named one is refused, and when
-/// nothing else is usable the user's windows are listed in the error; only
-/// an app with none of them falls back to its main or first window.
+/// explicit id must be a usable layer-0 window of this app; without one, prefer
+/// the usable main window, then the first usable one. If none is usable, only
+/// an unambiguous layer-0 main/first match can be a fallback.
+/// Returns (AX index, capture index).
+/// Excluded captures are never used. When nothing else is usable, list only
+/// real user windows; unmatched small snapshot helpers do not create a refusal.
+/// With no eligible AX match or real user window, report no_window.
 pub(super) fn choose_window(
     id: Option<u32>,
     pid: i32,
@@ -135,17 +178,13 @@ pub(super) fn choose_window(
     main: Option<usize>,
     user_windows: &[u32],
 ) -> Result<(usize, usize), DriverError> {
-    let no_capture = || {
+    let no_window = || {
         super::error(
             ErrorKind::WindowNotFound,
-            "No capture window matches the accessibility window",
+            crate::messages::no_window(app_name),
         )
     };
-    let capture_of = |facts: &AxWindowFacts| {
-        captures
-            .iter()
-            .position(|c| c.layer == 0 && c.pid == pid && facts.matches(c.id, c.frame))
-    };
+    let capture_of = |facts: &AxWindowFacts| capture_index(pid, captures, facts);
     if let Some(id) = id {
         let not_usable = || {
             super::error(
@@ -164,6 +203,9 @@ pub(super) fn choose_window(
             ));
         }
         let index = ax_index(ax, id, captures[capture].frame).ok_or_else(not_usable)?;
+        if capture_of(&ax[index]).is_none() {
+            return Err(not_usable());
+        }
         if let Some(user) = captures.iter().find(|capture| {
             ax[index].id.is_none()
                 && capture.layer == 0
@@ -187,15 +229,10 @@ pub(super) fn choose_window(
         }
         return Ok((index, capture));
     }
-    if ax.is_empty() {
-        return Err(super::error(
-            ErrorKind::WindowNotFound,
-            crate::messages::no_window(app_name),
-        ));
-    }
     let theirs = |facts: &AxWindowFacts| {
-        // Without an AX id, any same-frame user capture makes this window
-        // unsafe, even if Orca's capture appears first.
+        // Frame-only user-document matches are unsafe even if Orca's capture
+        // is first. capture_index also rejects same-frame non-layer-0 captures,
+        // including an unowned desktop/full-screen ambiguity.
         captures.iter().any(|capture| {
             capture.layer == 0
                 && capture.pid == pid
@@ -224,17 +261,9 @@ pub(super) fn choose_window(
     let index = match default_window(&choices) {
         Some(index) => index,
         None => {
-            let mut listed_ids = std::collections::HashSet::new();
-            // AX may report only the desktop, while CaptureKit still sees
-            // the user's document. Preserve the refusal and lone Cmd+N path.
-            let listed: Vec<(u32, String)> = captures
-                .iter()
-                .filter(|capture| {
-                    capture.layer == 0 && capture.pid == pid && user_windows.contains(&capture.id)
-                })
-                .filter(|capture| listed_ids.insert(capture.id))
-                .map(|capture| (capture.id, capture.title.clone()))
-                .collect();
+            // AX may omit off-screen documents, but small unmatched snapshot
+            // helpers must not create a refusal or suggest an unusable id.
+            let listed = real_user_windows(pid, captures, ax, user_windows);
             if !listed.is_empty() {
                 return Err(super::error(
                     ErrorKind::UserWindow,
@@ -243,12 +272,15 @@ pub(super) fn choose_window(
             }
             // AX can still name the desktop as main. The old main/first
             // fallback applies only to candidates with a layer-0 capture.
-            main.filter(|&index| capture_of(&ax[index]).is_some())
-                .or_else(|| ax.iter().position(|facts| capture_of(facts).is_some()))
-                .ok_or_else(no_capture)?
+            main.filter(|&index| {
+                ax.get(index)
+                    .is_some_and(|facts| capture_of(facts).is_some())
+            })
+            .or_else(|| ax.iter().position(|facts| capture_of(facts).is_some()))
+            .ok_or_else(no_window)?
         }
     };
-    let capture = capture_of(&ax[index]).ok_or_else(no_capture)?;
+    let capture = capture_of(&ax[index]).ok_or_else(no_window)?;
     Ok((index, capture))
 }
 
@@ -278,9 +310,17 @@ pub(super) fn gather_facts<W>(
     (kept, facts)
 }
 
-/// An app has a window when AX lists one or names a main window.
-pub(super) fn has_window(ax_windows: usize, main_window: bool) -> bool {
-    ax_windows > 0 || main_window
+/// Used before an app-level shortcut and after activation: helpers and the
+/// desktop do not count; an eligible AX match or real user document does.
+pub(super) fn windowless(
+    pid: i32,
+    captures: &[super::capture::Window],
+    ax: &[AxWindowFacts],
+    user_windows: &[u32],
+) -> bool {
+    !ax.iter()
+        .any(|facts| capture_index(pid, captures, facts).is_some())
+        && real_user_windows(pid, captures, ax, user_windows).is_empty()
 }
 
 pub(super) fn default_window(choices: &[WindowChoice]) -> Option<usize> {
@@ -310,7 +350,8 @@ mod tests {
     fn ax_windowless_shortcuts_only_allow_cmd_n_when_user_captures_remain() {
         let captures = [window(1, DOC, false)];
         assert!(
-            !app_shortcut_windowless(7, "Finder", &captures, &[1], &key(&["cmd", "n"])).unwrap()
+            !app_shortcut_windowless(7, "Finder", &captures, &[], &[1], &key(&["cmd", "n"]))
+                .unwrap()
         );
         for keys in [
             &["cmd", "w"][..],
@@ -319,7 +360,7 @@ mod tests {
             &["cmd", "shift", "n"],
         ] {
             let refused =
-                app_shortcut_windowless(7, "Finder", &captures, &[1], &key(keys)).unwrap_err();
+                app_shortcut_windowless(7, "Finder", &captures, &[], &[1], &key(keys)).unwrap_err();
             assert_eq!(refused.kind, ErrorKind::UserWindow);
             assert_eq!(
                 refused.message,
@@ -331,7 +372,7 @@ mod tests {
             target: Some(crate::protocol::Target::Element { element: 1 }),
         };
         assert_eq!(
-            app_shortcut_windowless(7, "Finder", &captures, &[1], &targeted)
+            app_shortcut_windowless(7, "Finder", &captures, &[], &[1], &targeted)
                 .unwrap_err()
                 .kind,
             ErrorKind::UserWindow
@@ -341,16 +382,30 @@ mod tests {
     #[test]
     fn ax_windowless_without_user_captures_keeps_the_existing_shortcut_path() {
         for keys in [&["cmd", "w"][..], &["cmd", "q"], &["ctrl", "n"]] {
-            assert!(app_shortcut_windowless(7, "Finder", &[], &[1], &key(keys)).unwrap());
+            assert!(app_shortcut_windowless(7, "Finder", &[], &[], &[1], &key(keys)).unwrap());
             // A capture of Orca's own that AX missed does not change the old path.
             assert!(
-                app_shortcut_windowless(7, "Finder", &[window(2, DOC, false)], &[1], &key(keys))
-                    .unwrap()
+                app_shortcut_windowless(
+                    7,
+                    "Finder",
+                    &[window(2, DOC, false)],
+                    &[],
+                    &[1],
+                    &key(keys)
+                )
+                .unwrap()
             );
             // Another process's user window cannot restrict this app's shortcuts.
             assert!(
-                app_shortcut_windowless(8, "Other", &[window(1, DOC, false)], &[1], &key(keys))
-                    .unwrap()
+                app_shortcut_windowless(
+                    8,
+                    "Other",
+                    &[window(1, DOC, false)],
+                    &[],
+                    &[1],
+                    &key(keys)
+                )
+                .unwrap()
             );
         }
     }
@@ -456,13 +511,16 @@ mod tests {
                 ErrorKind::WindowNotFound
             );
         }
-        // An id-less AX window must match the layer-0 capture even when a
-        // non-document capture with exactly the same frame precedes it.
+        // An id-less AX window cannot distinguish a layer-0 capture from a
+        // same-frame desktop capture, so neither default nor explicit use is safe.
         let captures = [desktop(), window(2, captures[0].frame, true)];
         let facts = ax_for_captures(&captures[1..], false);
+        assert!(choose_window(None, 7, "Finder", &captures, &facts, Some(0), &[45]).is_err());
         assert_eq!(
-            choose_window(None, 7, "Finder", &captures, &facts, Some(0), &[45]).unwrap(),
-            (0, 1)
+            choose_window(Some(2), 7, "Finder", &captures, &facts, Some(0), &[45])
+                .unwrap_err()
+                .message,
+            crate::messages::not_usable_window(2, "Finder")
         );
         let captures = [desktop(), window(2, BUBBLE, true)];
         for with_ids in [true, false] {
@@ -480,19 +538,178 @@ mod tests {
         let captures = [desktop(), window(1, DOC, false)];
         // Even an excluded non-document id must not create a user-document boundary.
         assert!(
-            app_shortcut_windowless(7, "Finder", &captures[..1], &[45], &key(&["cmd", "w"]))
+            app_shortcut_windowless(7, "Finder", &captures[..1], &[], &[45], &key(&["cmd", "w"]))
                 .unwrap()
         );
         let refused =
-            app_shortcut_windowless(7, "Finder", &captures, &[45, 1], &key(&["cmd", "w"]))
+            app_shortcut_windowless(7, "Finder", &captures, &[], &[45, 1], &key(&["cmd", "w"]))
                 .unwrap_err();
         assert_eq!(
             refused.message,
             crate::messages::user_window_only("Finder", &[(1, "w1".into())])
         );
         assert!(
-            !app_shortcut_windowless(7, "Finder", &captures, &[45, 1], &key(&["cmd", "n"]))
+            !app_shortcut_windowless(7, "Finder", &captures, &[], &[45, 1], &key(&["cmd", "n"]))
                 .unwrap()
+        );
+    }
+
+    fn finder_helpers() -> Vec<super::super::capture::Window> {
+        let mut captures = vec![desktop()];
+        for id in 56..60 {
+            let mut helper = window(id, [0.0, 0.0, 1728.0, 33.0], false);
+            helper.title.clear();
+            captures.push(helper);
+        }
+        let mut helper = window(79, [0.0, 0.0, 64.0, 64.0], false);
+        helper.title.clear();
+        captures.push(helper);
+        captures
+    }
+
+    #[test]
+    fn finder_refusal_lists_only_real_documents_not_snapshot_helpers() {
+        let mut captures = finder_helpers();
+        let mut out = window(23326, DOC, false);
+        out.title = "out".into();
+        let mut files = window(24538, MINI, false);
+        files.title = "files120".into();
+        captures.extend([out, files]);
+        let excluded: Vec<_> = captures[1..].iter().map(|capture| capture.id).collect();
+        let expected = crate::messages::user_window_only(
+            "Finder",
+            &[(23326, "out".into()), (24538, "files120".into())],
+        );
+        // Capture size protects off-screen documents even when AX sees only
+        // the desktop, or cannot see any windows on this Space.
+        for facts in [ax_for_captures(&captures[..1], true), vec![]] {
+            let error =
+                choose_window(None, 7, "Finder", &captures, &facts, None, &excluded).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::UserWindow);
+            assert_eq!(error.message, expected);
+        }
+    }
+
+    #[test]
+    fn desktop_only_finder_with_snapshot_helpers_is_windowless() {
+        let captures = finder_helpers();
+        let excluded: Vec<_> = captures[1..].iter().map(|capture| capture.id).collect();
+        let facts = ax_for_captures(&captures[..1], true);
+        let error =
+            choose_window(None, 7, "Finder", &captures, &facts, Some(0), &excluded).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::WindowNotFound);
+        assert_eq!(error.message, crate::messages::no_window("Finder"));
+        assert!(windowless(7, &captures, &facts, &excluded));
+        assert!(
+            app_shortcut_windowless(
+                7,
+                "Finder",
+                &captures,
+                &facts,
+                &excluded,
+                &key(&["cmd", "n"])
+            )
+            .unwrap()
+        );
+        // Rechecking the same state after activation must still be windowless;
+        // a new document with an AX match must instead require observation.
+        let mut restored = captures.clone();
+        restored.push(window(2, MINI, true));
+        let restored_facts = ax_for_captures(std::slice::from_ref(restored.last().unwrap()), true);
+        assert!(!windowless(7, &restored, &restored_facts, &excluded));
+    }
+
+    #[test]
+    fn app_shortcut_refusal_lists_only_real_user_windows() {
+        let mut captures = finder_helpers();
+        // Exact minimum size counts, irrespective of on-screen visibility.
+        captures.push(window(2, [4000.0, 4000.0, 120.0, 60.0], false));
+        let excluded: Vec<_> = captures[1..].iter().map(|capture| capture.id).collect();
+        let facts = ax_for_captures(&captures[..1], true);
+        let error = app_shortcut_windowless(
+            7,
+            "Finder",
+            &captures,
+            &facts,
+            &excluded,
+            &key(&["cmd", "w"]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            crate::messages::user_window_only("Finder", &[(2, "w2".into())])
+        );
+        assert!(
+            !app_shortcut_windowless(
+                7,
+                "Finder",
+                &captures,
+                &facts,
+                &excluded,
+                &key(&["cmd", "n"])
+            )
+            .unwrap()
+        );
+        assert!(!windowless(7, &captures, &facts, &excluded));
+    }
+
+    #[test]
+    fn a_small_ax_matched_user_window_is_real_even_below_document_size() {
+        let mut captures = finder_helpers();
+        captures.push(window(2, BUBBLE, false));
+        let excluded: Vec<_> = captures[1..].iter().map(|capture| capture.id).collect();
+        for with_ids in [true, false] {
+            let facts = ax_for_captures(&captures[captures.len() - 1..], with_ids);
+            let expected = crate::messages::user_window_only("Finder", &[(2, "w2".into())]);
+            assert_eq!(
+                choose_window(None, 7, "Finder", &captures, &facts, Some(0), &excluded)
+                    .unwrap_err()
+                    .message,
+                expected
+            );
+            assert_eq!(
+                app_shortcut_windowless(
+                    7,
+                    "Finder",
+                    &captures,
+                    &facts,
+                    &excluded,
+                    &key(&["cmd", "w"])
+                )
+                .unwrap_err()
+                .message,
+                expected
+            );
+            assert!(!windowless(7, &captures, &facts, &excluded));
+        }
+    }
+
+    #[test]
+    fn idless_non_layer_zero_frame_ambiguity_cannot_be_used() {
+        let captures = [desktop(), window(2, desktop().frame, true)];
+        let mut facts = ax_for_captures(&captures[1..], false);
+        for excluded in [&[][..], &[45][..]] {
+            assert!(
+                choose_window(None, 7, "Finder", &captures, &facts, Some(0), excluded).is_err()
+            );
+            assert_eq!(
+                choose_window(Some(2), 7, "Finder", &captures, &facts, Some(0), excluded)
+                    .unwrap_err()
+                    .message,
+                crate::messages::not_usable_window(2, "Finder")
+            );
+        }
+        facts[0].id = Some(2);
+        assert_eq!(
+            choose_window(Some(2), 7, "Finder", &captures, &facts, Some(0), &[45]).unwrap(),
+            (0, 1)
+        );
+        facts[0].id = None;
+        let mut other_app = captures.clone();
+        other_app[0].pid = 8;
+        assert_eq!(
+            choose_window(None, 7, "Finder", &other_app, &facts, Some(0), &[]).unwrap(),
+            (0, 1)
         );
     }
 
@@ -846,10 +1063,15 @@ mod tests {
     }
 
     #[test]
-    fn a_main_window_alone_counts_as_a_window() {
-        assert!(has_window(0, true));
-        assert!(has_window(1, false));
-        assert!(!has_window(0, false));
+    fn a_main_window_counts_only_when_it_maps_to_a_layer_zero_capture() {
+        // The native reader includes AXMainWindow when AXWindows is empty.
+        let captures = [window(1, DOC, true)];
+        let facts = ax_for_captures(&captures, true);
+        assert!(!windowless(7, &captures, &facts, &[]));
+        assert!(windowless(7, &[], &facts, &[]));
+        let mut desktop_layer = captures.clone();
+        desktop_layer[0].layer = -1;
+        assert!(windowless(7, &desktop_layer, &facts, &[]));
     }
 
     #[test]

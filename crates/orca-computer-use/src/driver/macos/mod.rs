@@ -293,11 +293,68 @@ pub(super) fn frames_match(ax: [f64; 4], capture: [f64; 4]) -> bool {
         .all(|(a, b)| (a - b).abs() <= 2.0)
 }
 
-/// Whether the app shows any window; unreadable AX state fails closed as an error.
-pub(super) fn app_has_window(application: &AxElement) -> Result<bool, DriverError> {
-    Ok(windows::has_window(
-        application.elements("AXWindows")?.len(),
-        application.attribute_element("AXMainWindow")?.is_some(),
+/// Read identities for the windowless decision. Unlike the resolver's optional
+/// candidate scan, incomplete or unreadable AX state must never mean no window.
+fn app_window_facts(application: &AxElement) -> Result<Vec<windows::AxWindowFacts>, DriverError> {
+    let mut candidates = application.elements("AXWindows")?;
+    let main = application.attribute_element("AXMainWindow")?;
+    if candidates.is_empty()
+        && let Some(main) = main
+    {
+        candidates.push(main);
+    }
+    let expected = candidates.len();
+    let mut read_error = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let (_, facts) = windows::gather_facts(candidates, deadline, |candidate, left| {
+        let timeout = unsafe { candidate.0.set_messaging_timeout(left) };
+        if timeout != objc2_application_services::AXError::Success {
+            read_error.get_or_insert_with(|| {
+                error(
+                    ErrorKind::Failed,
+                    format!("Accessibility window-state timeout failed: {timeout:?}"),
+                )
+            });
+            return None;
+        }
+        let id = candidate.window_id();
+        match candidate.position_size() {
+            Ok(frame) => Some(windows::AxWindowFacts {
+                id,
+                frame,
+                subrole: None,
+                minimized: false,
+            }),
+            Err(failure) => {
+                read_error.get_or_insert(failure);
+                None
+            }
+        }
+    });
+    if let Some(failure) = read_error {
+        return Err(failure);
+    }
+    if facts.len() != expected {
+        return Err(error(
+            ErrorKind::Failed,
+            "Could not read all accessibility windows before the window-state deadline",
+        ));
+    }
+    Ok(facts)
+}
+
+/// A fresh capture and required AX read share the same pure classification as act.
+fn app_has_window(
+    application: &AxElement,
+    captures: &[capture::Window],
+    user_windows: &[u32],
+) -> Result<bool, DriverError> {
+    let facts = app_window_facts(application)?;
+    Ok(!windows::windowless(
+        application.pid()?,
+        captures,
+        &facts,
+        user_windows,
     ))
 }
 
