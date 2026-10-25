@@ -162,11 +162,16 @@ impl CompiledPermissionRule {
                 }
                 pattern.matches(target.unwrap_or(""))
                     // App denies and prompts also cover the app's secure-input
-                    // and existing-window subtargets.
+                    // and existing-window subtargets. Window denies/prompts
+                    // also cover password entry in that same window.
                     || computer.as_ref().is_some_and(|computer| {
                         matches!(self.decision, Decision::Deny | Decision::Prompt)
                             && (computer.secure || computer.window.is_some())
-                            && pattern.matches(&computer.app)
+                            && (pattern.matches(&computer.app)
+                                || (computer.secure
+                                    && target
+                                        .and_then(|target| target.strip_suffix("#secure"))
+                                        .is_some_and(|window| pattern.matches(window))))
                     })
             })
     }
@@ -543,6 +548,29 @@ mod tests {
             prompt.matching_decision("computer", Some("com.apple.Safari#secure")),
             Some(Decision::Prompt)
         );
+    }
+
+    #[test]
+    fn window_denies_and_prompts_cover_only_that_windows_password_fields() {
+        for decision in [Decision::Deny, Decision::Prompt] {
+            let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+                rules: vec![PermissionRule::new(
+                    "computer",
+                    "com.apple.finder#window:7",
+                    decision,
+                )],
+            });
+            assert_eq!(
+                compiled.matching_decision("computer", Some("com.apple.finder#window:7#secure")),
+                Some(decision)
+            );
+            for target in [
+                "com.apple.finder#window:8",
+                "com.apple.finder#window:8#secure",
+            ] {
+                assert_eq!(compiled.matching_decision("computer", Some(target)), None);
+            }
+        }
     }
 
     #[test]
