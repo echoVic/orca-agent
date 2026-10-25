@@ -14,9 +14,29 @@ pub(super) struct CaptureWindowFacts {
 /// One entry of an app's `AXWindows`.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct AxWindowFacts {
+    pub id: Option<u32>,
     pub frame: [f64; 4],
     pub subrole: Option<String>,
     pub minimized: bool,
+}
+
+impl AxWindowFacts {
+    fn matches(&self, id: u32, frame: [f64; 4]) -> bool {
+        match self.id {
+            Some(ax_id) => ax_id == id,
+            None => super::frames_match(self.frame, frame),
+        }
+    }
+}
+
+// Prefer a known identity over an AX entry which can only match by frame.
+fn ax_index(ax: &[AxWindowFacts], id: u32, frame: [f64; 4]) -> Option<usize> {
+    ax.iter()
+        .position(|facts| facts.id == Some(id))
+        .or_else(|| {
+            ax.iter()
+                .position(|facts| facts.id.is_none() && facts.matches(id, frame))
+        })
 }
 
 /// Document-sized: smaller unknown windows are status bubbles and popups.
@@ -45,9 +65,7 @@ pub(super) fn usable_windows(
         .filter_map(|window| {
             let (subrole, minimized) = match ax {
                 Some(ax) => {
-                    let facts = ax
-                        .iter()
-                        .find(|facts| super::frames_match(facts.frame, window.frame))?;
+                    let facts = &ax[ax_index(ax, window.id, window.frame)?];
                     (facts.subrole.as_deref(), facts.minimized)
                 }
                 None => (None, false),
@@ -118,7 +136,7 @@ pub(super) fn choose_window(
     let capture_of = |facts: &AxWindowFacts| {
         captures
             .iter()
-            .position(|c| c.pid == pid && super::frames_match(facts.frame, c.frame))
+            .position(|c| c.pid == pid && facts.matches(c.id, c.frame))
     };
     if let Some(id) = id {
         let not_usable = || {
@@ -137,14 +155,12 @@ pub(super) fn choose_window(
                 crate::messages::user_window(id, &captures[capture].title),
             ));
         }
-        let index = ax
-            .iter()
-            .position(|facts| super::frames_match(facts.frame, captures[capture].frame))
-            .ok_or_else(not_usable)?;
+        let index = ax_index(ax, id, captures[capture].frame).ok_or_else(not_usable)?;
         if let Some(user) = captures.iter().find(|capture| {
-            capture.pid == pid
+            ax[index].id.is_none()
+                && capture.pid == pid
                 && user_windows.contains(&capture.id)
-                && super::frames_match(ax[index].frame, capture.frame)
+                && ax[index].matches(capture.id, capture.frame)
         }) {
             return Err(super::error(
                 ErrorKind::UserWindow,
@@ -169,12 +185,12 @@ pub(super) fn choose_window(
         ));
     }
     let theirs = |facts: &AxWindowFacts| {
-        // Same-frame windows are ambiguous: any matching user capture makes
-        // this AX window unsafe, even if Orca's capture appears first.
+        // Without an AX id, any same-frame user capture makes this window
+        // unsafe, even if Orca's capture appears first.
         captures.iter().any(|capture| {
             capture.pid == pid
                 && user_windows.contains(&capture.id)
-                && super::frames_match(facts.frame, capture.frame)
+                && facts.matches(capture.id, capture.frame)
         })
     };
     let choices: Vec<_> = ax
@@ -206,7 +222,7 @@ pub(super) fn choose_window(
                         && user_windows.contains(&capture.id)
                         && ax
                             .iter()
-                            .any(|facts| super::frames_match(facts.frame, capture.frame))
+                            .any(|facts| facts.matches(capture.id, capture.frame))
                 })
                 .filter(|capture| listed_ids.insert(capture.id))
                 .map(|capture| (capture.id, capture.title.clone()))
@@ -230,13 +246,13 @@ pub(super) fn choose_window(
 }
 
 /// Reads each candidate's facts while the deadline lasts. `read` gets the
-/// seconds left and returns (frame, subrole, minimized). A candidate whose
-/// frame cannot be read is dropped with its entry, so the lists stay aligned;
+/// seconds left and returns its facts. A candidate whose frame cannot be read
+/// is dropped with its entry, so the lists stay aligned;
 /// an unreadable subrole is absent and an unreadable minimized flag is false.
 pub(super) fn gather_facts<W>(
     candidates: Vec<W>,
     deadline: std::time::Instant,
-    mut read: impl FnMut(&W, f32) -> (Option<[f64; 4]>, Option<String>, Option<bool>),
+    mut read: impl FnMut(&W, f32) -> Option<AxWindowFacts>,
 ) -> (Vec<W>, Vec<AxWindowFacts>) {
     let mut kept = Vec::with_capacity(candidates.len());
     let mut facts = Vec::with_capacity(candidates.len());
@@ -247,14 +263,9 @@ pub(super) fn gather_facts<W>(
         else {
             break;
         };
-        let (frame, subrole, minimized) = read(&candidate, left.as_secs_f32());
-        if let Some(frame) = frame {
+        if let Some(window_facts) = read(&candidate, left.as_secs_f32()) {
             kept.push(candidate);
-            facts.push(AxWindowFacts {
-                frame,
-                subrole,
-                minimized: minimized.unwrap_or(false),
-            });
+            facts.push(window_facts);
         }
     }
     (kept, facts)
@@ -335,6 +346,58 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[test]
+    fn same_frame_windows_with_ids_choose_orcas_and_refuse_the_users() {
+        let captures = [window(2, DOC, true), window(1, DOC, true)];
+        let mut facts = [
+            ax(DOC, "AXStandardWindow", false),
+            ax(DOC, "AXStandardWindow", false),
+        ];
+        // AX order differs from capture order and the user's window is main.
+        facts[0].id = Some(1);
+        facts[1].id = Some(2);
+        assert_eq!(
+            choose_window(Some(2), 7, "Chrome", &captures, &facts, Some(0), &[1]).unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            choose_window(None, 7, "Chrome", &captures, &facts, Some(0), &[1]).unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            choose_window(Some(1), 7, "Chrome", &captures, &facts, Some(0), &[1])
+                .unwrap_err()
+                .kind,
+            ErrorKind::UserWindow
+        );
+    }
+
+    #[test]
+    fn usable_windows_match_ids_instead_of_same_frames() {
+        let captures = [capture(2, DOC, false), capture(1, DOC, false)];
+        let mut facts = [
+            ax(DOC, "AXStandardWindow", false),
+            ax(DOC, "AXStandardWindow", true),
+        ];
+        facts[0].id = Some(1);
+        facts[1].id = Some(2);
+        assert_eq!(usable_windows(&captures, Some(&facts)), vec![info(2, true)]);
+        // A known but different id must never fall back to the same frame.
+        assert!(usable_windows(&captures[..1], Some(&facts[..1])).is_empty());
+        assert!(
+            choose_window(
+                Some(2),
+                7,
+                "Chrome",
+                &[window(2, DOC, true)],
+                &facts[..1],
+                None,
+                &[]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -453,6 +516,7 @@ mod tests {
 
     fn ax(frame: [f64; 4], subrole: &str, minimized: bool) -> AxWindowFacts {
         AxWindowFacts {
+            id: None,
             frame,
             subrole: Some(subrole.into()),
             minimized,
@@ -600,12 +664,20 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let (kept, facts) = gather_facts(vec![1, 2, 3], deadline, |window, _| match window {
             // A helper whose frame cannot be read must not block the others.
-            2 => (None, Some("AXStandardWindow".into()), Some(false)),
+            2 => None,
             // Unreadable subrole and minimized state read as absent and false.
-            _ => (Some([0.0, 0.0, 800.0, 600.0]), None, None),
+            _ => Some(AxWindowFacts {
+                id: Some(*window),
+                frame: DOC,
+                subrole: None,
+                minimized: false,
+            }),
         });
         assert_eq!(kept, vec![1, 3]);
-        assert_eq!(facts.len(), 2);
+        assert_eq!(
+            facts.iter().map(|facts| facts.id).collect::<Vec<_>>(),
+            vec![Some(1), Some(3)]
+        );
         assert!(
             facts
                 .iter()
@@ -619,7 +691,7 @@ mod tests {
         let (kept, _) = gather_facts(vec![1, 2, 3, 4], deadline, |_, timeout| {
             assert!(timeout > 0.0 && timeout <= 0.04);
             std::thread::sleep(std::time::Duration::from_millis(25));
-            (Some([0.0, 0.0, 800.0, 600.0]), None, Some(false))
+            Some(ax(DOC, "AXStandardWindow", false))
         });
         assert_eq!(kept, vec![1, 2]);
     }

@@ -182,6 +182,8 @@ fn ax_window_facts(pid: i32, deadline: Instant) -> Option<Vec<AxWindowFacts>> {
     read_within(deadline, windows, |window, timeout| {
         // Every read gets only what is left, so slow answers cannot add up.
         with_timeout(&window, timeout)?;
+        let id = window.window_id();
+        with_timeout(&window, share_of(deadline)?)?;
         let frame = window.position_size().ok()?;
         with_timeout(&window, share_of(deadline)?)?;
         let subrole = window.attribute_string("AXSubrole").ok().flatten();
@@ -192,6 +194,7 @@ fn ax_window_facts(pid: i32, deadline: Instant) -> Option<Vec<AxWindowFacts>> {
             .flatten()
             .unwrap_or(false);
         Some(AxWindowFacts {
+            id,
             frame,
             subrole,
             minimized,
@@ -1632,6 +1635,7 @@ mod tests {
             |pid| {
                 asked.push(pid);
                 Some(vec![AxWindowFacts {
+                    id: None,
                     frame: [0.0, 0.0, 800.0, 600.0],
                     subrole: Some("AXStandardWindow".into()),
                     minimized: false,
@@ -1662,6 +1666,7 @@ mod tests {
             reads += 1;
             std::thread::sleep(Duration::from_millis(30));
             Some(AxWindowFacts {
+                id: None,
                 frame: [0.0, 0.0, 800.0, 600.0],
                 subrole: None,
                 minimized: false,

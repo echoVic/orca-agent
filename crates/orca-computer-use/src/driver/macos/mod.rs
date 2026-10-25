@@ -322,11 +322,16 @@ fn resolve_window<'a>(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let (mut candidates, facts) = windows::gather_facts(candidates, deadline, |candidate, left| {
         let _ = unsafe { candidate.0.set_messaging_timeout(left.min(2.0)) };
-        (
-            candidate.position_size().ok(),
-            candidate.attribute_string("AXSubrole").ok().flatten(),
-            candidate.attribute_bool("AXMinimized").ok().flatten(),
-        )
+        Some(windows::AxWindowFacts {
+            id: candidate.window_id(),
+            frame: candidate.position_size().ok()?,
+            subrole: candidate.attribute_string("AXSubrole").ok().flatten(),
+            minimized: candidate
+                .attribute_bool("AXMinimized")
+                .ok()
+                .flatten()
+                .unwrap_or(false),
+        })
     });
     let main_index = main
         .as_ref()

@@ -9,6 +9,11 @@ use objc2_core_foundation::{
 };
 
 use super::error;
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn _AXUIElementGetWindow(element: *const AXUIElement, window: *mut u32) -> AXError;
+}
 use crate::protocol::{DriverError, ErrorKind};
 
 #[derive(Clone, PartialEq)]
@@ -97,6 +102,13 @@ pub(super) fn secure_text_role(role: &str, subrole: &SubroleRead) -> bool {
 impl AxElement {
     pub(super) fn system_wide() -> Result<Self, DriverError> {
         Self::from_owned(unsafe { AXUIElement::new_system_wide() })
+    }
+    pub(super) fn window_id(&self) -> Option<u32> {
+        let mut id = 0;
+        // This private HIServices API identifies the same CGWindowID used by
+        // ScreenCaptureKit. Unsupported windows retain the frame fallback.
+        let result = unsafe { _AXUIElementGetWindow(&*self.0, &mut id) };
+        (result == AXError::Success && id != 0).then_some(id)
     }
     pub(super) fn pid(&self) -> Result<i32, DriverError> {
         let mut pid = 0;
