@@ -238,3 +238,54 @@ fn computer_surface_terminal_and_ide_dialogs_keep_exact_app_grants() {
         tui.completed();
     }
 }
+
+#[test]
+fn computer_surface_existing_window_dialog_offers_this_window_once_or_this_session() {
+    let _home = crate::test_support::isolate_orca_home();
+    let mut desktop = FakeDesktop::with_textedit();
+    // TextEdit's window was open before the turn: it is the user's.
+    desktop.snapshots_see_windows = true;
+    let mut tui = ComputerTui::start(desktop);
+    tui.send(serde_json::json!({"action":"observe","app":"TextEdit","window":1}));
+    tui.approval();
+    let dialog = tui.state.approval_dialog.as_ref().unwrap();
+    assert_eq!(
+        dialog.target.as_deref(),
+        Some("com.apple.TextEdit#window:1")
+    );
+    assert_eq!(
+        dialog.options,
+        vec![
+            ApprovalOption::Once,
+            ApprovalOption::AlwaysTarget,
+            ApprovalOption::Deny
+        ]
+    );
+    let screen = crate::test_support::frame_string(&mut tui.state, 140, 40);
+    for text in [
+        "your existing window \"probe.rtf\"",
+        "Allow this window once",
+        "Allow this window this session",
+    ] {
+        assert!(screen.contains(text), "{screen}");
+    }
+    tui.answer('2');
+    tui.completed();
+    // The same window in the next turn: the session grant answers.
+    tui.send(
+        serde_json::json!({"action":"click","app":"TextEdit","window":1,"target":{"element":1}}),
+    );
+    tui.until(|event| {
+        matches!(event, TuiEvent::SessionCompleted { .. })
+            || matches!(event, TuiEvent::ApprovalNeeded { .. })
+    });
+    assert!(
+        tui.state.approval_dialog.is_none(),
+        "the window grant must skip the dialog"
+    );
+    if tui.state.status != crate::types::AppStatus::Idle {
+        tui.completed();
+    }
+    tui.launcher
+        .desktop(|desktop| assert_eq!(desktop.actions_on("com.apple.TextEdit"), 1));
+}

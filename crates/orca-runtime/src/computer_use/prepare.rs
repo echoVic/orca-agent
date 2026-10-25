@@ -5,10 +5,12 @@ use orca_computer_use::call::ComputerCall;
 use orca_computer_use::client::CallError;
 use orca_computer_use::protocol::{Action, ErrorKind, Reply, Request, Target};
 use orca_core::approval_types::{ActionKind, ApprovalMode, Decision};
+use orca_core::computer_apps::ComputerTarget;
 use orca_core::config::RunConfig;
 
 use super::ComputerUseService;
-use super::budget::FailureBudget;
+use super::ownership::TurnWindows;
+use super::turn::TurnScope;
 use crate::tool_invocation::ToolInvocation;
 
 /// Resolve the app and apply authorization restrictions before asking approval.
@@ -19,17 +21,20 @@ pub(crate) fn prepare_invocation(
     config: &RunConfig,
     service: &ComputerUseService,
 ) -> Result<(), String> {
-    prepare_invocation_with_budget(invocation, config, service, None)
+    prepare_invocation_in_turn(invocation, config, service, None)
 }
 
-/// As `prepare_invocation`, also refusing an app the turn's failure budget
-/// stopped (before any approval is asked) and counting failures found here.
-pub(crate) fn prepare_invocation_with_budget(
+/// As `prepare_invocation`, within the turn's computer state: the failure
+/// budget refuses an app it stopped (before any approval is asked) and counts
+/// failures found here, and the turn's window snapshot decides which windows
+/// are the user's.
+pub(crate) fn prepare_invocation_in_turn(
     invocation: &mut ToolInvocation,
     config: &RunConfig,
     service: &ComputerUseService,
-    budget: Option<&FailureBudget>,
+    turn: Option<&TurnScope>,
 ) -> Result<(), String> {
+    let budget = turn.map(|turn| &*turn.budget);
     let raw = super::budget::raw_app(invocation.effective.raw_arguments.as_deref());
     // A known name of a stopped app is refused before the driver resolves it.
     if let (Some(budget), Some(raw)) = (budget, raw.as_deref())
@@ -38,7 +43,13 @@ pub(crate) fn prepare_invocation_with_budget(
         return Err(stop);
     }
     let mut app_key = raw.clone();
-    let result = prepare(invocation, config, service, &mut app_key);
+    let result = prepare(
+        invocation,
+        config,
+        service,
+        turn.map(|turn| &*turn.windows),
+        &mut app_key,
+    );
     let (Some(budget), Some(app)) = (budget, app_key.as_deref()) else {
         return result;
     };
@@ -65,6 +76,7 @@ fn prepare(
     invocation: &mut ToolInvocation,
     config: &RunConfig,
     service: &ComputerUseService,
+    windows: Option<&TurnWindows>,
     app_key: &mut Option<String>,
 ) -> Result<(), String> {
     ensure_visible(config, 0, Some(service))?;
@@ -84,6 +96,15 @@ fn prepare(
         return Err("plan mode only allows list_apps and observe".into());
     }
     let hello = check_permissions(service)?;
+    // The turn's first computer call notes which windows are open before
+    // anything acts. Full-auto asks about no window, so there a failed
+    // snapshot only costs the `(yours)` marks.
+    if let Some(windows) = windows
+        && let Err(error) = windows.ensure_start(service)
+        && config.approval_mode != ApprovalMode::FullAuto
+    {
+        return Err(error);
+    }
     if matches!(call, ComputerCall::ListApps) {
         invocation.action = None;
         return Ok(());
@@ -177,21 +198,43 @@ fn prepare(
         }
         _ => false,
     };
+    // The window this call uses, as execution picks it: the one named, or for
+    // an action the latest observed one. One of the user's own windows needs
+    // an approval of its own (none in full-auto).
+    let window = match &call {
+        ComputerCall::Observe { window, .. } => *window,
+        ComputerCall::Act { window, .. } => {
+            window.or_else(|| service.latest_window(&app.bundle_id))
+        }
+        _ => None,
+    };
+    let user_window = match (windows, window) {
+        (Some(windows), Some(id)) if config.approval_mode != ApprovalMode::FullAuto => windows
+            .user_windows(service, &app.bundle_id)
+            .into_iter()
+            .find(|user| user.id == id),
+        _ => None,
+    };
     invocation.action = Some(ActionKind::Computer);
-    invocation.effective.target = Some(if secure {
-        format!("{}#secure", app.bundle_id)
-    } else {
-        app.bundle_id.clone()
-    });
+    invocation.effective.target = Some(
+        ComputerTarget {
+            app: app.bundle_id.clone(),
+            window: user_window.as_ref().map(|user| user.id),
+            secure,
+        }
+        .to_string(),
+    );
+    let place = match &user_window {
+        Some(user) => format!(
+            "your existing window \"{}\" in {} ({})",
+            user.title, app.name, app.bundle_id
+        ),
+        None => format!("{} ({})", app.name, app.bundle_id),
+    };
     let mut preview = if secure {
-        format!(
-            "{} into a password field in {} ({})",
-            call.action_name(),
-            app.name,
-            app.bundle_id
-        )
+        format!("{} into a password field in {place}", call.action_name())
     } else {
-        format!("{} in {} ({})", call.action_name(), app.name, app.bundle_id)
+        format!("{} in {place}", call.action_name())
     };
     if let ComputerCall::LaunchApp { open, .. } = &call {
         for path in open {

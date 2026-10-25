@@ -1081,14 +1081,16 @@ impl ToolExecutionActor {
                 )
                 .and_then(|()| crate::computer_use::service(thread_store, cwd, config))
                 .and_then(|service| {
-                    let budget = extension_stores.map(|stores| {
-                        crate::computer_use::budget::FailureBudget::for_turn(stores.turn_store())
-                    });
-                    crate::computer_use::prepare::prepare_invocation_with_budget(
+                    // The same turn store execution uses, so prepare and
+                    // execution share the turn's budget and window snapshot.
+                    let turn_store = extension_stores
+                        .map(|stores| stores.turn_store())
+                        .unwrap_or(&self.runtime.turn_extensions);
+                    crate::computer_use::prepare::prepare_invocation_in_turn(
                         &mut invocation,
                         config,
                         &service,
-                        budget.as_deref(),
+                        Some(&crate::computer_use::turn::TurnScope::for_turn(turn_store)),
                     )
                 })
                 .and_then(|()| {
