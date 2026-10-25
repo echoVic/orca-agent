@@ -48,6 +48,9 @@ struct ServiceState {
     /// Windows that appeared during Orca's turns, by bundle ID: Orca's for the
     /// rest of the session. Driver restarts keep them.
     orca_windows: HashSet<(String, u32)>,
+    /// Apps whose calls reached the driver this session: approved, or in
+    /// full-auto. Only their windows are listed with titles.
+    used_apps: HashSet<String>,
     #[cfg(test)]
     before_esc_close: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -160,6 +163,22 @@ impl ComputerUseService {
                 }
             }
         })
+    }
+
+    pub(crate) fn note_used_app(&self, bundle_id: &str) {
+        self.state
+            .lock()
+            .expect("computer-use service lock poisoned")
+            .used_apps
+            .insert(bundle_id.to_owned());
+    }
+
+    pub(crate) fn used_app(&self, bundle_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("computer-use service lock poisoned")
+            .used_apps
+            .contains(bundle_id)
     }
 
     pub(crate) fn start_turn(&self, cancel: &CancelToken) {

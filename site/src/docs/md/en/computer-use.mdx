@@ -65,6 +65,36 @@ during delivery, Orca refuses unapproved input and sends no text. The result
 instructs the agent to observe again and target the secure field by its element id
 to request approval on retry.
 
+## Your windows
+
+Windows that were already open when you sent your message are yours, unless
+Orca opened them earlier in this session. Before Orca first observes or
+operates one of them, it asks about that window, naming its title:
+
+- `1` **Allow this window once**: run this call; later calls on the window ask again.
+- `2` **Allow this window this session**: skip approval for this window until you quit.
+- `4` **Deny**: refuse the call; Orca opens a new window instead, for example with Cmd+N.
+
+App grants, including **Allow all apps this session**, and allow rules for an
+app, a wildcard, or the whole tool do not cover your windows; only the
+window's own approval does. Deny and prompt rules for an app still apply to
+its windows. Without a window named, Orca leaves your windows alone: it uses a
+window it opened, or the model opens one (Cmd+N still reaches an app whose
+windows are all yours). Windows Orca opens are its own for the rest of the
+session. `full-auto` does not ask about windows, as it does not ask about
+apps; password entry still asks.
+
+In apps where Cmd+N does not open a window (Notes, for example, starts a new
+note), it acts in your frontmost window instead, and the result says that no
+new window opened.
+
+`list_apps` lists window titles only for apps Orca has used in this session,
+marking yours `(yours)`; for other apps it shows only how many windows they
+have.
+
+Known limits: a window you open while Orca is working on your message counts
+as Orca's, and so do windows an app restores when Orca launches it.
+
 ## App risk levels
 
 Keychain Access (`com.apple.keychainaccess`), Passwords (`com.apple.Passwords`),
@@ -156,14 +186,14 @@ model to stop trying workarounds and report what failed. After six failures
 in a row, Orca stops using that app for the rest of the turn; it is available
 again after your next message. A success resets the count.
 
-`list_apps` shows the windows Orca can observe, checked through Accessibility,
-and marks minimized windows. For an app that does not answer that check in
-time, it lists the app's visible document-sized windows instead, which observe
-may still refuse.
+For apps Orca has used in this session, `list_apps` shows the windows it can
+observe, checked through Accessibility, and marks minimized windows. For an
+app that does not answer that check in time, it lists the app's visible
+document-sized windows instead, which observe may still refuse.
 
 When an app has no window yet (for example, TextEdit showing only its Open
 panel), a Command or Control shortcut such as Cmd+N can be sent to the app
-without a window.
+without a window. When all of an app's windows are yours, only Cmd+N can.
 
 ## Disable computer use
 

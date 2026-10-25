@@ -129,12 +129,13 @@ fn run_call(
     }
     let model = config.model.as_deref().unwrap_or(FLASH_MODEL);
     let include_screenshot = config.model.supports_images(model) && accepts_tool_images(model);
+    let turn_windows = TurnWindows::for_turn(stores.turn_store());
     // The user's windows this call must not use: the app's, but the one
     // approved for this call. Full-auto asks about no window.
     let user_windows: Vec<u32> = if config.approval_mode == ApprovalMode::FullAuto {
         vec![]
     } else {
-        TurnWindows::for_turn(stores.turn_store())
+        turn_windows
             .user_windows(&service, app)
             .into_iter()
             .map(|window| window.id)
@@ -192,6 +193,11 @@ fn run_call(
         }),
         other => other.clone(),
     });
+    // A call that reaches the driver was approved (or runs in full-auto): its
+    // app's window titles may be listed from now on.
+    if !matches!(call, ComputerCall::ListApps) {
+        service.note_used_app(app);
+    }
     let mut reply = service.call(driver_request, timeout);
     // The inherited window is gone (the app's last window closed): forget it
     // and let the driver choose, which also reaches app-level shortcuts.
@@ -250,7 +256,7 @@ fn run_call(
                 for app in &error.candidates {
                     message.push('\n');
                     message.push_str(&app_line(app));
-                    append_windows(&mut message, app);
+                    append_windows(&mut message, app, &service, &turn_windows);
                 }
             }
             return ToolResult::failed(request, noted(message), None);
@@ -262,7 +268,7 @@ fn run_call(
             .iter()
             .map(|app| {
                 let mut text = app_line(app);
-                append_windows(&mut text, app);
+                append_windows(&mut text, app, &service, &turn_windows);
                 text
             })
             .collect::<Vec<_>>()
@@ -284,7 +290,7 @@ fn run_call(
                 text.push_str("; no window yet. ");
                 text.push_str(orca_computer_use::messages::NO_WINDOW_NEXT_STEP);
             }
-            append_windows(&mut text, &app);
+            append_windows(&mut text, &app, &service, &turn_windows);
             text
         }
         Reply::Observed { observation } => observation_text(&service, observation, &mut images),
@@ -334,9 +340,32 @@ fn app_line(app: &AppInfo) -> String {
     )
 }
 
-fn append_windows(text: &mut String, app: &AppInfo) {
+/// Appends an app's windows: with titles once the app has been used this
+/// session, the user's marked, else only how many it has.
+fn append_windows(
+    text: &mut String,
+    app: &AppInfo,
+    service: &ComputerUseService,
+    turn_windows: &TurnWindows,
+) {
+    if !service.used_app(&app.bundle_id) {
+        let count = app.windows.len();
+        text.push_str(&format!(
+            " · {count} window{}",
+            if count == 1 { "" } else { "s" }
+        ));
+        return;
+    }
+    let theirs: Vec<u32> = turn_windows
+        .user_windows(service, &app.bundle_id)
+        .into_iter()
+        .map(|window| window.id)
+        .collect();
     for window in &app.windows {
         text.push_str(&format!("\n  window {}: \"{}\"", window.id, window.title));
+        if theirs.contains(&window.id) {
+            text.push_str(" (yours)");
+        }
         if window.minimized {
             text.push_str(" (minimized)");
         }
@@ -1299,6 +1328,53 @@ mod tests {
     }
 
     #[test]
+    fn list_apps_hides_titles_of_apps_not_used_this_session() {
+        let mut desktop = FakeDesktop::with_textedit_and_calculator();
+        desktop.snapshots_see_windows = true;
+        let launcher = FakeLauncher::new(desktop);
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let turn = ExtensionData::new("turn");
+        let list = || {
+            run_turn_call(
+                &thread_store,
+                &turn,
+                json!({"action":"list_apps"}),
+                &CancelToken::new(),
+            )
+            .output
+            .unwrap()
+        };
+        let before = list();
+        assert!(
+            before.contains("TextEdit — com.apple.TextEdit (pid 42) · 1 window"),
+            "{before}"
+        );
+        assert!(
+            !before.contains("probe.rtf") && !before.contains("window 1"),
+            "{before}"
+        );
+        // Once TextEdit is used (its window approved), its windows show, the user's marked.
+        run_turn_call(
+            &thread_store,
+            &turn,
+            json!({"action":"observe", "app":"TextEdit", "window":1}),
+            &CancelToken::new(),
+        );
+        let after = list();
+        assert!(
+            after.contains(
+                "TextEdit — com.apple.TextEdit (pid 42)\n  window 1: \"probe.rtf\" (yours)"
+            ),
+            "{after}"
+        );
+        assert!(
+            after.contains("Calculator — com.apple.calculator (pid 42) · 1 window"),
+            "{after}"
+        );
+    }
+
+    #[test]
     fn list_apps_marks_minimized_windows() {
         let mut desktop = FakeDesktop::with_textedit();
         desktop.add_window(
@@ -1312,6 +1388,15 @@ mod tests {
         let launcher = FakeLauncher::new(desktop);
         let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
         insert_service(&thread_store, &launcher);
+        // Titles are listed once the app has been used this session.
+        execute(
+            &observe_request("com.apple.TextEdit"),
+            &flash_config(),
+            0,
+            RuntimeExtensionStores::new(&thread_store, &turn_store),
+            Path::new("/"),
+            &CancelToken::new(),
+        );
         let result = execute(
             &request(json!({"action":"list_apps"}), None),
             &flash_config(),
@@ -1659,12 +1744,17 @@ mod tests {
             (
                 json!({"action":"list_apps"}),
                 None,
-                "TextEdit — com.apple.TextEdit (pid 42)\n  window 1: \"probe.rtf\"",
+                "TextEdit — com.apple.TextEdit (pid 42) · 1 window",
             ),
             (
                 json!({"action":"launch_app", "app":"TextEdit", "open":["probe.rtf"]}),
                 Some("com.apple.TextEdit"),
                 "launched TextEdit (com.apple.TextEdit)\n  window 1: \"probe.rtf\"",
+            ),
+            (
+                json!({"action":"list_apps"}),
+                None,
+                "TextEdit — com.apple.TextEdit (pid 42)\n  window 1: \"probe.rtf\"",
             ),
             (
                 json!({"action":"scroll", "app":"TextEdit", "target":{"point":[312,190]}, "direction":"down", "amount":3, "observe":false}),

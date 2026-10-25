@@ -367,6 +367,38 @@ fn release_notes_retain_the_computer_use_approval_and_preview_boundaries() {
     );
 }
 
+#[test]
+fn computer_use_docs_cover_the_users_windows() {
+    for locale in ["en", "zh"] {
+        let source = public_page(locale, "computer-use");
+        require_fragments(
+            &source,
+            &[
+                "`1` **Allow this window once**",
+                "`2` **Allow this window this session**",
+                "**Allow all apps this session**",
+                "`(yours)`",
+                "`full-auto`",
+                "Cmd+N",
+            ],
+            locale,
+        );
+        let scope = match locale {
+            "en" => [
+                "do not cover your windows",
+                "only for apps Orca has used in this session",
+                "Known limits",
+            ],
+            _ => [
+                "都不覆盖你的窗口",
+                "只对本会话用过的应用列出窗口标题",
+                "已知限制",
+            ],
+        };
+        require_fragments(&source, &scope, locale);
+    }
+}
+
 fn public_page(locale: &str, page: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("site/src/docs/md")
