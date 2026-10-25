@@ -37,8 +37,9 @@ impl KeyStroke {
             && !self.modifiers.shift
             && !self.modifiers.ctrl
             && match self.keycode {
-                12 => !self.modifiers.option,     // Cmd+Q
+                12 => true,                       // Cmd+Q/Cmd+Option+Q
                 13 | 46 => self.modifiers.option, // Cmd+Option+W/M
+                4 => !self.modifiers.option,      // Cmd+H
                 _ => false,
             }
     }
@@ -258,7 +259,7 @@ mod tests {
 
     #[test]
     fn app_wide_shortcuts_have_exact_keys_and_modifiers() {
-        for key in ["q", "w", "m", "n", "a"] {
+        for key in ["q", "w", "m", "h", "n", "a"] {
             for mask in 0..16 {
                 let mut stroke = parse_key(key).unwrap();
                 stroke.modifiers = Modifiers {
@@ -269,7 +270,9 @@ mod tests {
                 };
                 assert_eq!(
                     stroke.acts_on_every_window(),
-                    (key == "q" && mask == 1) || (matches!(key, "w" | "m") && mask == 3),
+                    (key == "q" && matches!(mask, 1 | 3))
+                        || (matches!(key, "w" | "m") && mask == 3)
+                        || (key == "h" && mask == 1),
                     "{key} {mask}"
                 );
             }
