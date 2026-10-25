@@ -31,15 +31,13 @@ applies Monday to Friday from 09:00 to 12:00 and from 14:00 to 18:00 Beijing
 time, except on Chinese public holidays. Weekends and public holidays are
 off-peak all day.
 
-Orca ships with built-in prices last verified on 2026-10-20; v0.5.14 keeps
-them unchanged from v0.5.13. The first session in each process checks whether
-cached prices are missing or at least 24 hours old
+Orca ships with built-in prices last verified on 2026-10-20. The first session
+in each process checks whether cached prices are missing or at least 24 hours old
 and, if needed, refreshes them from models.dev in the background. Refreshing
 does not block startup, and a failed refresh keeps the existing prices.
 Development builds skip refresh unless `ORCA_PRICING_URL` is set to a URL.
 `ORCA_PRICING_URL=off` disables refresh in any build (case-insensitive, with
-surrounding whitespace ignored). This repository sets it for Cargo processes
-to keep tests offline; installed releases still refresh by default.
+surrounding whitespace ignored).
 Run `orca doctor` to see the price source, refresh setting, and current
 DeepSeek peak or off-peak hours in its `pricing` line. To disable pricing
 refresh, or to price a model yourself, add this to your user configuration:

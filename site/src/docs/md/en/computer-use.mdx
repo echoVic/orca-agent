@@ -4,8 +4,9 @@
 
 Orca can see and operate other macOS apps with the `computer` tool: list or
 launch apps, inspect windows, click, type, send keys, and scroll. Use it to
-check a UI you just built or work in an app you name. When you name an app,
-Orca should complete the work there. For other tasks, prefer file and
+check a UI you just built, work in an app without a command-line interface,
+or work in an app you name. When you name an app, Orca should complete the
+work there. For other tasks, prefer file and
 command-line tools when they can do the job. App launches use `launch_app`;
 shell `open` and `osascript` cannot reach apps from Orca's sandbox.
 
@@ -60,8 +61,12 @@ and neither does `full-auto`. Patterned allow rules, including exact app ids,
 wildcards such as `*`, and an explicit `#secure` target, also leave this check
 in place. Only a whole-tool allow rule for `computer`,
 without a `pattern`, preapproves it for apps that do not run commands. A matching deny rule still takes
-precedence; see [permission rules](approval-modes.md#permission-rules). In your
-existing windows, no allow rule preapproves password entry.
+precedence; see [permission rules](approval-modes.md#permission-rules). Outside
+`full-auto`, no allow rule preapproves password entry in your existing windows.
+In `full-auto`, it uses the ordinary `bundle#secure` target, which the
+whole-tool rule can preapprove for apps that do not run commands. Window deny
+and prompt rules (`bundle#window:<id>`) do not apply there; app deny and prompt
+rules still apply.
 
 If a point target or a stale observation reveals a password field only
 during delivery, Orca refuses unapproved input and sends no text. The result
@@ -78,14 +83,17 @@ operates one of them, it asks about that window, naming its title:
 - `2` **Allow this window this session**: skip approval for this window until you quit.
 - `4` **Deny**: refuse the call; Orca opens a new window instead, for example with Cmd+N.
 
-App grants, including **Allow all apps this session**, and allow rules for an
-app, a wildcard, or the whole tool do not cover your windows; only the
-window's own approval does. Deny and prompt rules for an app still apply to
+Outside `full-auto`, app grants, including **Allow all apps this session**,
+and allow rules for an app, a wildcard, or the whole tool do not cover your windows;
+only the window's own approval does. Deny and prompt rules for an app still apply to
 its windows. Without a window named, Orca leaves your windows alone: it uses a
 window it opened, or the model opens one (Cmd+N still reaches an app whose
 windows are all yours). Windows Orca opens are its own for the rest of the
 session. `full-auto` does not ask about windows, as it does not ask about
-apps; password entry still asks.
+apps; password entry still asks unless a whole-tool `computer` allow rule
+preapproves it for an app that does not run commands. In that mode its target
+is `bundle#secure`, so window deny and prompt rules do not apply; app deny and
+prompt rules still apply.
 
 In apps where Cmd+N does not open a window (Notes, for example, starts a new
 note), it acts in your frontmost window instead, and the result says that no
@@ -139,8 +147,11 @@ included, ask for app approval unless an applicable rule or grant already
 allows them.
 
 `full-auto` already runs commands on the host, so app calls run there without
-app approval. Password entry still asks each time, deny and prompt rules still
-apply, and apps blocked by default stay blocked.
+app approval. Password entry still asks each time unless a whole-tool
+`computer` allow rule preapproves it for an app that does not run commands.
+App deny and prompt rules still apply; window deny and prompt rules do not,
+because targets omit the window id in this mode. Apps blocked by default stay
+blocked.
 
 ## Observations and screenshots
 
@@ -163,9 +174,10 @@ screenshot (for example, `[1 image attached]`). Press `q` to close the preview.
 
 From the first `computer` call until the turn ends, Orca captures `Esc`
 system-wide. `Esc` interrupts the running turn, including while another app
-is in the foreground or a screenshot preview is open. On an approval panel,
-`Esc` means Deny instead: an ordinary existing-window denial lets the turn
-continue with another window; app and password-entry denials stop it.
+is in the foreground or a screenshot preview is open. The driver's system-wide
+listener also stops the turn while a window approval panel is open. Press `4`
+(Deny) to keep the window and let Orca continue with its own; app and
+password-entry denials stop the turn.
 
 ## Background and foreground
 

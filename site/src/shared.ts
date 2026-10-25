@@ -11,7 +11,7 @@ export const releases = [
     version: "v0.5.14",
     date: "2026-10-26",
     title: "Ask before using your windows",
-    body: "Computer use asks before observing or operating a window you already had open, with approval for one call or the session. App grants do not cover your windows; list_apps shows titles only for apps used this session. Usable-window selection, input delivery and recovery improve, repeated failures stop the app for the turn, and approval recovery fails closed when the tool cannot be restored. A developer acceptance harness checks 15 real tasks.",
+    body: "Outside full-auto, computer use asks before observing or operating a window you already had open, with approval for one call or the session. Press 4 (Deny) to keep the window and let Orca continue; Esc stops the turn even on that panel. App grants do not cover your windows; list_apps shows titles only for apps used this session. Usable-window selection, input delivery and recovery improve, and repeated failures stop the app for the turn. MCP approvals are never resumed after a restart; turn-only tool approvals fail closed unless the same definition can be restored. A developer acceptance harness checks 15 real tasks.",
     url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.14",
   },
   {

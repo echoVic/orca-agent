@@ -91,13 +91,16 @@ foreground_fallback = false
 | `computer` | 应用 bundle id；你的已有窗口为 `bundle#window:<id>`；密码输入的目标以 `#secure` 结尾。 |
 | MCP 工具 | 规范工具名，如 `mcp__github__create_issue`；通常不写 `pattern`。 |
 | `read_mcp_resource` | `server:uri`。 |
-| `read_skill` | Skill 名称。 |
+| `read_skill` | `id` 参数，通常是 skill 的目录名。 |
 | `Workflow` | 优先用脚本路径，否则用工作流名称或草稿 id。内联代码不匹配任何带 pattern 的规则，包括通配符。 |
 
-应用、通配符和整个工具的 allow 规则都不覆盖你的已有窗口，只有精确的
+在 `full-auto` 之外，应用、通配符和整个工具的 allow 规则都不覆盖你的已有窗口，只有精确的
 `bundle#window:<id>` allow 才覆盖这个窗口，且不预先批准其中的密码输入。
 窗口 id 不跨会话，建议直接在窗口面板里授予本会话权限。应用 deny 和 prompt 规则仍覆盖
-窗口；窗口 deny 和 prompt 规则也覆盖其中的密码输入。匹配方法、可执行命令应用和
+窗口；在 `full-auto` 之外，窗口 deny 和 prompt 规则也覆盖其中的密码输入。
+`full-auto` 中，密码输入使用 `bundle#secure`，整个 `computer` 工具的 allow 规则
+可以预先批准不能执行命令的应用的密码输入。窗口 deny 和 prompt 规则此时不适用，
+应用 deny 和 prompt 规则仍生效。匹配方法、可执行命令应用和
 密码输入的例外见[审批模式](approval-modes.md#权限规则)。
 
 ## 子代理

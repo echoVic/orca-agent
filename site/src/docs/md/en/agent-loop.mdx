@@ -135,7 +135,7 @@ Before executing any tool call, Orca checks the approval policy:
 | `plan` | Read-only; writes, shell, network and child-agent calls are refused. Computer use permits only listing apps and observing windows, with approval where required. |
 | `suggest` | Writes, shell, network, child-agent and computer calls ask unless an applicable rule or grant decides them. |
 | `auto-edit` | Ordinary edits, shell, network and child-agent calls run within the effective policy; computer calls still ask unless already allowed. |
-| `full-auto` | App and window calls skip ordinary approval; password entry still asks unless a qualifying rule covers it. Deny and prompt rules still apply. |
+| `full-auto` | Non-computer calls run without approval unless a rule requires otherwise. App and window calls skip ordinary approval; password entry and computer calls without an app target still ask unless a qualifying rule covers them. Deny and prompt rules still apply. |
 
 Permission rules, workspace trust and the sandbox remain separate checks. App
 allow rules do not authorize your existing windows. See
@@ -146,8 +146,9 @@ If approval is required:
 - The TUI displays the tool, target and available scopes before execution.
 - That call waits for a decision.
 - Deny stops the turn, except on an ordinary existing-window panel: the model
-  is told you kept the window and can continue by opening its own. `Esc` on
-  that panel also means Deny. Password-entry denials still stop the turn.
+  is told you kept the window and can continue by opening its own. Press `4`
+  (Deny) for this; during computer use, Esc stops the turn even while the
+  window panel is open. Password-entry denials still stop the turn.
 
 ### Phase 5: Execution Settlement
 

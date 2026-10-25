@@ -77,7 +77,7 @@ the input:
 | `1` Allow once | Run this call. |
 | `2` Allow this exact call | Run it, and allow the same tool with the same target again without asking. Not offered when the call has no specific target. |
 | `3` Allow `<tool>` this session | Run it, and stop asking for this tool until you quit. For `computer` it reads **Allow all apps this session**. |
-| `4` Deny | Do not run it. The turn stops, except on an ordinary existing-window panel: Orca can continue with its own window. `Esc` also denies. |
+| `4` Deny | Do not run it. The turn stops, except on an ordinary existing-window panel: Orca can continue with its own window. During computer use, Esc stops the turn, even on this panel. |
 | `5` Always allow `<tool>` (saved) | MCP tools and computer use. Run it, stop asking for this tool for the rest of the session, and save an allow rule to the user config so future sessions skip the prompt too. For `computer` it reads **Always allow all apps (saved)** and saves `pattern = "*"`. |
 | `6` Always allow the `<server>` server (saved) | MCP tools only. Run it, and do the same for every tool on that server, saving a server-wide allow rule instead. |
 | `7` Always allow this app (saved) | Computer use only. Run it, remember this app for the session, and save an allow rule for its exact bundle id. |
@@ -95,11 +95,12 @@ allow this app (saved), `5` Always allow all apps (saved), and `4` Deny. A compu
 
 For one of your existing windows, the panel instead offers `1` **Allow this
 window once**, `2` **Allow this window this session**, and `4` **Deny**.
-Deny, including `Esc` on that panel, keeps the window to yourself and lets the
-turn continue. It offers no saved or all-app options. App, wildcard and
+Press `4` (Deny) to keep the window to yourself and let the turn continue.
+During computer use, Esc stops the turn, even while this panel is open. It
+offers no saved or all-app options. Outside `full-auto`, app, wildcard and
 whole-tool allow rules do not cover these windows; only an exact window allow
-does. `full-auto` skips ordinary window approval, while password entry still
-asks separately. See [Your windows](computer-use.md#your-windows) for the
+does. `full-auto` skips window approval; its password-entry rules are described
+below. See [Your windows](computer-use.md#your-windows) for the
 ownership rules and known limits.
 
 Outside `full-auto`, terminals and IDEs need approval for that app itself:
@@ -115,8 +116,12 @@ and `Cmd+V`. App grants, grants for all apps, `full-auto`, and patterned allow
 rules, including `*` and one naming an explicit `#secure` target, do not
 preapprove these calls. Only a whole-tool allow rule
 for `computer` without a `pattern` does for apps that do not run commands,
-except in your existing windows, where no allow rule preapproves password entry;
-matching deny rules still win. See
+except in your existing windows outside `full-auto`, where no allow rule
+preapproves password entry. In `full-auto`, password entry uses the ordinary
+`bundle#secure` target, so that whole-tool rule can preapprove it for apps
+that do not run commands. Window deny and prompt rules (`bundle#window:<id>`)
+do not apply there; app deny and prompt rules still apply. Matching deny
+rules still win. See
 [Computer use](computer-use.md#app-approval).
 
 If the driver detects a password field only during a point action or from a

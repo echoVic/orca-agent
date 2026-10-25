@@ -298,8 +298,8 @@ Tool events:
 
 Requested-tool metadata uses the executing session or turn's tool definitions,
 including writable MCP and shell-classified external tools. Resource targets
-are `server:uri`; skill targets are names; Workflow targets prefer `scriptPath`,
-then name or draft id. Inline Workflow code has the target `<inline workflow>`
+are `server:uri`; read_skill targets are its `id` argument, usually the skill
+directory name; Workflow targets prefer `scriptPath`, then name or draft id. Inline Workflow code has the target `<inline workflow>`
 and cannot match any pattern-based permission rule, including wildcards;
 whole-tool rules keep their scope.
 

@@ -72,9 +72,9 @@ Valid unrelated definitions remain usable. The tool catalog notes excluded
 entries; requesting an unavailable custom name returns a diagnostic without
 starting a child.
 
-The custom-agent catalog is fixed when the session starts, including the
+The custom-agent catalog is fixed at the session's first turn, including the
 instructions and tool policy used to launch children. Editing a definition
-mid-session does not change that session's advertised agents or later launches.
+after that does not change the session's advertised agents or later launches.
 Start a new session to use the edit.
 
 ## Calling An Agent

@@ -105,14 +105,18 @@ approval, and disabling the tool with a deny rule.
 | `computer` | App bundle id, `bundle#window:<id>` for your existing window, or a target ending in `#secure` for password entry. |
 | MCP tools | Canonical tool name, such as `mcp__github__create_issue`; normally omit `pattern`. |
 | `read_mcp_resource` | `server:uri`. |
-| `read_skill` | Skill name. |
+| `read_skill` | The `id` argument, usually the skill directory name. |
 | `Workflow` | Script path, otherwise workflow name or draft id. Inline code does not match any pattern rule, including wildcards. |
 
-App, wildcard and whole-tool allow rules do not cover your existing windows.
-Only an exact `bundle#window:<id>` allow covers that window, never its password
-entry. Prefer the window panel's session grant, since window ids do not last
+Outside `full-auto`, app, wildcard and whole-tool allow rules do not cover
+your existing windows. Only an exact `bundle#window:<id>` allow covers that
+window, never its password entry. Prefer the window panel's session grant, since window ids do not last
 across sessions. App deny and prompt rules still apply to windows, and window
-deny and prompt rules apply to password entry in that window. See
+deny and prompt rules apply to password entry in that window outside
+`full-auto`. In `full-auto`, password entry uses `bundle#secure`, which a
+whole-tool `computer` allow rule can preapprove for apps that do not run
+commands. Window deny and prompt rules do not apply there; app deny and prompt
+rules still apply. See
 [Approval modes](approval-modes.md#permission-rules) for matching and the
 command-running-app and secure-input exceptions.
 
