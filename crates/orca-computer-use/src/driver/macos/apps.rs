@@ -43,7 +43,12 @@ fn running_info(app: &NSRunningApplication) -> Option<AppInfo> {
     })
 }
 
-fn windows(timeout: Duration) -> Result<HashMap<i32, Vec<CaptureWindowFacts>>, DriverError> {
+struct CapturedApps {
+    windows: HashMap<i32, Vec<CaptureWindowFacts>>,
+    owners: Vec<AppInfo>,
+}
+
+fn windows(timeout: Duration) -> Result<CapturedApps, DriverError> {
     if !CGPreflightScreenCaptureAccess() {
         return Err(error(
             ErrorKind::PermissionMissing,
@@ -61,10 +66,21 @@ fn windows(timeout: Duration) -> Result<HashMap<i32, Vec<CaptureWindowFacts>>, D
                     ))
                 } else if let Some(content) = content.as_ref() {
                     let mut windows: HashMap<i32, Vec<CaptureWindowFacts>> = HashMap::new();
+                    let mut owners = HashMap::new();
                     for window in content.windows() {
                         if window.windowLayer() == 0
                             && let Some(app) = window.owningApplication()
                         {
+                            let bundle_id = app.bundleIdentifier().to_string();
+                            if !bundle_id.is_empty() {
+                                owners.entry(app.processID()).or_insert_with(|| AppInfo {
+                                    bundle_id,
+                                    name: app.applicationName().to_string(),
+                                    pid: Some(app.processID()),
+                                    category: None,
+                                    windows: vec![],
+                                });
+                            }
                             let frame = window.frame();
                             windows
                                 .entry(app.processID())
@@ -88,7 +104,10 @@ fn windows(timeout: Duration) -> Result<HashMap<i32, Vec<CaptureWindowFacts>>, D
                     for values in windows.values_mut() {
                         values.sort_by_key(|window| window.id);
                     }
-                    Ok(windows)
+                    Ok(CapturedApps {
+                        windows,
+                        owners: owners.into_values().collect(),
+                    })
                 } else {
                     Err(error(
                         ErrorKind::Failed,
@@ -145,7 +164,7 @@ fn list_with_timeout(timeout: Duration, verify_windows: bool) -> Result<Vec<AppI
     let capture = windows(timeout)?;
     let running = running_apps();
     let ax_deadline = Instant::now() + LIST_AX_BUDGET.min(timeout);
-    Ok(merge_apps(running, capture, |pid| {
+    Ok(merge_apps(running, capture.windows, |pid| {
         verify_windows
             .then(|| ax_window_facts(pid, ax_deadline))
             .flatten()
@@ -221,18 +240,31 @@ pub(super) fn list_verified() -> Result<Vec<AppInfo>, DriverError> {
     list_with_timeout(Duration::from_secs(30), true)
 }
 
-/// Every regular app's windows by id and title, unfiltered and without
+/// Every running app's windows by id and title, unfiltered and without
 /// accessibility reads: who owns which window, off-screen and minimized ones
 /// included, for telling the user's windows from Orca's.
 pub(super) fn snapshot() -> Result<Vec<AppInfo>, DriverError> {
     let capture = windows(Duration::from_secs(10))?;
-    Ok(snapshot_apps(running_apps(), capture))
+    let running = NSWorkspace::sharedWorkspace()
+        .runningApplications()
+        .iter()
+        .filter_map(|app| running_info(&app))
+        .collect();
+    Ok(snapshot_apps(running, capture.windows, capture.owners))
 }
 
 fn snapshot_apps(
-    running: Vec<AppInfo>,
+    mut running: Vec<AppInfo>,
     mut capture: HashMap<i32, Vec<CaptureWindowFacts>>,
+    owners: Vec<AppInfo>,
 ) -> Vec<AppInfo> {
+    // Some window owners are absent from NSWorkspace. CaptureKit's bundle id
+    // still attributes their windows, including off-screen tray-app windows.
+    for owner in owners {
+        if !running.iter().any(|app| app.pid == owner.pid) {
+            running.push(owner);
+        }
+    }
     let mut apps: Vec<_> = running
         .into_iter()
         .map(|mut app| {
@@ -814,20 +846,40 @@ mod tests {
         // A document, an off-screen (minimized) one and a small helper all count.
         let snapshot = snapshot_apps(
             vec![app(2), app(1)],
-            HashMap::from([(
-                2,
-                vec![
-                    facts(9, [0.0, 0.0, 800.0, 600.0], true),
-                    facts(10, [0.0, 0.0, 800.0, 600.0], false),
-                    facts(11, [0.0, 0.0, 20.0, 10.0], true),
-                ],
-            )]),
+            HashMap::from([
+                (
+                    2,
+                    vec![
+                        facts(9, [0.0, 0.0, 800.0, 600.0], true),
+                        facts(10, [0.0, 0.0, 800.0, 600.0], false),
+                        facts(11, [0.0, 0.0, 20.0, 10.0], true),
+                    ],
+                ),
+                (3, vec![facts(12, [5000.0, 5000.0, 800.0, 600.0], false)]),
+            ]),
+            // A non-regular tray app missing from the regular running list;
+            // ScreenCaptureKit still identifies its off-screen layer-0 window.
+            vec![
+                AppInfo {
+                    name: "Tray app".into(),
+                    ..app(3)
+                },
+                app(2),
+            ],
         );
         assert_eq!(
             snapshot.iter().map(|app| app.pid).collect::<Vec<_>>(),
-            vec![Some(1), Some(2)]
+            vec![Some(1), Some(2), Some(3)]
         );
         assert!(snapshot[0].windows.is_empty());
+        assert_eq!(
+            snapshot[2].windows,
+            vec![WindowInfo {
+                id: 12,
+                title: "w12".into(),
+                minimized: false,
+            }]
+        );
         assert_eq!(
             snapshot[1]
                 .windows
