@@ -132,8 +132,10 @@ impl CompiledPermissionRule {
             // an allow naming that exact window covers it, never an app,
             // wildcard or whole-tool allow. Stricter than password entry on
             // purpose: the user chose to approve their windows one by one.
+            // An exact window allow never preapproves password entry in it.
             if computer.window.is_some() {
-                return self.matches_tool(tool)
+                return !computer.secure
+                    && self.matches_tool(tool)
                     && self.pattern.as_ref().is_some_and(|pattern| {
                         target.is_some_and(|target| pattern.pattern == target.as_bytes())
                     });
@@ -582,6 +584,15 @@ mod tests {
                 "{other}"
             );
         }
+        let exact_secure = compile(vec![PermissionRule::new(
+            "computer",
+            "com.apple.finder#window:7#secure",
+            Decision::Allow,
+        )]);
+        assert_eq!(
+            exact_secure.matching_decision("computer", Some("com.apple.finder#window:7#secure")),
+            None
+        );
         for decision in [Decision::Deny, Decision::Prompt] {
             let app = compile(vec![PermissionRule::new(
                 "computer",
