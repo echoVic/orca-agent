@@ -8,13 +8,64 @@ use orca_core::approval_types::{ActionKind, ApprovalMode, Decision};
 use orca_core::config::RunConfig;
 
 use super::ComputerUseService;
+use super::budget::FailureBudget;
 use crate::tool_invocation::ToolInvocation;
 
 /// Resolve the app and apply authorization restrictions before asking approval.
+/// Tests that do not exercise the failure budget use this form.
+#[cfg(test)]
 pub(crate) fn prepare_invocation(
     invocation: &mut ToolInvocation,
     config: &RunConfig,
     service: &ComputerUseService,
+) -> Result<(), String> {
+    prepare_invocation_with_budget(invocation, config, service, None)
+}
+
+/// As `prepare_invocation`, also refusing an app the turn's failure budget
+/// stopped (before any approval is asked) and counting failures found here.
+pub(crate) fn prepare_invocation_with_budget(
+    invocation: &mut ToolInvocation,
+    config: &RunConfig,
+    service: &ComputerUseService,
+    budget: Option<&FailureBudget>,
+) -> Result<(), String> {
+    let raw = super::budget::raw_app(invocation.effective.raw_arguments.as_deref());
+    // A known name of a stopped app is refused before the driver resolves it.
+    if let (Some(budget), Some(raw)) = (budget, raw.as_deref())
+        && let Some(stop) = budget.stopped(raw)
+    {
+        return Err(stop);
+    }
+    let mut app_key = raw.clone();
+    let result = prepare(invocation, config, service, &mut app_key);
+    let (Some(budget), Some(app)) = (budget, app_key.as_deref()) else {
+        return result;
+    };
+    if let Some(raw) = raw.as_deref()
+        && raw != app
+    {
+        budget.alias(raw, app);
+    }
+    if let Some(stop) = budget.stopped(app) {
+        return Err(stop);
+    }
+    result.map_err(|mut message| {
+        if let Some(note) = budget.record(app, true) {
+            message.push('\n');
+            message.push_str(&note);
+        }
+        message
+    })
+}
+
+/// `app_key` names the app as soon as it is known: the model's name first, the
+/// resolved bundle ID once resolution succeeds.
+fn prepare(
+    invocation: &mut ToolInvocation,
+    config: &RunConfig,
+    service: &ComputerUseService,
+    app_key: &mut Option<String>,
 ) -> Result<(), String> {
     ensure_visible(config, 0, Some(service))?;
     let arguments = serde_json::from_str(
@@ -26,6 +77,7 @@ pub(crate) fn prepare_invocation(
     )
     .map_err(|error| error.to_string())?;
     let call = ComputerCall::parse(&arguments)?;
+    *app_key = call.app().map(str::to_owned).or(app_key.take());
     if config.approval_mode == ApprovalMode::Plan
         && !matches!(call, ComputerCall::ListApps | ComputerCall::Observe { .. })
     {
@@ -73,6 +125,7 @@ pub(crate) fn prepare_invocation(
         Err(CallError::Disconnected) => return Err("Computer-use driver disconnected".into()),
         Ok(_) => return Err("Computer-use driver did not reply to resolve_app".into()),
     };
+    *app_key = Some(app.bundle_id.clone());
     let warning = match risk_tier(
         &app.bundle_id,
         app.category.as_deref(),
@@ -555,6 +608,7 @@ mod tests {
             orca_computer_use::protocol::WindowInfo {
                 id: 2,
                 title: "B".into(),
+                minimized: false,
             },
         );
         let (service, mut invocation) = setup(

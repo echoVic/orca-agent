@@ -287,16 +287,64 @@ impl MacDriver {
             .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
         let application = AxElement::application(pid)?;
         let windows = capture::windows()?;
-        let (ax_window, window) = resolve_window(&application, pid, &windows, params.window)
-            .map_err(|failure| {
-                if failure.kind == ErrorKind::WindowNotFound {
-                    stale()
-                } else {
-                    failure
+        if params.window.is_none() && !super::app_has_window(&application)? {
+            let Action::Key { keys, target: None } = &params.action else {
+                return Err(error(
+                    ErrorKind::WindowNotFound,
+                    crate::messages::no_window(&app.name),
+                ));
+            };
+            let stroke = parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
+            if !stroke.is_app_shortcut() {
+                return Err(error(
+                    ErrorKind::WindowNotFound,
+                    crate::messages::no_window(&app.name),
+                ));
+            }
+            if !params.foreground_fallback {
+                return Err(error(
+                    ErrorKind::NeedsForeground,
+                    "A shortcut for an app without a window needs the foreground; the foreground fallback is turned off",
+                ));
+            }
+            let note = foreground::run_app_shortcut(
+                &application,
+                &app.name,
+                stroke,
+                &self.aborted,
+                action_deadline,
+            )?;
+            let mut outcome = ActOutcome {
+                foreground_used: true,
+                note: Some(note),
+                scroll_position: None,
+                observation: None,
+            };
+            if params.observe_after {
+                // Cmd+N usually opens a window; show it, or say none appeared.
+                match self.observe(ObserveParams {
+                    app: params.app,
+                    window: None,
+                    query: None,
+                    max_elements: 300,
+                    include_screenshot: params.include_screenshot,
+                }) {
+                    Ok(observation) => outcome.observation = Some(observation),
+                    Err(_) => {
+                        let note = outcome.note.get_or_insert_with(String::new);
+                        note.push_str("; no window appeared yet; observe again");
+                    }
                 }
-            })?;
+            }
+            return Ok(outcome);
+        }
+        let (ax_window, window) =
+            resolve_window(&application, pid, &app.name, &windows, params.window)?;
         let id = window.id;
-        let table = self.element_tables.get(&(pid, id)).ok_or_else(stale)?;
+        let table = self
+            .element_tables
+            .get(&(pid, id))
+            .ok_or_else(|| error(ErrorKind::Stale, crate::messages::not_observed(id)))?;
         let frame = ax_window.position_size()?;
         if !frame
             .into_iter()
@@ -511,6 +559,15 @@ impl MacDriver {
                     note.push_str(
                         "The window was minimized again after the action; observe again.",
                     );
+                }
+                // The action was delivered: a failure here must not look like
+                // one, or the caller could send it again.
+                Err(failure) if failure.kind == ErrorKind::WindowNotFound => {
+                    let note = outcome.note.get_or_insert_with(String::new);
+                    if !note.is_empty() {
+                        note.push_str("; ");
+                    }
+                    note.push_str(crate::messages::WINDOW_UNUSABLE_AFTER_ACTION);
                 }
                 Err(failure) => return Err(failure),
             }

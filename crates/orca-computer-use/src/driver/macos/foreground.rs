@@ -17,7 +17,7 @@ use super::{
     events::HidEvents,
     tree::{self, ElementTable, SecurityScan},
 };
-use crate::keys::parse_combo;
+use crate::keys::{KeyStroke, parse_combo};
 use crate::protocol::{ActParams, Action, Button, DriverError, ErrorKind, Target};
 
 pub(super) fn check_abort(aborted: &AtomicBool) -> Result<(), DriverError> {
@@ -180,16 +180,8 @@ fn foreground_type_selection_is_preserved_only_with_original_and_current_focus()
     assert!(!preserve_foreground_type_selection(false, false));
 }
 
-pub(super) fn run(
-    type_target_was_focused: bool,
-    application: &AxElement,
-    window: &AxElement,
-    table: &ElementTable,
-    params: &ActParams,
-    aborted: &AtomicBool,
-    action_deadline: Instant,
-) -> Result<String, DriverError> {
-    let pid = application.pid()?;
+/// Waits until the user has been idle for half a second, within the action's deadline.
+fn wait_for_user_idle(aborted: &AtomicBool, action_deadline: Instant) -> Result<(), DriverError> {
     let deadline = (Instant::now() + crate::timing::IDLE_WAIT_LIMIT).min(action_deadline);
     loop {
         check_abort(aborted)?;
@@ -204,7 +196,7 @@ pub(super) fn run(
             CGEventType(u32::MAX),
         ) >= 0.5
         {
-            break;
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(error(
@@ -214,6 +206,69 @@ pub(super) fn run(
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Sends an app-level shortcut (Cmd+N while only a system Open panel shows) to
+/// an app with no window, then restores the previous app and pointer.
+pub(super) fn run_app_shortcut(
+    application: &AxElement,
+    app_name: &str,
+    stroke: KeyStroke,
+    aborted: &AtomicBool,
+    action_deadline: Instant,
+) -> Result<String, DriverError> {
+    let pid = application.pid()?;
+    wait_for_user_idle(aborted, action_deadline)?;
+    let old = NSWorkspace::new()
+        .frontmostApplication()
+        .ok_or_else(|| error(ErrorKind::Failed, "Could not read the frontmost app"))?;
+    let name = old
+        .localizedName()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| old.processIdentifier().to_string());
+    let pointer_event =
+        CGEvent::new(None).ok_or_else(|| error(ErrorKind::Failed, "Could not read the pointer"))?;
+    let mut restore = Restore {
+        application: old,
+        pointer: CGEvent::location(Some(&pointer_event)),
+        restored: false,
+        minimized_window: None,
+    };
+    let result = (|| {
+        check_abort(aborted)?;
+        let target = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
+        activate(&target, crate::timing::ACTIVATION_WAIT_LIMIT)?;
+        check_abort(aborted)?;
+        thread::sleep(crate::timing::ACTIVATION_SETTLE);
+        check_abort(aborted)?;
+        // A window that appeared meanwhile has an unobserved focus: observe it first.
+        if super::app_has_window(application)? {
+            return Err(error(
+                ErrorKind::Stale,
+                format!("{app_name} now has a window; observe it before sending keys"),
+            ));
+        }
+        let mut hid = HidEvents::new_until(pid, aborted, action_deadline)?;
+        let sent = hid.key(stroke);
+        hid.release();
+        sent
+    })();
+    let restored = restore.finish();
+    finish_foreground(result, restored, &name)
+}
+
+pub(super) fn run(
+    type_target_was_focused: bool,
+    application: &AxElement,
+    window: &AxElement,
+    table: &ElementTable,
+    params: &ActParams,
+    aborted: &AtomicBool,
+    action_deadline: Instant,
+) -> Result<String, DriverError> {
+    let pid = application.pid()?;
+    wait_for_user_idle(aborted, action_deadline)?;
     // The user may have moved the window while we waited for idle.
     check_window(window, table)?;
     let enters_text = match &params.action {
@@ -265,6 +320,7 @@ pub(super) fn run(
             .then(|| window.clone()),
     };
     let mut unfocused_key = false;
+    let mut raise_note: Option<&'static str> = None;
     let result = (|| {
         check_abort(aborted)?;
         let target = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
@@ -274,7 +330,16 @@ pub(super) fn run(
         }
         activate(&target, crate::timing::ACTIVATION_WAIT_LIMIT)?;
         check_abort(aborted)?;
-        window.perform("AXRaise")?;
+        let app_name = target
+            .localizedName()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| pid.to_string());
+        raise_note = raise_with_fallback(
+            || window.perform("AXRaise"),
+            || window_in_front(window, application),
+            || thread::sleep(Duration::from_millis(150)),
+            &app_name,
+        )?;
         check_abort(aborted)?;
         // Activation/raise can precede AppKit's key-window transition.
         // Keep this pause short and check abort again before any HID post.
@@ -431,12 +496,70 @@ pub(super) fn run(
     let restored = restore.finish();
     // Preserve successful delivery, and disclose any restoration failure.
     finish_foreground(result, restored, &name).map(|note| {
-        if unfocused_key {
+        let note = if unfocused_key {
             format!("{note}; sent key to an app that reports no focused element")
         } else {
             note
+        };
+        match raise_note {
+            Some(raise) => format!("{note}; {raise}"),
+            None => note,
         }
     })
+}
+
+pub(super) const ALREADY_IN_FRONT: &str = "window already in front (raise unsupported)";
+
+/// System Settings refuses AXRaise (-25205) even for its frontmost window. A
+/// failed raise is acceptable only for a window that is already in front;
+/// otherwise retry once, then fail. Every later foreground check still runs.
+pub(super) fn raise_with_fallback(
+    mut raise: impl FnMut() -> Result<(), DriverError>,
+    mut in_front: impl FnMut() -> bool,
+    mut pause: impl FnMut(),
+    app_name: &str,
+) -> Result<Option<&'static str>, DriverError> {
+    match raise() {
+        Ok(()) => return Ok(None),
+        Err(failure) if failure.kind == ErrorKind::Stale => return Err(failure),
+        Err(_) => {}
+    }
+    if in_front() {
+        return Ok(Some(ALREADY_IN_FRONT));
+    }
+    pause();
+    let failure = match raise() {
+        Ok(()) => return Ok(None),
+        Err(retry) if retry.kind == ErrorKind::Stale => return Err(retry),
+        Err(retry) => retry,
+    };
+    if in_front() {
+        return Ok(Some(ALREADY_IN_FRONT));
+    }
+    Err(error(
+        ErrorKind::Failed,
+        format!(
+            "Could not bring {app_name}'s window to the front ({}). Call observe again; if it keeps failing, tell the user.",
+            failure.message.trim_start_matches("Accessibility ")
+        ),
+    ))
+}
+
+/// Only the focused window counts as in front: a main window can sit behind a
+/// focused dialog of the same app, which would then receive the input.
+fn accepts_unraised(_is_main: bool, is_focused: bool) -> bool {
+    is_focused
+}
+
+fn window_in_front(window: &AxElement, application: &AxElement) -> bool {
+    accepts_unraised(
+        window.attribute_bool("AXMain").ok().flatten() == Some(true),
+        application
+            .attribute_element("AXFocusedWindow")
+            .ok()
+            .flatten()
+            .is_some_and(|focused| focused == *window),
+    )
 }
 fn finish_foreground(
     result: Result<(), DriverError>,
@@ -615,4 +738,111 @@ pub fn test_element_click_point(
     let element = AxElement::from_owned(element)?;
     let window = AxElement::from_owned(window)?;
     element_click_point(&element, &window)
+}
+
+#[cfg(test)]
+mod raise_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn failed() -> Result<(), DriverError> {
+        Err(error(
+            ErrorKind::Failed,
+            "Accessibility AXRaise failed: AXError(-25205)",
+        ))
+    }
+
+    #[test]
+    fn a_main_window_behind_a_focused_dialog_is_not_in_front() {
+        // Same-app dialog B is focused over observed main window A: input would reach B.
+        assert!(!accepts_unraised(true, false));
+        assert!(accepts_unraised(false, true));
+        assert!(accepts_unraised(true, true));
+    }
+
+    #[test]
+    fn a_raised_window_needs_no_fallback() {
+        let raises = Cell::new(0);
+        let note = raise_with_fallback(
+            || {
+                raises.set(raises.get() + 1);
+                Ok(())
+            },
+            || false,
+            || {},
+            "System Settings",
+        )
+        .unwrap();
+        assert_eq!((note, raises.get()), (None, 1));
+    }
+
+    #[test]
+    fn an_unsupported_raise_is_fine_for_a_window_already_in_front() {
+        let raises = Cell::new(0);
+        let note = raise_with_fallback(
+            || {
+                raises.set(raises.get() + 1);
+                failed()
+            },
+            || true,
+            || {},
+            "System Settings",
+        )
+        .unwrap();
+        assert_eq!((note, raises.get()), (Some(ALREADY_IN_FRONT), 1));
+    }
+
+    #[test]
+    fn a_failed_raise_is_retried_once_after_a_pause() {
+        let raises = Cell::new(0);
+        let paused = Cell::new(false);
+        let note = raise_with_fallback(
+            || {
+                raises.set(raises.get() + 1);
+                if raises.get() == 1 { failed() } else { Ok(()) }
+            },
+            || false,
+            || paused.set(true),
+            "System Settings",
+        )
+        .unwrap();
+        assert_eq!((note, raises.get(), paused.get()), (None, 2, true));
+    }
+
+    #[test]
+    fn two_failed_raises_fail_unless_the_window_reached_the_front() {
+        let checks = Cell::new(0);
+        let note = raise_with_fallback(
+            failed,
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() == 2
+            },
+            || {},
+            "System Settings",
+        )
+        .unwrap();
+        assert_eq!(note, Some(ALREADY_IN_FRONT));
+        let error = raise_with_fallback(failed, || false, || {}, "System Settings").unwrap_err();
+        assert_eq!(
+            error.message,
+            "Could not bring System Settings's window to the front (AXRaise failed: AXError(-25205)). Call observe again; if it keeps failing, tell the user."
+        );
+    }
+
+    #[test]
+    fn a_stale_window_is_not_retried() {
+        let raises = Cell::new(0);
+        let error = raise_with_fallback(
+            || {
+                raises.set(raises.get() + 1);
+                Err(actions::stale())
+            },
+            || true,
+            || {},
+            "System Settings",
+        )
+        .unwrap_err();
+        assert_eq!((error.kind, raises.get()), (ErrorKind::Stale, 1));
+    }
 }

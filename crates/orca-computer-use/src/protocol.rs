@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RequestLine {
@@ -167,10 +167,14 @@ pub struct AppInfo {
     pub windows: Vec<WindowInfo>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct WindowInfo {
     pub id: u32,
     pub title: String,
+    /// A minimized window is listed so the model knows it is off screen; acting
+    /// on it restores it as before.
+    #[serde(default)]
+    pub minimized: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -288,8 +292,21 @@ mod tests {
     }
 
     #[test]
+    fn window_info_from_an_older_driver_reads_as_not_minimized() {
+        let window: WindowInfo = serde_json::from_str(r#"{"id":7,"title":"Doc"}"#).unwrap();
+        assert_eq!(
+            window,
+            WindowInfo {
+                id: 7,
+                title: "Doc".into(),
+                minimized: false
+            }
+        );
+    }
+
+    #[test]
     fn every_request_and_action_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION, 2);
         let actions = [
             Action::Click {
                 target: Target::Element { element: 12 },
@@ -353,6 +370,7 @@ mod tests {
             windows: vec![WindowInfo {
                 id: 1,
                 title: "Document".into(),
+                minimized: false,
             }],
         };
         let observation = Observation {

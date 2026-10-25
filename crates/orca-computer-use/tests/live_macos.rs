@@ -58,6 +58,9 @@ fn trials() -> Vec<libtest_mimic::Trial> {
         list_and_resolve_find_the_fixture_by_name_and_bundle_id,
         a_second_driver_finds_the_session_lock_held,
         launch_app_opens_a_file_in_textedit,
+        list_apps_shows_only_windows_observe_can_use,
+        a_shortcut_reaches_textedit_before_it_has_a_window,
+        a_system_settings_click_survives_an_unsupported_raise,
         opening_a_nonexistent_file_in_already_running_textedit_returns_an_error,
         cleanup_only_selects_explicitly_launched_processes,
         cleanup_preserves_an_app_launched_by_another_live_session,
@@ -274,7 +277,7 @@ use objc2_core_graphics::{
     CGEvent, CGEventSource, CGEventSourceStateID, CGEventType, CGWarpMouseCursorPosition,
 };
 use objc2_foundation::NSString;
-use orca_computer_use::client::{DriverClient, HelloInfo};
+use orca_computer_use::client::{CallError, DriverClient, HelloInfo};
 use orca_computer_use::driver::macos::MacDriver;
 use orca_computer_use::inprocess::InProcessLauncher;
 use orca_computer_use::protocol::{
@@ -1148,6 +1151,179 @@ fn launch_app_opens_a_file_in_textedit() {
             !app.windows.is_empty(),
             "TextEdit opened the temporary file"
         );
+    });
+}
+
+fn list_apps_shows_only_windows_observe_can_use() {
+    run_live_test(|| {
+        let Some(live) = Live::start() else {
+            return;
+        };
+        let Reply::Apps { apps } = live
+            .client
+            .call(Request::ListApps, Duration::from_secs(30))
+            .unwrap()
+        else {
+            panic!("expected apps")
+        };
+        // Every listed, non-minimized window of a running app must be observable.
+        for app in apps.iter().filter(|app| app.pid.is_some()) {
+            for window in app.windows.iter().filter(|window| !window.minimized) {
+                let observed = live.client.call(
+                    Request::Observe(ObserveParams {
+                        app: app.bundle_id.clone(),
+                        window: Some(window.id),
+                        query: Some("\u{0}no-match".into()),
+                        max_elements: 1,
+                        include_screenshot: false,
+                    }),
+                    Duration::from_secs(30),
+                );
+                assert!(
+                    !matches!(&observed, Err(CallError::Driver(error)) if error.message.contains("that Orca can use")),
+                    "{} window {} was listed but is not usable: {observed:?}",
+                    app.bundle_id,
+                    window.id
+                );
+            }
+        }
+    });
+}
+
+fn a_shortcut_reaches_textedit_before_it_has_a_window() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        if !bundle_pids("com.apple.TextEdit").is_empty() {
+            eprintln!(
+                "skipped: TextEdit is already running; the test must not touch the user's documents"
+            );
+            return;
+        }
+        let before = bundle_pids("com.apple.TextEdit");
+        let launched = live.client.call(
+            Request::LaunchApp {
+                app: "com.apple.TextEdit".into(),
+                open: vec![],
+            },
+            Duration::from_secs(60),
+        );
+        register_launch_pids(
+            &mut live.launched,
+            &before,
+            &bundle_pids("com.apple.TextEdit"),
+        );
+        let Reply::Launched { app } = launched.unwrap() else {
+            panic!("expected launched")
+        };
+        if !app.windows.is_empty() {
+            eprintln!("skipped: TextEdit opened a window at launch on this Mac");
+            return;
+        }
+        let acted = live.client.call(
+            Request::Act(ActParams {
+                app: "com.apple.TextEdit".into(),
+                window: None,
+                action: Action::Key {
+                    keys: vec!["cmd".into(), "n".into()],
+                    target: None,
+                },
+                foreground_fallback: true,
+                observe_after: true,
+                include_screenshot: false,
+                secure_approved: false,
+            }),
+            Duration::from_secs(30),
+        );
+        let Reply::Acted { outcome } = acted.unwrap() else {
+            panic!("expected acted")
+        };
+        assert!(outcome.foreground_used);
+        assert!(
+            outcome.observation.is_some(),
+            "Cmd+N should open an observable document window"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+fn a_system_settings_click_survives_an_unsupported_raise() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        if !bundle_pids("com.apple.systempreferences").is_empty() {
+            eprintln!(
+                "skipped: System Settings is already open; the test must not change the user's pane"
+            );
+            return;
+        }
+        let before = bundle_pids("com.apple.systempreferences");
+        let launched = live.client.call(
+            Request::LaunchApp {
+                app: "com.apple.systempreferences".into(),
+                open: vec![],
+            },
+            Duration::from_secs(60),
+        );
+        register_launch_pids(
+            &mut live.launched,
+            &before,
+            &bundle_pids("com.apple.systempreferences"),
+        );
+        launched.unwrap();
+        let Reply::Observed { observation } = live
+            .client
+            .call(
+                Request::Observe(ObserveParams {
+                    app: "com.apple.systempreferences".into(),
+                    window: None,
+                    query: Some("General".into()),
+                    max_elements: 50,
+                    include_screenshot: false,
+                }),
+                Duration::from_secs(30),
+            )
+            .unwrap()
+        else {
+            panic!("expected observation")
+        };
+        let general = observation
+            .elements
+            .iter()
+            .find(|element| {
+                element
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label == "General" || label == "通用")
+            })
+            .expect("the sidebar lists General");
+        // A double click always takes the foreground path, which raises the window.
+        let acted = live.client.call(
+            Request::Act(ActParams {
+                app: "com.apple.systempreferences".into(),
+                window: Some(observation.window.id),
+                action: Action::Click {
+                    target: Target::Element {
+                        element: general.id,
+                    },
+                    button: Button::Left,
+                    count: 2,
+                    modifiers: vec![],
+                },
+                foreground_fallback: true,
+                observe_after: false,
+                include_screenshot: false,
+                secure_approved: false,
+            }),
+            Duration::from_secs(30),
+        );
+        assert!(
+            acted.is_ok(),
+            "a foreground click in System Settings must not fail on AXRaise: {acted:?}"
+        );
+        live.assert_frontmost_and_pointer_unchanged();
     });
 }
 

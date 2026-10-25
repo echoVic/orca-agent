@@ -22,6 +22,7 @@ mod foreground;
 mod occlusion;
 mod permissions;
 mod tree;
+mod windows;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -99,7 +100,8 @@ impl MacDriver {
             let _ = application.set_bool("AXManualAccessibility", true);
         }
         let windows = capture::windows()?;
-        let (ax_window, window) = resolve_window(&application, pid, &windows, params.window)?;
+        let (ax_window, window) =
+            resolve_window(&application, pid, &app.name, &windows, params.window)?;
         let window_frame = ax_window.position_size()?;
         if window_frame.iter().any(|v| !v.is_finite())
             || window_frame[2] <= 0.0
@@ -160,6 +162,7 @@ impl MacDriver {
             window: WindowInfo {
                 id: window.id,
                 title: window.title.clone(),
+                minimized: false,
             },
             elements,
             omitted,
@@ -225,7 +228,7 @@ impl DriverHandler for MacDriver {
                 })
             }
             Request::ListApps => Ok(Reply::Apps {
-                apps: apps::list()?,
+                apps: apps::list_verified()?,
             }),
             Request::ResolveApp {
                 app,
@@ -272,64 +275,55 @@ impl DriverHandler for MacDriver {
     }
 }
 
-fn frames_match(ax: [f64; 4], capture: [f64; 4]) -> bool {
+pub(super) fn frames_match(ax: [f64; 4], capture: [f64; 4]) -> bool {
     ax.into_iter()
         .zip(capture)
         .all(|(a, b)| (a - b).abs() <= 2.0)
+}
+
+/// Whether the app shows any window; unreadable AX state fails closed as an error.
+pub(super) fn app_has_window(application: &AxElement) -> Result<bool, DriverError> {
+    Ok(windows::has_window(
+        application.elements("AXWindows")?.len(),
+        application.attribute_element("AXMainWindow")?.is_some(),
+    ))
 }
 
 /// Act and observe resolve the same live window, including apps with no main window.
 fn resolve_window<'a>(
     application: &AxElement,
     pid: i32,
+    app_name: &str,
     windows: &'a [capture::Window],
     id: Option<u32>,
 ) -> Result<(AxElement, &'a capture::Window), DriverError> {
-    let ax_windows = application.elements("AXWindows")?;
-    let resolved = if let Some(id) = id {
-        let window = windows
-            .iter()
-            .find(|w| w.id == id && w.pid == pid)
-            .ok_or_else(|| error(ErrorKind::WindowNotFound, "Window not found for this app"))?;
-        let mut matching = None;
-        for candidate in ax_windows {
-            if frames_match(candidate.position_size()?, window.frame) {
-                matching = Some(candidate);
-                break;
-            }
-        }
+    let mut candidates = application.elements("AXWindows")?;
+    let main = application.attribute_element("AXMainWindow")?;
+    if candidates.is_empty()
+        && let Some(main) = &main
+    {
+        candidates.push(main.clone());
+    }
+    // One unreadable helper window must not block the app, and a hung app
+    // must not hold observe/act past this budget.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let (mut candidates, facts) = windows::gather_facts(candidates, deadline, |candidate, left| {
+        let _ = unsafe { candidate.0.set_messaging_timeout(left.min(2.0)) };
         (
-            matching.ok_or_else(|| {
-                error(
-                    ErrorKind::WindowNotFound,
-                    "No accessibility window matches the capture window",
-                )
-            })?,
-            window,
+            candidate.position_size().ok(),
+            candidate.attribute_string("AXSubrole").ok().flatten(),
+            candidate.attribute_bool("AXMinimized").ok().flatten(),
         )
-    } else {
-        let window = application
-            .attribute_element("AXMainWindow")?
-            .or_else(|| ax_windows.into_iter().next())
-            .ok_or_else(|| {
-                error(
-                    ErrorKind::WindowNotFound,
-                    "The app has no accessibility window",
-                )
-            })?;
-        let frame = window.position_size()?;
-        let capture = windows
-            .iter()
-            .find(|w| w.pid == pid && frames_match(frame, w.frame))
-            .ok_or_else(|| {
-                error(
-                    ErrorKind::WindowNotFound,
-                    "No capture window matches the accessibility window",
-                )
-            })?;
-        (window, capture)
-    };
-    Ok(resolved)
+    });
+    let main_index = main
+        .as_ref()
+        .and_then(|main| candidates.iter().position(|candidate| candidate == main));
+    let (ax_index, capture_index) =
+        windows::choose_window(id, pid, app_name, windows, &facts, main_index)?;
+    let chosen = candidates.swap_remove(ax_index);
+    // The budget may have shortened this handle's timeout; observe/act need the usual one.
+    let _ = unsafe { chosen.0.set_messaging_timeout(2.0) };
+    Ok((chosen, &windows[capture_index]))
 }
 
 #[cfg(test)]

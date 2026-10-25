@@ -171,7 +171,17 @@ def collect(task, native, base, before, evidence, metrics):
     data = {'ax': [], 'windows': [w['id'] for w in windows], 'actions': metrics['actions'], 'answer': metrics['final_answer']}
     for w in windows:
         op = 'buttons' if task['id'] == 'S7' else ('settings' if app == 'com.apple.systempreferences' else 'ax')
-        ax = native.call(op, app, str(w['id']))
+        try:
+            ax = native.call(op, app, str(w['id']))
+        except RuntimeError as error:
+            # Panels and popups are visible windows with no AX window of their
+            # own; they hold no task evidence, so skip them rather than abort.
+            if 'Expected exactly one matching AX window' not in str(error):
+                raise
+            data.setdefault('skipped_windows', []).append(w['id'])
+            # No evidence there, so GUI coverage must not count actions on it either.
+            data['windows'].remove(w['id'])
+            continue
         data['ax'].extend(ax)
         # No screenshots of pre-existing user windows. AX exceptions above are scoped.
         if w['id'] not in original and task['id'] != 'S7' and app != 'com.apple.systempreferences':

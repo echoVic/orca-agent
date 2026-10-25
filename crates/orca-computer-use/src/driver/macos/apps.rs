@@ -13,8 +13,9 @@ use objc2_core_graphics::CGPreflightScreenCaptureAccess;
 use objc2_foundation::{NSArray, NSBundle, NSError, NSString, NSURL};
 use objc2_screen_capture_kit::SCShareableContent;
 
+use super::windows::{AxWindowFacts, CaptureWindowFacts, usable_windows};
 use super::{ax::AxElement, error};
-use crate::protocol::{AppInfo, DriverError, ErrorKind, WindowInfo};
+use crate::protocol::{AppInfo, DriverError, ErrorKind};
 
 fn info_string(bundle: &NSBundle, key: &str) -> Option<String> {
     bundle
@@ -42,7 +43,7 @@ fn running_info(app: &NSRunningApplication) -> Option<AppInfo> {
     })
 }
 
-fn windows(timeout: Duration) -> Result<HashMap<i32, Vec<WindowInfo>>, DriverError> {
+fn windows(timeout: Duration) -> Result<HashMap<i32, Vec<CaptureWindowFacts>>, DriverError> {
     if !CGPreflightScreenCaptureAccess() {
         return Err(error(
             ErrorKind::PermissionMissing,
@@ -59,20 +60,28 @@ fn windows(timeout: Duration) -> Result<HashMap<i32, Vec<WindowInfo>>, DriverErr
                         format!("Could not list windows: {}", failure.localizedDescription()),
                     ))
                 } else if let Some(content) = content.as_ref() {
-                    let mut windows: HashMap<i32, Vec<WindowInfo>> = HashMap::new();
+                    let mut windows: HashMap<i32, Vec<CaptureWindowFacts>> = HashMap::new();
                     for window in content.windows() {
                         if window.windowLayer() == 0
                             && let Some(app) = window.owningApplication()
                         {
+                            let frame = window.frame();
                             windows
                                 .entry(app.processID())
                                 .or_default()
-                                .push(WindowInfo {
+                                .push(CaptureWindowFacts {
                                     id: window.windowID(),
                                     title: window
                                         .title()
                                         .map(|title| title.to_string())
                                         .unwrap_or_default(),
+                                    frame: [
+                                        frame.origin.x,
+                                        frame.origin.y,
+                                        frame.size.width,
+                                        frame.size.height,
+                                    ],
+                                    on_screen: window.isOnScreen(),
                                 });
                         }
                     }
@@ -98,13 +107,18 @@ fn windows(timeout: Duration) -> Result<HashMap<i32, Vec<WindowInfo>>, DriverErr
         .map_err(|_| error(ErrorKind::Failed, "Window listing timed out"))?
 }
 
-fn merge_apps(running: Vec<AppInfo>, mut windows: HashMap<i32, Vec<WindowInfo>>) -> Vec<AppInfo> {
+fn merge_apps(
+    running: Vec<AppInfo>,
+    mut capture: HashMap<i32, Vec<CaptureWindowFacts>>,
+    mut ax_facts: impl FnMut(i32) -> Option<Vec<AxWindowFacts>>,
+) -> Vec<AppInfo> {
     let mut apps: Vec<_> = running
         .into_iter()
         .map(|mut app| {
             app.windows = app
                 .pid
-                .and_then(|pid| windows.remove(&pid))
+                .and_then(|pid| capture.remove(&pid).map(|windows| (pid, windows)))
+                .map(|(pid, windows)| usable_windows(&windows, ax_facts(pid).as_deref()))
                 .unwrap_or_default();
             app
         })
@@ -113,15 +127,72 @@ fn merge_apps(running: Vec<AppInfo>, mut windows: HashMap<i32, Vec<WindowInfo>>)
     apps
 }
 
-fn list_with_timeout(timeout: Duration) -> Result<Vec<AppInfo>, DriverError> {
-    let windows = windows(timeout)?;
+/// The whole listing's accessibility budget, and each app's share of it. An
+/// app that does not answer in time keeps the visible document-sized rule.
+const LIST_AX_BUDGET: Duration = Duration::from_secs(2);
+const APP_AX_TIMEOUT_SECS: f32 = 0.25;
+
+fn list_with_timeout(timeout: Duration, verify_windows: bool) -> Result<Vec<AppInfo>, DriverError> {
+    let capture = windows(timeout)?;
     let running = NSWorkspace::sharedWorkspace()
         .runningApplications()
         .iter()
         .filter(|app| app.activationPolicy() == NSApplicationActivationPolicy::Regular)
         .filter_map(|app| running_info(&app))
         .collect();
-    Ok(merge_apps(running, windows))
+    let ax_deadline = Instant::now() + LIST_AX_BUDGET.min(timeout);
+    Ok(merge_apps(running, capture, |pid| {
+        verify_windows
+            .then(|| ax_window_facts(pid, ax_deadline))
+            .flatten()
+    }))
+}
+
+/// This app's share of what is left of the listing budget; None once it is spent.
+fn share_of(deadline: Instant) -> Option<f32> {
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    (!remaining.is_zero()).then(|| remaining.as_secs_f32().min(APP_AX_TIMEOUT_SECS))
+}
+
+/// Reads windows while the budget lasts; an app that runs out falls back to
+/// the visible document-sized rule (None) instead of extending the listing.
+fn read_within<W>(
+    deadline: Instant,
+    windows: impl IntoIterator<Item = W>,
+    mut read: impl FnMut(W, f32) -> Option<AxWindowFacts>,
+) -> Option<Vec<AxWindowFacts>> {
+    windows
+        .into_iter()
+        .map(|window| read(window, share_of(deadline)?))
+        .collect()
+}
+
+fn with_timeout(element: &AxElement, seconds: f32) -> Option<()> {
+    (unsafe { element.0.set_messaging_timeout(seconds) } == AXError::Success).then_some(())
+}
+
+fn ax_window_facts(pid: i32, deadline: Instant) -> Option<Vec<AxWindowFacts>> {
+    let application = AxElement::application(pid).ok()?;
+    with_timeout(&application, share_of(deadline)?)?;
+    let windows = application.elements("AXWindows").ok()?;
+    read_within(deadline, windows, |window, timeout| {
+        // Every read gets only what is left, so slow answers cannot add up.
+        with_timeout(&window, timeout)?;
+        let frame = window.position_size().ok()?;
+        with_timeout(&window, share_of(deadline)?)?;
+        let subrole = window.attribute_string("AXSubrole").ok().flatten();
+        with_timeout(&window, share_of(deadline)?)?;
+        let minimized = window
+            .attribute_bool("AXMinimized")
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        Some(AxWindowFacts {
+            frame,
+            subrole,
+            minimized,
+        })
+    })
 }
 
 fn wait_for_launch(
@@ -133,8 +204,14 @@ fn wait_for_launch(
         .map_err(|_| error(ErrorKind::Failed, "App launch timed out"))?
 }
 
+/// Resolution only needs identities, so it skips the accessibility check.
 pub(super) fn list() -> Result<Vec<AppInfo>, DriverError> {
-    list_with_timeout(Duration::from_secs(30))
+    list_with_timeout(Duration::from_secs(30), false)
+}
+
+/// What `list_apps` shows the model: windows observe and act can use.
+pub(super) fn list_verified() -> Result<Vec<AppInfo>, DriverError> {
+    list_with_timeout(Duration::from_secs(30), true)
 }
 
 /// Observe/act receive an already approved bundle ID; names cannot widen it.
@@ -647,18 +724,23 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
         if remaining.is_zero() {
             return Err(error(ErrorKind::Failed, "App launch timed out"));
         }
-        if let Some(app) = list_with_timeout(remaining)?.into_iter().find(|candidate| {
-            candidate.bundle_id == app.bundle_id && candidate.pid == Some(launched_pid)
-        }) {
+        if let Some(app) = list_with_timeout(remaining, false)?
+            .into_iter()
+            .find(|candidate| {
+                candidate.bundle_id == app.bundle_id && candidate.pid == Some(launched_pid)
+            })
+        {
             if wait_for_accessibility_window(launched_pid, deadline) {
                 // The first capture listing can precede the now-readable window.
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if !remaining.is_zero()
                     && let Some(refreshed) =
-                        list_with_timeout(remaining)?.into_iter().find(|candidate| {
-                            candidate.pid == Some(launched_pid)
-                                && candidate.bundle_id == app.bundle_id
-                        })
+                        list_with_timeout(remaining, true)?
+                            .into_iter()
+                            .find(|candidate| {
+                                candidate.pid == Some(launched_pid)
+                                    && candidate.bundle_id == app.bundle_id
+                            })
                 {
                     return Ok(refreshed);
                 }
@@ -673,6 +755,7 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::WindowInfo;
 
     fn application_fixture(root: &std::path::Path, folder: &str, id: &str) {
         let contents = root.join(format!("{folder}.app/Contents"));
@@ -1421,15 +1504,18 @@ mod tests {
             category: None,
             windows: vec![],
         };
-        let window = WindowInfo {
+        let facts = CaptureWindowFacts {
             id: 7,
             title: "Visible".into(),
+            frame: [0.0, 0.0, 800.0, 600.0],
+            on_screen: true,
         };
         let mut visible = app.clone();
         visible.pid = Some(43);
         let merged = merge_apps(
             vec![app.clone(), visible],
-            HashMap::from([(43, vec![window.clone()])]),
+            HashMap::from([(43, vec![facts])]),
+            |_| None,
         );
         assert_eq!(merged.iter().find(|info| info.pid == Some(42)), Some(&app));
         assert_eq!(
@@ -1438,8 +1524,89 @@ mod tests {
                 .find(|info| info.pid == Some(43))
                 .unwrap()
                 .windows,
-            vec![window]
+            vec![WindowInfo {
+                id: 7,
+                title: "Visible".into(),
+                minimized: false
+            }]
         );
+    }
+
+    #[test]
+    fn merge_asks_accessibility_only_for_apps_with_capture_windows() {
+        let app = |pid: i32| AppInfo {
+            bundle_id: format!("dev.orca.{pid}"),
+            name: pid.to_string(),
+            pid: Some(pid),
+            category: None,
+            windows: vec![],
+        };
+        let mut asked = vec![];
+        let facts = CaptureWindowFacts {
+            id: 9,
+            title: "Doc".into(),
+            frame: [0.0, 0.0, 800.0, 600.0],
+            on_screen: true,
+        };
+        let merged = merge_apps(
+            vec![app(1), app(2)],
+            HashMap::from([(2, vec![facts])]),
+            |pid| {
+                asked.push(pid);
+                Some(vec![AxWindowFacts {
+                    frame: [0.0, 0.0, 800.0, 600.0],
+                    subrole: Some("AXStandardWindow".into()),
+                    minimized: false,
+                }])
+            },
+        );
+        assert_eq!(asked, vec![2]);
+        assert_eq!(
+            merged
+                .iter()
+                .find(|info| info.pid == Some(2))
+                .unwrap()
+                .windows
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn slow_window_reads_stop_at_the_listing_deadline() {
+        // Five windows whose reads each take 30 ms, with 50 ms left: the app is
+        // abandoned at the deadline instead of finishing all five reads.
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(50);
+        let mut reads = 0;
+        let facts = read_within(deadline, 0..5, |_, timeout| {
+            assert!(timeout <= APP_AX_TIMEOUT_SECS);
+            reads += 1;
+            std::thread::sleep(Duration::from_millis(30));
+            Some(AxWindowFacts {
+                frame: [0.0, 0.0, 800.0, 600.0],
+                subrole: None,
+                minimized: false,
+            })
+        });
+        assert_eq!(facts, None);
+        assert!(reads <= 2, "{reads} reads");
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn ax_window_facts_skip_apps_once_the_listing_budget_is_spent() {
+        // A spent deadline returns before any accessibility call, so a hung app
+        // cannot extend list_apps.
+        let started = Instant::now();
+        assert_eq!(
+            ax_window_facts(
+                std::process::id() as i32,
+                started - Duration::from_millis(1)
+            ),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_millis(50));
     }
 
     #[test]

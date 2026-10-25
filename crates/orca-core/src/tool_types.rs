@@ -886,6 +886,14 @@ impl ToolResult {
         }
     }
 
+    /// Adds a line to a failed result's error; other results are unchanged.
+    pub fn append_error_note(&mut self, note: &str) {
+        if let Some(error) = self.terminal.error.as_mut() {
+            error.push('\n');
+            error.push_str(note);
+        }
+    }
+
     pub fn failed(request: &ToolRequest, error: impl Into<String>, exit_code: Option<i32>) -> Self {
         Self::failed_with_started(request, error, exit_code, ToolInvocationStarted::Unknown)
     }
@@ -1180,6 +1188,23 @@ fn approx_bytes_for_tokens(tokens: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_note_is_appended_only_to_failed_results() {
+        let request = ToolRequest {
+            id: "t".into(),
+            name: ToolName::Computer,
+            action: ActionKind::Computer,
+            target: None,
+            raw_arguments: None,
+        };
+        let mut failed = ToolResult::failed(&request, "AXRaise failed", None);
+        failed.append_error_note("stop now");
+        assert_eq!(failed.error.as_deref(), Some("AXRaise failed\nstop now"));
+        let mut done = ToolResult::completed(&request, "ok".into(), false);
+        done.append_error_note("stop now");
+        assert_eq!(done.error, None);
+    }
 
     #[test]
     fn computer_actions_have_a_builtin_name_and_take_capability_precedence() {

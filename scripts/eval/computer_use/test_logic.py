@@ -171,6 +171,30 @@ class VerifierTests(unittest.TestCase):
         self.assertTrue(evaluate('button', {'ax': [], 'ocr_found': [answer], 'answer': answer})['passed'])
         self.assertFalse(evaluate('button', {'ax': [], 'ocr_found': [], 'answer': answer})['passed'])
 
+    def test_a_task_window_without_an_ax_window_is_skipped_not_fatal(self):
+        from unittest.mock import patch
+        from verify import collect
+        state = {'apps': [{'bundle': 'com.apple.TextEdit', 'pid': 5}],
+                 'windows': [{'id': 10, 'pid': 5, 'layer': 0, 'on_screen': True},
+                             {'id': 11, 'pid': 5, 'layer': 0, 'on_screen': True}]}
+        class Native:
+            def call(self, op, *args):
+                if op == 'state':
+                    return state
+                if args[1] == '11':
+                    raise RuntimeError('Native ax: Expected exactly one matching AX window')
+                return [{'role': 'AXTextArea', 'AXValue': 'one'}]
+        task = {'id': 'M1', 'allowed_apps': ['com.apple.TextEdit'], 'verifier': 'todo'}
+        metrics = {'actions': {}, 'final_answer': '', 'calls': []}
+        with tempfile.TemporaryDirectory() as d, patch('verify.command_value'):
+            base = Path(d); (base / 'out').mkdir(); (base / 'evidence').mkdir()
+            collect(task, Native(), base, {'windows': []}, base / 'evidence', metrics)
+            data = json.loads((base / 'evidence/verification-input.json').read_text())
+        self.assertEqual(data['ax'], [{'role': 'AXTextArea', 'AXValue': 'one'}])
+        self.assertEqual(data['skipped_windows'], [11])
+        # A skipped window holds no evidence, so actions on it cannot count either.
+        self.assertEqual(data['windows'], [10])
+
     def test_calculator_requires_input_not_a_restored_display(self):
         task = {'id': 'S1', 'allowed_apps': ['com.apple.calculator']}
         observe = {'name': 'computer', 'target': 'com.apple.calculator', 'status': 'completed', 'arguments': {'action': 'observe', 'window': 10}}

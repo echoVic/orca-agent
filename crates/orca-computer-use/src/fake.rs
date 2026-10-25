@@ -34,6 +34,8 @@ pub struct FakeDesktop {
     pub turn_active: bool,
     pub last_observe: Option<ObserveParams>,
     pub launch_reply_override: Option<AppInfo>,
+    /// The observation after a delivered action finds the window unusable.
+    pub post_act_observe_fails: bool,
     apps: Vec<FakeApp>,
 }
 
@@ -111,6 +113,7 @@ impl FakeDesktop {
             turn_active: false,
             last_observe: None,
             launch_reply_override: None,
+            post_act_observe_fails: false,
             apps: vec![FakeApp {
                 info: AppInfo {
                     bundle_id: bundle_id.into(),
@@ -124,6 +127,7 @@ impl FakeDesktop {
                         } else {
                             name.into()
                         },
+                        minimized: false,
                     }],
                 },
                 elements,
@@ -135,6 +139,15 @@ impl FakeDesktop {
     }
 
     /// Adds another window to the fixture's app for window-binding tests.
+    /// A running app with no window yet, like TextEdit showing only its Open panel.
+    pub fn with_windowless_app(bundle_id: &str, name: &str) -> Self {
+        let mut desktop = Self::with_app(bundle_id, name);
+        for app in &mut desktop.apps {
+            app.info.windows.clear();
+        }
+        desktop
+    }
+
     pub fn add_window(&mut self, bundle_id: &str, window: WindowInfo) {
         self.apps
             .iter_mut()
@@ -143,6 +156,17 @@ impl FakeDesktop {
             .info
             .windows
             .push(window);
+    }
+
+    /// The user closed every window; the app keeps running.
+    pub fn close_windows(&mut self, bundle_id: &str) {
+        for app in self
+            .apps
+            .iter_mut()
+            .filter(|app| app.info.bundle_id == bundle_id)
+        {
+            app.info.windows.clear();
+        }
     }
 
     pub fn quit_app(&mut self, bundle_id: &str) {
@@ -206,7 +230,7 @@ impl FakeDesktop {
         {
             return Err(error(
                 ErrorKind::WindowNotFound,
-                format!("Window not found: {window}"),
+                crate::messages::not_usable_window(window, &self.apps[index].info.name),
             ));
         }
         Ok(index)
@@ -214,6 +238,12 @@ impl FakeDesktop {
 
     fn observe(&self, params: &ObserveParams) -> Result<Observation, DriverError> {
         let app = &self.apps[self.running_app(&params.app, params.window)?];
+        if params.window.is_none() && app.info.windows.is_empty() {
+            return Err(error(
+                ErrorKind::WindowNotFound,
+                crate::messages::no_window(&app.info.name),
+            ));
+        }
         let mut elements = params.query.as_ref().map_or_else(
             || app.elements.clone(),
             |query| filter_elements(&app.elements, query),
@@ -256,6 +286,41 @@ impl FakeDesktop {
     }
 
     fn act(&mut self, params: ActParams) -> Result<Reply, DriverError> {
+        if params.window.is_none()
+            && let Some(app) = self.apps.iter_mut().find(|app| {
+                app.info.bundle_id == params.app
+                    && app.info.pid.is_some()
+                    && app.info.windows.is_empty()
+            })
+        {
+            let shortcut = match &params.action {
+                Action::Key { keys, target: None } => crate::keys::parse_combo(keys)
+                    .map_err(|message| error(ErrorKind::Failed, message))?
+                    .is_app_shortcut(),
+                _ => false,
+            };
+            if !shortcut {
+                return Err(error(
+                    ErrorKind::WindowNotFound,
+                    crate::messages::no_window(&app.info.name),
+                ));
+            }
+            if !params.foreground_fallback {
+                return Err(error(
+                    ErrorKind::NeedsForeground,
+                    "A shortcut for an app without a window needs the foreground; the foreground fallback is turned off",
+                ));
+            }
+            app.actions += 1;
+            return Ok(Reply::Acted {
+                outcome: ActOutcome {
+                    foreground_used: true,
+                    note: Some("sent to the app, which has no window".into()),
+                    scroll_position: None,
+                    observation: None,
+                },
+            });
+        }
         // Never resolve an action by display name or redirect it to another app.
         let index = self.running_app(&params.app, params.window)?;
         let target = match &params.action {
@@ -360,21 +425,38 @@ impl FakeDesktop {
         }
         app.actions += 1;
         let scroll_position = matches!(params.action, Action::Scroll { .. }).then_some(app.scroll);
+        let mut note = None;
         let observation = if params.observe_after {
-            Some(self.observe(&ObserveParams {
-                app: params.app,
-                window: params.window,
-                query: None,
-                max_elements: 300,
-                include_screenshot: params.include_screenshot,
-            })?)
+            let observed = if self.post_act_observe_fails {
+                Err(error(
+                    ErrorKind::WindowNotFound,
+                    crate::messages::not_usable_window(params.window.unwrap_or(0), &params.app),
+                ))
+            } else {
+                self.observe(&ObserveParams {
+                    app: params.app,
+                    window: params.window,
+                    query: None,
+                    max_elements: 300,
+                    include_screenshot: params.include_screenshot,
+                })
+            };
+            match observed {
+                Ok(observation) => Some(observation),
+                // As in the driver: the action happened, so report it, not a failure.
+                Err(failure) if failure.kind == ErrorKind::WindowNotFound => {
+                    note = Some(crate::messages::WINDOW_UNUSABLE_AFTER_ACTION.to_string());
+                    None
+                }
+                Err(failure) => return Err(failure),
+            }
         } else {
             None
         };
         Ok(Reply::Acted {
             outcome: ActOutcome {
                 foreground_used: self.background_fails,
-                note: None,
+                note,
                 scroll_position,
                 observation,
             },
@@ -543,6 +625,56 @@ mod regression_tests {
     use super::*;
 
     #[test]
+    fn a_windowless_app_accepts_only_an_app_shortcut_without_a_window() {
+        let mut desktop = FakeDesktop::with_windowless_app("com.apple.TextEdit", "TextEdit");
+        let key = |keys: &[&str], window| ActParams {
+            app: "com.apple.TextEdit".into(),
+            window,
+            action: Action::Key {
+                keys: keys.iter().map(|k| k.to_string()).collect(),
+                target: None,
+            },
+            foreground_fallback: true,
+            observe_after: false,
+            include_screenshot: false,
+            secure_approved: false,
+        };
+        let Ok(Reply::Acted { outcome }) = desktop.act(key(&["cmd", "n"], None)) else {
+            panic!("cmd+n should reach a windowless app")
+        };
+        assert!(outcome.foreground_used);
+        let error = desktop.act(key(&["a"], None)).unwrap_err();
+        assert_eq!(error.message, crate::messages::no_window("TextEdit"));
+        let mut off = key(&["cmd", "n"], None);
+        off.foreground_fallback = false;
+        assert_eq!(
+            desktop.act(off).unwrap_err().kind,
+            ErrorKind::NeedsForeground
+        );
+    }
+
+    #[test]
+    fn fake_window_errors_use_the_shared_messages() {
+        let mut desktop = FakeDesktop::with_textedit();
+        let observe = |window| ObserveParams {
+            app: "com.apple.TextEdit".into(),
+            window,
+            query: None,
+            max_elements: 10,
+            include_screenshot: false,
+        };
+        let error = desktop.observe(&observe(Some(999))).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::WindowNotFound);
+        assert_eq!(
+            error.message,
+            crate::messages::not_usable_window(999, "TextEdit")
+        );
+        desktop.apps[0].info.windows.clear();
+        let error = desktop.observe(&observe(None)).unwrap_err();
+        assert_eq!(error.message, crate::messages::no_window("TextEdit"));
+    }
+
+    #[test]
     fn secure_fields_gate_text_keys_but_not_tab() {
         for (keys, approval_needed) in [
             (vec!["p"], true),
@@ -578,6 +710,7 @@ mod regression_tests {
             WindowInfo {
                 id: 2,
                 title: "B".into(),
+                minimized: false,
             },
         );
         let observation = desktop

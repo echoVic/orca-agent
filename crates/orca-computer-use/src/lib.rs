@@ -11,6 +11,7 @@ pub mod geometry;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod inprocess;
 pub mod keys;
+pub mod messages;
 pub mod observation;
 pub mod protocol;
 pub mod serve;

@@ -1055,7 +1055,19 @@ impl ToolExecutionActor {
         let mut invocation =
             prepare_tool_invocation(tool_request, subagent_depth, mcp_registry, config);
         let failure = match validate_tool_invocation(&invocation, mcp_registry, config) {
-            Err(error) => Some(error.into_result()),
+            Err(error) => {
+                let mut result = error.into_result();
+                if invocation.effective.name == tool_types::ToolName::Computer
+                    && let Some(stores) = extension_stores
+                {
+                    crate::computer_use::budget::FailureBudget::for_turn(stores.turn_store())
+                        .note_invalid_call(
+                            invocation.effective.raw_arguments.as_deref(),
+                            &mut result,
+                        );
+                }
+                Some(result)
+            }
             Ok(()) if invocation.effective.name == tool_types::ToolName::Computer => {
                 let thread_store = extension_stores
                     .map(|stores| stores.thread_store())
@@ -1069,10 +1081,14 @@ impl ToolExecutionActor {
                 )
                 .and_then(|()| crate::computer_use::service(thread_store, cwd, config))
                 .and_then(|service| {
-                    crate::computer_use::prepare::prepare_invocation(
+                    let budget = extension_stores.map(|stores| {
+                        crate::computer_use::budget::FailureBudget::for_turn(stores.turn_store())
+                    });
+                    crate::computer_use::prepare::prepare_invocation_with_budget(
                         &mut invocation,
                         config,
                         &service,
+                        budget.as_deref(),
                     )
                 })
                 .and_then(|()| {

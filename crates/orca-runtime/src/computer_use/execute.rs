@@ -12,8 +12,9 @@ use orca_core::config::RunConfig;
 use orca_core::conversation::ImageInput;
 use orca_core::model::{FLASH_MODEL, accepts_tool_images};
 use orca_core::tool_images::tool_image;
-use orca_core::tool_types::{ToolRequest, ToolResult};
+use orca_core::tool_types::{ToolRequest, ToolResult, ToolStatus};
 
+use super::budget::FailureBudget;
 use super::{ComputerUseService, service, turn::begin_turn};
 use crate::extension::RuntimeExtensionStores;
 
@@ -55,6 +56,45 @@ fn execute_with_timeout(
     cancel: &CancelToken,
     timeout: Duration,
 ) -> ToolResult {
+    let target = request.target.as_deref().unwrap_or_default();
+    let app = target.strip_suffix("#secure").unwrap_or(target);
+    // list_apps has no app; every other call counts toward its app's budget.
+    let budget = (!app.is_empty()).then(|| FailureBudget::for_turn(stores.turn_store()));
+    if let Some(stop) = budget.as_ref().and_then(|budget| budget.stopped(app)) {
+        return ToolResult::failed_before_start(request, stop, None);
+    }
+    let mut result = run_call(
+        request,
+        config,
+        subagent_depth,
+        stores,
+        cwd,
+        cancel,
+        timeout,
+    );
+    let failed = match result.status {
+        ToolStatus::Failed => Some(true),
+        ToolStatus::Completed => Some(false),
+        // A cancellation is the user's, not the app's failure.
+        _ => None,
+    };
+    if let (Some(budget), Some(failed)) = (budget, failed)
+        && let Some(note) = budget.record(app, failed)
+    {
+        result.append_error_note(&note);
+    }
+    result
+}
+
+fn run_call(
+    request: &ToolRequest,
+    config: &RunConfig,
+    subagent_depth: u32,
+    stores: RuntimeExtensionStores<'_>,
+    cwd: &Path,
+    cancel: &CancelToken,
+    timeout: Duration,
+) -> ToolResult {
     let existing_service = stores.thread_store().get::<ComputerUseService>();
     if let Err(error) =
         super::prepare::ensure_visible(config, subagent_depth, existing_service.as_deref())
@@ -86,6 +126,11 @@ fn execute_with_timeout(
     }
     let model = config.model.as_deref().unwrap_or(FLASH_MODEL);
     let include_screenshot = config.model.supports_images(model) && accepts_tool_images(model);
+    // An act without a window inherits the latest observed one.
+    let inherited = match &call {
+        ComputerCall::Act { window: None, .. } => service.latest_window(app),
+        _ => None,
+    };
     let driver_request = match &call {
         ComputerCall::ListApps => Request::ListApps,
         ComputerCall::LaunchApp { open, .. } => Request::LaunchApp {
@@ -111,7 +156,7 @@ fn execute_with_timeout(
             ..
         } => Request::Act(ActParams {
             app: app.into(),
-            window: window.or_else(|| service.latest_window(app)),
+            window: window.or(inherited),
             action: action.clone(),
             foreground_fallback: config.computer_use.foreground_fallback,
             observe_after: *observe_after,
@@ -123,7 +168,22 @@ fn execute_with_timeout(
     if cancel.is_cancelled() {
         return ToolResult::cancelled_before_start(request, "the turn was cancelled");
     }
-    let reply = service.call(driver_request, timeout);
+    let retry = inherited.map(|_| match &driver_request {
+        Request::Act(params) => Request::Act(ActParams {
+            window: None,
+            ..params.clone()
+        }),
+        other => other.clone(),
+    });
+    let mut reply = service.call(driver_request, timeout);
+    // The inherited window is gone (the app's last window closed): forget it
+    // and let the driver choose, which also reaches app-level shortcuts.
+    if let (Some(retry), Err(CallError::Driver(error))) = (retry, &reply)
+        && error.kind == ErrorKind::WindowNotFound
+    {
+        service.forget_window(app);
+        reply = service.call(retry, timeout);
+    }
     // An app's first result this session carries its risk warning, whatever
     // the outcome, so calls approved without a panel (full-auto, rules,
     // session grants) show it too.
@@ -203,6 +263,10 @@ fn execute_with_timeout(
             }
             let app = launched;
             let mut text = format!("launched {} ({})", app.name, app.bundle_id);
+            if app.windows.is_empty() {
+                text.push_str("; no window yet. ");
+                text.push_str(orca_computer_use::messages::NO_WINDOW_NEXT_STEP);
+            }
             append_windows(&mut text, &app);
             text
         }
@@ -256,6 +320,9 @@ fn app_line(app: &AppInfo) -> String {
 fn append_windows(text: &mut String, app: &AppInfo) {
     for window in &app.windows {
         text.push_str(&format!("\n  window {}: \"{}\"", window.id, window.title));
+        if window.minimized {
+            text.push_str(" (minimized)");
+        }
     }
 }
 
@@ -466,6 +533,355 @@ mod tests {
         assert_eq!(results[1].status, ToolStatus::Completed);
         let output = results[1].output.as_deref().unwrap();
         assert!(!output.contains("warning:"), "{output}");
+    }
+
+    fn run_turn_call(
+        thread_store: &ExtensionData,
+        turn_store: &ExtensionData,
+        args: Value,
+        cancel: &CancelToken,
+    ) -> ToolResult {
+        let service = thread_store.get::<ComputerUseService>().unwrap();
+        let budget = crate::computer_use::budget::FailureBudget::for_turn(turn_store);
+        let call = request(args, None);
+        let mut invocation = crate::tool_invocation::ToolInvocation {
+            requested: call.clone(),
+            effective: call,
+            action: Some(ActionKind::Computer),
+            approval_preview: None,
+        };
+        if let Err(error) = crate::computer_use::prepare::prepare_invocation_with_budget(
+            &mut invocation,
+            &flash_config(),
+            &service,
+            Some(&budget),
+        ) {
+            return ToolResult::failed_before_start(&invocation.effective, error, None);
+        }
+        execute(
+            &invocation.effective,
+            &flash_config(),
+            0,
+            RuntimeExtensionStores::new(thread_store, turn_store),
+            Path::new("/"),
+            cancel,
+        )
+    }
+
+    #[test]
+    fn a_stopped_app_is_refused_without_reaching_the_driver_until_the_next_turn() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let bad_click = json!({"action":"click", "app":"TextEdit", "target":{"element":999}});
+        let turn = ExtensionData::new("turn-1");
+        let results: Vec<_> = (0..6)
+            .map(|_| run_turn_call(&thread_store, &turn, bad_click.clone(), &CancelToken::new()))
+            .collect();
+        assert!(
+            results[2]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("has failed 3 times in a row"),
+            "{:?}",
+            results[2].error
+        );
+        assert!(
+            results[5]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Orca stopped computer use on com.apple.TextEdit"),
+            "{:?}",
+            results[5].error
+        );
+        let actions_before = launcher.desktop(|desktop| desktop.actions_on("com.apple.TextEdit"));
+        // A click that would succeed: if it reached the driver, the action count would grow.
+        let good_click = json!({"action":"click", "app":"TextEdit", "target":{"element":1}});
+        let refused = run_turn_call(&thread_store, &turn, good_click, &CancelToken::new());
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Orca stopped computer use"),
+            "{:?}",
+            refused.error
+        );
+        assert_eq!(
+            launcher.desktop(|desktop| desktop.actions_on("com.apple.TextEdit")),
+            actions_before
+        );
+        drop(turn);
+        let next = ExtensionData::new("turn-2");
+        let observed = run_turn_call(
+            &thread_store,
+            &next,
+            json!({"action":"observe", "app":"TextEdit"}),
+            &CancelToken::new(),
+        );
+        assert_eq!(observed.status, ToolStatus::Completed);
+    }
+
+    #[test]
+    fn budget_counts_each_app_separately_and_ignores_cancellation() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit_and_calculator());
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let turn = ExtensionData::new("turn");
+        let bad = |app: &str| json!({"action":"click", "app":app, "target":{"element":999}});
+        for _ in 0..2 {
+            run_turn_call(&thread_store, &turn, bad("TextEdit"), &CancelToken::new());
+            run_turn_call(&thread_store, &turn, bad("Calculator"), &CancelToken::new());
+        }
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        let skipped = run_turn_call(&thread_store, &turn, bad("TextEdit"), &cancelled);
+        assert_eq!(skipped.status, ToolStatus::Cancelled);
+        let third = run_turn_call(&thread_store, &turn, bad("TextEdit"), &CancelToken::new());
+        assert!(
+            third
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("com.apple.TextEdit has failed 3 times"),
+            "{:?}",
+            third.error
+        );
+    }
+
+    #[test]
+    fn a_failure_before_the_app_resolves_counts_under_the_name_the_model_used() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let turn = ExtensionData::new("turn");
+        let missing = json!({"action":"observe", "app":"TextEditt"});
+        let results: Vec<_> = (0..3)
+            .map(|_| run_turn_call(&thread_store, &turn, missing.clone(), &CancelToken::new()))
+            .collect();
+        assert!(
+            results[2]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("TextEditt has failed 3 times"),
+            "{:?}",
+            results[2].error
+        );
+    }
+
+    #[test]
+    fn a_call_that_fails_validation_counts_under_the_app_it_names() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let turn = ExtensionData::new("turn");
+        // list_apps takes no app: ComputerCall::parse refuses it before resolution.
+        let invalid = json!({"action":"list_apps", "app":"TextEdit"});
+        let results: Vec<_> = (0..3)
+            .map(|_| run_turn_call(&thread_store, &turn, invalid.clone(), &CancelToken::new()))
+            .collect();
+        assert!(
+            results[2]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("TextEdit has failed 3 times"),
+            "{:?}",
+            results[2].error
+        );
+    }
+
+    #[test]
+    fn a_stopped_app_is_refused_before_the_driver_resolves_it() {
+        let (started, requests) = std::sync::mpsc::channel();
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.request_started = Some(started);
+        let launcher = FakeLauncher::new(desktop);
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let turn = ExtensionData::new("turn");
+        let bad_click = json!({"action":"click", "app":"TextEdit", "target":{"element":999}});
+        for _ in 0..6 {
+            run_turn_call(&thread_store, &turn, bad_click.clone(), &CancelToken::new());
+        }
+        while requests.try_recv().is_ok() {}
+        let refused = run_turn_call(
+            &thread_store,
+            &turn,
+            json!({"action":"observe", "app":"TextEdit"}),
+            &CancelToken::new(),
+        );
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Orca stopped computer use on TextEdit"),
+            "{:?}",
+            refused.error
+        );
+        let sent: Vec<_> = requests.try_iter().collect();
+        assert!(sent.is_empty(), "the driver saw {sent:?}");
+    }
+
+    #[test]
+    fn a_delivered_action_is_not_repeated_when_its_window_is_unusable_afterwards() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let stores = RuntimeExtensionStores::new(&thread_store, &turn_store);
+        let observed = execute(
+            &observe_request("com.apple.TextEdit"),
+            &flash_config(),
+            0,
+            stores,
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            observed.status,
+            ToolStatus::Completed,
+            "{:?}",
+            observed.error
+        );
+        launcher.desktop(|desktop| desktop.post_act_observe_fails = true);
+        // The click inherits the observed window and lands; only the follow-up observation fails.
+        let clicked = execute(
+            &request(
+                json!({"action":"click", "app":"TextEdit", "target":{"element":1}}),
+                Some("com.apple.TextEdit"),
+            ),
+            &flash_config(),
+            0,
+            stores,
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            launcher.desktop(|desktop| desktop.actions_on("com.apple.TextEdit")),
+            1,
+            "the click must not be sent twice"
+        );
+        assert_eq!(clicked.status, ToolStatus::Completed, "{:?}", clicked.error);
+        assert!(
+            clicked
+                .output
+                .as_deref()
+                .unwrap()
+                .contains(orca_computer_use::messages::WINDOW_UNUSABLE_AFTER_ACTION),
+            "{:?}",
+            clicked.output
+        );
+    }
+
+    #[test]
+    fn a_shortcut_after_the_last_window_closed_reaches_the_app() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_textedit());
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let stores = RuntimeExtensionStores::new(&thread_store, &turn_store);
+        let observed = execute(
+            &observe_request("com.apple.TextEdit"),
+            &flash_config(),
+            0,
+            stores,
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            observed.status,
+            ToolStatus::Completed,
+            "{:?}",
+            observed.error
+        );
+        launcher.desktop(|desktop| desktop.close_windows("com.apple.TextEdit"));
+        // The model omits window; the observed window it would inherit is gone.
+        let shortcut = execute(
+            &request(
+                json!({"action":"key", "app":"TextEdit", "keys":["cmd", "n"]}),
+                Some("com.apple.TextEdit"),
+            ),
+            &flash_config(),
+            0,
+            stores,
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            shortcut.status,
+            ToolStatus::Completed,
+            "{:?}",
+            shortcut.error
+        );
+        assert!(
+            shortcut
+                .output
+                .as_deref()
+                .unwrap()
+                .contains("used the foreground"),
+            "{:?}",
+            shortcut.output
+        );
+    }
+
+    #[test]
+    fn launching_an_app_without_a_window_says_what_to_do_next() {
+        let launcher = FakeLauncher::new(FakeDesktop::with_windowless_app(
+            "com.apple.TextEdit",
+            "TextEdit",
+        ));
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let result = execute(
+            &request(
+                json!({"action":"launch_app", "app":"TextEdit"}),
+                Some("com.apple.TextEdit"),
+            ),
+            &flash_config(),
+            0,
+            RuntimeExtensionStores::new(&thread_store, &turn_store),
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            result.output.as_deref().unwrap(),
+            format!(
+                "launched TextEdit (com.apple.TextEdit); no window yet. {}",
+                orca_computer_use::messages::NO_WINDOW_NEXT_STEP
+            )
+        );
+    }
+
+    #[test]
+    fn list_apps_marks_minimized_windows() {
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.add_window(
+            "com.apple.TextEdit",
+            orca_computer_use::protocol::WindowInfo {
+                id: 812,
+                title: "draft.txt".into(),
+                minimized: true,
+            },
+        );
+        let launcher = FakeLauncher::new(desktop);
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let result = execute(
+            &request(json!({"action":"list_apps"}), None),
+            &flash_config(),
+            0,
+            RuntimeExtensionStores::new(&thread_store, &turn_store),
+            Path::new("/"),
+            &CancelToken::new(),
+        );
+        let output = result.output.as_deref().unwrap();
+        assert!(
+            output.contains("window 812: \"draft.txt\" (minimized)"),
+            "{output}"
+        );
     }
 
     #[test]
@@ -852,6 +1268,9 @@ mod tests {
             json!({"action":"type", "app":"TextEdit", "target":{"element":14}, "text":"secret"}),
             Some("com.apple.TextEdit"),
         );
+        // A new turn: a third failure in a row would carry the failure budget's hint.
+        let next_turn = ExtensionData::new("turn-2");
+        let stores = RuntimeExtensionStores::new(&thread_store, &next_turn);
         let result = execute(&secure, &config, 0, stores, Path::new("/"), &cancel);
         assert_eq!(
             result.error.as_deref(),
@@ -963,6 +1382,7 @@ mod tests {
             orca_computer_use::protocol::WindowInfo {
                 id: 2,
                 title: "B".into(),
+                minimized: false,
             },
         );
         let launcher = FakeLauncher::new(desktop);

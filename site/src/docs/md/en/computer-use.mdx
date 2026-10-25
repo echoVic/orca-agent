@@ -149,6 +149,22 @@ foreground_fallback = false
 Actions that need the foreground, including Command shortcuts, then fail
 instead of switching apps.
 
+## When an app keeps failing
+
+When computer actions on one app fail three times in a row, Orca tells the
+model to stop trying workarounds and report what failed. After six failures
+in a row, Orca stops using that app for the rest of the turn; it is available
+again after your next message. A success resets the count.
+
+`list_apps` shows the windows Orca can observe, checked through Accessibility,
+and marks minimized windows. For an app that does not answer that check in
+time, it lists the app's visible document-sized windows instead, which observe
+may still refuse.
+
+When an app has no window yet (for example, TextEdit showing only its Open
+panel), a Command or Control shortcut such as Cmd+N can be sent to the app
+without a window.
+
 ## Disable computer use
 
 Add a whole-tool deny rule to your user configuration, without a `pattern`.

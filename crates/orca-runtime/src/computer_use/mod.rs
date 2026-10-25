@@ -14,6 +14,7 @@ use orca_core::config::RunConfig;
 
 use crate::extension::ExtensionData;
 
+pub(crate) mod budget;
 pub(crate) mod execute;
 pub(crate) mod prepare;
 pub(crate) mod turn;
@@ -291,6 +292,16 @@ impl ComputerUseService {
             .warned_apps
             .insert(bundle_id.to_owned())
             .then_some(warning)
+    }
+
+    /// Drops a remembered window that no longer exists, so a call without a
+    /// window falls back to the app's own window choice.
+    pub(crate) fn forget_window(&self, bundle_id: &str) {
+        self.state
+            .lock()
+            .expect("computer-use service lock poisoned")
+            .latest_window
+            .remove(bundle_id);
     }
 
     pub(crate) fn latest_window(&self, bundle_id: &str) -> Option<u32> {

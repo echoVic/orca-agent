@@ -24,6 +24,12 @@ impl KeyStroke {
         }
         matches!(self.keycode, 0..=50) && !matches!(self.keycode, 36 | 48)
     }
+
+    /// A shortcut that can go to an app with no window: Command or Control
+    /// combinations that cannot enter text, or Escape.
+    pub fn is_app_shortcut(self) -> bool {
+        !self.enters_text() && (self.modifiers.cmd || self.modifiers.ctrl || self.keycode == 53)
+    }
 }
 
 fn modifier(name: &str) -> Option<Modifiers> {
@@ -175,7 +181,31 @@ pub fn parse_key(name: &str) -> Result<KeyStroke, String> {
     Ok(KeyStroke { keycode, modifiers })
 }
 
+/// Splits "shift+right" or "cmd++" into separate key names; "+" alone is the plus key.
+fn split_combos(keys: &[String]) -> Vec<String> {
+    keys.iter()
+        .flat_map(|key| {
+            if key == "+" || !key.contains('+') {
+                return vec![key.clone()];
+            }
+            let (body, plus) = match key.strip_suffix("++") {
+                Some(body) => (body, true),
+                None => (key.as_str(), false),
+            };
+            let mut parts: Vec<String> = body.split('+').map(str::to_owned).collect();
+            if parts.iter().any(String::is_empty) {
+                return vec![key.clone()];
+            }
+            if plus {
+                parts.push("+".into());
+            }
+            parts
+        })
+        .collect()
+}
+
 pub fn parse_combo(keys: &[String]) -> Result<KeyStroke, String> {
+    let keys = split_combos(keys);
     let (main, prefixes) = keys
         .split_last()
         .ok_or_else(|| "key needs non-empty \"keys\"".to_owned())?;
@@ -186,7 +216,11 @@ pub fn parse_combo(keys: &[String]) -> Result<KeyStroke, String> {
     for name in prefixes {
         parse_key(name)?;
         let flags = modifier(name)
-            .ok_or_else(|| format!("{name:?} must be a modifier before the main key"))?;
+            .ok_or_else(|| {
+                format!(
+                    r#"{name:?} must be a modifier before the main key; "keys" is one shortcut: modifiers first, then one main key, such as ["shift", "right"]. Send it again to press it again."#
+                )
+            })?;
         stroke.modifiers.cmd |= flags.cmd;
         stroke.modifiers.shift |= flags.shift;
         stroke.modifiers.option |= flags.option;
@@ -198,6 +232,48 @@ pub fn parse_combo(keys: &[String]) -> Result<KeyStroke, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn combo(keys: &[&str]) -> KeyStroke {
+        parse_combo(&keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn plus_joined_combos_are_split_and_a_lone_plus_stays_a_key() {
+        let parse =
+            |keys: &[&str]| parse_combo(&keys.iter().map(|k| k.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            parse(&["shift+right"]).unwrap(),
+            parse(&["shift", "right"]).unwrap()
+        );
+        assert_eq!(
+            parse(&["cmd+shift+g"]).unwrap(),
+            parse(&["cmd", "shift", "g"]).unwrap()
+        );
+        assert_eq!(parse(&["cmd++"]).unwrap(), parse(&["cmd", "+"]).unwrap());
+        assert_eq!(parse(&["+"]).unwrap(), parse_key("+").unwrap());
+        assert!(parse(&["++"]).is_err());
+    }
+
+    #[test]
+    fn a_second_main_key_explains_the_shortcut_shape() {
+        let error = parse_combo(&["shift".into(), "right".into(), "right".into()]).unwrap_err();
+        assert_eq!(
+            error,
+            r#""right" must be a modifier before the main key; "keys" is one shortcut: modifiers first, then one main key, such as ["shift", "right"]. Send it again to press it again."#
+        );
+    }
+
+    #[test]
+    fn shortcut_without_a_window_is_only_for_windowless_apps() {
+        assert!(combo(&["cmd", "n"]).is_app_shortcut());
+        assert!(combo(&["ctrl", "a"]).is_app_shortcut());
+        assert!(combo(&["escape"]).is_app_shortcut());
+        // Without an observed focus, nothing that can enter text may be sent.
+        assert!(!combo(&["cmd", "v"]).is_app_shortcut());
+        assert!(!combo(&["a"]).is_app_shortcut());
+        assert!(!combo(&["shift", "right"]).is_app_shortcut());
+        assert!(!combo(&["return"]).is_app_shortcut());
+    }
 
     #[test]
     fn cmd_s_is_keycode_1_with_command() {
