@@ -64,7 +64,7 @@ CLI 选项优先于环境变量、受信任项目配置、用户配置和内置�
 | `1` Allow once | 执行这一次。 |
 | `2` Allow this exact call | 执行，并且之后同一工具、同一目标的调用不再询问。调用没有具体目标时不提供这一项。 |
 | `3` Allow `<tool>` this session | 执行，并且在退出前不再询问这个工具。`computer` 显示为 **Allow all apps this session**（本会话允许所有应用）。 |
-| `4` Deny | 不执行，本轮停下；普通的已有窗口面板除外，Orca 可以继续新开自己的窗口。Computer use 期间 Esc 停止轮次，面板打开时也一样。 |
+| `4` Deny | 不执行，本轮停下；普通的已有窗口面板除外，Orca 可以继续新开自己的窗口。Esc 可能直接停止整轮：本轮已经执行过 computer 调用后，即使这个面板还开着，Orca 的 Esc 监听也会停止这一轮。 |
 | `5` Always allow `<tool>` (saved) | MCP 工具和 computer use 提供。执行，本会话内不再询问这个工具，并把一条允许规则保存到用户配置，之后的会话也不再询问。`computer` 显示为 **Always allow all apps (saved)**（总是允许所有应用），保存的是 `pattern = "*"`。 |
 | `6` Always allow the `<server>` server (saved) | 仅 MCP 工具提供。执行，本会话内该服务器上的所有工具都不再询问，改为保存一条覆盖整个服务器的允许规则。 |
 | `7` Always allow this app (saved) | 仅 computer use 提供。执行，本会话允许该应用，并保存一条精确匹配其 bundle id 的 allow 规则。 |
@@ -78,8 +78,9 @@ all apps (saved) 和 `4` Deny。没有解析出应用目标的 computer 审批
 
 你的已有窗口使用另一组选择：`1` **Allow this window once**（仅这一次）、
 `2` **Allow this window this session**（本会话允许这个窗口）和 `4` **Deny**。
-按 `4`（Deny）会把窗口留给你，本轮继续，Orca 可以新开自己的窗口。
-Computer use 期间 Esc 停止轮次，面板打开时也一样。这里不提供保存或所有应用的选项。
+想保留窗口并让 Orca 继续，请按 `4`（拒绝）。Esc 可能直接停止整轮：本轮已经执行过
+computer 调用后，即使这个面板还开着，Orca 的 Esc 监听也会停止这一轮。
+窗口面板不提供保存或所有应用的选项。
 在 `full-auto` 之外，应用、通配符和整个工具的 allow 规则都不覆盖这些窗口，
 只有精确窗口 allow 才行。`full-auto` 不询问窗口，密码输入的规则见下文。
 归属规则和已知限制见[你的窗口](computer-use.md#你的窗口)。

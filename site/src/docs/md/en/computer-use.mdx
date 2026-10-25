@@ -174,12 +174,14 @@ screenshot (for example, `[1 image attached]`). Press `q` to close the preview.
 
 ## Stop
 
-From the first `computer` call until the turn ends, Orca captures `Esc`
-system-wide. `Esc` interrupts the running turn, including while another app
-is in the foreground or a screenshot preview is open. The driver's system-wide
-listener also stops the turn while a window approval panel is open. Press `4`
-(Deny) to keep the window and let Orca continue with its own; app and
-password-entry denials stop the turn.
+After the first `computer` call has run, Orca captures `Esc` system-wide
+until the turn ends. `Esc` interrupts the running turn, including while
+another app is in the foreground or a screenshot preview is open.
+
+Press `4` (Deny) to keep the window and let Orca continue. Esc can stop the
+whole turn instead: once a computer call has run in the turn, Orca's Esc
+listener stops the turn even while this panel is open. App and password-entry
+denials stop the turn.
 
 ## Background and foreground
 
