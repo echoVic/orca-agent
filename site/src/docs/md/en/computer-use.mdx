@@ -90,13 +90,13 @@ new window opened.
 
 Opening a file or URL with `launch_app` can also land in one of your windows when the app reuses it (a browser may add a tab); the result says so.
 
-Shortcuts that act on every window of an app (Quit, Close All, Minimize All) are refused while your windows are open in it.
+Shortcuts that act on every window of an app (Quit, Close All, Minimize All) are refused while your windows are open in it (`full-auto` does not refuse them).
 
 `list_apps` lists window titles only for apps Orca has used in this session,
 marking yours `(yours)`; for other apps it shows only how many windows they
 have.
 
-Known limits: a window you open while Orca is working on your message counts
+Known limits: a window you open after Orca's first computer-use step for your message counts
 as Orca's, and so do windows an app restores when Orca launches it.
 
 ## App risk levels
