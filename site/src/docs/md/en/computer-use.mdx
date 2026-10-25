@@ -67,7 +67,7 @@ to request approval on retry.
 
 ## Your windows
 
-Windows that were already open when you sent your message are yours, unless
+Windows that were already open before Orca's first computer-use step for your message are yours, unless
 Orca opened them earlier in this session. Before Orca first observes or
 operates one of them, it asks about that window, naming its title:
 
@@ -87,6 +87,10 @@ apps; password entry still asks.
 In apps where Cmd+N does not open a window (Notes, for example, starts a new
 note), it acts in your frontmost window instead, and the result says that no
 new window opened.
+
+Opening a file or URL with `launch_app` can also land in one of your windows when the app reuses it (a browser may add a tab); the result says so.
+
+Shortcuts that act on every window of an app (Quit, Close All, Minimize All) are refused while your windows are open in it.
 
 `list_apps` lists window titles only for apps Orca has used in this session,
 marking yours `(yours)`; for other apps it shows only how many windows they
