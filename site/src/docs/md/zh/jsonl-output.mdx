@@ -30,6 +30,13 @@ orca exec --output-format jsonl "运行测试套件" |
   jq -c 'select(.type == "tool.call.completed")'
 ~~~
 
+## 工具请求元数据
+
+`tool.call.requested` 包含 `name`、`action` 和 `target`，与 server 模式一致。
+MCP 和外部工具的 action 使用执行会话或轮次中的工具定义。目标把 MCP 资源写成
+`server:uri`、skill 写成名称、工作流优先写成脚本路径，否则写名称或草稿 id。
+内联工作流代码使用 `<inline workflow>`，不匹配带 pattern 的权限规则；整个工具的规则仍生效。
+
 ## 历史行为
 
 JSONL 运行会将事件写入标准输出，但默认不记录本地历史。需要后续恢复时，加上 --save-history：

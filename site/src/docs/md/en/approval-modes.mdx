@@ -77,7 +77,7 @@ the input:
 | `1` Allow once | Run this call. |
 | `2` Allow this exact call | Run it, and allow the same tool with the same target again without asking. Not offered when the call has no specific target. |
 | `3` Allow `<tool>` this session | Run it, and stop asking for this tool until you quit. For `computer` it reads **Allow all apps this session**. |
-| `4` Deny | Do not run it. The turn stops so you can tell Orca what to do instead. `Esc` also denies. |
+| `4` Deny | Do not run it. The turn stops, except on an ordinary existing-window panel: Orca can continue with its own window. `Esc` also denies. |
 | `5` Always allow `<tool>` (saved) | MCP tools and computer use. Run it, stop asking for this tool for the rest of the session, and save an allow rule to the user config so future sessions skip the prompt too. For `computer` it reads **Always allow all apps (saved)** and saves `pattern = "*"`. |
 | `6` Always allow the `<server>` server (saved) | MCP tools only. Run it, and do the same for every tool on that server, saving a server-wide allow rule instead. |
 | `7` Always allow this app (saved) | Computer use only. Run it, remember this app for the session, and save an allow rule for its exact bundle id. |
@@ -93,6 +93,15 @@ For `computer` calls with an app target, the choices are `1` Allow once,
 `2` Allow this app this session, `3` Allow all apps this session, `7` Always
 allow this app (saved), `5` Always allow all apps (saved), and `4` Deny. A computer approval with no resolved app target offers only `1` and `4`.
 
+For one of your existing windows, the panel instead offers `1` **Allow this
+window once**, `2` **Allow this window this session**, and `4` **Deny**.
+Deny, including `Esc` on that panel, keeps the window to yourself and lets the
+turn continue. It offers no saved or all-app options. App, wildcard and
+whole-tool allow rules do not cover these windows; only an exact window allow
+does. `full-auto` skips ordinary window approval, while password entry still
+asks separately. See [Your windows](computer-use.md#your-windows) for the
+ownership rules and known limits.
+
 Outside `full-auto`, terminals and IDEs need approval for that app itself:
 `1`, `2`, or `7`, or an allow rule whose `pattern` is the exact bundle id.
 **Allow all apps this session**, `pattern = "*"` or another wildcard, and a
@@ -105,7 +114,8 @@ text-entering `key` call, including printable keys alone or with Shift/Option
 and `Cmd+V`. App grants, grants for all apps, `full-auto`, and patterned allow
 rules, including `*` and one naming an explicit `#secure` target, do not
 preapprove these calls. Only a whole-tool allow rule
-for `computer` without a `pattern` does for apps that do not run commands;
+for `computer` without a `pattern` does for apps that do not run commands,
+except in your existing windows, where no allow rule preapproves password entry;
 matching deny rules still win. See
 [Computer use](computer-use.md#app-approval).
 
@@ -134,7 +144,8 @@ can switch to plan mode in the middle of a conversation. See
 
 For `computer`, plan mode permits only `list_apps` and `observe`.
 `list_apps` needs no app approval, and `observe` asks for it unless an
-applicable rule or grant already allows it. Rules cannot permit other computer
+applicable rule or grant already allows it. Your existing windows need their
+own approval even for observe. Rules cannot permit other computer
 actions in plan mode. In `full-auto`, app calls run without app approval; see
 [Computer use](computer-use.md#approval-modes).
 
@@ -169,9 +180,11 @@ path pattern, `*` and `?` stay within one directory and `**` crosses
 directories. On Windows, matching ignores ASCII case. Rules cannot lift plan
 mode's limits.
 
-Without a `pattern`, a rule covers every call of its tool, whatever the
-target: every path, nested or absolute, and every command. That is not the
-same as `pattern = "*"`, which in a path stays within one directory. Take care
+Without a `pattern`, a rule normally covers every call of its tool, whatever
+the target: every path, nested or absolute, and every command. For `computer`,
+allow rules still respect the separate window and command-running-app limits
+above. Omitting `pattern` is not the same as `pattern = "*"`, which in a path
+stays within one directory. Take care
 with allow rules: `tool = "bash"` with `decision = "allow"` and no `pattern`
 lets Orca run any command without asking.
 
@@ -197,6 +210,15 @@ decision = "deny"
 
 With both rules, every tool on the `github` server runs without asking except
 `delete_repo`, which the stricter deny rule refuses.
+
+## Approval recovery
+
+A pending approval stays answerable while its turn is alive. MCP approvals
+are not resumed after a restart: their tool definitions can change on
+reconnection. Approvals for tools supplied only to the turn are also refused
+on restart unless Orca can restore the same definition. Older saved approval
+continuations without that proof fail closed. Reopening history does not
+authorize a changed or missing tool; inspect the state and start a new request.
 
 ## Trust remains separate
 

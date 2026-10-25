@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.14":
+        "Ask before using your windows. Computer use asks separately before observing or operating a window you already had open: allow once, allow this window this session, or deny and let Orca open its own. Esc on that panel also denies; other denials still stop the turn. App, wildcard and whole-tool allows do not cover your windows; full-auto skips window approval, but password entry still asks. list_apps shows titles only for apps used this session. The driver leaves the desktop alone and keeps input in the selected window; a lone Cmd+N can open a window when all usable windows are yours. Usable-window lists, clearer errors, windowless shortcuts and AXRaise recovery reduce failed actions. Three consecutive failures prompt a stop-and-report hint; six stop the app for the turn. App session grants now appear in the real TUI. MCP and turn-only tool approvals fail closed on restart when their definitions cannot be restored. Stale queue updates no longer revive finished turns, and flaky tests use controlled synchronization. A developer harness checks 15 real tasks; acceptance attempt 3 recorded no unapproved use of pre-existing windows, single-step 8/8 twice, and multi-step 6/7 and 7/7. Pricing is unchanged.",
       "v0.5.13":
         "DeepSeek pricing, computer input, and smaller requests. Cost estimates now follow current DeepSeek rates and double during weekday peak hours in Beijing, so max_cost_usd budgets may stop sooner. Prices can refresh from models.dev in the background; user-only settings can disable refresh or set fixed model prices. Fixed request prefixes are about 24% smaller after removing duplicate tool descriptions and hiding unavailable tools. The measured first request fell from 10,517 to 8,094 prompt tokens. Element-targeted typing preserves an existing selection and caret; targets that need refocusing still receive text at the end. Exec JSONL batches consecutive text deltas without changing their combined text, but seq may skip values; exec and server tool.call.requested events gain action/target metadata. Invalid project configuration now preserves user settings. macOS tests run on stable Rust, confirm fixture process exit, and accept safe Save panel hit-test outcomes. UU overlay handling authenticates the process and refuses other covers, including transparent windows; active UU sessions remain untested. README badges and a first-run terminal demo complete this release.",
       "v0.5.12":
@@ -702,6 +704,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.14":
+        "先询问，再用你的窗口。computer use 观察或操作你原先开着的窗口前，会单独询问：允许一次、本会话允许这个窗口，或拒绝后让 Orca 新开自己的窗口。面板上按 Esc 也是拒绝；其他拒绝仍结束轮次。应用、通配符和整个工具的 allow 规则都不覆盖你的窗口；full-auto 不询问窗口，密码输入仍单独询问。list_apps 只显示本会话用过的应用的窗口标题。驱动不使用桌面，输入必须落在选中的窗口；可用窗口都是你的时，仍能单独发送 Cmd+N 新开窗口。可用窗口列表、明确的错误提示、无窗口快捷键和 AXRaise 回退减少动作失败。连续失败 3 次提示停止绕路，6 次后本轮停用该应用。应用会话授权现在能在真实 TUI 中选到。重启恢复时，无法还原定义的 MCP 和仅本轮存在的工具审批会被拒绝。过期队列更新不再让已结束轮次重新运行，易抖动测试改用受控同步。开发者验收工具独立检查 15 项真机任务；第三次验收两跑均无未经批准使用已有窗口，单步均为 8/8，多步为 6/7、7/7。定价不变。",
       "v0.5.13":
         "DeepSeek 定价、computer use 和请求前缀优化。费用估算改用官方现价，按北京时间工作日高峰翻倍，max_cost_usd 预算可能更早停止。价格过期时默认后台从 models.dev 刷新；用户配置可关闭刷新或设置全天固定价。移除重复工具说明并隐藏不可用工具后，固定请求前缀约小 24%；实测首个请求从 10,517 降到 8,094 个 prompt token。按元素输入保留已有选区和光标，重新聚焦的目标仍在末尾追加。exec JSONL 会合并连续文字增量，拼接文本不变但 seq 可能跳号；exec 和 server 的 tool.call.requested 都补充 action、target。项目配置无效时保留用户配置。macOS 真机测试支持 stable Rust，清理会确认自有进程退出，保存面板测试接受安全的命中结果。UU 浮层逻辑带签名校验，其他遮挡包括透明窗口仍会阻止点击，尚未在连接 UU 的会话里实测。README 新增徽章与首次运行终端演示。",
       "v0.5.12":

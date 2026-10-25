@@ -132,15 +132,22 @@ Before executing any tool call, Orca checks the approval policy:
 
 | Approval Mode | What gets checked |
 |---------------|-------------------|
-| `plan` | **Everything** — each tool call requires manual approval |
-| `suggest` | Shell commands, deletes, network calls |
-| `auto-edit` | Only destructive shell commands (`rm`, `curl`, etc.) |
-| `full-auto` | **Nothing** — all calls auto-approved |
+| `plan` | Read-only; writes, shell, network and child-agent calls are refused. Computer use permits only listing apps and observing windows, with approval where required. |
+| `suggest` | Writes, shell, network, child-agent and computer calls ask unless an applicable rule or grant decides them. |
+| `auto-edit` | Ordinary edits, shell, network and child-agent calls run within the effective policy; computer calls still ask unless already allowed. |
+| `full-auto` | App and window calls skip ordinary approval; password entry still asks unless a qualifying rule covers it. Deny and prompt rules still apply. |
+
+Permission rules, workspace trust and the sandbox remain separate checks. App
+allow rules do not authorize your existing windows. See
+[Approval modes](approval-modes.md) for the full policy and exceptions.
 
 If approval is required:
-- The TUI displays an approval dialog with the command, affected files, and risk assessment
-- The agent **continues planning** while waiting — it can issue more tool calls or text responses
-- If the user denies, the tool call is marked as "denied" and the model is notified
+
+- The TUI displays the tool, target and available scopes before execution.
+- That call waits for a decision.
+- Deny stops the turn, except on an ordinary existing-window panel: the model
+  is told you kept the window and can continue by opening its own. `Esc` on
+  that panel also means Deny. Password-entry denials still stop the turn.
 
 ### Phase 5: Execution Settlement
 

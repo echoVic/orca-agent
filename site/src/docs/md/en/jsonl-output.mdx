@@ -38,6 +38,15 @@ orca exec --output-format jsonl "Run the test suite" |
   jq -c 'select(.type == "tool.call.completed")'
 ~~~
 
+## Requested-tool metadata
+
+`tool.call.requested` includes `name`, `action` and `target`, as in server
+mode. MCP and external tool actions follow the executing session or turn's
+tool definitions. Targets identify MCP resources as `server:uri`, skills by
+name, and workflows by script path, otherwise name or draft id. Inline
+workflow code uses `<inline workflow>` and does not match pattern-based
+permission rules; whole-tool rules still apply.
+
 ## History behavior
 
 A JSONL run writes its event stream to stdout but does not record local history

@@ -77,7 +77,28 @@ foreground_fallback = false
 
 `foreground_fallback` 默认是 `true`：需要前台的动作会短暂切到目标应用，再恢复原来的
 应用和鼠标位置。设为 `false` 后，这些动作会被拒绝，包括所有 Command 快捷键。
-系统权限、应用授权和用 deny 规则关闭工具的方法，见 [Computer Use](computer-use.md)。
+系统权限、应用与窗口授权，以及用 deny 规则关闭工具的方法，见 [Computer Use](computer-use.md)。
+
+## 权限规则的目标
+
+`[[permissions.rules]]` 写在用户配置中。规则包含 `tool`、可选的目标 `pattern`，
+以及取值为 `allow`、`prompt` 或 `deny` 的 `decision`。多条匹配时取最严格的一条。目标包括：
+
+| 工具 | 目标 |
+| --- | --- |
+| `bash` | 命令行。 |
+| 文件工具 | 文件路径。 |
+| `computer` | 应用 bundle id；你的已有窗口为 `bundle#window:<id>`；密码输入的目标以 `#secure` 结尾。 |
+| MCP 工具 | 规范工具名，如 `mcp__github__create_issue`；通常不写 `pattern`。 |
+| `read_mcp_resource` | `server:uri`。 |
+| `read_skill` | Skill 名称。 |
+| `Workflow` | 优先用脚本路径，否则用工作流名称或草稿 id。内联代码不匹配任何带 pattern 的规则，包括通配符。 |
+
+应用、通配符和整个工具的 allow 规则都不覆盖你的已有窗口，只有精确的
+`bundle#window:<id>` allow 才覆盖这个窗口，且不预先批准其中的密码输入。
+窗口 id 不跨会话，建议直接在窗口面板里授予本会话权限。应用 deny 和 prompt 规则仍覆盖
+窗口；窗口 deny 和 prompt 规则也覆盖其中的密码输入。匹配方法、可执行命令应用和
+密码输入的例外见[审批模式](approval-modes.md#权限规则)。
 
 ## 子代理
 
