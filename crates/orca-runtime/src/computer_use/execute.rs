@@ -7,7 +7,9 @@ use orca_computer_use::observation::render_observation;
 use orca_computer_use::protocol::{
     ActParams, Action, AppInfo, ErrorKind, Observation, ObserveParams, Reply, Request, Target,
 };
+use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::CancelToken;
+use orca_core::computer_apps::ComputerTarget;
 use orca_core::config::RunConfig;
 use orca_core::conversation::ImageInput;
 use orca_core::model::{FLASH_MODEL, accepts_tool_images};
@@ -15,6 +17,7 @@ use orca_core::tool_images::tool_image;
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolStatus};
 
 use super::budget::FailureBudget;
+use super::ownership::TurnWindows;
 use super::{ComputerUseService, service, turn::begin_turn};
 use crate::extension::RuntimeExtensionStores;
 
@@ -56,8 +59,8 @@ fn execute_with_timeout(
     cancel: &CancelToken,
     timeout: Duration,
 ) -> ToolResult {
-    let target = request.target.as_deref().unwrap_or_default();
-    let app = target.strip_suffix("#secure").unwrap_or(target);
+    let app = ComputerTarget::parse(request.target.as_deref().unwrap_or_default()).app;
+    let app = app.as_str();
     // list_apps has no app; every other call counts toward its app's budget.
     let budget = (!app.is_empty()).then(|| FailureBudget::for_turn(stores.turn_store()));
     if let Some(stop) = budget.as_ref().and_then(|budget| budget.stopped(app)) {
@@ -108,9 +111,9 @@ fn run_call(
         Ok(call) => call,
         Err(error) => return ToolResult::invalid_input(request, error),
     };
-    let target = request.target.as_deref().unwrap_or_default();
-    let secure_approved = target.ends_with("#secure");
-    let app = target.strip_suffix("#secure").unwrap_or(target);
+    let target = ComputerTarget::parse(request.target.as_deref().unwrap_or_default());
+    let secure_approved = target.secure;
+    let app = target.app.as_str();
     if !matches!(call, ComputerCall::ListApps) && app.is_empty() {
         return ToolResult::failed(request, "computer requires an approved app target", None);
     }
@@ -126,6 +129,19 @@ fn run_call(
     }
     let model = config.model.as_deref().unwrap_or(FLASH_MODEL);
     let include_screenshot = config.model.supports_images(model) && accepts_tool_images(model);
+    let turn_windows = TurnWindows::for_turn(stores.turn_store());
+    // The user's windows this call must not use: the app's, but the one
+    // approved for this call. Full-auto asks about no window.
+    let user_windows: Vec<u32> = if config.approval_mode == ApprovalMode::FullAuto {
+        vec![]
+    } else {
+        turn_windows
+            .user_windows(&service, app)
+            .into_iter()
+            .map(|window| window.id)
+            .filter(|&id| Some(id) != target.window)
+            .collect()
+    };
     // An act without a window inherits the latest observed one.
     let inherited = match &call {
         ComputerCall::Act { window: None, .. } => service.latest_window(app),
@@ -148,6 +164,7 @@ fn run_call(
             query: query.clone(),
             max_elements: *max_elements,
             include_screenshot,
+            user_windows,
         }),
         ComputerCall::Act {
             window,
@@ -162,6 +179,7 @@ fn run_call(
             observe_after: *observe_after,
             include_screenshot,
             secure_approved,
+            user_windows,
         }),
     };
     begin_turn(&service, stores.turn_store(), cancel);
@@ -175,6 +193,11 @@ fn run_call(
         }),
         other => other.clone(),
     });
+    // A call that reaches the driver was approved (or runs in full-auto): its
+    // app's window titles may be listed from now on.
+    if !matches!(call, ComputerCall::ListApps) {
+        service.note_used_app(app);
+    }
     let mut reply = service.call(driver_request, timeout);
     // The inherited window is gone (the app's last window closed): forget it
     // and let the driver choose, which also reaches app-level shortcuts.
@@ -233,7 +256,7 @@ fn run_call(
                 for app in &error.candidates {
                     message.push('\n');
                     message.push_str(&app_line(app));
-                    append_windows(&mut message, app);
+                    append_windows(&mut message, app, &service, &turn_windows);
                 }
             }
             return ToolResult::failed(request, noted(message), None);
@@ -245,7 +268,7 @@ fn run_call(
             .iter()
             .map(|app| {
                 let mut text = app_line(app);
-                append_windows(&mut text, app);
+                append_windows(&mut text, app, &service, &turn_windows);
                 text
             })
             .collect::<Vec<_>>()
@@ -267,7 +290,19 @@ fn run_call(
                 text.push_str("; no window yet. ");
                 text.push_str(orca_computer_use::messages::NO_WINDOW_NEXT_STEP);
             }
-            append_windows(&mut text, &app);
+            append_windows(&mut text, &app, &service, &turn_windows);
+            if matches!(&call, ComputerCall::LaunchApp { open, .. } if !open.is_empty()) {
+                let user_windows = turn_windows.user_windows(&service, &app.bundle_id);
+                if !user_windows.is_empty()
+                    && app
+                        .windows
+                        .iter()
+                        .all(|window| user_windows.iter().any(|user| user.id == window.id))
+                {
+                    text.push(' ');
+                    text.push_str(orca_computer_use::messages::OPENED_IN_USER_WINDOW);
+                }
+            }
             text
         }
         Reply::Observed { observation } => observation_text(&service, observation, &mut images),
@@ -317,9 +352,32 @@ fn app_line(app: &AppInfo) -> String {
     )
 }
 
-fn append_windows(text: &mut String, app: &AppInfo) {
+/// Appends an app's windows: with titles once the app has been used this
+/// session, the user's marked, else only how many it has.
+fn append_windows(
+    text: &mut String,
+    app: &AppInfo,
+    service: &ComputerUseService,
+    turn_windows: &TurnWindows,
+) {
+    if !service.used_app(&app.bundle_id) {
+        let count = app.windows.len();
+        text.push_str(&format!(
+            " · {count} window{}",
+            if count == 1 { "" } else { "s" }
+        ));
+        return;
+    }
+    let theirs: Vec<u32> = turn_windows
+        .user_windows(service, &app.bundle_id)
+        .into_iter()
+        .map(|window| window.id)
+        .collect();
     for window in &app.windows {
         text.push_str(&format!("\n  window {}: \"{}\"", window.id, window.title));
+        if theirs.contains(&window.id) {
+            text.push_str(" (yours)");
+        }
         if window.minimized {
             text.push_str(" (minimized)");
         }
@@ -535,14 +593,20 @@ mod tests {
         assert!(!output.contains("warning:"), "{output}");
     }
 
-    fn run_turn_call(
+    /// TextEdit whose window 1 ("probe.rtf") was open before the turn: the user's.
+    fn textedit_with_the_users_window() -> FakeDesktop {
+        let mut desktop = FakeDesktop::with_textedit();
+        desktop.snapshots_see_windows = true;
+        desktop
+    }
+
+    fn prepare_in_turn(
         thread_store: &ExtensionData,
         turn_store: &ExtensionData,
         args: Value,
-        cancel: &CancelToken,
-    ) -> ToolResult {
+        config: &RunConfig,
+    ) -> Result<crate::tool_invocation::ToolInvocation, String> {
         let service = thread_store.get::<ComputerUseService>().unwrap();
-        let budget = crate::computer_use::budget::FailureBudget::for_turn(turn_store);
         let call = request(args, None);
         let mut invocation = crate::tool_invocation::ToolInvocation {
             requested: call.clone(),
@@ -550,22 +614,583 @@ mod tests {
             action: Some(ActionKind::Computer),
             approval_preview: None,
         };
-        if let Err(error) = crate::computer_use::prepare::prepare_invocation_with_budget(
+        crate::computer_use::prepare::prepare_invocation_in_turn(
             &mut invocation,
-            &flash_config(),
+            config,
             &service,
-            Some(&budget),
-        ) {
-            return ToolResult::failed_before_start(&invocation.effective, error, None);
+            Some(&crate::computer_use::turn::TurnScope::for_turn(turn_store)),
+        )?;
+        Ok(invocation)
+    }
+
+    /// Prepares and runs one call of a turn as if its approval was granted.
+    fn run_turn_call_with(
+        config: &RunConfig,
+        thread_store: &ExtensionData,
+        turn_store: &ExtensionData,
+        args: Value,
+        cancel: &CancelToken,
+    ) -> ToolResult {
+        match prepare_in_turn(thread_store, turn_store, args.clone(), config) {
+            Ok(invocation) => execute(
+                &invocation.effective,
+                config,
+                0,
+                RuntimeExtensionStores::new(thread_store, turn_store),
+                Path::new("/"),
+                cancel,
+            ),
+            Err(error) => ToolResult::failed_before_start(&request(args, None), error, None),
         }
-        execute(
-            &invocation.effective,
+    }
+
+    fn run_turn_call(
+        thread_store: &ExtensionData,
+        turn_store: &ExtensionData,
+        args: Value,
+        cancel: &CancelToken,
+    ) -> ToolResult {
+        run_turn_call_with(&flash_config(), thread_store, turn_store, args, cancel)
+    }
+
+    #[test]
+    fn launch_open_warns_only_when_every_listed_window_is_the_users() {
+        for (with_open, with_orca_window, expected_note) in [
+            (true, false, true),
+            (false, false, false),
+            (true, true, false),
+        ] {
+            let launcher = FakeLauncher::new(textedit_with_the_users_window());
+            let (thread_store, turn_store) =
+                (ExtensionData::new("thread"), ExtensionData::new("turn"));
+            insert_service(&thread_store, &launcher);
+            let listed = run_turn_call(
+                &thread_store,
+                &turn_store,
+                json!({"action":"list_apps"}),
+                &CancelToken::new(),
+            );
+            assert_eq!(listed.status, ToolStatus::Completed);
+            if with_orca_window {
+                launcher.desktop(|desktop| {
+                    desktop.add_window(
+                        "com.apple.TextEdit",
+                        orca_computer_use::protocol::WindowInfo {
+                            id: 2,
+                            title: "Untitled".into(),
+                            minimized: false,
+                        },
+                    )
+                });
+            }
+            let open = if with_open {
+                vec!["/tmp/example.txt"]
+            } else {
+                vec![]
+            };
+            let result = run_turn_call(
+                &thread_store,
+                &turn_store,
+                json!({"action":"launch_app", "app":"TextEdit", "open":open}),
+                &CancelToken::new(),
+            );
+            assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+            let output = result.output.unwrap();
+            assert_eq!(
+                output.contains(orca_computer_use::messages::OPENED_IN_USER_WINDOW),
+                expected_note,
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_user_window_execution_excludes_only_the_unapproved_windows() {
+        let (started, requests) = std::sync::mpsc::channel();
+        let mut desktop = textedit_with_the_users_window();
+        desktop.add_window(
+            "com.apple.TextEdit",
+            orca_computer_use::protocol::WindowInfo {
+                id: 2,
+                title: "Other user's window".into(),
+                minimized: false,
+            },
+        );
+        desktop.request_started = Some(started);
+        let launcher = FakeLauncher::new(desktop);
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let observed = run_turn_call(
+            &thread_store,
+            &turn_store,
+            json!({"action":"observe", "app":"TextEdit", "window":1}),
+            &CancelToken::new(),
+        );
+        assert_eq!(observed.status, ToolStatus::Completed);
+        let args =
+            json!({"action":"click", "app":"TextEdit", "target":{"element":1}, "observe":false});
+        let prepared =
+            prepare_in_turn(&thread_store, &turn_store, args.clone(), &flash_config()).unwrap();
+        assert_eq!(
+            prepared.effective.target.as_deref(),
+            Some("com.apple.TextEdit#window:1")
+        );
+        let acted = run_turn_call(&thread_store, &turn_store, args, &CancelToken::new());
+        assert_eq!(acted.status, ToolStatus::Completed, "{:?}", acted.error);
+        let sent: Vec<_> = requests
+            .try_iter()
+            .filter_map(|request| match request {
+                Request::Act(params) => Some(params),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].window, Some(1));
+        assert_eq!(sent[0].user_windows, vec![2]);
+        assert_eq!(
+            launcher.desktop(|desktop| desktop.actions_on("com.apple.TextEdit")),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_end_of_turn_snapshot_makes_new_windows_the_users_next_turn() {
+        let launcher = FakeLauncher::new(textedit_with_the_users_window());
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        {
+            let turn = ExtensionData::new("turn-1");
+            let listed = run_turn_call(
+                &thread_store,
+                &turn,
+                json!({"action":"list_apps"}),
+                &CancelToken::new(),
+            );
+            assert_eq!(listed.status, ToolStatus::Completed);
+            launcher.desktop(|desktop| {
+                desktop.add_window(
+                    "com.apple.TextEdit",
+                    orca_computer_use::protocol::WindowInfo {
+                        id: 2,
+                        title: "Untitled".into(),
+                        minimized: false,
+                    },
+                );
+                desktop.snapshot_fails = true;
+            });
+        }
+        launcher.desktop(|desktop| desktop.snapshot_fails = false);
+        let turn = ExtensionData::new("turn-2");
+        let prepared = prepare_in_turn(
+            &thread_store,
+            &turn,
+            json!({"action":"observe", "app":"TextEdit", "window":2}),
             &flash_config(),
-            0,
-            RuntimeExtensionStores::new(thread_store, turn_store),
-            Path::new("/"),
-            cancel,
         )
+        .unwrap();
+        assert_eq!(
+            prepared.effective.target.as_deref(),
+            Some("com.apple.TextEdit#window:2")
+        );
+    }
+
+    #[test]
+    fn a_named_user_window_gets_its_own_approval_target_and_preview() {
+        let launcher = FakeLauncher::new(textedit_with_the_users_window());
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let observe = prepare_in_turn(
+            &thread_store,
+            &turn_store,
+            json!({"action":"observe", "app":"TextEdit", "window":1}),
+            &flash_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            observe.effective.target.as_deref(),
+            Some("com.apple.TextEdit#window:1")
+        );
+        assert_eq!(
+            observe.approval_preview.as_deref(),
+            Some("observe in your existing window \"probe.rtf\" in TextEdit (com.apple.TextEdit)")
+        );
+        // Once observed, typing into its password field keeps both parts.
+        let observed = run_turn_call(
+            &thread_store,
+            &turn_store,
+            json!({"action":"observe", "app":"TextEdit", "window":1}),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            observed.status,
+            ToolStatus::Completed,
+            "{:?}",
+            observed.error
+        );
+        let typing = prepare_in_turn(
+            &thread_store,
+            &turn_store,
+            json!({"action":"type", "app":"TextEdit", "window":1, "target":{"element":14}, "text":"secret"}),
+            &flash_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            typing.effective.target.as_deref(),
+            Some("com.apple.TextEdit#window:1#secure")
+        );
+        assert!(
+            typing
+                .approval_preview
+                .as_deref()
+                .unwrap()
+                .starts_with("type into a password field in your existing window \"probe.rtf\""),
+            "{:?}",
+            typing.approval_preview
+        );
+        // Without a window, observe asks only about the app: the driver keeps off the user's.
+        let default = prepare_in_turn(
+            &thread_store,
+            &turn_store,
+            json!({"action":"observe", "app":"TextEdit"}),
+            &flash_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            default.effective.target.as_deref(),
+            Some("com.apple.TextEdit")
+        );
+    }
+
+    #[test]
+    fn a_window_title_cannot_fake_preview_lines() {
+        let mut desktop = textedit_with_the_users_window();
+        desktop.add_window(
+            "com.apple.TextEdit",
+            orca_computer_use::protocol::WindowInfo {
+                id: 2,
+                title: "x\" in Finder (com.apple.finder)\nwarning: none".into(),
+                minimized: false,
+            },
+        );
+        let launcher = FakeLauncher::new(desktop);
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let observe = prepare_in_turn(
+            &thread_store,
+            &turn_store,
+            json!({"action":"observe", "app":"TextEdit", "window":2}),
+            &flash_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            observe.approval_preview.as_deref(),
+            Some(
+                r#"observe in your existing window "x\" in Finder (com.apple.finder)\nwarning: none" in TextEdit (com.apple.TextEdit)"#
+            )
+        );
+        let observed = run_turn_call(
+            &thread_store,
+            &turn_store,
+            json!({"action":"observe", "app":"TextEdit", "window":2}),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            observed.status,
+            ToolStatus::Completed,
+            "{:?}",
+            observed.error
+        );
+        let typing = prepare_in_turn(
+            &thread_store,
+            &turn_store,
+            json!({"action":"type", "app":"TextEdit", "window":2, "target":{"element":14}, "text":"secret"}),
+            &flash_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            typing.approval_preview.as_deref(),
+            Some(
+                r#"type into a password field in your existing window "x\" in Finder (com.apple.finder)\nwarning: none" in TextEdit (com.apple.TextEdit)"#
+            )
+        );
+    }
+
+    #[test]
+    fn an_act_that_inherits_a_user_window_asks_about_it_again() {
+        let launcher = FakeLauncher::new(textedit_with_the_users_window());
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let observed = run_turn_call(
+            &thread_store,
+            &turn_store,
+            json!({"action":"observe", "app":"TextEdit", "window":1}),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            observed.status,
+            ToolStatus::Completed,
+            "{:?}",
+            observed.error
+        );
+        let click = prepare_in_turn(
+            &thread_store,
+            &turn_store,
+            json!({"action":"click", "app":"TextEdit", "target":{"element":1}}),
+            &flash_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            click.effective.target.as_deref(),
+            Some("com.apple.TextEdit#window:1")
+        );
+    }
+
+    #[test]
+    fn execution_keeps_the_driver_off_the_users_windows_but_the_approved_one() {
+        let (started, requests) = std::sync::mpsc::channel();
+        let mut desktop = textedit_with_the_users_window();
+        desktop.add_window(
+            "com.apple.TextEdit",
+            orca_computer_use::protocol::WindowInfo {
+                id: 2,
+                title: "Notes".into(),
+                minimized: false,
+            },
+        );
+        desktop.request_started = Some(started);
+        let launcher = FakeLauncher::new(desktop);
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        // Both windows predate the turn; this call's approval names window 2.
+        let observed = run_turn_call(
+            &thread_store,
+            &turn_store,
+            json!({"action":"observe", "app":"TextEdit", "window":2}),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            observed.status,
+            ToolStatus::Completed,
+            "{:?}",
+            observed.error
+        );
+        let sent: Vec<_> = requests
+            .try_iter()
+            .filter_map(|request| match request {
+                Request::Observe(params) => Some(params.user_windows),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, vec![vec![1]]);
+    }
+
+    #[test]
+    fn windows_orca_opened_in_an_earlier_turn_are_its_own() {
+        let launcher = FakeLauncher::new(textedit_with_the_users_window());
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        {
+            let turn = ExtensionData::new("turn-1");
+            // The turn's first call notes window 1; then Orca opens window 2.
+            let listed = run_turn_call(
+                &thread_store,
+                &turn,
+                json!({"action":"list_apps"}),
+                &CancelToken::new(),
+            );
+            assert_eq!(listed.status, ToolStatus::Completed, "{:?}", listed.error);
+            launcher.desktop(|desktop| {
+                desktop.add_window(
+                    "com.apple.TextEdit",
+                    orca_computer_use::protocol::WindowInfo {
+                        id: 2,
+                        title: "Untitled".into(),
+                        minimized: false,
+                    },
+                )
+            });
+            // A window that appeared during the turn is usable at once.
+            let fresh = prepare_in_turn(
+                &thread_store,
+                &turn,
+                json!({"action":"observe", "app":"TextEdit", "window":2}),
+                &flash_config(),
+            )
+            .unwrap();
+            assert_eq!(
+                fresh.effective.target.as_deref(),
+                Some("com.apple.TextEdit")
+            );
+        } // The turn ends: its last snapshot makes window 2 Orca's.
+        let turn = ExtensionData::new("turn-2");
+        for (window, target) in [
+            (2, "com.apple.TextEdit"),
+            (1, "com.apple.TextEdit#window:1"),
+        ] {
+            let prepared = prepare_in_turn(
+                &thread_store,
+                &turn,
+                json!({"action":"observe", "app":"TextEdit", "window":window}),
+                &flash_config(),
+            )
+            .unwrap();
+            assert_eq!(
+                prepared.effective.target.as_deref(),
+                Some(target),
+                "window {window}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_window_snapshot_refuses_the_call_until_one_succeeds() {
+        let mut desktop = textedit_with_the_users_window();
+        desktop.snapshot_fails = true;
+        let launcher = FakeLauncher::new(desktop);
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let turn = ExtensionData::new("turn");
+        let refused = run_turn_call(
+            &thread_store,
+            &turn,
+            json!({"action":"observe", "app":"TextEdit", "window":1}),
+            &CancelToken::new(),
+        );
+        assert_eq!(refused.status, ToolStatus::Failed);
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("cannot tell which are the user's"),
+            "{:?}",
+            refused.error
+        );
+        assert!(launcher.desktop(|desktop| desktop.last_observe.is_none()));
+        // The next call takes the snapshot once windows can be listed again.
+        launcher.desktop(|desktop| desktop.snapshot_fails = false);
+        let prepared = prepare_in_turn(
+            &thread_store,
+            &turn,
+            json!({"action":"observe", "app":"TextEdit", "window":1}),
+            &flash_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.effective.target.as_deref(),
+            Some("com.apple.TextEdit#window:1")
+        );
+    }
+
+    #[test]
+    fn full_auto_asks_about_no_window_and_excludes_none() {
+        let (started, requests) = std::sync::mpsc::channel();
+        let mut desktop = textedit_with_the_users_window();
+        desktop.request_started = Some(started);
+        let launcher = FakeLauncher::new(desktop);
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let mut config = flash_config();
+        config.approval_mode = orca_core::approval_types::ApprovalMode::FullAuto;
+        let prepared = prepare_in_turn(
+            &thread_store,
+            &turn_store,
+            json!({"action":"observe", "app":"TextEdit", "window":1}),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.effective.target.as_deref(),
+            Some("com.apple.TextEdit")
+        );
+        let observed = run_turn_call_with(
+            &config,
+            &thread_store,
+            &turn_store,
+            json!({"action":"observe", "app":"TextEdit"}),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            observed.status,
+            ToolStatus::Completed,
+            "{:?}",
+            observed.error
+        );
+        assert!(
+            requests
+                .try_iter()
+                .filter_map(|request| match request {
+                    Request::Observe(params) => Some(params.user_windows),
+                    _ => None,
+                })
+                .all(|user_windows| user_windows.is_empty())
+        );
+    }
+
+    #[test]
+    fn cmd_n_reaches_an_app_whose_windows_are_all_the_users() {
+        let launcher = FakeLauncher::new(textedit_with_the_users_window());
+        let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
+        insert_service(&thread_store, &launcher);
+        let shortcut = run_turn_call(
+            &thread_store,
+            &turn_store,
+            json!({"action":"key", "app":"TextEdit", "keys":["cmd", "n"]}),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            shortcut.status,
+            ToolStatus::Completed,
+            "{:?}",
+            shortcut.error
+        );
+        assert!(
+            shortcut
+                .output
+                .as_deref()
+                .unwrap()
+                .contains("used the foreground"),
+            "{:?}",
+            shortcut.output
+        );
+        let other = run_turn_call(
+            &thread_store,
+            &turn_store,
+            json!({"action":"key", "app":"TextEdit", "keys":["cmd", "w"]}),
+            &CancelToken::new(),
+        );
+        assert_eq!(other.status, ToolStatus::Failed);
+        assert!(
+            other
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("only has the user's own windows"),
+            "{:?}",
+            other.error
+        );
+    }
+
+    #[test]
+    fn failures_on_a_users_window_count_toward_its_app() {
+        let launcher = FakeLauncher::new(textedit_with_the_users_window());
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let turn = ExtensionData::new("turn");
+        let bad_click =
+            json!({"action":"click", "app":"TextEdit", "window":1, "target":{"element":999}});
+        let results: Vec<_> = (0..3)
+            .map(|_| run_turn_call(&thread_store, &turn, bad_click.clone(), &CancelToken::new()))
+            .collect();
+        assert!(
+            results[2]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("com.apple.TextEdit has failed 3 times"),
+            "{:?}",
+            results[2].error
+        );
     }
 
     #[test]
@@ -856,6 +1481,53 @@ mod tests {
     }
 
     #[test]
+    fn list_apps_hides_titles_of_apps_not_used_this_session() {
+        let mut desktop = FakeDesktop::with_textedit_and_calculator();
+        desktop.snapshots_see_windows = true;
+        let launcher = FakeLauncher::new(desktop);
+        let thread_store = ExtensionData::new("thread");
+        insert_service(&thread_store, &launcher);
+        let turn = ExtensionData::new("turn");
+        let list = || {
+            run_turn_call(
+                &thread_store,
+                &turn,
+                json!({"action":"list_apps"}),
+                &CancelToken::new(),
+            )
+            .output
+            .unwrap()
+        };
+        let before = list();
+        assert!(
+            before.contains("TextEdit — com.apple.TextEdit (pid 42) · 1 window"),
+            "{before}"
+        );
+        assert!(
+            !before.contains("probe.rtf") && !before.contains("window 1"),
+            "{before}"
+        );
+        // Once TextEdit is used (its window approved), its windows show, the user's marked.
+        run_turn_call(
+            &thread_store,
+            &turn,
+            json!({"action":"observe", "app":"TextEdit", "window":1}),
+            &CancelToken::new(),
+        );
+        let after = list();
+        assert!(
+            after.contains(
+                "TextEdit — com.apple.TextEdit (pid 42)\n  window 1: \"probe.rtf\" (yours)"
+            ),
+            "{after}"
+        );
+        assert!(
+            after.contains("Calculator — com.apple.calculator (pid 42) · 1 window"),
+            "{after}"
+        );
+    }
+
+    #[test]
     fn list_apps_marks_minimized_windows() {
         let mut desktop = FakeDesktop::with_textedit();
         desktop.add_window(
@@ -869,6 +1541,15 @@ mod tests {
         let launcher = FakeLauncher::new(desktop);
         let (thread_store, turn_store) = (ExtensionData::new("thread"), ExtensionData::new("turn"));
         insert_service(&thread_store, &launcher);
+        // Titles are listed once the app has been used this session.
+        execute(
+            &observe_request("com.apple.TextEdit"),
+            &flash_config(),
+            0,
+            RuntimeExtensionStores::new(&thread_store, &turn_store),
+            Path::new("/"),
+            &CancelToken::new(),
+        );
         let result = execute(
             &request(json!({"action":"list_apps"}), None),
             &flash_config(),
@@ -1216,12 +1897,17 @@ mod tests {
             (
                 json!({"action":"list_apps"}),
                 None,
-                "TextEdit — com.apple.TextEdit (pid 42)\n  window 1: \"probe.rtf\"",
+                "TextEdit — com.apple.TextEdit (pid 42) · 1 window",
             ),
             (
                 json!({"action":"launch_app", "app":"TextEdit", "open":["probe.rtf"]}),
                 Some("com.apple.TextEdit"),
                 "launched TextEdit (com.apple.TextEdit)\n  window 1: \"probe.rtf\"",
+            ),
+            (
+                json!({"action":"list_apps"}),
+                None,
+                "TextEdit — com.apple.TextEdit (pid 42)\n  window 1: \"probe.rtf\"",
             ),
             (
                 json!({"action":"scroll", "app":"TextEdit", "target":{"point":[312,190]}, "direction":"down", "amount":3, "observe":false}),
@@ -1535,6 +2221,7 @@ mod tests {
                     query: None,
                     max_elements: 300,
                     include_screenshot: false,
+                    user_windows: vec![],
                 }),
                 Duration::from_secs(30),
             )

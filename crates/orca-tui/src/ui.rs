@@ -6499,7 +6499,7 @@ fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog,
             &option.key().to_string(),
             &labels[index],
             label_width,
-            approval_option_detail(*option, &dialog.tool),
+            approval_option_detail(*option, &dialog.tool, dialog.target.as_deref()),
             inner_width,
         ));
     }
@@ -6534,6 +6534,16 @@ fn render_approval_panel(frame: &mut Frame, area: Rect, dialog: &ApprovalDialog,
     frame.render_widget(Paragraph::new(content).block(block), popup);
 }
 
+/// A computer approval for one of the user's existing windows.
+fn is_existing_window(tool: &str, target: Option<&str>) -> bool {
+    tool == "computer"
+        && target.is_some_and(|target| {
+            orca_core::computer_apps::ComputerTarget::parse(target)
+                .window
+                .is_some()
+        })
+}
+
 fn approval_option_label(option: ApprovalOption, tool: &str, target: Option<&str>) -> String {
     match option {
         ApprovalOption::Once
@@ -6541,11 +6551,17 @@ fn approval_option_label(option: ApprovalOption, tool: &str, target: Option<&str
         {
             "Allow typing this once".to_string()
         }
+        ApprovalOption::Once if is_existing_window(tool, target) => {
+            "Allow this window once".to_string()
+        }
         ApprovalOption::Once => "Allow once".to_string(),
         ApprovalOption::AlwaysTool if tool == "computer" => {
             "Allow all apps this session".to_string()
         }
         ApprovalOption::AlwaysTool => format!("Allow {tool} this session"),
+        ApprovalOption::AlwaysTarget if is_existing_window(tool, target) => {
+            "Allow this window this session".to_string()
+        }
         ApprovalOption::AlwaysTarget if tool == "computer" => {
             "Allow this app this session".to_string()
         }
@@ -6566,13 +6582,20 @@ fn approval_option_label(option: ApprovalOption, tool: &str, target: Option<&str
     }
 }
 
-fn approval_option_detail(option: ApprovalOption, tool: &str) -> &'static str {
+fn approval_option_detail(
+    option: ApprovalOption,
+    tool: &str,
+    target: Option<&str>,
+) -> &'static str {
     match option {
         ApprovalOption::Once => "run it now",
         ApprovalOption::AlwaysTool if tool == "computer" => {
             "skip approval for every app until you quit"
         }
         ApprovalOption::AlwaysTool => "skip approval for this tool until you quit",
+        ApprovalOption::AlwaysTarget if is_existing_window(tool, target) => {
+            "skip approval for this window until you quit"
+        }
         ApprovalOption::AlwaysTarget if tool == "computer" => {
             "skip approval for this app until you quit"
         }
@@ -6585,6 +6608,12 @@ fn approval_option_detail(option: ApprovalOption, tool: &str) -> &'static str {
         ApprovalOption::AlwaysToolSaved => "save an allow rule so future sessions skip it too",
         ApprovalOption::AlwaysServerSaved => {
             "save an allow rule covering every tool on this server"
+        }
+        ApprovalOption::Deny
+            if is_existing_window(tool, target)
+                && !target.is_some_and(|target| target.ends_with("#secure")) =>
+        {
+            "keep the window to yourself; Orca opens its own"
         }
         ApprovalOption::Deny => "ask Orca for another way",
     }
@@ -9171,6 +9200,29 @@ mod tests {
         assert!(frame.contains("1/4 pick"), "{frame}");
         assert!(!frame.contains("this session"), "{frame}");
         assert!(!frame.contains("(saved)"), "{frame}");
+    }
+
+    #[test]
+    fn an_existing_window_approval_names_the_window_in_its_options() {
+        let mut state = approval_state();
+        let dialog = state.approval_dialog.as_mut().unwrap();
+        dialog.tool = "computer".into();
+        dialog.target = Some("com.apple.finder#window:7".into());
+        dialog.options = ApprovalDialog::options_for("computer", Some("com.apple.finder#window:7"));
+
+        let frame = frame_string(&mut state, 100, 30);
+        for text in [
+            "Allow this window once",
+            "Allow this window this session",
+            "skip approval for this window until you quit",
+            "Deny",
+            "keep the window to yourself; Orca opens its own",
+        ] {
+            assert!(frame.contains(text), "missing {text:?}: {frame}");
+        }
+        for text in ["Allow all apps", "Allow this app", "(saved)"] {
+            assert!(!frame.contains(text), "unexpected {text:?}: {frame}");
+        }
     }
 
     #[test]

@@ -2,6 +2,9 @@
 from collections import Counter
 from datetime import datetime
 import json
+import re
+
+from approvals import WINDOW
 
 
 def read_jsonl(path):
@@ -62,11 +65,11 @@ def extract(records, approvals, submitted, ended=None):
     events = semantic(records)
     responses = [e for e in events if e['type'] == 'model.response.completed']
     calls = {}
-    for e in responses:
-        for c in e['payload'].get('tool_calls', []):
-            calls[c['id']] = {'id': c['id'], 'name': c['function_name'], 'arguments': arguments(c.get('arguments'))}
     for e in events:
-        if e['type'] == 'tool.call.requested':
+        if e['type'] == 'model.response.completed':
+            for c in e['payload'].get('tool_calls', []):
+                calls.setdefault(c['id'], {'id': c['id'], 'name': c['function_name'], 'arguments': arguments(c.get('arguments'))})
+        elif e['type'] == 'tool.call.requested':
             p = e['payload']
             calls.setdefault(p['id'], {'id': p['id'], 'name': p['name'], 'arguments': arguments(p.get('raw_arguments'))})
             calls[p['id']]['target'] = p.get('target')
@@ -74,10 +77,27 @@ def extract(records, approvals, submitted, ended=None):
     computer = [c for c in calls.values() if c['name'] == 'computer']
     errors, observations = [], []
     foreground = 0
+    latest_observed = {}
     for c in calls.values():
         r = results.get(c['id'], {})
         c['status'] = r.get('status')
         output = r.get('output') or ''
+        if c['name'] == 'computer':
+            # App listings carry raw titles; only an observation header proves its window.
+            seen = None
+            if c['status'] == 'completed' and c['arguments'].get('action') not in ('list_apps', 'launch_app'):
+                seen = re.search(r'(?m)^[^"\n]*"(?:[^"\\\n]|\\.)*" \[window (\d+)\]: ', output)
+            c['requested_window'] = c['arguments'].get('window')
+            c['observed_window'] = int(seen[1]) if seen else None
+            bundle = (c.get('target') or '').split('#', 1)[0]
+            c['inherited_window'] = None
+            if (c['arguments'].get('action') in ('click', 'type', 'key', 'scroll')
+                    and c['requested_window'] is None and c['observed_window'] is None):
+                c['inherited_window'] = latest_observed.get(bundle)
+            c['window'] = next((c[field] for field in ('observed_window', 'requested_window', 'inherited_window')
+                                if c[field] is not None), None)
+            if bundle and c['observed_window'] is not None:
+                latest_observed[bundle] = c['observed_window']
         foreground += int('used the foreground' in output)
         if c['name'] == 'computer' and ('screenshot ' in output or c['arguments'].get('action') == 'observe'):
             observations.append(len(output))
@@ -99,3 +119,35 @@ def extract(records, approvals, submitted, ended=None):
             'final_answer': next((e['payload'].get('assistant_content') or '' for e in reversed(responses)
                                   if not e['payload'].get('tool_calls')), ''),
             'routing': sorted({e['payload']['actual_model'] for e in events if e['type'] == 'model.routed'})}
+
+
+def _call_windows(call):
+    # Read older metrics too; new records derive `window` from these three IDs.
+    return {call.get(field) for field in ('requested_window', 'observed_window', 'inherited_window', 'window')} - {None}
+
+
+def user_window_touches(calls, preexisting, approvals):
+    """Every pre-existing window used by a completed call without a covering grant."""
+    order = {c['id']: index for index, c in enumerate(calls) if c.get('id')}
+    grants = []
+    for approval in approvals:
+        match = WINDOW.search(approval.get('target') or '')
+        answered = order.get(approval.get('call_id'))
+        if match and answered is not None and approval.get('chosen') not in (None, 'Deny'):
+            grants.append((int(match[1]), answered, approval['chosen'] == 'Allow this window this session'))
+    touched = set()
+    for index, call in enumerate(calls):
+        if call['name'] != 'computer' or call.get('status') != 'completed':
+            continue
+        for window in _call_windows(call) & set(preexisting):
+            if not any(granted == window and (answered == index or session and answered < index)
+                       for granted, answered, session in grants):
+                touched.add(window)
+    return sorted(touched)
+
+
+def unattributed_computer_calls(calls):
+    """Completed window operations whose destination the transcript cannot establish."""
+    return sum(c['name'] == 'computer' and c.get('status') == 'completed'
+               and c.get('arguments', {}).get('action') not in ('list_apps', 'launch_app')
+               and not _call_windows(c) for c in calls)

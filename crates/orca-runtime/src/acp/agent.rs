@@ -3867,7 +3867,11 @@ mod tests {
 
     #[test]
     fn computer_approval_wire_request_names_the_resolved_app_and_non_shell_kind() {
-        for target in ["com.apple.TextEdit", "com.apple.TextEdit#secure"] {
+        for target in [
+            "com.apple.TextEdit",
+            "com.apple.TextEdit#secure",
+            "com.apple.TextEdit#window:7",
+        ] {
             let view = crate::runtime_host::test_support::computer_approval_view(target);
             let (wire, _) = build_interaction_request(&SessionId::new("computer"), &view).unwrap();
             let AcpInteractionWireRequest::Permission(request) = wire else {

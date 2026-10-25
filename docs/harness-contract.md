@@ -296,6 +296,13 @@ Tool events:
 - `tool.call.requested` — emitted before execution, contains `name`, `action`, `target`
 - `tool.call.completed` — emitted after execution, contains `name`, `status` (completed/failed/denied), `output`, `truncated`
 
+Requested-tool metadata uses the executing session or turn's tool definitions,
+including writable MCP and shell-classified external tools. Resource targets
+are `server:uri`; read_skill targets are its `id` argument, usually the skill
+directory name; Workflow targets prefer `scriptPath`, then name or draft id. Inline Workflow code has the target `<inline workflow>`
+and cannot match any pattern-based permission rule, including wildcards;
+whole-tool rules keep their scope.
+
 External tools:
 - Orca loads `~/.orca/tools/*.toml` at startup.
 - Each descriptor defines `name`, `description`, `action_kind`, `command`, and `schema`.

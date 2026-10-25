@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.13";
+export const releaseVersion = "v0.5.14";
 
 export const releases = [
+  {
+    version: "v0.5.14",
+    date: "2026-10-26",
+    title: "Ask before using your windows",
+    body: "Outside full-auto, computer use asks before observing or operating a window you already had open, with approval for one call or the session. Press 4 to keep a window and let Orca continue (Esc can stop the whole turn). App grants do not cover your windows; list_apps shows titles only for apps used this session. Usable-window selection, input delivery and recovery improve, and repeated failures stop the app for the turn. MCP approvals are never resumed after a restart; turn-only tool approvals fail closed unless the same definition can be restored. A developer acceptance harness checks 15 real tasks.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.14",
+  },
   {
     version: "v0.5.13",
     date: "2026-10-20",

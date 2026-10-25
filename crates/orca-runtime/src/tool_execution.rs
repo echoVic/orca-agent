@@ -235,6 +235,7 @@ pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) tool_request: &'a tool_types::ToolRequest,
     pub(crate) invocation: &'a ToolInvocation,
+    pub(crate) turn_store: Option<&'a crate::extension::ExtensionData>,
     pub(crate) policy: &'a ApprovalPolicy,
     pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
     pub(crate) approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
@@ -1081,14 +1082,16 @@ impl ToolExecutionActor {
                 )
                 .and_then(|()| crate::computer_use::service(thread_store, cwd, config))
                 .and_then(|service| {
-                    let budget = extension_stores.map(|stores| {
-                        crate::computer_use::budget::FailureBudget::for_turn(stores.turn_store())
-                    });
-                    crate::computer_use::prepare::prepare_invocation_with_budget(
+                    // The same turn store execution uses, so prepare and
+                    // execution share the turn's budget and window snapshot.
+                    let turn_store = extension_stores
+                        .map(|stores| stores.turn_store())
+                        .unwrap_or(&self.runtime.turn_extensions);
+                    crate::computer_use::prepare::prepare_invocation_in_turn(
                         &mut invocation,
                         config,
                         &service,
-                        budget.as_deref(),
+                        Some(&crate::computer_use::turn::TurnScope::for_turn(turn_store)),
                     )
                 })
                 .and_then(|()| {
@@ -1158,6 +1161,7 @@ impl ToolExecutionActor {
                 sink,
                 tool_request,
                 invocation: &invocation,
+                turn_store: extension_stores.map(|stores| stores.turn_store()),
                 policy,
                 permission_overlay,
                 approval_handler,
@@ -1413,6 +1417,7 @@ impl ToolExecutionActor {
             sink,
             tool_request,
             invocation,
+            turn_store,
             policy,
             permission_overlay,
             approval_handler,
@@ -1551,9 +1556,20 @@ impl ToolExecutionActor {
                     }
                     match final_resolution.decision {
                         ApprovalDecision::Deny => {
+                            let kept = computer_window_denial_reason(
+                                &approval,
+                                turn_store.unwrap_or(&self.runtime.turn_extensions),
+                            );
+                            // Keeping a plain window refuses this call while letting
+                            // the model open its own. App/password denials still stop.
+                            let status = if kept.is_some() {
+                                RunStatus::Success
+                            } else {
+                                RunStatus::ApprovalRequired
+                            };
                             let result = tool_types::ToolResult::denied(
                                 tool_request,
-                                final_resolution.reason,
+                                kept.unwrap_or(final_resolution.reason),
                             );
                             return finish_approval_gate_terminal(
                                 events,
@@ -1562,7 +1578,7 @@ impl ToolExecutionActor {
                                 emit_deltas,
                                 provider_response_ingress,
                                 event_error,
-                                RunStatus::ApprovalRequired,
+                                status,
                                 result,
                             );
                         }
@@ -1763,6 +1779,36 @@ impl ToolExecutionActor {
     }
 }
 
+/// The preview's window title comes from this same turn snapshot; read that
+/// structured source rather than parsing the escaped, human-facing preview.
+fn computer_window_denial_reason(
+    approval: &orca_core::approval_types::ApprovalRequest,
+    turn_store: &crate::extension::ExtensionData,
+) -> Option<String> {
+    if approval.tool.as_deref() != Some("computer") {
+        return None;
+    }
+    let target = orca_core::computer_apps::ComputerTarget::parse(approval.target.as_deref()?);
+    let id = target.window?;
+    if target.secure {
+        return None;
+    }
+    let title = turn_store
+        .get::<crate::computer_use::ownership::TurnWindows>()
+        .and_then(|windows| windows.start())
+        .and_then(|snapshot| {
+            snapshot
+                .get(&target.app)?
+                .iter()
+                .find(|window| window.id == id)
+                .map(|window| window.title.clone())
+        });
+    Some(match title {
+        Some(title) => orca_computer_use::messages::window_kept(&title),
+        None => "The user kept their window to themselves. Leave it alone: open a new window instead (for example with key cmd+n, or launch_app with open), or ask the user.".into(),
+    })
+}
+
 fn failed_approval_gate_before_start<W: io::Write>(
     events: &mut EventFactory,
     sink: &mut EventSink<W>,
@@ -1905,7 +1951,8 @@ mod tests {
 
     use super::{
         ToolApprovalGateContext, ToolExecutionActor, ToolExecutionContext,
-        policy_for_tool_execution, publish_tool_call_completed, tool_call_outcome_for_result,
+        computer_window_denial_reason, policy_for_tool_execution, publish_tool_call_completed,
+        tool_call_outcome_for_result,
     };
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
     use crate::cost::CostTracker;
@@ -2273,6 +2320,7 @@ mod tests {
                     query: None,
                     max_elements: 300,
                     include_screenshot: false,
+                    user_windows: vec![],
                 }),
                 std::time::Duration::from_secs(5),
             )
@@ -2311,6 +2359,7 @@ mod tests {
                 sink: &mut sink,
                 tool_request: &request,
                 invocation: &invocation,
+                turn_store: None,
                 policy: &policy,
                 permission_overlay: &mut overlay,
                 approval_handler: Some(&handler),
@@ -2385,6 +2434,7 @@ mod tests {
                         query: None,
                         max_elements: 300,
                         include_screenshot: false,
+                        user_windows: vec![],
                     }),
                     std::time::Duration::from_secs(5),
                 )
@@ -2424,6 +2474,7 @@ mod tests {
             sink: &mut sink,
             tool_request: &request,
             invocation: &invocation,
+            turn_store: None,
             policy: &policy,
             permission_overlay: &mut overlay,
             approval_handler: Some(&handler),
@@ -2502,6 +2553,7 @@ mod tests {
                         observe_after: false,
                         include_screenshot: false,
                         secure_approved: false,
+                        user_windows: vec![],
                     }),
                     std::time::Duration::from_secs(5),
                 )
@@ -2692,6 +2744,7 @@ mod tests {
                             query: None,
                             max_elements: 300,
                             include_screenshot: false,
+                            user_windows: vec![],
                         },
                     ),
                     std::time::Duration::from_secs(30),
@@ -2741,6 +2794,108 @@ mod tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         (status, result, emitted)
+    }
+
+    #[test]
+    fn computer_window_denial_keeps_the_window_and_continues_the_turn() {
+        for use_extension_stores in [false, true] {
+            let mut desktop = orca_computer_use::fake::FakeDesktop::with_textedit();
+            desktop.snapshots_see_windows = true;
+            let handler = ComputerApprovalRecording::default();
+            let (status, result, emitted) = execute_computer_arguments_for_approval(
+                &computer_config(),
+                desktop,
+                use_extension_stores,
+                &handler,
+                serde_json::json!({"action":"observe", "app":"TextEdit", "window":1}),
+            );
+            assert_eq!(result.status, ToolStatus::Denied);
+            assert_eq!(
+                result.error.as_deref(),
+                Some(
+                    "The user kept their window \"probe.rtf\" to themselves. Leave it alone: open a new window instead (for example with key cmd+n, or launch_app with open), or ask the user."
+                )
+            );
+            assert_eq!(status, RunStatus::Success);
+            assert_eq!(
+                handler.0.lock().unwrap()[0].target.as_deref(),
+                Some("com.apple.TextEdit#window:1")
+            );
+            assert_eq!(
+                emitted
+                    .iter()
+                    .filter(|event| event["type"] == "tool.call.completed")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn computer_window_denial_without_a_snapshot_omits_the_title() {
+        let store = ExtensionData::new("missing-window-snapshot");
+        let mut approval = ApprovalRequest {
+            id: "computer-1".into(),
+            action: ActionKind::Computer,
+            description: "observe".into(),
+            tool: Some("computer".into()),
+            target: Some("com.apple.TextEdit#window:1".into()),
+            preview: None,
+        };
+        assert_eq!(
+            computer_window_denial_reason(&approval, &store).as_deref(),
+            Some(
+                "The user kept their window to themselves. Leave it alone: open a new window instead (for example with key cmd+n, or launch_app with open), or ask the user."
+            )
+        );
+        for target in [
+            "com.apple.TextEdit",
+            "com.apple.TextEdit#window:bad",
+            "com.apple.TextEdit#window:1#secure",
+        ] {
+            approval.target = Some(target.into());
+            assert!(computer_window_denial_reason(&approval, &store).is_none());
+        }
+        approval.target = Some("com.apple.TextEdit#window:1".into());
+        approval.tool = Some("bash".into());
+        assert!(computer_window_denial_reason(&approval, &store).is_none());
+    }
+
+    #[test]
+    fn computer_app_and_password_denials_still_require_approval() {
+        for arguments in [
+            serde_json::json!({"action":"observe", "app":"TextEdit"}),
+            serde_json::json!({"action":"type", "app":"TextEdit", "text":"secret", "target":{"element":14}}),
+        ] {
+            let handler = ComputerApprovalRecording::default();
+            let (status, result, _) = execute_computer_arguments_for_approval(
+                &computer_config(),
+                orca_computer_use::fake::FakeDesktop::with_textedit(),
+                true,
+                &handler,
+                arguments,
+            );
+            assert_eq!(result.status, ToolStatus::Denied);
+            assert_eq!(result.error.as_deref(), Some("denied in test"));
+            assert_eq!(status, RunStatus::ApprovalRequired);
+        }
+        // A password field in a user's window stays on the secure denial path.
+        let mut desktop = orca_computer_use::fake::FakeDesktop::with_textedit();
+        desktop.snapshots_see_windows = true;
+        let handler = ComputerApprovalRecording::default();
+        let (status, result, _) = execute_computer_arguments_for_approval(
+            &computer_config(),
+            desktop,
+            true,
+            &handler,
+            serde_json::json!({"action":"type", "app":"TextEdit", "window":1, "text":"secret", "target":{"element":14}}),
+        );
+        assert_eq!(
+            handler.0.lock().unwrap()[0].target.as_deref(),
+            Some("com.apple.TextEdit#window:1#secure")
+        );
+        assert_eq!(result.error.as_deref(), Some("denied in test"));
+        assert_eq!(status, RunStatus::ApprovalRequired);
     }
 
     #[test]
@@ -3114,6 +3269,7 @@ mod tests {
                 sink: &mut sink,
                 tool_request: &request,
                 invocation: &invocation,
+                turn_store: None,
                 policy: &policy,
                 permission_overlay: &mut overlay,
                 approval_handler: Some(&handler),
@@ -3164,6 +3320,7 @@ mod tests {
             sink: &mut sink,
             tool_request: &request,
             invocation: &invocation,
+            turn_store: None,
             policy: &policy,
             permission_overlay: &mut overlay,
             approval_handler: None,

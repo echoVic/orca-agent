@@ -64,7 +64,7 @@ CLI 选项优先于环境变量、受信任项目配置、用户配置和内置�
 | `1` Allow once | 执行这一次。 |
 | `2` Allow this exact call | 执行，并且之后同一工具、同一目标的调用不再询问。调用没有具体目标时不提供这一项。 |
 | `3` Allow `<tool>` this session | 执行，并且在退出前不再询问这个工具。`computer` 显示为 **Allow all apps this session**（本会话允许所有应用）。 |
-| `4` Deny | 不执行。本轮停下，由你告诉 Orca 换什么做法。按 `Esc` 也是拒绝。 |
+| `4` Deny | 不执行，本轮停下；普通的已有窗口面板除外，Orca 可以继续新开自己的窗口。Esc 可能直接停止整轮：本轮已经执行过 computer 调用后，即使这个面板还开着，Orca 的 Esc 监听也会停止这一轮。 |
 | `5` Always allow `<tool>` (saved) | MCP 工具和 computer use 提供。执行，本会话内不再询问这个工具，并把一条允许规则保存到用户配置，之后的会话也不再询问。`computer` 显示为 **Always allow all apps (saved)**（总是允许所有应用），保存的是 `pattern = "*"`。 |
 | `6` Always allow the `<server>` server (saved) | 仅 MCP 工具提供。执行，本会话内该服务器上的所有工具都不再询问，改为保存一条覆盖整个服务器的允许规则。 |
 | `7` Always allow this app (saved) | 仅 computer use 提供。执行，本会话允许该应用，并保存一条精确匹配其 bundle id 的 allow 规则。 |
@@ -76,6 +76,15 @@ MCP 工具的调用里，选项 `5`、`6` 取代 `2` 的位置：MCP 工具调�
 all apps (saved) 和 `4` Deny。没有解析出应用目标的 computer 审批
 只有 `1` 和 `4`。
 
+你的已有窗口使用另一组选择：`1` **Allow this window once**（仅这一次）、
+`2` **Allow this window this session**（本会话允许这个窗口）和 `4` **Deny**。
+想保留窗口并让 Orca 继续，请按 `4`（拒绝）。Esc 可能直接停止整轮：本轮已经执行过
+computer 调用后，即使这个面板还开着，Orca 的 Esc 监听也会停止这一轮。
+窗口面板不提供保存或所有应用的选项。
+在 `full-auto` 之外，应用、通配符和整个工具的 allow 规则都不覆盖这些窗口，
+只有精确窗口 allow 才行。`full-auto` 不询问窗口，密码输入的规则见下文。
+归属规则和已知限制见[你的窗口](computer-use.md#你的窗口)。
+
 在 `full-auto` 之外，终端和 IDE 需要针对该应用本身的授权：`1`、`2` 或 `7`，
 或者 `pattern` 为精确 bundle id 的 allow 规则。**Allow all apps this session**、
 `pattern = "*"` 或其他通配符，以及整个工具的 allow 规则都不覆盖它们。
@@ -85,7 +94,11 @@ all apps (saved) 和 `4` Deny。没有解析出应用目标的 computer 审批
 或能输入文字的 `key` 调用都会单独询问，包括单独或配合 Shift/Option 的可打印键和
 `Cmd+V`。应用授权、所有应用的授权、`full-auto` 和带 `pattern` 的 allow 规则都不能
 预先批准，包括 `*` 和显式写了 `#secure` 目标的规则。对不能执行命令的应用，只有整个工具的 allow 规则，即为 `computer` 设置 allow 且不写
-`pattern`，能预先批准；匹配的 deny 规则仍优先。详见[Computer use](computer-use.md#应用授权)。
+`pattern`，能预先批准；但在 `full-auto` 之外，你的已有窗口中的密码输入不能被任何
+allow 规则预先批准。`full-auto` 中，密码输入使用普通的 `bundle#secure` 目标，
+因此上述整个工具规则可以预先批准不能执行命令的应用的密码输入。
+窗口 deny 和 prompt 规则（`bundle#window:<id>`）此时不适用；应用 deny 和 prompt
+规则仍生效。匹配的 deny 规则仍优先。详见[Computer use](computer-use.md#应用授权)。
 
 驱动因坐标操作或过期观察，在投递时才发现密码框时，会拒绝未批准的输入。
 需要重新观察，再以密码框的元素 id 重试并请求审批。
@@ -101,7 +114,7 @@ all apps (saved) 和 `4` Deny。没有解析出应用目标的 computer 审批
 在 plan 模式下，Orca 只读地调查，可能会先问几个澄清问题，最后给出计划。随后 **Plan ready** 对话框让你选择：实现计划（切回进入 plan 之前的模式；如果会话一开始就在 plan 模式，则切到 auto-edit），或者留在 plan 模式继续完善。对话进行到一半也可以切到 plan 模式。详见[终端界面](terminal-ui.md)。
 
 对于 `computer`，plan 模式只允许 `list_apps` 和 `observe`。`list_apps` 不需要应用授权；
-`observe` 会请求应用授权，已有适用规则或授权时除外。规则不能放开 plan 模式下的其他
+`observe` 会请求应用授权，已有适用规则或授权时除外。观察你的已有窗口还需要这个窗口自己的授权。规则不能放开 plan 模式下的其他
 computer 动作。`full-auto` 下的应用调用不再请求应用授权，详见[Computer use](computer-use.md#审批模式)。
 
 ## 权限规则
@@ -127,7 +140,7 @@ decision = "deny"
 
 `decision` 可以是 `allow`、`prompt` 或 `deny`；多条规则同时匹配时，取最严格的一条。规则按工具名和调用目标匹配：`bash` 的目标是命令行，文件工具的目标是路径。在 `bash` 的 pattern 里，`*` 匹配任意文本（包括 `/`），所以 `rm -rf *` 也能拦住 `rm -rf /tmp/build`。在路径 pattern 里，`*` 和 `?` 不跨目录，`**` 可以跨目录。Windows 上匹配不区分 ASCII 大小写。规则不能放宽 plan 模式的限制。
 
-不写 `pattern` 的规则覆盖这个工具的所有调用，不论目标是什么：任何路径（包括嵌套路径和绝对路径）、任何命令。这与 `pattern = "*"` 不同，后者在路径里不跨目录。写 allow 规则时要当心：`tool = "bash"`、`decision = "allow"` 而不写 `pattern`，会让 Orca 不经询问执行任何命令。
+不写 `pattern` 的规则通常覆盖这个工具的所有调用，不论目标是什么：任何路径（包括嵌套路径和绝对路径）、任何命令。`computer` 的 allow 规则仍受前文的窗口和可执行命令应用的限制。这与 `pattern = "*"` 不同，后者在路径里不跨目录。写 allow 规则时要当心：`tool = "bash"`、`decision = "allow"` 而不写 `pattern`，会让 Orca 不经询问执行任何命令。
 
 MCP 工具的名字是 `mcp__<server>__<tool>`，规则可以精确匹配某一个；写成 `mcp__<server>__*`（或者只写 `mcp__<server>`）就覆盖该服务器上的所有工具。MCP 规则不要写 `pattern`：MCP 调用的目标就是工具自己的名字，比如 `mcp__github__create_issue`，pattern 只能重复 `tool` 已经写明的内容。规则里 `mcp__` 名字的服务器段和工具段，会按 Orca 给 MCP 工具命名的方式规范化：转成小写，连续的其他字符换成一个 `_`，所以 `mcp__My-Server__deleteRepo` 指的是工具 `mcp__my_server__deleterepo`。`/mcp` 面板里服务器的详情列出了每个工具在规则里的写法。
 
@@ -142,6 +155,13 @@ decision = "deny"
 ~~~
 
 同时有这两条规则时，`github` 服务器上的工具都不再询问，只有 `delete_repo` 被更严格的 deny 规则拒绝。
+
+## 审批恢复
+
+轮次仍在运行时，等待中的审批照常可以回答。MCP 工具的定义可能在重连时变化，
+因此 MCP 审批不会在重启后恢复。仅本轮提供的工具，除非 Orca 能还原相同的定义，
+否则也不恢复审批。旧记录缺少这项证明时会拒绝恢复。
+重新打开历史不会批准已变化或已缺失的工具；请先检查状态，再发起新请求。
 
 ## 信任是独立边界
 

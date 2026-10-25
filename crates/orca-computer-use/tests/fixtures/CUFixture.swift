@@ -54,6 +54,17 @@ final class Controller: NSObject, NSTextFieldDelegate {
         window.makeFirstResponder(nil)
         log(["type": "focus_reset"])
     }
+    var newWindows: [NSWindow] = []
+    @objc func newProbeWindow(_ sender: Any?) {
+        let extra = NSWindow(contentRect: NSRect(x: 260, y: 160, width: 480, height: 320),
+                             styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        extra.title = "Orca CU Fixture New"
+        extra.isReleasedWhenClosed = false
+        extra.makeKeyAndOrderFront(nil)
+        newWindows.append(extra)
+        log(["type": "new_window"])
+    }
+
     func controlTextDidChange(_ note: Notification) {
         if let field = note.object as? NSTextField { log(["type": "input", "value": field.stringValue]) }
     }
@@ -165,6 +176,10 @@ submenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:))
 submenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
 edit.submenu = submenu; menu.addItem(edit); app.mainMenu = menu
 let controller = Controller()
+// Cmd+N opens another window, as File > New Window does in a real app.
+submenu.addItem(withTitle: "New Window", action: #selector(Controller.newProbeWindow(_:)),
+                keyEquivalent: "n").target = controller
+
 let window = ProbeWindow(contentRect: NSRect(x: 200, y: 200, width: 640, height: 480),
                       styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
 window.title = "Orca CU Fixture"

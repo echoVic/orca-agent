@@ -5,12 +5,132 @@ use super::{
     tree::ElementTable,
 };
 use crate::{
-    keys::parse_combo,
+    keys::{KeyStroke, parse_combo},
     protocol::{
         ActOutcome, ActParams, Action, Button, Direction, DriverError, ErrorKind, ObserveParams,
         Target,
     },
 };
+
+#[derive(Debug, PartialEq)]
+enum RecipientDelivery {
+    Background,
+    Foreground,
+}
+
+fn recipient_delivery<T: PartialEq>(
+    recipient_window: Option<&T>,
+    selected_window: &T,
+    foreground_fallback: bool,
+    description: &str,
+) -> Result<RecipientDelivery, DriverError> {
+    if recipient_window == Some(selected_window) {
+        Ok(RecipientDelivery::Background)
+    } else if foreground_fallback {
+        Ok(RecipientDelivery::Foreground)
+    } else {
+        Err(foreground(format!(
+            "The {description} is in another window of the app; foreground delivery is required"
+        )))
+    }
+}
+
+// Keep the keyboard guard testable without native AX reads.
+fn keyboard_recipient_delivery<T: PartialEq>(
+    target: Option<Target>,
+    selected_window: &T,
+    foreground_fallback: bool,
+    read_window: impl FnOnce() -> Result<Option<T>, DriverError>,
+) -> Result<RecipientDelivery, DriverError> {
+    // The target explains the request, but the app's actual focus receives keys.
+    // Even an observed element cannot exempt that recipient from the boundary.
+    let description = if matches!(target, Some(Target::Element { .. })) {
+        "focus for the element target"
+    } else {
+        "focus"
+    };
+    let window = read_window()?;
+    recipient_delivery(
+        window.as_ref(),
+        selected_window,
+        foreground_fallback,
+        description,
+    )
+}
+
+struct RecipientBoundary<'a> {
+    selected: &'a AxElement,
+    foreground_fallback: bool,
+    deadline: std::time::Instant,
+}
+
+impl RecipientBoundary<'_> {
+    fn check(&self, element: &AxElement, description: &str) -> Result<(), DriverError> {
+        let window = self.window_of(element)?;
+        match recipient_delivery(
+            window.as_ref(),
+            self.selected,
+            self.foreground_fallback,
+            description,
+        )? {
+            RecipientDelivery::Background => Ok(()),
+            RecipientDelivery::Foreground => Err(foreground(format!(
+                "The {description} is in another window of the app"
+            ))),
+        }
+    }
+
+    fn window_of(&self, element: &AxElement) -> Result<Option<AxElement>, DriverError> {
+        let mut current = element.clone();
+        let mut visited = Vec::new();
+        loop {
+            check_scroll_deadline(self.deadline)?;
+            if current == *self.selected {
+                return Ok(Some(current));
+            }
+            if visited.contains(&current) {
+                return Ok(None);
+            }
+            visited.push(current.clone());
+            if let Some(window) = current.modal_attribute_element("AXWindow")?
+                && window != current
+            {
+                current = window;
+                continue;
+            }
+            // Some apps expose a sheet as AXWindow; resolve its attachment
+            // rather than treating the sheet as an unrelated document window.
+            let role = current.modal_attribute_string("AXRole")?;
+            let subrole = current.modal_attribute_string("AXSubrole")?;
+            if top_level_is_sheet(role.as_deref(), subrole.as_deref()) {
+                let Some(parent) = current.modal_attribute_element("AXParent")? else {
+                    return Ok(None);
+                };
+                current = parent;
+            } else {
+                return Ok((role.as_deref() == Some("AXWindow")).then_some(current));
+            }
+        }
+    }
+
+    fn keyboard(
+        &self,
+        application: &AxElement,
+        element: &AxElement,
+        target: Option<Target>,
+    ) -> Result<(), DriverError> {
+        match keyboard_recipient_delivery(target, self.selected, self.foreground_fallback, || {
+            let focused = keyboard_recipient(application, Some(element))?
+                .ok_or_else(|| foreground("The app has no focused element"))?;
+            self.window_of(&focused)
+        })? {
+            RecipientDelivery::Background => Ok(()),
+            RecipientDelivery::Foreground => {
+                Err(foreground("The focus is in another window of the app"))
+            }
+        }
+    }
+}
 
 pub(super) fn stale() -> DriverError {
     error(
@@ -282,64 +402,58 @@ impl MacDriver {
 
         capture::check_unlocked()?;
         let app = apps::resolve_approved(&params.app)?;
+        if !params.user_windows.is_empty()
+            && let Action::Key { keys, .. } = &params.action
+            && parse_combo(keys)
+                .map_err(|message| error(ErrorKind::Failed, message))?
+                .acts_on_every_window()
+        {
+            return Err(error(
+                ErrorKind::UserWindow,
+                crate::messages::app_wide_key(&app.name),
+            ));
+        }
         let pid = app
             .pid
             .ok_or_else(|| error(ErrorKind::AppNotFound, "The app is not running"))?;
         let application = AxElement::application(pid)?;
         let windows = capture::windows()?;
-        if params.window.is_none() && !super::app_has_window(&application)? {
-            let Action::Key { keys, target: None } = &params.action else {
-                return Err(error(
-                    ErrorKind::WindowNotFound,
-                    crate::messages::no_window(&app.name),
-                ));
-            };
-            let stroke = parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
-            if !stroke.is_app_shortcut() {
-                return Err(error(
-                    ErrorKind::WindowNotFound,
-                    crate::messages::no_window(&app.name),
-                ));
-            }
-            if !params.foreground_fallback {
-                return Err(error(
-                    ErrorKind::NeedsForeground,
-                    "A shortcut for an app without a window needs the foreground; the foreground fallback is turned off",
-                ));
-            }
-            let note = foreground::run_app_shortcut(
+        // General shortcuts require proven AX emptiness and no real user windows.
+        // A failed probe is inconclusive: let the normal resolver skip unreadable
+        // candidates. With no usable window, only lone Cmd+N can recover.
+        let ax_windows = if params.window.is_none() {
+            super::app_window_facts(&application).ok()
+        } else {
+            None
+        };
+        let windowless = params.window.is_none()
+            && super::windows::windowless(
+                pid,
+                &windows,
+                ax_windows.as_deref(),
+                &params.user_windows,
+            );
+        let resolved = if windowless {
+            None
+        } else {
+            match resolve_window(
                 &application,
+                pid,
                 &app.name,
-                stroke,
-                &self.aborted,
-                action_deadline,
-            )?;
-            let mut outcome = ActOutcome {
-                foreground_used: true,
-                note: Some(note),
-                scroll_position: None,
-                observation: None,
-            };
-            if params.observe_after {
-                // Cmd+N usually opens a window; show it, or say none appeared.
-                match self.observe(ObserveParams {
-                    app: params.app,
-                    window: None,
-                    query: None,
-                    max_elements: 300,
-                    include_screenshot: params.include_screenshot,
-                }) {
-                    Ok(observation) => outcome.observation = Some(observation),
-                    Err(_) => {
-                        let note = outcome.note.get_or_insert_with(String::new);
-                        note.push_str("; no window appeared yet; observe again");
-                    }
+                &windows,
+                params.window,
+                &params.user_windows,
+            ) {
+                Ok(resolved) => Some(resolved),
+                Err(error) if recover_with_app_shortcut(params.window, &params.action, &error) => {
+                    None
                 }
+                Err(error) => return Err(error),
             }
-            return Ok(outcome);
-        }
-        let (ax_window, window) =
-            resolve_window(&application, pid, &app.name, &windows, params.window)?;
+        };
+        let Some((ax_window, window)) = resolved else {
+            return self.app_shortcut(params, &application, &app.name, windowless, action_deadline);
+        };
         let id = window.id;
         let table = self
             .element_tables
@@ -373,6 +487,11 @@ impl MacDriver {
             scroll_position: None,
             observation: None,
         };
+        let boundary = RecipientBoundary {
+            selected: &ax_window,
+            foreground_fallback: params.foreground_fallback,
+            deadline: action_deadline,
+        };
         let background = (|| {
             match &params.action {
                 Action::Click {
@@ -396,6 +515,9 @@ impl MacDriver {
                     let hidden = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
                         .is_some_and(|app| app.isHidden());
                     let element = click_target_element(table, &application, *target, hidden)?;
+                    if matches!(target, Target::Point { .. }) {
+                        boundary.check(&element, "point")?;
+                    }
                     if needs_foreground {
                         return Err(foreground(click_message));
                     }
@@ -420,6 +542,7 @@ impl MacDriver {
                             for depth in 0..=5 {
                                 let Some(element) = candidate else { break };
                                 if element.actions()?.iter().any(|a| a == "AXPress") {
+                                    boundary.check(&element, "point")?;
                                     element.perform("AXPress")?;
                                     pressed = true;
                                     break;
@@ -452,17 +575,19 @@ impl MacDriver {
                             if type_target_was_focused {
                                 element
                             } else {
-                                focus(table, &application, Some(*target))?
+                                focus(table, &application, Some(*target), &boundary)?
                             }
                         }
-                        _ => focus(table, &application, *target)?,
+                        _ => focus(table, &application, *target, &boundary)?,
                     };
                     check_type_recipient(&element, text)?;
+                    boundary.keyboard(&application, &element, *target)?;
                     check_background_keyboard(pid, &application, &element, action_deadline)?;
                     check_secure_approval(&application, Some(&element), params.secure_approved)?;
                     if target.is_some() {
                         let focused = keyboard_recipient(&application, Some(&element))?
                             .ok_or_else(|| foreground("The app has no focused element"))?;
+                        boundary.check(&focused, "focus")?;
                         if should_collapse_type_selection(type_target_was_focused) {
                             focused.collapse_selection_to_end();
                         }
@@ -474,6 +599,7 @@ impl MacDriver {
                     }
                     let recipient = keyboard_recipient(&application, Some(&element))?
                         .ok_or_else(|| foreground("The app has no focused element"))?;
+                    boundary.check(&recipient, "focus")?;
                     check_type_recipient(&recipient, text)?;
                     events::post_unicode_text(pid, text, || {
                         verify_type_recipient(&application, &recipient, false)
@@ -484,7 +610,8 @@ impl MacDriver {
                         parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
                     // On the real Mac, process-directed Cmd+A/Cmd+S events
                     // reached the app but did not dispatch its menu shortcut.
-                    let element = focus(table, &application, *target)?;
+                    let element = focus(table, &application, *target, &boundary)?;
+                    boundary.keyboard(&application, &element, *target)?;
                     check_background_keyboard(pid, &application, &element, action_deadline)?;
                     if stroke.enters_text() {
                         check_secure_approval(
@@ -504,6 +631,9 @@ impl MacDriver {
                     amount,
                 } => {
                     let element = target_element(table, &application, *target)?;
+                    if matches!(target, Target::Point { .. }) {
+                        boundary.check(&element, "point")?;
+                    }
                     outcome.scroll_position =
                         scroll(table, element, *direction, *amount, action_deadline)?;
                 }
@@ -538,6 +668,7 @@ impl MacDriver {
                 query: None,
                 max_elements: 300,
                 include_screenshot: params.include_screenshot,
+                user_windows: params.user_windows.clone(),
             });
             match observation {
                 Ok(observation) => outcome.observation = Some(observation),
@@ -574,6 +705,99 @@ impl MacDriver {
         }
         Ok(outcome)
     }
+
+    /// General shortcuts require no AX window and no real user windows.
+    /// Otherwise only lone Cmd+N may reach the user-window/desktop recovery path.
+    fn app_shortcut(
+        &mut self,
+        params: ActParams,
+        application: &AxElement,
+        app_name: &str,
+        windowless: bool,
+        action_deadline: std::time::Instant,
+    ) -> Result<ActOutcome, DriverError> {
+        let Action::Key { keys, target: None } = &params.action else {
+            return Err(error(
+                ErrorKind::WindowNotFound,
+                crate::messages::no_window(app_name),
+            ));
+        };
+        let stroke = parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
+        if !app_shortcut_allowed(stroke, windowless) {
+            return Err(error(
+                ErrorKind::WindowNotFound,
+                crate::messages::no_window(app_name),
+            ));
+        }
+        if !params.foreground_fallback {
+            return Err(error(
+                ErrorKind::NeedsForeground,
+                "A shortcut for an app without a window needs the foreground; the foreground fallback is turned off",
+            ));
+        }
+        let note = foreground::run_app_shortcut(
+            application,
+            app_name,
+            stroke,
+            windowless,
+            &params.user_windows,
+            &self.aborted,
+            action_deadline,
+        )?;
+        let mut outcome = ActOutcome {
+            foreground_used: true,
+            note: Some(note),
+            scroll_position: None,
+            observation: None,
+        };
+        if params.observe_after {
+            // Show a new window, or warn that Cmd+N may have acted in a user window.
+            match self.observe(ObserveParams {
+                app: params.app,
+                window: None,
+                query: None,
+                max_elements: 300,
+                include_screenshot: params.include_screenshot,
+                user_windows: params.user_windows.clone(),
+            }) {
+                Ok(observation) => outcome.observation = Some(observation),
+                Err(_) => {
+                    let note = outcome.note.get_or_insert_with(String::new);
+                    note.push_str("; ");
+                    note.push_str(if windowless {
+                        "no window appeared yet; observe again"
+                    } else {
+                        crate::messages::CMD_N_OPENED_NO_WINDOW
+                    });
+                }
+            }
+        } else if !windowless {
+            let note = outcome.note.get_or_insert_with(String::new);
+            note.push_str("; ");
+            note.push_str(crate::messages::CMD_N_OPENED_NO_WINDOW);
+        }
+        Ok(outcome)
+    }
+}
+
+fn app_shortcut_allowed(stroke: KeyStroke, windowless: bool) -> bool {
+    stroke.is_app_shortcut() && (windowless || stroke.opens_new_window())
+}
+
+fn recover_with_app_shortcut(window: Option<u32>, action: &Action, failure: &DriverError) -> bool {
+    window.is_none()
+        && matches!(
+            failure.kind,
+            ErrorKind::UserWindow | ErrorKind::WindowNotFound
+        )
+        && opens_new_window(action)
+}
+
+/// Lone untargeted Cmd+N is allowed when only user windows remain;
+/// whether it opens a window depends on the app.
+fn opens_new_window(action: &Action) -> bool {
+    matches!(action, Action::Key { keys, target: None }
+        if parse_combo(keys).is_ok_and(|stroke| stroke.opens_new_window()))
 }
 
 fn window_gone(application: &AxElement, window: &AxElement, pid: i32) -> bool {
@@ -768,9 +992,13 @@ fn focus(
     table: &ElementTable,
     application: &AxElement,
     target: Option<Target>,
+    boundary: &RecipientBoundary<'_>,
 ) -> Result<AxElement, DriverError> {
     if let Some(target) = target {
         let element = target_element(table, application, target)?;
+        if matches!(target, Target::Point { .. }) {
+            boundary.check(&element, "point")?;
+        }
         if element.attribute_string("AXRole")?.as_deref() == Some("AXWindow")
             && application
                 .attribute_element("AXFocusedUIElement")?
@@ -795,9 +1023,11 @@ fn focus(
         }
         Ok(element)
     } else {
-        application
+        let element = application
             .attribute_element("AXFocusedUIElement")?
-            .ok_or_else(|| foreground("The app has no focused element"))
+            .ok_or_else(|| foreground("The app has no focused element"))?;
+        boundary.check(&element, "focus")?;
+        Ok(element)
     }
 }
 
@@ -923,6 +1153,101 @@ fn scroll(
 mod tests {
     use super::*;
     use crate::geometry::CaptureGeometry;
+
+    fn shortcut(keys: &[&str]) -> Action {
+        Action::Key {
+            keys: keys.iter().map(|key| (*key).into()).collect(),
+            target: None,
+        }
+    }
+
+    #[test]
+    fn an_unusable_ax_window_allows_only_lone_cmd_n_recovery() {
+        let missing = error(
+            ErrorKind::WindowNotFound,
+            crate::messages::no_window("Finder"),
+        );
+        let new_window = shortcut(&["cmd", "n"]);
+        assert!(recover_with_app_shortcut(None, &new_window, &missing));
+        assert!(app_shortcut_allowed(
+            parse_combo(&["cmd".into(), "n".into()]).unwrap(),
+            false
+        ));
+        for keys in [
+            &["cmd", "shift", "n"][..],
+            &["cmd", "delete"],
+            &["cmd", "a"],
+            &["cmd", "o"],
+            &["cmd", "down"],
+            &["cmd", "d"],
+            &["cmd", "l"],
+            &["escape"],
+            &["ctrl", "a"],
+        ] {
+            let action = shortcut(keys);
+            assert!(
+                !recover_with_app_shortcut(None, &action, &missing),
+                "{keys:?}"
+            );
+            let Action::Key { keys: combo, .. } = action else {
+                unreachable!()
+            };
+            assert!(
+                !app_shortcut_allowed(parse_combo(&combo).unwrap(), false),
+                "{keys:?}"
+            );
+        }
+        assert!(!recover_with_app_shortcut(Some(45), &new_window, &missing));
+        let targeted = Action::Key {
+            keys: vec!["cmd".into(), "n".into()],
+            target: Some(Target::Element { element: 1 }),
+        };
+        assert!(!recover_with_app_shortcut(None, &targeted, &missing));
+        assert!(!recover_with_app_shortcut(
+            None,
+            &new_window,
+            &error(ErrorKind::Failed, "AX read failed")
+        ));
+    }
+
+    #[test]
+    fn a_genuinely_windowless_app_keeps_general_shortcuts() {
+        // TextEdit's system Open panel belongs to another process; its AX
+        // application lists no window and there are no real user captures.
+        assert!(super::super::windows::windowless(7, &[], Some(&[]), &[]));
+        for keys in [
+            &["cmd", "n"][..],
+            &["cmd", "o"],
+            &["ctrl", "a"],
+            &["escape"],
+        ] {
+            let combo = keys.iter().map(|key| (*key).into()).collect::<Vec<_>>();
+            assert!(
+                app_shortcut_allowed(parse_combo(&combo).unwrap(), true),
+                "{keys:?}"
+            );
+        }
+        assert!(!app_shortcut_allowed(
+            parse_combo(&["cmd".into(), "v".into()]).unwrap(),
+            true
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_windowless_probe_leaves_cmd_n_recovery_to_the_resolver() {
+        assert!(!super::super::windows::windowless(7, &[], None, &[]));
+        let theirs = error(ErrorKind::UserWindow, "only user windows remain");
+        assert!(recover_with_app_shortcut(
+            None,
+            &shortcut(&["cmd", "n"]),
+            &theirs
+        ));
+        assert!(!recover_with_app_shortcut(
+            None,
+            &shortcut(&["cmd", "a"]),
+            &theirs
+        ));
+    }
 
     #[test]
     fn typing_into_an_already_focused_element_keeps_its_selection() {
@@ -1083,6 +1408,45 @@ mod tests {
             read,
             std::time::Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT,
         )
+    }
+
+    #[test]
+    fn recipient_window_boundary_chooses_background_fallback_or_refusal() {
+        assert_eq!(
+            recipient_delivery(Some(&2), &2, false, "focus").unwrap(),
+            RecipientDelivery::Background
+        );
+        for recipient in [Some(&1), None] {
+            for description in ["focus", "point"] {
+                assert_eq!(
+                    recipient_delivery(recipient, &2, true, description).unwrap(),
+                    RecipientDelivery::Foreground
+                );
+                let failure = recipient_delivery(recipient, &2, false, description).unwrap_err();
+                assert_eq!(failure.kind, ErrorKind::NeedsForeground);
+                assert!(failure.message.contains(description));
+                assert!(failure.message.contains("another window of the app"));
+            }
+        }
+    }
+
+    #[test]
+    fn element_target_keyboard_uses_the_actual_recipients_window() {
+        let target = Some(Target::Element { element: 42 });
+        assert_eq!(
+            keyboard_recipient_delivery(target, &2, true, || Ok(Some(1))).unwrap(),
+            RecipientDelivery::Foreground
+        );
+        let failure = keyboard_recipient_delivery(target, &2, false, || Ok(Some(1))).unwrap_err();
+        assert_eq!(failure.kind, ErrorKind::NeedsForeground);
+        assert!(failure.message.contains("focus"));
+        assert!(failure.message.contains("another window of the app"));
+        for fallback in [false, true] {
+            assert_eq!(
+                keyboard_recipient_delivery(target, &2, fallback, || Ok(Some(2))).unwrap(),
+                RecipientDelivery::Background
+            );
+        }
     }
 
     #[test]

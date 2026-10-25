@@ -208,12 +208,17 @@ fn wait_for_user_idle(aborted: &AtomicBool, action_deadline: Instant) -> Result<
     }
 }
 
-/// Sends an app-level shortcut (Cmd+N while only a system Open panel shows) to
-/// an app with no window, then restores the previous app and pointer.
+/// Sends an app-level shortcut to an app with no window of its own to use,
+/// then restores the previous app and pointer: any such shortcut to an app
+/// with no window (Cmd+N while only a system Open panel shows), or Cmd+N to
+/// an app whose windows are all the user's. Cmd+N's effect depends on the app
+/// and may act within the user's key window instead of opening a new window.
 pub(super) fn run_app_shortcut(
     application: &AxElement,
     app_name: &str,
     stroke: KeyStroke,
+    windowless: bool,
+    user_windows: &[u32],
     aborted: &AtomicBool,
     action_deadline: Instant,
 ) -> Result<String, DriverError> {
@@ -243,11 +248,14 @@ pub(super) fn run_app_shortcut(
         thread::sleep(crate::timing::ACTIVATION_SETTLE);
         check_abort(aborted)?;
         // A window that appeared meanwhile has an unobserved focus: observe it first.
-        if super::app_has_window(application)? {
-            return Err(error(
-                ErrorKind::Stale,
-                format!("{app_name} now has a window; observe it before sending keys"),
-            ));
+        if windowless {
+            let captures = super::capture::windows()?;
+            if super::app_has_window(application, &captures, user_windows) {
+                return Err(error(
+                    ErrorKind::Stale,
+                    format!("{app_name} now has a window; observe it before sending keys"),
+                ));
+            }
         }
         let mut hid = HidEvents::new_until(pid, aborted, action_deadline)?;
         let sent = hid.key(stroke);

@@ -18,6 +18,17 @@ def row(tid, kind, passed, seconds):
 
 
 class ReportTests(unittest.TestCase):
+    def test_window_panels_and_unapproved_touches_are_aggregated(self):
+        first, second = row('S3', 'single', True, 2), row('M3', 'multi', True, 4)
+        first['metrics'].update(user_window_touches=[24538], window_panels=2, unattributed_calls=3)
+        a = aggregate([first, second], False)
+        self.assertEqual((a['user_window_touches'], a['window_panels']), (1, 2))
+        self.assertEqual(a.get('unattributed_calls'), 3)
+        self.assertEqual(a['tasks']['S3'].get('unattributed_calls'), 3)
+        self.assertEqual(a['tasks']['M3'].get('unattributed_calls'), 0)
+        self.assertEqual(a['tasks']['S3']['user_window_touches'], [24538])
+        self.assertEqual(a['tasks']['M3']['user_window_touches'], [])
+
     def test_aggregate_selected_tasks_and_dry_run_are_separate(self):
         rows = [row('S1', 'single', True, 2), row('M1', 'multi', False, 6)]
         a = aggregate(rows, False)

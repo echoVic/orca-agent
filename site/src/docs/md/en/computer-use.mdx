@@ -4,8 +4,11 @@
 
 Orca can see and operate other macOS apps with the `computer` tool: list or
 launch apps, inspect windows, click, type, send keys, and scroll. Use it to
-check a UI you just built or work in an app without a command-line interface;
-prefer file and command-line tools when they can do the job.
+check a UI you just built, work in an app without a command-line interface,
+or work in an app you name. When you name an app, Orca should complete the
+work there. For other tasks, prefer file and
+command-line tools when they can do the job. App launches use `launch_app`;
+shell `open` and `osascript` cannot reach apps from Orca's sandbox.
 
 ## Requirements
 
@@ -28,7 +31,7 @@ permission rule already decides the call or the session is in `full-auto` (see
 - `3` **Allow all apps this session**: skip approval for every app until you quit.
 - `7` **Always allow this app (saved)**: save an allow rule for this app for future sessions.
 - `5` **Always allow all apps (saved)**: save an allow rule for every app for future sessions.
-- `4` **Deny**: refuse the call and ask Orca for another way.
+- `4` **Deny**: refuse the call and stop the turn so you can ask for another way.
 
 Outside `full-auto`, terminals and IDEs need approval for that app itself:
 `1`, `2`, or `7`, or an allow rule whose `pattern` is the exact bundle id.
@@ -58,12 +61,56 @@ and neither does `full-auto`. Patterned allow rules, including exact app ids,
 wildcards such as `*`, and an explicit `#secure` target, also leave this check
 in place. Only a whole-tool allow rule for `computer`,
 without a `pattern`, preapproves it for apps that do not run commands. A matching deny rule still takes
-precedence; see [permission rules](approval-modes.md#permission-rules).
+precedence; see [permission rules](approval-modes.md#permission-rules). Outside
+`full-auto`, no allow rule preapproves password entry in your existing windows.
+In `full-auto`, it uses the ordinary `bundle#secure` target, which the
+whole-tool rule can preapprove for apps that do not run commands. Window deny
+and prompt rules (`bundle#window:<id>`) do not apply there; app deny and prompt
+rules still apply.
 
 If a point target or a stale observation reveals a password field only
 during delivery, Orca refuses unapproved input and sends no text. The result
 instructs the agent to observe again and target the secure field by its element id
 to request approval on retry.
+
+## Your windows
+
+Windows that were already open before Orca's first computer-use step for your message are yours, unless
+Orca opened them earlier in this session. Before Orca first observes or
+operates one of them, it asks about that window, naming its title:
+
+- `1` **Allow this window once**: run this call; later calls on the window ask again.
+- `2` **Allow this window this session**: skip approval for this window until you quit.
+- `4` **Deny**: refuse the call; Orca opens a new window instead, for example with Cmd+N.
+
+Outside `full-auto`, app grants, including **Allow all apps this session**,
+and allow rules for an app, a wildcard, or the whole tool do not cover your windows;
+only the window's own approval does. Deny and prompt rules for an app still apply to
+its windows. Without a window named, Orca leaves your windows alone: it uses a
+window it opened, or the model opens one (Cmd+N still reaches an app whose
+windows are all yours). Windows Orca opens are its own for the rest of the
+session. `full-auto` does not ask about windows, as it does not ask about
+apps; password entry still asks unless a whole-tool `computer` allow rule
+preapproves it for an app that does not run commands. In that mode its target
+is `bundle#secure`, so window deny and prompt rules do not apply; app deny and
+prompt rules still apply.
+
+In apps where Cmd+N does not open a window (Notes, for example, starts a new
+note), it acts in your frontmost window instead, and the result says that no
+new window opened.
+
+Opening a file or URL with `launch_app` can also land in one of your windows when the app reuses it (a browser may add a tab); the result says so.
+
+Cmd+Q, Cmd+Option+Q (Quit and Keep Windows), Cmd+Option+W (Close All),
+Cmd+Option+M (Minimize All) and Cmd+H (Hide) act on every window of an app
+and are refused while the app has any of your windows that the call is not approved to use (`full-auto` does not refuse them).
+
+`list_apps` lists window titles only for apps Orca has used in this session,
+marking yours `(yours)`; for other apps it shows only how many windows they
+have.
+
+Known limits: a window you open after Orca's first computer-use step for your message counts
+as Orca's, and so do windows an app restores when Orca launches it. An app that reuses one of its closed windows for a newly opened document (Preview, for example) can make Orca ask about that window.
 
 ## App risk levels
 
@@ -102,8 +149,11 @@ included, ask for app approval unless an applicable rule or grant already
 allows them.
 
 `full-auto` already runs commands on the host, so app calls run there without
-app approval. Password entry still asks each time, deny and prompt rules still
-apply, and apps blocked by default stay blocked.
+app approval. Password entry still asks each time unless a whole-tool
+`computer` allow rule preapproves it for an app that does not run commands.
+App deny and prompt rules still apply; window deny and prompt rules do not,
+because targets omit the window id in this mode. Apps blocked by default stay
+blocked.
 
 ## Observations and screenshots
 
@@ -124,9 +174,14 @@ screenshot (for example, `[1 image attached]`). Press `q` to close the preview.
 
 ## Stop
 
-From the first `computer` call until the turn ends, Orca captures `Esc`
-system-wide. `Esc` interrupts the running turn, including while another app
-is in the foreground or a screenshot preview is open.
+After the first `computer` call has run, Orca captures `Esc` system-wide
+until the turn ends. `Esc` interrupts the running turn, including while
+another app is in the foreground or a screenshot preview is open.
+
+Press `4` (Deny) to keep the window and let Orca continue. Esc can stop the
+whole turn instead: once a computer call has run in the turn, Orca's Esc
+listener stops the turn even while this panel is open. App and password-entry
+denials stop the turn.
 
 ## Background and foreground
 
@@ -154,16 +209,27 @@ instead of switching apps.
 When computer actions on one app fail three times in a row, Orca tells the
 model to stop trying workarounds and report what failed. After six failures
 in a row, Orca stops using that app for the rest of the turn; it is available
-again after your next message. A success resets the count.
+again after your next message. A success resets the count. Validation errors
+and timeouts count; approval denials, cancellation and `list_apps` do not.
 
-`list_apps` shows the windows Orca can observe, checked through Accessibility,
-and marks minimized windows. For an app that does not answer that check in
-time, it lists the app's visible document-sized windows instead, which observe
-may still refuse.
+For apps Orca has used in this session, `list_apps` shows the windows it can
+observe, checked through Accessibility, and marks minimized windows. For an
+app that does not answer that check in time, it lists the app's visible
+document-sized windows instead, which observe may still refuse.
 
 When an app has no window yet (for example, TextEdit showing only its Open
 panel), a Command or Control shortcut such as Cmd+N can be sent to the app
-without a window.
+without a window; Escape is also allowed, but text-entering keys are not.
+This needs foreground switching, and a window that appears during activation
+gets no unobserved input. When all of an app's windows are yours, or Finder
+shows only its desktop, only a lone Cmd+N can use this path. The driver never
+observes or operates the desktop or floating windows.
+
+Window errors distinguish an unusable id, a window not yet observed, a changed
+window, and an app with no window, with a next step for each. If raising a
+window fails but it is already the app's focused window, Orca can continue;
+otherwise it retries once. Input must still reach the selected window, and
+cover checks still apply.
 
 ## Disable computer use
 

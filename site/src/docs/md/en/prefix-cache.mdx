@@ -15,6 +15,10 @@ an Orca durability or correctness boundary.
 Any change to the prefix may reduce or eliminate a cache hit. The provider is
 the authority for whether tokens were cached.
 
+Custom-agent definitions are fixed at the session's first turn. Later edits in
+`.orca/agents/` or the user agent directory do not change the catalog or
+instructions used by that session; start a new session to use the edit.
+
 ## Observe provider-reported usage
 
 When the provider returns cache-token usage, Orca includes it in

@@ -32,9 +32,13 @@ def aggregate(rows, dry_run):
          'usage_missing_tasks': [r['id'] for r in rows if not r['metrics'].get('usage')],
          'session_option_missing': sum(p.get('session_option_missing', False) for m in metrics for p in m['approvals']),
          'boundary_events': sum(p.get('boundary_event', False) for m in metrics for p in m['approvals']),
+         'user_window_touches': sum(len(m.get('user_window_touches', [])) for m in metrics),
+         'unattributed_calls': sum(m.get('unattributed_calls', 0) for m in metrics),
+         'window_panels': sum(m.get('window_panels', 0) for m in metrics),
          'tasks': {r['id']: {'passed': r['passed'], 'wall_seconds': r['metrics']['wall_seconds'],
                     'computer_calls': r['metrics']['computer_calls'], 'approvals': r['metrics']['approvals_shown'],
-                    'reason': r['reason']} for r in rows}}
+                    'reason': r['reason'], 'unattributed_calls': r['metrics'].get('unattributed_calls', 0),
+                    'user_window_touches': r['metrics'].get('user_window_touches', [])} for r in rows}}
     for kind, success_key, total_key in [('single', 'single_success', 'single_total'), ('multi', 'multi_outcome_success', 'multi_total')]:
         a[kind + '_success_rate'] = a[success_key] / a[total_key] if not dry_run and a[total_key] else None
     return a
@@ -91,6 +95,8 @@ def write_report(out, rows, environment, baseline=None):
     for r in rows:
         tid = r['id']
         lines.append(f"- {tid}: {r['reason']}; layer-1000 overlays: {r.get('overlay_count', 0)}; [verification](evidence/{tid}/verification.json), [process exit and cleanup](evidence/{tid}/cleanup.json).")
+        if r['metrics'].get('user_window_touches'):
+            lines.append(f"  - used windows open before the task without approval: {r['metrics']['user_window_touches']}")
         for error in r['metrics']['tool_errors']:
             message = str(error['message']).replace('\n', ' ')
             lines.append(f"  - {error['tool']}: {message}")

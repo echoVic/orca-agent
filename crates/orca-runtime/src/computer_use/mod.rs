@@ -16,9 +16,14 @@ use crate::extension::ExtensionData;
 
 pub(crate) mod budget;
 pub(crate) mod execute;
+pub(crate) mod ownership;
 pub(crate) mod prepare;
 pub(crate) mod turn;
 pub(crate) mod visibility;
+
+/// A window snapshot lists windows without accessibility reads; the driver's
+/// own listing gives up after 10 s.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) struct ComputerUseService {
     launcher: Arc<dyn DriverLauncher>,
@@ -40,6 +45,12 @@ struct ServiceState {
     /// Driver restarts keep both: the warning is shown once per session.
     risk_warnings: HashMap<String, String>,
     warned_apps: HashSet<String>,
+    /// Windows that appeared during Orca's turns, by bundle ID: Orca's for the
+    /// rest of the session. Driver restarts keep them.
+    orca_windows: HashSet<(String, u32)>,
+    /// Apps whose calls reached the driver this session: approved, or in
+    /// full-auto. Only their windows are listed with titles.
+    used_apps: HashSet<String>,
     #[cfg(test)]
     before_esc_close: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -154,6 +165,22 @@ impl ComputerUseService {
         })
     }
 
+    pub(crate) fn note_used_app(&self, bundle_id: &str) {
+        self.state
+            .lock()
+            .expect("computer-use service lock poisoned")
+            .used_apps
+            .insert(bundle_id.to_owned());
+    }
+
+    pub(crate) fn used_app(&self, bundle_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("computer-use service lock poisoned")
+            .used_apps
+            .contains(bundle_id)
+    }
+
     pub(crate) fn start_turn(&self, cancel: &CancelToken) {
         self.state
             .lock()
@@ -162,7 +189,9 @@ impl ComputerUseService {
         let _ = self.call(Request::Turn { active: true }, Duration::from_secs(30));
     }
 
-    pub(crate) fn end_turn(&self) {
+    /// `start` is the turn's first window snapshot; windows that appeared since
+    /// become Orca's for the session.
+    pub(crate) fn end_turn(&self, start: Option<&ownership::Snapshot>) {
         let client = {
             let mut state = self
                 .state
@@ -173,10 +202,17 @@ impl ComputerUseService {
             state.driver.as_ref().map(|(client, _)| Arc::clone(client))
         };
         // Do not launch a replacement driver just to end an interrupted turn.
-        if let Some(client) = client
-            && client
-                .call(Request::Turn { active: false }, Duration::from_secs(30))
-                .is_err()
+        let Some(client) = client else {
+            return;
+        };
+        if let Some(start) = start
+            && let Ok(Reply::Apps { apps }) = client.call(Request::WindowSnapshot, SNAPSHOT_TIMEOUT)
+        {
+            self.note_orca_windows(start, &ownership::snapshot_of(apps));
+        }
+        if client
+            .call(Request::Turn { active: false }, Duration::from_secs(30))
+            .is_err()
         {
             self.reset();
         }
@@ -311,6 +347,35 @@ impl ComputerUseService {
             .latest_window
             .get(bundle_id)
             .copied()
+    }
+
+    /// Every app's windows by bundle ID, for telling the user's from Orca's.
+    pub(crate) fn snapshot_windows(&self) -> Result<ownership::Snapshot, String> {
+        match self.call(Request::WindowSnapshot, SNAPSHOT_TIMEOUT) {
+            Ok(Reply::Apps { apps }) => Ok(ownership::snapshot_of(apps)),
+            Ok(_) => Err("the driver did not reply with windows".into()),
+            Err(CallError::Driver(error)) => Err(error.message),
+            Err(CallError::TimedOut) => Err("the driver timed out".into()),
+            Err(CallError::Disconnected) => Err("the driver disconnected".into()),
+        }
+    }
+
+    /// Windows that appeared during a turn are Orca's for the rest of the session.
+    pub(crate) fn note_orca_windows(&self, start: &ownership::Snapshot, end: &ownership::Snapshot) {
+        let fresh = ownership::new_windows(start, end);
+        self.state
+            .lock()
+            .expect("computer-use service lock poisoned")
+            .orca_windows
+            .extend(fresh);
+    }
+
+    pub(crate) fn is_orca_window(&self, bundle_id: &str, id: u32) -> bool {
+        self.state
+            .lock()
+            .expect("computer-use service lock poisoned")
+            .orca_windows
+            .contains(&(bundle_id.to_owned(), id))
     }
 
     pub(crate) fn is_secure(&self, bundle_id: &str, window: Option<u32>, id: u32) -> bool {
@@ -472,6 +537,7 @@ mod tests {
                     query: None,
                     max_elements: 300,
                     include_screenshot: true,
+                    user_windows: vec![],
                 }),
                 Duration::from_secs(30),
             )
@@ -634,7 +700,7 @@ mod tests {
             2,
             "the replacement must remain usable without another restart"
         );
-        service.end_turn();
+        service.end_turn(None);
     }
 
     #[test]
@@ -739,6 +805,7 @@ mod tests {
                     query: None,
                     max_elements: 300,
                     include_screenshot: false,
+                    user_windows: vec![],
                 }),
                 Duration::from_secs(30),
             )

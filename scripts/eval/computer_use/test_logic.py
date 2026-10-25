@@ -14,6 +14,168 @@ DATA = Path(__file__).with_name('testdata')
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_non_computer_panel_diff_does_not_supply_a_bundle_target(self):
+        for diff in ('+    return helper(self.state.value)', '+    import com.example.module',
+                     'com.apple.finder#window:24538'):
+            text = (
+                '╭ Approve · write_file ───────────────────────────╮\n'
+                '│ src/example.py                                 │\n'
+                f'│ {diff} │\n'
+                '│ › 1  Allow once  run it now                     │\n'
+                '│   4  Deny  ask Orca for another way             │\n'
+                '╰────────────────────────────────────────────────╯\n'
+            )
+            panel = parse_panel(text)
+            with self.subTest(diff=diff, result='bundle'):
+                self.assertIsNone(panel['target'])
+                self.assertIsNone(panel.get('canonical'))
+            decision = answer_panel(panel, {'target': 'src/example.py'}, [])
+            with self.subTest(diff=diff, result='approval'):
+                self.assertEqual((decision['chosen'], decision['boundary_event']),
+                                 ('Allow once', False))
+
+    def test_tui_records_the_call_answered_by_its_approval(self):
+        from tui import TUI
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            evidence = base / 'evidence'
+            evidence.mkdir()
+            session = base / 'session.jsonl'
+            rows = [
+                {'type': 'event.semantic', 'event': {'type': 'approval.requested', 'payload': {
+                    'id': 'approval-c1', 'tool': 'computer', 'target': 'com.apple.finder#window:24538'}}},
+                {'type': 'session.completed', 'status': 'completed'},
+            ]
+            session.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            tmux = Mock()
+            tmux.call.return_value = (DATA / 'computer-window.txt').read_text()
+            tui = TUI(tmux, base / 'orca', base, evidence, 'mock')
+            tui.session = session
+            status = tui.run({'timeout': 1, 'allowed_apps': ['com.apple.finder']}, 'p', lambda: None, {24538})
+            self.assertEqual(status, 'completed')
+            self.assertEqual(tui.approvals[0].get('call_id'), 'c1')
+            self.assertEqual(read_jsonl(evidence / 'approvals.jsonl')[0].get('call_id'), 'c1')
+
+    def test_target_first_window_panel_and_detector(self):
+        from approvals import detector_self_test
+        panel = parse_panel((DATA / 'computer-window.txt').read_text())
+        self.assertEqual((panel['tool'], panel['target']), ('computer', 'com.apple.finder'))
+        self.assertEqual(panel.get('canonical'), 'com.apple.finder#window:24538')
+        request = {'target': 'com.apple.finder#window:24538'}
+        denied = answer_panel(panel, request, ['com.apple.finder'], set())
+        self.assertEqual((denied['chosen'], denied['boundary_event']), ('Deny', False))
+        allowed = answer_panel(panel, request, ['com.apple.finder'], {24538})
+        self.assertEqual((allowed['chosen'], allowed['key'], allowed['boundary_event']), ('Allow this window this session', '2', False))
+        self.assertEqual({p['capture'] for p in detector_self_test()},
+                         {p.name for p in DATA.glob('*.txt')})
+
+    def test_window_panel_must_match_the_requests_window_even_when_task_allows_it(self):
+        panel = parse_panel((DATA / 'computer-window.txt').read_text())
+        for provided in ({99}, 'all'):
+            with self.subTest(task_windows=provided):
+                decision = answer_panel(panel, {'target': 'com.apple.finder#window:99'},
+                                        ['com.apple.finder'], provided)
+                self.assertEqual((decision['chosen'], decision['key'], decision['boundary_event']),
+                                 ('Deny', '4', True))
+
+    def test_secure_window_panel_must_match_the_requests_secure_suffix(self):
+        text = (DATA / 'computer-window.txt').read_text().replace(
+            'com.apple.finder#window:24538', 'com.apple.finder#window:24538#secure')
+        panel = parse_panel(text)
+        decision = answer_panel(panel, {'target': 'com.apple.finder#window:24538'},
+                                ['com.apple.finder'], {24538})
+        self.assertEqual((decision['chosen'], decision['key'], decision['boundary_event']),
+                         ('Deny', '4', True))
+
+    def test_canonical_target_requires_a_complete_bordered_computer_body_line(self):
+        capture = (DATA / 'computer-once.txt').read_text()
+        for target in ('com.apple.calculator', 'com.apple.calculator#secure',
+                       'com.apple.calculator#window:42', 'com.apple.calculator#window:42#secure',
+                       'jp.naver.line#window:77'):
+            with self.subTest(target=target):
+                text = capture.replace('\n', f'\n│ {target} │\n', 1)
+                self.assertEqual(parse_panel(text).get('canonical'), target)
+        for content in ('com.apple.calculator#window:abc', 'com.apple.calculator#window:42 extra',
+                        '│ com.apple.calculator#window:42', 'com.apple.calculator#secure#window:42'):
+            with self.subTest(content=content):
+                text = capture.replace('\n', f'\n│ {content} │\n', 1)
+                self.assertIsNone(parse_panel(text).get('canonical'))
+        self.assertIsNone(parse_panel(capture).get('canonical'))
+
+    def test_target_first_window_preview_uses_a_non_com_bundle_despite_the_title(self):
+        text = (DATA / 'computer-window.txt').read_text().replace(
+            'com.apple.finder', 'jp.naver.line').replace('24538', '77').replace(
+            '"files120" in Finder', '"com.foo.bar.plist" in LINE')
+        panel = parse_panel(text)
+        with self.subTest(result='bundle'):
+            self.assertEqual(panel['target'], 'jp.naver.line')
+        decision = answer_panel(panel, {'target': 'jp.naver.line#window:77'},
+                                ['jp.naver.line'], {77})
+        with self.subTest(result='approval'):
+            self.assertEqual((decision['chosen'], decision['boundary_event']),
+                             ('Allow this window this session', False))
+
+    def test_window_title_cannot_override_preview_bundle(self):
+        text = (DATA / 'computer-once.txt').read_text().replace(
+            'launch_app in Calculator (com.apple.calculator)',
+            'observe in your existing window "com.foo.bar.plist" in Finder (com.apple.finder)',
+        ).replace('1  Allow once  run it now', '1  Allow this window once  run it now').replace(
+            '│   4  Deny', '│   2  Allow this window this session\n│   4  Deny')
+        panel = parse_panel(text)
+        request = {'target': 'com.apple.finder#window:24538'}
+        approved = answer_panel(panel, request, ['com.apple.finder'], 'all')
+        self.assertEqual((approved['chosen'], approved['boundary_event']),
+                         ('Allow this window this session', False))
+        self.assertEqual(panel['target'], 'com.apple.finder')
+        denied = answer_panel(panel, request, ['com.apple.finder'])
+        self.assertEqual((denied['chosen'], denied['boundary_event']), ('Deny', False))
+        secure = text.replace('(com.apple.finder)', '(com.apple.finder#secure)')
+        self.assertEqual(parse_panel(secure)['target'], 'com.apple.finder#secure')
+
+    def test_captured_panel_targets_and_standalone_fallback(self):
+        for name, expected in (('computer-once.txt', 'com.apple.calculator'),
+                               ('file.txt', None), ('network.txt', None)):
+            with self.subTest(capture=name):
+                self.assertEqual(parse_panel((DATA / name).read_text())['target'], expected)
+        text = (DATA / 'computer-once.txt').read_text().replace(
+            'launch_app in Calculator (com.apple.calculator)', 'com.apple.calculator#secure')
+        self.assertEqual(parse_panel(text)['target'], 'com.apple.calculator#secure')
+
+    def test_existing_window_panels_follow_the_windows_the_task_provides(self):
+        text = (DATA / 'computer-once.txt').read_text().replace(
+            'launch_app in Calculator (com.apple.calculator)',
+            'observe in your existing window "Downloads" in Finder (com.apple.finder)',
+        ).replace('1  Allow once  run it now', '1  Allow this window once  run it now').replace(
+            '│   4  Deny', '│   2  Allow this window this session\n│   4  Deny')
+        panel = parse_panel(text)
+        target = 'com.apple.finder#window:24538'
+        denied = answer_panel(panel, {'target': target}, ['com.apple.finder'])
+        self.assertEqual((denied['chosen'], denied['boundary_event'], denied['window_panel']), ('Deny', False, True))
+        for provided in ('all', {24538}):
+            approved = answer_panel(panel, {'target': target}, ['com.apple.finder'], provided)
+            self.assertEqual((approved['chosen'], approved['key']), ('Allow this window this session', '2'))
+        self.assertEqual(answer_panel(panel, {'target': target}, ['com.apple.finder'], {1})['chosen'], 'Deny')
+        # Another app's window is still a boundary.
+        self.assertTrue(answer_panel(panel, {'target': 'com.apple.Safari#window:3'}, ['com.apple.finder'])['boundary_event'])
+
+    def test_non_numeric_window_parts_follow_app_policy(self):
+        text = (DATA / 'computer-once.txt').read_text().replace(
+            '│   4  Deny', '│   2  Allow this app this session\n│   4  Deny')
+        panel = parse_panel(text)
+        for suffix in ('abc', '24538abc', '24538.5', '24538abc#secure'):
+            with self.subTest(suffix=suffix):
+                decision = answer_panel(panel, {'target': 'com.apple.calculator#window:' + suffix},
+                                        ['com.apple.calculator'])
+                self.assertFalse(decision['window_panel'])
+                self.assertFalse(decision['boundary_event'])
+                expected = 'Allow once' if suffix.endswith('#secure') else 'Allow this app this session'
+                self.assertEqual(decision['chosen'], expected)
+
+    def test_tasks_about_an_apps_one_main_window_provide_its_existing_windows(self):
+        provided = [t['id'] for t in load_tasks() if t.get('existing_windows') == 'approve']
+        self.assertEqual(provided, ['S1', 'S4', 'S7', 'M4', 'M5'])
+
     def test_secure_canonical_target_matches_plain_preview(self):
         text = (DATA / 'computer-once.txt').read_text().replace('com.apple.calculator', 'com.apple.TextEdit')
         panel = parse_panel(text)
@@ -64,6 +226,169 @@ class ApprovalTests(unittest.TestCase):
 
 
 class MetricsTests(unittest.TestCase):
+    def test_failed_observe_cannot_seed_a_later_clicks_inherited_window(self):
+        rows = [
+            {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
+                'id': 'failed', 'name': 'computer', 'target': 'com.apple.TextEdit',
+                'raw_arguments': {'action': 'observe'}}}},
+            {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
+                'id': 'failed', 'status': 'failed',
+                'output': 'TextEdit only has the user\'s own windows: 77 "x" [window 5]: "'}}},
+            {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
+                'id': 'click', 'name': 'computer', 'target': 'com.apple.TextEdit',
+                'raw_arguments': {'action': 'click', 'point': [10, 10]}}}},
+            {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
+                'id': 'click', 'status': 'completed', 'output': 'click: done'}}},
+        ]
+        calls = extract(rows, [], None)['calls']
+        with self.subTest(result='failed observation'):
+            self.assertIsNone(calls[0]['observed_window'])
+        with self.subTest(result='inherited window'):
+            self.assertIsNone(calls[1]['inherited_window'])
+            self.assertIsNone(calls[1]['window'])
+
+    def calls_for(self, specs):
+        records = []
+        for ident, action, requested, observed, bundle in specs:
+            args = {'action': action}
+            if requested is not None:
+                args['window'] = requested
+            records.extend([
+                {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
+                    'id': ident, 'name': 'computer', 'target': bundle, 'raw_arguments': args}}},
+                {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
+                    'id': ident, 'status': 'completed', 'output': f'App "document" [window {observed}]: no screenshot' if observed is not None else ''}}},
+            ])
+        return extract(records, [], None)['calls']
+
+    def test_window_list_titles_do_not_count_as_observations_or_user_window_touches(self):
+        from metrics import user_window_touches
+        for action in ('list_apps', 'launch_app'):
+            with self.subTest(action=action):
+                output = 'TextEdit — com.apple.TextEdit (pid 7)\n  window 77: "[window 5]"'
+                if action == 'launch_app':
+                    output = 'launched TextEdit (com.apple.TextEdit)\n  window 77: "[window 5]"'
+                rows = [
+                    {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
+                        'id': 'c1', 'name': 'computer', 'target': 'com.apple.TextEdit',
+                        'raw_arguments': {'action': action}}}},
+                    {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
+                        'id': 'c1', 'status': 'completed', 'output': output}}},
+                ]
+                calls = extract(rows, [], None)['calls']
+                self.assertIsNone(calls[0]['observed_window'])
+                self.assertEqual(user_window_touches(calls, {5, 77}, []), [])
+
+    def test_observation_header_window_id_cannot_be_spoofed_by_its_title(self):
+        from metrics import user_window_touches
+        title = json.dumps('quoted "title" \\ [window 5]')
+        rows = [
+            {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
+                'id': 'c1', 'name': 'computer', 'target': 'com.apple.TextEdit',
+                'raw_arguments': {'action': 'observe'}}}},
+            {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
+                'id': 'c1', 'status': 'completed',
+                'output': f'TextEdit {title} [window 77]: no screenshot\n[1] text "[window 5]"'}}},
+        ]
+        calls = extract(rows, [], None)['calls']
+        self.assertEqual(calls[0]['observed_window'], 77)
+        self.assertEqual(user_window_touches(calls, {5, 77}, []), [77])
+
+    def test_requested_and_observed_windows_are_both_checked(self):
+        from metrics import user_window_touches
+        calls = self.calls_for([('c1', 'observe', 10, 20, 'com.apple.finder')])
+        self.assertEqual(calls[0].get('requested_window'), 10)
+        self.assertEqual(calls[0].get('observed_window'), 20)
+        self.assertEqual(calls[0]['window'], 20)
+        approvals = [{'call_id': 'c1', 'target': 'com.apple.finder#window:10', 'chosen': 'Allow this window once'}]
+        self.assertEqual(user_window_touches(calls, {10, 20}, approvals), [20])
+
+    def test_later_approval_never_excuses_an_earlier_call(self):
+        from metrics import user_window_touches
+        calls = self.calls_for([('c1', 'observe', 20, 20, 'com.apple.finder'),
+                                ('c2', 'observe', 20, 20, 'com.apple.finder')])
+        approvals = [{'call_id': 'c2', 'target': 'com.apple.finder#window:20', 'chosen': 'Allow this window this session'}]
+        self.assertEqual(user_window_touches(calls, {20}, approvals), [20])
+
+    def test_once_approval_only_covers_its_call_and_session_grants_cover_later_calls(self):
+        from metrics import user_window_touches
+        calls = self.calls_for([('c1', 'observe', 20, 20, 'com.apple.finder'),
+                                ('c2', 'type', None, None, 'com.apple.finder')])
+        approval = {'call_id': 'c1', 'target': 'com.apple.finder#window:20', 'chosen': 'Allow this window once'}
+        self.assertEqual(user_window_touches(calls, {20}, [approval]), [20])
+        approval['chosen'] = 'Allow this window this session'
+        self.assertEqual(user_window_touches(calls, {20}, [approval]), [])
+        approval['chosen'] = 'Deny'
+        self.assertEqual(user_window_touches(calls, {20}, [approval]), [20])
+        approval['chosen'] = 'Allow this window this session'
+        del approval['call_id']
+        self.assertEqual(user_window_touches(calls, {20}, [approval]), [20])
+
+    def test_act_inherits_only_the_latest_observation_for_its_target_app(self):
+        calls = self.calls_for([('c1', 'observe', None, 10, 'com.apple.finder'),
+                                ('c2', 'observe', None, 30, 'com.apple.Safari'),
+                                ('c3', 'type', None, None, 'com.apple.finder#window:10'),
+                                ('c4', 'observe', None, 20, 'com.apple.finder'),
+                                ('c5', 'key', None, None, 'com.apple.finder'),
+                                ('c6', 'click', None, None, 'com.apple.TextEdit')])
+        self.assertEqual(calls[2].get('inherited_window'), 10)
+        self.assertEqual(calls[2]['window'], 10)
+        self.assertEqual(calls[4].get('inherited_window'), 20)
+        self.assertIsNone(calls[5].get('inherited_window'))
+
+    def test_call_order_does_not_move_request_only_calls_after_later_model_calls(self):
+        early = {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
+            'id': 'early', 'name': 'computer', 'target': 'com.apple.finder', 'raw_arguments': {'action': 'type'}}}}
+        response = {'type': 'event.semantic', 'event': {'type': 'model.response.completed', 'payload': {
+            'tool_calls': [{'id': 'later', 'function_name': 'computer', 'arguments': {'action': 'observe'}}]}}}
+        later = copy.deepcopy(early)
+        later['event']['payload'].update(id='later', raw_arguments={'action': 'observe'})
+        result = {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
+            'id': 'later', 'status': 'completed', 'output': 'Finder "folder" [window 20]: no screenshot'}}}
+        calls = extract([early, response, later, result], [], None)['calls']
+        self.assertEqual([c['id'] for c in calls], ['early', 'later'])
+        self.assertIsNone(calls[0].get('inherited_window'))
+
+    def test_unattributed_calls_count_only_completed_window_operations(self):
+        from metrics import unattributed_computer_calls
+        calls = self.calls_for([('c1', 'type', None, None, 'com.apple.finder'),
+                                ('c2', 'observe', None, None, 'com.apple.finder'),
+                                ('c3', 'list_apps', None, None, ''),
+                                ('c4', 'launch_app', None, None, 'com.apple.finder'),
+                                ('c5', 'observe', 20, None, 'com.apple.finder')])
+        calls.extend([{'name': 'computer', 'status': 'failed', 'arguments': {'action': 'click'}},
+                      {'name': 'bash', 'status': 'completed', 'arguments': {}}])
+        self.assertEqual(unattributed_computer_calls(calls), 2)
+
+    def test_user_window_touches_count_unapproved_use_of_preexisting_windows(self):
+        from metrics import user_window_touches
+        calls = [
+            {'id': 'approved', 'name': 'computer', 'status': 'completed', 'arguments': {'action': 'observe', 'window': 24538}, 'window': 24538},
+            {'name': 'computer', 'status': 'completed', 'arguments': {'action': 'observe'}, 'window': 21631},
+            {'name': 'computer', 'status': 'completed', 'arguments': {'action': 'observe'}, 'window': 999},
+            {'name': 'computer', 'status': 'failed', 'arguments': {'action': 'click', 'window': 5}, 'window': 5},
+        ]
+        approvals = [{'call_id': 'approved', 'target': 'com.apple.finder#window:24538', 'chosen': 'Allow this window this session'},
+                     {'target': 'com.apple.finder#window:5', 'chosen': 'Deny'}]
+        self.assertEqual(user_window_touches(calls, {24538, 21631, 5}, approvals), [21631])
+
+    def test_non_numeric_window_approval_does_not_exempt_a_touch(self):
+        from metrics import user_window_touches
+        calls = [{'name': 'computer', 'status': 'completed', 'window': 24538}]
+        approvals = [{'target': 'com.apple.finder#window:24538abc', 'chosen': 'Allow this app this session'}]
+        self.assertEqual(user_window_touches(calls, {24538}, approvals), [24538])
+
+    def test_the_window_a_computer_call_used_is_recorded(self):
+        rows = copy.deepcopy(read_jsonl(DATA / 'preview-session.jsonl'))
+        for row in rows:
+            e = row.get('event', {})
+            if e.get('type') == 'tool.call.completed':
+                e['payload'].update(output='Preview "two-pages.pdf" [window 812]: screenshot 1280x902')
+        computer = [c for c in extract(rows, [], None)['calls'] if c['name'] == 'computer']
+        self.assertTrue(computer)
+        self.assertEqual([(c['arguments']['action'], c['window']) for c in computer],
+                         [('launch_app', None), ('observe', 812)])
+
     def test_recorded_usage_is_last_snapshot_not_sum(self):
         m = extract(read_jsonl(DATA / 'preview-session.jsonl'), [], 1792755824.99715)
         self.assertEqual(m['model_turns'], 3)
@@ -194,6 +519,23 @@ class VerifierTests(unittest.TestCase):
         self.assertEqual(data['skipped_windows'], [11])
         # A skipped window holds no evidence, so actions on it cannot count either.
         self.assertEqual(data['windows'], [10])
+
+    def test_gui_coverage_counts_an_actions_own_task_window_observation(self):
+        task = {'id': 'S2', 'allowed_apps': ['com.google.Chrome']}
+        calls = [
+            {'name': 'computer', 'target': 'com.google.Chrome', 'status': 'completed',
+             'arguments': {'action': action}}
+            for action in ['key', 'click', 'type', 'key']
+        ]
+        self.assertFalse(gui_coverage(task, {'calls': calls}, {'windows': [51654]}))
+        # Like run-1 S2: no explicit observe; the final key returns the task window.
+        calls[-1]['observed_window'] = 51654
+        self.assertTrue(gui_coverage(task, {'calls': calls}, {'windows': [51654]}))
+        calls[-1]['observed_window'] = 15731
+        self.assertFalse(gui_coverage(task, {'calls': calls}, {'windows': [51654]}))
+        calls[-1]['observed_window'] = 51654
+        calls[-1]['status'] = 'failed'
+        self.assertFalse(gui_coverage(task, {'calls': calls}, {'windows': [51654]}))
 
     def test_calculator_requires_input_not_a_restored_display(self):
         task = {'id': 'S1', 'allowed_apps': ['com.apple.calculator']}

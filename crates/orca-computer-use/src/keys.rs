@@ -30,6 +30,30 @@ impl KeyStroke {
     pub fn is_app_shortcut(self) -> bool {
         !self.enters_text() && (self.modifiers.cmd || self.modifiers.ctrl || self.keycode == 53)
     }
+
+    /// These exact shortcuts act on every window, regardless of the selected one.
+    pub fn acts_on_every_window(self) -> bool {
+        self.modifiers.cmd
+            && !self.modifiers.shift
+            && !self.modifiers.ctrl
+            && match self.keycode {
+                12 => true,                       // Cmd+Q/Cmd+Option+Q
+                13 | 46 => self.modifiers.option, // Cmd+Option+W/M
+                4 => !self.modifiers.option,      // Cmd+H
+                _ => false,
+            }
+    }
+
+    /// Cmd+N alone: the app-level shortcut that opens a new window, the only
+    /// key Orca sends to an app whose windows are all the user's.
+    pub fn opens_new_window(self) -> bool {
+        self.keycode == 45
+            && self.modifiers
+                == Modifiers {
+                    cmd: true,
+                    ..Modifiers::default()
+                }
+    }
 }
 
 fn modifier(name: &str) -> Option<Modifiers> {
@@ -232,6 +256,42 @@ pub fn parse_combo(keys: &[String]) -> Result<KeyStroke, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_wide_shortcuts_have_exact_keys_and_modifiers() {
+        for key in ["q", "w", "m", "h", "n", "a"] {
+            for mask in 0..16 {
+                let mut stroke = parse_key(key).unwrap();
+                stroke.modifiers = Modifiers {
+                    cmd: mask & 1 != 0,
+                    option: mask & 2 != 0,
+                    shift: mask & 4 != 0,
+                    ctrl: mask & 8 != 0,
+                };
+                assert_eq!(
+                    stroke.acts_on_every_window(),
+                    (key == "q" && matches!(mask, 1 | 3))
+                        || (matches!(key, "w" | "m") && mask == 3)
+                        || (key == "h" && mask == 1),
+                    "{key} {mask}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_cmd_n_alone_opens_a_new_window() {
+        assert!(combo(&["cmd", "n"]).opens_new_window());
+        for keys in [
+            &["cmd", "shift", "n"][..],
+            &["cmd", "option", "n"],
+            &["ctrl", "n"],
+            &["cmd", "w"],
+            &["n"],
+        ] {
+            assert!(!combo(keys).opens_new_window(), "{keys:?}");
+        }
+    }
 
     fn combo(keys: &[&str]) -> KeyStroke {
         parse_combo(&keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()).unwrap()

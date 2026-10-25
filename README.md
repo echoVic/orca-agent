@@ -111,8 +111,10 @@ OS sandbox. Then type a task and press `Enter`.
   background.
 - **Approve tool calls.** A call that needs approval turns the input into an
   approval panel: allow once, allow this exact call, allow the tool for the
-  session, or deny (`Esc`). An MCP tool can also be always allowed, alone or
-  with its whole server, as a rule saved to your config. `Shift+Tab` cycles
+  session, or deny. `Esc` denies; once a computer call has run in the turn, it
+  stops the whole turn instead. On a window panel, press `4` to keep the
+  window and let Orca continue. An MCP tool can also be always
+  allowed, alone or with its whole server, as a rule saved to your config. `Shift+Tab` cycles
   `suggest` → `auto-edit` → `full-auto` → `plan`. Entering `full-auto` asks for
   an explicit Full Access confirmation; the running task picks it up at its
   next tool call, while tools already running and subagents already launched
@@ -131,7 +133,12 @@ OS sandbox. Then type a task and press `Enter`.
   slash command, `/mcp__<server>__<prompt>`.
 - **Computer use on macOS.** On macOS 14 or later, the main TUI session can
   inspect and operate other apps to check a UI or work without a command-line
-  interface, with app approval and Esc to stop. See
+  interface, or work in an app you name. App grants work for one call, the
+  session, or future sessions. Outside `full-auto`, windows you already had
+  open ask separately; app grants do not cover them. Press `4` to keep a
+  window and let Orca continue (Esc can stop the whole turn). Password entry
+  asks separately unless a qualifying whole-tool rule preapproves it. Window titles appear only for apps used
+  this session. See
   [Computer Use](https://orcaagent.dev/docs/#computer-use) for system permissions
   and foreground switching.
 - **Plan, goals, and recap.** `/plan` investigates read-only and ends with a

@@ -15,7 +15,7 @@ use objc2_screen_capture_kit::SCShareableContent;
 
 use super::windows::{AxWindowFacts, CaptureWindowFacts, usable_windows};
 use super::{ax::AxElement, error};
-use crate::protocol::{AppInfo, DriverError, ErrorKind};
+use crate::protocol::{AppInfo, DriverError, ErrorKind, WindowInfo};
 
 fn info_string(bundle: &NSBundle, key: &str) -> Option<String> {
     bundle
@@ -43,7 +43,12 @@ fn running_info(app: &NSRunningApplication) -> Option<AppInfo> {
     })
 }
 
-fn windows(timeout: Duration) -> Result<HashMap<i32, Vec<CaptureWindowFacts>>, DriverError> {
+struct CapturedApps {
+    windows: HashMap<i32, Vec<CaptureWindowFacts>>,
+    owners: Vec<AppInfo>,
+}
+
+fn windows(timeout: Duration) -> Result<CapturedApps, DriverError> {
     if !CGPreflightScreenCaptureAccess() {
         return Err(error(
             ErrorKind::PermissionMissing,
@@ -61,10 +66,21 @@ fn windows(timeout: Duration) -> Result<HashMap<i32, Vec<CaptureWindowFacts>>, D
                     ))
                 } else if let Some(content) = content.as_ref() {
                     let mut windows: HashMap<i32, Vec<CaptureWindowFacts>> = HashMap::new();
+                    let mut owners = HashMap::new();
                     for window in content.windows() {
                         if window.windowLayer() == 0
                             && let Some(app) = window.owningApplication()
                         {
+                            let bundle_id = app.bundleIdentifier().to_string();
+                            if !bundle_id.is_empty() {
+                                owners.entry(app.processID()).or_insert_with(|| AppInfo {
+                                    bundle_id,
+                                    name: app.applicationName().to_string(),
+                                    pid: Some(app.processID()),
+                                    category: None,
+                                    windows: vec![],
+                                });
+                            }
                             let frame = window.frame();
                             windows
                                 .entry(app.processID())
@@ -88,7 +104,10 @@ fn windows(timeout: Duration) -> Result<HashMap<i32, Vec<CaptureWindowFacts>>, D
                     for values in windows.values_mut() {
                         values.sort_by_key(|window| window.id);
                     }
-                    Ok(windows)
+                    Ok(CapturedApps {
+                        windows,
+                        owners: owners.into_values().collect(),
+                    })
                 } else {
                     Err(error(
                         ErrorKind::Failed,
@@ -132,16 +151,20 @@ fn merge_apps(
 const LIST_AX_BUDGET: Duration = Duration::from_secs(2);
 const APP_AX_TIMEOUT_SECS: f32 = 0.25;
 
-fn list_with_timeout(timeout: Duration, verify_windows: bool) -> Result<Vec<AppInfo>, DriverError> {
-    let capture = windows(timeout)?;
-    let running = NSWorkspace::sharedWorkspace()
+fn running_apps() -> Vec<AppInfo> {
+    NSWorkspace::sharedWorkspace()
         .runningApplications()
         .iter()
         .filter(|app| app.activationPolicy() == NSApplicationActivationPolicy::Regular)
         .filter_map(|app| running_info(&app))
-        .collect();
+        .collect()
+}
+
+fn list_with_timeout(timeout: Duration, verify_windows: bool) -> Result<Vec<AppInfo>, DriverError> {
+    let capture = windows(timeout)?;
+    let running = running_apps();
     let ax_deadline = Instant::now() + LIST_AX_BUDGET.min(timeout);
-    Ok(merge_apps(running, capture, |pid| {
+    Ok(merge_apps(running, capture.windows, |pid| {
         verify_windows
             .then(|| ax_window_facts(pid, ax_deadline))
             .flatten()
@@ -178,6 +201,8 @@ fn ax_window_facts(pid: i32, deadline: Instant) -> Option<Vec<AxWindowFacts>> {
     read_within(deadline, windows, |window, timeout| {
         // Every read gets only what is left, so slow answers cannot add up.
         with_timeout(&window, timeout)?;
+        let id = window.window_id();
+        with_timeout(&window, share_of(deadline)?)?;
         let frame = window.position_size().ok()?;
         with_timeout(&window, share_of(deadline)?)?;
         let subrole = window.attribute_string("AXSubrole").ok().flatten();
@@ -188,6 +213,7 @@ fn ax_window_facts(pid: i32, deadline: Instant) -> Option<Vec<AxWindowFacts>> {
             .flatten()
             .unwrap_or(false);
         Some(AxWindowFacts {
+            id,
             frame,
             subrole,
             minimized,
@@ -212,6 +238,52 @@ pub(super) fn list() -> Result<Vec<AppInfo>, DriverError> {
 /// What `list_apps` shows the model: windows observe and act can use.
 pub(super) fn list_verified() -> Result<Vec<AppInfo>, DriverError> {
     list_with_timeout(Duration::from_secs(30), true)
+}
+
+/// Every running app's windows by id and title, unfiltered and without
+/// accessibility reads: who owns which window, off-screen and minimized ones
+/// included, for telling the user's windows from Orca's.
+pub(super) fn snapshot() -> Result<Vec<AppInfo>, DriverError> {
+    let capture = windows(Duration::from_secs(10))?;
+    let running = NSWorkspace::sharedWorkspace()
+        .runningApplications()
+        .iter()
+        .filter_map(|app| running_info(&app))
+        .collect();
+    Ok(snapshot_apps(running, capture.windows, capture.owners))
+}
+
+fn snapshot_apps(
+    mut running: Vec<AppInfo>,
+    mut capture: HashMap<i32, Vec<CaptureWindowFacts>>,
+    owners: Vec<AppInfo>,
+) -> Vec<AppInfo> {
+    // Some window owners are absent from NSWorkspace. CaptureKit's bundle id
+    // still attributes their windows, including off-screen tray-app windows.
+    for owner in owners {
+        if !running.iter().any(|app| app.pid == owner.pid) {
+            running.push(owner);
+        }
+    }
+    let mut apps: Vec<_> = running
+        .into_iter()
+        .map(|mut app| {
+            app.windows = app
+                .pid
+                .and_then(|pid| capture.remove(&pid))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|window| WindowInfo {
+                    id: window.id,
+                    title: window.title,
+                    minimized: false,
+                })
+                .collect();
+            app
+        })
+        .collect();
+    apps.sort_by(|a, b| a.bundle_id.cmp(&b.bundle_id).then(a.pid.cmp(&b.pid)));
+    apps
 }
 
 /// Observe/act receive an already approved bundle ID; names cannot widen it.
@@ -755,7 +827,68 @@ pub(super) fn launch(name: &str, open: &[String]) -> Result<AppInfo, DriverError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::WindowInfo;
+
+    #[test]
+    fn a_window_snapshot_keeps_every_window_unfiltered() {
+        let app = |pid: i32| AppInfo {
+            bundle_id: format!("dev.orca.{pid}"),
+            name: pid.to_string(),
+            pid: Some(pid),
+            category: None,
+            windows: vec![],
+        };
+        let facts = |id: u32, frame: [f64; 4], on_screen: bool| CaptureWindowFacts {
+            id,
+            title: format!("w{id}"),
+            frame,
+            on_screen,
+        };
+        // A document, an off-screen (minimized) one and a small helper all count.
+        let snapshot = snapshot_apps(
+            vec![app(2), app(1)],
+            HashMap::from([
+                (
+                    2,
+                    vec![
+                        facts(9, [0.0, 0.0, 800.0, 600.0], true),
+                        facts(10, [0.0, 0.0, 800.0, 600.0], false),
+                        facts(11, [0.0, 0.0, 20.0, 10.0], true),
+                    ],
+                ),
+                (3, vec![facts(12, [5000.0, 5000.0, 800.0, 600.0], false)]),
+            ]),
+            // A non-regular tray app missing from the regular running list;
+            // ScreenCaptureKit still identifies its off-screen layer-0 window.
+            vec![
+                AppInfo {
+                    name: "Tray app".into(),
+                    ..app(3)
+                },
+                app(2),
+            ],
+        );
+        assert_eq!(
+            snapshot.iter().map(|app| app.pid).collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)]
+        );
+        assert!(snapshot[0].windows.is_empty());
+        assert_eq!(
+            snapshot[2].windows,
+            vec![WindowInfo {
+                id: 12,
+                title: "w12".into(),
+                minimized: false,
+            }]
+        );
+        assert_eq!(
+            snapshot[1]
+                .windows
+                .iter()
+                .map(|window| window.id)
+                .collect::<Vec<_>>(),
+            vec![9, 10, 11]
+        );
+    }
 
     fn application_fixture(root: &std::path::Path, folder: &str, id: &str) {
         let contents = root.join(format!("{folder}.app/Contents"));
@@ -1554,6 +1687,7 @@ mod tests {
             |pid| {
                 asked.push(pid);
                 Some(vec![AxWindowFacts {
+                    id: None,
                     frame: [0.0, 0.0, 800.0, 600.0],
                     subrole: Some("AXStandardWindow".into()),
                     minimized: false,
@@ -1584,6 +1718,7 @@ mod tests {
             reads += 1;
             std::thread::sleep(Duration::from_millis(30));
             Some(AxWindowFacts {
+                id: None,
                 frame: [0.0, 0.0, 800.0, 600.0],
                 subrole: None,
                 minimized: false,

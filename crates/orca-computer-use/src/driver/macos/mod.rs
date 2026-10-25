@@ -100,8 +100,14 @@ impl MacDriver {
             let _ = application.set_bool("AXManualAccessibility", true);
         }
         let windows = capture::windows()?;
-        let (ax_window, window) =
-            resolve_window(&application, pid, &app.name, &windows, params.window)?;
+        let (ax_window, window) = resolve_window(
+            &application,
+            pid,
+            &app.name,
+            &windows,
+            params.window,
+            &params.user_windows,
+        )?;
         let window_frame = ax_window.position_size()?;
         if window_frame.iter().any(|v| !v.is_finite())
             || window_frame[2] <= 0.0
@@ -230,6 +236,12 @@ impl DriverHandler for MacDriver {
             Request::ListApps => Ok(Reply::Apps {
                 apps: apps::list_verified()?,
             }),
+            Request::WindowSnapshot => {
+                capture::check_unlocked()?;
+                Ok(Reply::Apps {
+                    apps: apps::snapshot()?,
+                })
+            }
             Request::ResolveApp {
                 app,
                 allow_not_running,
@@ -281,12 +293,68 @@ pub(super) fn frames_match(ax: [f64; 4], capture: [f64; 4]) -> bool {
         .all(|(a, b)| (a - b).abs() <= 2.0)
 }
 
-/// Whether the app shows any window; unreadable AX state fails closed as an error.
-pub(super) fn app_has_window(application: &AxElement) -> Result<bool, DriverError> {
-    Ok(windows::has_window(
-        application.elements("AXWindows")?.len(),
-        application.attribute_element("AXMainWindow")?.is_some(),
-    ))
+/// Read identities for the windowless decision. Unlike the resolver's optional
+/// candidate scan, incomplete or unreadable AX state must never mean no window.
+fn app_window_facts(application: &AxElement) -> Result<Vec<windows::AxWindowFacts>, DriverError> {
+    let mut candidates = application.elements("AXWindows")?;
+    let main = application.attribute_element("AXMainWindow")?;
+    if candidates.is_empty()
+        && let Some(main) = main
+    {
+        candidates.push(main);
+    }
+    let expected = candidates.len();
+    let mut read_error = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let (_, facts) = windows::gather_facts(candidates, deadline, |candidate, left| {
+        let timeout = unsafe { candidate.0.set_messaging_timeout(left) };
+        if timeout != objc2_application_services::AXError::Success {
+            read_error.get_or_insert_with(|| {
+                error(
+                    ErrorKind::Failed,
+                    format!("Accessibility window-state timeout failed: {timeout:?}"),
+                )
+            });
+            return None;
+        }
+        let id = candidate.window_id();
+        match candidate.position_size() {
+            Ok(frame) => Some(windows::AxWindowFacts {
+                id,
+                frame,
+                subrole: None,
+                minimized: false,
+            }),
+            Err(failure) => {
+                read_error.get_or_insert(failure);
+                None
+            }
+        }
+    });
+    if let Some(failure) = read_error {
+        return Err(failure);
+    }
+    if facts.len() != expected {
+        return Err(error(
+            ErrorKind::Failed,
+            "Could not read all accessibility windows before the window-state deadline",
+        ));
+    }
+    Ok(facts)
+}
+
+/// An unreadable AX state may contain a window, so the post-activation
+/// check must return Stale rather than authorize a general shortcut.
+fn app_has_window(
+    application: &AxElement,
+    captures: &[capture::Window],
+    user_windows: &[u32],
+) -> bool {
+    let Ok(pid) = application.pid() else {
+        return true;
+    };
+    let facts = app_window_facts(application).ok();
+    !windows::windowless(pid, captures, facts.as_deref(), user_windows)
 }
 
 /// Act and observe resolve the same live window, including apps with no main window.
@@ -296,6 +364,7 @@ fn resolve_window<'a>(
     app_name: &str,
     windows: &'a [capture::Window],
     id: Option<u32>,
+    user_windows: &[u32],
 ) -> Result<(AxElement, &'a capture::Window), DriverError> {
     let mut candidates = application.elements("AXWindows")?;
     let main = application.attribute_element("AXMainWindow")?;
@@ -309,17 +378,22 @@ fn resolve_window<'a>(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let (mut candidates, facts) = windows::gather_facts(candidates, deadline, |candidate, left| {
         let _ = unsafe { candidate.0.set_messaging_timeout(left.min(2.0)) };
-        (
-            candidate.position_size().ok(),
-            candidate.attribute_string("AXSubrole").ok().flatten(),
-            candidate.attribute_bool("AXMinimized").ok().flatten(),
-        )
+        Some(windows::AxWindowFacts {
+            id: candidate.window_id(),
+            frame: candidate.position_size().ok()?,
+            subrole: candidate.attribute_string("AXSubrole").ok().flatten(),
+            minimized: candidate
+                .attribute_bool("AXMinimized")
+                .ok()
+                .flatten()
+                .unwrap_or(false),
+        })
     });
     let main_index = main
         .as_ref()
         .and_then(|main| candidates.iter().position(|candidate| candidate == main));
     let (ax_index, capture_index) =
-        windows::choose_window(id, pid, app_name, windows, &facts, main_index)?;
+        windows::choose_window(id, pid, app_name, windows, &facts, main_index, user_windows)?;
     let chosen = candidates.swap_remove(ax_index);
     // The budget may have shortened this handle's timeout; observe/act need the usual one.
     let _ = unsafe { chosen.0.set_messaging_timeout(2.0) };
@@ -343,8 +417,10 @@ mod tests {
                 query: None,
                 max_elements: 300,
                 include_screenshot: true,
+                user_windows: vec![],
             }),
             Request::ListApps,
+            Request::WindowSnapshot,
             Request::Act(crate::protocol::ActParams {
                 app: "dev.orca.not-installed".into(),
                 window: None,
@@ -356,6 +432,7 @@ mod tests {
                 observe_after: false,
                 include_screenshot: false,
                 secure_approved: false,
+                user_windows: vec![],
             }),
             Request::Turn { active: true },
             Request::LaunchApp {
@@ -414,6 +491,7 @@ fn stdin_stop_rejects_buffered_work_after_a_successful_hello() {
                 query: None,
                 max_elements: 300,
                 include_screenshot: false,
+                user_windows: vec![],
             }),
             &output,
         )

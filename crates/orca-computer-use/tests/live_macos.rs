@@ -60,6 +60,7 @@ fn trials() -> Vec<libtest_mimic::Trial> {
         launch_app_opens_a_file_in_textedit,
         list_apps_shows_only_windows_observe_can_use,
         a_shortcut_reaches_textedit_before_it_has_a_window,
+        cmd_n_reaches_an_app_with_only_the_users_windows,
         a_system_settings_click_survives_an_unsupported_raise,
         opening_a_nonexistent_file_in_already_running_textedit_returns_an_error,
         cleanup_only_selects_explicitly_launched_processes,
@@ -424,6 +425,7 @@ impl Live {
                     query: query.map(str::to_owned),
                     max_elements,
                     include_screenshot,
+                    user_windows: vec![],
                 }),
                 Duration::from_secs(30),
             )
@@ -472,6 +474,7 @@ impl Live {
                     observe_after: true,
                     include_screenshot: false,
                     secure_approved,
+                    user_windows: vec![],
                 }),
                 Duration::from_secs(30),
             )
@@ -1176,6 +1179,7 @@ fn list_apps_shows_only_windows_observe_can_use() {
                         query: Some("\u{0}no-match".into()),
                         max_elements: 1,
                         include_screenshot: false,
+                        user_windows: vec![],
                     }),
                     Duration::from_secs(30),
                 );
@@ -1233,6 +1237,7 @@ fn a_shortcut_reaches_textedit_before_it_has_a_window() {
                 observe_after: true,
                 include_screenshot: false,
                 secure_approved: false,
+                user_windows: vec![],
             }),
             Duration::from_secs(30),
         );
@@ -1244,6 +1249,81 @@ fn a_shortcut_reaches_textedit_before_it_has_a_window() {
             outcome.observation.is_some(),
             "Cmd+N should open an observable document window"
         );
+        live.assert_frontmost_and_pointer_unchanged();
+    });
+}
+
+fn cmd_n_reaches_an_app_with_only_the_users_windows() {
+    run_live_test(|| {
+        let Some(mut live) = Live::start() else {
+            return;
+        };
+        let fixture = "dev.orca.cu-fixture";
+        live.launch_fixture();
+        live.make_finder_frontmost();
+        // Treat every fixture window open now as the user's.
+        let Reply::Apps { apps } = live
+            .client
+            .call(Request::WindowSnapshot, Duration::from_secs(30))
+            .unwrap()
+        else {
+            panic!("expected a snapshot")
+        };
+        let theirs: Vec<u32> = apps
+            .iter()
+            .filter(|app| app.bundle_id == fixture)
+            .flat_map(|app| app.windows.iter().map(|window| window.id))
+            .collect();
+        assert!(
+            !theirs.is_empty(),
+            "the fixture window must be in the snapshot"
+        );
+        // Without a window, observe skips the user's windows and says how to go on.
+        let observed = live.client.call(
+            Request::Observe(ObserveParams {
+                app: fixture.into(),
+                window: None,
+                query: None,
+                max_elements: 50,
+                include_screenshot: false,
+                user_windows: theirs.clone(),
+            }),
+            Duration::from_secs(30),
+        );
+        let Err(CallError::Driver(error)) = observed else {
+            panic!("expected a refusal: {observed:?}")
+        };
+        assert_eq!(error.kind, ErrorKind::UserWindow);
+        assert!(
+            error.message.contains("only has the user's own windows"),
+            "{}",
+            error.message
+        );
+        // Cmd+N still reaches the app, and the observation after it shows the new window.
+        let acted = live.client.call(
+            Request::Act(ActParams {
+                app: fixture.into(),
+                window: None,
+                action: Action::Key {
+                    keys: vec!["cmd".into(), "n".into()],
+                    target: None,
+                },
+                foreground_fallback: true,
+                observe_after: true,
+                include_screenshot: false,
+                secure_approved: false,
+                user_windows: theirs.clone(),
+            }),
+            Duration::from_secs(30),
+        );
+        let Reply::Acted { outcome } = acted.unwrap() else {
+            panic!("expected acted")
+        };
+        assert!(outcome.foreground_used);
+        let observation = outcome
+            .observation
+            .expect("Cmd+N should open an observable window of Orca's own");
+        assert!(!theirs.contains(&observation.window.id));
         live.assert_frontmost_and_pointer_unchanged();
     });
 }
@@ -1282,6 +1362,7 @@ fn a_system_settings_click_survives_an_unsupported_raise() {
                     query: Some("General".into()),
                     max_elements: 50,
                     include_screenshot: false,
+                    user_windows: vec![],
                 }),
                 Duration::from_secs(30),
             )
@@ -1316,6 +1397,7 @@ fn a_system_settings_click_survives_an_unsupported_raise() {
                 observe_after: false,
                 include_screenshot: false,
                 secure_approved: false,
+                user_windows: vec![],
             }),
             Duration::from_secs(30),
         );
@@ -3616,6 +3698,7 @@ fn an_action_after_the_element_label_changed_is_stale() {
             observe_after: false,
             include_screenshot: false,
             secure_approved: false,
+            user_windows: vec![],
         });
         assert!(matches!(
             live.client
@@ -3880,6 +3963,7 @@ fn approved_actions_and_observations_require_the_exact_bundle_id() {
                 query: None,
                 max_elements: 300,
                 include_screenshot: false,
+                user_windows: vec![],
             }),
             Duration::from_secs(30),
         );
@@ -6638,6 +6722,7 @@ fn native_slow_ancestry_and_foreground_delivery_share_one_action_deadline() {
                 observe_after: false,
                 include_screenshot: false,
                 secure_approved: false,
+                user_windows: vec![],
             }),
             Duration::from_secs(36),
         );
