@@ -14,6 +14,24 @@ DATA = Path(__file__).with_name('testdata')
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_non_computer_panel_diff_does_not_supply_a_bundle_target(self):
+        for diff in ('+    return helper(self.state.value)', '+    import com.example.module'):
+            text = (
+                '╭ Approve · write_file ───────────────────────────╮\n'
+                '│ src/example.py                                 │\n'
+                f'│ {diff} │\n'
+                '│ › 1  Allow once  run it now                     │\n'
+                '│   4  Deny  ask Orca for another way             │\n'
+                '╰────────────────────────────────────────────────╯\n'
+            )
+            panel = parse_panel(text)
+            with self.subTest(diff=diff, result='bundle'):
+                self.assertIsNone(panel['target'])
+            decision = answer_panel(panel, {'target': 'src/example.py'}, [])
+            with self.subTest(diff=diff, result='approval'):
+                self.assertEqual((decision['chosen'], decision['boundary_event']),
+                                 ('Allow once', False))
+
     def test_tui_records_the_call_answered_by_its_approval(self):
         from tui import TUI
         from unittest.mock import Mock
@@ -171,6 +189,27 @@ class ApprovalTests(unittest.TestCase):
 
 
 class MetricsTests(unittest.TestCase):
+    def test_failed_observe_cannot_seed_a_later_clicks_inherited_window(self):
+        rows = [
+            {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
+                'id': 'failed', 'name': 'computer', 'target': 'com.apple.TextEdit',
+                'raw_arguments': {'action': 'observe'}}}},
+            {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
+                'id': 'failed', 'status': 'failed',
+                'output': 'TextEdit only has the user\'s own windows: 77 "x" [window 5]: "'}}},
+            {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
+                'id': 'click', 'name': 'computer', 'target': 'com.apple.TextEdit',
+                'raw_arguments': {'action': 'click', 'point': [10, 10]}}}},
+            {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
+                'id': 'click', 'status': 'completed', 'output': 'click: done'}}},
+        ]
+        calls = extract(rows, [], None)['calls']
+        with self.subTest(result='failed observation'):
+            self.assertIsNone(calls[0]['observed_window'])
+        with self.subTest(result='inherited window'):
+            self.assertIsNone(calls[1]['inherited_window'])
+            self.assertIsNone(calls[1]['window'])
+
     def calls_for(self, specs):
         records = []
         for ident, action, requested, observed, bundle in specs:

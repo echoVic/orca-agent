@@ -85,7 +85,7 @@ def extract(records, approvals, submitted, ended=None):
         if c['name'] == 'computer':
             # App listings carry raw titles; only an observation header proves its window.
             seen = None
-            if c['arguments'].get('action') not in ('list_apps', 'launch_app'):
+            if c['status'] == 'completed' and c['arguments'].get('action') not in ('list_apps', 'launch_app'):
                 seen = re.search(r'(?m)^[^"\n]*"(?:[^"\\\n]|\\.)*" \[window (\d+)\]: ', output)
             c['requested_window'] = c['arguments'].get('window')
             c['observed_window'] = int(seen[1]) if seen else None
