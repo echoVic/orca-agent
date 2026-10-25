@@ -139,8 +139,12 @@ def run_task(task, args, base, out, tmux, services, native):
             errors.append(f'process stop: {error}')
         records = exit_proof.pop('records', [])
         metrics = extract(records, tui.approvals, tui.submitted, time.time())
+        preexisting = {w['id'] for w in before['windows']}
+        if isinstance(task_windows, set):
+            # The harness's browser window also predates Orca's turn.
+            preexisting.update(task_windows)
         metrics['user_window_touches'] = user_window_touches(
-            metrics['calls'], {w['id'] for w in before['windows']}, tui.approvals)
+            metrics['calls'], preexisting, tui.approvals)
         metrics['window_panels'] = sum(bool(a.get('window_panel')) for a in tui.approvals)
         dump(evidence / 'metrics.json', metrics)
         try:

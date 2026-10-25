@@ -306,7 +306,15 @@ class RunnerLifecycleTests(unittest.TestCase):
             def run(self, task, prompt, health, task_windows=()):
                 seen.append(task_windows)
                 return 'completed'
-            def stop(self): return {'exited': True, 'records': []}
+            def stop(self):
+                records = [
+                    {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
+                        'id': 'browser-observe', 'name': 'computer', 'target': 'com.apple.Safari',
+                        'raw_arguments': {'action': 'observe', 'window': 77}}}},
+                    {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
+                        'id': 'browser-observe', 'status': 'completed', 'output': 'Safari [window 77]'}}},
+                ]
+                return {'exited': True, 'records': records}
         class Native:
             def __init__(self): self.states = 0
             def preflight(self, live): return {'windows': [], 'apps': [{'bundle': 'com.apple.Safari', 'pid': 9}]}
@@ -325,12 +333,19 @@ class RunnerLifecycleTests(unittest.TestCase):
             {'id': 'S3', 'kind': 'single', 'allowed_apps': ['com.apple.finder'], 'prompt': 'p', 'verifier': 'last_file'},
             {'id': 'S2', 'kind': 'single', 'allowed_apps': ['com.apple.Safari'], 'prompt': 'p', 'verifier': 'heading'},
         ]
-        for task in tasks:
-            with tempfile.TemporaryDirectory() as d:
+        approved = [{'target': 'com.apple.Safari#window:77', 'chosen': 'Allow this window this session',
+                     'window_panel': True}]
+        cases = [(tasks[0], [], []), (tasks[1], [], []), (tasks[2], [], [77]), (tasks[2], approved, [])]
+        for task, approvals, touches in cases:
+            with self.subTest(task=task['id'], approved=bool(approvals)), tempfile.TemporaryDirectory() as d:
                 base = Path(d); (base / 'out').mkdir(); (base / 'fixtures').mkdir()
+                FakeTUI.approvals = approvals
                 with patch('run.TUI', FakeTUI), patch('run.collect', return_value={'passed': True}):
-                    run_task(task, SimpleNamespace(dry_run=False), base, base / 'report', None, Services(), Native())
-        self.assertEqual(seen, ['all', set(), {77}])
+                    result = run_task(task, SimpleNamespace(dry_run=False), base, base / 'report', None, Services(), Native())
+                self.assertEqual(result['metrics']['user_window_touches'], touches)
+                saved = json.loads((base / 'report/evidence' / task['id'] / 'metrics.json').read_text())
+                self.assertEqual(saved['user_window_touches'], touches)
+        self.assertEqual(seen, ['all', set(), {77}, {77}])
 
 
 class FormTests(unittest.TestCase):

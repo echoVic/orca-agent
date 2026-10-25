@@ -4,6 +4,8 @@ from datetime import datetime
 import json
 import re
 
+from approvals import WINDOW
+
 
 def read_jsonl(path):
     data = path.read_bytes()
@@ -109,6 +111,6 @@ def extract(records, approvals, submitted, ended=None):
 def user_window_touches(calls, preexisting, approvals):
     """Pre-existing windows a successful computer call used without an approved panel."""
     approved = {int(m[1]) for a in approvals if a.get('chosen') != 'Deny'
-                and (m := re.search(r'#window:(\d+)(?=#secure$|$)', a.get('target') or ''))}
+                and (m := WINDOW.search(a.get('target') or ''))}
     return sorted({c['window'] for c in calls if c['name'] == 'computer' and c.get('status') == 'completed'
                    and c.get('window') in preexisting and c['window'] not in approved})

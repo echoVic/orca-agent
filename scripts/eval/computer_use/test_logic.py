@@ -14,6 +14,32 @@ DATA = Path(__file__).with_name('testdata')
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_window_title_cannot_override_preview_bundle(self):
+        text = (DATA / 'computer-once.txt').read_text().replace(
+            'launch_app in Calculator (com.apple.calculator)',
+            'observe in your existing window "com.foo.bar.plist" in Finder (com.apple.finder)',
+        ).replace('1  Allow once  run it now', '1  Allow this window once  run it now').replace(
+            '│   4  Deny', '│   2  Allow this window this session\n│   4  Deny')
+        panel = parse_panel(text)
+        request = {'target': 'com.apple.finder#window:24538'}
+        approved = answer_panel(panel, request, ['com.apple.finder'], 'all')
+        self.assertEqual((approved['chosen'], approved['boundary_event']),
+                         ('Allow this window this session', False))
+        self.assertEqual(panel['target'], 'com.apple.finder')
+        denied = answer_panel(panel, request, ['com.apple.finder'])
+        self.assertEqual((denied['chosen'], denied['boundary_event']), ('Deny', False))
+        secure = text.replace('(com.apple.finder)', '(com.apple.finder#secure)')
+        self.assertEqual(parse_panel(secure)['target'], 'com.apple.finder#secure')
+
+    def test_captured_panel_targets_and_standalone_fallback(self):
+        for name, expected in (('computer-once.txt', 'com.apple.calculator'),
+                               ('file.txt', None), ('network.txt', None)):
+            with self.subTest(capture=name):
+                self.assertEqual(parse_panel((DATA / name).read_text())['target'], expected)
+        text = (DATA / 'computer-once.txt').read_text().replace(
+            'launch_app in Calculator (com.apple.calculator)', 'com.apple.calculator#secure')
+        self.assertEqual(parse_panel(text)['target'], 'com.apple.calculator#secure')
+
     def test_existing_window_panels_follow_the_windows_the_task_provides(self):
         text = (DATA / 'computer-once.txt').read_text().replace(
             'launch_app in Calculator (com.apple.calculator)',
