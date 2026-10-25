@@ -12,6 +12,99 @@ use crate::{
     },
 };
 
+#[derive(Debug, PartialEq)]
+enum RecipientDelivery {
+    Background,
+    Foreground,
+}
+
+fn recipient_delivery<T: PartialEq>(
+    recipient_window: Option<&T>,
+    selected_window: &T,
+    foreground_fallback: bool,
+    description: &str,
+) -> Result<RecipientDelivery, DriverError> {
+    if recipient_window == Some(selected_window) {
+        Ok(RecipientDelivery::Background)
+    } else if foreground_fallback {
+        Ok(RecipientDelivery::Foreground)
+    } else {
+        Err(foreground(format!(
+            "The {description} is in another window of the app; foreground delivery is required"
+        )))
+    }
+}
+
+struct RecipientBoundary<'a> {
+    selected: &'a AxElement,
+    foreground_fallback: bool,
+    deadline: std::time::Instant,
+}
+
+impl RecipientBoundary<'_> {
+    fn check(&self, element: &AxElement, description: &str) -> Result<(), DriverError> {
+        let window = self.window_of(element)?;
+        match recipient_delivery(
+            window.as_ref(),
+            self.selected,
+            self.foreground_fallback,
+            description,
+        )? {
+            RecipientDelivery::Background => Ok(()),
+            RecipientDelivery::Foreground => Err(foreground(format!(
+                "The {description} is in another window of the app"
+            ))),
+        }
+    }
+
+    fn window_of(&self, element: &AxElement) -> Result<Option<AxElement>, DriverError> {
+        let mut current = element.clone();
+        let mut visited = Vec::new();
+        loop {
+            check_scroll_deadline(self.deadline)?;
+            if current == *self.selected {
+                return Ok(Some(current));
+            }
+            if visited.contains(&current) {
+                return Ok(None);
+            }
+            visited.push(current.clone());
+            if let Some(window) = current.modal_attribute_element("AXWindow")?
+                && window != current
+            {
+                current = window;
+                continue;
+            }
+            // Some apps expose a sheet as AXWindow; resolve its attachment
+            // rather than treating the sheet as an unrelated document window.
+            let role = current.modal_attribute_string("AXRole")?;
+            let subrole = current.modal_attribute_string("AXSubrole")?;
+            if top_level_is_sheet(role.as_deref(), subrole.as_deref()) {
+                let Some(parent) = current.modal_attribute_element("AXParent")? else {
+                    return Ok(None);
+                };
+                current = parent;
+            } else {
+                return Ok((role.as_deref() == Some("AXWindow")).then_some(current));
+            }
+        }
+    }
+
+    fn keyboard(
+        &self,
+        application: &AxElement,
+        element: &AxElement,
+        target: Option<Target>,
+    ) -> Result<(), DriverError> {
+        if !matches!(target, Some(Target::Element { .. })) {
+            let focused = keyboard_recipient(application, Some(element))?
+                .ok_or_else(|| foreground("The app has no focused element"))?;
+            self.check(&focused, "focus")?;
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn stale() -> DriverError {
     error(
         ErrorKind::Stale,
@@ -362,6 +455,11 @@ impl MacDriver {
             scroll_position: None,
             observation: None,
         };
+        let boundary = RecipientBoundary {
+            selected: &ax_window,
+            foreground_fallback: params.foreground_fallback,
+            deadline: action_deadline,
+        };
         let background = (|| {
             match &params.action {
                 Action::Click {
@@ -385,6 +483,9 @@ impl MacDriver {
                     let hidden = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
                         .is_some_and(|app| app.isHidden());
                     let element = click_target_element(table, &application, *target, hidden)?;
+                    if matches!(target, Target::Point { .. }) {
+                        boundary.check(&element, "point")?;
+                    }
                     if needs_foreground {
                         return Err(foreground(click_message));
                     }
@@ -409,6 +510,7 @@ impl MacDriver {
                             for depth in 0..=5 {
                                 let Some(element) = candidate else { break };
                                 if element.actions()?.iter().any(|a| a == "AXPress") {
+                                    boundary.check(&element, "point")?;
                                     element.perform("AXPress")?;
                                     pressed = true;
                                     break;
@@ -441,12 +543,13 @@ impl MacDriver {
                             if type_target_was_focused {
                                 element
                             } else {
-                                focus(table, &application, Some(*target))?
+                                focus(table, &application, Some(*target), &boundary)?
                             }
                         }
-                        _ => focus(table, &application, *target)?,
+                        _ => focus(table, &application, *target, &boundary)?,
                     };
                     check_type_recipient(&element, text)?;
+                    boundary.keyboard(&application, &element, *target)?;
                     check_background_keyboard(pid, &application, &element, action_deadline)?;
                     check_secure_approval(&application, Some(&element), params.secure_approved)?;
                     if target.is_some() {
@@ -463,6 +566,7 @@ impl MacDriver {
                     }
                     let recipient = keyboard_recipient(&application, Some(&element))?
                         .ok_or_else(|| foreground("The app has no focused element"))?;
+                    boundary.keyboard(&application, &recipient, *target)?;
                     check_type_recipient(&recipient, text)?;
                     events::post_unicode_text(pid, text, || {
                         verify_type_recipient(&application, &recipient, false)
@@ -473,7 +577,8 @@ impl MacDriver {
                         parse_combo(keys).map_err(|message| error(ErrorKind::Failed, message))?;
                     // On the real Mac, process-directed Cmd+A/Cmd+S events
                     // reached the app but did not dispatch its menu shortcut.
-                    let element = focus(table, &application, *target)?;
+                    let element = focus(table, &application, *target, &boundary)?;
+                    boundary.keyboard(&application, &element, *target)?;
                     check_background_keyboard(pid, &application, &element, action_deadline)?;
                     if stroke.enters_text() {
                         check_secure_approval(
@@ -493,6 +598,9 @@ impl MacDriver {
                     amount,
                 } => {
                     let element = target_element(table, &application, *target)?;
+                    if matches!(target, Target::Point { .. }) {
+                        boundary.check(&element, "point")?;
+                    }
                     outcome.scroll_position =
                         scroll(table, element, *direction, *amount, action_deadline)?;
                 }
@@ -833,9 +941,13 @@ fn focus(
     table: &ElementTable,
     application: &AxElement,
     target: Option<Target>,
+    boundary: &RecipientBoundary<'_>,
 ) -> Result<AxElement, DriverError> {
     if let Some(target) = target {
         let element = target_element(table, application, target)?;
+        if matches!(target, Target::Point { .. }) {
+            boundary.check(&element, "point")?;
+        }
         if element.attribute_string("AXRole")?.as_deref() == Some("AXWindow")
             && application
                 .attribute_element("AXFocusedUIElement")?
@@ -860,9 +972,11 @@ fn focus(
         }
         Ok(element)
     } else {
-        application
+        let element = application
             .attribute_element("AXFocusedUIElement")?
-            .ok_or_else(|| foreground("The app has no focused element"))
+            .ok_or_else(|| foreground("The app has no focused element"))?;
+        boundary.check(&element, "focus")?;
+        Ok(element)
     }
 }
 
@@ -1148,6 +1262,26 @@ mod tests {
             read,
             std::time::Instant::now() + crate::timing::FOREGROUND_ACTION_LIMIT,
         )
+    }
+
+    #[test]
+    fn recipient_window_boundary_chooses_background_fallback_or_refusal() {
+        assert_eq!(
+            recipient_delivery(Some(&2), &2, false, "focus").unwrap(),
+            RecipientDelivery::Background
+        );
+        for recipient in [Some(&1), None] {
+            for description in ["focus", "point"] {
+                assert_eq!(
+                    recipient_delivery(recipient, &2, true, description).unwrap(),
+                    RecipientDelivery::Foreground
+                );
+                let failure = recipient_delivery(recipient, &2, false, description).unwrap_err();
+                assert_eq!(failure.kind, ErrorKind::NeedsForeground);
+                assert!(failure.message.contains(description));
+                assert!(failure.message.contains("another window of the app"));
+            }
+        }
     }
 
     #[test]

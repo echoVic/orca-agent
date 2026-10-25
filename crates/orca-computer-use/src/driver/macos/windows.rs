@@ -141,6 +141,16 @@ pub(super) fn choose_window(
             .iter()
             .position(|facts| super::frames_match(facts.frame, captures[capture].frame))
             .ok_or_else(not_usable)?;
+        if let Some(user) = captures.iter().find(|capture| {
+            capture.pid == pid
+                && user_windows.contains(&capture.id)
+                && super::frames_match(ax[index].frame, capture.frame)
+        }) {
+            return Err(super::error(
+                ErrorKind::UserWindow,
+                crate::messages::user_window(user.id, &user.title),
+            ));
+        }
         let (window, facts) = (&captures[capture], &ax[index]);
         if !usable(
             window.on_screen,
@@ -325,6 +335,42 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[test]
+    fn explicit_window_refuses_a_same_frame_user_capture() {
+        let captures = [window(2, DOC, true), window(1, DOC, true)];
+        let facts = [ax(DOC, "AXStandardWindow", false)];
+        let refused =
+            choose_window(Some(2), 7, "Finder", &captures, &facts, None, &[1]).unwrap_err();
+        assert_eq!(refused.kind, ErrorKind::UserWindow);
+        assert_eq!(refused.message, crate::messages::user_window(1, "w1"));
+    }
+
+    #[test]
+    fn explicit_window_without_same_frame_user_capture_is_chosen() {
+        let captures = [window(2, DOC, true), window(1, MINI, true)];
+        let facts = [
+            ax(DOC, "AXStandardWindow", false),
+            ax(MINI, "AXStandardWindow", false),
+        ];
+        assert_eq!(
+            choose_window(Some(2), 7, "Finder", &captures, &facts, None, &[1]).unwrap(),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn explicit_approved_user_window_works_with_another_user_window_excluded() {
+        let captures = [window(1, DOC, true), window(2, MINI, true)];
+        let facts = [
+            ax(DOC, "AXStandardWindow", false),
+            ax(MINI, "AXStandardWindow", false),
+        ];
+        assert_eq!(
+            choose_window(Some(1), 7, "Finder", &captures, &facts, None, &[2]).unwrap(),
+            (0, 0)
+        );
     }
 
     #[test]
