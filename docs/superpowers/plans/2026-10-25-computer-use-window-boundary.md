@@ -2637,7 +2637,7 @@ fn append_windows(
 `registry.rs:1718`：在 `"The user approves each app before its first use"` 之前插入下面这句（含末尾空格）：
 
 ```text
-Windows the user already had open are theirs: to navigate somewhere new, open a new window instead (for example cmd+n), and do not use or close the user's windows unless the user asks or approves. 
+Windows the user already had open are theirs: to navigate somewhere new, open a new window instead (for example cmd+n), and do not use or close the user's windows unless the user asks or approves.
 ```
 
 `site/src/docs/md/en/computer-use.mdx`：
