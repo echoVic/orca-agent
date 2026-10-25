@@ -48,6 +48,19 @@ class ApprovalTests(unittest.TestCase):
         self.assertEqual((allowed['chosen'], allowed['key'], allowed['boundary_event']), ('Allow this window this session', '2', False))
         self.assertIn('computer-window.txt', {p['capture'] for p in detector_self_test()})
 
+    def test_target_first_window_preview_uses_a_non_com_bundle_despite_the_title(self):
+        text = (DATA / 'computer-window.txt').read_text().replace(
+            'com.apple.finder', 'jp.naver.line').replace('24538', '77').replace(
+            '"files120" in Finder', '"com.foo.bar.plist" in LINE')
+        panel = parse_panel(text)
+        with self.subTest(result='bundle'):
+            self.assertEqual(panel['target'], 'jp.naver.line')
+        decision = answer_panel(panel, {'target': 'jp.naver.line#window:77'},
+                                ['jp.naver.line'], {77})
+        with self.subTest(result='approval'):
+            self.assertEqual((decision['chosen'], decision['boundary_event']),
+                             ('Allow this window this session', False))
+
     def test_window_title_cannot_override_preview_bundle(self):
         text = (DATA / 'computer-once.txt').read_text().replace(
             'launch_app in Calculator (com.apple.calculator)',
@@ -168,9 +181,42 @@ class MetricsTests(unittest.TestCase):
                 {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
                     'id': ident, 'name': 'computer', 'target': bundle, 'raw_arguments': args}}},
                 {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
-                    'id': ident, 'status': 'completed', 'output': f'[window {observed}]' if observed is not None else ''}}},
+                    'id': ident, 'status': 'completed', 'output': f'App "document" [window {observed}]: no screenshot' if observed is not None else ''}}},
             ])
         return extract(records, [], None)['calls']
+
+    def test_window_list_titles_do_not_count_as_observations_or_user_window_touches(self):
+        from metrics import user_window_touches
+        for action in ('list_apps', 'launch_app'):
+            with self.subTest(action=action):
+                output = 'TextEdit — com.apple.TextEdit (pid 7)\n  window 77: "[window 5]"'
+                if action == 'launch_app':
+                    output = 'launched TextEdit (com.apple.TextEdit)\n  window 77: "[window 5]"'
+                rows = [
+                    {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
+                        'id': 'c1', 'name': 'computer', 'target': 'com.apple.TextEdit',
+                        'raw_arguments': {'action': action}}}},
+                    {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
+                        'id': 'c1', 'status': 'completed', 'output': output}}},
+                ]
+                calls = extract(rows, [], None)['calls']
+                self.assertIsNone(calls[0]['observed_window'])
+                self.assertEqual(user_window_touches(calls, {5, 77}, []), [])
+
+    def test_observation_header_window_id_cannot_be_spoofed_by_its_title(self):
+        from metrics import user_window_touches
+        title = json.dumps('quoted "title" \\ [window 5]')
+        rows = [
+            {'type': 'event.semantic', 'event': {'type': 'tool.call.requested', 'payload': {
+                'id': 'c1', 'name': 'computer', 'target': 'com.apple.TextEdit',
+                'raw_arguments': {'action': 'observe'}}}},
+            {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
+                'id': 'c1', 'status': 'completed',
+                'output': f'TextEdit {title} [window 77]: no screenshot\n[1] text "[window 5]"'}}},
+        ]
+        calls = extract(rows, [], None)['calls']
+        self.assertEqual(calls[0]['observed_window'], 77)
+        self.assertEqual(user_window_touches(calls, {5, 77}, []), [77])
 
     def test_requested_and_observed_windows_are_both_checked(self):
         from metrics import user_window_touches
@@ -222,7 +268,7 @@ class MetricsTests(unittest.TestCase):
         later = copy.deepcopy(early)
         later['event']['payload'].update(id='later', raw_arguments={'action': 'observe'})
         result = {'type': 'event.semantic', 'event': {'type': 'tool.call.completed', 'payload': {
-            'id': 'later', 'status': 'completed', 'output': '[window 20]'}}}
+            'id': 'later', 'status': 'completed', 'output': 'Finder "folder" [window 20]: no screenshot'}}}
         calls = extract([early, response, later, result], [], None)['calls']
         self.assertEqual([c['id'] for c in calls], ['early', 'later'])
         self.assertIsNone(calls[0].get('inherited_window'))
@@ -264,7 +310,8 @@ class MetricsTests(unittest.TestCase):
                 e['payload'].update(output='Preview "two-pages.pdf" [window 812]: screenshot 1280x902')
         computer = [c for c in extract(rows, [], None)['calls'] if c['name'] == 'computer']
         self.assertTrue(computer)
-        self.assertEqual({c['window'] for c in computer}, {812})
+        self.assertEqual([(c['arguments']['action'], c['window']) for c in computer],
+                         [('launch_app', None), ('observe', 812)])
 
     def test_recorded_usage_is_last_snapshot_not_sum(self):
         m = extract(read_jsonl(DATA / 'preview-session.jsonl'), [], 1792755824.99715)

@@ -31,21 +31,24 @@ def parse_panel(pane, titles=None):
             continue
         body = '\n'.join(lines[start + 1:end])
         options = []
+        preview_lines = []
         for line in body.splitlines():
             m = re.match(r'^\s*│\s*[›>]?\s*(\d)\s{2,}(.+?)\s*│?\s*$', line)
             if m:
                 label = re.split(r'\s{2,}', m[2].rstrip('│').strip())[0]
                 options.append({'key': m[1], 'label': label})
+            elif not options:
+                preview_lines.append(line)
         if not options or not any(o['label'] == 'Deny' for o in options):
             continue
         # Option+deny detection also recognizes future risk titles fail-safely.
         tool_match = re.search(r'(?:^|\n)\s*│\s*tool\s+(\S+)', body)
         tool = title.split('Approve · ', 1)[1] if title.startswith('Approve · ') else (tool_match[1] if tool_match else 'permissions')
         # The preview ends with the app bundle; its window title is user-controlled.
-        preview = re.search(r'\(([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,}(?:#secure)?)\)\s*│?\s*$',
-                            lines[start + 1])
+        preview = re.findall(r'\(([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,}(?:#secure)?)\)\s*│?\s*$',
+                             '\n'.join(preview_lines), re.MULTILINE)
         if preview:
-            target = preview[1]
+            target = preview[-1]
         else:
             # Older captures may show only a standalone canonical target.
             bundles = re.findall(r'(?<![\w./-])([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,}(?:#secure)?)(?![\w./-])', body)
