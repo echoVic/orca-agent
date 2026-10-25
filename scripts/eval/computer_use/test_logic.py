@@ -397,6 +397,23 @@ class VerifierTests(unittest.TestCase):
         # A skipped window holds no evidence, so actions on it cannot count either.
         self.assertEqual(data['windows'], [10])
 
+    def test_gui_coverage_counts_an_actions_own_task_window_observation(self):
+        task = {'id': 'S2', 'allowed_apps': ['com.google.Chrome']}
+        calls = [
+            {'name': 'computer', 'target': 'com.google.Chrome', 'status': 'completed',
+             'arguments': {'action': action}}
+            for action in ['key', 'click', 'type', 'key']
+        ]
+        self.assertFalse(gui_coverage(task, {'calls': calls}, {'windows': [51654]}))
+        # Like run-1 S2: no explicit observe; the final key returns the task window.
+        calls[-1]['observed_window'] = 51654
+        self.assertTrue(gui_coverage(task, {'calls': calls}, {'windows': [51654]}))
+        calls[-1]['observed_window'] = 15731
+        self.assertFalse(gui_coverage(task, {'calls': calls}, {'windows': [51654]}))
+        calls[-1]['observed_window'] = 51654
+        calls[-1]['status'] = 'failed'
+        self.assertFalse(gui_coverage(task, {'calls': calls}, {'windows': [51654]}))
+
     def test_calculator_requires_input_not_a_restored_display(self):
         task = {'id': 'S1', 'allowed_apps': ['com.apple.calculator']}
         observe = {'name': 'computer', 'target': 'com.apple.calculator', 'status': 'completed', 'arguments': {'action': 'observe', 'window': 10}}

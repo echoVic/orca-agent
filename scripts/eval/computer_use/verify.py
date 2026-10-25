@@ -128,6 +128,8 @@ def gui_coverage(task, metrics, data):
              and (c.get('target') or '').split('#')[0] == app
              and (c['arguments'].get('window') is None or c['arguments']['window'] in data['windows'])]
     actions = {c['arguments'].get('action') for c in calls}
+    if any(c.get('observed_window') in data['windows'] for c in calls):
+        actions.add('observe')
     required = {'S5': {'type'}, 'S8': {'click'}, 'M1': {'type'}, 'M2': {'click', 'type'},
                 'M3': {'type'}, 'M6': {'click'}, 'M7': {'type'}}.get(task['id'], {'observe'})
     if not required <= actions:
