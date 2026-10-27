@@ -80,8 +80,8 @@ const copy = {
       secondary: "View on GitHub",
       meta: {
         context: "context window",
-        turns: "max turns",
-        tools: "tool surfaces",
+        turns: "default turn cap",
+        tools: "built-in tools",
         platforms: "platforms",
         cache: "prefix-cache hit",
       },
@@ -342,8 +342,8 @@ const copy = {
       secondary: "查看 GitHub",
       meta: {
         context: "上下文窗口",
-        turns: "最大轮次",
-        tools: "工具面",
+        turns: "默认轮次上限",
+        tools: "内置工具",
         platforms: "支持平台",
         cache: "前缀缓存命中",
       },
@@ -1128,11 +1128,11 @@ function App() {
               <span className="l">{t.hero.meta.cache}</span>
             </div>
             <div>
-              <span className="k">128</span>
+              <span className="k symbol">∞</span>
               <span className="l">{t.hero.meta.turns}</span>
             </div>
             <div>
-              <span className="k">16</span>
+              <span className="k">37</span>
               <span className="l">{t.hero.meta.tools}</span>
             </div>
             <div>

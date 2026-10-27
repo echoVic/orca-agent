@@ -323,6 +323,13 @@ h3 {
   color: var(--fg);
 }
 
+/* ∞ is drawn at x-height; scale it up to the digits' cap height. */
+.hero-meta .k.symbol {
+  align-self: flex-start;
+  transform: scale(1.5);
+  transform-origin: left center;
+}
+
 .hero-meta .l {
   font-size: 0.78rem;
   color: var(--faint);
