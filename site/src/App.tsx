@@ -276,6 +276,22 @@ const copy = {
           q: "What makes persistent goals different from a long prompt?",
           a: "A /goal survives restarts, auto-continues successful turns, and requires an explicit complete or blocked audit before Orca stops.",
         },
+        {
+          q: "Which platforms does Orca support?",
+          a: "Orca ships native binaries for macOS, Linux, and Windows on arm64 and x64, plus an npm package that wraps the binary.",
+        },
+        {
+          q: "How does the sandbox protect my machine?",
+          a: "Shell commands run inside a sandbox scoped to the workspace. Linux prefers bubblewrap and falls back to Landlock plus seccomp; macOS uses Seatbelt. Network and writes outside trusted folders need approval.",
+        },
+        {
+          q: "What are approval modes?",
+          a: "Approval modes decide how tool calls are gated. Suggest mode asks before writes, auto-edit allows edits but still asks for shell and network, and full-auto runs everything within policy. You can also grant a tool once or for the session.",
+        },
+        {
+          q: "Can Orca use MCP tools?",
+          a: "Yes. Orca supports the Model Context Protocol: add stdio or HTTP servers with orca mcp, and their tools appear in the same approval-aware registry as built-in tools.",
+        },
       ],
     },
     specsEyebrow: "Technical specs",
@@ -536,6 +552,22 @@ const copy = {
         {
           q: "持久 goal 和写一个长 prompt 有什么不同？",
           a: "/goal 会跨重启保留，成功后自动继续，并要求 Orca 明确审计为 complete 或 blocked 后才停止。",
+        },
+        {
+          q: "Orca 支持哪些平台？",
+          a: "Orca 提供 macOS、Linux、Windows 的 arm64 / x64 原生二进制，以及一个封装二进制的 npm 包。",
+        },
+        {
+          q: "沙箱怎么保护我的电脑？",
+          a: "shell 命令在限定到工作区的沙箱里运行。Linux 优先使用 bubblewrap，回退到 Landlock 加 seccomp；macOS 使用 Seatbelt。网络和工作区外的写入需要审批。",
+        },
+        {
+          q: "审批模式有哪些？",
+          a: "审批模式决定工具调用的门槛。suggest 模式在写入前询问，auto-edit 允许编辑但仍询问 shell 和网络，full-auto 在策略范围内全自动运行。也可以对单个工具授予一次或整会话权限。",
+        },
+        {
+          q: "Orca 能用 MCP 工具吗？",
+          a: "可以。Orca 支持 Model Context Protocol：用 orca mcp 添加 stdio 或 HTTP 服务器，它们的工具会和内置工具一样出现在同一个带审批的注册表里。",
         },
       ],
     },
@@ -973,6 +1005,22 @@ function App() {
   const tuiBlocks = useMemo(() => makeTuiBlocks(t), [t]);
   const tui = useTuiAnimation(tuiBlocks, t.tui.user);
 
+  const faqJsonLd = useMemo(() => {
+    const mainEntity = t.faq.items.map((item) => ({
+      "@type": "Question",
+      name: item.q,
+      acceptedAnswer: {
+        "@type": "Answer",
+        text: item.a,
+      },
+    }));
+    return JSON.stringify({
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      mainEntity,
+    });
+  }, [t]);
+
   useEffect(() => {
     window.localStorage.setItem(localeStorageKey, locale);
     applySeoHead(locale, seoCopy[locale] satisfies SeoEntry, canonicalUrl);
@@ -1057,6 +1105,7 @@ function App() {
 
   return (
     <main>
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: faqJsonLd }} />
       <header className="nav">
         <a className="brand" href="#top" aria-label={t.aria.home}>
           <img className="brand-mark" src="/orca-icon.svg" alt="" aria-hidden="true" />
@@ -1489,6 +1538,9 @@ function App() {
           </a>
           <a href={links.releases} rel="noreferrer">
             {t.install.releases}
+          </a>
+          <a href={links.blog} rel="noreferrer">
+            Blog
           </a>
           <span>{t.community.qq}</span>
           <a href={links.telegram} rel="noreferrer">

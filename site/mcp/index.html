@@ -11,6 +11,7 @@
       content="Orca MCP tools let local DeepSeek coding workflows call external tool servers through the same spec-driven tools and approval-aware contracts as built-in tools."
     />
     <link rel="canonical" href="https://orcaagent.dev/mcp/" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/svg+xml" href="/orca-icon.svg" />
     <link rel="apple-touch-icon" href="/orca-icon.svg" />
     <link rel="stylesheet" href="/src/styles.css" />
@@ -58,27 +59,31 @@
         </a>
         <div class="nav-actions">
           <nav aria-label="Page navigation">
-            <a href="/">Home</a>
-            <a href="/terminal-coding-agent/">Terminal</a>
-            <a href="/deepseek-coding-agent/">DeepSeek</a>
-            <a href="/github/">GitHub</a>
-            <a class="nav-cta" href="/#install">Install</a>
+            <a href="/" data-zh="首页">Home</a>
+            <a href="/terminal-coding-agent/" data-zh="终端">Terminal</a>
+            <a href="/deepseek-coding-agent/" data-zh="DeepSeek">DeepSeek</a>
+            <a href="/github/" data-zh="GitHub">GitHub</a>
+            <a class="nav-cta" href="/#install" data-zh="安装">Install</a>
           </nav>
+          <div class="locale-switch" role="group" aria-label="Language">
+            <button type="button" data-locale="en" aria-label="English">EN</button>
+            <button type="button" data-locale="zh" aria-label="中文">中文</button>
+          </div>
         </div>
       </header>
 
       <section class="hero" id="top">
         <div class="hero-copy">
-          <span class="pill"><span class="dot"></span>orca mcp</span>
-          <h1>MCP tools inside an approval-aware coding loop.</h1>
-          <p class="subtitle">
+          <span class="pill"><span class="dot"></span><span data-zh="orca mcp">orca mcp</span></span>
+          <h1 data-zh="审批感知编程循环中的 MCP 工具。">MCP tools inside an approval-aware coding loop.</h1>
+          <p class="subtitle" data-zh="Orca MCP 工具用外部工具服务器扩展本地编程智能体，同时保留规范驱动工具、审批策略、沙箱行为与可恢复转录。">
             Orca MCP tools extend the local coding agent with external tool servers
             while preserving spec-driven tools, approval policies, sandbox behavior,
             and resumable transcripts.
           </p>
           <div class="actions">
-            <a class="primary" href="/#install">Install Orca</a>
-            <a class="secondary" href="/terminal-coding-agent/">Terminal workflow</a>
+            <a class="primary" href="/#install" data-zh="安装 Orca">Install Orca</a>
+            <a class="secondary" href="/terminal-coding-agent/" data-zh="终端工作流">Terminal workflow</a>
           </div>
         </div>
         <div class="code-panel">
@@ -90,24 +95,238 @@ mcp__browser__screenshot</code></pre>
 
       <section class="features" aria-labelledby="mcp-tools-heading">
         <div class="section-heading">
-          <p class="eyebrow">Tool contract</p>
-          <h2 id="mcp-tools-heading">MCP fits the same tool model as the rest of Orca.</h2>
+          <p class="eyebrow" data-zh="工具合约">Tool contract</p>
+          <h2 id="mcp-tools-heading" data-zh="MCP 适配与 Orca 其余部分相同的工具模型。">MCP fits the same tool model as the rest of Orca.</h2>
         </div>
         <div class="feature-grid">
           <article>
-            <h3>Spec-driven tools</h3>
-            <p>MCP, built-in, and external tools share one model-visible contract instead of scattered ad-hoc prompts.</p>
+            <h3 data-zh="规范驱动的工具">Spec-driven tools</h3>
+            <p data-zh="MCP、内置与外部工具共享一份对模型可见的合约，而非散落的临时提示。每个工具都声明其参数与能力，因此模型看到一致的表面，并获得可推理的结构化结果。">MCP, built-in, and external tools share one model-visible contract instead of scattered ad-hoc prompts. Every tool declares its parameters and capabilities, so the model sees a consistent surface and gets structured results it can reason over.</p>
           </article>
           <article>
-            <h3>Approval policies</h3>
-            <p>Tool capabilities determine whether calls run directly, ask for approval, or stay blocked by policy.</p>
+            <h3 data-zh="审批策略">Approval policies</h3>
+            <p data-zh="工具能力决定调用是直接运行、请求审批还是被策略阻止。MCP 工具与内置工具获得相同待遇：读取可以快速，写入与网络调用由相同规则把关。">Tool capabilities determine whether calls run directly, ask for approval, or stay blocked by policy. MCP tools get the same treatment as built-in ones: reads can be fast, writes and network calls are gated by the same rules.</p>
           </article>
           <article>
-            <h3>Auditable results</h3>
-            <p>Tool requests, outputs, approvals, and failures stay in the local JSONL transcript for later review.</p>
+            <h3 data-zh="可审计结果">Auditable results</h3>
+            <p data-zh="工具请求、输出、审批与失败都保留在本地 JSONL 转录中供后续审阅。MCP 调用会记录其服务器、工具名、参数与结果，因此外部工具使用与内置调用一样可追踪。">Tool requests, outputs, approvals, and failures stay in the local JSONL transcript for later review. MCP calls are recorded with their server, tool name, parameters, and result, so external tool usage is as traceable as built-in calls.</p>
+          </article>
+          <article>
+            <h3 data-zh="托管的服务器生命周期">Managed server lifecycle</h3>
+            <p data-zh="使用 <code>orca mcp</code> 添加、列出、移除、登录与登出已连接的 MCP 服务器。服务器在启动时于后台连接，因此工具在你的第一条消息前就可用，并保持列在 <code>/mcp</code> 面板中。">Add, list, remove, log in to, and log out of connected MCP servers with <code>orca mcp</code>. Servers connect in the background at launch, so tools are available before your first message and stay listed in the <code>/mcp</code> panel.</p>
+          </article>
+          <article>
+            <h3 data-zh="远程与本地服务器">Remote and local servers</h3>
+            <p data-zh="远程服务器使用可流式 HTTP，并回退到旧版 SSE，支持从环境中获取真实 OAuth 或 bearer token 登录。本地 stdio 服务器作为子进程运行，并像其他任何工具一样被监管，日志按需可用。">Remote servers speak streamable HTTP and fall back to legacy SSE, with real OAuth or bearer-token login from the environment. Local stdio servers run as child processes and are supervised like any other tool, with logs available on demand.</p>
+          </article>
+          <article>
+            <h3 data-zh="默认 Fail-closed">Fail-closed by default</h3>
+            <p data-zh="断开连接或返回错误的服务器会 fail-closed，而非静默重试。仅回合有效的工具审批在重启后不会被恢复，除非能还原相同的定义，因此过期审批永远不会授予对已变更工具的访问。">A server that drops its connection or returns an error fails closed rather than silently retrying. Turn-only tool approvals are never resumed after a restart unless the same definition can be restored, so a stale approval can never grant access to a changed tool.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="mcp-how-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="MCP 工具如何运作">How MCP tools work</p>
+          <h2 id="mcp-how-heading" data-zh="外部工具，相同的审批与审计模型。">External tools, same approval and audit model.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3 data-zh="注册服务器">Register a server</h3>
+            <p data-zh="使用 <code>orca mcp add</code> 注册 stdio 或 HTTP 服务器。Orca 存储配置、在后台连接，并列出它暴露的工具。远程服务器支持来自环境的 OAuth 或 bearer token，内联数组在你编辑列表时保留其注释。">Use <code>orca mcp add</code> to register a stdio or HTTP server. Orca stores the config, connects in the background, and lists the tools it exposes. Remote servers support OAuth or a bearer token from the environment, and inline arrays keep their comments when you edit the list.</p>
+          </article>
+          <article>
+            <h3 data-zh="工具出现在模型工具列表中">Tools appear in the model's tool list</h3>
+            <p data-zh="每个 MCP 工具都以其真实 schema 呈现。模型像调用内置工具一样调用它，使用带类型的参数与结构化结果。MCP 没有单独的提示路径，因此模型永远不必猜测如何调用任何工具。">Every MCP tool is surfaced with its real schema. The model calls it the same way it calls a built-in tool, with typed parameters and a structured result. There is no separate prompt path for MCP, so the model never has to guess how to invoke any tool.</p>
+          </article>
+          <article>
+            <h3 data-zh="审批统一适用">Approvals apply uniformly</h3>
+            <p data-zh="MCP 工具像内置工具一样声明能力。只读 MCP 工具可在建议模式下跳过审批；写入或调用网络的工具会请求审批，与内置等价物完全一样。你可以允许某个工具一次、整个会话，或保持阻止。">MCP tools declare capabilities just like built-in tools. A read-only MCP tool can skip approval in suggest mode; a tool that writes or calls the network asks for approval, exactly as a built-in equivalent would. You can allow a tool once, for the session, or keep it blocked.</p>
+          </article>
+          <article>
+            <h3 data-zh="图片回流到模型">Images flow back to the model</h3>
+            <p data-zh="当 MCP 工具返回图片时，它会作为真实图片输入交付给模型。DeepSeek 的视觉模型随后可以对 MCP 服务器返回的截图、图表与捕获进行推理，图片会存储在转录中供后续审阅。">When an MCP tool returns an image, it is delivered to the model as a real image input. DeepSeek's vision model can then reason about screenshots, diagrams, and captures returned by MCP servers, with the image stored in the transcript for later review.</p>
+          </article>
+          <article>
+            <h3 data-zh="连接保持活跃">Connections stay alive</h3>
+            <p data-zh="服务器在空闲时被 ping，失败时重连。回合只等待仍在连接的服务器，Esc 可取消卡在重连或繁忙流之后的 MCP 调用，让你永远不会被挂起的服务器阻塞。">Servers are pinged while idle and reconnected on failure. A turn waits only for servers still connecting, and Esc cancels an MCP call stuck behind a reconnect or a busy stream so you are never blocked by a hung server.</p>
+          </article>
+          <article>
+            <h3 data-zh="一切都被记录">Everything is recorded</h3>
+            <p data-zh="每次 MCP 调用始终写入 JSONL 转录：服务器、工具、参数、结果与审批状态。你也可以像审计内置工具一样审计外部工具使用，并提取完整轨迹用于调试或基准测试。">Each MCP call is always written to the JSONL transcript: server, tool, parameters, result, and approval state. You can also audit external tool usage the same way you audit built-in tools, and extract a full trajectory for debugging or benchmarking.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="mcp-cases-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="使用场景">Use cases</p>
+          <h2 id="mcp-cases-heading" data-zh="MCP 在编程循环中解锁的能力。">What MCP unlocks inside the coding loop.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3 data-zh="搜索 issue 与 PR">Search issues and PRs</h3>
+            <p data-zh="MCP GitHub 服务器让 Orca 无需单独集成即可搜索 issue、读取 PR 与发布评论。结果是真实数据，而非从网页解析的描述，因此智能体可以对精确数字与状态采取行动。">An MCP GitHub server lets Orca search issues, read PRs, and post comments without a separate integration. The results are real data, not a description parsed from a web page, so the agent can act on exact numbers and statuses.</p>
+          </article>
+          <article>
+            <h3 data-zh="阅读内部文档">Read internal docs</h3>
+            <p data-zh="连接文档服务器，Orca 就能读取你团队的 runbook、API 参考与架构笔记。引用来源以文件路径与页面标题返回，因此声明是可追溯的，而非凭记忆断言。">Connect a docs server and Orca can read your team's runbooks, API references, and architecture notes. Cited sources come back as file paths and page titles, so claims are traceable instead of asserted from memory.</p>
+          </article>
+          <article>
+            <h3 data-zh="浏览器自动化">Browser automation</h3>
+            <p data-zh="MCP 浏览器服务器可以导航、点击、填表与截图。Orca 可以驱动 Web 应用复现缺陷并将结果捕获为证据，然后借助视觉支持对截图进行推理。">An MCP browser server can navigate, click, fill forms, and take screenshots. Orca can drive a web app to reproduce a bug and capture the result as evidence, then reason about the screenshot with vision support.</p>
+          </article>
+          <article>
+            <h3 data-zh="数据库访问">Database access</h3>
+            <p data-zh="只读数据库 MCP 服务器让 Orca 无需授予数据库 shell 访问权限即可检查 schema、运行查询并验证数据迁移。结果以结构化数据返回，模型可直接对其推理。">A read-only database MCP server lets Orca inspect schema, run queries, and verify data migrations without granting shell access to the database. Results come back as structured data the model can reason over directly.</p>
+          </article>
+          <article>
+            <h3 data-zh="云与基础设施">Cloud and infrastructure</h3>
+            <p data-zh="连接云提供商的 MCP 服务器以检查资源、查看日志并验证部署。审批策略把关破坏性操作，因此只读侦察可以快速，而变更仍由你控制。">Connect a cloud provider's MCP server to inspect resources, check logs, and verify deployments. Approval policies keep destructive operations gated, so read-only reconnaissance can be fast while changes stay under your control.</p>
+          </article>
+          <article>
+            <h3 data-zh="内部服务">Internal services</h3>
+            <p data-zh="把任何内部 API 包装成 MCP 服务器，它就成为一等工具。Orca 可以调用它、检查结果，并将其纳入编程循环。由于工具是 schema 驱动的，模型获得带类型的参数与结构化结果，而非自由文本提示。">Wrap any internal API in an MCP server and it becomes a first-class tool. Orca can call it, inspect the result, and fold it into the coding loop. Because the tool is schema-driven, the model gets typed parameters and structured results instead of free-text prompts.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="faq" id="faq" aria-labelledby="mcp-faq-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="常见问题">FAQ</p>
+          <h2 id="mcp-faq-heading" data-zh="关于 Orca MCP 工具的问题。">Questions about Orca MCP tools.</h2>
+        </div>
+        <div class="faq-list">
+          <article>
+            <h3 data-zh="什么是 MCP？">What is MCP?</h3>
+            <p data-zh="模型上下文协议（Model Context Protocol）是把外部工具连接到 AI 助手的标准。Orca 实现了它，因此任何 MCP 服务器都能向编程智能体暴露工具。">The Model Context Protocol is a standard for connecting external tools to AI assistants. Orca implements it so any MCP server can expose tools to the coding agent.</p>
+          </article>
+          <article>
+            <h3 data-zh="MCP 工具与内置工具有区别对待吗？">Are MCP tools treated differently from built-in tools?</h3>
+            <p data-zh="没有。它们共享相同的规范驱动合约、审批策略与审计轨迹。无论工具是内置还是 MCP，模型看到的都是一份一致的工具列表。">No. They share the same spec-driven contract, approval policies, and audit trail. The model sees one consistent tool list regardless of whether a tool is built-in or MCP.</p>
+          </article>
+          <article>
+            <h3 data-zh="MCP 工具能不经审批就运行吗？">Can MCP tools run without approval?</h3>
+            <p data-zh="只读 MCP 工具可在建议模式下跳过审批。任何写入、调用网络或执行特权操作的工具都会请求审批，与内置等价物一样。">Read-only MCP tools can skip approval in suggest mode. Any tool that writes, calls the network, or performs a privileged operation asks for approval, just like a built-in equivalent.</p>
+          </article>
+          <article>
+            <h3 data-zh="如果 MCP 服务器断开连接会怎样？">What happens if an MCP server disconnects?</h3>
+            <p data-zh="Orca 会 ping 空闲服务器并在失败时重连。卡在重连之后的调用可以用 Esc 取消，失败会被记录在转录中，而非静默重试。">Orca pings idle servers and reconnects on failure. A call stuck behind a reconnect can be cancelled with Esc, and failures are recorded in the transcript rather than retried silently.</p>
+          </article>
+          <article>
+            <h3 data-zh="我能使用返回图片的 MCP 工具吗？">Can I use MCP tools that return images?</h3>
+            <p data-zh="可以。MCP 工具返回的图片会作为图片输入交付给模型。DeepSeek 的视觉模型随后可以把它们作为编程循环的一部分进行推理。">Yes. Images returned by MCP tools are delivered to the model as image inputs. DeepSeek's vision model can then reason about them as part of the coding loop.</p>
+          </article>
+          <article>
+            <h3 data-zh="MCP 工具调用会被记录吗？">Are MCP tool calls recorded?</h3>
+            <p data-zh="会。每次 MCP 调用——服务器、工具、参数、结果与审批状态——都会写入本地 JSONL 转录。你可以像审计内置工具一样审计外部工具使用。">Yes. Every MCP call — server, tool, parameters, result, and approval state — is written to the local JSONL transcript. You can audit external tool usage the same way you audit built-in tools.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="mcp-next-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="继续探索">Keep exploring</p>
+          <h2 id="mcp-next-heading" data-zh="MCP 扩展每个 Orca 工作流。">MCP extends every Orca workflow.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3><a href="/terminal-coding-agent/" data-zh="终端智能体">Terminal agent</a></h3>
+            <p data-zh="MCP 工具被调用、审批与记录的终端优先循环。">The terminal-first loop where MCP tools are called, approved, and recorded.</p>
+          </article>
+          <article>
+            <h3><a href="/deepseek-coding-agent/" data-zh="DeepSeek 原生">DeepSeek-native</a></h3>
+            <p data-zh="了解来自 MCP 工具的图片如何在同一个循环中到达 DeepSeek 的视觉模型。">See how images from MCP tools reach DeepSeek's vision model inside the same loop.</p>
+          </article>
+          <article>
+            <h3><a href="/github/" data-zh="GitHub 工作流">GitHub workflows</a></h3>
+            <p data-zh="使用 MCP GitHub 服务器在不离开终端的情况下搜索 issue 与读取 PR。">Use an MCP GitHub server to search issues and read PRs without leaving the terminal.</p>
+          </article>
+          <article>
+            <h3><a href="/docs/" data-zh="文档">Documentation</a></h3>
+            <p data-zh="阅读关于添加 MCP 服务器、审批策略与服务器生命周期的完整指南。">Read the full guide on adding MCP servers, approval policies, and server lifecycle.</p>
+          </article>
+          <article>
+            <h3><a href="/changelog/" data-zh="更新日志">Changelog</a></h3>
+            <p data-zh="关注涵盖 MCP 服务器管理、OAuth、可流式 HTTP 等的发布。">Follow releases covering MCP server management, OAuth, streamable HTTP, and more.</p>
+          </article>
+          <article>
+            <h3><a href="/#install" data-zh="安装 Orca">Install Orca</a></h3>
+            <p data-zh="使用 npm 或下载适用于 macOS、Linux 与 Windows 的 arm64 及 x64 原生二进制。">Use npm or download the native binary for macOS, Linux, and Windows on arm64 and x64.</p>
           </article>
         </div>
       </section>
     </main>
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "What is MCP?",
+            "acceptedAnswer": { "@type": "Answer", "text": "The Model Context Protocol is a standard for connecting external tools to AI assistants. Orca implements it so any MCP server can expose tools to the coding agent." }
+          },
+          {
+            "@type": "Question",
+            "name": "Are MCP tools treated differently from built-in tools?",
+            "acceptedAnswer": { "@type": "Answer", "text": "No. They share the same spec-driven contract, approval policies, and audit trail. The model sees one consistent tool list regardless of whether a tool is built-in or MCP." }
+          },
+          {
+            "@type": "Question",
+            "name": "Can MCP tools run without approval?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Read-only MCP tools can skip approval in suggest mode. Any tool that writes, calls the network, or performs a privileged operation asks for approval, just like a built-in equivalent." }
+          },
+          {
+            "@type": "Question",
+            "name": "What happens if an MCP server disconnects?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Orca pings idle servers and reconnects on failure. A call stuck behind a reconnect can be cancelled with Esc, and failures are recorded in the transcript rather than retried silently." }
+          },
+          {
+            "@type": "Question",
+            "name": "Can I use MCP tools that return images?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Yes. Images returned by MCP tools are delivered to the model as image inputs. DeepSeek's vision model can then reason about them as part of the coding loop." }
+          },
+          {
+            "@type": "Question",
+            "name": "Are MCP tool calls recorded?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Yes. Every MCP call — server, tool, parameters, result, and approval state — is written to the local JSONL transcript. You can audit external tool usage the same way you audit built-in tools." }
+          }
+        ]
+      }
+    </script>
+    <script>
+      (function () {
+        var KEY = "orca-site-locale";
+        function detect() {
+          try {
+            var s = localStorage.getItem(KEY);
+            if (s === "en" || s === "zh") return s;
+          } catch (e) {}
+          return navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+        }
+        function apply(loc) {
+          document.documentElement.lang = loc === "zh" ? "zh-CN" : "en";
+          document.querySelectorAll("[data-zh]").forEach(function (el) {
+            if (!el.dataset.en) el.dataset.en = el.innerHTML;
+            el.innerHTML = loc === "zh" ? el.dataset.zh : el.dataset.en;
+          });
+          document.querySelectorAll(".locale-switch button").forEach(function (btn) {
+            btn.setAttribute("aria-pressed", btn.dataset.locale === loc ? "true" : "false");
+          });
+        }
+        var current = detect();
+        apply(current);
+        document.querySelectorAll(".locale-switch button").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            current = btn.dataset.locale;
+            try { localStorage.setItem(KEY, current); } catch (e) {}
+            apply(current);
+          });
+        });
+      })();
+    </script>
   </body>
 </html>

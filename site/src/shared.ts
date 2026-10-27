@@ -1536,6 +1536,7 @@ export const links = {
   npm: "https://www.npmjs.com/package/@blade-ai/orca",
   releases: "https://github.com/echoVic/orca-agent/releases/latest",
   telegram: "https://t.me/+11No1w5ZbTMyZTQ1",
+  blog: "https://echovic.com",
   home: "/",
   changelog: "/changelog/",
   terminalCodingAgent: "/terminal-coding-agent/",

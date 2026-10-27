@@ -177,45 +177,35 @@ const defaultLocale: Locale = "en";
 
 type MdxModule = { default: ComponentType };
 
+// Eager loading keeps the overview (and every section) available synchronously
+// during SSR, so crawlers that don't run JS see real documentation content
+// instead of the "Section not found" fallback.
 const mdLoaders = (import.meta as any).glob("./md/**/*.md", {
   query: "?raw",
   import: "default",
-  eager: false,
-}) as Record<string, () => Promise<string>>;
+  eager: true,
+}) as Record<string, string>;
 
 const mdxLoaders = (import.meta as any).glob("./md/**/*.mdx", {
-  eager: false,
-}) as Record<string, () => Promise<MdxModule>>;
+  eager: true,
+}) as Record<string, MdxModule>;
 
 type LoadedContent =
   | { kind: "md"; text: string }
   | { kind: "mdx"; MdxComponent: ComponentType }
   | null;
 
-const contentCache = new Map<string, Promise<LoadedContent>>();
-
-function loadContent(locale: Locale, file: string): Promise<LoadedContent> {
+function getLoadedContent(locale: Locale, file: string): LoadedContent {
   const langDir = locale === "zh" ? "zh" : "en";
-  const key = `${langDir}:${file}`;
-  if (contentCache.has(key)) return contentCache.get(key)!;
-
   const mdxKey = `./md/${langDir}/${file}.mdx`;
   const mdKey = `./md/${langDir}/${file}.md`;
-
-  const promise = (async () => {
-    if (mdxLoaders[mdxKey]) {
-      const mod = await mdxLoaders[mdxKey]();
-      return { kind: "mdx" as const, MdxComponent: mod.default };
-    }
-    if (mdLoaders[mdKey]) {
-      const text = await mdLoaders[mdKey]();
-      return { kind: "md" as const, text };
-    }
-    return null;
-  })();
-
-  contentCache.set(key, promise);
-  return promise;
+  if (mdxLoaders[mdxKey]) {
+    return { kind: "mdx" as const, MdxComponent: mdxLoaders[mdxKey].default };
+  }
+  if (mdLoaders[mdKey]) {
+    return { kind: "md" as const, text: mdLoaders[mdKey] };
+  }
+  return null;
 }
 
 function MdxRenderer({ component }: { component: ComponentType }) {
@@ -258,8 +248,9 @@ function LoadingSkeleton() {
 export default function Docs() {
   const [locale, setLocale] = useState<Locale>(() => detectInitialLocale() as Locale);
   const [activeId, setActiveId] = useState<string>("overview");
-  const [loaded, setLoaded] = useState<LoadedContent>(null);
-  const [loading, setLoading] = useState(false);
+  const [loaded, setLoaded] = useState<LoadedContent>(() =>
+    getLoadedContent(detectInitialLocale() as Locale, "overview"),
+  );
 
   const nav = sectionsByLocale[locale];
 
@@ -296,22 +287,14 @@ export default function Docs() {
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
+  // Content is resolved synchronously from the eager-loaded modules so both
+  // SSR and the client see the section body immediately.
   useEffect(() => {
     if (!activeSection) {
       setLoaded(null);
       return;
     }
-    let cancelled = false;
-    setLoading(true);
-    loadContent(locale, activeSection.file).then((content) => {
-      if (!cancelled) {
-        setLoaded(content);
-        setLoading(false);
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
+    setLoaded(getLoadedContent(locale, activeSection.file));
   }, [locale, activeSection]);
 
   const handleNavClick = (id: string) => {
@@ -327,9 +310,7 @@ export default function Docs() {
   const t = navCopy[locale];
 
   let content: ReactNode;
-  if (loading && !loaded) {
-    content = <LoadingSkeleton />;
-  } else if (!loaded) {
+  if (!loaded) {
     content = <p>Section not found.</p>;
   } else if (loaded.kind === "md") {
     content = <MarkdownRenderer text={loaded.text} />;

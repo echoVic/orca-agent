@@ -11,6 +11,7 @@
       content="Orca is a DeepSeek-native terminal coding agent for local repository work, long-context fixes, tool use, approvals, and verifier-gated automation."
     />
     <link rel="canonical" href="https://orcaagent.dev/terminal-coding-agent/" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/svg+xml" href="/orca-icon.svg" />
     <link rel="apple-touch-icon" href="/orca-icon.svg" />
     <link rel="stylesheet" href="/src/styles.css" />
@@ -58,33 +59,37 @@
         </a>
         <div class="nav-actions">
           <nav aria-label="Page navigation">
-            <a href="/">Home</a>
-            <a href="/deepseek-coding-agent/">DeepSeek</a>
-            <a href="/github/">GitHub</a>
-            <a href="/mcp/">MCP</a>
-            <a class="nav-cta" href="https://github.com/echoVic/orca-agent" rel="noreferrer">GitHub</a>
+            <a href="/" data-zh="首页">Home</a>
+            <a href="/deepseek-coding-agent/" data-zh="DeepSeek">DeepSeek</a>
+            <a href="/github/" data-zh="GitHub">GitHub</a>
+            <a href="/mcp/" data-zh="MCP">MCP</a>
+            <a class="nav-cta" href="https://github.com/echoVic/orca-agent" rel="noreferrer" data-zh="GitHub">GitHub</a>
           </nav>
+          <div class="locale-switch" role="group" aria-label="Language">
+            <button type="button" data-locale="en" aria-label="English">EN</button>
+            <button type="button" data-locale="zh" aria-label="中文">中文</button>
+          </div>
         </div>
       </header>
 
       <section class="hero" id="top">
         <div class="hero-copy">
-          <span class="pill"><span class="dot"></span>orca terminal</span>
-          <h1>A DeepSeek-native terminal coding agent.</h1>
-          <p class="subtitle">
+          <span class="pill"><span class="dot"></span><span data-zh="orca 终端">orca terminal</span></span>
+          <h1 data-zh="为 DeepSeek 而生的原生终端编程智能体。">A DeepSeek-native terminal coding agent.</h1>
+          <p class="subtitle" data-zh="Orca 是一款本地终端编程智能体，将代码编辑、shell 命令、验证器运行、持久化目标与可恢复历史整合在一个终端优先的 orca 工作流中。">
             Orca is a local terminal coding agent for developers who want code edits,
             shell commands, verifier runs, persistent goals, and resumable history in one
             terminal-first orca agent workflow.
           </p>
           <div class="actions">
-            <a class="primary" href="/#install">Install Orca</a>
-            <a class="secondary" href="https://github.com/echoVic/orca-agent" rel="noreferrer">View source</a>
+            <a class="primary" href="/#install" data-zh="安装 Orca">Install Orca</a>
+            <a class="secondary" href="https://github.com/echoVic/orca-agent" rel="noreferrer" data-zh="查看源码">View source</a>
           </div>
         </div>
         <div class="terminal" aria-label="Orca terminal workflow">
           <div class="terminal-bar">
             <span></span><span></span><span></span>
-            <span class="terminal-title">orca · terminal coding agent</span>
+            <span class="terminal-title" data-zh="orca · 终端编程智能体">orca · terminal coding agent</span>
           </div>
           <div class="tui-status">
             <span><span class="accent">orca</span> <span class="dim">deepseek-v4-pro</span></span>
@@ -101,24 +106,238 @@
 
       <section class="features" aria-labelledby="terminal-agent-heading">
         <div class="section-heading">
-          <p class="eyebrow">Why it fits</p>
-          <h2 id="terminal-agent-heading">Orca keeps the coding loop inside your terminal.</h2>
+          <p class="eyebrow" data-zh="为何合适">Why it fits</p>
+          <h2 id="terminal-agent-heading" data-zh="Orca 让编程循环留在你的终端之内。">Orca keeps the coding loop inside your terminal.</h2>
         </div>
         <div class="feature-grid">
           <article>
-            <h3>Local repository work</h3>
-            <p>Search, read, edit, and verify files without moving code through a separate chat window.</p>
+            <h3 data-zh="本地仓库操作">Local repository work</h3>
+            <p data-zh="在不经过独立聊天窗口的情况下搜索、读取、编辑并验证文件。Orca 直接针对你已信任的同一份检出代码运行，因此 diff 会落到你的工作区，编辑器也能立即看到变化。">Search, read, edit, and verify files without moving code through a separate chat window. Orca runs against the same checkout you already trust, so diffs land in your working tree and your editor sees them immediately.</p>
           </article>
           <article>
-            <h3>Approval-aware tools</h3>
-            <p>Reads can move quickly, while edits, shell commands, network calls, MCP tools, and subagents follow policy.</p>
+            <h3 data-zh="感知审批的工具">Approval-aware tools</h3>
+            <p data-zh="读取可以快速执行，而编辑、shell 命令、网络调用、MCP 工具与子智能体则遵循策略。每个工具都会声明其能力，审批模式决定一次调用是直接运行、询问一次，还是保持阻止。">Reads can move quickly, while edits, shell commands, network calls, MCP tools, and subagents follow policy. Each tool declares its capabilities, and the approval mode decides whether a call runs directly, asks once, or stays blocked.</p>
           </article>
           <article>
-            <h3>Long-running tasks</h3>
-            <p>Persistent goals and resumable JSONL history help long refactors continue across turns and restarts.</p>
+            <h3 data-zh="长时运行任务">Long-running tasks</h3>
+            <p data-zh="持久化目标与可恢复的 JSONL 历史，让大型重构可以跨越多个回合与重启继续进行。目标在进程退出后仍然存在，并在成功回合后自动延续，直到被显式审计完成或阻塞。">Persistent goals and resumable JSONL history help long refactors continue across turns and restarts. A goal survives the process exiting and auto-continues after successful turns until it is explicitly audited complete or blocked.</p>
+          </article>
+          <article>
+            <h3 data-zh="验证器把关的编辑">Verifier-gated edits</h3>
+            <p data-zh="将改动与 <code>npm test</code> 或 <code>cargo check</code> 之类的验证器命令配对。Orca 会在编辑后运行验证器，只有当检查通过时才认为该回合完成，因此回归会在同一个循环内暴露。">Pair a change with a verifier command such as <code>npm test</code> or <code>cargo check</code>. Orca runs the verifier after edits and only treats the turn as done when the check passes, so regressions surface inside the same loop.</p>
+          </article>
+          <article>
+            <h3 data-zh="风险工作的计划模式">Plan mode for risky work</h3>
+            <p data-zh="在触碰文件之前，让 Orca 进行只读调查并撰写计划。计划模式会产出一份包含步骤、风险与验证命令的结构化提案，并在开始执行前等待你的批准。">Before touching files, ask Orca to investigate read-only and write a plan. Plan mode produces a structured proposal with steps, risks, and verification commands, and waits for your approval before execution begins.</p>
+          </article>
+          <article>
+            <h3 data-zh="可恢复的 JSONL 转录">Resumable JSONL transcripts</h3>
+            <p data-zh="每条消息、工具调用、审批与验证器结果都会追加到 <code>~/.orca/sessions/</code> 下的本地 JSONL 转录中。无需将历史发送给第三方服务，即可恢复、分叉与搜索。">Every message, tool call, approval, and verifier result is appended to a local JSONL transcript under <code>~/.orca/sessions/</code>. Resume, fork, and search the history without sending it to a third-party service.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="terminal-how-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="工作原理">How it works</p>
+          <h2 id="terminal-how-heading" data-zh="一次终端会话，完成整个编程循环。">One terminal session, the whole coding loop.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3 data-zh="从真实检出开始">Start from a real checkout</h3>
+            <p data-zh="在任意仓库内运行 <code>orca</code>。Orca 继承你的工作目录、git 状态与环境，因此它看到的第一样东西就是你看到的同一份代码。没有上传步骤，也没有需要保持同步的独立工作区。">Run <code>orca</code> inside any repository. Orca inherits your working directory, your git state, and your environment, so the first thing it sees is the same code you see. There is no upload step and no separate workspace to keep in sync.</p>
+          </article>
+          <article>
+            <h3 data-zh="编辑前先搜索与读取">Search and read before editing</h3>
+            <p data-zh="Orca 使用内置的 <code>glob</code>、<code>grep</code> 与 <code>read_file</code> 工具定位相关文件。由于读取快速且低风险，默认无需审批即可运行，让智能体在提议任何改动之前先构建上下文。">Orca uses built-in <code>glob</code>, <code>grep</code>, and <code>read_file</code> tools to locate the relevant files. Because reads are fast and low-risk, they run without approval by default, letting the agent build context before it proposes a single change.</p>
+          </article>
+          <article>
+            <h3 data-zh="以显式 diff 编辑">Edit with an explicit diff</h3>
+            <p data-zh="编辑通过经过能力检查的 <code>edit</code> 或 <code>write_file</code> 工具进行。审批面板会在应用之前展示精确的 diff，改动会落入你的工作区，因此编辑器、linter 与测试都能立刻看到。">Edits go through a capability-checked <code>edit</code> or <code>write_file</code> tool. The approval panel shows the exact diff before it is applied, and the change lands in your working tree so your editor, linter, and tests see it at once.</p>
+          </article>
+          <article>
+            <h3 data-zh="在沙箱中运行命令">Run commands in a sandbox</h3>
+            <p data-zh="Shell 命令在默认面向工作区的沙箱下执行。Linux 主机优先使用 bubblewrap，并回退到 Landlock 加 seccomp；macOS 使用 Seatbelt。对受信任文件夹之外的网络与写入访问需要显式审批。">Shell commands execute under a sandbox that defaults to the workspace. Linux hosts prefer bubblewrap and fall back to Landlock plus seccomp; macOS uses Seatbelt. Network and write access outside trusted folders requires explicit approval.</p>
+          </article>
+          <article>
+            <h3 data-zh="声称成功前先验证">Verify before claiming success</h3>
+            <p data-zh="通过 <code>--verifier</code> 或在提示中内联为该回合附加一个验证器。Orca 会在每次编辑后运行它并报告结果；失败的验证器会使回合保持打开，让智能体修复回归，而不是把一个损坏的补丁交给你。">Attach a verifier to the turn with <code>--verifier</code> or inline in the prompt. Orca runs it after each edit and reports the result; a failing verifier keeps the turn open so the agent can fix the regression instead of handing you a broken patch.</p>
+          </article>
+          <article>
+            <h3 data-zh="跨重启继续">Continue across restarts</h3>
+            <p data-zh="当会话被中断时，<code>orca --resume</code> 会重新加载 JSONL 转录并恢复计划、目标与工具状态。大型重构与多步骤迁移不必因为终端关闭而从头开始。">When a session is interrupted, <code>orca --resume</code> reloads the JSONL transcript and restores the plan, goal, and tool state. Long refactors and multi-step migrations do not have to start over because the terminal closed.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="terminal-cases-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="适用场景">When to reach for it</p>
+          <h2 id="terminal-cases-heading" data-zh="为那些本就活在你终端里的工作而构建。">Built for the work that already lives in your terminal.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3 data-zh="修复失败的测试或 CI 任务">Fix a failing test or CI job</h3>
+            <p data-zh="把失败指向 Orca：它读取堆栈跟踪、grep 查找函数、本地复现问题、应用修复，并重新运行测试直到通过。转录会把复现命令与 diff 保存在一起。">Point Orca at the failure: it reads the stack trace, greps for the function, reproduces the issue locally, applies a fix, and reruns the test until it passes. The transcript keeps the reproduction command and the diff together.</p>
+          </article>
+          <article>
+            <h3 data-zh="跨文件重构">Refactor across many files</h3>
+            <p data-zh="大型重命名与 API 迁移正是持久化目标发挥价值之处。Orca 追踪剩余调用点，批量应用编辑，并在每批之后验证构建，从而在错误扩散之前将其捕获。">Large renames and API migrations are where a persistent goal pays off. Orca tracks the remaining call sites, applies edits in batches, and verifies the build after each batch so a mistake is caught before it spreads.</p>
+          </article>
+          <article>
+            <h3 data-zh="探索陌生代码库">Explore an unfamiliar codebase</h3>
+            <p data-zh="让 Orca 解释一个模块、追踪从路由到数据库的请求，或总结某个功能的连接方式。它搜索真实代码而非猜测，并引用你可以亲自打开的文件路径。">Ask Orca to explain a module, trace a request from route to database, or summarize how a feature is wired. It searches the real code instead of guessing, and cites file paths you can open yourself.</p>
+          </article>
+          <article>
+            <h3 data-zh="准备拉取请求">Prepare a pull request</h3>
+            <p data-zh="从分支出发，Orca 可以暂存正确的文件、撰写提交信息、运行测试套件，并为评审总结改动。将其与 <a href=&quot;/github/&quot;>GitHub 工作流</a> 搭配，可把循环延伸到 issue 与发布检查。">From a branch, Orca can stage the right files, write a commit message, run the test suite, and summarize the change for review. Pair it with the <a href="/github/">GitHub workflow</a> to extend the loop into issues and release checks.</p>
+          </article>
+          <article>
+            <h3 data-zh="自动化可重复琐事">Automate repeatable chores</h3>
+            <p data-zh="依赖升级、更新日志更新与格式化流程都变成带验证器的一次提示。由于转录在本地，你可以审计确切的改动，并在下一次复用该模式。">Dependency bumps, changelog updates, and formatting passes become one prompt with a verifier. Because the transcript is local, you can audit exactly what changed and reuse the pattern the next time.</p>
+          </article>
+          <article>
+            <h3 data-zh="用真实终端调试">Debug with a live terminal</h3>
+            <p data-zh="Orca 可以运行长期 shell 会话、流式输出其内容并作出反应。对于不稳定的测试或交互式 CLI，智能体会保持进程存活，而不是每个回合重新运行一次性命令。">Orca can run a long-lived shell session, stream its output, and react to it. For flaky tests or interactive CLIs, the agent keeps the process alive instead of re-running a one-shot command each turn.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="faq" id="faq" aria-labelledby="terminal-faq-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="常见问题">FAQ</p>
+          <h2 id="terminal-faq-heading" data-zh="关于终端编程智能体的问题。">Questions about the terminal coding agent.</h2>
+        </div>
+        <div class="faq-list">
+          <article>
+            <h3 data-zh="Orca 是在我现有的终端里运行吗？">Does Orca run in my existing terminal?</h3>
+            <p data-zh="是的。Orca 是一个你可从任意 shell 启动的单个 Rust 二进制文件。它不会替换你的终端；它在其中运行，并针对当前工作目录工作。">Yes. Orca is a single Rust binary you launch from any shell. It does not replace your terminal; it runs inside it and works against the current working directory.</p>
+          </article>
+          <article>
+            <h3 data-zh="它能未经我许可就编辑文件吗？">Can it edit files without my permission?</h3>
+            <p data-zh="默认不行。编辑、shell 写入与网络调用都需经过审批策略。你可以允许某个工具一次、整个会话，或保持阻止；默认模式在限制写入的同时让读取保持快速。">Not by default. Edits, shell writes, and network calls go through an approval policy. You can allow a tool once, for the session, or keep it blocked, and the default mode keeps reads fast while gating writes.</p>
+          </article>
+          <article>
+            <h3 data-zh="如果验证器失败会发生什么？">What happens if the verifier fails?</h3>
+            <p data-zh="回合会保持打开。Orca 看到验证器输出，提出另一个修复，并重新运行检查。只有当验证器通过时它才报告成功，因此你不会继承一个破坏构建的补丁。">The turn stays open. Orca sees the verifier output, proposes another fix, and reruns the check. It only reports success when the verifier passes, so you do not inherit a patch that breaks the build.</p>
+          </article>
+          <article>
+            <h3 data-zh="我的代码会被发送到别处吗？">Is my code sent anywhere?</h3>
+            <p data-zh="Orca 在本地运行，只会联系你配置的模型提供商。转录、工具输出与文件内容都留在你的机器上，除非模型 API 在请求中需要它们。">Orca runs locally and only contacts the model provider you configure. Transcripts, tool outputs, and file contents stay on your machine unless the model API needs them for a request.</p>
+          </article>
+          <article>
+            <h3 data-zh="关闭终端后我还能恢复会话吗？">Can I resume a session after closing the terminal?</h3>
+            <p data-zh="可以。会话以 JSONL 形式存储在 <code>~/.orca/sessions/</code> 下。使用 <code>orca --resume</code> 继续你中断的地方，或用 <code>--fork</code> 分叉会话并尝试另一种方法。">Yes. Sessions are stored as JSONL under <code>~/.orca/sessions/</code>. Use <code>orca --resume</code> to pick up where you left off, or <code>--fork</code> to branch a session and try an alternative approach.</p>
+          </article>
+          <article>
+            <h3 data-zh="这与基于聊天的智能体相比如何？">How does this compare to a chat-based agent?</h3>
+            <p data-zh="Orca 把仓库、shell 与转录保持在一个本地进程中。没有聊天窗口与编辑器之间的复制粘贴，而且从第一条提示起就能使用完整的工具与审批模型。">Orca keeps the repository, the shell, and the transcript in one local process. There is no copy-paste between a chat window and your editor, and the full tool and approval model is available from the first prompt.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="terminal-next-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="继续探索">Keep exploring</p>
+          <h2 id="terminal-next-heading" data-zh="终端智能体是每个 Orca 工作流的基础。">The terminal agent is the base of every Orca workflow.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3><a href="/deepseek-coding-agent/" data-zh="DeepSeek 原生调优">DeepSeek-native tuning</a></h3>
+            <p data-zh="了解 Orca 如何针对 DeepSeek V4 调优，包括最大推理努力、前缀缓存友好提示与 1M 上下文编程。">See how Orca is tuned for DeepSeek V4, with max reasoning effort, prefix-cache friendly prompts, and 1M-context coding.</p>
+          </article>
+          <article>
+            <h3><a href="/github/" data-zh="GitHub 工作流">GitHub workflows</a></h3>
+            <p data-zh="把终端循环延伸到 issue 分流、拉取请求准备与验证器把关的发布检查。">Extend the terminal loop into issue triage, pull-request prep, and verifier-gated release checks.</p>
+          </article>
+          <article>
+            <h3><a href="/mcp/" data-zh="MCP 工具">MCP tools</a></h3>
+            <p data-zh="通过与内置工具相同的规范驱动与审批感知合约连接外部工具服务器。">Connect external tool servers through the same spec-driven and approval-aware contracts as built-in tools.</p>
+          </article>
+          <article>
+            <h3><a href="/docs/" data-zh="文档">Documentation</a></h3>
+            <p data-zh="阅读关于审批模式、沙箱配置、计划模式、目标与可恢复会话的完整指南。">Read the full guide on approval modes, sandbox profiles, plan mode, goals, and resumable sessions.</p>
+          </article>
+          <article>
+            <h3><a href="/changelog/" data-zh="更新日志">Changelog</a></h3>
+            <p data-zh="关注涵盖 TUI、运行时、沙箱与模型集成改进的每周发布。">Follow weekly releases covering TUI, runtime, sandbox, and model-integration improvements.</p>
+          </article>
+          <article>
+            <h3><a href="/#install" data-zh="安装 Orca">Install Orca</a></h3>
+            <p data-zh="使用 npm 或下载适用于 macOS、Linux 与 Windows 的 arm64 及 x64 原生二进制。">Use npm or download the native binary for macOS, Linux, and Windows on arm64 and x64.</p>
           </article>
         </div>
       </section>
     </main>
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "Does Orca run in my existing terminal?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Yes. Orca is a single Rust binary you launch from any shell. It does not replace your terminal; it runs inside it and works against the current working directory." }
+          },
+          {
+            "@type": "Question",
+            "name": "Can it edit files without my permission?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Not by default. Edits, shell writes, and network calls go through an approval policy. You can allow a tool once, for the session, or keep it blocked, and the default mode keeps reads fast while gating writes." }
+          },
+          {
+            "@type": "Question",
+            "name": "What happens if the verifier fails?",
+            "acceptedAnswer": { "@type": "Answer", "text": "The turn stays open. Orca sees the verifier output, proposes another fix, and reruns the check. It only reports success when the verifier passes, so you do not inherit a patch that breaks the build." }
+          },
+          {
+            "@type": "Question",
+            "name": "Is my code sent anywhere?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Orca runs locally and only contacts the model provider you configure. Transcripts, tool outputs, and file contents stay on your machine unless the model API needs them for a request." }
+          },
+          {
+            "@type": "Question",
+            "name": "Can I resume a session after closing the terminal?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Yes. Sessions are stored as JSONL under ~/.orca/sessions/. Use orca --resume to pick up where you left off, or --fork to branch a session and try an alternative approach." }
+          },
+          {
+            "@type": "Question",
+            "name": "How does this compare to a chat-based agent?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Orca keeps the repository, the shell, and the transcript in one local process. There is no copy-paste between a chat window and your editor, and the full tool and approval model is available from the first prompt." }
+          }
+        ]
+      }
+    </script>
+    <script>
+      (function () {
+        var KEY = "orca-site-locale";
+        function detect() {
+          try {
+            var s = localStorage.getItem(KEY);
+            if (s === "en" || s === "zh") return s;
+          } catch (e) {}
+          return navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+        }
+        function apply(loc) {
+          document.documentElement.lang = loc === "zh" ? "zh-CN" : "en";
+          document.querySelectorAll("[data-zh]").forEach(function (el) {
+            if (!el.dataset.en) el.dataset.en = el.innerHTML;
+            el.innerHTML = loc === "zh" ? el.dataset.zh : el.dataset.en;
+          });
+          document.querySelectorAll(".locale-switch button").forEach(function (btn) {
+            btn.setAttribute("aria-pressed", btn.dataset.locale === loc ? "true" : "false");
+          });
+        }
+        var current = detect();
+        apply(current);
+        document.querySelectorAll(".locale-switch button").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            current = btn.dataset.locale;
+            try { localStorage.setItem(KEY, current); } catch (e) {}
+            apply(current);
+          });
+        });
+      })();
+    </script>
   </body>
 </html>

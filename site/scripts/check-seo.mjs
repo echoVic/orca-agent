@@ -90,6 +90,8 @@ check(sitemapXml.includes(`<loc>${changelogUrl}</loc>`), "sitemap.xml missing ch
 for (const page of intentPages) {
   check(sitemapXml.includes(`<loc>${page.url}</loc>`), `sitemap.xml missing ${page.url}`);
 }
+const docsUrl = "https://orcaagent.dev/docs/";
+check(sitemapXml.includes(`<loc>${docsUrl}</loc>`), "sitemap.xml missing docs loc");
 check(
   sitemapXml.includes(`<lastmod>${latestDate}</lastmod>`),
   "sitemap.xml lastmod must match the latest release date",
@@ -97,6 +99,33 @@ check(
 check(
   npmPackage.version === latestVersion,
   "npm package version must match the site releaseVersion",
+);
+
+// Homepage must expose FAQPage structured data for the FAQ section.
+// The FAQ JSON-LD is rendered by the App component and injected during
+// prerender, so check the built output rather than the source template.
+const distIndexPath = new URL("dist/index.html", root);
+if (existsSync(distIndexPath)) {
+  const distIndexHtml = readFileSync(distIndexPath, "utf8");
+  check(
+    /"@type":\s*"FAQPage"/.test(distIndexHtml),
+    "Prerendered homepage missing FAQPage JSON-LD structured data",
+  );
+} else {
+  check(
+    appSource.includes('"@type": "FAQPage"'),
+    "App source must render FAQPage JSON-LD structured data",
+  );
+}
+// Organization sameAs should link the author site so entity clustering works.
+check(
+  indexHtml.includes("https://echovic.com"),
+  "Homepage Organization sameAs missing echovic.com",
+);
+// Favicon must resolve so /favicon.ico is not a 404.
+check(
+  existsSync(new URL("public/favicon.ico", root)),
+  "Missing public/favicon.ico (causes /favicon.ico 404)",
 );
 
 check(
@@ -124,6 +153,10 @@ check(
 check(
   !changelogHtml.includes("crawler-links"),
   "Changelog template must not render root-level crawler links",
+);
+check(
+  changelogHtml.includes('"@type": "CollectionPage"'),
+  "changelog page missing CollectionPage JSON-LD structured data",
 );
 
 check(socialPng.subarray(1, 4).toString("ascii") === "PNG", "Social image is not a PNG");
@@ -199,11 +232,24 @@ for (const page of intentPages) {
     check(html.includes(`<title>${page.title}</title>`), `${page.path} missing title`);
     check(html.includes('<meta name="robots" content="index, follow" />'), `${page.path} noindex`);
     check(html.includes('"@type": "TechArticle"'), `${page.path} missing TechArticle schema`);
+    check(
+      /"@type":\s*"FAQPage"/.test(html),
+      `${page.path} missing FAQPage JSON-LD structured data`,
+    );
     for (const term of page.terms) {
       check(html.includes(term), `${page.path} missing search term: ${term}`);
     }
+    // Landing pages need substantive content to avoid thin-content penalties.
+    const words = html.replace(/<[^>]*>/g, " ").split(/\s+/).filter(Boolean).length;
+    check(words >= 1500, `${page.path} thin content: ${words} words (need >= 1500)`);
   }
 }
+
+// Custom 404 page must exist so unknown routes do not serve the host's default.
+check(
+  existsSync(new URL("public/404.html", root)),
+  "Missing public/404.html (unknown routes serve a default 404)",
+);
 
 const jsonLdBlocks = [
   ...indexHtml.matchAll(

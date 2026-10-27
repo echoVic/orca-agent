@@ -11,6 +11,7 @@
       content="Orca is a DeepSeek coding agent tuned for DeepSeek V4, max reasoning effort, prefix-cache friendly prompts, local tools, and resumable coding sessions."
     />
     <link rel="canonical" href="https://orcaagent.dev/deepseek-coding-agent/" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/svg+xml" href="/orca-icon.svg" />
     <link rel="apple-touch-icon" href="/orca-icon.svg" />
     <link rel="stylesheet" href="/src/styles.css" />
@@ -58,57 +59,275 @@
         </a>
         <div class="nav-actions">
           <nav aria-label="Page navigation">
-            <a href="/">Home</a>
-            <a href="/terminal-coding-agent/">Terminal</a>
-            <a href="/github/">GitHub</a>
-            <a href="/mcp/">MCP</a>
-            <a class="nav-cta" href="/#install">Install</a>
+            <a href="/" data-zh="首页">Home</a>
+            <a href="/terminal-coding-agent/" data-zh="终端">Terminal</a>
+            <a href="/github/" data-zh="GitHub">GitHub</a>
+            <a href="/mcp/" data-zh="MCP">MCP</a>
+            <a class="nav-cta" href="/#install" data-zh="安装">Install</a>
           </nav>
+          <div class="locale-switch" role="group" aria-label="Language">
+            <button type="button" data-locale="en" aria-label="English">EN</button>
+            <button type="button" data-locale="zh" aria-label="中文">中文</button>
+          </div>
         </div>
       </header>
 
       <section class="hero" id="top">
         <div class="hero-copy">
-          <span class="pill"><span class="dot"></span>deepseek orca</span>
-          <h1>A DeepSeek coding agent with native model behavior.</h1>
-          <p class="subtitle">
+          <span class="pill"><span class="dot"></span><span data-zh="deepseek orca">deepseek orca</span></span>
+          <h1 data-zh="具备原生模型行为的 DeepSeek 编程智能体。">A DeepSeek coding agent with native model behavior.</h1>
+          <p class="subtitle" data-zh="Orca 是 DeepSeek 原生的：最大推理努力、流式推理、前缀缓存友好提示、1M 上下文编程、本地工具与审批感知自动化，都是常规循环的一部分。">
             Orca is DeepSeek-native: max reasoning effort, streaming reasoning,
             prefix-cache friendly prompts, 1M-context coding, local tools, and
             approval-aware automation are part of the normal loop.
           </p>
           <div class="actions">
-            <a class="primary" href="/#install">Install Orca</a>
-            <a class="secondary" href="/terminal-coding-agent/">Terminal workflow</a>
+            <a class="primary" href="/#install" data-zh="安装 Orca">Install Orca</a>
+            <a class="secondary" href="/terminal-coding-agent/" data-zh="终端工作流">Terminal workflow</a>
           </div>
         </div>
         <div class="spec-grid">
-          <div><div class="num">1<span class="u">M</span></div><p>context window for long-context coding</p></div>
-          <div><div class="num">99<span class="u">%</span></div><p>post-compaction prefix-cache hit in real API tuning</p></div>
-          <div><div class="num">128</div><p>turn budget for longer autonomous runs</p></div>
-          <div><div class="num">4<span class="u">x</span></div><p>macOS and Linux native binaries</p></div>
+          <div><div class="num">1<span class="u">M</span></div><p data-zh="长上下文编程的上下文窗口">context window for long-context coding</p></div>
+          <div><div class="num">99<span class="u">%</span></div><p data-zh="真实 API 调优下压缩后的前缀缓存命中率">post-compaction prefix-cache hit in real API tuning</p></div>
+          <div><div class="num">128</div><p data-zh="更长自主运行的回合预算">turn budget for longer autonomous runs</p></div>
+          <div><div class="num">4<span class="u">x</span></div><p data-zh="macOS 与 Linux 原生二进制">macOS and Linux native binaries</p></div>
         </div>
       </section>
 
       <section class="features" aria-labelledby="deepseek-agent-heading">
         <div class="section-heading">
-          <p class="eyebrow">Model fit</p>
-          <h2 id="deepseek-agent-heading">DeepSeek-native means more than an API endpoint.</h2>
+          <p class="eyebrow" data-zh="模型契合">Model fit</p>
+          <h2 id="deepseek-agent-heading" data-zh="DeepSeek 原生意味着不只是一个 API 端点。">DeepSeek-native means more than an API endpoint.</h2>
         </div>
         <div class="feature-grid">
           <article>
-            <h3>Reasoning and routing</h3>
-            <p>Orca treats DeepSeek reasoning settings and model routing as first-class coding workflow controls.</p>
+            <h3 data-zh="推理与路由">Reasoning and routing</h3>
+            <p data-zh="Orca 将 DeepSeek 推理设置与模型路由视为一等编程工作流控制。编程回合默认使用最大推理努力，模型选择器可把快速查找路由到更便宜的模型，同时把编辑保留在更强的模型上。">Orca treats DeepSeek reasoning settings and model routing as first-class coding workflow controls. Max reasoning effort is the default for coding turns, and the model selector can route fast lookups to a cheaper model while keeping edits on the stronger one.</p>
           </article>
           <article>
-            <h3>Prefix-cache friendly</h3>
-            <p>The prompt stays stable across tools, summaries, compaction, and resume so repeated turns avoid waste.</p>
+            <h3 data-zh="前缀缓存友好">Prefix-cache friendly</h3>
+            <p data-zh="提示在工具、摘要、压缩与恢复之间保持稳定，从而避免重复回合的浪费。固定的系统指令与工具规格被置于缓存前缀中，上下文计量器显示压缩前剩余的空间，而非原始的分数。">The prompt stays stable across tools, summaries, compaction, and resume so repeated turns avoid waste. Pinned system instructions and tool specs are placed in the cached prefix, and the context meter shows room left before compaction rather than a raw fraction.</p>
           </article>
           <article>
-            <h3>Local, inspectable history</h3>
-            <p>JSONL transcripts make DeepSeek Orca sessions searchable, resumable, forkable, and auditable.</p>
+            <h3 data-zh="本地、可审计的历史">Local, inspectable history</h3>
+            <p data-zh="JSONL 转录让 DeepSeek Orca 会话可搜索、可恢复、可分叉且可审计。每一段推理、每一次工具调用与每一个验证器结果都在本地记录，因此你可以重放会话或提取轨迹用于基准测试。">JSONL transcripts make DeepSeek Orca sessions searchable, resumable, forkable, and auditable. Every reasoning chunk, tool call, and verifier result is recorded locally, so you can replay a session or extract a trajectory for benchmarking.</p>
+          </article>
+          <article>
+            <h3 data-zh="1M 上下文编程">1M-context coding</h3>
+            <p data-zh="DeepSeek 的长上下文窗口让 Orca 能在一个回合中加载大型模块、完整 diff 与多文件复现指令。压缩在 80% 阈值后触发，并保留系统前缀与最近的消息。">DeepSeek's long context window lets Orca load large modules, full diffs, and multi-file repro instructions in one turn. Compaction kicks in past the 80% threshold and preserves the system prefix and the most recent messages.</p>
+          </article>
+          <article>
+            <h3 data-zh="流式推理">Streaming reasoning</h3>
+            <p data-zh="推理在到达时流式进入 TUI，因此你可以观看智能体思考一个难题，而不是等待黑盒答案。推理与最终回复一起存储以供后续审阅，恢复的会话会在答案加载前先显示推理。">Reasoning streams into the TUI as it arrives, so you can watch the agent think through a hard problem instead of waiting for a black-box answer. The reasoning is stored alongside the final reply for later review, and a resumed session shows reasoning before the answer loads.</p>
+          </article>
+          <article>
+            <h3 data-zh="OpenAI 兼容回退">OpenAI-compatible fallback</h3>
+            <p data-zh="虽然 Orca 针对 DeepSeek 调优，但配置可指向任何 OpenAI 兼容端点。拥有混合提供商的团队可在不同后端之间保持相同的工具、审批与转录模型，无需重写。">While Orca is tuned for DeepSeek, the config can point at any OpenAI-compatible endpoint. Teams with mixed providers keep the same tool, approval, and transcript model across backends, with no rewrite needed.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="deepseek-how-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="DeepSeek 原生如何运作">How DeepSeek-native works</p>
+          <h2 id="deepseek-how-heading" data-zh="针对 DeepSeek 实际编码方式进行调优。">Tuned for how DeepSeek actually codes.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3 data-zh="作为旋钮的推理努力">Reasoning effort as a dial</h3>
+            <p data-zh="编程回合默认使用最大推理努力，让模型在编辑前先规划。对于快速查找与摘要，Orca 可以降到较低努力或路由到闪存模型，使延迟与成本与任务相称。">Coding turns default to max reasoning effort so the model plans before it edits. For quick lookups and summarization, Orca can drop to a lower effort or route to a flash model, keeping latency and cost proportional to the task.</p>
+          </article>
+          <article>
+            <h3 data-zh="与模型匹配的工具语义">Tool semantics that match the model</h3>
+            <p data-zh="Orca 的工具规格是为 DeepSeek 调用工具的方式而写的：清晰的能力声明、带类型的参数，以及引导下一次尝试的失败消息。编辑会显示其 diff，模型会把每次调用记录为它所属的工具类型。">Orca's tool specs are written for how DeepSeek calls tools: clear capability declarations, typed parameters, and failure messages that guide the next attempt. Edits show their diff, and the model records each call as the kind of tool it is.</p>
+          </article>
+          <article>
+            <h3 data-zh="保护前缀的压缩">Compaction that protects the prefix</h3>
+            <p data-zh="当上下文填满时，压缩按消息单元工作，因此固定的系统提示或刚编辑的文件永远不会在回合中途被冻结。缓存前缀保持稳定，这正是真实会话中节省成本的主要来源。">When context fills up, compaction works by message unit so a pinned system prompt or a just-edited file is never frozen mid-turn. The cached prefix stays stable, which is where most of the cost savings come from in real sessions.</p>
+          </article>
+          <article>
+            <h3 data-zh="可看见的成本与延迟">Cost and latency you can see</h3>
+            <p data-zh="Orca 使用 DeepSeek 当前价格与工作日峰值费率进行成本估算，并支持后台价格刷新与用户覆盖。TUI 显示每个回合的 token 用量、成本与前缀缓存命中率，上下文计量器显示压缩前的空间。">Orca uses DeepSeek's current prices and weekday peak rates for cost estimates, with background price refresh and user overrides. The TUI shows token usage, cost, and prefix-cache hit rate per turn, and the context meter shows room before compaction.</p>
+          </article>
+          <article>
+            <h3 data-zh="支持截图与图表的视觉">Vision for screenshots and diagrams</h3>
+            <p data-zh="把截图粘贴或把图片拖入 TUI，Orca 就可以用 DeepSeek 的视觉模型对其进行推理。UI 缺陷、图表转代码任务与粘贴的错误图片都成为编程循环的一等输入，图片会存储在本地供后续审阅。">Paste a screenshot or drag an image into the TUI and Orca can reason about it with DeepSeek's vision model. UI bugs, diagram-to-code tasks, and pasted error images become first-class inputs to the coding loop, with the image stored locally for later review.</p>
+          </article>
+          <article>
+            <h3 data-zh="子智能体共享提供商">Subagents share the provider</h3>
+            <p data-zh="后台子智能体、工作流子项与托管智能体通过同一个 DeepSeek 提供商与预算核算运行。父回合可以委派工作而不丢失对成本、上下文或最终结果的追踪，子转录不会进入根对话。">Background subagents, workflow children, and hosted agents run through the same DeepSeek provider and budget accounting. A parent turn can delegate work without losing track of cost, context, or the final result, and child transcripts stay out of the root conversation.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="deepseek-cases-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="闪耀之处">When it shines</p>
+          <h2 id="deepseek-cases-heading" data-zh="DeepSeek 原生能带来回报的工作负载。">Workloads where DeepSeek-native pays off.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3 data-zh="长上下文代码库理解">Long-context codebase understanding</h3>
+            <p data-zh="把整个模块、大型 PR diff 或多文件复现加载到一个回合。DeepSeek 的上下文窗口让 Orca 能跨整个表面推理，而不是把细节摘要掉。">Load an entire module, a large PR diff, or a multi-file repro into one turn. DeepSeek's context window lets Orca reason across the whole surface instead of summarizing away the details.</p>
+          </article>
+          <article>
+            <h3 data-zh="重推理调试">Reasoning-heavy debugging</h3>
+            <p data-zh="最大推理努力有助于处理微妙缺陷：竞态条件、边界条件与层间交互。流式推理在 TUI 中可见，并存储在转录中。">Max reasoning effort helps with subtle bugs: race conditions, boundary conditions, and interactions between layers. The streamed reasoning is visible in the TUI and stored in the transcript.</p>
+          </article>
+          <article>
+            <h3 data-zh="成本感知的自主运行">Cost-aware autonomous runs</h3>
+            <p data-zh="对于 128 回合的自主目标，前缀缓存命中主导了成本。Orca 稳定的前缀与基于单元的压缩让缓存跨回合保持温暖，这才是真正节省的来源。">For a 128-turn autonomous goal, prefix-cache hits dominate the cost. Orca's stable prefix and unit-based compaction keep the cache warm across turns, which is where the real savings come from.</p>
+          </article>
+          <article>
+            <h3 data-zh="视觉辅助的 UI 工作">Vision-assisted UI work</h3>
+            <p data-zh="粘贴设计截图或失败的 UI 截图。Orca 读取图片、找到相关组件、编辑代码并验证结果——全都在一个本地循环中。">Paste a design screenshot or a failing UI capture. Orca reads the image, finds the relevant components, edits the code, and verifies the result — all in one local loop.</p>
+          </article>
+          <article>
+            <h3 data-zh="多文件重构">Multi-file refactors</h3>
+            <p data-zh="大型重命名与 API 变更需要把整个调用图纳入视野。借助 1M 上下文窗口，Orca 能在编辑前看到影响，然后在每批之后验证构建。">Large renames and API changes need the whole call graph in view. With a 1M-context window, Orca can see the impact before editing, then verify the build after each batch.</p>
+          </article>
+          <article>
+            <h3 data-zh="可恢复的长会话">Resumable long sessions</h3>
+            <p data-zh="跨越数小时的 DeepSeek 会话通过 JSONL 在重启后存活。恢复会还原模型状态、计划与目标，因此长迁移不必从头重启。">A DeepSeek session that spans hours survives restarts through JSONL. Resume restores the model state, the plan, and the goal, so a long migration does not have to restart from scratch.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="faq" id="faq" aria-labelledby="deepseek-faq-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="常见问题">FAQ</p>
+          <h2 id="deepseek-faq-heading" data-zh="关于 DeepSeek 编程智能体的问题。">Questions about the DeepSeek coding agent.</h2>
+        </div>
+        <div class="faq-list">
+          <article>
+            <h3 data-zh="我必须使用 DeepSeek 吗？">Do I have to use DeepSeek?</h3>
+            <p data-zh="不必。Orca 针对 DeepSeek 调优并在其中提供最佳体验，但配置可指向任何 OpenAI 兼容端点。工具、审批与转录模型在不同提供商之间保持一致。">No. Orca is tuned for DeepSeek and gives the best experience there, but the config can point at any OpenAI-compatible endpoint. The tool, approval, and transcript model stays the same across providers.</p>
+          </article>
+          <article>
+            <h3 data-zh="“前缀缓存友好”在实践中意味着什么？">What does "prefix-cache friendly" mean in practice?</h3>
+            <p data-zh="意思是提示中每回合都会重复的部分——系统指令、工具规格、固定上下文——被置于稳定的前缀中。DeepSeek 会缓存该前缀，因此每个回合只需为新消息付费，而不是重新处理整个提示。">It means the part of the prompt that repeats every turn — system instructions, tool specs, pinned context — is placed in a stable prefix. DeepSeek caches that prefix, so each turn only pays for the new messages instead of reprocessing the whole prompt.</p>
+          </article>
+          <article>
+            <h3 data-zh="Orca 如何处理 1M 上下文窗口？">How does Orca handle the 1M-context window?</h3>
+            <p data-zh="Orca 自然填充窗口，并在超过 80% 阈值后压缩。压缩按消息单元工作，因此固定内容得以保留，上下文计量器显示触发压缩前还剩多少空间。">Orca fills the window naturally and compacts past the 80% threshold. Compaction works by message unit, so pinned content survives, and the context meter shows how much room is left before compaction triggers.</p>
+          </article>
+          <article>
+            <h3 data-zh="我能看到模型的推理吗？">Can I see the model's reasoning?</h3>
+            <p data-zh="可以。推理在到达时流式进入 TUI，并与最终答案一起存储在 JSONL 转录中。你可以在回合后审阅它，或提取它用于基准测试。">Yes. Reasoning streams into the TUI as it arrives and is stored in the JSONL transcript alongside the final answer. You can review it after the turn or extract it for benchmarking.</p>
+          </article>
+          <article>
+            <h3 data-zh="成本如何估算？">How are costs estimated?</h3>
+            <p data-zh="Orca 使用 DeepSeek 当前价格与工作日峰值费率，并支持后台价格刷新与用户覆盖。TUI 显示每回合的 token 用量、成本与前缀缓存命中率。">Orca uses DeepSeek's current prices and weekday peak rates, with a background price refresh and user overrides. The TUI shows per-turn token usage, cost, and the prefix-cache hit rate.</p>
+          </article>
+          <article>
+            <h3 data-zh="视觉在终端里能用吗？">Does vision work in the terminal?</h3>
+            <p data-zh="可以。把图片粘贴或拖入 TUI，Orca 就能用 DeepSeek 的视觉模型对其推理。截图、图表与错误捕获都成为同一个编程循环的输入。">Yes. Paste or drag an image into the TUI and Orca can reason about it with DeepSeek's vision model. Screenshots, diagrams, and error captures become inputs to the same coding loop.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="deepseek-next-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="继续探索">Keep exploring</p>
+          <h2 id="deepseek-next-heading" data-zh="DeepSeek 调优驱动每个 Orca 工作流。">DeepSeek tuning powers every Orca workflow.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3><a href="/terminal-coding-agent/" data-zh="终端智能体">Terminal agent</a></h3>
+            <p data-zh="了解终端优先循环如何针对你的本地检出运行 DeepSeek 模型。">See how the terminal-first loop runs the DeepSeek model against your local checkout.</p>
+          </article>
+          <article>
+            <h3><a href="/github/" data-zh="GitHub 工作流">GitHub workflows</a></h3>
+            <p data-zh="用同一个 DeepSeek 原生智能体运行 issue 分流、PR 准备与发布检查。">Run issue triage, PR prep, and release checks with the same DeepSeek-native agent.</p>
+          </article>
+          <article>
+            <h3><a href="/mcp/" data-zh="MCP 工具">MCP tools</a></h3>
+            <p data-zh="通过相同的工具合约与审批模型连接外部工具服务器。">Connect external tool servers through the same tool contract and approval model.</p>
+          </article>
+          <article>
+            <h3><a href="/docs/" data-zh="文档">Documentation</a></h3>
+            <p data-zh="阅读关于模型路由、推理努力、压缩与成本追踪的完整指南。">Read the full guide on model routing, reasoning effort, compaction, and cost tracking.</p>
+          </article>
+          <article>
+            <h3><a href="/changelog/" data-zh="更新日志">Changelog</a></h3>
+            <p data-zh="关注涵盖 DeepSeek 定价、视觉、前缀缓存调优等的发布。">Follow releases covering DeepSeek pricing, vision, prefix-cache tuning, and more.</p>
+          </article>
+          <article>
+            <h3><a href="/#install" data-zh="安装 Orca">Install Orca</a></h3>
+            <p data-zh="使用 npm 或下载适用于 macOS、Linux 与 Windows 的 arm64 及 x64 原生二进制。">Use npm or download the native binary for macOS, Linux, and Windows on arm64 and x64.</p>
           </article>
         </div>
       </section>
     </main>
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "Do I have to use DeepSeek?",
+            "acceptedAnswer": { "@type": "Answer", "text": "No. Orca is tuned for DeepSeek and gives the best experience there, but the config can point at any OpenAI-compatible endpoint. The tool, approval, and transcript model stays the same across providers." }
+          },
+          {
+            "@type": "Question",
+            "name": "What does prefix-cache friendly mean in practice?",
+            "acceptedAnswer": { "@type": "Answer", "text": "It means the part of the prompt that repeats every turn — system instructions, tool specs, pinned context — is placed in a stable prefix. DeepSeek caches that prefix, so each turn only pays for the new messages instead of reprocessing the whole prompt." }
+          },
+          {
+            "@type": "Question",
+            "name": "How does Orca handle the 1M-context window?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Orca fills the window naturally and compacts past the 80% threshold. Compaction works by message unit, so pinned content survives, and the context meter shows how much room is left before compaction triggers." }
+          },
+          {
+            "@type": "Question",
+            "name": "Can I see the model's reasoning?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Yes. Reasoning streams into the TUI as it arrives and is stored in the JSONL transcript alongside the final answer. You can review it after the turn or extract it for benchmarking." }
+          },
+          {
+            "@type": "Question",
+            "name": "How are costs estimated?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Orca uses DeepSeek's current prices and weekday peak rates, with a background price refresh and user overrides. The TUI shows per-turn token usage, cost, and the prefix-cache hit rate." }
+          },
+          {
+            "@type": "Question",
+            "name": "Does vision work in the terminal?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Yes. Paste or drag an image into the TUI and Orca can reason about it with DeepSeek's vision model. Screenshots, diagrams, and error captures become inputs to the same coding loop." }
+          }
+        ]
+      }
+    </script>
+    <script>
+      (function () {
+        var KEY = "orca-site-locale";
+        function detect() {
+          try {
+            var s = localStorage.getItem(KEY);
+            if (s === "en" || s === "zh") return s;
+          } catch (e) {}
+          return navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+        }
+        function apply(loc) {
+          document.documentElement.lang = loc === "zh" ? "zh-CN" : "en";
+          document.querySelectorAll("[data-zh]").forEach(function (el) {
+            if (!el.dataset.en) el.dataset.en = el.innerHTML;
+            el.innerHTML = loc === "zh" ? el.dataset.zh : el.dataset.en;
+          });
+          document.querySelectorAll(".locale-switch button").forEach(function (btn) {
+            btn.setAttribute("aria-pressed", btn.dataset.locale === loc ? "true" : "false");
+          });
+        }
+        var current = detect();
+        apply(current);
+        document.querySelectorAll(".locale-switch button").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            current = btn.dataset.locale;
+            try { localStorage.setItem(KEY, current); } catch (e) {}
+            apply(current);
+          });
+        });
+      })();
+    </script>
   </body>
 </html>

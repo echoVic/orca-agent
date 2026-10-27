@@ -11,6 +11,7 @@
       content="Use Orca for GitHub workflows: issue triage, pull-request preparation, repository archaeology, release checks, and verifier-gated automation."
     />
     <link rel="canonical" href="https://orcaagent.dev/github/" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/svg+xml" href="/orca-icon.svg" />
     <link rel="apple-touch-icon" href="/orca-icon.svg" />
     <link rel="stylesheet" href="/src/styles.css" />
@@ -58,27 +59,31 @@
         </a>
         <div class="nav-actions">
           <nav aria-label="Page navigation">
-            <a href="/">Home</a>
-            <a href="/terminal-coding-agent/">Terminal</a>
-            <a href="/deepseek-coding-agent/">DeepSeek</a>
-            <a href="/mcp/">MCP</a>
-            <a class="nav-cta" href="https://github.com/echoVic/orca-agent" rel="noreferrer">GitHub</a>
+            <a href="/" data-zh="首页">Home</a>
+            <a href="/terminal-coding-agent/" data-zh="终端">Terminal</a>
+            <a href="/deepseek-coding-agent/" data-zh="DeepSeek">DeepSeek</a>
+            <a href="/mcp/" data-zh="MCP">MCP</a>
+            <a class="nav-cta" href="https://github.com/echoVic/orca-agent" rel="noreferrer" data-zh="GitHub">GitHub</a>
           </nav>
+          <div class="locale-switch" role="group" aria-label="Language">
+            <button type="button" data-locale="en" aria-label="English">EN</button>
+            <button type="button" data-locale="zh" aria-label="中文">中文</button>
+          </div>
         </div>
       </header>
 
       <section class="hero" id="top">
         <div class="hero-copy">
-          <span class="pill"><span class="dot"></span>orca github</span>
-          <h1>GitHub workflows from a local coding agent.</h1>
-          <p class="subtitle">
+          <span class="pill"><span class="dot"></span><span data-zh="orca github">orca github</span></span>
+          <h1 data-zh="来自本地编程智能体的 GitHub 工作流。">GitHub workflows from a local coding agent.</h1>
+          <p class="subtitle" data-zh="Orca 在不隐藏仓库状态的情况下协助 GitHub 工作流：检查 issue、准备拉取请求、运行发布检查、搜索代码，并把验证器把关的证据留在转录中。">
             Orca helps with GitHub workflows without hiding the repository state:
             inspect issues, prepare pull requests, run release checks, search code,
             and keep verifier-gated evidence in the transcript.
           </p>
           <div class="actions">
-            <a class="primary" href="https://github.com/echoVic/orca-agent" rel="noreferrer">Open GitHub</a>
-            <a class="secondary" href="/#install">Install Orca</a>
+            <a class="primary" href="https://github.com/echoVic/orca-agent" rel="noreferrer" data-zh="打开 GitHub">Open GitHub</a>
+            <a class="secondary" href="/#install" data-zh="安装 Orca">Install Orca</a>
           </div>
         </div>
         <div class="code-panel">
@@ -90,24 +95,238 @@ orca exec "find why the CI workflow started failing"</code></pre>
 
       <section class="features" aria-labelledby="github-workflows-heading">
         <div class="section-heading">
-          <p class="eyebrow">Repository loop</p>
-          <h2 id="github-workflows-heading">Built for evidence-first repository work.</h2>
+          <p class="eyebrow" data-zh="仓库循环">Repository loop</p>
+          <h2 id="github-workflows-heading" data-zh="为证据优先的仓库工作而构建。">Built for evidence-first repository work.</h2>
         </div>
         <div class="feature-grid">
           <article>
-            <h3>Pull-request prep</h3>
-            <p>Ask Orca to inspect diffs, update docs, run verifiers, and summarize the change for review.</p>
+            <h3 data-zh="拉取请求准备">Pull-request prep</h3>
+            <p data-zh="让 Orca 检查 diff、更新文档、运行验证器，并为评审总结改动。它能暂存正确的文件、撰写提交信息，并在你把分支推到上游之前运行测试套件。">Ask Orca to inspect diffs, update docs, run verifiers, and summarize the change for review. It can stage the right files, write a commit message, and run the test suite before you push the branch upstream.</p>
           </article>
           <article>
-            <h3>Issue triage</h3>
-            <p>Trace reports through the real codebase, then keep file paths, commands, and findings in one transcript.</p>
+            <h3 data-zh="Issue 分流">Issue triage</h3>
+            <p data-zh="通过真实代码库追踪报告，然后把文件路径、命令与发现保存在同一份转录中。Orca 在本地复现 issue、提出修复，并把证据连同具体步骤链接回 issue。">Trace reports through the real codebase, then keep file paths, commands, and findings in one transcript. Orca reproduces the issue locally, proposes a fix, and links the evidence back to the issue with concrete steps.</p>
           </article>
           <article>
-            <h3>Release checks</h3>
-            <p>Combine GitHub releases, local commands, changelog updates, and verifier-gated automation before shipping.</p>
+            <h3 data-zh="发布检查">Release checks</h3>
+            <p data-zh="在发布前组合 GitHub release、本地命令、更新日志更新与验证器把关的自动化。失败的检查会让回合保持打开，让智能体在创建并推送 release 之前修复回归。">Combine GitHub releases, local commands, changelog updates, and verifier-gated automation before shipping. A failed check keeps the turn open so the agent fixes the regression before the release is created and pushed.</p>
+          </article>
+          <article>
+            <h3 data-zh="仓库考古">Repository archaeology</h3>
+            <p data-zh="搜索代码、git 历史与 issue 追踪器，理解某个决策为何做出。Orca 可以跨 commit、PR 与发布说明追踪一个缺陷，并用你可以亲自验证的文件路径与日期总结时间线。">Search the code, the git history, and the issue tracker to understand why a decision was made. Orca can follow a bug through commits, PRs, and release notes and summarize the timeline with file paths and dates you can verify yourself.</p>
+          </article>
+          <article>
+            <h3 data-zh="验证器把关的自动化">Verifier-gated automation</h3>
+            <p data-zh="为每次改动配对一个验证器命令。Orca 在编辑后运行它，只有通过时才报告成功，因此发布说明、更新日志更新与版本升级永远不会带着损坏或未验证的状态发布。">Pair every change with a verifier command. Orca runs it after edits and only reports success when it passes, so release notes, changelog updates, and version bumps are never shipped broken or half-verified.</p>
+          </article>
+          <article>
+            <h3 data-zh="本地优先、感知 GitHub">Local-first, GitHub-aware</h3>
+            <p data-zh="Orca 针对你的本地检出运行，并把 GitHub 用于它擅长的事：issue、PR、release 与搜索。除非你推送，否则仓库状态永远不会离开你的机器，凭证也保留在你的环境中。">Orca runs against your local checkout and uses GitHub for what it is good at: issues, PRs, releases, and search. The repository state never leaves your machine unless you push it, and credentials stay in your environment.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="github-how-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="GitHub 循环如何运作">How the GitHub loop works</p>
+          <h2 id="github-how-heading" data-zh="从 issue 到 release，一个本地智能体。">From issue to release, one local agent.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3 data-zh="从 issue 或 PR 开始">Start from an issue or a PR</h3>
+            <p data-zh="给 Orca 一个 issue 编号或 PR URL。它获取上下文、在本地复现问题，并基于实际代码而非仅仅 issue 描述提出修复。">Give Orca an issue number or a PR URL. It fetches the context, reproduces the problem locally, and proposes a fix grounded in the actual code rather than the issue description alone.</p>
+          </article>
+          <article>
+            <h3 data-zh="编辑前先调查">Investigate before editing</h3>
+            <p data-zh="Orca 会搜索真实代码库、读取相关文件并检查实际 git 历史。读取默认无需审批即可运行，因此智能体可以在提出任何改动前快速构建上下文，并在计划中引用精确的文件路径。">Orca now searches the real codebase, reads the relevant files, and checks the actual git history. Reads run without approval by default, so the agent can build context fast before it proposes a single change and cites exact file paths in its plan.</p>
+          </article>
+          <article>
+            <h3 data-zh="同一回合内编辑并验证">Edit and verify in the same turn</h3>
+            <p data-zh="编辑通过带显式 diff 的能力检查工具进行。附加 <code>cargo test</code> 或 <code>npm test</code> 之类的验证器，Orca 会在每次编辑后运行它，循环直到检查干净通过。">Edits go through a capability-checked tool with an explicit diff. Attach a verifier like <code>cargo test</code> or <code>npm test</code> and Orca runs it after each edit, looping until the check passes cleanly.</p>
+          </article>
+          <article>
+            <h3 data-zh="准备 PR">Prepare the PR</h3>
+            <p data-zh="一旦改动完全验证，Orca 可以快速暂存文件，然后撰写提交信息，并为评审总结改动。总结会引用触及的文件、运行的验证器与任何值得注意的风险，让评审者能专注于判断而非考古。">Once the change is fully verified, Orca can quickly stage files, then write a commit message, and also summarize the change for review. The summary cites the files touched, the verifier run, and any risks worth noting so reviewers can focus on judgment instead of archaeology.</p>
+          </article>
+          <article>
+            <h3 data-zh="运行发布检查">Run release checks</h3>
+            <p data-zh="在打 release tag 之前，Orca 通过验证器模型运行构建、测试套件、linter 与任何自定义检查。失败会在推送坏 tag 之前停止发布，转录会记录运行过的每一项检查。">Before tagging a release, Orca runs the build, the test suite, the linter, and any custom checks through the verifier model. A failure stops the release before a bad tag is pushed, and the transcript records every check that ran.</p>
+          </article>
+          <article>
+            <h3 data-zh="保留可审计的痕迹">Keep an auditable trail</h3>
+            <p data-zh="每次 issue 读取、PR 检查、编辑与验证器结果都记录在本地 JSONL 转录中。你可以审计 Orca 确切做了什么，并为下一次发布复用该模式，或提取轨迹用于后续训练。">Every issue read, PR inspection, edit, and verifier result is recorded in the local JSONL transcript. You can now audit exactly what Orca did and reuse the pattern for the next release, or extract a trajectory to train on later.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="github-cases-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="常见工作流">Common workflows</p>
+          <h2 id="github-cases-heading" data-zh="Orca 从终端处理的 GitHub 任务。">GitHub tasks Orca handles from the terminal.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3 data-zh="分流缺陷报告">Triage a bug report</h3>
+            <p data-zh="Orca 读取 issue、在本地复现、通过代码追踪根因，并写出带通过验证器的聚焦修复。转录把复现与 diff 保存在一起。">Orca reads the issue, reproduces it locally, traces the root cause through the code, and writes a focused fix with a passing verifier. The transcript keeps the repro and the diff together.</p>
+          </article>
+          <article>
+            <h3 data-zh="评审拉取请求">Review a pull request</h3>
+            <p data-zh="把 PR 指向 Orca，它会检查 diff、运行测试，并用文件路径与行号标记问题。评审基于实际代码而非描述，因此你得到可操作的反馈而非泛泛建议。">Point Orca at a PR and it inspects the diff, runs the tests, and flags issues with file paths and line numbers. The review is grounded in the actual code, not just the description, so you get actionable feedback instead of generic suggestions.</p>
+          </article>
+          <article>
+            <h3 data-zh="准备发布说明">Prepare release notes</h3>
+            <p data-zh="Orca 读取自上一次 release 以来的 git log、分组改动，并起草发布说明。把它与检查更新日志格式的验证器配对，再发布 release。">Orca reads the git log since the last release, groups the changes, and drafts release notes. Pair it with a verifier that checks the changelog format before the release is published.</p>
+          </article>
+          <article>
+            <h3 data-zh="找出 CI 为何开始失败">Find why CI started failing</h3>
+            <p data-zh="Orca 可以二分历史、读取失败的作业日志，并把回归追踪到具体 commit。然后它提出修复并在本地重新运行失败的检查，让下一次绿色运行就是你推送的那一次。">Orca can bisect the history, read the failing job logs, and trace the regression to a specific commit. It then proposes a fix and reruns the failing check locally so the next green run is the one you push.</p>
+          </article>
+          <article>
+            <h3 data-zh="安全更新依赖">Update a dependency safely</h3>
+            <p data-zh="Orca 升级版本、运行构建与测试，并报告升级是否干净。如果测试失败，它会深挖破坏性变更并适配代码。">Orca bumps the version, runs the build and tests, and reports whether the upgrade is clean. If tests fail, it digs into the breaking change and adapts the code.</p>
+          </article>
+          <article>
+            <h3 data-zh="让更新日志保持诚实">Keep the changelog honest</h3>
+            <p data-zh="改动后，Orca 用实际触及的文件与行为更新更新日志。验证器可以强制每条更新日志条目引用真实改动，因此发布说明永远不会与代码脱节。">After a change, Orca updates the changelog with the actual files and behaviors touched. A verifier can enforce that every changelog entry references a real change, so the release notes never drift from the code.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="faq" id="faq" aria-labelledby="github-faq-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="常见问题">FAQ</p>
+          <h2 id="github-faq-heading" data-zh="关于 Orca 用于 GitHub 工作流的问题。">Questions about Orca for GitHub workflows.</h2>
+        </div>
+        <div class="faq-list">
+          <article>
+            <h3 data-zh="Orca 会自动推送到 GitHub 吗？">Does Orca push to GitHub automatically?</h3>
+            <p data-zh="不会。Orca 在本地准备改动并运行验证器，但推送、PR 创建与 release 仍由你控制。默认审批模型像限制其他编辑一样限制 git 写入。">No. Orca prepares changes locally and runs verifiers, but pushes, PR creation, and releases stay under your control. The default approval model gates git writes just like other edits.</p>
+          </article>
+          <article>
+            <h3 data-zh="它能不检出分支就评审 PR 吗？">Can it review a PR without checking out the branch?</h3>
+            <p data-zh="Orca 针对你的本地检出工作。要评审 PR，请检出分支并针对它运行 Orca。智能体会读取真实文件、运行真实测试，并引用真实行号。">Orca works against your local checkout. To review a PR, check out the branch and run Orca against it. The agent reads the real files, runs the real tests, and cites real line numbers.</p>
+          </article>
+          <article>
+            <h3 data-zh="什么是验证器把关的发布？">What is a verifier-gated release?</h3>
+            <p data-zh="意思是只有当每个配置的验证器都通过时，发布命令才会成功。如果构建、测试或 linter 失败，回合保持打开，Orca 会在打 release tag 之前修复回归。">It means a release command only succeeds when every configured verifier passes. If the build, tests, or linter fail, the turn stays open and Orca fixes the regression before the release is tagged.</p>
+          </article>
+          <article>
+            <h3 data-zh="我的仓库会被上传到别处吗？">Is my repository uploaded anywhere?</h3>
+            <p data-zh="不会。Orca 在本地针对你的检出运行。它只联系模型提供商，以及如果你使用 MCP 的话，联系你配置的工具服务器。仓库本身永远不会离开你的机器。">No. Orca runs locally against your checkout. It only contacts the model provider and, if you use MCP, the tool servers you configure. The repository itself never leaves your machine.</p>
+          </article>
+          <article>
+            <h3 data-zh="Orca 能跨多个仓库工作吗？">Can Orca work across multiple repositories?</h3>
+            <p data-zh="可以。在每个仓库中运行 Orca，或使用包含多个仓库的工作区。每个会话都绑定到一个工作目录，因此智能体始终知道它在操作哪一份检出。">Yes. Run Orca in each repository or use a workspace that contains several. Each session is tied to a working directory, so the agent always knows which checkout it is operating on.</p>
+          </article>
+          <article>
+            <h3 data-zh="这与 GitHub Action 相比如何？">How does this compare to a GitHub Action?</h3>
+            <p data-zh="Action 适合确定性 CI。Orca 通过处理调查性与适应性工作来补充它们：复现不稳定失败、理解缺陷，并写出能通过 action 的修复。">Actions are great for deterministic CI. Orca complements them by handling the investigative and adaptive work: reproducing a flaky failure, understanding a bug, and writing a fix that passes the action.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="github-next-heading">
+        <div class="section-heading">
+          <p class="eyebrow" data-zh="继续探索">Keep exploring</p>
+          <h2 id="github-next-heading" data-zh="GitHub 工作构建在 Orca 核心之上。">GitHub work builds on the Orca core.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3><a href="/terminal-coding-agent/" data-zh="终端智能体">Terminal agent</a></h3>
+            <p data-zh="驱动每个 GitHub 工作流的终端优先循环：读取、编辑、验证器与审批。">The terminal-first loop that powers every GitHub workflow: reads, edits, verifiers, and approvals.</p>
+          </article>
+          <article>
+            <h3><a href="/deepseek-coding-agent/" data-zh="DeepSeek 原生">DeepSeek-native</a></h3>
+            <p data-zh="了解模型调优如何让长会话中的 issue 分流与发布检查更可靠。">See how the model tuning makes issue triage and release checks reliable in long sessions.</p>
+          </article>
+          <article>
+            <h3><a href="/mcp/" data-zh="MCP 工具">MCP tools</a></h3>
+            <p data-zh="通过相同的审批感知合约连接 GitHub 与其他外部工具。">Connect GitHub and other external tools through the same approval-aware contract.</p>
+          </article>
+          <article>
+            <h3><a href="/docs/" data-zh="文档">Documentation</a></h3>
+            <p data-zh="阅读关于审批模式、验证器、计划模式与可恢复会话的完整指南。">Read the full guide on approval modes, verifiers, plan mode, and resumable sessions.</p>
+          </article>
+          <article>
+            <h3><a href="/changelog/" data-zh="更新日志">Changelog</a></h3>
+            <p data-zh="关注涵盖 git 写入审批、发布检查与工作流自动化的发布。">Follow releases covering git write approvals, release checks, and workflow automation.</p>
+          </article>
+          <article>
+            <h3><a href="/#install" data-zh="安装 Orca">Install Orca</a></h3>
+            <p data-zh="使用 npm 或下载适用于 macOS、Linux 与 Windows 的 arm64 及 x64 原生二进制。">Use npm or download the native binary for macOS, Linux, and Windows on arm64 and x64.</p>
           </article>
         </div>
       </section>
     </main>
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "Does Orca push to GitHub automatically?",
+            "acceptedAnswer": { "@type": "Answer", "text": "No. Orca prepares changes locally and runs verifiers, but pushes, PR creation, and releases stay under your control. The default approval model gates git writes just like other edits." }
+          },
+          {
+            "@type": "Question",
+            "name": "Can it review a PR without checking out the branch?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Orca works against your local checkout. To review a PR, check out the branch and run Orca against it. The agent reads the real files, runs the real tests, and cites real line numbers." }
+          },
+          {
+            "@type": "Question",
+            "name": "What is a verifier-gated release?",
+            "acceptedAnswer": { "@type": "Answer", "text": "It means a release command only succeeds when every configured verifier passes. If the build, tests, or linter fail, the turn stays open and Orca fixes the regression before the release is tagged." }
+          },
+          {
+            "@type": "Question",
+            "name": "Is my repository uploaded anywhere?",
+            "acceptedAnswer": { "@type": "Answer", "text": "No. Orca runs locally against your checkout. It only contacts the model provider and, if you use MCP, the tool servers you configure. The repository itself never leaves your machine." }
+          },
+          {
+            "@type": "Question",
+            "name": "Can Orca work across multiple repositories?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Yes. Run Orca in each repository or use a workspace that contains several. Each session is tied to a working directory, so the agent always knows which checkout it is operating on." }
+          },
+          {
+            "@type": "Question",
+            "name": "How does this compare to a GitHub Action?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Actions are great for deterministic CI. Orca complements them by handling the investigative and adaptive work: reproducing a flaky failure, understanding a bug, and writing a fix that passes the action." }
+          }
+        ]
+      }
+    </script>
+    <script>
+      (function () {
+        var KEY = "orca-site-locale";
+        function detect() {
+          try {
+            var s = localStorage.getItem(KEY);
+            if (s === "en" || s === "zh") return s;
+          } catch (e) {}
+          return navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+        }
+        function apply(loc) {
+          document.documentElement.lang = loc === "zh" ? "zh-CN" : "en";
+          document.querySelectorAll("[data-zh]").forEach(function (el) {
+            if (!el.dataset.en) el.dataset.en = el.innerHTML;
+            el.innerHTML = loc === "zh" ? el.dataset.zh : el.dataset.en;
+          });
+          document.querySelectorAll(".locale-switch button").forEach(function (btn) {
+            btn.setAttribute("aria-pressed", btn.dataset.locale === loc ? "true" : "false");
+          });
+        }
+        var current = detect();
+        apply(current);
+        document.querySelectorAll(".locale-switch button").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            current = btn.dataset.locale;
+            try { localStorage.setItem(KEY, current); } catch (e) {}
+            apply(current);
+          });
+        });
+      })();
+    </script>
   </body>
 </html>
