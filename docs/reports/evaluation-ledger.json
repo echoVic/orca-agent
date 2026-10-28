@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-10-11",
+  "updated_at": "2026-10-28",
   "definition": {
     "tb2_mean": "Harbor aggregation over every scheduled trial; a trial without a verifier reward counts as 0",
     "tb2_mean_scored_only": "mean over the trials that produced a verifier reward",
@@ -12,7 +12,11 @@
       "source_commit": "3aa4efdfa",
       "version": "v0.4.31",
       "tasks": 89,
-      "settings": { "attempts": 1, "concurrency": 3, "environment_build_timeout_multiplier": 2.0 },
+      "settings": {
+        "attempts": 1,
+        "concurrency": 3,
+        "environment_build_timeout_multiplier": 2.0
+      },
       "tb2_mean": 0.494,
       "tb2_passed": 44,
       "report": "docs/reports/2026-09-15-terminal-bench-2-v0.4.31.md"
@@ -22,8 +26,14 @@
       "source_commit": "48fa0a458",
       "version": "v0.4.31+fixes",
       "tasks": 88,
-      "excluded_tasks": ["terminal-bench/qemu-startup"],
-      "settings": { "attempts": 1, "concurrency": 3, "environment_build_timeout_multiplier": 2.0 },
+      "excluded_tasks": [
+        "terminal-bench/qemu-startup"
+      ],
+      "settings": {
+        "attempts": 1,
+        "concurrency": 3,
+        "environment_build_timeout_multiplier": 2.0
+      },
       "tb2_mean": 0.727,
       "tb2_mean_infra_corrected": 0.761,
       "report": "docs/reports/2026-09-16-terminal-bench-2-v0.4.31-fixed.md"
@@ -33,8 +43,13 @@
       "source_commit": "5970b40c",
       "version": "v0.4.32",
       "tasks": 88,
-      "excluded_tasks": ["terminal-bench/qemu-startup"],
-      "settings": { "attempts": 1, "concurrency": 6 },
+      "excluded_tasks": [
+        "terminal-bench/qemu-startup"
+      ],
+      "settings": {
+        "attempts": 1,
+        "concurrency": 6
+      },
       "tb2_mean": 0.7955,
       "tb2_mean_scored_only": 0.8434,
       "tb2_passed": 70,
@@ -51,8 +66,16 @@
         "verifier_passed": 5,
         "mean_if_counted": 0.8523
       },
-      "l1": { "runs": 26, "unique_suites": 24, "failed": 0, "note": "sandbox_probe.py runs in default and privileged modes" },
-      "issues_filed": [114, 115],
+      "l1": {
+        "runs": 26,
+        "unique_suites": 24,
+        "failed": 0,
+        "note": "sandbox_probe.py runs in default and privileged modes"
+      },
+      "issues_filed": [
+        114,
+        115
+      ],
       "report": "docs/reports/2026-09-19-v0.4.32-evaluation.md",
       "summary": "docs/reports/2026-09-19-tb2-v0432-summary.json"
     },
@@ -61,7 +84,9 @@
       "source_commit": "55ca547e",
       "version": "v0.5.10",
       "tasks": 88,
-      "excluded_tasks": ["terminal-bench/qemu-startup"],
+      "excluded_tasks": [
+        "terminal-bench/qemu-startup"
+      ],
       "settings": {
         "attempts": 1,
         "concurrency": 6,
@@ -84,7 +109,10 @@
         "verifier_passed": 7,
         "settings": "one task per job, concurrency 1",
         "mean_if_counted": 0.8068,
-        "unscorable": ["terminal-bench/pytorch-model-cli", "terminal-bench/pytorch-model-recovery"]
+        "unscorable": [
+          "terminal-bench/pytorch-model-cli",
+          "terminal-bench/pytorch-model-recovery"
+        ]
       },
       "l1": {
         "runs": 26,
@@ -94,6 +122,42 @@
       },
       "report": "docs/reports/2026-10-11-v0.5.10-evaluation.md",
       "summary": "docs/reports/2026-10-11-tb2-v0510-summary.json"
+    },
+    {
+      "date": "2026-10-28",
+      "source_commit": "5b3a7f1c",
+      "version": "v0.5.14",
+      "tasks": 88,
+      "excluded_tasks": [
+        "terminal-bench/qemu-startup"
+      ],
+      "settings": {
+        "attempts": 1,
+        "concurrency": 5,
+        "environment_build_timeout_multiplier": 2.0,
+        "model": "deepseek-flash"
+      },
+      "tb2_mean": 0.8182,
+      "tb2_passed": 72,
+      "tb2_scored": 88,
+      "tb2_errored": 6,
+      "exceptions": {
+        "AgentTimeoutError": 6
+      },
+      "l1": {
+        "suites": 26,
+        "failed": 0
+      },
+      "new_suites": [
+        "goal_probe.py",
+        "workflow_mode_probe.py",
+        "computer_use (mock)"
+      ],
+      "issues_filed": [
+        151
+      ],
+      "report": "docs/reports/2026-10-28-v0.5.14-evaluation.md",
+      "summary": "docs/reports/2026-10-28-tb2-v0514-summary.json"
     }
   ]
 }

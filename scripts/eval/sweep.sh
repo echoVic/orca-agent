@@ -37,6 +37,8 @@ SUITES=(
   "trust_probe.py"
   "trust_race_probe.py"
   "workflow_probe.py"
+  "workflow_mode_probe.py"
+  "goal_probe.py"
   "workspace_lifetime_probe.py"
   "task_recovery_probe.py"
   "server_restart_probe.py"
