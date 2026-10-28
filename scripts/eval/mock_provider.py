@@ -286,6 +286,31 @@ class Handler(BaseHTTPRequestHandler):
         step = len(results)
         last = results[-1] if results else {}
 
+        if tool == "goal":
+            # Goal-mode scripted flow: read the goal, then claim a terminal state.
+            kind = "complete"
+            for token in prompt.replace("\n", " ").split():
+                if token.startswith("FIGOAL="):
+                    kind = token.split("=", 1)[1]
+            if step == 0:
+                self._stream_tool_call("get_goal", {})
+            elif step == 1:
+                self._stream_tool_call(
+                    "update_goal",
+                    {
+                        "status": kind,
+                        "reason": "goal probe: the objective is satisfied",
+                        "evidence": [
+                            {
+                                "kind": "observation",
+                                "summary": "goal probe observed the objective satisfied",
+                            }
+                        ],
+                    },
+                )
+            else:
+                self._stream(reasoning=False, content=True, terminal=True)
+            return
         if tool == "timeout":
             if step == 0:
                 self._stream_tool_call("bash", {"command": "sleep 30", "timeout_ms": 2000})
