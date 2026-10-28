@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "S0-smoke-pass",
+  "axis": "S",
+  "rung": 1,
+  "difficulty": {"level": 1},
+  "backend": "local",
+  "fixture": "fixture",
+  "prompt": "smoke: reply only, no tools",
+  "prompt_is_text": true,
+  "verify": ["test -f README.md && test -f tests/test_marker.txt"],
+  "limits": {"wall_seconds": 180, "verify_seconds": 60},
+  "anti_cheat": ["tests_unmodified"],
+  "diagnostics": ["workspace_diff", "test_log", "trajectory"],
+  "provider": "mock"
+}
