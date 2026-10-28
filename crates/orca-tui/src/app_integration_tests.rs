@@ -1365,7 +1365,9 @@ fn hosted_tui_failed_workflow_launch_rejects_the_foreground_action() {
                 Err(error) => panic!("workflow launch rejection missing: {error}"),
             }
         };
-        assert!(rejected.contains("typed TUI workflow launch failed"));
+        assert!(rejected.starts_with("workflow was not started: "));
+        assert!(rejected.contains("workflow script `missing-workflow` not found"));
+        assert!(!rejected.contains("RuntimeUnavailable"));
 
         action_tx
             .send(UserAction::Cancel)

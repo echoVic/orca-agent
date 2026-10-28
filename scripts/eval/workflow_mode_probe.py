@@ -111,7 +111,7 @@ def main() -> int:
         tui.send("/workflow:missing_probe_workflow")
         time.sleep(2)
         pane = tui.capture()
-        error_shown = tui.alive() and ("failed" in pane.lower() or "not found" in pane.lower())
+        error_shown = tui.alive() and "not found" in pane.lower() and "RuntimeUnavailable" not in pane
         failures += 0 if error_shown else 1
         cause = next((line.strip() for line in pane.splitlines() if "cause" in line), "")
         print(f"[{'PASS' if error_shown else 'FAIL'}] unknown     error_shown={error_shown} cause={cause[:100]}", flush=True)
