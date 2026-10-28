@@ -2559,11 +2559,45 @@ impl ThreadActor {
         })
     }
 
+    fn surface_workflow_launch_target(&self) -> surface::MutationTarget {
+        surface::MutationTarget::Thread {
+            thread_id: self
+                .resident_surface
+                .coordinator
+                .state()
+                .snapshot()
+                .thread
+                .thread_id
+                .clone(),
+        }
+    }
+
+    fn invalid_surface_workflow_launch(
+        &self,
+        request_id: surface::SurfaceRequestId,
+        code: surface::SurfaceMutationErrorCode,
+        message: impl Into<String>,
+    ) -> surface::MutationReply<surface::WorkflowControlOutput> {
+        surface::MutationReply::Uncommitted {
+            mutation: surface::UncommittedMutation::Invalid {
+                request_id,
+                target: Some(self.surface_workflow_launch_target()),
+                error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
+                    code,
+                    message: surface::DisplayText::new(message),
+                    winning_request_id: None,
+                    current_revision: None,
+                }),
+            },
+        }
+    }
+
     pub(super) fn control_surface_workflow(
         &mut self,
         client: &surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
         action: surface::WorkflowControlAction,
+        operation_running: bool,
     ) -> Result<
         surface::MutationReply<surface::WorkflowControlOutput>,
         surface::SurfaceClientCommandError,
@@ -2583,18 +2617,57 @@ impl ThreadActor {
                 return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
             }
         };
-        if observed_catalog_revision
-            != surface::WorkflowCatalogRevision::try_new(1).expect("one is valid")
-            || parent.is_some()
-        {
-            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        let catalog_revision = surface::WorkflowCatalogRevision::try_new(1).expect("one is valid");
+        if observed_catalog_revision != catalog_revision {
+            return Ok(surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Stale {
+                    request_id,
+                    target: Some(self.surface_workflow_launch_target()),
+                    error: surface::StaleMutationError::new(surface::SurfaceMutationError {
+                        code: surface::SurfaceMutationErrorCode::StaleRevision,
+                        message: surface::DisplayText::new(format!(
+                            "workflow catalog revision {} is stale; the current revision is 1",
+                            observed_catalog_revision.get(),
+                        )),
+                        winning_request_id: None,
+                        current_revision: Some(surface::SurfaceMutationRevision::WorkflowCatalog {
+                            revision: catalog_revision,
+                        }),
+                    }),
+                },
+            });
+        }
+        if parent.is_some() {
+            return Ok(self.invalid_surface_workflow_launch(
+                request_id,
+                surface::SurfaceMutationErrorCode::InvalidInput,
+                "launching a workflow under a parent operation is not supported",
+            ));
         }
         let mut raw_args = serde_json::Map::new();
         for (name, value) in args {
-            let value = serde_json::from_str(value.as_str())
-                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let value = match serde_json::from_str(value.as_str()) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Ok(self.invalid_surface_workflow_launch(
+                        request_id,
+                        surface::SurfaceMutationErrorCode::InvalidInput,
+                        format!(
+                            "workflow argument `{}` is not valid JSON: {error}",
+                            name.as_str()
+                        ),
+                    ));
+                }
+            };
             if raw_args.insert(name.as_str().to_string(), value).is_some() {
-                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+                return Ok(self.invalid_surface_workflow_launch(
+                    request_id,
+                    surface::SurfaceMutationErrorCode::InvalidInput,
+                    format!(
+                        "workflow argument `{}` was provided more than once",
+                        name.as_str()
+                    ),
+                ));
             }
         }
         let workflow_args = serde_json::Value::Object(raw_args);
@@ -2606,14 +2679,30 @@ impl ThreadActor {
         )? {
             return Ok(replay);
         }
-        if self.active.is_some() || self.operation_recovery.pending_manual_compaction.is_some() {
-            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        if operation_running
+            || self.active.is_some()
+            || self.operation_recovery.pending_manual_compaction.is_some()
+        {
+            return Ok(self.invalid_surface_workflow_launch(
+                request_id,
+                surface::SurfaceMutationErrorCode::IllegalState,
+                "another operation is running; run the workflow after it finishes",
+            ));
         }
-        self.ensure_background_capacity(1)
-            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if let Err(error) = self.ensure_background_capacity(1) {
+            return Ok(self.invalid_surface_workflow_launch(
+                request_id,
+                surface::SurfaceMutationErrorCode::IllegalState,
+                error.to_string(),
+            ));
+        }
         let config = self.config.clone();
         if !config.workflows.enabled {
-            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            return Ok(self.invalid_surface_workflow_launch(
+                request_id,
+                surface::SurfaceMutationErrorCode::IllegalState,
+                "workflows are disabled",
+            ));
         }
         let cwd = config
             .cwd
@@ -2629,21 +2718,46 @@ impl ThreadActor {
             .workflow_session_dir(&cwd)
             .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         let runner = WorkflowRunner::new(config, task_registry.clone(), session_dir);
-        let prepared = runner
-            .prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
-                name: Some(catalog_entry_id.as_str().to_string()),
-                args: Some(workflow_args.clone()),
-                ..Default::default()
-            }))
-            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let prepared = match runner.prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+            name: Some(catalog_entry_id.as_str().to_string()),
+            args: Some(workflow_args.clone()),
+            ..Default::default()
+        })) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let code = match error.kind() {
+                    io::ErrorKind::NotFound => surface::SurfaceMutationErrorCode::UnknownWorkflow,
+                    io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
+                        surface::SurfaceMutationErrorCode::InvalidInput
+                    }
+                    _ => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
+                };
+                return Ok(self.invalid_surface_workflow_launch(
+                    request_id,
+                    code,
+                    error.to_string(),
+                ));
+            }
+        };
         let tool_use_id = format!("workflow-{}", uuid::Uuid::new_v4());
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let task_id = surface::SurfaceTaskId::try_new(prepared.task_id.clone())
             .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         let workflow_run_id = surface::SurfaceWorkflowRunId::try_new(prepared.run_id.clone())
             .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let workflow_name = surface::NonEmptyText::try_new(prepared.workflow_name.clone())
-            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let workflow_name = match surface::NonEmptyText::try_new(prepared.workflow_name.clone()) {
+            Ok(name) => name,
+            Err(_) => {
+                return Ok(self.invalid_surface_workflow_launch(
+                    request_id,
+                    surface::SurfaceMutationErrorCode::InvalidInput,
+                    format!(
+                        "workflow script `{}` has an empty `name` in `export const meta`",
+                        catalog_entry_id.as_str()
+                    ),
+                ));
+            }
+        };
         let surface_tool_use_id = surface::SurfaceToolCallId::try_new(tool_use_id.clone())
             .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
 

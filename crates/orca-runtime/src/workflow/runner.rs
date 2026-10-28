@@ -1076,7 +1076,10 @@ impl WorkflowRunner {
 
     fn prepare_launch(&self, request: WorkflowLaunchRequest) -> io::Result<PreparedWorkflowRun> {
         let mut request = request;
-        let cwd = self.config.cwd.clone().unwrap_or(std::env::current_dir()?);
+        let cwd = match self.config.cwd.clone() {
+            Some(cwd) => cwd,
+            None => std::env::current_dir()?,
+        };
         fs::create_dir_all(&self.session_dir)?;
 
         if request.input.token_budget.is_none()
