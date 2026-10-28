@@ -75,6 +75,12 @@ def run_axis_a(args) -> int:
         print("axis A needs --from-run <harbor run dir> (repeatable)", file=sys.stderr)
         return 2
     tasks = axis_a.failing_tasks(run_dirs)
+    if args.tasks:
+        wanted = {name.strip() for name in args.tasks.split(",") if name.strip()}
+        tasks = [task for task in tasks if task in wanted]
+        missing = wanted - set(tasks)
+        if missing:
+            print(f"note: not in the failing set: {', '.join(sorted(missing))}", file=sys.stderr)
     multipliers = [float(value) for value in (args.multipliers or "2,4").split(",")]
     planned = axis_a.plan(tasks, multipliers)
     (out / "plan.json").write_text(json.dumps(planned, indent=2) + "\n", encoding="utf-8")
@@ -227,6 +233,7 @@ def main() -> int:
     parser.add_argument("--against", help="`last` or a run id: write a diff against that run")
     parser.add_argument("--from-run", action="append", help="axis A: Harbor run directory to take failures from")
     parser.add_argument("--multipliers", help="axis A: timeout multipliers, e.g. 2,4")
+    parser.add_argument("--tasks", help="axis A: restrict to these task names (comma-separated)")
     parser.add_argument("--execute", action="store_true", help="axis A: actually run Harbor (costs API budget)")
     parser.add_argument("--issue", help="print an issue body for a scenario from the latest run")
     args = parser.parse_args()

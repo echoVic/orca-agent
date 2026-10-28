@@ -74,6 +74,8 @@ def _read_results(multiplier: float, run_dir: Path) -> list[dict]:
     rows = []
     for result_path in glob.glob(str(run_dir / "*" / "result.json")) + glob.glob(str(run_dir / "*" / "*" / "result.json")):
         result = json.loads(Path(result_path).read_text(encoding="utf-8"))
+        if "trial_name" not in result and "verifier_result" not in result:
+            continue  # Harbor's job-level aggregate, not a trial
         reward = (result.get("verifier_result") or {}).get("rewards", {}).get("reward")
         exception = (result.get("exception_info") or {}).get("exception_type")
         task = (result.get("task_name") or Path(result_path).parent.name.split("__")[0]).split("/")[-1]
