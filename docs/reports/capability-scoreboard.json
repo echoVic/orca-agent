@@ -240,6 +240,28 @@
         "verification_strictness": 0,
         "capability_gap": 1
       }
+    },
+    {
+      "run_id": "20261029-100355",
+      "started_at": "2026-10-29T10:03:55",
+      "profile": "standard",
+      "source_commit": "f280c1ae",
+      "binary_sha256": "430fffce49fabe41",
+      "model": "deepseek-flash (effort max)",
+      "axes": {
+        "B": {
+          "l50": null,
+          "pass_rate": 1.0
+        }
+      },
+      "taxonomy": {
+        "harness": 0,
+        "environment": 0,
+        "time_bound": 0,
+        "product_bug": 0,
+        "verification_strictness": 0,
+        "capability_gap": 0
+      }
     }
   ]
 }

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "B-l4-real",
+  "axis": "B",
+  "rung": 4,
+  "difficulty": {
+    "level": 4,
+    "files": "real-repo",
+    "context_tokens_approx": 50000
+  },
+  "backend": "docker",
+  "image": "messense/rust-musl-cross:x86_64-musl",
+  "fixture": "fixture",
+  "prepare": "../../generators/orca_real.py",
+  "prompt": "prompts/L4real.md",
+  "verify": [
+    "mkdir -p crates/orca-file-search/tests && cp /artifacts/hidden_real.rs crates/orca-file-search/tests/hidden_real.rs && cargo test -p orca-file-search --test hidden_real --quiet"
+  ],
+  "limits": {
+    "wall_seconds": 1800,
+    "verify_seconds": 1200
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "deepseek"
+}
