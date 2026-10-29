@@ -22,7 +22,7 @@ REQUIRED = {
     "fixture": str,
     "verify": list,
 }
-BACKENDS = {"local", "harbor"}
+BACKENDS = {"local", "harbor", "docker"}
 AXES = {"A", "B", "C", "D", "E", "F", "G", "H", "S"}
 
 
@@ -44,6 +44,14 @@ class Scenario:
     anti_cheat: list[str] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
     provider: str = "mock"
+    prepare: Path | None = None
+    prepare_env: dict = field(default_factory=dict)
+    verify_env: dict = field(default_factory=dict)
+    image: str = ""
+    docker_args: list = field(default_factory=list)
+    workspace_mode: str = "rw"
+    command: str = "exec"
+    script: str = "workflow.js"
     path: Path | None = None
 
     @property
@@ -84,6 +92,19 @@ def load(path: Path) -> Scenario:
             prompt = str(raw["prompt"]).strip()
         else:
             raise ScenarioError(f"{path}: prompt file not found: {candidate}")
+    prepare_env = dict(raw.get("prepare_env") or {})
+    verify_env = dict(raw.get("verify_env") or {})
+    image = str(raw.get("image") or "")
+    command = str(raw.get("command") or "exec")
+    if command not in ("exec", "workflow", "goal"):
+        raise ScenarioError(f"{path}: command must be exec, workflow or goal")
+    script = str(raw.get("script") or "workflow.js")
+    prepare = None
+    if raw.get("prepare"):
+        prepare_path = (path.parent / raw["prepare"]).resolve()
+        if not prepare_path.is_file():
+            raise ScenarioError(f"{path}: prepare script not found: {prepare_path}")
+        prepare = prepare_path
     return Scenario(
         id=raw["id"],
         axis=raw["axis"],
@@ -97,6 +118,14 @@ def load(path: Path) -> Scenario:
         anti_cheat=list(raw.get("anti_cheat") or []),
         diagnostics=list(raw.get("diagnostics") or []),
         provider=str(raw.get("provider") or "mock"),
+        prepare=prepare,
+        prepare_env=prepare_env,
+        verify_env=verify_env,
+        image=image,
+        docker_args=list(raw.get("docker_args") or []),
+        workspace_mode=str(raw.get("workspace_mode") or "rw"),
+        command=command,
+        script=script,
         path=path,
     )
 

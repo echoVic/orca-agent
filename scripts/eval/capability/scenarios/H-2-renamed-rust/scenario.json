@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "H-2-renamed-rust",
+  "axis": "H",
+  "rung": 2,
+  "difficulty": {"level": 2, "skin": "renamed-rust", "source": "B-l2-three-files"},
+  "backend": "local",
+  "fixture": "fixture",
+  "prompt": "prompts/H2.md",
+  "verify": ["cargo test --quiet"],
+  "limits": {"wall_seconds": 900, "verify_seconds": 300},
+  "anti_cheat": ["tests_unmodified"],
+  "diagnostics": ["workspace_diff", "test_log", "trajectory"],
+  "provider": "deepseek"
+}

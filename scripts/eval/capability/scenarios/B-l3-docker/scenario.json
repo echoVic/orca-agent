@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "id": "B-l3-docker",
+  "axis": "B",
+  "rung": 3,
+  "difficulty": {
+    "level": 3,
+    "files": 10,
+    "backend": "docker"
+  },
+  "backend": "docker",
+  "image": "messense/rust-musl-cross:x86_64-musl",
+  "fixture": "../B-l3-ten-files/fixture",
+  "prompt": "prompts/task.md",
+  "verify": [
+    "cargo test --quiet"
+  ],
+  "limits": {
+    "wall_seconds": 1800,
+    "verify_seconds": 900
+  },
+  "anti_cheat": [
+    "tests_unmodified"
+  ],
+  "diagnostics": [
+    "test_log",
+    "trajectory",
+    "workspace_diff"
+  ],
+  "provider": "deepseek"
+}

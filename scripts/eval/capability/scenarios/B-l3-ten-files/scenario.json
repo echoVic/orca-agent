@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "B-l3-ten-files",
+  "axis": "B",
+  "rung": 3,
+  "difficulty": {"level": 3, "files": 10},
+  "backend": "local",
+  "fixture": "fixture",
+  "prompt": "prompts/L3.md",
+  "verify": ["cargo test --quiet"],
+  "limits": {"wall_seconds": 1200, "verify_seconds": 300},
+  "anti_cheat": ["tests_unmodified"],
+  "diagnostics": ["workspace_diff", "test_log", "trajectory"],
+  "provider": "deepseek"
+}

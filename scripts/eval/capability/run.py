@@ -109,14 +109,25 @@ def run_scenarios(args, scenarios: list[scenario.Scenario], binary: Path) -> dic
     out.mkdir(parents=True, exist_ok=True)
     pairs = []
     product_findings: list[tuple[str, str]] = []
+    spent_usd = 0.0
+    spent_limit = args.max_usd if args.max_usd is not None else (20.0 if args.profile == "deep" else 5.0)
     for item in scenarios:
+        if spent_usd >= spent_limit:
+            print(f"stop: estimated spend ${spent_usd:.2f} reached the ${spent_limit:.2f} cap", flush=True)
+            break
         attempts = []
         for attempt_index in range(args.k):
             attempt_dir = out / "per-scenario" / item.id / f"attempt-{attempt_index + 1}"
-            if item.backend != "local":
+            if item.backend not in ("local", "docker"):
                 print(f"skip {item.id}: backend `{item.backend}` not implemented yet", flush=True)
                 continue
-            attempt = backend.run_local(item, attempt_dir, binary=binary, provider=args.provider)
+            runner = backend.run_docker if item.backend == "docker" else backend.run_local
+            attempt = runner(item, attempt_dir, binary=binary, provider=args.provider)
+            spent_usd += (
+                attempt.cost_usd
+                if attempt.cost_usd is not None
+                else metrics.estimate_usd(attempt.tokens_in, attempt.tokens_out)
+            )
             attempts.append(attempt.as_dict())
             if attempt.failure_class == "product_bug":
                 product_findings.extend(triage_signals(item.id, attempt))
@@ -150,6 +161,7 @@ def run_scenarios(args, scenarios: list[scenario.Scenario], binary: Path) -> dic
         "k": args.k,
         "out": str(out),
         "protocol": protocol_block,
+        "spend_usd": round(spent_usd, 3),
         "summary": report.summarize(pairs),
         "product_findings": product_findings,
         "scenarios": [
@@ -230,6 +242,8 @@ def main() -> int:
     parser.add_argument("--provider", default=None, help="mock | deepseek (default: scenario value)")
     parser.add_argument("--out", default=str(DEFAULT_OUT))
     parser.add_argument("--record", action="store_true", help="append the scoreboard and a dated report")
+    parser.add_argument("--max-usd", type=float, default=None,
+                        help="stop before the next scenario when the estimated spend exceeds this")
     parser.add_argument("--against", help="`last` or a run id: write a diff against that run")
     parser.add_argument("--from-run", action="append", help="axis A: Harbor run directory to take failures from")
     parser.add_argument("--multipliers", help="axis A: timeout multipliers, e.g. 2,4")

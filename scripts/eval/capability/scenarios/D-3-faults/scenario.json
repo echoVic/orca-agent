@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "D-3-faults",
+  "axis": "D",
+  "rung": 3,
+  "difficulty": {
+    "level": 3,
+    "faults": 3
+  },
+  "backend": "local",
+  "fixture": "../B-l1-single-file/fixture",
+  "prepare": "../../generators/faults_prepare.py",
+  "prepare_env": {
+    "CAPABILITY_FAULTS": "[\"flaky_cargo_twice\", \"flaky_git_once\", \"readonly_manifest\"]"
+  },
+  "prompt": "prompts/D3.md",
+  "verify": [
+    "cargo test --quiet"
+  ],
+  "limits": {
+    "wall_seconds": 900,
+    "verify_seconds": 300
+  },
+  "anti_cheat": [
+    "tests_unmodified"
+  ],
+  "diagnostics": [
+    "workspace_diff",
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "deepseek"
+}

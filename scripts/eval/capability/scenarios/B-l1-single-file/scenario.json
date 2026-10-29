@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "B-l1-single-file",
+  "axis": "B",
+  "rung": 1,
+  "difficulty": {"level": 1, "files": 1},
+  "backend": "local",
+  "fixture": "fixture",
+  "prompt": "prompts/L1.md",
+  "verify": ["cargo test --quiet"],
+  "limits": {"wall_seconds": 900, "verify_seconds": 300},
+  "anti_cheat": ["tests_unmodified"],
+  "diagnostics": ["workspace_diff", "test_log", "trajectory"],
+  "provider": "deepseek"
+}

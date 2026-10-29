@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "C-300k-context",
+  "axis": "C",
+  "rung": 300000,
+  "difficulty": {
+    "level": 300000,
+    "context_tokens": 300000
+  },
+  "backend": "local",
+  "fixture": "fixture",
+  "prepare": "../../generators/c_context.py",
+  "prepare_env": {
+    "CAPABILITY_CONTEXT_TOKENS": "300000"
+  },
+  "prompt": "prompts/C.md",
+  "verify": [
+    "python3 verify.py"
+  ],
+  "verify_env": {
+    "CAPABILITY_EXPECTED_SKU": "ZX-9100"
+  },
+  "limits": {
+    "wall_seconds": 900,
+    "verify_seconds": 120
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "deepseek"
+}
