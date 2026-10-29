@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "H-1-python-skin",
+  "axis": "H",
+  "rung": 1,
+  "difficulty": {"level": 1, "skin": "python", "source": "B-l1-single-file"},
+  "backend": "local",
+  "fixture": "fixture",
+  "prompt": "prompts/H1.md",
+  "verify": ["python3 -m unittest discover -s tests -q"],
+  "limits": {"wall_seconds": 600, "verify_seconds": 180},
+  "anti_cheat": ["tests_unmodified"],
+  "diagnostics": ["workspace_diff", "test_log", "trajectory"],
+  "provider": "deepseek"
+}
