@@ -45,6 +45,7 @@ class Scenario:
     diagnostics: list[str] = field(default_factory=list)
     provider: str = "mock"
     prepare: Path | None = None
+    prepare_env: dict = field(default_factory=dict)
     path: Path | None = None
 
     @property
@@ -85,6 +86,7 @@ def load(path: Path) -> Scenario:
             prompt = str(raw["prompt"]).strip()
         else:
             raise ScenarioError(f"{path}: prompt file not found: {candidate}")
+    prepare_env = dict(raw.get("prepare_env") or {})
     prepare = None
     if raw.get("prepare"):
         prepare_path = (path.parent / raw["prepare"]).resolve()
@@ -105,6 +107,7 @@ def load(path: Path) -> Scenario:
         diagnostics=list(raw.get("diagnostics") or []),
         provider=str(raw.get("provider") or "mock"),
         prepare=prepare,
+        prepare_env=prepare_env,
         path=path,
     )
 

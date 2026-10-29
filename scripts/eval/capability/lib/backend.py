@@ -87,13 +87,15 @@ class MockProvider:
             self.process.kill()
 
 
-def agent_env(home: Path, provider: str, mock: MockProvider | None) -> dict[str, str]:
+def agent_env(home: Path, provider: str, mock: MockProvider | None, extra_path: Path | None = None) -> dict[str, str]:
     env = {
         key: value
         for key, value in os.environ.items()
         if not key.startswith(("ORCA_", "DEEPSEEK_", "OPENAI_", "ANTHROPIC_")) and key != "NODE_OPTIONS"
     }
     env.update(ORCA_HOME=str(home), TERM="xterm-256color")
+    if extra_path is not None and extra_path.is_dir():
+        env["PATH"] = f"{extra_path}:{env.get('PATH', '')}"
     if provider == "mock":
         env.update(ORCA_API_KEY="mock", DEEPSEEK_API_KEY="mock")
         if mock:
@@ -182,8 +184,10 @@ def run_local(
     if not (workspace / ".git").exists():
         subprocess.run(["git", "init", "-q", str(workspace)], capture_output=True, timeout=30)
     if scenario.prepare is not None:
+        prepare_process_env = {**os.environ, **scenario.prepare_env}
         prepared = subprocess.run(
-            [sys.executable, str(scenario.prepare)], cwd=workspace, capture_output=True, text=True, timeout=120
+            [sys.executable, str(scenario.prepare)], cwd=workspace, capture_output=True, text=True,
+            timeout=120, env=prepare_process_env,
         )
         (attempt_dir / "prepare.log").write_text(prepared.stdout + prepared.stderr, encoding="utf-8")
         if prepared.returncode != 0:
@@ -222,7 +226,7 @@ def run_local(
                     str(binary), "exec", "--mode", "full-auto", "--output-format", "jsonl",
                     "--cwd", str(workspace), "--", scenario.prompt,
                 ],
-                env=agent_env(home, provider, mock),
+                env=agent_env(home, provider, mock, extra_path=workspace / ".faultbin"),
                 cwd=workspace,
                 stdout=stdout,
                 stderr=stderr,

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "D-5-faults",
+  "axis": "D",
+  "rung": 5,
+  "difficulty": {
+    "level": 5,
+    "faults": 5
+  },
+  "backend": "local",
+  "fixture": "../B-l1-single-file/fixture",
+  "prepare": "../../generators/faults_prepare.py",
+  "prepare_env": {
+    "CAPABILITY_FAULTS": "[\"flaky_cargo_once\", \"flaky_git_once\", \"flaky_mkdir_once\", \"readonly_manifest\", \"stale_lock\"]"
+  },
+  "prompt": "prompts/D5.md",
+  "verify": [
+    "cargo test --quiet"
+  ],
+  "limits": {
+    "wall_seconds": 900,
+    "verify_seconds": 300
+  },
+  "anti_cheat": [
+    "tests_unmodified"
+  ],
+  "diagnostics": [
+    "workspace_diff",
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "deepseek"
+}
