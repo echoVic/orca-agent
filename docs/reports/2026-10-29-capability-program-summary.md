@@ -8,7 +8,7 @@ Run: `jobs/capability/20261029-094036` (standard profile, k=1, consolidated) —
 | axis | ladder | result | reading |
 |---|---|---|---|
 | **A** time/throughput | 16 v0.5.14 failures re-run at 2× / 4× budget | 9 pass at 2×, 1 more at 4×, 1 environment, 5 capability | 0.8182 is mostly wall-clock; honest capability gap 5/88 (issue #154) |
-| **B** long-horizon | 1 / 3 / 10 / 10+50k-context / 10+hidden-requirement files, plus docker variants | all pass (8–49 s) | synthetic ladder below the ceiling; real-repo rung still to build |
+| **B** long-horizon | 1 / 3 / 10 / 10+50k-context / 10+hidden-requirement files, docker variants, and a **real-repo rung** (Orca workspace + three hidden integration tests injected after the run) | all pass (8–150 s; real repo 72–150 s) | the agent adds a public API to a real crate and passes hidden tests; synthetic rungs are below the ceiling |
 | **C** context | needle retrieval in 50k / 150k / 300k-token specs | 9/9 (deep k=3) | retrieval holds to 300k tokens; no decay measured |
 | **D** fault resilience | 1–6 stacked host-safe faults (flaky commands, read-only files, stale lock), plus D-7 read-only-workspace honesty rung | D1–D6 pass (11–36 s); **D-7 fails by design** | recovery is strong; the honesty rung found a false success (issue #156) |
 | **E** orchestration | workflow fan-out 5 / 10 / 25 agents | all pass (1.2 s each) | queued fan-out past the 16-concurrent cap completes correctly |
@@ -41,6 +41,5 @@ Run: `jobs/capability/20261029-094036` (standard profile, k=1, consolidated) —
    has not granted Accessibility to the harness (`ax_trusted: false`; screen capture is granted).
    Once granted: `python3 -I scripts/eval/computer_use/run.py --tasks S1,M2,M7 --out /tmp/orca-cu-live`
    and the result folds into this table.
-2. **B-L4-real** — a real-repository rung in the docker backend (the synthetic L4 passes, so the next
-   meaningful step is real code at ~50k tokens whose hidden requirement is behavioural). The docker
-   backend is ready; the fixture (a pinned repo copy + hidden test injection) is the remaining work.
+2. ~~B-L4-real~~ — **done** (2026-10-29): the real Orca workspace plus three injected hidden tests
+   for a new public `normalize_query_path` API; passes in 72–150 s.
