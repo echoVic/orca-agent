@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "B-l4-large-context",
+  "axis": "B",
+  "rung": 4,
+  "difficulty": {"level": 4, "files": 10, "context_tokens_approx": 50000},
+  "backend": "local",
+  "fixture": "../B-l3-ten-files/fixture",
+  "prepare": "../../generators/l4_context.py",
+  "prompt": "prompts/L4.md",
+  "verify": ["cargo test --quiet"],
+  "limits": {"wall_seconds": 1200, "verify_seconds": 300},
+  "anti_cheat": ["tests_unmodified"],
+  "diagnostics": ["workspace_diff", "test_log", "trajectory"],
+  "provider": "deepseek"
+}

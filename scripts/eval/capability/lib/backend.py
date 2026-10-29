@@ -181,6 +181,17 @@ def run_local(
     (home / "config.toml").write_text("auto_memory = false\n", encoding="utf-8")
     if not (workspace / ".git").exists():
         subprocess.run(["git", "init", "-q", str(workspace)], capture_output=True, timeout=30)
+    if scenario.prepare is not None:
+        prepared = subprocess.run(
+            [sys.executable, str(scenario.prepare)], cwd=workspace, capture_output=True, text=True, timeout=120
+        )
+        (attempt_dir / "prepare.log").write_text(prepared.stdout + prepared.stderr, encoding="utf-8")
+        if prepared.returncode != 0:
+            return Attempt(
+                outcome="error", failure_class="environment", wall_seconds=0.0, verify_seconds=0.0,
+                environment_error=f"prepare script failed: {prepared.stderr.strip()[:300]}",
+                artifacts={"workspace": str(workspace)},
+            )
     try:
         subprocess.run(
             [str(binary), "trust", "add", "--cwd", str(workspace)],

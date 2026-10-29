@@ -44,6 +44,7 @@ class Scenario:
     anti_cheat: list[str] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
     provider: str = "mock"
+    prepare: Path | None = None
     path: Path | None = None
 
     @property
@@ -84,6 +85,12 @@ def load(path: Path) -> Scenario:
             prompt = str(raw["prompt"]).strip()
         else:
             raise ScenarioError(f"{path}: prompt file not found: {candidate}")
+    prepare = None
+    if raw.get("prepare"):
+        prepare_path = (path.parent / raw["prepare"]).resolve()
+        if not prepare_path.is_file():
+            raise ScenarioError(f"{path}: prepare script not found: {prepare_path}")
+        prepare = prepare_path
     return Scenario(
         id=raw["id"],
         axis=raw["axis"],
@@ -97,6 +104,7 @@ def load(path: Path) -> Scenario:
         anti_cheat=list(raw.get("anti_cheat") or []),
         diagnostics=list(raw.get("diagnostics") or []),
         provider=str(raw.get("provider") or "mock"),
+        prepare=prepare,
         path=path,
     )
 
