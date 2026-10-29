@@ -443,9 +443,12 @@ def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provi
     (attempt_dir / "prompt.txt").write_text(scenario.prompt, encoding="utf-8")
     protected = hash_protected(workspace)
     mounts = [
-        "-v", f"{workspace}:/workspace", "-v", f"{musl.parent}:/mnt/orca-bin:ro",
+        "-v", f"{workspace}:/workspace:{'ro' if scenario.workspace_mode == 'ro' else 'rw'}",
+        "-v", f"{musl.parent}:/mnt/orca-bin:ro",
         "-v", f"{home}:/home/orca", "-v", f"{attempt_dir}:/artifacts",
     ]
+    for extra in scenario.docker_args:
+        mounts.append(str(extra).replace("{workspace}", str(workspace)))
     agent_command = (
         "/mnt/orca-bin/orca trust add --cwd /workspace >/dev/null 2>&1 || true; "
         "exec /mnt/orca-bin/orca exec --mode full-auto --output-format jsonl --cwd /workspace "
@@ -469,8 +472,17 @@ def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provi
     events = parse_events(stdout_path)
     verify_started = time.monotonic()
     verify_command = " && ".join(scenario.verify)
+    verify_env = {
+        **scenario.verify_env,
+        "CAPABILITY_AGENT_EXIT": "" if agent_exit is None else str(agent_exit),
+        "CAPABILITY_AGENT_TERMINAL": str(events.get("terminal") or ""),
+    }
+    verify_env_args = []
+    for key, value in verify_env.items():
+        verify_env_args += ["-e", f"{key}={value}"]
     verify_process = subprocess.run(
-        ["docker", "run", "--rm", *mounts, "-w", "/workspace", scenario.image, "bash", "-lc", verify_command],
+        ["docker", "run", "--rm", *mounts, *verify_env_args, "-w", "/workspace", scenario.image,
+         "bash", "-lc", verify_command],
         capture_output=True, text=True, timeout=scenario.limits.get("verify_seconds", 600),
     )
     (attempt_dir / "verify.log").write_text(verify_process.stdout + verify_process.stderr, encoding="utf-8")

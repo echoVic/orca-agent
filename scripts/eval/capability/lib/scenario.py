@@ -48,6 +48,8 @@ class Scenario:
     prepare_env: dict = field(default_factory=dict)
     verify_env: dict = field(default_factory=dict)
     image: str = ""
+    docker_args: list = field(default_factory=list)
+    workspace_mode: str = "rw"
     command: str = "exec"
     script: str = "workflow.js"
     path: Path | None = None
@@ -120,6 +122,8 @@ def load(path: Path) -> Scenario:
         prepare_env=prepare_env,
         verify_env=verify_env,
         image=image,
+        docker_args=list(raw.get("docker_args") or []),
+        workspace_mode=str(raw.get("workspace_mode") or "rw"),
         command=command,
         script=script,
         path=path,
