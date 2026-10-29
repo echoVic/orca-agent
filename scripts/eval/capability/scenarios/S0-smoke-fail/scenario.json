@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "S0-smoke-fail",
+  "axis": "S",
+  "rung": 2,
+  "difficulty": {"level": 2},
+  "backend": "local",
+  "fixture": "fixture",
+  "prompt": "prompts/smoke.md",
+  "verify": ["test -f OUT.txt"],
+  "limits": {"wall_seconds": 180, "verify_seconds": 60},
+  "anti_cheat": ["tests_unmodified"],
+  "diagnostics": ["workspace_diff", "test_log", "trajectory"],
+  "provider": "mock"
+}
