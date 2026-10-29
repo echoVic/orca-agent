@@ -211,6 +211,61 @@ def run_local(
             artifacts={"workspace": str(workspace)},
         )
 
+    if scenario.command == "goal":
+        from . import goal_episode  # noqa: PLC0415
+
+        goal_started = time.monotonic()
+        episode = goal_episode.run(scenario, attempt_dir, binary)
+        goal_wall = time.monotonic() - goal_started
+        verify_env = {
+            **os.environ,
+            "CAPABILITY_ORCA_BIN": str(binary),
+            "CAPABILITY_GOAL_OUTCOME": str(attempt_dir / "goal-outcome.json"),
+            **scenario.verify_env,
+        }
+        verifier_results = []
+        verify_started = time.monotonic()
+        for index, command in enumerate(scenario.verify):
+            try:
+                result = subprocess.run(
+                    ["bash", "-lc", command], cwd=workspace, capture_output=True, text=True,
+                    timeout=scenario.limits.get("verify_seconds", 120), env=verify_env,
+                )
+                code, output = result.returncode, result.stdout + result.stderr
+            except subprocess.TimeoutExpired:
+                code, output = 124, f"verifier timed out: {command}\n"
+            (attempt_dir / f"verify-{index}.log").write_text(output, encoding="utf-8")
+            verifier_results.append({"command": command, "exit": code})
+        goal_verify = time.monotonic() - verify_started
+        failures = [item for item in verifier_results if item["exit"] != 0]
+        harness_error = None
+        if episode.get("error"):
+            harness_error = episode["error"]
+            outcome = "error"
+            failure_class = "harness"
+        elif failures:
+            outcome, failure_class = "fail", "capability_gap"
+        else:
+            outcome, failure_class = "pass", None
+        (attempt_dir / "attempt.json").write_text(
+            json.dumps(
+                {"outcome": outcome, "failure_class": failure_class, "episode": episode,
+                 "verifier": verifier_results, "wall_seconds": round(goal_wall, 2),
+                 "verify_seconds": round(goal_verify, 2)},
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        return Attempt(
+            outcome=outcome,
+            failure_class=failure_class,
+            wall_seconds=goal_wall,
+            verify_seconds=goal_verify,
+            agent_exit_code=0,
+            harness_error=harness_error,
+            artifacts={"goal_outcome": str(attempt_dir / "goal-outcome.json")},
+        )
+
     protected = hash_protected(workspace)
     mock = None
     stdout_path = attempt_dir / "agent.stdout.jsonl"

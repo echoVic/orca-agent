@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "F-6-goal-cycles",
+  "axis": "F",
+  "rung": 6,
+  "difficulty": {
+    "level": 6,
+    "cycles": 6
+  },
+  "backend": "local",
+  "command": "goal",
+  "fixture": "fixture",
+  "verify": [
+    "python3 verify.py"
+  ],
+  "verify_env": {
+    "CAPABILITY_EXPECTED_CYCLES": "6"
+  },
+  "limits": {
+    "wall_seconds": 600,
+    "verify_seconds": 60
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "pane"
+  ],
+  "provider": "mock"
+}

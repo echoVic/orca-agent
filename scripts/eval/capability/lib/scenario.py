@@ -92,8 +92,8 @@ def load(path: Path) -> Scenario:
     prepare_env = dict(raw.get("prepare_env") or {})
     verify_env = dict(raw.get("verify_env") or {})
     command = str(raw.get("command") or "exec")
-    if command not in ("exec", "workflow"):
-        raise ScenarioError(f"{path}: command must be exec or workflow")
+    if command not in ("exec", "workflow", "goal"):
+        raise ScenarioError(f"{path}: command must be exec, workflow or goal")
     script = str(raw.get("script") or "workflow.js")
     prepare = None
     if raw.get("prepare"):
