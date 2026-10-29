@@ -118,10 +118,11 @@ def run_scenarios(args, scenarios: list[scenario.Scenario], binary: Path) -> dic
         attempts = []
         for attempt_index in range(args.k):
             attempt_dir = out / "per-scenario" / item.id / f"attempt-{attempt_index + 1}"
-            if item.backend != "local":
+            if item.backend not in ("local", "docker"):
                 print(f"skip {item.id}: backend `{item.backend}` not implemented yet", flush=True)
                 continue
-            attempt = backend.run_local(item, attempt_dir, binary=binary, provider=args.provider)
+            runner = backend.run_docker if item.backend == "docker" else backend.run_local
+            attempt = runner(item, attempt_dir, binary=binary, provider=args.provider)
             spent_usd += (
                 attempt.cost_usd
                 if attempt.cost_usd is not None

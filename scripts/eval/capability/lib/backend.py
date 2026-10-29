@@ -407,3 +407,92 @@ def run_local(
         verifier_partial=verifier_partial and (agent_exit == 0),
         artifacts={"workspace": str(workspace), "agent_stdout": str(stdout_path)},
     )
+
+
+def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provider: str | None = None) -> Attempt:
+    """Run one attempt inside a Linux container (the design's `docker` backend for B/D)."""
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    provider = provider or scenario.provider
+    if scenario.provider == "mock" or provider == "mock":
+        raise BackendError("the docker backend needs a real provider (no host-network mock wiring yet)")
+    if not scenario.image:
+        raise BackendError("docker scenarios need an `image`")
+    if provider != "deepseek":
+        raise BackendError(f"unsupported docker provider: {provider}")
+    musl = REPO / "target" / "x86_64-unknown-linux-musl" / "release" / "orca"
+    if not musl.exists():
+        return Attempt(outcome="error", failure_class="environment", wall_seconds=0.0, verify_seconds=0.0,
+                       environment_error=f"musl binary missing: {musl}")
+    try:
+        key = json.loads((Path.home() / ".orca" / "auth.json").read_text(encoding="utf-8"))["DEEPSEEK_API_KEY"]
+    except (OSError, ValueError, KeyError) as error:
+        return Attempt(outcome="error", failure_class="environment", wall_seconds=0.0, verify_seconds=0.0,
+                       environment_error=f"cannot read API key: {error}")
+    started = time.monotonic()
+    workspace = attempt_dir / "workspace"
+    home = attempt_dir / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text("auto_memory = false\n", encoding="utf-8")
+    shutil.copytree(scenario.fixture, workspace)
+    if scenario.prepare is not None:
+        prepared = subprocess.run([sys.executable, str(scenario.prepare)], cwd=workspace, capture_output=True,
+                                  text=True, timeout=120, env={**os.environ, **scenario.prepare_env})
+        if prepared.returncode != 0:
+            return Attempt(outcome="error", failure_class="environment", wall_seconds=0.0, verify_seconds=0.0,
+                           environment_error=f"prepare failed: {prepared.stderr.strip()[:200]}")
+    (attempt_dir / "prompt.txt").write_text(scenario.prompt, encoding="utf-8")
+    protected = hash_protected(workspace)
+    mounts = [
+        "-v", f"{workspace}:/workspace", "-v", f"{musl.parent}:/mnt/orca-bin:ro",
+        "-v", f"{home}:/home/orca", "-v", f"{attempt_dir}:/artifacts",
+    ]
+    agent_command = (
+        "/mnt/orca-bin/orca trust add --cwd /workspace >/dev/null 2>&1 || true; "
+        "exec /mnt/orca-bin/orca exec --mode full-auto --output-format jsonl --cwd /workspace "
+        "--api-key \"$DEEPSEEK_API_KEY\" -- \"$(cat /artifacts/prompt.txt)\""
+    )
+    agent_exit: int | None = None
+    stdout_path = attempt_dir / "agent.stdout.jsonl"
+    stderr_path = attempt_dir / "agent.stderr.txt"
+    try:
+        with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
+            process = subprocess.run(
+                ["docker", "run", "--rm", *mounts, "-e", "ORCA_HOME=/home/orca",
+                 "-e", f"DEEPSEEK_API_KEY={key}", "-w", "/workspace", scenario.image,
+                 "bash", "-lc", agent_command],
+                stdout=stdout, stderr=stderr, timeout=scenario.limits.get("wall_seconds", 1800),
+            )
+        agent_exit = process.returncode
+    except subprocess.TimeoutExpired:
+        agent_exit = None
+    wall = time.monotonic() - started
+    events = parse_events(stdout_path)
+    verify_started = time.monotonic()
+    verify_command = " && ".join(scenario.verify)
+    verify_process = subprocess.run(
+        ["docker", "run", "--rm", *mounts, "-w", "/workspace", scenario.image, "bash", "-lc", verify_command],
+        capture_output=True, text=True, timeout=scenario.limits.get("verify_seconds", 600),
+    )
+    (attempt_dir / "verify.log").write_text(verify_process.stdout + verify_process.stderr, encoding="utf-8")
+    verify_seconds = time.monotonic() - verify_started
+    after = hash_protected(workspace)
+    tampered = sorted(path for path, digest in protected.items() if after.get(path) != digest)
+    outcome = "pass" if verify_process.returncode == 0 and not tampered else "fail"
+    evidence = triage.Evidence(outcome=outcome, wall_seconds=wall, wall_limit=scenario.limits.get("wall_seconds", 1800),
+                               agent_exit_code=agent_exit, tool_calls=events.get("tool_calls"),
+                               false_completion=(agent_exit == 0 and verify_process.returncode != 0),
+                               product_signals=(["exit_137"] if agent_exit == 137 else []))
+    failure_class = None if outcome == "pass" else triage.classify(evidence)
+    if tampered:
+        outcome, failure_class = "error", "harness"
+    (attempt_dir / "attempt.json").write_text(json.dumps({
+        "outcome": outcome, "failure_class": failure_class, "agent_exit": agent_exit, "tampered": tampered,
+        "verifier": [{"command": verify_command, "exit": verify_process.returncode}], "events": events,
+        "wall_seconds": round(wall, 2), "verify_seconds": round(verify_seconds, 2)}, indent=2) + "\n",
+        encoding="utf-8")
+    return Attempt(outcome=outcome, failure_class=failure_class, wall_seconds=wall, verify_seconds=verify_seconds,
+                   agent_exit_code=agent_exit, tool_calls=events.get("tool_calls"), tokens_out=events.get("tokens_out"),
+                   tokens_in=events.get("tokens_in"), cost_usd=events.get("cost_usd"),
+                   false_completion=(agent_exit == 0 and verify_process.returncode != 0),
+                   harness_error=f"protected files were modified: {tampered}" if tampered else None,
+                   artifacts={"workspace": str(workspace), "agent_stdout": str(stdout_path)})

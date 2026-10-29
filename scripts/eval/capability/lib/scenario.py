@@ -22,7 +22,7 @@ REQUIRED = {
     "fixture": str,
     "verify": list,
 }
-BACKENDS = {"local", "harbor"}
+BACKENDS = {"local", "harbor", "docker"}
 AXES = {"A", "B", "C", "D", "E", "F", "G", "H", "S"}
 
 
@@ -47,6 +47,7 @@ class Scenario:
     prepare: Path | None = None
     prepare_env: dict = field(default_factory=dict)
     verify_env: dict = field(default_factory=dict)
+    image: str = ""
     command: str = "exec"
     script: str = "workflow.js"
     path: Path | None = None
@@ -91,6 +92,7 @@ def load(path: Path) -> Scenario:
             raise ScenarioError(f"{path}: prompt file not found: {candidate}")
     prepare_env = dict(raw.get("prepare_env") or {})
     verify_env = dict(raw.get("verify_env") or {})
+    image = str(raw.get("image") or "")
     command = str(raw.get("command") or "exec")
     if command not in ("exec", "workflow", "goal"):
         raise ScenarioError(f"{path}: command must be exec, workflow or goal")
@@ -117,6 +119,7 @@ def load(path: Path) -> Scenario:
         prepare=prepare,
         prepare_env=prepare_env,
         verify_env=verify_env,
+        image=image,
         command=command,
         script=script,
         path=path,
