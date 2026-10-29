@@ -1785,9 +1785,16 @@ pub(crate) fn launch_workflow(
             parent: None,
         },
     );
-    let output = match result
-        .map_err(|error| io::Error::other(format!("typed TUI workflow launch failed: {error:?}")))?
-    {
+    use crate::diagnostics::WORKFLOW_NOT_STARTED_PREFIX;
+    let output = match result.map_err(|error| {
+        let cause = match error {
+            SurfaceClientCommandError::RuntimeUnavailable => "the runtime is unavailable",
+            SurfaceClientCommandError::Unauthorized => {
+                "the TUI may not manage workflows in this conversation"
+            }
+        };
+        io::Error::other(format!("{WORKFLOW_NOT_STARTED_PREFIX}{cause}"))
+    })? {
         MutationReply::Committed { value, .. } => value,
         MutationReply::Deferred { mutation, .. } => {
             detach(&surface, &attachment.client);
@@ -1798,8 +1805,14 @@ pub(crate) fn launch_workflow(
         }
         MutationReply::Uncommitted { mutation } => {
             detach(&surface, &attachment.client);
+            let cause = match &mutation {
+                UncommittedMutation::Invalid { error, .. } => error.error().message.as_str(),
+                UncommittedMutation::Stale { error, .. } => error.error().message.as_str(),
+                UncommittedMutation::Unavailable { error, .. } => error.error().message.as_str(),
+                UncommittedMutation::CommitFailed { error, .. } => error.error().message.as_str(),
+            };
             return Err(io::Error::other(format!(
-                "typed TUI workflow launch did not commit: {mutation:?}"
+                "{WORKFLOW_NOT_STARTED_PREFIX}{cause}"
             )));
         }
     };

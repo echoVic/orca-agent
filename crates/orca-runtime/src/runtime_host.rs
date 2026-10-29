@@ -19482,7 +19482,7 @@ impl ThreadActor {
                 let result = if self
                     .admits_surface_client(&client, surface::SurfaceCapability::ManageWorkflow)
                 {
-                    self.control_surface_workflow(&client, request_id, action)
+                    self.control_surface_workflow(&client, request_id, action, false)
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
@@ -20278,8 +20278,24 @@ impl ThreadActor {
             ThreadCommand::SurfaceGoalMutation { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
             }
-            ThreadCommand::SurfaceWorkflowControl { reply, .. } => {
-                let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+            ThreadCommand::SurfaceWorkflowControl {
+                client,
+                request_id,
+                action,
+                reply,
+            } => {
+                let result = if matches!(action, surface::WorkflowControlAction::Launch { .. }) {
+                    if self
+                        .admits_surface_client(&client, surface::SurfaceCapability::ManageWorkflow)
+                    {
+                        self.control_surface_workflow(&client, request_id, action, true)
+                    } else {
+                        Err(surface::SurfaceClientCommandError::Unauthorized)
+                    }
+                } else {
+                    Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+                };
+                let _ = reply.send(result);
             }
             ThreadCommand::SurfaceTaskControl {
                 client,
@@ -27987,6 +28003,82 @@ mod tests {
             .wait_operation_terminal(surface_request_id(), operation_id)
             .expect("wait exact-selector operation terminal");
         host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[test]
+    fn typed_workflow_launch_while_foreground_running_is_invalid() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(GatedSuccessExecutor {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "busy workflow launch",
+            )
+            .expect("start thread");
+        let handle = thread.surface();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &handle,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ManageWorkflow,
+            ]),
+        );
+        let (operation_id, _) = admit_surface_turn(&handle, &attachment, "hold foreground turn");
+        entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("foreground entered");
+        let snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &handle,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let before = snapshot();
+        let reply = attachment.client.workflow_control(
+            surface_request_id(),
+            surface::WorkflowControlAction::Launch {
+                catalog_entry_id: surface::SurfaceCatalogEntryId::try_new("probe").unwrap(),
+                observed_catalog_revision: surface::WorkflowCatalogRevision::try_new(1).unwrap(),
+                args: Vec::new(),
+                parent: None,
+            },
+        );
+        let after = snapshot();
+        release_tx.send(()).expect("release foreground");
+        attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait foreground terminal");
+        host.shutdown().expect("shutdown runtime host");
+        let surface::MutationReply::Uncommitted {
+            mutation: surface::UncommittedMutation::Invalid { error, .. },
+        } = reply.expect("typed workflow refusal")
+        else {
+            panic!("expected invalid launch while foreground is running");
+        };
+        assert_eq!(
+            error.error().code,
+            surface::SurfaceMutationErrorCode::IllegalState
+        );
+        assert_eq!(
+            error.error().message.as_str(),
+            "another operation is running; run the workflow after it finishes"
+        );
+        assert!(before.foreground_operation.is_some());
+        assert!(after.tasks == before.tasks);
+        assert!(after.workflows == before.workflows);
+        assert!(after.queued_operations == before.queued_operations);
+        assert!(after.operation_history == before.operation_history);
+        assert!(after.foreground_operation == before.foreground_operation);
     }
 
     #[test]

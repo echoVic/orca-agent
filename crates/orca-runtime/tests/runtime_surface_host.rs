@@ -22,6 +22,10 @@ use orca_runtime::surface::{
     SurfaceSubscriptionItem, WaitOperationTerminalResult, WorkflowCatalogRevision,
     WorkflowControlAction,
 };
+use orca_runtime::surface::{
+    FreshSurfaceAttachment, MutationTarget, RuntimeSurfaceThreadHandle, SurfaceMutationErrorCode,
+    SurfaceMutationRevision, SurfaceSnapshot, UncommittedMutation, WorkflowControlOutput,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
@@ -727,6 +731,362 @@ fn closed_thread_facade_owns_task_control_and_background_approval() {
     );
 
     host.shutdown().expect("shutdown runtime host");
+}
+
+enum WorkflowWorkspaceTrust {
+    Trusted,
+    Untrusted,
+}
+
+struct WorkflowLaunchFixture {
+    host: RuntimeHost,
+    thread: RuntimeSurfaceThreadHandle,
+    attachment: FreshSurfaceAttachment,
+    _cwd: tempfile::TempDir,
+    _home_guard: OrcaHomeGuard,
+    _home: tempfile::TempDir,
+}
+
+impl WorkflowLaunchFixture {
+    fn new(trust: WorkflowWorkspaceTrust, configure: impl FnOnce(&mut RunConfig)) -> Self {
+        let home = tempdir().expect("temporary ORCA_HOME");
+        let home_guard = OrcaHomeGuard::at(home.path());
+        let cwd = tempdir().expect("workflow cwd");
+        let workflow_dir = cwd.path().join(".orca/workflows");
+        fs::create_dir_all(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("probe.js"),
+            "export const meta = { name: 'probe', description: 'launch refusal probe', phases: ['main'] };\nexport const args = { label: { type: 'string', required: true } };\nexport default await phase('main', async () => 'done');",
+        ).unwrap();
+        if matches!(trust, WorkflowWorkspaceTrust::Trusted) {
+            orca_core::config::folder_trust::set_trust_with_config_dir(
+                cwd.path(),
+                home.path(),
+                orca_core::config::folder_trust::TrustLevel::Trusted,
+            )
+            .unwrap();
+        }
+        let mut config = test_config(cwd.path().to_path_buf());
+        configure(&mut config);
+        let host = RuntimeHost::start().unwrap();
+        let thread = host
+            .surface_handle()
+            .start_thread(config, "refused workflow launch")
+            .unwrap();
+        let attachment = Self::attach(&thread);
+        Self {
+            host,
+            thread,
+            attachment,
+            _cwd: cwd,
+            _home_guard: home_guard,
+            _home: home,
+        }
+    }
+
+    fn add_script(&self, id: &str, source: &str) {
+        fs::write(self._cwd.path().join(".orca/workflows").join(id), source).unwrap();
+    }
+
+    fn attach(thread: &RuntimeSurfaceThreadHandle) -> FreshSurfaceAttachment {
+        match thread.surface().attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Tui,
+            requested_capabilities: BTreeSet::from([
+                SurfaceCapability::ReadSnapshot,
+                SurfaceCapability::ManageWorkflow,
+            ]),
+            interaction_capabilities: BTreeSet::new(),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("workflow attachment failed"),
+        }
+    }
+
+    fn launch(
+        &self,
+        name: &str,
+        revision: WorkflowCatalogRevision,
+        args: Vec<(NonEmptyText, DisplayText)>,
+    ) -> MutationReply<WorkflowControlOutput> {
+        self.attachment
+            .client
+            .workflow_control(
+                SurfaceRequestId::new(),
+                WorkflowControlAction::Launch {
+                    catalog_entry_id: SurfaceCatalogEntryId::try_new(name).unwrap(),
+                    observed_catalog_revision: revision,
+                    args,
+                    parent: None,
+                },
+            )
+            .expect("launch returns a typed reply")
+    }
+
+    fn snapshot(&self) -> Arc<SurfaceSnapshot> {
+        Self::attach(&self.thread).baseline.snapshot
+    }
+
+    fn assert_nothing_launched(before: &SurfaceSnapshot, after: &SurfaceSnapshot) {
+        assert!(after.tasks == before.tasks);
+        assert!(after.workflows == before.workflows);
+        assert!(after.queued_operations == before.queued_operations);
+        assert!(after.operation_history == before.operation_history);
+        assert!(after.foreground_operation == before.foreground_operation);
+    }
+
+    fn shutdown(self) {
+        self.host.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn typed_workflow_launch_blank_meta_name_is_invalid_input() {
+    let fixture = WorkflowLaunchFixture::new(WorkflowWorkspaceTrust::Trusted, |_| {});
+    for name in ["", "   "] {
+        fixture.add_script(
+            "blank.js",
+            &format!("export const meta = {{ name: '{name}', description: 'blank name', phases: ['main'] }};\nexport default await phase('main', async () => 'done');"),
+        );
+        let before = fixture.snapshot();
+        let reply = fixture.launch(
+            "blank",
+            WorkflowCatalogRevision::try_new(1).unwrap(),
+            vec![],
+        );
+        let MutationReply::Uncommitted {
+            mutation: UncommittedMutation::Invalid { error, .. },
+        } = reply
+        else {
+            panic!("expected invalid launch for blank meta name");
+        };
+        assert_eq!(error.error().code, SurfaceMutationErrorCode::InvalidInput);
+        assert_eq!(
+            error.error().message.as_str(),
+            "workflow script `blank` has an empty `name` in `export const meta`"
+        );
+        WorkflowLaunchFixture::assert_nothing_launched(&before, &fixture.snapshot());
+    }
+    fixture.shutdown();
+}
+
+#[test]
+fn typed_workflow_launch_unknown_name_preserves_cause_and_runtime_health() {
+    let fixture = WorkflowLaunchFixture::new(WorkflowWorkspaceTrust::Trusted, |_| {});
+    let before = fixture.snapshot();
+    let reply = fixture.launch(
+        "missing-workflow",
+        WorkflowCatalogRevision::try_new(1).unwrap(),
+        vec![],
+    );
+    let MutationReply::Uncommitted {
+        mutation: UncommittedMutation::Invalid { target, error, .. },
+    } = reply
+    else {
+        panic!("expected invalid launch");
+    };
+    assert_eq!(
+        target,
+        Some(MutationTarget::Thread {
+            thread_id: before.thread.thread_id.clone()
+        })
+    );
+    assert_eq!(
+        error.error().code,
+        SurfaceMutationErrorCode::UnknownWorkflow
+    );
+    assert_eq!(
+        error.error().message.as_str(),
+        "workflow script `missing-workflow` not found"
+    );
+    assert_eq!(error.error().winning_request_id, None);
+    assert_eq!(error.error().current_revision, None);
+    WorkflowLaunchFixture::assert_nothing_launched(&before, &fixture.snapshot());
+    if orca_runtime::workflow::host::WorkflowHost::node_available() {
+        assert!(matches!(
+            fixture.launch(
+                "probe",
+                WorkflowCatalogRevision::try_new(1).unwrap(),
+                vec![(
+                    NonEmptyText::try_new("label").unwrap(),
+                    DisplayText::new(r#""ok""#)
+                )],
+            ),
+            MutationReply::Committed { .. }
+        ));
+    }
+    fixture.shutdown();
+}
+
+#[test]
+fn typed_workflow_launch_untrusted_workspace_preserves_trust_advice() {
+    let fixture = WorkflowLaunchFixture::new(WorkflowWorkspaceTrust::Untrusted, |_| {});
+    let before = fixture.snapshot();
+    let reply = fixture.launch(
+        "probe",
+        WorkflowCatalogRevision::try_new(1).unwrap(),
+        vec![],
+    );
+    let MutationReply::Uncommitted {
+        mutation: UncommittedMutation::Invalid { target, error, .. },
+    } = reply
+    else {
+        panic!("expected invalid launch");
+    };
+    assert_eq!(
+        target,
+        Some(MutationTarget::Thread {
+            thread_id: before.thread.thread_id.clone()
+        })
+    );
+    assert_eq!(
+        error.error().code,
+        SurfaceMutationErrorCode::UnknownWorkflow
+    );
+    assert!(error.error().message.as_str().contains("not trusted"));
+    assert!(error.error().message.as_str().contains("orca trust add"));
+    assert_eq!(error.error().winning_request_id, None);
+    assert_eq!(error.error().current_revision, None);
+    WorkflowLaunchFixture::assert_nothing_launched(&before, &fixture.snapshot());
+    fixture.shutdown();
+}
+
+#[test]
+fn typed_workflow_launch_disabled_explains_illegal_state() {
+    let fixture = WorkflowLaunchFixture::new(WorkflowWorkspaceTrust::Trusted, |config| {
+        config.workflows.enabled = false
+    });
+    let before = fixture.snapshot();
+    let reply = fixture.launch(
+        "probe",
+        WorkflowCatalogRevision::try_new(1).unwrap(),
+        vec![],
+    );
+    let MutationReply::Uncommitted {
+        mutation: UncommittedMutation::Invalid { target, error, .. },
+    } = reply
+    else {
+        panic!("expected invalid launch");
+    };
+    assert_eq!(
+        target,
+        Some(MutationTarget::Thread {
+            thread_id: before.thread.thread_id.clone()
+        })
+    );
+    assert_eq!(error.error().code, SurfaceMutationErrorCode::IllegalState);
+    assert_eq!(error.error().message.as_str(), "workflows are disabled");
+    assert_eq!(error.error().winning_request_id, None);
+    assert_eq!(error.error().current_revision, None);
+    WorkflowLaunchFixture::assert_nothing_launched(&before, &fixture.snapshot());
+    fixture.shutdown();
+}
+
+#[test]
+fn typed_workflow_launch_non_json_argument_names_invalid_input() {
+    let fixture = WorkflowLaunchFixture::new(WorkflowWorkspaceTrust::Trusted, |_| {});
+    let before = fixture.snapshot();
+    let reply = fixture.launch(
+        "probe",
+        WorkflowCatalogRevision::try_new(1).unwrap(),
+        vec![(
+            NonEmptyText::try_new("label").unwrap(),
+            DisplayText::new("not json"),
+        )],
+    );
+    let MutationReply::Uncommitted {
+        mutation: UncommittedMutation::Invalid { target, error, .. },
+    } = reply
+    else {
+        panic!("expected invalid launch");
+    };
+    assert_eq!(
+        target,
+        Some(MutationTarget::Thread {
+            thread_id: before.thread.thread_id.clone()
+        })
+    );
+    assert_eq!(error.error().code, SurfaceMutationErrorCode::InvalidInput);
+    assert!(
+        error
+            .error()
+            .message
+            .as_str()
+            .starts_with("workflow argument `label` is not valid JSON: ")
+    );
+    assert_eq!(error.error().winning_request_id, None);
+    assert_eq!(error.error().current_revision, None);
+    WorkflowLaunchFixture::assert_nothing_launched(&before, &fixture.snapshot());
+    fixture.shutdown();
+}
+
+#[test]
+fn typed_workflow_launch_missing_required_argument_preserves_validator_cause() {
+    let fixture = WorkflowLaunchFixture::new(WorkflowWorkspaceTrust::Trusted, |_| {});
+    let before = fixture.snapshot();
+    let reply = fixture.launch(
+        "probe",
+        WorkflowCatalogRevision::try_new(1).unwrap(),
+        vec![],
+    );
+    let MutationReply::Uncommitted {
+        mutation: UncommittedMutation::Invalid { target, error, .. },
+    } = reply
+    else {
+        panic!("expected invalid launch");
+    };
+    assert_eq!(
+        target,
+        Some(MutationTarget::Thread {
+            thread_id: before.thread.thread_id.clone()
+        })
+    );
+    assert_eq!(error.error().code, SurfaceMutationErrorCode::InvalidInput);
+    assert_eq!(
+        error.error().message.as_str(),
+        "missing required workflow arg `label`"
+    );
+    assert_eq!(error.error().winning_request_id, None);
+    assert_eq!(error.error().current_revision, None);
+    WorkflowLaunchFixture::assert_nothing_launched(&before, &fixture.snapshot());
+    fixture.shutdown();
+}
+
+#[test]
+fn typed_workflow_launch_stale_catalog_revision_is_a_stale_reply() {
+    let fixture = WorkflowLaunchFixture::new(WorkflowWorkspaceTrust::Trusted, |_| {});
+    let before = fixture.snapshot();
+    let reply = fixture.launch(
+        "probe",
+        WorkflowCatalogRevision::try_new(2).unwrap(),
+        vec![],
+    );
+    let MutationReply::Uncommitted {
+        mutation: UncommittedMutation::Stale { target, error, .. },
+    } = reply
+    else {
+        panic!("expected stale launch");
+    };
+    assert_eq!(
+        target,
+        Some(MutationTarget::Thread {
+            thread_id: before.thread.thread_id.clone()
+        })
+    );
+    assert_eq!(error.error().code, SurfaceMutationErrorCode::StaleRevision);
+    assert_eq!(
+        error.error().message.as_str(),
+        "workflow catalog revision 2 is stale; the current revision is 1"
+    );
+    assert_eq!(
+        error.error().current_revision,
+        Some(SurfaceMutationRevision::WorkflowCatalog {
+            revision: WorkflowCatalogRevision::try_new(1).unwrap(),
+        })
+    );
+    assert_eq!(error.error().winning_request_id, None);
+    WorkflowLaunchFixture::assert_nothing_launched(&before, &fixture.snapshot());
+    fixture.shutdown();
 }
 
 #[test]

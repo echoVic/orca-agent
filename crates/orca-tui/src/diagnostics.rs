@@ -9,6 +9,9 @@ use orca_runtime::surface::{
     SurfaceShutdownReason, TurnRequestBudgetScope,
 };
 
+/// The TUI prefixes a refused workflow launch with this text; `from_message` strips it.
+pub(crate) const WORKFLOW_NOT_STARTED_PREFIX: &str = "workflow was not started: ";
+
 const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,6 +84,19 @@ impl TuiDiagnostic {
                 "Connection lost",
                 message,
                 Some(LOST_CONNECTION_ACTION),
+            );
+        }
+        if let Some(cause) = message.strip_prefix(WORKFLOW_NOT_STARTED_PREFIX) {
+            return Self::new(
+                DiagnosticLevel::Error,
+                "workflow.not_started",
+                "Workflow not started",
+                cause,
+                Some(if cause.contains("not found") {
+                    "Check the workflow name, then run it again. Type `/workflow:` to list the saved workflows."
+                } else {
+                    "Fix the reported cause, then run the workflow again."
+                }),
             );
         }
         let (code, title, action) = if contains_any(
@@ -630,6 +646,46 @@ const LOST_CONNECTION_ACTION: &str = "Reconnect and inspect the restored session
 mod tests {
     use super::*;
     use orca_runtime::surface::SafeDiagnosticText;
+
+    #[test]
+    fn refused_workflow_not_found_preserves_cause_and_lists_workflows() {
+        let cause = "workflow script `missing-workflow` not found";
+        let diagnostic = TuiDiagnostic::from_message(
+            DiagnosticContext::Operation,
+            format!("workflow was not started: {cause}"),
+        );
+        assert_eq!(diagnostic.level(), DiagnosticLevel::Error);
+        assert_eq!(diagnostic.code(), "workflow.not_started");
+        assert_eq!(diagnostic.title(), "Workflow not started");
+        assert_eq!(diagnostic.detail(), cause);
+        assert!(diagnostic.action().unwrap().contains("/workflow:"));
+    }
+
+    #[test]
+    fn refused_workflow_cause_bypasses_keyword_classification() {
+        for cause in [
+            "failed to read workflow script: Permission denied (os error 13)",
+            "workflow history timed out",
+        ] {
+            let diagnostic = TuiDiagnostic::from_message(
+                DiagnosticContext::Operation,
+                format!("workflow was not started: {cause}"),
+            );
+            assert_eq!(diagnostic.code(), "workflow.not_started");
+            assert_eq!(diagnostic.detail(), cause);
+            assert_eq!(
+                diagnostic.action(),
+                Some("Fix the reported cause, then run the workflow again.")
+            );
+        }
+    }
+
+    #[test]
+    fn running_workflow_failure_keeps_existing_presentation() {
+        let diagnostic =
+            TuiDiagnostic::from_message(DiagnosticContext::Runtime, "workflow step failed");
+        assert_eq!(diagnostic.code(), "workflow.failed");
+    }
 
     #[test]
     fn raw_errors_keep_the_cause_and_add_actionable_classification() {
