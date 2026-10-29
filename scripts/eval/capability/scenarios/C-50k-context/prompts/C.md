@@ -1,0 +1,1 @@
+The workspace contains a large specification under docs/. Find the `Constraint-C-87` line and write its SKU value verbatim into `answer.txt` (only the value on one line, upper case). Do not guess: the document is the only source.

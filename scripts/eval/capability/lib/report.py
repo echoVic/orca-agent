@@ -38,9 +38,15 @@ def summarize(pairs: list[tuple[dict, list[dict]]]) -> dict:
         rungs = [entry for entry in axis["scenarios"] if entry["attempts"] and entry["difficulty_value"] is not None]
         rungs.sort(key=lambda entry: entry["difficulty_value"])
         axis["rungs"] = [entry["rung"] for entry in rungs]
-        axis["l50"] = metrics.l50(
-            [(entry["difficulty_value"], entry["passes"], entry["attempts"]) for entry in rungs]
-        )
+        rates = [entry["pass_rate"] for entry in rungs]
+        # A threshold only exists when the ladder straddles it: all-pass or all-fail data is
+        # separable and the maximum-likelihood fit would be meaningless.
+        if rungs and (all(rate == 1.0 for rate in rates) or all(rate == 0.0 for rate in rates)):
+            axis["l50"] = None
+        else:
+            axis["l50"] = metrics.l50(
+                [(entry["difficulty_value"], entry["passes"], entry["attempts"]) for entry in rungs]
+            )
         axis["scenarios"].sort(key=lambda entry: entry["rung"])
     return {"axes": axes, "taxonomy": triage.taxonomy(classes), "scenarios": len(pairs)}
 
