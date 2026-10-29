@@ -217,15 +217,21 @@ def run_local(
     stderr_path = attempt_dir / "agent.stderr.txt"
     agent_exit: int | None = None
     wall_limit = scenario.limits.get("wall_seconds", 1800)
+    if scenario.command == "workflow":
+        stdout_path = attempt_dir / "workflow.stdout.txt"
+        stderr_path = attempt_dir / "workflow.stderr.txt"
     try:
         if provider == "mock":
             mock = MockProvider(attempt_dir / "provider-requests.jsonl")
+        argv = (
+            [str(binary), "exec", "--mode", "full-auto", "--output-format", "jsonl",
+             "--cwd", str(workspace), "--", scenario.prompt]
+            if scenario.command == "exec"
+            else [str(binary), "workflow", "run", str(workspace / scenario.script), "--cwd", str(workspace)]
+        )
         with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
             process = subprocess.run(
-                [
-                    str(binary), "exec", "--mode", "full-auto", "--output-format", "jsonl",
-                    "--cwd", str(workspace), "--", scenario.prompt,
-                ],
+                argv,
                 env=agent_env(home, provider, mock, extra_path=workspace / ".faultbin"),
                 cwd=workspace,
                 stdout=stdout,
@@ -233,21 +239,46 @@ def run_local(
                 timeout=wall_limit,
             )
         agent_exit = process.returncode
+        if scenario.command == "workflow":
+            deadline = time.monotonic() + wall_limit
+            final_state = None
+            while time.monotonic() < deadline:
+                listing = subprocess.run(
+                    [str(binary), "workflow", "list"], cwd=workspace, capture_output=True, text=True,
+                    timeout=30, env=agent_env(home, provider, None),
+                )
+                try:
+                    runs = json.loads(listing.stdout or "[]")
+                except json.JSONDecodeError:
+                    runs = []
+                local = [run for run in runs if run.get("cwd") == str(workspace)]
+                if local and local[-1].get("status") in ("completed", "failed", "stopped"):
+                    final_state = local[-1]
+                    break
+                time.sleep(1)
+            (attempt_dir / "workflow-final.json").write_text(
+                json.dumps(final_state, indent=2) + "\n", encoding="utf-8"
+            )
+            if final_state is not None:
+                agent_exit = 0 if final_state.get("status") == "completed" else 1
     except subprocess.TimeoutExpired:
         agent_exit = None
     finally:
         if mock:
             mock.stop()
     wall = time.monotonic() - started
-    events = parse_events(stdout_path)
+    events = parse_events(stdout_path) if scenario.command == "exec" else {"tool_calls": None, "tokens_out": None,
+                                                                          "tokens_in": None, "cost_usd": None,
+                                                                          "terminal": None}
 
     verify_started = time.monotonic()
     verifier_results: list[dict] = []
     for index, command in enumerate(scenario.verify):
+        verify_process_env = {**os.environ, "CAPABILITY_ORCA_BIN": str(binary), **scenario.verify_env}
         try:
             result = subprocess.run(
                 ["bash", "-lc", command], cwd=workspace, capture_output=True, text=True,
-                timeout=scenario.limits.get("verify_seconds", 600),
+                timeout=scenario.limits.get("verify_seconds", 600), env=verify_process_env,
             )
             code = result.returncode
             output = result.stdout + result.stderr

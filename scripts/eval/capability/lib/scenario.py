@@ -46,6 +46,9 @@ class Scenario:
     provider: str = "mock"
     prepare: Path | None = None
     prepare_env: dict = field(default_factory=dict)
+    verify_env: dict = field(default_factory=dict)
+    command: str = "exec"
+    script: str = "workflow.js"
     path: Path | None = None
 
     @property
@@ -87,6 +90,11 @@ def load(path: Path) -> Scenario:
         else:
             raise ScenarioError(f"{path}: prompt file not found: {candidate}")
     prepare_env = dict(raw.get("prepare_env") or {})
+    verify_env = dict(raw.get("verify_env") or {})
+    command = str(raw.get("command") or "exec")
+    if command not in ("exec", "workflow"):
+        raise ScenarioError(f"{path}: command must be exec or workflow")
+    script = str(raw.get("script") or "workflow.js")
     prepare = None
     if raw.get("prepare"):
         prepare_path = (path.parent / raw["prepare"]).resolve()
@@ -108,6 +116,9 @@ def load(path: Path) -> Scenario:
         provider=str(raw.get("provider") or "mock"),
         prepare=prepare,
         prepare_env=prepare_env,
+        verify_env=verify_env,
+        command=command,
+        script=script,
         path=path,
     )
 

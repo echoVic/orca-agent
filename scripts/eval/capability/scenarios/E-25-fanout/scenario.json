@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "E-25-fanout",
+  "axis": "E",
+  "rung": 25,
+  "difficulty": {
+    "level": 25,
+    "fanout": 25
+  },
+  "backend": "local",
+  "command": "workflow",
+  "script": "workflow.js",
+  "fixture": "fixture",
+  "verify": [
+    "python3 verify.py"
+  ],
+  "verify_env": {
+    "CAPABILITY_EXPECTED_AGENTS": "25"
+  },
+  "limits": {
+    "wall_seconds": 600,
+    "verify_seconds": 120
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "mock"
+}

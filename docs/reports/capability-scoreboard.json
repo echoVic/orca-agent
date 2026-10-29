@@ -44,6 +44,28 @@
         "verification_strictness": 0,
         "capability_gap": 0
       }
+    },
+    {
+      "run_id": "20261029-093121",
+      "started_at": "2026-10-29T09:31:21",
+      "profile": "standard",
+      "source_commit": "cac60674",
+      "binary_sha256": "430fffce49fabe41",
+      "model": "mock",
+      "axes": {
+        "E": {
+          "l50": null,
+          "pass_rate": 1.0
+        }
+      },
+      "taxonomy": {
+        "harness": 0,
+        "environment": 0,
+        "time_bound": 0,
+        "product_bug": 0,
+        "verification_strictness": 0,
+        "capability_gap": 0
+      }
     }
   ]
 }
