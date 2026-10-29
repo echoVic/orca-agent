@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "B-l5-hidden-requirement",
+  "axis": "B",
+  "rung": 5,
+  "difficulty": {"level": 5, "files": 10},
+  "backend": "local",
+  "fixture": "../B-l3-ten-files/fixture",
+  "prompt": "prompts/L5.md",
+  "verify": ["cargo test --quiet"],
+  "limits": {"wall_seconds": 1200, "verify_seconds": 300},
+  "anti_cheat": ["tests_unmodified"],
+  "diagnostics": ["workspace_diff", "test_log", "trajectory"],
+  "provider": "deepseek"
+}

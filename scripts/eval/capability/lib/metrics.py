@@ -59,6 +59,19 @@ def _logit_fit(points: list[tuple[float, int, int]]) -> tuple[float, float] | No
     return (a, b)
 
 
+# Conservative DeepSeek-flash prices in USD per million tokens. Overestimates on purpose: the
+# cap is a safety limit, not an invoice.
+INPUT_USD_PER_MTOK = 0.5
+OUTPUT_USD_PER_MTOK = 2.0
+
+
+def estimate_usd(tokens_in: int | None, tokens_out: int | None) -> float:
+    return (
+        (tokens_in or 0) / 1_000_000 * INPUT_USD_PER_MTOK
+        + (tokens_out or 0) / 1_000_000 * OUTPUT_USD_PER_MTOK
+    )
+
+
 def l50(points: list[tuple[float, int, int]]) -> float | None:
     """Difficulty where the fitted pass probability is 0.5. `points` = (difficulty, pass, attempts)."""
     fit = _logit_fit(points)

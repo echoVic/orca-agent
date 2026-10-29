@@ -42,6 +42,8 @@ class Attempt:
     agent_terminal: str | None = None
     tool_calls: int | None = None
     tokens_out: int | None = None
+    tokens_in: int | None = None
+    cost_usd: float | None = None
     false_completion: bool = False
     harness_error: str | None = None
     environment_error: str | None = None
@@ -122,12 +124,24 @@ def parse_events(path: Path) -> dict:
     """Read `orca exec --output-format jsonl` output: tool calls, output tokens, terminal status."""
     tool_calls = 0
     tokens_out = None
+    tokens_in = None
+    cost_usd = None
     terminal = None
     if not path.exists():
-        return {"tool_calls": None, "tokens_out": None, "terminal": None}
+        return {"tool_calls": None, "tokens_out": None, "tokens_in": None, "cost_usd": None, "terminal": None}
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         if '"tool.call.requested"' in line:
             tool_calls += 1
+            continue
+        if '"usage.updated"' in line:
+            # Cumulative per run: the last event wins.
+            try:
+                payload = json.loads(line).get("payload") or {}
+            except json.JSONDecodeError:
+                continue
+            tokens_in = payload.get("input_tokens", tokens_in)
+            tokens_out = payload.get("output_tokens", tokens_out)
+            cost_usd = payload.get("estimated_cost_usd", cost_usd)
             continue
         if '"session.completed"' not in line and '"usage"' not in line:
             continue
@@ -140,9 +154,14 @@ def parse_events(path: Path) -> dict:
         usage = payload.get("usage") or {}
         if usage.get("output_tokens") is not None:
             tokens_out = usage["output_tokens"]
+        if usage.get("input_tokens") is not None:
+            tokens_in = usage["input_tokens"]
         if payload.get("output_tokens") is not None:
             tokens_out = payload["output_tokens"]
-    return {"tool_calls": tool_calls, "tokens_out": tokens_out, "terminal": terminal}
+        if payload.get("input_tokens") is not None:
+            tokens_in = payload["input_tokens"]
+    return {"tool_calls": tool_calls, "tokens_out": tokens_out, "tokens_in": tokens_in,
+            "cost_usd": cost_usd, "terminal": terminal}
 
 
 def run_local(
@@ -280,6 +299,8 @@ def run_local(
         agent_terminal=events.get("terminal"),
         tool_calls=events.get("tool_calls"),
         tokens_out=events.get("tokens_out"),
+        tokens_in=events.get("tokens_in"),
+        cost_usd=events.get("cost_usd"),
         false_completion=(agent_exit == 0 and bool(failures)),
         harness_error=f"protected files were modified: {tampered}" if tampered else None,
         verifier_partial=verifier_partial and (agent_exit == 0),
