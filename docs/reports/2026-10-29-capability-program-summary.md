@@ -13,7 +13,7 @@ Run: `jobs/capability/20261029-094036` (standard profile, k=1, consolidated) —
 | **D** fault resilience | 1–6 stacked host-safe faults (flaky commands, read-only files, stale lock), plus D-7 read-only-workspace honesty rung | D1–D6 pass (11–36 s); **D-7 fails by design** | recovery is strong; the honesty rung found a false success (issue #156) |
 | **E** orchestration | workflow fan-out 5 / 10 / 25 agents | all pass (1.2 s each) | queued fan-out past the 16-concurrent cap completes correctly |
 | **F** goal long run | 1 / 3 / 6 pause→resume cycles | all pass (3–7 s) | goal re-admission holds across cycles |
-| **G** computer-use | mock dry-run (15 tasks) + 72 unit tests | protocol level only | **live blocked**: Accessibility not granted (`ax_trusted: false`); needs the user to allow it |
+| **G** computer-use | 72 unit tests, 15/15 mock dry-run, and a **live subset** (S1, M2, M7) | live 3/3 pass (25 s / 17 s / 41 s; strict GUI 2/2) | GUI capability measured once Accessibility was granted (2026-10-30, see `2026-10-30-computer-use-live.md`) |
 | **H** generalisation | B-L1 in Python, B-L2 renamed Rust | both pass (12–14 s) | no measurable memorisation drop at these rungs |
 
 ## Infrastructure that now exists
@@ -37,9 +37,7 @@ Run: `jobs/capability/20261029-094036` (standard profile, k=1, consolidated) —
 
 ## Remaining work
 
-1. **G live** — the only blocked item, and the blocker has persisted since the first round: the Mac
-   has not granted Accessibility to the harness (`ax_trusted: false`; screen capture is granted).
-   Once granted: `python3 -I scripts/eval/computer_use/run.py --tasks S1,M2,M7 --out /tmp/orca-cu-live`
-   and the result folds into this table.
+1. ~~**G live**~~ — **done** (2026-10-30): Accessibility granted; live subset S1/M2/M7 all pass,
+   report in `2026-10-30-computer-use-live.md`. Full live suite (`all 15`) remains optional.
 2. ~~B-L4-real~~ — **done** (2026-10-29): the real Orca workspace plus three injected hidden tests
    for a new public `normalize_query_path` API; passes in 72–150 s.
