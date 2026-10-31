@@ -915,6 +915,7 @@ mod tests {
 
         assert!(names.contains(&"subagent"));
         assert!(names.contains(&"bash"));
+        assert!(names.contains(&"report_blocker"));
         assert!(!names.contains(&"get_goal"));
         assert!(!names.contains(&"create_goal"));
         assert!(!names.contains(&"update_goal"));
@@ -1004,6 +1005,7 @@ mod tests {
         assert!(names.contains(&"get_goal"));
         assert!(names.contains(&"create_goal"));
         assert!(names.contains(&"update_goal"));
+        assert!(!names.contains(&"report_blocker"));
     }
 
     #[test]

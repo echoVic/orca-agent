@@ -18,8 +18,8 @@ use orca_core::tool_types::{
 use orca_mcp::{McpElicitationHandler, McpRegistry, McpRequestError, client::McpCallOutput};
 
 use crate::{
-    edit, external, git, glob, grep, list_files, read_file, skills, update_goal, update_plan,
-    web_search, write_file,
+    edit, external, git, glob, grep, list_files, read_file, report_blocker, skills, update_goal,
+    update_plan, web_search, write_file,
 };
 
 #[cfg(test)]
@@ -1461,6 +1461,45 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::UpdateGoal,
     ));
     registry.register(BuiltinTool::new(
+        conservative_builtin_spec(
+            "report_blocker",
+            "Call this tool when you cannot make progress because of something outside your control — for example, a read-only workspace, missing credentials, no network access, or a requirement you cannot satisfy. This ends the session and records the blocker. Do not claim success or simply stop: call this tool instead.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["user_decision","missing_authority","external_state","environment_contradiction","unverifiable_requirement"],
+                        "description": "Category of the blocker."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Short explanation of why progress is blocked (at most 2000 characters)."
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string"},
+                                "summary": {"type": "string"},
+                                "target": {"type": "string"}
+                            },
+                            "required": ["kind","summary"]
+                        },
+                        "description": "Optional supporting observations (at most 32 items)."
+                    }
+                },
+                "required": ["kind","summary"]
+            }),
+            CapabilitySet::new(vec![]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            false,
+        ),
+        BuiltinExecutor::ReportBlocker,
+    ));
+    registry.register(BuiltinTool::new(
         safe_local_read_builtin_spec(
             "list_skills",
             "List available user and project skills. Use before read_skill when the user asks for a skill or reusable procedure.",
@@ -2002,6 +2041,7 @@ impl Tool for BuiltinTool {
             BuiltinExecutor::GetGoal => update_goal::execute_get(request),
             BuiltinExecutor::CreateGoal => update_goal::execute_create(request),
             BuiltinExecutor::UpdateGoal => update_goal::execute_update(request),
+            BuiltinExecutor::ReportBlocker => report_blocker::execute_report_blocker(request),
             BuiltinExecutor::UpdatePlan => update_plan::execute(request),
             BuiltinExecutor::ListSkills => skills::execute_list(request, ctx.cwd),
             BuiltinExecutor::ReadSkill => skills::execute_read(request, ctx.cwd),
@@ -2058,6 +2098,7 @@ enum BuiltinExecutor {
     GetGoal,
     CreateGoal,
     UpdateGoal,
+    ReportBlocker,
     UpdatePlan,
     ListSkills,
     ReadSkill,

@@ -20,6 +20,7 @@ regex = { workspace = true }
 chrono = { workspace = true }
 libc = { workspace = true }
 similar = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }

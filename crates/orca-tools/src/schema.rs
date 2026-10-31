@@ -75,6 +75,7 @@ pub fn canonical_builtin_role(requested: &str) -> Option<&'static str> {
 }
 
 const GOAL_TOOL_NAMES: &[&str] = &["get_goal", "create_goal", "update_goal"];
+const BASE_ONLY_TOOL_NAMES: &[&str] = &["report_blocker"];
 const STRICT_MODE_TOOL_NAMES: &[&str] = &["glob", "update_goal", "update_plan"];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -147,7 +148,7 @@ pub fn canonical_tool_definitions(
         .model_visible_tools()
         .filter(|tool| match &policy.selection {
             ToolSelection::Base => !GOAL_TOOL_NAMES.contains(&tool.name()),
-            ToolSelection::Goal => true,
+            ToolSelection::Goal => !BASE_ONLY_TOOL_NAMES.contains(&tool.name()),
             ToolSelection::Allowed(_) => allowed
                 .as_ref()
                 .is_some_and(|allowed| allowed.contains(tool.name())),
@@ -463,6 +464,33 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "read_file"));
         assert!(!names.iter().any(|name| name == "private_lookup"));
+    }
+
+    #[test]
+    fn report_blocker_is_exposed_only_by_the_base_policy() {
+        let registry = crate::registry::default_tool_registry();
+        let names = |policy: &ToolPolicy| {
+            canonical_tool_definitions(policy, registry)
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            names(&ToolPolicy::base())
+                .iter()
+                .any(|name| name == "report_blocker")
+        );
+        assert!(
+            !names(&ToolPolicy::goal())
+                .iter()
+                .any(|name| name == "report_blocker")
+        );
+        assert!(
+            !names(&ToolPolicy::for_subagent(&SubagentType::General))
+                .iter()
+                .any(|name| name == "report_blocker")
+        );
     }
 
     #[test]
