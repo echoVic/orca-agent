@@ -2269,7 +2269,7 @@ impl WorkflowRunner {
         self.record_parent_budget_usage(result.budget_usage);
         let budget_usage = result.budget_usage;
         let task = lifecycle
-            .finish_task(result.status)
+            .finish_task(result.status.clone())
             .map(workflow_task_lifecycle_evidence)
             .or_else(|| {
                 lifecycle

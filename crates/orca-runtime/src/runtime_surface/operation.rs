@@ -11,6 +11,8 @@ use super::identity::{
     SurfaceWorkflowResultId, SurfaceWorkflowRunId, ThreadOwnerEpoch, UnixMillis,
 };
 use super::projection::SurfaceOperationCompletionProof;
+use orca_core::budget::BudgetUsage;
+use orca_core::goal_runtime::BlockerSummary;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub const SURFACE_RESERVATION_LEASE_MS: u64 = 30_000;
@@ -599,6 +601,7 @@ pub enum GenerationCompletionStatus {
     Success,
     VerificationFailed { message: SafeDiagnosticText },
     BudgetExhausted { budget: OperationBudget },
+    Blocked { blocker: BlockerSummary },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -861,6 +864,11 @@ pub enum OperationTerminal {
     },
     Shutdown {
         reason: SurfaceShutdownReason,
+    },
+    /// The model declared an external blocker through a terminal tool.
+    Blocked {
+        blocker: BlockerSummary,
+        usage: BudgetUsage,
     },
 }
 

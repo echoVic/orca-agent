@@ -10949,7 +10949,8 @@ fn actor_finalizer_task_terminal_authorized(
         super::OperationTerminal::Failed { .. }
         | super::OperationTerminal::Panicked { .. }
         | super::OperationTerminal::JoinFailed { .. }
-        | super::OperationTerminal::BudgetExhausted { .. } => super::SurfaceTaskStatus::Failed,
+        | super::OperationTerminal::BudgetExhausted { .. }
+        | super::OperationTerminal::Blocked { .. } => super::SurfaceTaskStatus::Failed,
     };
     task.task_type == super::SurfaceTaskType::MainSession
         && task.parent_operation.as_ref() == Some(operation_id)
@@ -12056,6 +12057,12 @@ pub(crate) fn terminal_from_generation_stop(
             super::GenerationCompletionStatus::BudgetExhausted { budget } => {
                 super::OperationTerminal::BudgetExhausted {
                     budget: budget.clone(),
+                }
+            }
+            super::GenerationCompletionStatus::Blocked { blocker } => {
+                super::OperationTerminal::Blocked {
+                    blocker: blocker.clone(),
+                    usage: orca_core::budget::BudgetUsage::default(),
                 }
             }
         },

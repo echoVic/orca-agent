@@ -3258,6 +3258,15 @@ fn generation_stop_matches_terminal(
                 budget: terminal_budget,
             },
         ) => budget == terminal_budget,
+        (
+            GenerationStopReason::Completed {
+                status: GenerationCompletionStatus::Blocked { blocker },
+            },
+            OperationTerminal::Blocked {
+                blocker: terminal_blocker,
+                ..
+            },
+        ) => blocker == terminal_blocker,
         (GenerationStopReason::Cancelled { cause }, terminal) => {
             terminalization_cause_matches_terminal(*cause, terminal)
         }

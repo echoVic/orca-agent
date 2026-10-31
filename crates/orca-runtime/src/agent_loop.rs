@@ -190,6 +190,7 @@ fn cancelled_agent_loop() -> AgentLoopOutcome {
         RunStatus::Cancelled,
         TurnEndReason::Cancelled,
         Some("turn cancelled".to_string()),
+        None,
     ))
 }
 

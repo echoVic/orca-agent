@@ -879,7 +879,7 @@ impl ThreadOperationExecutor for UserInputExecutor {
             RunStatus::Cancelled
         };
         self.answer_tx.send(user_input_text(answer)).unwrap();
-        thread.lifecycle_mut().finish_task(status);
+        thread.lifecycle_mut().finish_task(status.clone());
         Ok(status.into())
     }
 }

@@ -232,6 +232,7 @@ impl RuntimeTaskStatus {
         match status {
             RunStatus::Success => Self::Succeeded,
             RunStatus::Failed | RunStatus::VerificationFailed => Self::Failed,
+            RunStatus::Blocked { .. } => Self::Failed,
             RunStatus::Cancelled => Self::Cancelled,
             RunStatus::ApprovalRequired => Self::ApprovalRequired,
         }

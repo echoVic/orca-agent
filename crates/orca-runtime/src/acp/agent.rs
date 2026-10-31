@@ -2756,6 +2756,7 @@ pub(super) fn terminal_to_stop_reason(terminal: &OperationTerminal) -> Result<St
         OperationTerminal::AbortedByRuntimeRestart { .. } => {
             Err("ACP operation aborted by runtime restart".to_string())
         }
+        OperationTerminal::Blocked { .. } => Err("blocked".to_string()),
         OperationTerminal::Shutdown { .. } => Ok(StopReason::Cancelled),
     }
 }

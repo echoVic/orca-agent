@@ -841,7 +841,8 @@ impl AgentSurfacePublisher {
                     }
                     RunStatus::Failed
                     | RunStatus::ApprovalRequired
-                    | RunStatus::VerificationFailed => {
+                    | RunStatus::VerificationFailed
+                    | RunStatus::Blocked { .. } => {
                         crate::runtime_surface::SurfaceSubagentTerminalStatus::Failed
                     }
                 },
@@ -862,7 +863,10 @@ fn publish_surface_terminal(
     let terminal_status = match status {
         RunStatus::Success => crate::runtime_surface::SurfaceSubagentTerminalStatus::Completed,
         RunStatus::Cancelled => crate::runtime_surface::SurfaceSubagentTerminalStatus::Cancelled,
-        RunStatus::Failed | RunStatus::ApprovalRequired | RunStatus::VerificationFailed => {
+        RunStatus::Failed
+        | RunStatus::ApprovalRequired
+        | RunStatus::VerificationFailed
+        | RunStatus::Blocked { .. } => {
             crate::runtime_surface::SurfaceSubagentTerminalStatus::Failed
         }
     };
@@ -924,7 +928,7 @@ fn settle_operation(
                     .and_then(|snapshot| snapshot.completion_error())
                     .unwrap_or_else(|| status.as_str())
                     .to_string();
-                (*status, Some(reason))
+                (status.clone(), Some(reason))
             }
             OperationOutcome::Stopped(terminal) => {
                 let reason = format!("agent stopped: {terminal:?}");

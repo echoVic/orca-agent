@@ -508,78 +508,97 @@ impl ThreadActor {
             .operation_terminal
             .as_ref()
             .and_then(surface_budget_from_core_terminal);
-        let (task_status, stop_reason, terminal) =
-            match (shutdown_reason.clone(), outcome.status, budget_terminal) {
-                (Some(reason), _, _) => (
-                    surface::SurfaceTaskStatus::Stopped,
-                    surface::GenerationStopReason::Cancelled {
-                        cause: match reason {
-                            surface::SurfaceShutdownReason::HostShutdown => {
-                                surface::TerminalizationCause::HostShutdown
-                            }
-                            surface::SurfaceShutdownReason::ThreadClose => {
-                                surface::TerminalizationCause::ThreadClose
-                            }
-                        },
+        let (task_status, stop_reason, terminal) = match (
+            shutdown_reason.clone(),
+            outcome.status.clone(),
+            budget_terminal,
+        ) {
+            (Some(reason), _, _) => (
+                surface::SurfaceTaskStatus::Stopped,
+                surface::GenerationStopReason::Cancelled {
+                    cause: match reason {
+                        surface::SurfaceShutdownReason::HostShutdown => {
+                            surface::TerminalizationCause::HostShutdown
+                        }
+                        surface::SurfaceShutdownReason::ThreadClose => {
+                            surface::TerminalizationCause::ThreadClose
+                        }
                     },
-                    surface::OperationTerminal::Shutdown { reason },
-                ),
-                (None, _, _) if committed_user_cancel => (
-                    surface::SurfaceTaskStatus::Cancelled,
-                    surface::GenerationStopReason::Cancelled {
-                        cause: surface::TerminalizationCause::UserCancel,
+                },
+                surface::OperationTerminal::Shutdown { reason },
+            ),
+            (None, _, _) if committed_user_cancel => (
+                surface::SurfaceTaskStatus::Cancelled,
+                surface::GenerationStopReason::Cancelled {
+                    cause: surface::TerminalizationCause::UserCancel,
+                },
+                surface::OperationTerminal::Cancelled {
+                    reason: surface::CancelReason::User,
+                },
+            ),
+            (None, _, Some(budget)) => (
+                surface::SurfaceTaskStatus::Stopped,
+                surface::GenerationStopReason::Completed {
+                    status: surface::GenerationCompletionStatus::BudgetExhausted {
+                        budget: budget.clone(),
                     },
-                    surface::OperationTerminal::Cancelled {
-                        reason: surface::CancelReason::User,
+                },
+                surface::OperationTerminal::BudgetExhausted { budget },
+            ),
+            (None, RunStatus::Success, None) => (
+                surface::SurfaceTaskStatus::Completed,
+                surface::GenerationStopReason::Completed {
+                    status: surface::GenerationCompletionStatus::Success,
+                },
+                surface::OperationTerminal::Succeeded {
+                    usage: usage.clone(),
+                },
+            ),
+            (None, RunStatus::Cancelled, None) => (
+                surface::SurfaceTaskStatus::Cancelled,
+                surface::GenerationStopReason::Cancelled {
+                    cause: surface::TerminalizationCause::UserCancel,
+                },
+                surface::OperationTerminal::Cancelled {
+                    reason: surface::CancelReason::User,
+                },
+            ),
+            (None, RunStatus::ApprovalRequired, None) => (
+                surface::SurfaceTaskStatus::ApprovalRequired,
+                surface::GenerationStopReason::ProviderSuspended,
+                surface::OperationTerminal::Failed {
+                    class: surface::FailureClass::LegacyApprovalRequired,
+                    message: approval_message,
+                },
+            ),
+            (None, RunStatus::Blocked { blocker }, None) => (
+                surface::SurfaceTaskStatus::Failed,
+                surface::GenerationStopReason::Completed {
+                    status: surface::GenerationCompletionStatus::Blocked {
+                        blocker: blocker.clone(),
                     },
-                ),
-                (None, _, Some(budget)) => (
-                    surface::SurfaceTaskStatus::Stopped,
-                    surface::GenerationStopReason::Completed {
-                        status: surface::GenerationCompletionStatus::BudgetExhausted {
-                            budget: budget.clone(),
-                        },
-                    },
-                    surface::OperationTerminal::BudgetExhausted { budget },
-                ),
-                (None, RunStatus::Success, None) => (
-                    surface::SurfaceTaskStatus::Completed,
-                    surface::GenerationStopReason::Completed {
-                        status: surface::GenerationCompletionStatus::Success,
-                    },
-                    surface::OperationTerminal::Succeeded {
-                        usage: usage.clone(),
-                    },
-                ),
-                (None, RunStatus::Cancelled, None) => (
-                    surface::SurfaceTaskStatus::Cancelled,
-                    surface::GenerationStopReason::Cancelled {
-                        cause: surface::TerminalizationCause::UserCancel,
-                    },
-                    surface::OperationTerminal::Cancelled {
-                        reason: surface::CancelReason::User,
-                    },
-                ),
-                (None, RunStatus::ApprovalRequired, None) => (
-                    surface::SurfaceTaskStatus::ApprovalRequired,
-                    surface::GenerationStopReason::ProviderSuspended,
-                    surface::OperationTerminal::Failed {
-                        class: surface::FailureClass::LegacyApprovalRequired,
-                        message: approval_message,
-                    },
-                ),
-                (None, RunStatus::Failed | RunStatus::VerificationFailed, None) => (
-                    surface::SurfaceTaskStatus::Failed,
-                    surface::GenerationStopReason::ExecutionFailed {
-                        class: surface::GenerationExecutionFailureClass::RuntimeInvariant,
-                        message: failure_message.clone(),
-                    },
-                    surface::OperationTerminal::Failed {
-                        class: surface::FailureClass::RuntimeInvariant,
-                        message: failure_message,
-                    },
-                ),
-            };
+                },
+                surface::OperationTerminal::Blocked {
+                    blocker,
+                    usage: outcome
+                        .operation_terminal
+                        .as_ref()
+                        .and_then(|terminal| terminal.usage())
+                        .unwrap_or_default(),
+                },
+            ),
+            (None, RunStatus::Failed | RunStatus::VerificationFailed, None) => (
+                surface::SurfaceTaskStatus::Failed,
+                surface::GenerationStopReason::ExecutionFailed {
+                    class: surface::GenerationExecutionFailureClass::RuntimeInvariant,
+                    message: failure_message.clone(),
+                },
+                surface::OperationTerminal::Failed {
+                    class: surface::FailureClass::RuntimeInvariant,
+                    message: failure_message,
+                },
+            ),
+        };
         let finalize_intent_id =
             surface::SurfaceFinalizeIntentId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7");
@@ -991,7 +1010,7 @@ impl ThreadActor {
                     outcome.usage,
                 )
             } else {
-                match (shutdown_reason, outcome.status) {
+                match (shutdown_reason, outcome.status.clone()) {
                     (Some(_), _) | (None, RunStatus::Cancelled) => {
                         typed.task_registry.stop_with_usage(
                             typed.task_id.as_str(),
@@ -1022,6 +1041,16 @@ impl ThreadActor {
                             Err("typed approval outcome lost its provider response".to_string())
                         }
                     },
+                    (None, RunStatus::Blocked { blocker }) => typed
+                        .task_registry
+                        .apply_main_session_terminal_update(
+                            typed.task_id.as_str(),
+                            MainSessionTerminalUpdate::Failed {
+                                error: blocker.summary.clone(),
+                            },
+                            outcome.usage,
+                        )
+                        .map(|_| ()),
                     (None, RunStatus::Failed | RunStatus::VerificationFailed) => typed
                         .task_registry
                         .apply_main_session_terminal_update(

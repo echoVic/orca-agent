@@ -645,15 +645,16 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             return 1;
         }
     }
-    let terminal_status = match child.status {
+    let terminal_status = match &child.status {
         RunStatus::Success => SurfaceSubagentTerminalStatus::Completed,
         RunStatus::Cancelled => SurfaceSubagentTerminalStatus::Cancelled,
-        RunStatus::Failed | RunStatus::ApprovalRequired | RunStatus::VerificationFailed => {
-            SurfaceSubagentTerminalStatus::Failed
-        }
+        RunStatus::Failed
+        | RunStatus::ApprovalRequired
+        | RunStatus::VerificationFailed
+        | RunStatus::Blocked { .. } => SurfaceSubagentTerminalStatus::Failed,
     };
     let completed_task = child_lifecycle
-        .finish_task(child.status)
+        .finish_task(child.status.clone())
         .cloned()
         .unwrap_or_else(|| {
             child_lifecycle.active_task().cloned().unwrap_or_else(|| {

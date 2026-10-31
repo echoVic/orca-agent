@@ -1539,7 +1539,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
                 history_writer.as_deref_mut(),
                 tool_request,
                 &execution.result,
-                execution.status,
+                execution.status.clone(),
                 emit_deltas,
             )
             .map_err(|error| RuntimeNormalToolTurnFailure {
@@ -1575,7 +1575,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
                 history_writer.as_deref_mut(),
                 tool_request,
                 &execution.result,
-                execution.status,
+                execution.status.clone(),
                 emit_deltas,
             )
             .map_err(|error| RuntimeNormalToolTurnFailure {

@@ -896,7 +896,7 @@ impl RuntimeProviderResponseResultStep {
                 terminal,
             } => {
                 let mut result =
-                    AgentLoopResult::terminal(status, TurnEndReason::Unclassified, error);
+                    AgentLoopResult::terminal(status, TurnEndReason::Unclassified, error, None);
                 if let Some(terminal) = terminal {
                     result.terminal = terminal;
                 }
