@@ -1815,6 +1815,7 @@ fn stop_before_the_turn<W: io::Write>(
             thread.startup_warnings(),
         ))
         .and_then(|()| {
+            // No turn ran, so no file-writing tool could have succeeded.
             sink.emit(events.session_completed_terminal(&terminal, thread.session_id(), false))
         });
     drop(sink);

@@ -461,6 +461,7 @@ impl From<RunStatus> for ThreadOperationOutcome {
             background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
             terminal: None,
             verification: None,
+            // A bare status has no turn transcript from which to detect writes.
             writes_applied: false,
         }
     }
@@ -2185,6 +2186,7 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
                 background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
                 terminal: None,
                 verification: None,
+                // Manual compaction does not execute file-writing tools.
                 writes_applied: false,
             });
         }
@@ -2222,6 +2224,7 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
                     background_workflows,
                     terminal,
                     verification,
+                    // Preserve the completed turn signal for the headless session emit.
                     writes_applied,
                 },
                 crate::controller::ThreadTurnOutcome::ProviderSuspended {
