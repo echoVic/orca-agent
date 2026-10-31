@@ -63,6 +63,32 @@ class TriageTests(unittest.TestCase):
         evidence = triage.Evidence(outcome="fail", environment_error="no docker", product_signals=["exit_137"])
         self.assertEqual(triage.classify(evidence), "environment")
 
+    def test_verifier_package_mirror_404_is_environment(self):
+        output = (
+            "Err:2 http://deb.debian.org/debian-security bullseye-security/main amd64 libnghttp2-14 "
+            "1.52.0-1+deb12u1 404  Not Found\n"
+            "Err:5 http://deb.debian.org/debian-security bullseye-security/main amd64 libcurl4 "
+            "7.88.1-10+deb12u5 404  Not Found\n"
+        )
+        self.assertEqual(triage.environment_failure(output), "package_mirror_404")
+        self.assertEqual(triage.classify(triage.Evidence(outcome="fail", verifier_output=output)), "environment")
+
+    def test_missing_verifier_tools_are_environment(self):
+        for tool in ("curl", "uvx"):
+            with self.subTest(tool=tool):
+                evidence = triage.Evidence(
+                    outcome="fail",
+                    verifier_output=f"/tests/test.sh: line 8: {tool}: command not found\n",
+                )
+                self.assertEqual(triage.classify(evidence), "environment")
+
+    def test_unrelated_404_stays_capability_gap(self):
+        evidence = triage.Evidence(
+            outcome="fail",
+            verifier_output="GET /missing 404 Not Found\nAssertionError: expected 200\n",
+        )
+        self.assertEqual(triage.classify(evidence), "capability_gap")
+
     def test_product_signal_wins_over_time_bound(self):
         evidence = triage.Evidence(outcome="fail", product_signals=["exit_137"], cross_budget_passed=True)
         self.assertEqual(triage.classify(evidence), "product_bug")

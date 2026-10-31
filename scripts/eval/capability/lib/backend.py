@@ -224,6 +224,7 @@ def run_local(
             **scenario.verify_env,
         }
         verifier_results = []
+        verifier_outputs: list[str] = []
         verify_started = time.monotonic()
         for index, command in enumerate(scenario.verify):
             try:
@@ -236,6 +237,7 @@ def run_local(
                 code, output = 124, f"verifier timed out: {command}\n"
             (attempt_dir / f"verify-{index}.log").write_text(output, encoding="utf-8")
             verifier_results.append({"command": command, "exit": code})
+            verifier_outputs.append(output)
         goal_verify = time.monotonic() - verify_started
         failures = [item for item in verifier_results if item["exit"] != 0]
         harness_error = None
@@ -244,7 +246,8 @@ def run_local(
             outcome = "error"
             failure_class = "harness"
         elif failures:
-            outcome, failure_class = "fail", "capability_gap"
+            evidence = triage.Evidence(outcome="fail", verifier_output="\n".join(verifier_outputs))
+            outcome, failure_class = "fail", triage.classify(evidence)
         else:
             outcome, failure_class = "pass", None
         (attempt_dir / "attempt.json").write_text(
@@ -328,6 +331,7 @@ def run_local(
 
     verify_started = time.monotonic()
     verifier_results: list[dict] = []
+    verifier_outputs: list[str] = []
     for index, command in enumerate(scenario.verify):
         verify_process_env = {**os.environ, "CAPABILITY_ORCA_BIN": str(binary), **scenario.verify_env}
         try:
@@ -345,6 +349,7 @@ def run_local(
             output = f"verifier could not start: {error}\n"
         (attempt_dir / f"verify-{index}.log").write_text(output, encoding="utf-8")
         verifier_results.append({"command": command, "exit": code})
+        verifier_outputs.append(output)
     verify_seconds = time.monotonic() - verify_started
 
     after = hash_protected(workspace)
@@ -368,6 +373,7 @@ def run_local(
         tool_calls=events.get("tool_calls"),
         false_completion=(agent_exit == 0 and bool(failures)),
         product_signals=signals,
+        verifier_output="\n".join(verifier_outputs),
         verifier_partial=verifier_partial and (agent_exit == 0),
     )
     failure_class = None if outcome == "pass" else triage.classify(evidence)
@@ -485,7 +491,8 @@ def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provi
          "bash", "-lc", verify_command],
         capture_output=True, text=True, timeout=scenario.limits.get("verify_seconds", 600),
     )
-    (attempt_dir / "verify.log").write_text(verify_process.stdout + verify_process.stderr, encoding="utf-8")
+    verifier_output = verify_process.stdout + verify_process.stderr
+    (attempt_dir / "verify.log").write_text(verifier_output, encoding="utf-8")
     verify_seconds = time.monotonic() - verify_started
     after = hash_protected(workspace)
     tampered = sorted(path for path, digest in protected.items() if after.get(path) != digest)
@@ -493,7 +500,8 @@ def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provi
     evidence = triage.Evidence(outcome=outcome, wall_seconds=wall, wall_limit=scenario.limits.get("wall_seconds", 1800),
                                agent_exit_code=agent_exit, tool_calls=events.get("tool_calls"),
                                false_completion=(agent_exit == 0 and verify_process.returncode != 0),
-                               product_signals=(["exit_137"] if agent_exit == 137 else []))
+                               product_signals=(["exit_137"] if agent_exit == 137 else []),
+                               verifier_output=verifier_output)
     failure_class = None if outcome == "pass" else triage.classify(evidence)
     if tampered:
         outcome, failure_class = "error", "harness"
