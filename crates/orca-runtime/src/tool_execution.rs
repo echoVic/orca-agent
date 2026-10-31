@@ -82,6 +82,7 @@ pub(crate) struct ToolExecutionContext<'a> {
     subagent_depth: u32,
     emit_deltas: bool,
     goal_mode: bool,
+    headless: bool,
     policy: &'a ApprovalPolicy,
     instructions: Option<&'a ProjectInstructions>,
     memory: Option<&'a MemoryBlock>,
@@ -319,6 +320,7 @@ impl<'a> ToolExecutionContext<'a> {
             subagent_depth,
             emit_deltas,
             goal_mode: false,
+            headless: false,
             policy,
             instructions: None,
             memory: None,
@@ -353,6 +355,11 @@ impl<'a> ToolExecutionContext<'a> {
         child_budget: Option<orca_core::budget::BudgetSpec>,
     ) -> Self {
         self.child_budget = child_budget;
+        self
+    }
+
+    pub(crate) fn with_headless(mut self, headless: bool) -> Self {
+        self.headless = headless;
         self
     }
 
@@ -1016,6 +1023,7 @@ impl ToolExecutionActor {
             subagent_depth,
             emit_deltas,
             goal_mode,
+            headless,
             policy,
             instructions,
             memory,
@@ -1328,6 +1336,7 @@ impl ToolExecutionActor {
                 sink,
                 execution_request,
                 goal_mode,
+                headless,
                 subagent_depth,
                 instructions,
                 memory,

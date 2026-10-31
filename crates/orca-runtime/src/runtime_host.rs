@@ -915,6 +915,8 @@ impl HostedTurnRequest {
         };
         let tool_mode = if self.allow_goal_tools {
             ThreadTurnToolMode::Goal
+        } else if self.envelope == HostedOperationEnvelope::HeadlessSession {
+            ThreadTurnToolMode::Headless
         } else {
             ThreadTurnToolMode::Standard
         };

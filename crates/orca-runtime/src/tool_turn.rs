@@ -130,6 +130,7 @@ pub(crate) struct RuntimeNormalToolTurnRequest<'a> {
     pub(crate) subagent_depth: u32,
     pub(crate) emit_deltas: bool,
     pub(crate) goal_mode: bool,
+    pub(crate) headless: bool,
     pub(crate) policy: &'a ApprovalPolicy,
     pub(crate) root_task_id: Option<&'a str>,
     /// Lease-derived budget bound for subagent children of this tool call.
@@ -1049,6 +1050,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 subagent_depth,
                 emit_deltas,
                 goal_mode: tool_policy.is_goal_mode(),
+                headless: tool_policy.is_headless(),
                 policy,
                 root_task_id: parent_task_id.or(root_task_id),
                 child_budget: child_lease.as_ref().map(|lease| *lease.spec()),
@@ -1404,6 +1406,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         subagent_depth,
         emit_deltas,
         goal_mode,
+        headless,
         policy,
         root_task_id,
         child_budget,
@@ -1477,6 +1480,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
     }
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
         .with_goal_mode(goal_mode)
+        .with_headless(headless)
         .with_root_task_id(root_task_id)
         .with_child_budget(child_budget)
         .with_services(instructions, memory, mcp_registry, hooks)
@@ -2368,6 +2372,7 @@ mod tests {
                 subagent_depth: 0,
                 emit_deltas: false,
                 goal_mode: false,
+                headless: false,
                 policy: &policy,
                 root_task_id: None,
                 child_budget: None,
@@ -2468,6 +2473,7 @@ mod tests {
                 subagent_depth: 0,
                 emit_deltas: false,
                 goal_mode: false,
+                headless: false,
                 policy: &policy,
                 root_task_id: Some(&root.id),
                 child_budget: None,
@@ -3856,6 +3862,7 @@ mod tests {
                 subagent_depth: 0,
                 emit_deltas: false,
                 goal_mode: false,
+                headless: false,
                 policy: &policy,
                 root_task_id: None,
                 child_budget: None,

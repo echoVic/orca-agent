@@ -45,6 +45,7 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) execution_request: &'a tool_types::ToolRequest,
     pub(crate) goal_mode: bool,
+    pub(crate) headless: bool,
     pub(crate) subagent_depth: u32,
     pub(crate) instructions: &'a ProjectInstructions,
     pub(crate) memory: &'a MemoryBlock,
@@ -148,6 +149,7 @@ impl<'a> RuntimeToolRouter<'a> {
             sink,
             execution_request,
             goal_mode,
+            headless,
             subagent_depth,
             instructions,
             memory,
@@ -195,6 +197,15 @@ impl<'a> RuntimeToolRouter<'a> {
                 ))
             }
             RuntimeSpecialToolDispatch::ReportBlocker => {
+                if !headless || goal_mode || subagent_depth > 0 {
+                    return Ok(RuntimeToolDispatchOutput::continue_model(
+                        tool_types::ToolResult::failed(
+                            execution_request,
+                            "report_blocker is only available in headless orca exec runs",
+                            None,
+                        ),
+                    ));
+                }
                 return Ok(match parse_report_blocker_args(execution_request) {
                     Ok(blocker) => RuntimeToolDispatchOutput {
                         result: tool_types::ToolResult::completed(
@@ -561,6 +572,7 @@ mod tests {
                     sink: &mut sink,
                     execution_request: &request,
                     goal_mode: false,
+                    headless: false,
                     subagent_depth: depth,
                     instructions: &instructions,
                     memory: &memory,
@@ -689,6 +701,7 @@ mod tests {
                     sink: &mut sink,
                     execution_request: &request,
                     goal_mode: false,
+                    headless: false,
                     subagent_depth: 0,
                     instructions: &instructions,
                     memory: &memory,
@@ -787,7 +800,12 @@ mod tests {
         }
     }
 
-    fn dispatch_only(request: &tool_types::ToolRequest) -> RuntimeToolDispatchOutput {
+    fn dispatch_only(
+        request: &tool_types::ToolRequest,
+        headless: bool,
+        goal_mode: bool,
+        subagent_depth: u32,
+    ) -> RuntimeToolDispatchOutput {
         let cwd = tempfile::tempdir().unwrap();
         let config = RunConfig::default();
         let mut runtime = RuntimeToolActorContext::new("router-report-blocker");
@@ -810,8 +828,9 @@ mod tests {
                 events: &mut events,
                 sink: &mut sink,
                 execution_request: request,
-                goal_mode: false,
-                subagent_depth: 0,
+                goal_mode,
+                headless,
+                subagent_depth,
                 instructions: &instructions,
                 memory: &memory,
                 mcp_registry: &registry,
@@ -853,7 +872,7 @@ mod tests {
             ),
         };
 
-        let output = dispatch_only(&request);
+        let output = dispatch_only(&request, true, false, 0);
 
         assert_eq!(output.disposition, RuntimeToolTurnDisposition::StopTurn);
         assert_eq!(output.result.status, ToolStatus::Completed);
@@ -869,6 +888,30 @@ mod tests {
     }
 
     #[test]
+    fn report_blocker_dispatch_refuses_non_headless_goal_and_child_turns() {
+        let request = tool_types::ToolRequest {
+            id: "refused-blocker".into(),
+            name: ToolName::ReportBlocker,
+            action: ActionKind::Agent,
+            target: None,
+            raw_arguments: Some(r#"{"kind":"external_state","summary":"waiting"}"#.into()),
+        };
+        for (headless, goal_mode, depth) in [(false, false, 0), (true, true, 0), (true, false, 1)] {
+            let output = dispatch_only(&request, headless, goal_mode, depth);
+            assert_eq!(
+                output.disposition,
+                RuntimeToolTurnDisposition::ContinueModel
+            );
+            assert_eq!(output.result.status, ToolStatus::Failed);
+            assert_eq!(
+                output.result.error.as_deref(),
+                Some("report_blocker is only available in headless orca exec runs")
+            );
+            assert!(output.status.is_none());
+        }
+    }
+
+    #[test]
     fn report_blocker_dispatch_continues_on_invalid_args() {
         let request = tool_types::ToolRequest {
             id: "router-report-blocker-invalid".into(),
@@ -878,7 +921,7 @@ mod tests {
             raw_arguments: Some(r#"{"summary":"missing kind"}"#.into()),
         };
 
-        let output = dispatch_only(&request);
+        let output = dispatch_only(&request, true, false, 0);
 
         assert_eq!(
             output.disposition,

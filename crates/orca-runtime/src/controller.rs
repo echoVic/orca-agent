@@ -360,6 +360,7 @@ pub enum ThreadTurnPromptPlacement {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThreadTurnToolMode {
     Standard,
+    Headless,
     Goal,
 }
 
@@ -1394,6 +1395,7 @@ impl ThreadTurnToolMode {
     fn policy(self) -> AgentToolPolicyContext<'static> {
         match self {
             Self::Standard => AgentToolPolicyContext::unrestricted(),
+            Self::Headless => AgentToolPolicyContext::headless(),
             Self::Goal => AgentToolPolicyContext::goal_mode(),
         }
     }
@@ -4395,6 +4397,7 @@ mod tests {
                 sink: &mut sink,
                 execution_request: &request,
                 goal_mode: false,
+                headless: false,
                 subagent_depth: 0,
                 instructions: &instructions,
                 memory: &memory,
@@ -4468,6 +4471,7 @@ mod tests {
                     sink: &mut sink,
                     execution_request: request,
                     goal_mode: false,
+                    headless: false,
                     subagent_depth: 0,
                     instructions: &instructions,
                     memory: &memory,
