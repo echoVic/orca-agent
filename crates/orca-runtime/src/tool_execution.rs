@@ -1365,10 +1365,12 @@ impl ToolExecutionActor {
                     ),
                 ),
                 disposition: RuntimeToolTurnDisposition::ContinueModel,
+                status: None,
                 child_budget_usage: None,
             },
         };
         let result = dispatch.result;
+        let status = dispatch.status;
         // The subagent child's budget receipt rides to the turn settlement
         // point so the parent operation merges exactly what the child spent.
         let child_budget_usage = dispatch.child_budget_usage;
@@ -1403,6 +1405,9 @@ impl ToolExecutionActor {
             completion.event_error = dispatch_event_error;
         }
         completion.disposition = dispatch.disposition;
+        if let Some(status) = status {
+            completion.status = status;
+        }
         Ok(completion)
     }
 

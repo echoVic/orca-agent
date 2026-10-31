@@ -125,6 +125,21 @@ impl AgentLoopResult {
         }
     }
 
+    pub(crate) fn blocked(blocker: orca_core::goal_runtime::BlockerSummary) -> Self {
+        Self {
+            status: RunStatus::Blocked {
+                blocker: blocker.clone(),
+            },
+            reason: TurnEndReason::Unclassified,
+            final_message: None,
+            error: None,
+            terminal: orca_core::budget::OperationTerminal::Blocked {
+                blocker,
+                usage: orca_core::budget::BudgetUsage::default(),
+            },
+        }
+    }
+
     pub(crate) fn failure(status: RunStatus, error: impl Into<String>) -> Self {
         Self::terminal(
             status,

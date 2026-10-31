@@ -895,8 +895,12 @@ impl RuntimeProviderResponseResultStep {
                 error,
                 terminal,
             } => {
-                let mut result =
-                    AgentLoopResult::terminal(status, TurnEndReason::Unclassified, error, None);
+                let mut result = match status {
+                    RunStatus::Blocked { blocker } => AgentLoopResult::blocked(blocker),
+                    status => {
+                        AgentLoopResult::terminal(status, TurnEndReason::Unclassified, error, None)
+                    }
+                };
                 if let Some(terminal) = terminal {
                     result.terminal = terminal;
                 }
@@ -2389,6 +2393,42 @@ mod tests {
         assert!(matches!(
             continuing,
             RuntimeProviderResponseResult::Continue
+        ));
+    }
+
+    #[test]
+    fn provider_response_result_step_folds_blocked_turn_with_blocker() {
+        let blocker = orca_core::goal_runtime::BlockerSummary {
+            kind: orca_core::goal_runtime::BlockerKind::ExternalState,
+            summary: "workspace is read-only".to_string(),
+            fingerprint: "fp-1".to_string(),
+            evidence: Vec::new(),
+        };
+
+        let blocked =
+            RuntimeProviderResponseResultStep::new().fold(RuntimeProviderResponseOutcome::Return {
+                status: RunStatus::Blocked {
+                    blocker: blocker.clone(),
+                },
+                error: None,
+                terminal: None,
+            });
+
+        let RuntimeProviderResponseResult::Return(result) = blocked else {
+            panic!("blocked outcome should return loop result");
+        };
+        assert_eq!(
+            result.status,
+            RunStatus::Blocked {
+                blocker: blocker.clone()
+            }
+        );
+        assert!(matches!(
+            result.terminal,
+            orca_core::budget::OperationTerminal::Blocked {
+                blocker: ref terminal_blocker,
+                ..
+            } if terminal_blocker == &blocker
         ));
     }
 
