@@ -10,6 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::goal_runtime::BlockerSummary;
+
 /// Independently optional budget dimensions for one operation.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", default)]
@@ -186,24 +188,31 @@ pub enum OperationTerminal {
         reason: CancelReason,
         checkpoint_id: Option<String>,
     },
+    /// The model declared an external blocker through a terminal tool.
+    Blocked {
+        blocker: BlockerSummary,
+        usage: BudgetUsage,
+    },
 }
 
 impl OperationTerminal {
     pub fn usage(&self) -> Option<BudgetUsage> {
         match self {
             Self::Completed { usage } | Self::Stopped { usage, .. } => Some(*usage),
+            Self::Blocked { usage, .. } => Some(*usage),
             Self::Failed { .. } | Self::Cancelled { .. } => None,
         }
     }
 
     /// Exit-code contribution for this terminal, mirroring the legacy
     /// `RunStatus::exit_code` mapping (budget stops keep exit code 4).
-    pub fn exit_code(self) -> i32 {
+    pub fn exit_code(&self) -> i32 {
         match self {
             Self::Completed { .. } => 0,
             Self::Stopped { .. } => 4,
             Self::Failed { .. } => 1,
             Self::Cancelled { .. } => 130,
+            Self::Blocked { .. } => 5,
         }
     }
 
@@ -213,6 +222,7 @@ impl OperationTerminal {
             Self::Stopped { .. } => "stopped",
             Self::Failed { .. } => "failed",
             Self::Cancelled { .. } => "cancelled",
+            Self::Blocked { .. } => "blocked",
         }
     }
 }

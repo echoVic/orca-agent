@@ -10,9 +10,9 @@ use serde_json::{Value, json};
 use crate::approval_types::{ApprovalRequest, ApprovalResolution};
 use crate::cost_types::UsageTotals;
 use crate::goal_runtime::{
-    EvidenceItem, GoalId, GoalNextAction, GoalOuterTurnId, GoalPauseReason, GoalRecord, GoalRunId,
-    GoalState, GoalTurnOrigin, GoalTurnStatus, GoalUpdateAck, GoalUpdateIntent, GoalUsage,
-    GoalVerificationResult,
+    BlockerSummary, EvidenceItem, GoalId, GoalNextAction, GoalOuterTurnId, GoalPauseReason,
+    GoalRecord, GoalRunId, GoalState, GoalTurnOrigin, GoalTurnStatus, GoalUpdateAck,
+    GoalUpdateIntent, GoalUsage, GoalVerificationResult,
 };
 use crate::model::ModelRouteDecision;
 use crate::plan_types::UpdatePlanArgs;
@@ -328,7 +328,7 @@ impl EventType {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Success,
@@ -336,6 +336,7 @@ pub enum RunStatus {
     Cancelled,
     ApprovalRequired,
     VerificationFailed,
+    Blocked { blocker: BlockerSummary },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -359,23 +360,25 @@ pub struct ContextCompactedPayload {
 }
 
 impl RunStatus {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Success => "success",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::ApprovalRequired => "approval_required",
             Self::VerificationFailed => "verification_failed",
+            Self::Blocked { .. } => "blocked",
         }
     }
 
-    pub fn exit_code(self) -> i32 {
+    pub fn exit_code(&self) -> i32 {
         match self {
             Self::Success => 0,
             Self::Failed => 1,
             Self::VerificationFailed => 2,
             Self::ApprovalRequired => 3,
             Self::Cancelled => 130,
+            Self::Blocked { .. } => 5,
         }
     }
 }
@@ -1286,6 +1289,7 @@ impl EventFactory {
             crate::budget::OperationTerminal::Stopped { .. } => "budget_exhausted",
             crate::budget::OperationTerminal::Failed { .. } => "failed",
             crate::budget::OperationTerminal::Cancelled { .. } => "cancelled",
+            crate::budget::OperationTerminal::Blocked { .. } => "blocked",
         };
         let mut payload = json!({
             "status": status,
@@ -1923,5 +1927,56 @@ mod tests {
         );
         assert_eq!(events[0].run_id, events[1].run_id);
         assert_eq!(events[1].run_id, events[2].run_id);
+    }
+
+    #[test]
+    fn blocked_run_status_has_correct_string_and_exit_code() {
+        use crate::goal_runtime::{BlockerKind, BlockerSummary};
+        let blocker = BlockerSummary {
+            kind: BlockerKind::EnvironmentContradiction,
+            summary: "workspace is read-only".to_string(),
+            fingerprint: "fp-1".to_string(),
+            evidence: vec![],
+        };
+        let status = RunStatus::Blocked { blocker };
+        assert_eq!(status.as_str(), "blocked");
+        assert_eq!(status.exit_code(), 5);
+    }
+
+    #[test]
+    fn blocked_operation_terminal_has_correct_exit_code() {
+        use crate::budget::{BudgetUsage, OperationTerminal};
+        use crate::goal_runtime::{BlockerKind, BlockerSummary};
+        let terminal = OperationTerminal::Blocked {
+            blocker: BlockerSummary {
+                kind: BlockerKind::EnvironmentContradiction,
+                summary: "workspace is read-only".to_string(),
+                fingerprint: "fp-1".to_string(),
+                evidence: vec![],
+            },
+            usage: BudgetUsage::default(),
+        };
+        assert_eq!(terminal.exit_code(), 5);
+        assert_eq!(terminal.as_str(), "blocked");
+        assert!(terminal.usage().is_some());
+    }
+
+    #[test]
+    fn session_completed_terminal_emits_blocked_status() {
+        use crate::budget::{BudgetUsage, OperationTerminal};
+        use crate::goal_runtime::{BlockerKind, BlockerSummary};
+        let terminal = OperationTerminal::Blocked {
+            blocker: BlockerSummary {
+                kind: BlockerKind::EnvironmentContradiction,
+                summary: "workspace is read-only".to_string(),
+                fingerprint: "fp-1".to_string(),
+                evidence: vec![],
+            },
+            usage: BudgetUsage::default(),
+        };
+        let mut factory = EventFactory::new("run-1".to_string());
+        let draft = factory.session_completed_terminal(&terminal, None);
+        let payload = &draft.payload;
+        assert_eq!(payload["status"], "blocked");
     }
 }
