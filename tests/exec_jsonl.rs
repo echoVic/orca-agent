@@ -5,6 +5,68 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 #[test]
+fn exec_session_completed_reports_writes_applied_false_without_writes() {
+    let workspace = TempDir::new().expect("temporary workspace");
+    let home = TempDir::new().expect("temporary ORCA_HOME");
+    std::fs::write(workspace.path().join("note.txt"), "before").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(workspace.path())
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--no-history",
+            "read note.txt",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let events = parse_jsonl(&output.stdout);
+    assert_eq!(
+        find_event(&events, "session.completed")["payload"]["writes_applied"],
+        false
+    );
+}
+
+#[test]
+fn exec_session_completed_reports_writes_applied_true_after_a_write() {
+    let workspace = TempDir::new().expect("temporary workspace");
+    let home = TempDir::new().expect("temporary ORCA_HOME");
+    std::fs::write(workspace.path().join("note.txt"), "before").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(workspace.path())
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--no-history",
+            "--mode",
+            "full-auto",
+            "edit note.txt :: before => after",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+        "after"
+    );
+    let events = parse_jsonl(&output.stdout);
+    assert_eq!(
+        find_event(&events, "session.completed")["payload"]["writes_applied"],
+        true
+    );
+}
+
+#[test]
 fn exec_outputs_jsonl_contract_and_success_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([

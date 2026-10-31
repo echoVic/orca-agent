@@ -2333,6 +2333,58 @@ mod tests {
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
 
+    #[test]
+    fn writes_applied_requires_a_successful_matching_file_tool_result() {
+        use orca_core::conversation::RawToolCall;
+        use orca_core::tool_types::{ToolName, ToolRequest, ToolResult, ToolResultKind};
+
+        for name in [
+            ToolName::Edit,
+            ToolName::WriteFile,
+            ToolName::ReadFile,
+            ToolName::Bash,
+        ] {
+            for succeeds in [false, true] {
+                let request = ToolRequest {
+                    id: "write-1".into(),
+                    name: name.clone(),
+                    action: ActionKind::Write,
+                    target: Some("note.txt".into()),
+                    raw_arguments: None,
+                };
+                let mut conversation = Conversation::new();
+                conversation.add_assistant(
+                    None,
+                    None,
+                    vec![RawToolCall {
+                        id: request.id.clone(),
+                        function_name: name.as_str().into(),
+                        arguments: "{}".into(),
+                    }],
+                );
+                assert!(!turn_writes_applied(&conversation.messages));
+                let result = if succeeds {
+                    ToolResult::completed_kind(
+                        &request,
+                        "done".into(),
+                        false,
+                        ToolResultKind::Success,
+                    )
+                } else {
+                    ToolResult::failed(&request, "failed", None)
+                };
+                conversation.add_tool_result_with_terminal(&result, "result".into());
+                assert_eq!(
+                    turn_writes_applied(&conversation.messages),
+                    succeeds && matches!(name, ToolName::Edit | ToolName::WriteFile),
+                    "{name:?}, succeeds={succeeds}",
+                );
+                // A result alone cannot attribute a write to this turn.
+                assert!(!turn_writes_applied(&conversation.messages[1..]));
+            }
+        }
+    }
+
     struct PermissionCarryNormalHandler {
         calls: AtomicUsize,
     }
