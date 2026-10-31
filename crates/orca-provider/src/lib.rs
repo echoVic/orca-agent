@@ -1508,6 +1508,19 @@ fn mock_flaky_once_should_fail(key: &str) -> bool {
 fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
     let prompt = prompt.trim();
 
+    if let Some(rest) = prompt.strip_prefix("report_blocker ") {
+        let (kind, summary) = rest.split_once(' ')?;
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::ReportBlocker,
+            action: ActionKind::Agent,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({ "kind": kind, "summary": summary }).to_string(),
+            ),
+        });
+    }
+
     if let Some(arguments) = prompt.strip_prefix("computer ") {
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
