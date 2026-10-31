@@ -444,6 +444,8 @@ pub enum ThreadOperationOutcome {
         /// Typed operation terminal; the authoritative fact when present.
         terminal: Option<orca_core::budget::OperationTerminal>,
         verification: Option<orca_core::verification::VerificationResult>,
+        /// True when at least one successful file write was recorded.
+        writes_applied: bool,
     },
     ProviderSuspended {
         suspension: Box<RuntimeProviderSuspension>,
@@ -459,6 +461,7 @@ impl From<RunStatus> for ThreadOperationOutcome {
             background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
             terminal: None,
             verification: None,
+            writes_applied: false,
         }
     }
 }
@@ -2182,6 +2185,7 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
                 background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
                 terminal: None,
                 verification: None,
+                writes_applied: false,
             });
         }
         if request.operation_kind() != &HostedOperationKind::Turn
@@ -2211,12 +2215,14 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
                     background_workflows,
                     terminal,
                     verification,
+                    writes_applied,
                 } => ThreadOperationOutcome::Completed {
                     status,
                     end_reason,
                     background_workflows,
                     terminal,
                     verification,
+                    writes_applied,
                 },
                 crate::controller::ThreadTurnOutcome::ProviderSuspended {
                     suspension,
@@ -22264,6 +22270,7 @@ impl ThreadActor {
                                         end_reason,
                                         terminal,
                                         verification,
+                                        writes_applied,
                                         ..
                                     },
                                 ) => {
@@ -22282,6 +22289,7 @@ impl ThreadActor {
                                                     terminal.as_ref().expect("matched stop"),
                                                     result.state.thread.session().session_id(),
                                                     verification.as_ref(),
+                                                    writes_applied,
                                                 ),
                                             _ => result
                                                 .state
@@ -22290,6 +22298,7 @@ impl ThreadActor {
                                                     status,
                                                     result.state.thread.session().session_id(),
                                                     verification.as_ref(),
+                                                    writes_applied,
                                                 ),
                                         };
                                         observe_runtime_event(
@@ -22712,14 +22721,17 @@ impl ThreadActor {
         }
         let outcome = match result.outcome {
             GenerationTaskOutcome::Executed(ThreadOperationOutcome::Completed {
-                status, ..
+                status,
+                writes_applied,
+                ..
             }) => {
                 observe_runtime_event(
                     active.request.event_observer().as_deref(),
-                    result
-                        .state
-                        .events
-                        .session_completed(status, result.state.thread.session().session_id()),
+                    result.state.events.session_completed(
+                        status,
+                        result.state.thread.session().session_id(),
+                        writes_applied,
+                    ),
                 );
                 OperationOutcome::Completed(status)
             }
@@ -23161,6 +23173,7 @@ fn run_headless_session(
     if let ThreadOperationOutcome::Completed {
         terminal,
         verification,
+        writes_applied,
         background_workflows: _,
         ..
     } = &outcome
@@ -23187,12 +23200,14 @@ fn run_headless_session(
                     terminal,
                     thread.session().session_id(),
                     verification.as_ref(),
+                    *writes_applied,
                 ))?;
             } else {
                 sink.emit(events.session_completed_with_verification(
                     status,
                     thread.session().session_id(),
                     verification.as_ref(),
+                    *writes_applied,
                 ))?;
             }
         } else {
@@ -23200,6 +23215,7 @@ fn run_headless_session(
                 status,
                 thread.session().session_id(),
                 verification.as_ref(),
+                *writes_applied,
             ))?;
         }
     }
@@ -23519,7 +23535,7 @@ fn run_provider_background_task(
         }
         observe_runtime_event(
             context.observer.as_deref(),
-            events.session_completed(status, None),
+            events.session_completed(status, None, false),
         );
     }
 }
@@ -26007,12 +26023,14 @@ mod tests {
                         background_workflows,
                         terminal,
                         verification,
+                        writes_applied,
                     } => ThreadOperationOutcome::Completed {
                         status,
                         end_reason,
                         background_workflows,
                         terminal,
                         verification,
+                        writes_applied,
                     },
                     crate::controller::ThreadTurnOutcome::ProviderSuspended {
                         suspension,
@@ -26053,6 +26071,7 @@ mod tests {
                         resumable: true,
                     }),
                     verification: None,
+                    writes_applied: false,
                 });
             }
             SurfaceGoalUpdateExecutor.run_turn(thread, request, generation, events, writer, cancel)
@@ -26110,6 +26129,7 @@ mod tests {
                     resumable: false,
                 }),
                 verification: None,
+                writes_applied: false,
             })
         }
     }
@@ -26194,12 +26214,14 @@ mod tests {
                         background_workflows,
                         terminal,
                         verification,
+                        writes_applied,
                     } => ThreadOperationOutcome::Completed {
                         status,
                         end_reason,
                         background_workflows,
                         terminal,
                         verification,
+                        writes_applied,
                     },
                     crate::controller::ThreadTurnOutcome::ProviderSuspended {
                         suspension,
@@ -38511,6 +38533,7 @@ mod tests {
             background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
             terminal: None,
             verification: None,
+            writes_applied: false,
         };
         let budget_stop = ThreadOperationOutcome::Completed {
             status: RunStatus::Failed,
@@ -38523,6 +38546,7 @@ mod tests {
                 resumable: true,
             }),
             verification: None,
+            writes_applied: false,
         };
         let cost = ThreadOperationOutcome::Completed {
             status: RunStatus::Failed,
@@ -38537,6 +38561,7 @@ mod tests {
                 resumable: false,
             }),
             verification: None,
+            writes_applied: false,
         };
         let failed = ThreadOperationOutcome::Completed {
             status: RunStatus::Failed,
@@ -38544,6 +38569,7 @@ mod tests {
             background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
             terminal: None,
             verification: None,
+            writes_applied: false,
         };
 
         let disposition = |outcome: &ThreadOperationOutcome| match outcome {

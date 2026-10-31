@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -270,6 +271,9 @@ struct ThreadTurnCompletion {
     /// stops carry `OperationTerminal::Stopped`).
     terminal: Option<orca_core::budget::OperationTerminal>,
     verification: Option<orca_core::verification::VerificationResult>,
+    /// True when at least one successful file write (`edit`/`write_file`)
+    /// was recorded during the turn.
+    writes_applied: bool,
 }
 
 enum PreparedThreadTurnOutcome {
@@ -288,6 +292,8 @@ pub enum ThreadTurnOutcome {
         /// Typed operation terminal; the authoritative fact when present.
         terminal: Option<orca_core::budget::OperationTerminal>,
         verification: Option<orca_core::verification::VerificationResult>,
+        /// True when at least one successful file write was recorded.
+        writes_applied: bool,
     },
     ProviderSuspended {
         suspension: Box<RuntimeProviderSuspension>,
@@ -936,8 +942,52 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             background_workflows,
             terminal: Some(result.terminal),
             verification,
+            writes_applied: turn_writes_applied(
+                parts
+                    .conversation
+                    .messages
+                    .get(memory_start..)
+                    .unwrap_or_default(),
+            ),
         }))
     }
+}
+
+/// A turn applied writes when its transcript records a successful `edit` or
+/// `write_file` tool result. Those tools are the ones that carry a
+/// `file_change_preview`; the preview itself is not retained on the tool
+/// message, so the completed result is the durable signal.
+fn turn_writes_applied(messages: &[Message]) -> bool {
+    let write_tool_call_ids = messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant { tool_calls, .. } => Some(tool_calls),
+            _ => None,
+        })
+        .flatten()
+        .filter(|call| {
+            matches!(
+                orca_core::tool_types::ToolName::from_str(call.function_name.as_str()),
+                Some(
+                    orca_core::tool_types::ToolName::Edit
+                        | orca_core::tool_types::ToolName::WriteFile
+                )
+            )
+        })
+        .map(|call| call.id.as_str())
+        .collect::<HashSet<_>>();
+    !write_tool_call_ids.is_empty()
+        && messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::Tool {
+                    tool_call_id,
+                    terminal: Some(terminal),
+                    ..
+                } if terminal.kind == orca_core::tool_types::ToolResultKind::Success
+                    && write_tool_call_ids.contains(tool_call_id.as_str())
+            )
+        })
 }
 
 impl ThreadTurnCompletion {
@@ -975,6 +1025,7 @@ impl ThreadTurnCompletion {
                     self.status,
                     session.session_id(),
                     self.verification.as_ref(),
+                    self.writes_applied,
                 ))?;
             }
             return Ok(self.status);
@@ -994,9 +1045,14 @@ impl ThreadTurnCompletion {
                     terminal,
                     session.session_id(),
                     self.verification.as_ref(),
+                    self.writes_applied,
                 ))?;
             } else {
-                sink.emit(events.session_completed(self.status, session.session_id()))?;
+                sink.emit(events.session_completed(
+                    self.status,
+                    session.session_id(),
+                    self.writes_applied,
+                ))?;
             }
         }
         if crate::memory::automatic_memory_capture_is_eligible(
@@ -1037,6 +1093,7 @@ impl PreparedThreadTurnOutcome {
                 let end_reason = completion.end_reason;
                 let terminal = completion.terminal.clone();
                 let verification = completion.verification.clone();
+                let writes_applied = completion.writes_applied;
                 completion
                     .commit(config, session, request, cancel, events, sink)
                     .map(|status| ThreadTurnOutcome::Completed {
@@ -1045,6 +1102,7 @@ impl PreparedThreadTurnOutcome {
                         background_workflows,
                         terminal,
                         verification,
+                        writes_applied,
                     })
             }
             Self::ProviderSuspended {
@@ -1757,7 +1815,7 @@ fn stop_before_the_turn<W: io::Write>(
             thread.startup_warnings(),
         ))
         .and_then(|()| {
-            sink.emit(events.session_completed_terminal(&terminal, thread.session_id()))
+            sink.emit(events.session_completed_terminal(&terminal, thread.session_id(), false))
         });
     drop(sink);
     let _ = host.shutdown();

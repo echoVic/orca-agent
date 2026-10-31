@@ -1240,8 +1240,13 @@ impl EventFactory {
         )
     }
 
-    pub fn session_completed(&mut self, status: RunStatus, session_id: Option<&str>) -> EventDraft {
-        self.session_completed_with_verification(status, session_id, None)
+    pub fn session_completed(
+        &mut self,
+        status: RunStatus,
+        session_id: Option<&str>,
+        writes_applied: bool,
+    ) -> EventDraft {
+        self.session_completed_with_verification(status, session_id, None, writes_applied)
     }
 
     pub fn session_completed_with_verification(
@@ -1249,9 +1254,11 @@ impl EventFactory {
         status: RunStatus,
         session_id: Option<&str>,
         verification: Option<&VerificationResult>,
+        writes_applied: bool,
     ) -> EventDraft {
         let mut payload = json!({
-            "status": status
+            "status": status,
+            "writes_applied": writes_applied
         });
         insert_completion_proof(&mut payload, verification);
         if let Some(session_id) = session_id {
@@ -1267,8 +1274,14 @@ impl EventFactory {
         &mut self,
         terminal: &crate::budget::OperationTerminal,
         session_id: Option<&str>,
+        writes_applied: bool,
     ) -> EventDraft {
-        self.session_completed_terminal_with_verification(terminal, session_id, None)
+        self.session_completed_terminal_with_verification(
+            terminal,
+            session_id,
+            None,
+            writes_applied,
+        )
     }
 
     /// Terminal-complete session event carrying the exact verifier result used
@@ -1280,6 +1293,7 @@ impl EventFactory {
         terminal: &crate::budget::OperationTerminal,
         session_id: Option<&str>,
         verification: Option<&VerificationResult>,
+        writes_applied: bool,
     ) -> EventDraft {
         let status = match terminal {
             crate::budget::OperationTerminal::Completed { .. } => "success",
@@ -1290,6 +1304,7 @@ impl EventFactory {
         let mut payload = json!({
             "status": status,
             "terminal": terminal,
+            "writes_applied": writes_applied,
         });
         insert_completion_proof(&mut payload, verification);
         if let Some(session_id) = session_id {
@@ -1488,13 +1503,32 @@ mod tests {
     fn session_completed_payload_carries_durable_session_id_when_present() {
         let mut f = EventFactory::new("run-1".to_string());
 
-        let with_session = f.session_completed(RunStatus::Failed, Some("session-9"));
+        let with_session = f.session_completed(RunStatus::Failed, Some("session-9"), false);
         assert_eq!(with_session.payload["status"], "failed");
         assert_eq!(with_session.payload["session_id"], "session-9");
+        assert_eq!(with_session.payload["writes_applied"], false);
 
-        let without_session = f.session_completed(RunStatus::Success, None);
+        let without_session = f.session_completed(RunStatus::Success, None, false);
         assert_eq!(without_session.payload["status"], "success");
         assert!(without_session.payload["session_id"].is_null());
+    }
+
+    #[test]
+    fn session_completed_terminal_includes_writes_applied() {
+        use crate::budget::{BudgetUsage, OperationTerminal};
+
+        let terminal = OperationTerminal::Completed {
+            usage: BudgetUsage::default(),
+        };
+        let mut factory = EventFactory::new("run-1".to_string());
+
+        let applied =
+            factory.session_completed_terminal_with_verification(&terminal, None, None, true);
+        assert_eq!(applied.payload["writes_applied"], true);
+
+        let not_applied =
+            factory.session_completed_terminal_with_verification(&terminal, None, None, false);
+        assert_eq!(not_applied.payload["writes_applied"], false);
     }
 
     #[test]
