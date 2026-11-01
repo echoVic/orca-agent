@@ -17,7 +17,7 @@
 
 ## Global Constraints
 
-- **Repository:** worktree `/Users/qingyun/Documents/GitHub/.orca-fix/blocker-followups`, branch `feat/blocker-followups`, stacked on `fix/issue-156-exec-blocker-declaration` (head `d16c5d9c`).
+- **Repository:** worktree `/Users/qingyun/Documents/GitHub/.orca-fix/blocker-followups`, branch `feat/blocker-followups`, stacked on `fix/issue-156-exec-blocker-declaration` (head `e1c1722d` after the review fixes).
   - Work only there.
   - Never touch `/Users/qingyun/Documents/GitHub/blade-deepseek` or `~/.orca`.
 - **Exec status and exit code:** exit code `5` and `status: "blocked"` stay as #156 defined them. No new run status and no new exit code.
@@ -307,13 +307,13 @@ No validator compares them to the code, so nothing failed.
   env -u NODE_OPTIONS cargo test -p orca-runtime --test runtime_surface_interaction --locked -- --test-threads=1
   env -u NODE_OPTIONS cargo test -p orca-runtime --test operation_terminal_contract --locked -- --test-threads=1
   env -u NODE_OPTIONS cargo clippy --workspace --all-targets --locked
-  rustfmt --edition 2024 --check <every .rs file changed on this branch since d16c5d9c>
+  rustfmt --edition 2024 --check <every .rs file changed on this branch since e1c1722d>
   env -u NODE_OPTIONS node scripts/test-validate-runtime-surface-contract.mjs; echo exit=$?
   env -u NODE_OPTIONS node scripts/validate-runtime-surface-contract.mjs; echo exit=$?
   env -u NODE_OPTIONS node scripts/test-validate-windows-platform-boundaries.mjs; echo exit=$?
   env -u NODE_OPTIONS node scripts/validate-windows-platform-boundaries.mjs; echo exit=$?
   ```
-- [ ] **Step 2:** A failure in `orca-runtime --lib` or `runtime_surface_interaction` may be a known flake when the tests run in parallel. These commands already run serially. If one still fails, rerun that one test alone. If it passes alone, report it as flaky with both results. If it fails alone, check it on `d16c5d9c` (`git stash` or a scratch worktree) before calling it pre-existing.
+- [ ] **Step 2:** A failure in `orca-runtime --lib` or `runtime_surface_interaction` may be a known flake when the tests run in parallel. These commands already run serially. If one still fails, rerun that one test alone. If it passes alone, report it as flaky with both results. If it fails alone, check it on `e1c1722d` (`git stash` or a scratch worktree) before calling it pre-existing.
 - [ ] **Step 3:** No commit unless a validator baseline changed. A baseline change goes in the task commit it belongs to; amend only your own commits on this branch.
 
 ## Final summary
@@ -322,5 +322,5 @@ End with:
 - every change, with `file:line`;
 - the new test names;
 - every verification command with its real exit code;
-- the final `git log --oneline d16c5d9c..HEAD`;
+- the final `git log --oneline e1c1722d..HEAD`;
 - anything you did differently from the plan, and why.
