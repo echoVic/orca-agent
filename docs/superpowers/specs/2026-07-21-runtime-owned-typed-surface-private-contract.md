@@ -1222,7 +1222,7 @@ OperationTerminal =
       last_generation: SurfaceGenerationId,
     }
   | Shutdown { reason: HostShutdown | ThreadClose }
-  | Blocked { blocker: BlockerSummary, usage: BudgetUsage }
+  | Blocked { blocker: BlockerSummary, usage: UsageTotals }
 
 `Blocked` is produced only when the model ends a headless exec turn with `report_blocker`. Its legacy run status is `blocked`, exit code 5.
 

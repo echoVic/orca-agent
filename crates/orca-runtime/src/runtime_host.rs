@@ -24138,7 +24138,12 @@ mod tests {
             .unwrap(),
             terminal: surface::OperationTerminal::Blocked {
                 blocker: blocker.clone(),
-                usage: orca_core::budget::BudgetUsage::default(),
+                usage: surface::UsageTotals {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_tokens: 0,
+                    estimated_cost_usd_micros: 0,
+                },
             },
             usage: surface::UsageTotals {
                 input_tokens: 0,

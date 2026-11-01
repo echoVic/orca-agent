@@ -4301,7 +4301,7 @@ fn operation_terminal_fixtures(
                 },
                 OperationTerminal::Blocked {
                     blocker,
-                    usage: orca_core::budget::BudgetUsage::default(),
+                    usage: usage(),
                 },
                 current,
             )]
