@@ -652,6 +652,38 @@ fn exec_report_blocker_with_passing_verifier_stays_blocked() {
     assert_exec_report_blocker(true);
 }
 
+#[test]
+fn exec_report_blocker_text_mode_prints_the_reason() {
+    let home = TempDir::new().expect("temporary ORCA_HOME");
+    let cwd = TempDir::new().expect("temporary workspace");
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "text",
+            "--provider",
+            "mock",
+            "--no-history",
+            "report_blocker environment_contradiction workspace is read-only",
+        ])
+        .output()
+        .expect("run orca");
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status: blocked"), "{stdout}");
+    assert!(
+        stdout.contains("blocked: environment_contradiction — workspace is read-only"),
+        "{stdout}"
+    );
+}
+
 fn assert_exec_report_blocker(with_verifier: bool) {
     let home = TempDir::new().expect("temporary ORCA_HOME");
     let cwd = TempDir::new().expect("temporary workspace");

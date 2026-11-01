@@ -314,11 +314,18 @@ impl<W: Write> EventSink<W> {
                 event.payload["message"].as_str().unwrap_or("unknown")
             ),
             EventType::SessionCompleted => {
-                writeln!(
-                    self.writer,
-                    "status: {}",
-                    event.payload["status"].as_str().unwrap_or("unknown")
-                )
+                let status = event.payload["status"].as_str().unwrap_or("unknown");
+                writeln!(self.writer, "status: {status}")?;
+                if status == "blocked" {
+                    let blocker = &event.payload["terminal"]["blocked"]["blocker"];
+                    writeln!(
+                        self.writer,
+                        "blocked: {} — {}",
+                        blocker["kind"].as_str().unwrap_or("unknown"),
+                        blocker["summary"].as_str().unwrap_or("unknown")
+                    )?;
+                }
+                Ok(())
             }
         }
     }
