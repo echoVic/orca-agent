@@ -91,7 +91,7 @@ fn session_completed_terminal_emits_typed_terminal_payload() {
         checkpoint_id: "cp-9".to_string(),
         resumable: true,
     };
-    let event = events.session_completed_terminal(&terminal, Some("session-9"));
+    let event = events.session_completed_terminal(&terminal, Some("session-9"), false);
 
     // Status string is a projection of the terminal; the typed object rides
     // along so adapters never reconstruct limits from constants.
@@ -265,6 +265,7 @@ fn session_terminal_event_binds_the_verification_proof() {
         &terminal,
         Some("session-proof"),
         Some(&result),
+        false,
     );
 
     assert_eq!(

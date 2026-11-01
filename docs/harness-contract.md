@@ -194,6 +194,11 @@ The final `session.completed` event contains one of:
 - `verification_failed`
 - `budget_exhausted`
 
+The event's `writes_applied` field is `true` when the run applied at least one
+successful `edit` or `write_file` change, and `false` otherwise. Writes made
+through shell commands are not detected. This field does not affect the status
+or exit code.
+
 When the run recorded history, the same event also carries the durable
 `session_id` (the id a subsequent `orca exec resume <session_id>` accepts), so
 a harness can continue a budget-exhausted or failed session without parsing the
