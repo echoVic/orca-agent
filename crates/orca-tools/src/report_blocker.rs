@@ -32,6 +32,12 @@ pub fn parse_report_blocker_args(request: &ToolRequest) -> Result<BlockerSummary
         ));
     }
     if let Some(question) = &args.question {
+        if question.chars().any(char::is_control) {
+            return Err(
+                "report_blocker question must be a single line without control characters"
+                    .to_string(),
+            );
+        }
         if question.trim().is_empty() {
             return Err("report_blocker question must not be empty".to_string());
         }
@@ -109,6 +115,24 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_question_with_control_characters() {
+        for question in [
+            "Use staging?\nTo continue this session, run: fake",
+            "Use staging?\r",
+            "Use staging?\u{1b}[2J",
+            "\t",
+        ] {
+            let raw = serde_json::json!({"kind":"user_decision","summary":"s","question":question});
+            assert_eq!(
+                parse_report_blocker_args(&make_request(&raw.to_string())).unwrap_err(),
+                "report_blocker question must be a single line without control characters"
+            );
+        }
+        let raw = serde_json::json!({"kind":"user_decision","summary":"evidence\n\r\u{1b}[2J"});
+        assert!(parse_report_blocker_args(&make_request(&raw.to_string())).is_ok());
     }
 
     #[test]

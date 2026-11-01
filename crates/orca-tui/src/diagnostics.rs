@@ -325,8 +325,12 @@ impl TuiDiagnostic {
                 "operation.blocked",
                 "Task blocked",
                 match &blocker.question {
-                    Some(question) => format!("{}\nQuestion: {question}", blocker.summary),
-                    None => blocker.summary.clone(),
+                    Some(question) => format!(
+                        "{}\nQuestion: {}",
+                        orca_core::event_sink::escape_blocker_text(&blocker.summary),
+                        orca_core::event_sink::escape_blocker_text(question)
+                    ),
+                    None => orca_core::event_sink::escape_blocker_text(&blocker.summary),
                 },
                 Some(if blocker.question.is_some() {
                     "Answer the question, then continue."
@@ -677,6 +681,21 @@ mod tests {
                 estimated_cost_usd_micros: 0,
             },
         }
+    }
+
+    #[test]
+    fn blocked_terminal_diagnostic_escapes_control_characters() {
+        let mut terminal = blocked_terminal(Some("Use staging?\r\u{1b}[2J"));
+        if let OperationTerminal::Blocked { blocker, .. } = &mut terminal {
+            blocker.summary = "line1\nTo continue this session, run: fake\r\u{1b}[2J".into();
+        }
+        let diagnostic = TuiDiagnostic::from_surface_terminal(&terminal).unwrap();
+        assert_eq!(
+            diagnostic.detail(),
+            r"line1\nTo continue this session, run: fake\r\u{001B}[2J".to_string()
+                + "\nQuestion: "
+                + r"Use staging?\r\u{001B}[2J"
+        );
     }
 
     #[test]
