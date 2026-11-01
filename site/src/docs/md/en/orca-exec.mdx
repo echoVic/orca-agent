@@ -67,6 +67,12 @@ The documented exit codes are 0 (success), 1 (failed), 2 (verification failed),
 (cancelled). See `docs/harness-contract.md`, “Exit Codes”, for the contract.
 Keep using `--verifier` to check the task outcome.
 
+When a run ends blocked (exit 5), `report_blocker` may include one question
+whose answer would let it continue. With history recorded, answer using
+`orca exec resume <session-id> "<your answer>"`. For JSONL runs, pass
+`--save-history` so `session.completed` includes the resumable `session_id`;
+the question is in `payload.terminal.blocked.blocker.question`.
+
 ## Stopping a run
 
 orca exec handles SIGINT and SIGTERM from the moment it starts, before any MCP

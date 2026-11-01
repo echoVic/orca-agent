@@ -24132,6 +24132,7 @@ mod tests {
         };
         snapshot.tasks.push(task);
         let blocker = orca_core::goal_runtime::BlockerSummary {
+            question: None,
             kind: orca_core::goal_runtime::BlockerKind::MissingAuthority,
             summary: "write permission needed".to_string(),
             fingerprint: "blocked-test".to_string(),

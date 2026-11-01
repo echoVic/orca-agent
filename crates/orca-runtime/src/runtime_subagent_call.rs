@@ -2950,11 +2950,15 @@ fn unix_time_ms() -> i64 {
 
 fn blocked_subagent_output(blocker: &orca_core::goal_runtime::BlockerSummary) -> String {
     let kind = serde_json::to_value(blocker.kind).expect("blocker kind serializes");
-    format!(
+    let mut output = format!(
         "Subagent status: Blocked\nkind: {}\nsummary: {}",
         kind.as_str().expect("snake_case kind"),
         blocker.summary
-    )
+    );
+    if let Some(question) = &blocker.question {
+        output.push_str(&format!("\nquestion: {question}"));
+    }
+    output
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3205,6 +3209,24 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn report_blocker_subagent_output_includes_optional_question() {
+        for question in [None, Some("Use port 8080?")] {
+            let blocker = serde_json::from_value(serde_json::json!({
+                "kind": "user_decision", "summary": "need a port",
+                "fingerprint": "port", "evidence": [], "question": question
+            }))
+            .unwrap();
+            let output = super::blocked_subagent_output(&blocker);
+            let expected = if question.is_some() {
+                "Subagent status: Blocked\nkind: user_decision\nsummary: need a port\nquestion: Use port 8080?"
+            } else {
+                "Subagent status: Blocked\nkind: user_decision\nsummary: need a port"
+            };
+            assert_eq!(output, expected);
+        }
+    }
+
     use super::*;
     use crate::agent_continuation::{AgentAttemptId, ToolBoundary};
     use crate::runtime_surface::RuntimeSubagentActivityIngress;

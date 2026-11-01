@@ -4463,6 +4463,7 @@ fn core_goal_state_from_surface(state: &crate::runtime_surface::SurfaceGoalState
         },
         SurfaceGoalState::Blocked { blocker } => GoalState::Blocked {
             blocker: orca_core::goal_runtime::BlockerSummary {
+                question: None,
                 kind: match blocker.kind {
                     SurfaceBlockerKind::UserDecision => {
                         orca_core::goal_runtime::BlockerKind::UserDecision
@@ -5475,6 +5476,7 @@ fn legacy_state(goal: &ThreadGoal) -> GoalState {
         },
         ThreadGoalStatus::Blocked => GoalState::Blocked {
             blocker: BlockerSummary {
+                question: None,
                 kind: BlockerKind::UnverifiableRequirement,
                 summary: "migrated legacy blocked goal without structured evidence".to_string(),
                 fingerprint: format!("legacy-blocked:{}", goal.session_id),

@@ -294,6 +294,7 @@ fn operation_generation_and_terminal_algebras_are_closed() {
         },
         OperationTerminal::Blocked {
             blocker: BlockerSummary {
+                question: None,
                 kind: BlockerKind::ExternalState,
                 summary: "workspace is read-only".to_string(),
                 fingerprint: "blocked-terminal".to_string(),
@@ -350,6 +351,7 @@ fn every_generation_stop_and_finalizer_source_is_constructible() {
         GenerationStopReason::Completed {
             status: GenerationCompletionStatus::Blocked {
                 blocker: BlockerSummary {
+                    question: None,
                     kind: BlockerKind::ExternalState,
                     summary: "workspace is read-only".to_string(),
                     fingerprint: "blocked-status".to_string(),

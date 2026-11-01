@@ -653,6 +653,115 @@ fn exec_report_blocker_with_passing_verifier_stays_blocked() {
 }
 
 #[test]
+fn exec_report_blocker_carries_question() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--no-history",
+            "--provider",
+            "mock",
+            "report_blocker user_decision need a port ? Use port 8080?",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = parse_jsonl(&output.stdout);
+    let terminal = &events.last().unwrap()["payload"]["terminal"]["blocked"]["blocker"];
+    assert_eq!(terminal["summary"], "need a port");
+    assert_eq!(terminal["question"], "Use port 8080?");
+}
+
+#[test]
+fn exec_blocked_text_mode_prints_question_without_resume_line_when_history_is_off() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "text",
+            "--no-history",
+            "--provider",
+            "mock",
+            "report_blocker user_decision need a port ? Use port 8080?",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("blocked: user_decision — need a port\nQuestion: Use port 8080?"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("orca exec resume"), "{stdout}");
+}
+
+#[test]
+fn exec_blocked_text_mode_prints_answer_resume_hint_with_saved_session_id() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "text",
+            "--save-history",
+            "--provider",
+            "mock",
+            "report_blocker user_decision need a port ? Use port 8080?",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let documents = session_documents(home.path());
+    assert_eq!(documents.len(), 1);
+    let session_id = documents[0]
+        .1
+        .iter()
+        .find(|record| record["type"] == "session.meta")
+        .and_then(|record| record["session_id"].as_str())
+        .expect("saved session id");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("blocked: user_decision — need a port\nQuestion: Use port 8080?"),
+        "{stdout}"
+    );
+    let hint = stdout
+        .lines()
+        .find(|line| line.starts_with("To continue this session, run:"))
+        .expect("resume hint");
+    assert_eq!(
+        hint,
+        format!("To continue this session, run: orca exec resume {session_id} \"<your answer>\"")
+    );
+}
+
+#[test]
 fn exec_report_blocker_text_mode_prints_the_reason() {
     let home = TempDir::new().expect("temporary ORCA_HOME");
     let cwd = TempDir::new().expect("temporary workspace");

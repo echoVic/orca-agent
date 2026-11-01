@@ -4288,6 +4288,7 @@ fn operation_terminal_fixtures(
         }
         "Completed(Blocked)" => {
             let blocker = orca_core::goal_runtime::BlockerSummary {
+                question: None,
                 kind: orca_core::goal_runtime::BlockerKind::MissingAuthority,
                 summary: "write permission needed".to_string(),
                 fingerprint: "blocked-mapping".to_string(),

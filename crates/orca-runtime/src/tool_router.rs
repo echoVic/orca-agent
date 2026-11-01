@@ -920,6 +920,39 @@ mod tests {
     }
 
     #[test]
+    fn report_blocker_dispatch_continues_on_invalid_question() {
+        for question in ["".to_string(), "   ".to_string(), "x".repeat(1001)] {
+            let request = tool_types::ToolRequest {
+                id: "invalid-question".into(),
+                name: ToolName::ReportBlocker,
+                action: ActionKind::Agent,
+                target: None,
+                raw_arguments: Some(
+                    serde_json::json!({
+                        "kind": "user_decision", "summary": "need a port", "question": question
+                    })
+                    .to_string(),
+                ),
+            };
+            let output = dispatch_only(&request, true, false, 0);
+            assert_eq!(
+                output.disposition,
+                RuntimeToolTurnDisposition::ContinueModel
+            );
+            assert_eq!(output.result.status, ToolStatus::Failed);
+            assert!(output.status.is_none());
+            assert!(
+                output
+                    .result
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("report_blocker question")
+            );
+        }
+    }
+
+    #[test]
     fn report_blocker_dispatch_continues_on_invalid_args() {
         let request = tool_types::ToolRequest {
             id: "router-report-blocker-invalid".into(),

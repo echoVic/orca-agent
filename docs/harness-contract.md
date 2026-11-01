@@ -193,7 +193,7 @@ The final `session.completed` event contains one of:
 - `approval_required`
 - `verification_failed`
 - `budget_exhausted`
-- `blocked`: the model called `report_blocker` to declare that it cannot make progress because of something outside its control; the terminal carries the blocker's `kind` and `summary`.
+- `blocked`: the model called `report_blocker` to declare that it cannot make progress because of something outside its control; the terminal carries the blocker's `kind`, `summary`, and optional `question`.
 
 When the run recorded history, the same event also carries the durable
 `session_id` (the id a subsequent `orca exec resume <session_id>` accepts), so
@@ -203,6 +203,15 @@ transcript. In text mode, a non-success exit prints the exact resume command:
 ```text
 To continue this session, run: orca exec resume <session-id>
 ```
+
+A blocker can include one concrete question (at most 1,000 characters) in
+`payload.terminal.blocked.blocker.question`. Answer it with
+`orca exec resume <session-id> "<your answer>"`; the answer becomes the resumed
+run's prompt, alongside the recorded `report_blocker` call. JSONL runs need
+`--save-history` to record a resumable session and include its `session_id` in
+`session.completed`. Text output prints `Question: <question>` after the
+`blocked: <kind> — <summary>` line and adds `"<your answer>"` to the resume hint.
+Without recorded history, it prints the reason and question without a resume hint.
 
 A resumed run appends to the original transcript and owns a fresh budget scope:
 the previous invocation's `max_budget` ceiling does not carry over, while its

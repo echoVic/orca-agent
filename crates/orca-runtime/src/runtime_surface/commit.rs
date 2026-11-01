@@ -13275,6 +13275,7 @@ mod tests {
             estimated_cost_usd_micros: 456,
         };
         let blocker = orca_core::goal_runtime::BlockerSummary {
+            question: None,
             kind: orca_core::goal_runtime::BlockerKind::EnvironmentContradiction,
             summary: "workspace is read-only".to_string(),
             fingerprint: "read-only".to_string(),

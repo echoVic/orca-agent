@@ -324,6 +324,9 @@ impl<W: Write> EventSink<W> {
                         blocker["kind"].as_str().unwrap_or("unknown"),
                         blocker["summary"].as_str().unwrap_or("unknown")
                     )?;
+                    if let Some(question) = blocker["question"].as_str() {
+                        writeln!(self.writer, "Question: {question}")?;
+                    }
                 }
                 Ok(())
             }

@@ -1729,9 +1729,15 @@ fn run_headless<W: io::Write>(
         && status != RunStatus::Success
         && let Some(session_id) = thread.session_id()
     {
+        let answer = if matches!(&status, RunStatus::Blocked { blocker } if blocker.question.is_some())
+        {
+            " \"<your answer>\""
+        } else {
+            ""
+        };
         writeln!(
             writer,
-            "To continue this session, run: orca exec resume {session_id}"
+            "To continue this session, run: orca exec resume {session_id}{answer}"
         )?;
     }
     Ok(exit_code)

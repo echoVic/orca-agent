@@ -289,6 +289,7 @@ fn session_terminal_event_binds_the_verification_proof() {
 fn blocked_terminal_serializes_blocker_fields() {
     let terminal = OperationTerminal::Blocked {
         blocker: orca_core::goal_runtime::BlockerSummary {
+            question: None,
             kind: orca_core::goal_runtime::BlockerKind::EnvironmentContradiction,
             summary: "workspace is read-only".into(),
             fingerprint: "read-only-workspace".into(),

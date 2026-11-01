@@ -2,6 +2,7 @@ use orca_core::goal_runtime::{BlockerKind, BlockerSummary, EvidenceItem};
 use orca_core::tool_types::{ToolRequest, ToolResult};
 use serde::Deserialize;
 
+const MAX_REPORT_BLOCKER_QUESTION_CHARS: usize = 1_000;
 const MAX_REPORT_BLOCKER_SUMMARY_CHARS: usize = 2_000;
 const MAX_REPORT_BLOCKER_EVIDENCE_ITEMS: usize = 32;
 
@@ -9,6 +10,8 @@ const MAX_REPORT_BLOCKER_EVIDENCE_ITEMS: usize = 32;
 struct ReportBlockerArgs {
     kind: BlockerKind,
     summary: String,
+    #[serde(default)]
+    question: Option<String>,
     #[serde(default)]
     evidence: Vec<EvidenceItem>,
 }
@@ -28,8 +31,19 @@ pub fn parse_report_blocker_args(request: &ToolRequest) -> Result<BlockerSummary
             "report_blocker evidence must contain at most {MAX_REPORT_BLOCKER_EVIDENCE_ITEMS} items"
         ));
     }
+    if let Some(question) = &args.question {
+        if question.trim().is_empty() {
+            return Err("report_blocker question must not be empty".to_string());
+        }
+        if question.chars().count() > MAX_REPORT_BLOCKER_QUESTION_CHARS {
+            return Err(format!(
+                "report_blocker question must be at most {MAX_REPORT_BLOCKER_QUESTION_CHARS} characters"
+            ));
+        }
+    }
     let fingerprint = uuid::Uuid::now_v7().to_string();
     Ok(BlockerSummary {
+        question: args.question,
         kind: args.kind,
         summary: args.summary,
         fingerprint,
@@ -72,6 +86,48 @@ mod tests {
         assert_eq!(blocker.summary, "workspace is read-only");
         assert!(blocker.evidence.is_empty());
         assert!(!blocker.fingerprint.is_empty());
+    }
+
+    #[test]
+    fn parses_optional_question() {
+        let request =
+            make_request(r#"{"kind":"user_decision","summary":"s","question":"Use port 8080?"}"#);
+        let blocker = parse_report_blocker_args(&request).expect("valid question");
+        assert_eq!(
+            serde_json::to_value(blocker).unwrap()["question"],
+            "Use port 8080?"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_question() {
+        for question in ["", "   "] {
+            let raw = serde_json::json!({"kind":"user_decision","summary":"s","question":question});
+            let error = parse_report_blocker_args(&make_request(&raw.to_string())).unwrap_err();
+            assert!(
+                error.contains("report_blocker question must not be empty"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_long_question() {
+        let raw =
+            serde_json::json!({"kind":"user_decision","summary":"s","question":"x".repeat(1001)});
+        let error = parse_report_blocker_args(&make_request(&raw.to_string())).unwrap_err();
+        assert!(
+            error.contains("report_blocker question must be at most 1000 characters"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn accepts_question_at_character_limit() {
+        let question = "问".repeat(1000);
+        let raw = serde_json::json!({"kind":"user_decision","summary":"s","question":question});
+        let blocker = parse_report_blocker_args(&make_request(&raw.to_string())).unwrap();
+        assert_eq!(serde_json::to_value(blocker).unwrap()["question"], question);
     }
 
     #[test]

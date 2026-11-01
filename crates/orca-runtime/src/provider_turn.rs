@@ -2399,6 +2399,7 @@ mod tests {
     #[test]
     fn provider_response_result_step_folds_blocked_turn_with_blocker() {
         let blocker = orca_core::goal_runtime::BlockerSummary {
+            question: None,
             kind: orca_core::goal_runtime::BlockerKind::ExternalState,
             summary: "workspace is read-only".to_string(),
             fingerprint: "fp-1".to_string(),

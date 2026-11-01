@@ -1532,14 +1532,21 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
 
     if let Some(rest) = prompt.strip_prefix("report_blocker ") {
         let (kind, summary) = rest.split_once(' ')?;
+        let (summary, question) = summary
+            .split_once(" ? ")
+            .map_or((summary, None), |(summary, question)| {
+                (summary, Some(question))
+            });
+        let mut arguments = serde_json::json!({ "kind": kind, "summary": summary });
+        if let Some(question) = question {
+            arguments["question"] = question.into();
+        }
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
             name: ToolName::ReportBlocker,
             action: ActionKind::Agent,
             target: None,
-            raw_arguments: Some(
-                serde_json::json!({ "kind": kind, "summary": summary }).to_string(),
-            ),
+            raw_arguments: Some(arguments.to_string()),
         });
     }
 
