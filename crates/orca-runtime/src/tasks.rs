@@ -714,6 +714,9 @@ pub struct TaskHandle {
 
 #[derive(Clone, Debug)]
 pub enum MainSessionTerminalUpdate {
+    Blocked {
+        error: String,
+    },
     Completed {
         result: String,
     },
@@ -1151,6 +1154,7 @@ impl PendingSubagentResult {
     pub fn status_label(&self) -> &'static str {
         match self.status {
             TaskStatus::Completed => "completed",
+            TaskStatus::Blocked => "blocked",
             TaskStatus::Failed => "failed",
             TaskStatus::Cancelled => "cancelled",
             TaskStatus::Stopped | TaskStatus::ApprovalRequired => "stopped",
@@ -1306,7 +1310,11 @@ fn finished_child_session_transcript(
 ) -> Result<TaskTranscriptRecord, TaskTranscriptReadError> {
     let finished = matches!(
         record.status,
-        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Stopped | TaskStatus::Cancelled
+        TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::Blocked
+            | TaskStatus::Stopped
+            | TaskStatus::Cancelled
     );
     let Some(child_thread_id) = record
         .subagent_child_thread_id
@@ -2357,6 +2365,7 @@ impl TaskRegistry {
                 TaskStatus::Completed
                     | TaskStatus::Stopped
                     | TaskStatus::Failed
+                    | TaskStatus::Blocked
                     | TaskStatus::Cancelled
             ) && task.completed_at_ms.is_some()
                 && task.worker_pid.is_none()
@@ -4388,6 +4397,7 @@ impl TaskRegistry {
                     record.status,
                     TaskStatus::Completed
                         | TaskStatus::Failed
+                        | TaskStatus::Blocked
                         | TaskStatus::Cancelled
                         | TaskStatus::Stopped
                 )
@@ -4704,6 +4714,15 @@ impl TaskRegistry {
                         record.status = TaskStatus::Completed;
                         record.result = Some(result);
                         record.error = None;
+                        record.tool = None;
+                        record.pending_tool_call = None;
+                        record.pending_tool_approval_response = None;
+                        record.pending_provider_response = None;
+                    }
+                    MainSessionTerminalUpdate::Blocked { error } => {
+                        record.status = TaskStatus::Blocked;
+                        record.result = None;
+                        record.error = Some(error);
                         record.tool = None;
                         record.pending_tool_call = None;
                         record.pending_tool_approval_response = None;
@@ -6833,6 +6852,7 @@ fn is_terminal(status: TaskStatus) -> bool {
         TaskStatus::Stopped
             | TaskStatus::Completed
             | TaskStatus::Failed
+            | TaskStatus::Blocked
             | TaskStatus::ApprovalRequired
             | TaskStatus::Cancelled
     )

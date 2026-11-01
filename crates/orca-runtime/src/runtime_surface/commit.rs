@@ -6504,6 +6504,9 @@ fn actor_control_subagent_activity_authorized(
                         super::SurfaceSubagentTerminalStatus::Completed,
                         super::SurfaceTaskStatus::Completed
                     ) | (
+                        super::SurfaceSubagentTerminalStatus::Blocked,
+                        super::SurfaceTaskStatus::Blocked
+                    ) | (
                         super::SurfaceSubagentTerminalStatus::Failed,
                         super::SurfaceTaskStatus::Failed
                     ) | (
@@ -6524,6 +6527,9 @@ fn actor_control_subagent_activity_authorized(
                     (
                         super::SurfaceSubagentTerminalStatus::Completed,
                         super::SurfaceTaskStatus::Completed
+                    ) | (
+                        super::SurfaceSubagentTerminalStatus::Blocked,
+                        super::SurfaceTaskStatus::Blocked
                     ) | (
                         super::SurfaceSubagentTerminalStatus::Failed,
                         super::SurfaceTaskStatus::Failed
@@ -6982,6 +6988,7 @@ fn actor_control_task_ownership_authorized(
             task.status,
             super::SurfaceTaskStatus::Completed
                 | super::SurfaceTaskStatus::Failed
+                | super::SurfaceTaskStatus::Blocked
                 | super::SurfaceTaskStatus::Stopped
                 | super::SurfaceTaskStatus::Cancelled
         )
@@ -9148,6 +9155,7 @@ fn workflow_background_stop_authorized(
         super::SurfaceTaskStatus::Stopped
             | super::SurfaceTaskStatus::Completed
             | super::SurfaceTaskStatus::Failed
+            | super::SurfaceTaskStatus::Blocked
             | super::SurfaceTaskStatus::Cancelled
     ) && task.revision == *task_expected
         && task_expected.get().checked_add(1) == Some(task_next.get())
@@ -9328,6 +9336,7 @@ fn provider_background_stop_authorized(
             super::SurfaceTaskStatus::Stopped
                 | super::SurfaceTaskStatus::Completed
                 | super::SurfaceTaskStatus::Failed
+                | super::SurfaceTaskStatus::Blocked
                 | super::SurfaceTaskStatus::ApprovalRequired
                 | super::SurfaceTaskStatus::Cancelled
         )
@@ -10949,8 +10958,8 @@ fn actor_finalizer_task_terminal_authorized(
         super::OperationTerminal::Failed { .. }
         | super::OperationTerminal::Panicked { .. }
         | super::OperationTerminal::JoinFailed { .. }
-        | super::OperationTerminal::BudgetExhausted { .. }
-        | super::OperationTerminal::Blocked { .. } => super::SurfaceTaskStatus::Failed,
+        | super::OperationTerminal::BudgetExhausted { .. } => super::SurfaceTaskStatus::Failed,
+        super::OperationTerminal::Blocked { .. } => super::SurfaceTaskStatus::Blocked,
     };
     task.task_type == super::SurfaceTaskType::MainSession
         && task.parent_operation.as_ref() == Some(operation_id)

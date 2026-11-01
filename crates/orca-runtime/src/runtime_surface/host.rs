@@ -542,6 +542,7 @@ impl RuntimeSurfaceThreadHandle {
             task.status,
             TaskStatus::Completed
                 | TaskStatus::Failed
+                | TaskStatus::Blocked
                 | TaskStatus::Cancelled
                 | TaskStatus::Stopped
         ) {
@@ -617,6 +618,7 @@ fn task_status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Paused => "paused",
         TaskStatus::Stopping => "stopping",
         TaskStatus::Completed => "completed",
+        TaskStatus::Blocked => "blocked",
         TaskStatus::Failed => "failed",
         TaskStatus::Cancelled => "cancelled",
         TaskStatus::Stopped => "stopped",

@@ -385,6 +385,7 @@ fn execution_state(record: &TaskRecord, waiting_on_children: bool) -> ExecutionS
         TaskStatus::Stopped
         | TaskStatus::Completed
         | TaskStatus::Failed
+        | TaskStatus::Blocked
         | TaskStatus::Cancelled => ExecutionState::Terminal,
         TaskStatus::ApprovalRequired => ExecutionState::Waiting,
     }
@@ -404,6 +405,7 @@ pub fn task_waits_on_children(registry: &TaskRegistry, task_id: &str) -> bool {
                 TaskStatus::Stopped
                     | TaskStatus::Completed
                     | TaskStatus::Failed
+                    | TaskStatus::Blocked
                     | TaskStatus::Cancelled
             )
     })
@@ -471,6 +473,7 @@ pub fn status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Stopping => "stopping",
         TaskStatus::Stopped => "stopped",
         TaskStatus::Completed => "completed",
+        TaskStatus::Blocked => "blocked",
         TaskStatus::Failed => "failed",
         TaskStatus::ApprovalRequired => "approval_required",
         TaskStatus::Cancelled => "cancelled",

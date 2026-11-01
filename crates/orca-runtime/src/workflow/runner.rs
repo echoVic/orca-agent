@@ -954,6 +954,7 @@ impl WorkflowRunner {
                         task.status,
                         TaskStatus::Completed
                             | TaskStatus::Failed
+                            | TaskStatus::Blocked
                             | TaskStatus::Stopped
                             | TaskStatus::Cancelled
                     ) {
@@ -2689,6 +2690,7 @@ fn workflow_task_lifecycle_evidence(task: &RuntimeTaskLifecycle) -> WorkflowTask
         status: match task.status() {
             RuntimeTaskStatus::Running => "running",
             RuntimeTaskStatus::Succeeded => "succeeded",
+            RuntimeTaskStatus::Blocked => "blocked",
             RuntimeTaskStatus::Failed => "failed",
             RuntimeTaskStatus::Cancelled => "cancelled",
             RuntimeTaskStatus::ApprovalRequired => "approval_required",

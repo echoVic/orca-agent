@@ -618,7 +618,10 @@ impl AppState {
                 if old.status == task.status
                     || !matches!(
                         task.status,
-                        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+                        TaskStatus::Completed
+                            | TaskStatus::Failed
+                            | TaskStatus::Blocked
+                            | TaskStatus::Cancelled
                     )
                 {
                     return None;
@@ -631,6 +634,9 @@ impl AppState {
                     task.id.clone(),
                     match task.status {
                         TaskStatus::Completed => format!("Agent completed: {name}"),
+                        TaskStatus::Blocked => {
+                            format!("Agent blocked: {}", task.error.as_deref().unwrap_or(name))
+                        }
                         TaskStatus::Failed => {
                             format!("Agent failed: {}", task.error.as_deref().unwrap_or(name))
                         }
@@ -771,6 +777,7 @@ fn workflow_task_panel_group(task: &BackgroundTaskSummary) -> u8 {
         orca_core::task_types::TaskStatus::Stopped
         | orca_core::task_types::TaskStatus::Completed
         | orca_core::task_types::TaskStatus::Failed
+        | orca_core::task_types::TaskStatus::Blocked
         | orca_core::task_types::TaskStatus::Cancelled => 2,
     }
 }

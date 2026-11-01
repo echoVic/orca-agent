@@ -2051,6 +2051,7 @@ fn task_status(status: SurfaceTaskStatus) -> TaskStatus {
         SurfaceTaskStatus::Stopped => TaskStatus::Stopped,
         SurfaceTaskStatus::Completed => TaskStatus::Completed,
         SurfaceTaskStatus::Failed => TaskStatus::Failed,
+        SurfaceTaskStatus::Blocked => TaskStatus::Blocked,
         SurfaceTaskStatus::ApprovalRequired => TaskStatus::ApprovalRequired,
         SurfaceTaskStatus::Cancelled => TaskStatus::Cancelled,
     }

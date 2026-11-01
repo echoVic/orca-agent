@@ -207,7 +207,7 @@ fn shell_task_settled_events(
     } else {
         match end.status {
             TaskStatus::Completed => (surface::SurfaceTaskStatus::Completed, None),
-            TaskStatus::Failed => (
+            TaskStatus::Failed | TaskStatus::Blocked => (
                 surface::SurfaceTaskStatus::Failed,
                 end.exit_code.map(ShellEndDetail::ExitCode),
             ),

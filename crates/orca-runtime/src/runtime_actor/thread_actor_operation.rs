@@ -2204,6 +2204,7 @@ impl ThreadActor {
                 surface::SurfaceTaskStatus::Stopped
                     | surface::SurfaceTaskStatus::Completed
                     | surface::SurfaceTaskStatus::Failed
+                    | surface::SurfaceTaskStatus::Blocked
                     | surface::SurfaceTaskStatus::Cancelled
             ) {
                 return Ok(surface::MutationReply::Uncommitted {
@@ -2370,6 +2371,7 @@ impl ThreadActor {
                 surface::SurfaceTaskStatus::Stopped
                     | surface::SurfaceTaskStatus::Completed
                     | surface::SurfaceTaskStatus::Failed
+                    | surface::SurfaceTaskStatus::Blocked
                     | surface::SurfaceTaskStatus::Cancelled
             )
         {
@@ -2379,6 +2381,7 @@ impl ThreadActor {
                 let status = match task.status {
                     surface::SurfaceTaskStatus::Stopped => "stopped",
                     surface::SurfaceTaskStatus::Completed => "completed",
+                    surface::SurfaceTaskStatus::Blocked => "blocked",
                     surface::SurfaceTaskStatus::Failed => "failed",
                     surface::SurfaceTaskStatus::Cancelled => "cancelled",
                     _ => "not controllable",

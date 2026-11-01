@@ -436,6 +436,7 @@ impl<'a> ExecutionScope<'a> {
                 TaskStatus::Stopped
                     | TaskStatus::Completed
                     | TaskStatus::Failed
+                    | TaskStatus::Blocked
                     | TaskStatus::Cancelled
             );
             if live && let Some(parent) = summary.parent_task_id.as_ref() {
@@ -473,6 +474,7 @@ impl<'a> ExecutionScope<'a> {
             TaskStatus::Stopped
             | TaskStatus::Completed
             | TaskStatus::Failed
+            | TaskStatus::Blocked
             | TaskStatus::Cancelled => ExecutionState::Terminal,
             TaskStatus::ApprovalRequired => ExecutionState::Waiting,
         }
@@ -943,7 +945,11 @@ pub fn mark_started(registry: &TaskRegistry, task_id: &str) -> Option<TaskRecord
 pub fn occupies_scope(status: TaskStatus) -> bool {
     !matches!(
         status,
-        TaskStatus::Stopped | TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        TaskStatus::Stopped
+            | TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::Blocked
+            | TaskStatus::Cancelled
     )
 }
 

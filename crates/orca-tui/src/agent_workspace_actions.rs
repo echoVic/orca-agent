@@ -112,6 +112,7 @@ pub(crate) fn handle_agent_workspace_key(
                         task.status,
                         TaskStatus::Completed
                             | TaskStatus::Failed
+                            | TaskStatus::Blocked
                             | TaskStatus::Cancelled
                             | TaskStatus::Stopped
                     ) =>
@@ -124,6 +125,7 @@ pub(crate) fn handle_agent_workspace_key(
                             task.status,
                             TaskStatus::Completed
                                 | TaskStatus::Failed
+                                | TaskStatus::Blocked
                                 | TaskStatus::Cancelled
                                 | TaskStatus::Stopped
                         ) =>

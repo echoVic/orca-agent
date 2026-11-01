@@ -2189,7 +2189,11 @@ fn is_transcript_readable_task(task: &BackgroundTaskSummary) -> bool {
 fn is_stoppable_task(task: &BackgroundTaskSummary) -> bool {
     !matches!(
         task.status,
-        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Stopped
+        TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::Blocked
+            | TaskStatus::Cancelled
+            | TaskStatus::Stopped
     )
 }
 
@@ -2911,7 +2915,7 @@ fn workflow_launch_input_label(input: &orca_core::workflow_types::WorkflowInput)
 fn workflow_gauge_ratio(status: TaskStatus, tick: u64) -> f64 {
     match status {
         TaskStatus::Completed => 1.0,
-        TaskStatus::Failed | TaskStatus::Cancelled => 1.0,
+        TaskStatus::Failed | TaskStatus::Blocked | TaskStatus::Cancelled => 1.0,
         TaskStatus::Queued
         | TaskStatus::Paused
         | TaskStatus::Stopped
@@ -2933,6 +2937,7 @@ fn workflow_gauge_ratio(status: TaskStatus, tick: u64) -> f64 {
 fn workflow_gauge_label(status: TaskStatus) -> String {
     match status {
         TaskStatus::Completed => "done".to_string(),
+        TaskStatus::Blocked => "blocked".to_string(),
         TaskStatus::Failed => "failed".to_string(),
         TaskStatus::ApprovalRequired => "approval required".to_string(),
         TaskStatus::Cancelled => "cancelled".to_string(),
@@ -4327,6 +4332,7 @@ fn task_status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Stopping => "stopping",
         TaskStatus::Stopped => "stopped",
         TaskStatus::Completed => "completed",
+        TaskStatus::Blocked => "blocked",
         TaskStatus::Failed => "failed",
         TaskStatus::ApprovalRequired => "approval required",
         TaskStatus::Cancelled => "cancelled",
@@ -4337,7 +4343,7 @@ fn task_status_color(status: TaskStatus, theme: &Theme) -> Color {
     match status {
         TaskStatus::Running | TaskStatus::Stopping => theme.warning,
         TaskStatus::Completed => theme.success,
-        TaskStatus::Failed | TaskStatus::Cancelled => theme.error,
+        TaskStatus::Failed | TaskStatus::Blocked | TaskStatus::Cancelled => theme.error,
         TaskStatus::ApprovalRequired => theme.warning,
         TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Stopped => theme.muted,
     }

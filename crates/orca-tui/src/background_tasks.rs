@@ -226,7 +226,11 @@ pub(crate) fn task_notice_label(tasks: &[BackgroundTaskSummary], task_id: &str) 
 pub(crate) fn is_terminal_task_status(status: TaskStatus) -> bool {
     matches!(
         status,
-        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Stopped
+        TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::Blocked
+            | TaskStatus::Cancelled
+            | TaskStatus::Stopped
     )
 }
 

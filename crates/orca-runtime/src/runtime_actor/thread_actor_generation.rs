@@ -87,6 +87,11 @@ fn settled_subagent_batch(
             surface::SurfaceSubagentTerminalStatus::Completed,
             "completed",
         ),
+        TaskStatus::Blocked => (
+            surface::SurfaceTaskStatus::Blocked,
+            surface::SurfaceSubagentTerminalStatus::Blocked,
+            "blocked",
+        ),
         TaskStatus::Failed => (
             surface::SurfaceTaskStatus::Failed,
             surface::SurfaceSubagentTerminalStatus::Failed,
@@ -1566,6 +1571,9 @@ impl ThreadActor {
                             }
                             surface::SurfaceSubagentTerminalStatus::Failed => {
                                 surface::SurfaceTaskStatus::Failed
+                            }
+                            surface::SurfaceSubagentTerminalStatus::Blocked => {
+                                surface::SurfaceTaskStatus::Blocked
                             }
                             surface::SurfaceSubagentTerminalStatus::Cancelled => {
                                 surface::SurfaceTaskStatus::Cancelled

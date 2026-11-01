@@ -7914,6 +7914,7 @@ fn reconcile_durable_provider_outcomes_on_start(
                 TaskStatus::Completed
                     | TaskStatus::ApprovalRequired
                     | TaskStatus::Failed
+                    | TaskStatus::Blocked
                     | TaskStatus::Stopped
                     | TaskStatus::Cancelled
             ) {
@@ -8393,6 +8394,18 @@ fn mirror_recovered_typed_provider_outcome(
                 };
                 task_registry.stop_with_usage(task_id, result.to_string(), outcome.usage)
             }
+            TaskStatus::Blocked => task_registry
+                .apply_main_session_terminal_update(
+                    task_id,
+                    MainSessionTerminalUpdate::Blocked {
+                        error: outcome
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "background provider blocked".to_string()),
+                    },
+                    outcome.usage,
+                )
+                .map(|_| ()),
             TaskStatus::Failed => task_registry
                 .apply_main_session_terminal_update(
                     task_id,
@@ -8504,7 +8517,7 @@ fn reconcile_terminal_main_session_tasks(
                 Some(surface::DisplayText::new(message.as_str())),
             ),
             surface::OperationTerminal::Blocked { blocker, .. } => (
-                surface::SurfaceTaskStatus::Failed,
+                surface::SurfaceTaskStatus::Blocked,
                 None,
                 Some(surface::DisplayText::new(blocker.summary.as_str())),
             ),
@@ -8585,6 +8598,18 @@ fn reconcile_terminal_main_session_tasks(
                             .as_ref()
                             .map(|value| value.as_str().to_string())
                             .unwrap_or_default(),
+                    },
+                    Some(legacy_usage),
+                );
+            }
+            surface::SurfaceTaskStatus::Blocked => {
+                let _ = task_registry.apply_main_session_terminal_update(
+                    task.task_id.as_str(),
+                    MainSessionTerminalUpdate::Blocked {
+                        error: error
+                            .as_ref()
+                            .map(|value| value.as_str().to_string())
+                            .unwrap_or_else(|| "Background turn blocked".to_string()),
                     },
                     Some(legacy_usage),
                 );
@@ -8690,7 +8715,7 @@ fn prepare_main_session_task_terminal_projection(
             )),
         ),
         surface::OperationTerminal::Blocked { blocker, .. } => (
-            surface::SurfaceTaskStatus::Failed,
+            surface::SurfaceTaskStatus::Blocked,
             None,
             Some(surface::DisplayText::new(blocker.summary.as_str())),
         ),
@@ -8743,6 +8768,19 @@ fn mirror_main_session_task_terminal_projection(
                 Some(legacy_usage),
             );
         }
+        surface::SurfaceTaskStatus::Blocked => {
+            let _ = task_registry.apply_main_session_terminal_update(
+                projection.task_id.as_str(),
+                MainSessionTerminalUpdate::Blocked {
+                    error: projection
+                        .error
+                        .as_ref()
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_else(|| "Background turn blocked".to_string()),
+                },
+                Some(legacy_usage),
+            );
+        }
         surface::SurfaceTaskStatus::Failed => {
             let _ = task_registry.apply_main_session_terminal_update(
                 projection.task_id.as_str(),
@@ -8788,7 +8826,11 @@ fn reconcile_main_session_task_mirror(task_registry: &TaskRegistry, task: &surfa
     }
     if matches!(
         legacy.status,
-        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Stopped
+        TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::Blocked
+            | TaskStatus::Cancelled
+            | TaskStatus::Stopped
     ) {
         return;
     }
@@ -8808,6 +8850,19 @@ fn reconcile_main_session_task_mirror(task_registry: &TaskRegistry, task: &surfa
                         .as_ref()
                         .map(|value| value.as_str().to_string())
                         .unwrap_or_default(),
+                },
+                usage,
+            )
+            .map(|_| ()),
+        surface::SurfaceTaskStatus::Blocked => task_registry
+            .apply_main_session_terminal_update(
+                task.task_id.as_str(),
+                MainSessionTerminalUpdate::Blocked {
+                    error: task
+                        .error
+                        .as_ref()
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_else(|| "Background turn blocked".to_string()),
                 },
                 usage,
             )
@@ -8865,6 +8920,7 @@ fn reconcile_main_session_task_mirrors_on_start(
             task.status,
             surface::SurfaceTaskStatus::Completed
                 | surface::SurfaceTaskStatus::Failed
+                | surface::SurfaceTaskStatus::Blocked
                 | surface::SurfaceTaskStatus::Stopped
                 | surface::SurfaceTaskStatus::Cancelled
                 | surface::SurfaceTaskStatus::ApprovalRequired
@@ -14707,11 +14763,10 @@ fn durable_typed_provider_outcome(
         } else {
             match outcome.status {
                 RunStatus::Success => TaskStatus::Completed,
+                RunStatus::Blocked { .. } => TaskStatus::Blocked,
                 RunStatus::ApprovalRequired => TaskStatus::ApprovalRequired,
                 RunStatus::Cancelled => TaskStatus::Cancelled,
-                RunStatus::Failed | RunStatus::VerificationFailed | RunStatus::Blocked { .. } => {
-                    TaskStatus::Failed
-                }
+                RunStatus::Failed | RunStatus::VerificationFailed => TaskStatus::Failed,
             }
         },
         response: outcome.response.clone(),
@@ -17266,6 +17321,7 @@ impl ThreadActor {
                 orca_core::task_types::TaskStatus::Stopped
                     | orca_core::task_types::TaskStatus::Completed
                     | orca_core::task_types::TaskStatus::Failed
+                    | orca_core::task_types::TaskStatus::Blocked
                     | orca_core::task_types::TaskStatus::Cancelled
             ) {
                 return true;
@@ -23499,7 +23555,16 @@ fn run_provider_background_task(
                     usage,
                 );
             }
-            RunStatus::Failed | RunStatus::VerificationFailed | RunStatus::Blocked { .. } => {
+            RunStatus::Blocked { ref blocker } => {
+                let _ = context.task_registry.apply_main_session_terminal_update(
+                    &context.task_id,
+                    MainSessionTerminalUpdate::Blocked {
+                        error: blocker.summary.clone(),
+                    },
+                    usage,
+                );
+            }
+            RunStatus::Failed | RunStatus::VerificationFailed => {
                 let _ = context.task_registry.apply_main_session_terminal_update(
                     &context.task_id,
                     MainSessionTerminalUpdate::Failed {
@@ -24016,6 +24081,106 @@ mod tests {
     // to publish its durable provider outcome, which turned the seed phase into
     // an intermittent failure.
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn surface_task_status_blocked_terminal_preserves_projection_and_registry() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled);
+        let mut snapshot = initial_surface_snapshot(
+            surface::SurfaceThreadId::try_from_bytes(*uuid::Uuid::new_v4().as_bytes()).unwrap(),
+            surface::SurfaceIncarnation::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+            surface::ThreadOwnerEpoch::new(1),
+            surface::ThreadPersistence::EphemeralAttached,
+            &config,
+            "blocked task",
+            None,
+        )
+        .unwrap();
+        let operation_id =
+            surface::SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let registry = TaskRegistry::new("blocked-mirror".to_string());
+        let record = registry.create_main_session("blocked task".to_string());
+        registry.mark_running(&record.id).unwrap();
+        let task = surface::SurfaceTask {
+            task_id: surface::SurfaceTaskId::try_new(record.id.clone()).expect("surface task id"),
+            revision: surface::TaskRevision::try_new(2).expect("task revision"),
+            task_type: surface::SurfaceTaskType::MainSession,
+            status: surface::SurfaceTaskStatus::Running,
+            backgrounded: false,
+            description: surface::DisplayText::new("foreground mirror"),
+            created_at: surface::UnixMillis::new(1),
+            started_at: Some(surface::UnixMillis::new(2)),
+            completed_at: None,
+            parent_operation: Some(operation_id.clone()),
+            parent_task_id: None,
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: None,
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        };
+        snapshot.tasks.push(task);
+        let blocker = orca_core::goal_runtime::BlockerSummary {
+            kind: orca_core::goal_runtime::BlockerKind::MissingAuthority,
+            summary: "write permission needed".to_string(),
+            fingerprint: "blocked-test".to_string(),
+            evidence: Vec::new(),
+        };
+        let terminal = surface::OperationTerminalRecord {
+            operation_id: operation_id.clone(),
+            finalize_intent_id: surface::SurfaceFinalizeIntentId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            terminal: surface::OperationTerminal::Blocked {
+                blocker: blocker.clone(),
+                usage: orca_core::budget::BudgetUsage::default(),
+            },
+            usage: surface::UsageTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_tokens: 0,
+                estimated_cost_usd_micros: 0,
+            },
+            source_diagnostic_digest: None,
+            settlement_receipts: Vec::new(),
+            completion_proof: Default::default(),
+            committed_at: surface::UnixMillis::new(3),
+        };
+        let prepared =
+            prepare_main_session_task_terminal_projection(&snapshot, &operation_id, &terminal)
+                .unwrap()
+                .unwrap();
+        assert_eq!(prepared.status, surface::SurfaceTaskStatus::Blocked);
+        assert_eq!(
+            prepared.error.as_ref().unwrap().as_str(),
+            "write permission needed"
+        );
+        mirror_main_session_task_terminal_projection(&registry, &terminal, &prepared);
+        assert_eq!(
+            registry.get(&record.id).unwrap().status,
+            TaskStatus::Blocked
+        );
+        assert_eq!(
+            crate::runtime_lifecycle::RuntimeTaskStatus::from_run_status(RunStatus::Blocked {
+                blocker: blocker.clone()
+            }),
+            crate::runtime_lifecycle::RuntimeTaskStatus::Blocked
+        );
+        let outcome = durable_typed_provider_outcome(&TypedProviderBackgroundOutcome {
+            response: None,
+            status: RunStatus::Blocked { blocker },
+            error: Some("write permission needed".to_string()),
+            usage: None,
+            operation_terminal: None,
+            completed_at_ms: 3,
+        });
+        assert_eq!(outcome.status, TaskStatus::Blocked);
+    }
 
     #[test]
     fn passthrough_finish_fault_cannot_be_consumed_by_another_runtime_thread() {

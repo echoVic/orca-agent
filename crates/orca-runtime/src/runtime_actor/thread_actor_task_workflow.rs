@@ -986,6 +986,7 @@ impl ThreadActor {
                         record.status,
                         TaskStatus::Completed
                             | TaskStatus::Failed
+                            | TaskStatus::Blocked
                             | TaskStatus::Stopped
                             | TaskStatus::Cancelled
                             | TaskStatus::ApprovalRequired

@@ -121,11 +121,11 @@ const ID_TABLES = new Set([
 ]);
 
 const TERMINAL_TRANSITION_STATES = {
-  task_status_transitions: ["Stopped", "Completed", "Failed", "Cancelled"],
+  task_status_transitions: ["Stopped", "Completed", "Failed", "Blocked", "Cancelled"],
   workflow_run_status_transitions: ["Stopped", "Completed", "Failed", "Cancelled"],
   workflow_phase_status_transitions: ["Stopped", "Completed", "Failed", "Cancelled"],
   workflow_agent_attempt_transitions: ["Cached", "Completed", "Failed", "Cancelled"],
-  subagent_status_transitions: ["Completed", "Failed", "Cancelled"],
+  subagent_status_transitions: ["Completed", "Failed", "Blocked", "Cancelled"],
 };
 
 const COMMAND_CAPABILITIES = new Set([
@@ -296,6 +296,7 @@ const TRANSITION_STATE_SETS = {
     "Stopped",
     "Completed",
     "Failed",
+    "Blocked",
     "ApprovalRequired",
     "Cancelled",
   ]),
@@ -334,6 +335,7 @@ const TRANSITION_STATE_SETS = {
     "Running(Progress)",
     "Completed",
     "Failed",
+    "Blocked",
     "Cancelled",
   ]),
   acp_prompt_binding_transitions: new Set([

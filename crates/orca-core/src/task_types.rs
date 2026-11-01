@@ -16,6 +16,7 @@ pub enum TaskStatus {
     Failed,
     ApprovalRequired,
     Cancelled,
+    Blocked,
 }
 
 impl TaskStatus {
@@ -293,5 +294,39 @@ impl TaskActivitySummary {
 
     pub fn requires_attention(self) -> bool {
         self.attention_count > 0
+    }
+}
+
+#[cfg(test)]
+mod blocked_status_tests {
+    use super::*;
+
+    #[test]
+    fn task_status_blocked_is_terminal_without_attention() {
+        assert!(!TaskStatus::Blocked.is_active());
+        assert!(!TaskStatus::Blocked.requires_attention());
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Blocked).unwrap(),
+            "\"blocked\""
+        );
+    }
+
+    #[test]
+    fn task_status_reads_every_pre_blocked_value() {
+        for name in [
+            "queued",
+            "running",
+            "paused",
+            "stopping",
+            "stopped",
+            "completed",
+            "failed",
+            "approval_required",
+            "cancelled",
+        ] {
+            let wire = serde_json::to_string(name).unwrap();
+            let status: TaskStatus = serde_json::from_str(&wire).unwrap();
+            assert_eq!(serde_json::to_string(&status).unwrap(), wire);
+        }
     }
 }

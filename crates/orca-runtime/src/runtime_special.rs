@@ -716,6 +716,7 @@ fn task_status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Stopping => "stopping",
         TaskStatus::Stopped => "stopped",
         TaskStatus::Completed => "completed",
+        TaskStatus::Blocked => "blocked",
         TaskStatus::Failed => "failed",
         TaskStatus::ApprovalRequired => "approval_required",
         TaskStatus::Cancelled => "cancelled",
@@ -735,7 +736,11 @@ fn task_type_label(task_type: TaskType) -> &'static str {
 fn is_terminal_task_status(status: TaskStatus) -> bool {
     matches!(
         status,
-        TaskStatus::Stopped | TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        TaskStatus::Stopped
+            | TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::Blocked
+            | TaskStatus::Cancelled
     )
 }
 

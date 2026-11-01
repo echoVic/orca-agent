@@ -35,6 +35,7 @@ pub enum RuntimeTaskStatus {
     Cancelled,
     ApprovalRequired,
     BudgetExhausted,
+    Blocked,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,7 +233,7 @@ impl RuntimeTaskStatus {
         match status {
             RunStatus::Success => Self::Succeeded,
             RunStatus::Failed | RunStatus::VerificationFailed => Self::Failed,
-            RunStatus::Blocked { .. } => Self::Failed,
+            RunStatus::Blocked { .. } => Self::Blocked,
             RunStatus::Cancelled => Self::Cancelled,
             RunStatus::ApprovalRequired => Self::ApprovalRequired,
         }

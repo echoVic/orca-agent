@@ -1460,6 +1460,7 @@ pub(crate) fn detached_child_permission_interaction_terminal_matches(
             SurfaceTaskStatus::Stopped
                 | SurfaceTaskStatus::Completed
                 | SurfaceTaskStatus::Failed
+                | SurfaceTaskStatus::Blocked
                 | SurfaceTaskStatus::Cancelled
         )
         || task.completed_at.is_none()
@@ -1470,6 +1471,7 @@ pub(crate) fn detached_child_permission_interaction_terminal_matches(
             subagent.status,
             SurfaceSubagentStatus::Completed
                 | SurfaceSubagentStatus::Failed
+                | SurfaceSubagentStatus::Blocked
                 | SurfaceSubagentStatus::Cancelled
         )
     {
@@ -8946,6 +8948,7 @@ fn apply_subagent_patch(
             subagent.status = match status {
                 SurfaceSubagentTerminalStatus::Completed => SurfaceSubagentStatus::Completed,
                 SurfaceSubagentTerminalStatus::Failed => SurfaceSubagentStatus::Failed,
+                SurfaceSubagentTerminalStatus::Blocked => SurfaceSubagentStatus::Blocked,
                 SurfaceSubagentTerminalStatus::Cancelled => SurfaceSubagentStatus::Cancelled,
             };
             subagent.output = output.clone();
@@ -9066,6 +9069,7 @@ fn apply_subagent_patch(
             subagent.status = match status {
                 SurfaceSubagentTerminalStatus::Completed => SurfaceSubagentStatus::Completed,
                 SurfaceSubagentTerminalStatus::Failed => SurfaceSubagentStatus::Failed,
+                SurfaceSubagentTerminalStatus::Blocked => SurfaceSubagentStatus::Blocked,
                 SurfaceSubagentTerminalStatus::Cancelled => SurfaceSubagentStatus::Cancelled,
             };
             subagent.output = output.clone();
@@ -9109,15 +9113,24 @@ fn task_status_transition_allowed(
         (from, to),
         (
             Queued,
-            Running | Paused | Stopping | Stopped | Failed | Cancelled
+            Running | Paused | Stopping | Stopped | Failed | Blocked | Cancelled
         ) | (
             Running,
-            Paused | Stopping | Stopped | Completed | Failed | ApprovalRequired | Cancelled
+            Paused
+                | Stopping
+                | Stopped
+                | Completed
+                | Failed
+                | Blocked
+                | ApprovalRequired
+                | Cancelled
         ) | (
             ApprovalRequired,
-            Running | Stopping | Stopped | Failed | Cancelled
-        ) | (Paused, Running | Stopping | Stopped | Failed | Cancelled)
-            | (Stopping, Stopped | Failed | Cancelled)
+            Running | Stopping | Stopped | Failed | Blocked | Cancelled
+        ) | (
+            Paused,
+            Running | Stopping | Stopped | Failed | Blocked | Cancelled
+        ) | (Stopping, Stopped | Failed | Blocked | Cancelled)
     );
     manifest_transition
         || (task_type == SurfaceTaskType::Subagent && from == Running && to == Running)
@@ -9286,6 +9299,7 @@ fn apply_task_patch(
                 SurfaceTaskStatus::Stopped
                     | SurfaceTaskStatus::Completed
                     | SurfaceTaskStatus::Failed
+                    | SurfaceTaskStatus::Blocked
                     | SurfaceTaskStatus::Cancelled
             ) {
                 task.pending_interaction_id = None;
@@ -9376,6 +9390,7 @@ fn apply_task_patch(
                 SurfaceTaskStatus::Stopped
                     | SurfaceTaskStatus::Completed
                     | SurfaceTaskStatus::Failed
+                    | SurfaceTaskStatus::Blocked
                     | SurfaceTaskStatus::Cancelled
             ) || (*backgrounded != background_fence.is_some())
             {

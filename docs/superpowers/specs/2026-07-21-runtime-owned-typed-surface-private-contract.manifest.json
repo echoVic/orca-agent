@@ -10506,7 +10506,7 @@
   },
   "artifact_bundle": {
     "private_contract_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-    "private_contract_sha256": "72ec3a54e9a70a3be6358874f25b75735377bea1ce521404dbbd69d3bb0931e7",
+    "private_contract_sha256": "4fd4c36a3faa8fbdb91f99eee970f6b404b41bc75855475df8265e70874e95b1",
     "parent_design_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md",
     "parent_design_commit": "89979d6062246ec4a9b98032ee62cc6d45c1e3ba",
     "parent_design_blob": "bf80af4ce1fde3607af3fd75874abddfaf79b450",
@@ -12016,6 +12016,10 @@
     ],
     [
       "Queued",
+      "Blocked"
+    ],
+    [
+      "Queued",
       "Cancelled"
     ],
     [
@@ -12037,6 +12041,10 @@
     [
       "Running",
       "Failed"
+    ],
+    [
+      "Running",
+      "Blocked"
     ],
     [
       "Running",
@@ -12064,6 +12072,10 @@
     ],
     [
       "ApprovalRequired",
+      "Blocked"
+    ],
+    [
+      "ApprovalRequired",
       "Cancelled"
     ],
     [
@@ -12084,6 +12096,10 @@
     ],
     [
       "Paused",
+      "Blocked"
+    ],
+    [
+      "Paused",
       "Cancelled"
     ],
     [
@@ -12093,6 +12109,10 @@
     [
       "Stopping",
       "Failed"
+    ],
+    [
+      "Stopping",
+      "Blocked"
     ],
     [
       "Stopping",
@@ -12281,6 +12301,10 @@
     [
       "Running",
       "Failed"
+    ],
+    [
+      "Running",
+      "Blocked"
     ],
     [
       "Running",
