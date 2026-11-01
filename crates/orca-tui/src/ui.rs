@@ -9815,6 +9815,30 @@ mod tests {
     }
 
     #[test]
+    fn blocked_terminal_diagnostics_render_question_on_its_own_line() {
+        let terminal = orca_runtime::surface::OperationTerminal::Blocked {
+            blocker: orca_core::goal_runtime::BlockerSummary {
+                kind: orca_core::goal_runtime::BlockerKind::UserDecision,
+                summary: "need a port".into(),
+                question: Some("Use port 8080?".into()),
+                fingerprint: "port".into(),
+                evidence: Vec::new(),
+            },
+            usage: orca_runtime::surface::UsageTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_tokens: 0,
+                estimated_cost_usd_micros: 0,
+            },
+        };
+        let diagnostic = TuiDiagnostic::from_surface_terminal(&terminal).unwrap();
+        let text = message_text(None, &ChatMessage::Diagnostic(diagnostic));
+        assert_eq!(text[1], "      cause  need a port");
+        assert_eq!(text[2], "             Question: Use port 8080?");
+        assert_eq!(text[3], "      next   Answer the question, then continue.");
+    }
+
+    #[test]
     fn diagnostics_render_as_an_icon_title_with_indented_cause_and_next() {
         let text = message_text(
             None,

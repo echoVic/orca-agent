@@ -138,6 +138,9 @@ enum TestBehavior {
     Fail {
         message: String,
     },
+    Blocked {
+        question: Option<String>,
+    },
     WaitForCancel,
 }
 
@@ -248,6 +251,26 @@ impl ThreadOperationExecutor for AcpTestExecutor {
                 }
                 ingress.commit_response(&mut response)?;
                 Ok(RunStatus::Success.into())
+            }
+            TestBehavior::Blocked { question } => {
+                let blocker = orca_core::goal_runtime::BlockerSummary {
+                    kind: orca_core::goal_runtime::BlockerKind::UserDecision,
+                    summary: "need a port".into(),
+                    question,
+                    fingerprint: "port".into(),
+                    evidence: Vec::new(),
+                };
+                let mut outcome: ThreadOperationOutcome = RunStatus::Blocked {
+                    blocker: blocker.clone(),
+                }
+                .into();
+                if let ThreadOperationOutcome::Completed { terminal, .. } = &mut outcome {
+                    *terminal = Some(orca_core::budget::OperationTerminal::Blocked {
+                        blocker,
+                        usage: Default::default(),
+                    });
+                }
+                Ok(outcome)
             }
             TestBehavior::Fail { message } => Err(io::Error::other(message)),
             TestBehavior::WaitForCancel => {
@@ -640,26 +663,39 @@ fn prompt_updates(behavior: TestBehavior) -> Vec<SessionUpdate> {
         .build()
         .unwrap();
     let local = tokio::task::LocalSet::new();
-    let stop_reason = local.block_on(&rt, async {
+    let (stop_reason, updates) = local.block_on(&rt, async {
         initialize_agent(&agent).await;
         let session = agent
             .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
             .await
             .expect("new_session");
-        agent
+        let response = agent
             .prompt(PromptRequest::new(
                 session.session_id,
                 vec![ContentBlock::from("Say something".to_string())],
             ))
             .await
-            .expect("prompt")
-            .stop_reason
+            .expect("prompt");
+        (response.stop_reason, drain_notifications(&mut note_rx))
     });
     assert_eq!(stop_reason, StopReason::EndTurn);
 
-    let updates = drain_notifications(&mut note_rx);
     host.shutdown().expect("shutdown");
     updates
+}
+
+#[test]
+fn blocked_terminal_sends_its_summary_before_end_turn() {
+    for question in [None, Some("Use port 8080?")] {
+        let updates = prompt_updates(TestBehavior::Blocked {
+            question: question.map(str::to_string),
+        });
+        let expected = match question {
+            Some(question) => format!("message:Blocked: need a port\nQuestion: {question}"),
+            None => "message:Blocked: need a port".to_string(),
+        };
+        assert_eq!(assistant_text(&updates), vec![expected]);
+    }
 }
 
 #[test]

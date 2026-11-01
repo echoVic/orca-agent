@@ -2502,6 +2502,8 @@ fn drain_surface_prompt(
         }
     };
     prepared.detach_once();
+    emit_blocked_terminal(&session_id, &note_tx, &terminal)
+        .map_err(|()| "ACP blocker notification delivery failed; reload session".to_string())?;
     terminal_to_stop_reason(&terminal)
 }
 
@@ -2716,6 +2718,26 @@ fn reconcile_operation_snapshot(
     }
 }
 
+/// Uses the assistant notification lane before the prompt response can complete.
+/// Shared sessions call this from their observer; their prompt drain is silent.
+pub(super) fn emit_blocked_terminal(
+    session_id: &SessionId,
+    note_tx: &AcpNotificationSender,
+    terminal: &OperationTerminal,
+) -> Result<(), ()> {
+    if let OperationTerminal::Blocked { blocker, .. } = terminal {
+        let mut text = format!("Blocked: {}", blocker.summary);
+        if let Some(question) = &blocker.question {
+            text.push_str(&format!("\nQuestion: {question}"));
+        }
+        note_tx.send(SessionNotification::new(
+            session_id.clone(),
+            assistant_chunk(AssistantChannel::Message, &text),
+        ))?;
+    }
+    Ok(())
+}
+
 pub(super) fn terminal_to_stop_reason(terminal: &OperationTerminal) -> Result<StopReason, String> {
     match terminal {
         OperationTerminal::Succeeded { .. } => Ok(StopReason::EndTurn),
@@ -2756,7 +2778,7 @@ pub(super) fn terminal_to_stop_reason(terminal: &OperationTerminal) -> Result<St
         OperationTerminal::AbortedByRuntimeRestart { .. } => {
             Err("ACP operation aborted by runtime restart".to_string())
         }
-        OperationTerminal::Blocked { .. } => Err("blocked".to_string()),
+        OperationTerminal::Blocked { .. } => Ok(StopReason::EndTurn),
         OperationTerminal::Shutdown { .. } => Ok(StopReason::Cancelled),
     }
 }
@@ -3814,6 +3836,26 @@ mod tests {
             .expect_err("header names are case-insensitive")
             .contains("duplicate header name")
         );
+    }
+
+    #[test]
+    fn blocked_terminal_ends_the_acp_turn_normally() {
+        let terminal = OperationTerminal::Blocked {
+            blocker: orca_core::goal_runtime::BlockerSummary {
+                kind: orca_core::goal_runtime::BlockerKind::UserDecision,
+                summary: "need a port".into(),
+                question: Some("Use port 8080?".into()),
+                fingerprint: "port".into(),
+                evidence: Vec::new(),
+            },
+            usage: crate::surface::UsageTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_tokens: 0,
+                estimated_cost_usd_micros: 0,
+            },
+        };
+        assert_eq!(terminal_to_stop_reason(&terminal), Ok(StopReason::EndTurn));
     }
 
     #[test]
