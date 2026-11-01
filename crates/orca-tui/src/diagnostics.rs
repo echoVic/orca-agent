@@ -320,6 +320,13 @@ impl TuiDiagnostic {
                 ),
                 Some("Reload the session and inspect the recovered state before retrying."),
             )),
+            OperationTerminal::Blocked { blocker, .. } => Some(Self::new(
+                DiagnosticLevel::Warning,
+                "operation.blocked",
+                "Task blocked",
+                blocker.summary.as_str(),
+                Some("Resolve the external blocker and submit the request again."),
+            )),
             OperationTerminal::BudgetExhausted { budget } => Some(budget_diagnostic(budget)),
             OperationTerminal::NotAdmitted { reason } => Some(not_admitted_diagnostic(*reason)),
             OperationTerminal::Cancelled { reason } => Some(match reason {

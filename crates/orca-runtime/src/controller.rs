@@ -366,6 +366,7 @@ pub enum ThreadTurnPromptPlacement {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThreadTurnToolMode {
     Standard,
+    Headless,
     Goal,
 }
 
@@ -679,7 +680,10 @@ impl ThreadTurnMainSessionTask {
                 self.registry
                     .stop_with_usage(&self.id, status.as_str().to_string(), Some(usage))
             }
-            RunStatus::Failed | RunStatus::ApprovalRequired | RunStatus::VerificationFailed => self
+            RunStatus::Failed
+            | RunStatus::ApprovalRequired
+            | RunStatus::VerificationFailed
+            | RunStatus::Blocked { .. } => self
                 .registry
                 .apply_main_session_terminal_update(
                     &self.id,
@@ -890,9 +894,9 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
                 Option<String>,
                 Option<orca_core::verification::VerificationResult>,
             )> {
-                let status = result.status;
+                let status = result.status.clone();
                 let mut end_reason = result.reason;
-                lifecycle.finish_task(status);
+                lifecycle.finish_task(status.clone());
                 if request.options().wait_for_background_workflows {
                     observe_background_workflows(
                         true,
@@ -1017,12 +1021,18 @@ impl ThreadTurnCompletion {
             let _ =
                 session.complete_with_error_durable(self.status.as_str(), self.error.as_deref());
             if let Some(task) = self.main_session_task.as_ref() {
-                task.finish_and_emit(self.status, self.error.as_deref(), self.usage, events, sink)?;
+                task.finish_and_emit(
+                    self.status.clone(),
+                    self.error.as_deref(),
+                    self.usage,
+                    events,
+                    sink,
+                )?;
                 task.emit_all(events, sink)?;
             }
             if request.emit_session_completed() {
                 sink.emit(events.session_completed_with_verification(
-                    self.status,
+                    self.status.clone(),
                     session.session_id(),
                     self.verification.as_ref(),
                     self.writes_applied,
@@ -1036,7 +1046,13 @@ impl ThreadTurnCompletion {
             session.complete_with_error_durable(self.status.as_str(), self.error.as_deref())
         };
         if let Some(task) = self.main_session_task.as_ref() {
-            task.finish_and_emit(self.status, self.error.as_deref(), self.usage, events, sink)?;
+            task.finish_and_emit(
+                self.status.clone(),
+                self.error.as_deref(),
+                self.usage,
+                events,
+                sink,
+            )?;
             task.emit_all(events, sink)?;
         }
         if request.emit_session_completed() {
@@ -1049,7 +1065,7 @@ impl ThreadTurnCompletion {
                 ))?;
             } else {
                 sink.emit(events.session_completed(
-                    self.status,
+                    self.status.clone(),
                     session.session_id(),
                     self.writes_applied,
                 ))?;
@@ -1057,7 +1073,7 @@ impl ThreadTurnCompletion {
         }
         if crate::memory::automatic_memory_capture_is_eligible(
             config,
-            self.status,
+            self.status.clone(),
             transcript_committed,
             request.emit_session_completed(),
         ) {
@@ -1130,8 +1146,8 @@ impl ThreadTurnOutcome {
                 // The typed terminal's exit code is authoritative for budget
                 // stops (4); plain statuses keep the legacy mapping.
                 Ok(terminal
-                    .map(orca_core::budget::OperationTerminal::exit_code)
-                    .map_or(status, |_| status))
+                    .map(|terminal| terminal.exit_code())
+                    .map_or(status.clone(), |_| status))
             }
             Self::ProviderSuspended {
                 suspension,
@@ -1437,6 +1453,7 @@ impl ThreadTurnToolMode {
     fn policy(self) -> AgentToolPolicyContext<'static> {
         match self {
             Self::Standard => AgentToolPolicyContext::unrestricted(),
+            Self::Headless => AgentToolPolicyContext::headless(),
             Self::Goal => AgentToolPolicyContext::goal_mode(),
         }
     }
@@ -2015,6 +2032,9 @@ fn headless_operation_status(
             class: SurfaceFailureClass::Verification,
             ..
         } => RunStatus::VerificationFailed,
+        SurfaceOperationTerminal::Blocked { blocker, .. } => RunStatus::Blocked {
+            blocker: blocker.clone(),
+        },
         _ => RunStatus::Failed,
     }
 }
@@ -2024,6 +2044,7 @@ fn headless_operation_exit_code(
 ) -> i32 {
     match terminal.terminal {
         SurfaceOperationTerminal::BudgetExhausted { .. } => 4,
+        SurfaceOperationTerminal::Blocked { .. } => 5,
         _ => headless_operation_status(terminal).exit_code(),
     }
 }
@@ -4487,6 +4508,7 @@ mod tests {
                 sink: &mut sink,
                 execution_request: &request,
                 goal_mode: false,
+                headless: false,
                 subagent_depth: 0,
                 instructions: &instructions,
                 memory: &memory,
@@ -4560,6 +4582,7 @@ mod tests {
                     sink: &mut sink,
                     execution_request: request,
                     goal_mode: false,
+                    headless: false,
                     subagent_depth: 0,
                     instructions: &instructions,
                     memory: &memory,

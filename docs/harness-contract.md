@@ -193,6 +193,7 @@ The final `session.completed` event contains one of:
 - `approval_required`
 - `verification_failed`
 - `budget_exhausted`
+- `blocked`: the model called `report_blocker` to declare that it cannot make progress because of something outside its control; the terminal carries the blocker's `kind` and `summary`.
 
 The event's `writes_applied` field is `true` when the run applied at least one
 successful `edit` or `write_file` change, and `false` otherwise. Writes made
@@ -245,6 +246,7 @@ promised: Orca does not snapshot external workspace state.
 - `2`: verification failed
 - `3`: approval required or denied
 - `4`: budget exhausted
+- `5`: blocked
 - `130`: cancelled
 
 ## Tool Contract
@@ -264,6 +266,7 @@ Built-in tools:
 | `write_file` | write | Creates or overwrites a file under the active approval policy and sandbox |
 | `subagent` | agent | Runs a synchronous child agent with `description` and `prompt`, returning the child summary |
 | `Workflow` | agent | Starts a background dynamic workflow |
+| `report_blocker` | agent | Declares a terminal blocker with `kind` and `summary`; offered only in headless `orca exec` root runs outside goal mode |
 | `update_plan` | read | Updates the visible plan state |
 | `get_goal` | read | Reads active persistent goal state while goal mode is running |
 | `create_goal` | read | Creates a persistent goal while goal mode is running and no unfinished goal exists |
@@ -419,9 +422,10 @@ Explicit `[budget]` dimensions (`max_turns`, `max_tool_calls`,
 `max_cost_usd_micros`, `max_wall_time_ms`) are independently optional:
 
 1. Send conversation to DeepSeek (with system prompt + tool schemas)
-2. If response contains tool calls → execute each tool → add results to conversation → next turn
-3. If response is a final message → return success
-4. If an explicit budget dimension is exhausted → the operation stops with a
+2. If response calls `report_blocker` with valid arguments → return blocked with the declared blocker (headless exec only)
+3. If response contains other tool calls → execute each tool → add results to conversation → next turn
+4. If response is a final message → return success
+5. If an explicit budget dimension is exhausted → the operation stops with a
    typed `OperationTerminal::Stopped` (exit code 4) after settling the current
    tool and creating a checkpoint; the `session.completed` event carries the
    typed terminal object.

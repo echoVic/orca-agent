@@ -18,6 +18,7 @@ pub mod list_files;
 pub mod process;
 pub mod read_file;
 pub mod registry;
+pub mod report_blocker;
 pub mod sandbox;
 pub mod schema;
 pub mod skills;

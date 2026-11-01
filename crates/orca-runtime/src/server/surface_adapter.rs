@@ -2649,6 +2649,7 @@ fn terminal_status(terminal: &OperationTerminal) -> &'static str {
         | OperationTerminal::Panicked { .. }
         | OperationTerminal::JoinFailed { .. }
         | OperationTerminal::AbortedByRuntimeRestart { .. } => "failed",
+        OperationTerminal::Blocked { .. } => "blocked",
     }
 }
 

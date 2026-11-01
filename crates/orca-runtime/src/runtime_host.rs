@@ -564,7 +564,7 @@ pub enum GoalContinuationRejectCode {
     RuntimeUnavailable,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum GoalTurnDisposition {
     /// The outer turn completed normally and advanced the goal.
     Advanced,
@@ -600,7 +600,7 @@ fn goal_turn_disposition(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct GoalContinuationPreflight {
     cancelled: bool,
     disposition: GoalTurnDisposition,
@@ -919,6 +919,8 @@ impl HostedTurnRequest {
         };
         let tool_mode = if self.allow_goal_tools {
             ThreadTurnToolMode::Goal
+        } else if self.envelope == HostedOperationEnvelope::HeadlessSession {
+            ThreadTurnToolMode::Headless
         } else {
             ThreadTurnToolMode::Standard
         };
@@ -3046,7 +3048,7 @@ impl CompletedTurnOutcome {
             RunStatus::ApprovalRequired => {
                 orca_core::goal_runtime::GoalTurnStatus::ApprovalRequired
             }
-            RunStatus::Failed | RunStatus::VerificationFailed => {
+            RunStatus::Failed | RunStatus::VerificationFailed | RunStatus::Blocked { .. } => {
                 orca_core::goal_runtime::GoalTurnStatus::Failed
             }
         }
@@ -3054,7 +3056,7 @@ impl CompletedTurnOutcome {
 
     fn permits_goal_continuation(&self) -> bool {
         matches!(
-            goal_turn_disposition(self.status, self.end_reason, self.terminal.as_ref()),
+            goal_turn_disposition(self.status.clone(), self.end_reason, self.terminal.as_ref()),
             GoalTurnDisposition::Advanced | GoalTurnDisposition::Interrupted { .. }
         )
     }
@@ -8510,6 +8512,11 @@ fn reconcile_terminal_main_session_tasks(
                 None,
                 Some(surface::DisplayText::new(message.as_str())),
             ),
+            surface::OperationTerminal::Blocked { blocker, .. } => (
+                surface::SurfaceTaskStatus::Failed,
+                None,
+                Some(surface::DisplayText::new(blocker.summary.as_str())),
+            ),
             surface::OperationTerminal::AbortedByRuntimeRestart { .. } => (
                 surface::SurfaceTaskStatus::Stopped,
                 Some(surface::DisplayText::new(
@@ -8690,6 +8697,11 @@ fn prepare_main_session_task_terminal_projection(
             Some(surface::DisplayText::new(
                 "Background turn exhausted its runtime budget",
             )),
+        ),
+        surface::OperationTerminal::Blocked { blocker, .. } => (
+            surface::SurfaceTaskStatus::Failed,
+            None,
+            Some(surface::DisplayText::new(blocker.summary.as_str())),
         ),
     };
     let event = (
@@ -14706,7 +14718,9 @@ fn durable_typed_provider_outcome(
                 RunStatus::Success => TaskStatus::Completed,
                 RunStatus::ApprovalRequired => TaskStatus::ApprovalRequired,
                 RunStatus::Cancelled => TaskStatus::Cancelled,
-                RunStatus::Failed | RunStatus::VerificationFailed => TaskStatus::Failed,
+                RunStatus::Failed | RunStatus::VerificationFailed | RunStatus::Blocked { .. } => {
+                    TaskStatus::Failed
+                }
             }
         },
         response: outcome.response.clone(),
@@ -22207,7 +22221,7 @@ impl ThreadActor {
                                 },
                             ) => {
                                 let completed = CompletedTurnOutcome {
-                                    status: *status,
+                                    status: status.clone(),
                                     end_reason: *end_reason,
                                     terminal: terminal.clone(),
                                     verification: verification.clone(),
@@ -22298,7 +22312,7 @@ impl ThreadActor {
                                                 .state
                                                 .events
                                                 .session_completed_with_verification(
-                                                    status,
+                                                    status.clone(),
                                                     result.state.thread.session().session_id(),
                                                     verification.as_ref(),
                                                     writes_applied,
@@ -22311,7 +22325,7 @@ impl ThreadActor {
                                     }
                                     self.state = Some(result.state);
                                     completed_turn = Some(CompletedTurnOutcome {
-                                        status,
+                                        status: status.clone(),
                                         end_reason,
                                         terminal: terminal.clone(),
                                         verification: verification.clone(),
@@ -22731,12 +22745,12 @@ impl ThreadActor {
                 observe_runtime_event(
                     active.request.event_observer().as_deref(),
                     result.state.events.session_completed(
-                        status,
+                        status.clone(),
                         result.state.thread.session().session_id(),
                         writes_applied,
                     ),
                 );
-                OperationOutcome::Completed(status)
+                OperationOutcome::Completed(status.clone())
             }
             GenerationTaskOutcome::ExecutionFailed { kind, message } => {
                 OperationOutcome::ExecutionFailed { kind, message }
@@ -23011,7 +23025,7 @@ fn run_hosted_operation(
                     end_reason,
                     terminal,
                     ..
-                }) => (*status, *end_reason, terminal.clone()),
+                }) => (status.clone(), *end_reason, terminal.clone()),
                 Ok(ThreadOperationOutcome::ProviderSuspended { .. }) => (
                     RunStatus::ApprovalRequired,
                     crate::lifecycle::TurnEndReason::Unclassified,
@@ -23066,7 +23080,9 @@ fn run_hosted_operation(
                         RunStatus::ApprovalRequired => {
                             orca_core::goal_runtime::GoalTurnStatus::ApprovalRequired
                         }
-                        RunStatus::Failed | RunStatus::VerificationFailed => {
+                        RunStatus::Failed
+                        | RunStatus::VerificationFailed
+                        | RunStatus::Blocked { .. } => {
                             orca_core::goal_runtime::GoalTurnStatus::Failed
                         }
                     }
@@ -23156,7 +23172,7 @@ fn run_headless_session(
     )?;
 
     let status = match &outcome {
-        ThreadOperationOutcome::Completed { status, .. } => *status,
+        ThreadOperationOutcome::Completed { status, .. } => status.clone(),
         ThreadOperationOutcome::ProviderSuspended { .. } => RunStatus::Success,
     };
     if let Err(error) = thread.session().hooks().run(
@@ -23241,7 +23257,7 @@ fn settle_suspended_operation(
 ) -> io::Result<Option<orca_core::budget::OperationTerminal>> {
     let mut last_error = None;
     for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
-        match settle_suspended_operation_once(handle, response, model, status, error) {
+        match settle_suspended_operation_once(handle, response, model, status.clone(), error) {
             Ok(terminal) => return Ok(terminal),
             Err(settle_error) => {
                 last_error = Some(settle_error);
@@ -23316,6 +23332,10 @@ fn settle_suspended_operation_once(
         RunStatus::Cancelled => orca_core::budget::OperationTerminal::Cancelled {
             reason: orca_core::budget::CancelReason::User,
             checkpoint_id: None,
+        },
+        RunStatus::Blocked { blocker } => orca_core::budget::OperationTerminal::Blocked {
+            blocker,
+            usage: operation.controller.usage(),
         },
         _ => orca_core::budget::OperationTerminal::Failed {
             class: orca_core::budget::FailureClass::Provider,
@@ -23410,7 +23430,7 @@ fn run_provider_background_task(
             handle,
             response.as_ref(),
             context.model.as_deref(),
-            status,
+            status.clone(),
             error.as_deref(),
         ) {
             Ok(terminal) => {
@@ -23435,7 +23455,7 @@ fn run_provider_background_task(
         let completed_at_ms = chrono::Utc::now().timestamp_millis();
         let outcome = TypedProviderBackgroundOutcome {
             response,
-            status,
+            status: status.clone(),
             error,
             usage,
             operation_terminal,
@@ -23498,7 +23518,7 @@ fn run_provider_background_task(
                     usage,
                 );
             }
-            RunStatus::Failed | RunStatus::VerificationFailed => {
+            RunStatus::Failed | RunStatus::VerificationFailed | RunStatus::Blocked { .. } => {
                 let _ = context.task_registry.apply_main_session_terminal_update(
                     &context.task_id,
                     MainSessionTerminalUpdate::Failed {
@@ -38436,21 +38456,21 @@ mod tests {
             (
                 GoalContinuationPreflight {
                     queued_user_input: true,
-                    ..baseline
+                    ..baseline.clone()
                 },
                 GoalContinuationRejectCode::QueuedUserInput,
             ),
             (
                 GoalContinuationPreflight {
                     plan_mode: true,
-                    ..baseline
+                    ..baseline.clone()
                 },
                 GoalContinuationRejectCode::PlanMode,
             ),
             (
                 GoalContinuationPreflight {
                     duplicate_admission: true,
-                    ..baseline
+                    ..baseline.clone()
                 },
                 GoalContinuationRejectCode::DuplicateAdmission,
             ),
@@ -38477,7 +38497,7 @@ mod tests {
         };
 
         // Success remains admissible.
-        assert_eq!(goal_continuation_preflight(baseline), None);
+        assert_eq!(goal_continuation_preflight(baseline.clone()), None);
 
         // A resumable typed budget stop is an interruption, not a block.
         assert_eq!(
@@ -38485,7 +38505,7 @@ mod tests {
                 disposition: GoalTurnDisposition::Interrupted {
                     reason: crate::lifecycle::TurnEndReason::Unclassified,
                 },
-                ..baseline
+                ..baseline.clone()
             }),
             None
         );
@@ -38497,7 +38517,7 @@ mod tests {
                     status: RunStatus::Failed,
                     reason: crate::lifecycle::TurnEndReason::CostBudgetExhausted,
                 },
-                ..baseline
+                ..baseline.clone()
             }),
             Some(GoalContinuationAdmission::Reject { code, .. })
                 if code == GoalContinuationRejectCode::NonSuccessfulTurn
@@ -38581,7 +38601,7 @@ mod tests {
                 end_reason,
                 terminal,
                 ..
-            } => goal_turn_disposition(*status, *end_reason, terminal.as_ref()),
+            } => goal_turn_disposition(status.clone(), *end_reason, terminal.as_ref()),
             _ => unreachable!("test outcomes are completed"),
         };
 
@@ -41303,7 +41323,7 @@ mod tests {
             };
             drop(operation);
 
-            settle_suspended_operation(&handle, None, None, status, error)
+            settle_suspended_operation(&handle, None, None, status.clone(), error)
                 .expect("response-less terminal settles");
             let reopened = crate::operation_context::OperationContext::reopen(
                 handle.journal_path.clone(),

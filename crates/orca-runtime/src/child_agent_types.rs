@@ -698,7 +698,8 @@ impl ChildAgentActivityEmitter {
                     RunStatus::Cancelled => SurfaceToolTerminalStatus::Cancelled,
                     RunStatus::Failed
                     | RunStatus::ApprovalRequired
-                    | RunStatus::VerificationFailed => SurfaceToolTerminalStatus::Failed,
+                    | RunStatus::VerificationFailed
+                    | RunStatus::Blocked { .. } => SurfaceToolTerminalStatus::Failed,
                 },
                 summary: None,
             },

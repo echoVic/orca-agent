@@ -2297,6 +2297,7 @@ pub(crate) fn operation_terminal_status(terminal: &OperationTerminal) -> Option<
         OperationTerminal::Panicked { .. }
         | OperationTerminal::JoinFailed { .. }
         | OperationTerminal::AbortedByRuntimeRestart { .. } => Some("failed"),
+        OperationTerminal::Blocked { .. } => Some("blocked"),
         OperationTerminal::Shutdown { .. } => Some("cancelled"),
     }
 }

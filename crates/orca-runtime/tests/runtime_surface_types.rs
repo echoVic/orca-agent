@@ -1,3 +1,4 @@
+use orca_core::goal_runtime::{BlockerKind, BlockerSummary};
 use orca_runtime::surface::*;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -291,8 +292,22 @@ fn operation_generation_and_terminal_algebras_are_closed() {
         OperationTerminal::Shutdown {
             reason: SurfaceShutdownReason::HostShutdown,
         },
+        OperationTerminal::Blocked {
+            blocker: BlockerSummary {
+                kind: BlockerKind::ExternalState,
+                summary: "workspace is read-only".to_string(),
+                fingerprint: "blocked-terminal".to_string(),
+                evidence: vec![],
+            },
+            usage: UsageTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_tokens: 0,
+                estimated_cost_usd_micros: 0,
+            },
+        },
     ];
-    assert_eq!(terminals.len(), 9);
+    assert_eq!(terminals.len(), 10);
     for terminal in terminals {
         match terminal {
             OperationTerminal::NotAdmitted { .. }
@@ -303,7 +318,8 @@ fn operation_generation_and_terminal_algebras_are_closed() {
             | OperationTerminal::Panicked { .. }
             | OperationTerminal::JoinFailed { .. }
             | OperationTerminal::AbortedByRuntimeRestart { .. }
-            | OperationTerminal::Shutdown { .. } => {}
+            | OperationTerminal::Shutdown { .. }
+            | OperationTerminal::Blocked { .. } => {}
         }
     }
 
@@ -330,6 +346,16 @@ fn every_generation_stop_and_finalizer_source_is_constructible() {
         },
         GenerationStopReason::Completed {
             status: GenerationCompletionStatus::BudgetExhausted { budget },
+        },
+        GenerationStopReason::Completed {
+            status: GenerationCompletionStatus::Blocked {
+                blocker: BlockerSummary {
+                    kind: BlockerKind::ExternalState,
+                    summary: "workspace is read-only".to_string(),
+                    fingerprint: "blocked-status".to_string(),
+                    evidence: vec![],
+                },
+            },
         },
         GenerationStopReason::Cancelled {
             cause: TerminalizationCause::UserCancel,

@@ -62,8 +62,10 @@ orca exec \
 ~~~
 
 Use the process exit status and the verifier output as the automation gate.
-Orca does not publish a stable numeric taxonomy beyond that process result, so
-scripts should not infer semantics from undocumented exit-code labels.
+The documented exit codes are 0 (success), 1 (failed), 2 (verification failed),
+3 (approval required or denied), 4 (budget exhausted), 5 (blocked), and 130
+(cancelled). See `docs/harness-contract.md`, “Exit Codes”, for the contract.
+Keep using `--verifier` to check the task outcome.
 
 ## Stopping a run
 

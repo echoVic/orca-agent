@@ -1417,7 +1417,7 @@ fn run_threaded_agent_worker(
             let registry_result = if launch.running {
                 Ok(())
             } else {
-                match (status, registry_task_id.as_deref()) {
+                match (status.clone(), registry_task_id.as_deref()) {
                     (RunStatus::Success, Some(task_id)) => task_registry.complete_with_usage(
                         task_id,
                         output.clone(),
@@ -1468,7 +1468,7 @@ fn run_threaded_agent_worker(
             }
             if let Some(activity) = launch_surface_activity.as_ref() {
                 if let Err(surface_error) = activity.publish_terminal(
-                    status,
+                    status.clone(),
                     (status == RunStatus::Success).then_some(output.as_str()),
                     event_error.as_deref(),
                     usage,
@@ -1484,12 +1484,13 @@ fn run_threaded_agent_worker(
             let task_status = if launch.running {
                 RuntimeTaskStatus::Running
             } else {
-                match status {
+                match &status {
                     RunStatus::Success => RuntimeTaskStatus::Succeeded,
                     RunStatus::Cancelled => RuntimeTaskStatus::Cancelled,
                     RunStatus::Failed
                     | RunStatus::ApprovalRequired
-                    | RunStatus::VerificationFailed => RuntimeTaskStatus::Failed,
+                    | RunStatus::VerificationFailed
+                    | RunStatus::Blocked { .. } => RuntimeTaskStatus::Failed,
                 }
             };
             let task = Some(started_task.with_status(task_status));
@@ -2271,9 +2272,10 @@ fn execute_acquired_sync_subagent(
     let terminal_status = match output.status {
         RunStatus::Success => SurfaceSubagentTerminalStatus::Completed,
         RunStatus::Cancelled => SurfaceSubagentTerminalStatus::Cancelled,
-        RunStatus::Failed | RunStatus::ApprovalRequired | RunStatus::VerificationFailed => {
-            SurfaceSubagentTerminalStatus::Failed
-        }
+        RunStatus::Failed
+        | RunStatus::ApprovalRequired
+        | RunStatus::VerificationFailed
+        | RunStatus::Blocked { .. } => SurfaceSubagentTerminalStatus::Failed,
     };
     if let Err(error) = activity.publish_payload(SubagentActivityPayload::Completed {
         status: terminal_status,
@@ -2936,7 +2938,7 @@ fn finish_child_output(
     started_task: RuntimeTaskLifecycle,
 ) -> RuntimeSubagentCallOutput {
     let completed_task = lifecycle
-        .finish_task(child.status)
+        .finish_task(child.status.clone())
         .cloned()
         .unwrap_or_else(|| started_task.clone());
     let worktree = match worktree {

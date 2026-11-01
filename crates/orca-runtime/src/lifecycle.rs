@@ -125,16 +125,37 @@ impl AgentLoopResult {
         }
     }
 
+    pub(crate) fn blocked(blocker: orca_core::goal_runtime::BlockerSummary) -> Self {
+        Self {
+            status: RunStatus::Blocked {
+                blocker: blocker.clone(),
+            },
+            reason: TurnEndReason::Unclassified,
+            final_message: None,
+            error: None,
+            terminal: orca_core::budget::OperationTerminal::Blocked {
+                blocker,
+                usage: orca_core::budget::BudgetUsage::default(),
+            },
+        }
+    }
+
     pub(crate) fn failure(status: RunStatus, error: impl Into<String>) -> Self {
-        Self::terminal(status, TurnEndReason::Unclassified, Some(error.into()))
+        Self::terminal(
+            status,
+            TurnEndReason::Unclassified,
+            Some(error.into()),
+            None,
+        )
     }
 
     pub(crate) fn terminal(
         status: RunStatus,
         reason: TurnEndReason,
         error: Option<String>,
+        blocker: Option<orca_core::goal_runtime::BlockerSummary>,
     ) -> Self {
-        let terminal = Self::terminal_from_status(status, error.as_deref());
+        let terminal = Self::terminal_from_status(status.clone(), error.as_deref(), blocker);
         Self {
             status,
             reason,
@@ -150,6 +171,7 @@ impl AgentLoopResult {
     fn terminal_from_status(
         status: RunStatus,
         error: Option<&str>,
+        blocker: Option<orca_core::goal_runtime::BlockerSummary>,
     ) -> orca_core::budget::OperationTerminal {
         use orca_core::budget::{CancelReason, FailureClass};
         match status {
@@ -170,6 +192,18 @@ impl AgentLoopResult {
                     message: error.unwrap_or_default().to_string(),
                 }
             }
+            RunStatus::Blocked { .. } => orca_core::budget::OperationTerminal::Blocked {
+                blocker: blocker.unwrap_or_else(|| {
+                    // Should not happen: Blocked status always has a blocker.
+                    orca_core::goal_runtime::BlockerSummary {
+                        kind: orca_core::goal_runtime::BlockerKind::ExternalState,
+                        summary: "blocker not available".to_string(),
+                        fingerprint: String::new(),
+                        evidence: vec![],
+                    }
+                }),
+                usage: orca_core::budget::BudgetUsage::default(),
+            },
         }
     }
 
@@ -202,10 +236,10 @@ impl From<RuntimeTurnStartError> for AgentLoopResult {
         // A terminal already committed to the execution journal (durable
         // checkpoint + terminal) is the fact; otherwise derive it from the
         // outcome status. Legacy status/reason are projections of it.
-        let terminal = error
-            .terminal
-            .unwrap_or_else(|| Self::terminal_from_status(error.status, Some(&error.message)));
-        let mut result = Self::terminal(error.status, error.reason, Some(error.message));
+        let terminal = error.terminal.unwrap_or_else(|| {
+            Self::terminal_from_status(error.status.clone(), Some(&error.message), None)
+        });
+        let mut result = Self::terminal(error.status, error.reason, Some(error.message), None);
         result.terminal = terminal;
         result
     }
@@ -2037,7 +2071,7 @@ mod tests {
         assert_eq!(failure.error.as_deref(), Some("provider failed"));
 
         let terminal =
-            AgentLoopResult::terminal(RunStatus::Cancelled, TurnEndReason::Cancelled, None);
+            AgentLoopResult::terminal(RunStatus::Cancelled, TurnEndReason::Cancelled, None, None);
         assert_eq!(terminal.status, RunStatus::Cancelled);
         assert_eq!(terminal.reason, TurnEndReason::Cancelled);
         assert_eq!(terminal.final_message, None);

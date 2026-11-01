@@ -49,6 +49,7 @@ pub enum ToolName {
     ReadMcpResource,
     ListSkills,
     ReadSkill,
+    ReportBlocker,
     Namespaced {
         namespace: String,
         name: String,
@@ -101,6 +102,7 @@ impl ToolName {
             "read_mcp_resource" => Self::ReadMcpResource,
             "list_skills" => Self::ListSkills,
             "read_skill" => Self::ReadSkill,
+            "report_blocker" => Self::ReportBlocker,
             other => Self::External(other.to_string()),
         }
     }
@@ -165,6 +167,7 @@ impl ToolName {
             Self::ReadMcpResource => "read_mcp_resource",
             Self::ListSkills => "list_skills",
             Self::ReadSkill => "read_skill",
+            Self::ReportBlocker => "report_blocker",
             Self::Namespaced { name, .. } => name,
             Self::Mcp(name) => name
                 .rsplit_once("__")
@@ -215,6 +218,7 @@ impl ToolName {
             Self::ReadMcpResource => "read_mcp_resource",
             Self::ListSkills => "list_skills",
             Self::ReadSkill => "read_skill",
+            Self::ReportBlocker => "report_blocker",
             Self::Namespaced { serialized, .. } => serialized,
             Self::Mcp(name) | Self::External(name) => name,
         }
@@ -267,6 +271,7 @@ impl ToolName {
             "read_mcp_resource" => Self::ReadMcpResource,
             "list_skills" => Self::ListSkills,
             "read_skill" => Self::ReadSkill,
+            "report_blocker" => Self::ReportBlocker,
             other => Self::External(other.to_string()),
         })
     }

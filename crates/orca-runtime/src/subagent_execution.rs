@@ -921,7 +921,7 @@ fn emit_runtime_subagent_terminal(
         task.attach_to_event(events.subagent_completed(
             &output.tool_request.id,
             &output.description,
-            output.status,
+            output.status.clone(),
             output.event_output.as_deref(),
             output.event_error.as_deref(),
         )),
@@ -2872,7 +2872,7 @@ mod tests {
             execution
                 .results
                 .iter()
-                .map(|(status, result)| (*status, result.status))
+                .map(|(status, result)| (status.clone(), result.status.clone()))
                 .collect::<Vec<_>>()
         );
         let statuses = task_registry
@@ -3031,7 +3031,7 @@ mod tests {
             execution
                 .results
                 .iter()
-                .map(|(status, result)| (*status, result.status))
+                .map(|(status, result)| (status.clone(), result.status.clone()))
                 .collect::<Vec<_>>()
         );
         assert_eq!(completed(&task_registry), 4);

@@ -27,6 +27,7 @@ pub(crate) struct AgentToolPolicyContext<'a> {
     allowed_tools: Option<&'a [String]>,
     label: Option<&'a str>,
     goal_mode: bool,
+    headless: bool,
     workflow_child: bool,
     delegation: DelegationPolicy,
 }
@@ -43,6 +44,7 @@ impl<'a> AgentToolPolicyContext<'a> {
             allowed_tools,
             label,
             goal_mode: false,
+            headless: false,
             workflow_child: false,
             delegation: DelegationPolicy::default(),
         }
@@ -52,11 +54,23 @@ impl<'a> AgentToolPolicyContext<'a> {
         Self::new(None, None)
     }
 
+    pub(crate) fn headless() -> Self {
+        Self {
+            headless: true,
+            ..Self::unrestricted()
+        }
+    }
+
+    pub(crate) fn is_headless(&self) -> bool {
+        self.headless
+    }
+
     pub(crate) fn goal_mode() -> Self {
         Self {
             allowed_tools: None,
             label: None,
             goal_mode: true,
+            headless: false,
             workflow_child: false,
             delegation: DelegationPolicy::default(),
         }
@@ -79,9 +93,12 @@ impl<'a> AgentToolPolicyContext<'a> {
         label: &'a str,
     ) -> Self {
         if let Some(allowed_tools) = allowed_tools {
-            Self::new(Some(allowed_tools), Some(label))
-                .with_delegation(self.delegation)
-                .with_workflow_ipc(self.workflow_child)
+            Self {
+                headless: self.headless,
+                ..Self::new(Some(allowed_tools), Some(label))
+            }
+            .with_delegation(self.delegation)
+            .with_workflow_ipc(self.workflow_child)
         } else {
             self
         }
@@ -135,7 +152,12 @@ pub(crate) fn provider_tool_schema_override(
             .into_iter()
             .filter(|definition| {
                 // A policy the model cannot act on must not be advertised.
-                (definition.name != "subagent" || tool_policy.delegation().allows_new_children())
+                (definition.name != "report_blocker"
+                    || (tool_policy.is_headless()
+                        && subagent_depth == 0
+                        && !tool_policy.is_goal_mode()))
+                    && (definition.name != "subagent"
+                        || tool_policy.delegation().allows_new_children())
                     && (definition.name != "computer"
                         || (subagent_depth == 0 && tool_policy.allowed_tools().is_none()))
             })
@@ -915,9 +937,47 @@ mod tests {
 
         assert!(names.contains(&"subagent"));
         assert!(names.contains(&"bash"));
+        assert!(!names.contains(&"report_blocker"));
         assert!(!names.contains(&"get_goal"));
         assert!(!names.contains(&"create_goal"));
         assert!(!names.contains(&"update_goal"));
+    }
+
+    #[test]
+    fn provider_tool_schema_override_exposes_report_blocker_only_for_headless_root() {
+        let registry = McpRegistry::default();
+        for (depth, policy, expected) in [
+            (0, AgentToolPolicyContext::headless(), true),
+            (1, AgentToolPolicyContext::headless(), false),
+            (0, AgentToolPolicyContext::goal_mode(), false),
+        ] {
+            let tools = provider_tool_schema_override(
+                depth,
+                &SubagentType::General,
+                policy,
+                &registry,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(schema_names(&tools).contains(&"report_blocker"), expected);
+        }
+    }
+
+    #[test]
+    fn provider_tool_schema_override_preserves_headless_with_allowed_tools() {
+        let allowed = vec!["report_blocker".to_string()];
+        let policy = AgentToolPolicyContext::headless()
+            .replace_allowed_tools(Some(&allowed), "runtime directive");
+        assert!(policy.is_headless());
+        let tools = provider_tool_schema_override(
+            0,
+            &SubagentType::General,
+            policy,
+            &McpRegistry::default(),
+            &[],
+        )
+        .unwrap();
+        assert!(schema_names(&tools).contains(&"report_blocker"));
     }
 
     #[test]
@@ -1004,6 +1064,7 @@ mod tests {
         assert!(names.contains(&"get_goal"));
         assert!(names.contains(&"create_goal"));
         assert!(names.contains(&"update_goal"));
+        assert!(!names.contains(&"report_blocker"));
     }
 
     #[test]

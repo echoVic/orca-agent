@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::{HistoryMode, RunConfig};
-use orca_core::event_schema::EventFactory;
+use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::tool_types;
 use orca_mcp::{McpElicitationHandler, McpRegistry};
+use orca_tools::report_blocker::parse_report_blocker_args;
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
@@ -44,6 +45,7 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) execution_request: &'a tool_types::ToolRequest,
     pub(crate) goal_mode: bool,
+    pub(crate) headless: bool,
     pub(crate) subagent_depth: u32,
     pub(crate) instructions: &'a ProjectInstructions,
     pub(crate) memory: &'a MemoryBlock,
@@ -84,6 +86,9 @@ pub(crate) enum RuntimeToolTurnDisposition {
 pub(crate) struct RuntimeToolDispatchOutput {
     pub(crate) result: tool_types::ToolResult,
     pub(crate) disposition: RuntimeToolTurnDisposition,
+    /// Terminal status for special tools whose outcome the tool result alone
+    /// cannot express (for example, `report_blocker`).
+    pub(crate) status: Option<RunStatus>,
     /// The subagent child's consumed budget receipt, when this dispatch ran
     /// a child agent that reported one.
     pub(crate) child_budget_usage: Option<orca_core::budget::BudgetUsage>,
@@ -94,6 +99,7 @@ impl RuntimeToolDispatchOutput {
         Self {
             result,
             disposition: RuntimeToolTurnDisposition::ContinueModel,
+            status: None,
             child_budget_usage: None,
         }
     }
@@ -102,6 +108,7 @@ impl RuntimeToolDispatchOutput {
         Self {
             result,
             disposition: RuntimeToolTurnDisposition::StopTurn,
+            status: None,
             child_budget_usage: None,
         }
     }
@@ -142,6 +149,7 @@ impl<'a> RuntimeToolRouter<'a> {
             sink,
             execution_request,
             goal_mode,
+            headless,
             subagent_depth,
             instructions,
             memory,
@@ -187,6 +195,32 @@ impl<'a> RuntimeToolRouter<'a> {
                     cwd,
                     cancel,
                 ))
+            }
+            RuntimeSpecialToolDispatch::ReportBlocker => {
+                if !headless || goal_mode || subagent_depth > 0 {
+                    return Ok(RuntimeToolDispatchOutput::continue_model(
+                        tool_types::ToolResult::failed(
+                            execution_request,
+                            "report_blocker is only available in headless orca exec runs",
+                            None,
+                        ),
+                    ));
+                }
+                return Ok(match parse_report_blocker_args(execution_request) {
+                    Ok(blocker) => RuntimeToolDispatchOutput {
+                        result: tool_types::ToolResult::completed(
+                            execution_request,
+                            "Blocker declared.".to_string(),
+                            false,
+                        ),
+                        disposition: RuntimeToolTurnDisposition::StopTurn,
+                        status: Some(RunStatus::Blocked { blocker }),
+                        child_budget_usage: None,
+                    },
+                    Err(error) => RuntimeToolDispatchOutput::continue_model(
+                        tool_types::ToolResult::failed(execution_request, error, None),
+                    ),
+                });
             }
             RuntimeSpecialToolDispatch::GetGoal
             | RuntimeSpecialToolDispatch::CreateGoal
@@ -465,6 +499,7 @@ impl<'a> RuntimeToolRouter<'a> {
         Ok(RuntimeToolDispatchOutput {
             result,
             disposition: RuntimeToolTurnDisposition::ContinueModel,
+            status: None,
             child_budget_usage: dispatch_child_budget_usage,
         })
     }
@@ -537,6 +572,7 @@ mod tests {
                     sink: &mut sink,
                     execution_request: &request,
                     goal_mode: false,
+                    headless: false,
                     subagent_depth: depth,
                     instructions: &instructions,
                     memory: &memory,
@@ -665,6 +701,7 @@ mod tests {
                     sink: &mut sink,
                     execution_request: &request,
                     goal_mode: false,
+                    headless: false,
                     subagent_depth: 0,
                     instructions: &instructions,
                     memory: &memory,
@@ -761,5 +798,143 @@ mod tests {
             );
             assert!(!batch_output.contains(other), "{batch_output}");
         }
+    }
+
+    fn dispatch_only(
+        request: &tool_types::ToolRequest,
+        headless: bool,
+        goal_mode: bool,
+        subagent_depth: u32,
+    ) -> RuntimeToolDispatchOutput {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = RunConfig::default();
+        let mut runtime = RuntimeToolActorContext::new("router-report-blocker");
+        let mut events = EventFactory::new("router-report-blocker".into());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let tasks = TaskRegistry::new("router-report-blocker".into());
+        let mut workflows = Vec::new();
+        let mut overlay = TurnPermissionOverlay::default();
+        let mut event_error = None;
+        RuntimeToolRouter::new(&mut runtime)
+            .dispatch(RuntimeToolInvocationContext {
+                config: &config,
+                cwd: cwd.path(),
+                events: &mut events,
+                sink: &mut sink,
+                execution_request: request,
+                goal_mode,
+                headless,
+                subagent_depth,
+                instructions: &instructions,
+                memory: &memory,
+                mcp_registry: &registry,
+                hooks: &hooks,
+                emit_deltas: false,
+                cost_tracker: &mut cost,
+                cancel: &cancel,
+                task_registry: &tasks,
+                background_workflows: &mut workflows,
+                workflow_ipc: None,
+                permission_overlay: &mut overlay,
+                permission_handler: None,
+                permission_handler_owned: None,
+                user_input_handler: None,
+                mcp_elicitation_handler: None,
+                extension_stores: None,
+                goal_runtime: None,
+                goal_turn: None,
+                event_error: &mut event_error,
+                subagent_child_executor: unused_child_executor,
+                workflow_child_executor: unused_child_executor,
+                workflow_lifecycle_ingress: None,
+                wait_for_background_workflows: false,
+                root_task_id: None,
+                child_budget: None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn report_blocker_dispatch_ends_turn_with_blocked_status() {
+        let request = tool_types::ToolRequest {
+            id: "router-report-blocker".into(),
+            name: ToolName::ReportBlocker,
+            action: ActionKind::Agent,
+            target: None,
+            raw_arguments: Some(
+                r#"{"kind":"environment_contradiction","summary":"workspace is read-only"}"#.into(),
+            ),
+        };
+
+        let output = dispatch_only(&request, true, false, 0);
+
+        assert_eq!(output.disposition, RuntimeToolTurnDisposition::StopTurn);
+        assert_eq!(output.result.status, ToolStatus::Completed);
+        assert_eq!(output.result.output.as_deref(), Some("Blocker declared."));
+        let Some(RunStatus::Blocked { blocker }) = output.status else {
+            panic!("report_blocker must end the turn with Blocked");
+        };
+        assert_eq!(
+            blocker.kind,
+            orca_core::goal_runtime::BlockerKind::EnvironmentContradiction
+        );
+        assert_eq!(blocker.summary, "workspace is read-only");
+    }
+
+    #[test]
+    fn report_blocker_dispatch_refuses_non_headless_goal_and_child_turns() {
+        let request = tool_types::ToolRequest {
+            id: "refused-blocker".into(),
+            name: ToolName::ReportBlocker,
+            action: ActionKind::Agent,
+            target: None,
+            raw_arguments: Some(r#"{"kind":"external_state","summary":"waiting"}"#.into()),
+        };
+        for (headless, goal_mode, depth) in [(false, false, 0), (true, true, 0), (true, false, 1)] {
+            let output = dispatch_only(&request, headless, goal_mode, depth);
+            assert_eq!(
+                output.disposition,
+                RuntimeToolTurnDisposition::ContinueModel
+            );
+            assert_eq!(output.result.status, ToolStatus::Failed);
+            assert_eq!(
+                output.result.error.as_deref(),
+                Some("report_blocker is only available in headless orca exec runs")
+            );
+            assert!(output.status.is_none());
+        }
+    }
+
+    #[test]
+    fn report_blocker_dispatch_continues_on_invalid_args() {
+        let request = tool_types::ToolRequest {
+            id: "router-report-blocker-invalid".into(),
+            name: ToolName::ReportBlocker,
+            action: ActionKind::Agent,
+            target: None,
+            raw_arguments: Some(r#"{"summary":"missing kind"}"#.into()),
+        };
+
+        let output = dispatch_only(&request, true, false, 0);
+
+        assert_eq!(
+            output.disposition,
+            RuntimeToolTurnDisposition::ContinueModel
+        );
+        assert_eq!(output.result.status, ToolStatus::Failed);
+        assert!(
+            output
+                .result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("report_blocker"))
+        );
+        assert!(output.status.is_none());
     }
 }

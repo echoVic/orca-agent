@@ -285,3 +285,38 @@ fn session_terminal_event_binds_the_verification_proof() {
         0
     );
 }
+
+#[test]
+fn blocked_terminal_serializes_blocker_fields() {
+    let terminal = OperationTerminal::Blocked {
+        blocker: orca_core::goal_runtime::BlockerSummary {
+            kind: orca_core::goal_runtime::BlockerKind::EnvironmentContradiction,
+            summary: "workspace is read-only".into(),
+            fingerprint: "read-only-workspace".into(),
+            evidence: Vec::new(),
+        },
+        usage: BudgetUsage::default(),
+    };
+    let value = serde_json::to_value(&terminal).unwrap();
+    assert_eq!(
+        value["blocked"]["blocker"]["kind"],
+        "environment_contradiction"
+    );
+    assert_eq!(
+        value["blocked"]["blocker"]["summary"],
+        "workspace is read-only"
+    );
+    assert_eq!(
+        value["blocked"]["blocker"]["fingerprint"],
+        "read-only-workspace"
+    );
+    assert_eq!(
+        value["blocked"]["blocker"]["evidence"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        serde_json::from_value::<OperationTerminal>(value).unwrap(),
+        terminal
+    );
+    assert_eq!(terminal.exit_code(), 5);
+}

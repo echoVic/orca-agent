@@ -2165,7 +2165,7 @@ mod tests {
             } else {
                 orca_core::event_schema::RunStatus::Success
             };
-            thread.lifecycle_mut().finish_task(status);
+            thread.lifecycle_mut().finish_task(status.clone());
             Ok(status.into())
         }
     }
@@ -2187,7 +2187,7 @@ mod tests {
         ) -> std::io::Result<orca_runtime::runtime_host::ThreadOperationOutcome> {
             self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let status = orca_core::event_schema::RunStatus::Success;
-            thread.lifecycle_mut().finish_task(status);
+            thread.lifecycle_mut().finish_task(status.clone());
             Ok(status.into())
         }
     }

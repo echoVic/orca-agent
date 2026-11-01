@@ -195,7 +195,7 @@ impl ThreadOperationExecutor for ScriptedExecutor {
                 panic!("operation must not reach the executor")
             }
         };
-        thread.lifecycle_mut().finish_task(status);
+        thread.lifecycle_mut().finish_task(status.clone());
         Ok(status.into())
     }
 }

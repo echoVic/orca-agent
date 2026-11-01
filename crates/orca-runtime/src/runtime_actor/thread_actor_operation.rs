@@ -5895,6 +5895,24 @@ impl ThreadActor {
                     };
                     (surface::GenerationStopReason::Cancelled { cause }, terminal)
                 }
+                (
+                    OperationOutcome::Completed(RunStatus::Blocked { blocker }),
+                    Some(CompletedTurnOutcome {
+                        status: RunStatus::Blocked { .. },
+                        terminal: Some(orca_core::budget::OperationTerminal::Blocked { .. }),
+                        ..
+                    }),
+                ) => (
+                    surface::GenerationStopReason::Completed {
+                        status: surface::GenerationCompletionStatus::Blocked {
+                            blocker: blocker.clone(),
+                        },
+                    },
+                    surface::OperationTerminal::Blocked {
+                        blocker: blocker.clone(),
+                        usage: surface_usage.clone(),
+                    },
+                ),
                 (OperationOutcome::Stopped(terminal), Some(_completed)) => {
                     // The typed terminal owns the budget facts; the surface
                     // projection derives its budget from the stop reason with
@@ -6457,7 +6475,8 @@ impl ThreadActor {
             surface::OperationTerminal::Failed { .. }
             | surface::OperationTerminal::Panicked { .. }
             | surface::OperationTerminal::JoinFailed { .. }
-            | surface::OperationTerminal::AbortedByRuntimeRestart { .. } => {
+            | surface::OperationTerminal::AbortedByRuntimeRestart { .. }
+            | surface::OperationTerminal::Blocked { .. } => {
                 Self::push_completion_limitation(
                     &mut proof,
                     "operation did not complete successfully",
@@ -6761,7 +6780,7 @@ impl ThreadActor {
                         Some(orca_core::budget::OperationTerminal::Stopped { .. }) => {
                             OperationOutcome::Stopped(terminal.clone().expect("matched stop"))
                         }
-                        _ => OperationOutcome::Completed(status),
+                        _ => OperationOutcome::Completed(status.clone()),
                     };
                     (
                         outcome,

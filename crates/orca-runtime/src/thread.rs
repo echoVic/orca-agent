@@ -253,7 +253,7 @@ impl RuntimeThread {
                 RunStatus::ApprovalRequired => {
                     orca_core::goal_runtime::GoalTurnStatus::ApprovalRequired
                 }
-                RunStatus::Failed | RunStatus::VerificationFailed => {
+                RunStatus::Failed | RunStatus::VerificationFailed | RunStatus::Blocked { .. } => {
                     orca_core::goal_runtime::GoalTurnStatus::Failed
                 }
             }
@@ -536,7 +536,7 @@ impl RuntimeThread {
             turn_progress_evidence_since(self.session.conversation(), &progress_baseline);
         let settled = self.finish_goal_turn(
             binding.as_ref(),
-            result.as_ref().copied().unwrap_or(RunStatus::Failed),
+            result.as_ref().cloned().unwrap_or(RunStatus::Failed),
             crate::lifecycle::TurnEndReason::Unclassified,
             None,
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
@@ -574,7 +574,7 @@ impl RuntimeThread {
             turn_progress_evidence_since(self.session.conversation(), &progress_baseline);
         let settled = self.finish_goal_turn(
             binding.as_ref(),
-            result.as_ref().copied().unwrap_or(RunStatus::Failed),
+            result.as_ref().cloned().unwrap_or(RunStatus::Failed),
             crate::lifecycle::TurnEndReason::Unclassified,
             None,
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
@@ -631,7 +631,7 @@ impl RuntimeThread {
             turn_progress_evidence_since(self.session.conversation(), &progress_baseline);
         let settled = self.finish_goal_turn(
             binding.as_ref(),
-            result.as_ref().copied().unwrap_or(RunStatus::Failed),
+            result.as_ref().cloned().unwrap_or(RunStatus::Failed),
             crate::lifecycle::TurnEndReason::Unclassified,
             None,
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
@@ -686,7 +686,7 @@ impl RuntimeThread {
         let settled = self.finish_goal_turn(
             binding.as_ref(),
             match &result {
-                Ok(ThreadTurnOutcome::Completed { status, .. }) => *status,
+                Ok(ThreadTurnOutcome::Completed { status, .. }) => status.clone(),
                 Ok(ThreadTurnOutcome::ProviderSuspended { .. }) => RunStatus::ApprovalRequired,
                 Err(_) => RunStatus::Failed,
             },

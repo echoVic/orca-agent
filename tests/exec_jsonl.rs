@@ -703,3 +703,90 @@ fn run_exec_with_stdin(args: &[&str], stdin: &str) -> std::process::Output {
 fn shell_escape(path: &std::path::Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
+
+#[test]
+fn exec_report_blocker_ends_blocked_with_exit_5() {
+    assert_exec_report_blocker(false);
+}
+
+#[test]
+fn exec_report_blocker_with_passing_verifier_stays_blocked() {
+    assert_exec_report_blocker(true);
+}
+
+#[test]
+fn exec_report_blocker_text_mode_prints_the_reason() {
+    let home = TempDir::new().expect("temporary ORCA_HOME");
+    let cwd = TempDir::new().expect("temporary workspace");
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "text",
+            "--provider",
+            "mock",
+            "--no-history",
+            "report_blocker environment_contradiction workspace is read-only",
+        ])
+        .output()
+        .expect("run orca");
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status: blocked"), "{stdout}");
+    assert!(
+        stdout.contains("blocked: environment_contradiction — workspace is read-only"),
+        "{stdout}"
+    );
+}
+
+fn assert_exec_report_blocker(with_verifier: bool) {
+    let home = TempDir::new().expect("temporary ORCA_HOME");
+    let cwd = TempDir::new().expect("temporary workspace");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
+    command
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--no-history",
+        ]);
+    if with_verifier {
+        command.args(["--verifier", "printf ok"]);
+    }
+    let output = command
+        .arg("report_blocker environment_contradiction workspace is read-only")
+        .output()
+        .expect("run orca");
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = parse_jsonl(&output.stdout);
+    let terminal = events.last().expect("terminal event");
+    assert_eq!(terminal["type"], "session.completed");
+    assert_eq!(terminal["payload"]["status"], "blocked");
+    let usage = &terminal["payload"]["terminal"]["blocked"]["usage"];
+    assert!(usage["turns"].as_u64().expect("turn count") >= 1);
+    assert!(usage["tool_calls"].as_u64().expect("tool call count") >= 1);
+    let blocker = &terminal["payload"]["terminal"]["blocked"]["blocker"];
+    assert_eq!(blocker["kind"], "environment_contradiction");
+    assert_eq!(blocker["summary"], "workspace is read-only");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["type"] == "verification.started")
+    );
+}
