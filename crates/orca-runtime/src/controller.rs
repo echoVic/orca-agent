@@ -228,6 +228,7 @@ pub struct ThreadTurnContext<'a> {
     cwd: PathBuf,
     prompt: String,
     memory_start: usize,
+    file_write_baseline: std::collections::HashMap<String, u64>,
     parts: InteractiveSessionRuntimeParts<'a>,
 }
 
@@ -494,10 +495,10 @@ impl<'a> ThreadTurnContext<'a> {
         if request.prompt_placement() != ThreadTurnPromptPlacement::ExistingTurn {
             session.wait_for_automatic_memory_snapshot();
         }
-        let memory_start = session.begin_automatic_memory_turn(
+        let turn_start = session.begin_runtime_turn(
             request.turn_id().as_str(),
             request.prompt_placement() == ThreadTurnPromptPlacement::ExistingTurn,
-        );
+        )?;
         let mut parts = session.runtime_parts();
         if let Some(writer) = parts.writer.as_deref_mut() {
             writer.enter_turn(request.turn_id().clone());
@@ -544,7 +545,8 @@ impl<'a> ThreadTurnContext<'a> {
         Ok(Self {
             cwd,
             prompt,
-            memory_start,
+            memory_start: turn_start.message_index,
+            file_write_baseline: turn_start.file_write_baseline,
             parts,
         })
     }
@@ -746,6 +748,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             cwd,
             prompt,
             memory_start,
+            file_write_baseline,
             parts,
         } = context;
         let main_session_task = ThreadTurnMainSessionTask::from_request(
@@ -946,13 +949,23 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             background_workflows,
             terminal: Some(result.terminal),
             verification,
-            writes_applied: turn_writes_applied(
-                parts
-                    .conversation
-                    .messages
-                    .get(memory_start..)
-                    .unwrap_or_default(),
-            ),
+            writes_applied: request
+                .root_task_id()
+                .map(|root| {
+                    parts
+                        .task_registry
+                        .task_tree_writes_applied(root, &file_write_baseline)
+                })
+                .transpose()
+                .map_err(io::Error::other)?
+                .unwrap_or(false)
+                || turn_writes_applied(
+                    parts
+                        .conversation
+                        .messages
+                        .get(memory_start..)
+                        .unwrap_or_default(),
+                ),
         }))
     }
 }
@@ -1086,8 +1099,6 @@ impl ThreadTurnCompletion {
             ) {
                 eprintln!("orca: warning: automatic memory extraction failed: {error}");
             }
-        } else {
-            session.finish_automatic_memory_turn(request.turn_id().as_str());
         }
         Ok(self.status)
     }
@@ -2359,6 +2370,110 @@ mod tests {
     use orca_core::conversation::Message;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
+
+    #[test]
+    fn child_write_survives_resumed_generations_in_the_same_turn() {
+        use crate::provider_stream::{
+            RuntimeProviderSuspensionControl, RuntimeProviderSuspensionEvent,
+        };
+        #[derive(Debug)]
+        struct SuspendAfterWrite(PathBuf, AtomicBool);
+        impl RuntimeProviderSuspensionControl for SuspendAfterWrite {
+            fn take_suspension_request(&self) -> bool {
+                std::fs::read_to_string(&self.0).is_ok_and(|text| text == "after")
+                    && !self.1.swap(true, Ordering::AcqRel)
+            }
+        }
+        for interrupted in [false, true] {
+            let cwd = tempfile::tempdir().unwrap();
+            std::fs::write(cwd.path().join("note.txt"), "before").unwrap();
+            let mut config = config(SubagentConfig::default());
+            config.cwd = Some(cwd.path().into());
+            config.approval_mode = ApprovalMode::FullAuto;
+            let prompt = "subagent sync edit note.txt :: before => after";
+            let mut thread = RuntimeThread::start(&config, prompt).unwrap();
+            let root = thread
+                .session()
+                .task_registry()
+                .create_main_session("root".into());
+            let request = ThreadTurnRequest::new(prompt)
+                .with_root_task_id(root.id.clone())
+                .with_provider_suspension_control(Arc::new(SuspendAfterWrite(
+                    cwd.path().join("note.txt"),
+                    AtomicBool::new(false),
+                )));
+            let mut events = EventFactory::new(thread.thread_id().to_string());
+            let outcome = thread
+                .run_request_with_event_factory_and_cancel_outcome(
+                    &config,
+                    &request,
+                    io::sink(),
+                    &mut events,
+                    CancelToken::new(),
+                )
+                .unwrap();
+            let ThreadTurnOutcome::ProviderSuspended { mut suspension, .. } = outcome else {
+                panic!("expected suspension after child write")
+            };
+            let response = loop {
+                if let RuntimeProviderSuspensionEvent::Completed(response) = suspension
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap()
+                {
+                    break response;
+                }
+            };
+            if interrupted {
+                let cancelled = ThreadTurnRequest::new(prompt)
+                    .with_turn_id(request.turn_id().clone())
+                    .with_root_task_id(root.id.clone())
+                    .with_existing_turn_prompt()
+                    .with_deferred_cancel_terminal(true);
+                let cancel = CancelToken::new();
+                cancel.cancel();
+                let outcome = thread
+                    .run_request_with_event_factory_and_cancel_outcome(
+                        &config,
+                        &cancelled,
+                        io::sink(),
+                        &mut events,
+                        cancel,
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    outcome,
+                    ThreadTurnOutcome::Completed {
+                        status: RunStatus::Cancelled,
+                        ..
+                    }
+                ));
+            }
+            let resumed = ThreadTurnRequest::new(prompt)
+                .with_turn_id(request.turn_id().clone())
+                .with_root_task_id(root.id)
+                .with_continuation(crate::background_turn::RuntimeTurnContinuation {
+                    response,
+                    preapproved_tool_call_id: None,
+                });
+            let outcome = thread
+                .run_request_with_event_factory_and_cancel_outcome(
+                    &config,
+                    &resumed,
+                    io::sink(),
+                    &mut events,
+                    CancelToken::new(),
+                )
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                ThreadTurnOutcome::Completed {
+                    status: RunStatus::Success,
+                    writes_applied: true,
+                    ..
+                }
+            ));
+        }
+    }
 
     #[test]
     fn writes_applied_requires_a_successful_matching_file_tool_result() {

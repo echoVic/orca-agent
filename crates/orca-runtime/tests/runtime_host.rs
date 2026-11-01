@@ -2782,6 +2782,43 @@ fn canonical_hosted_bash_streams_output_before_tool_terminal() {
 }
 
 #[test]
+fn untracked_hosted_turn_does_not_recount_an_earlier_child_write() {
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(cwd.path().join("note.txt"), "before").unwrap();
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.approval_mode = ApprovalMode::FullAuto;
+    let host = RuntimeHost::start().unwrap();
+    let thread = host.start_thread(config, "turn scoped writes").unwrap();
+    for (prompt, writes) in [
+        ("subagent sync edit note.txt :: before => after", true),
+        ("read note.txt", false),
+    ] {
+        let output = SharedWriter::default();
+        let operation = thread
+            .start_turn(HostedTurnRequest::new(prompt), output.clone())
+            .unwrap();
+        assert_eq!(
+            operation
+                .wait_timeout(BACKGROUND_WORK_TIMEOUT)
+                .unwrap()
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+        let completed = output
+            .json_events()
+            .into_iter()
+            .find(|event| event["type"] == "session.completed")
+            .unwrap();
+        assert_eq!(completed["payload"]["writes_applied"], writes, "{prompt}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(cwd.path().join("note.txt")).unwrap(),
+        "after"
+    );
+    host.shutdown().unwrap();
+}
+
+#[test]
 fn canonical_hosted_edit_emits_committed_diff() {
     let cwd = tempfile::tempdir().unwrap();
     std::fs::write(cwd.path().join("notes.txt"), "old\nsame\n").unwrap();

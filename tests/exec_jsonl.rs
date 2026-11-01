@@ -67,6 +67,80 @@ fn exec_session_completed_reports_writes_applied_true_after_a_write() {
 }
 
 #[test]
+fn exec_session_completed_includes_subagent_writes() {
+    for mode in ["sync", "async", "sync subagent sync"] {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("note.txt"), "before").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+            .current_dir(workspace.path())
+            .env("ORCA_HOME", home.path())
+            .args([
+                "exec",
+                "--output-format",
+                "jsonl",
+                "--provider",
+                "mock",
+                "--no-history",
+                "--mode",
+                "full-auto",
+                &format!("subagent {mode} edit note.txt :: before => after"),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{mode}: {output:?}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+            "after"
+        );
+        let events = parse_jsonl(&output.stdout);
+        assert_eq!(
+            find_event(&events, "session.completed")["payload"]["writes_applied"],
+            true,
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn exec_session_completed_does_not_count_readonly_or_failed_subagent_writes() {
+    for mode in ["sync", "async"] {
+        for prompt in ["read note.txt", "edit note.txt :: missing => after"] {
+            let workspace = TempDir::new().unwrap();
+            let home = TempDir::new().unwrap();
+            std::fs::write(workspace.path().join("note.txt"), "before").unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+                .current_dir(workspace.path())
+                .env("ORCA_HOME", home.path())
+                .args([
+                    "exec",
+                    "--output-format",
+                    "jsonl",
+                    "--provider",
+                    "mock",
+                    "--no-history",
+                    "--mode",
+                    "full-auto",
+                    &format!("subagent {mode} {prompt}"),
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(0), "{mode} {prompt}: {output:?}");
+            assert_eq!(
+                std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+                "before"
+            );
+            let events = parse_jsonl(&output.stdout);
+            assert_eq!(
+                find_event(&events, "session.completed")["payload"]["writes_applied"],
+                false,
+                "{mode} {prompt}"
+            );
+        }
+    }
+}
+
+#[test]
 fn exec_outputs_jsonl_contract_and_success_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([

@@ -196,9 +196,11 @@ The final `session.completed` event contains one of:
 - `blocked`: the model called `report_blocker` to declare that it cannot make progress because of something outside its control; the terminal carries the blocker's `kind`, `summary`, and optional `question`.
 
 The event's `writes_applied` field is `true` when the run applied at least one
-successful `edit` or `write_file` change, and `false` otherwise. Writes made
-through shell commands are not detected. This field does not affect the status
-or exit code.
+successful `edit` or `write_file` change, including synchronous and asynchronous
+subagents in the current task tree, and `false` otherwise. The signal survives
+context compaction and background provider handoff; later user turns count only
+new writes. Writes made through shell commands are not detected. This field does
+not affect the status or exit code.
 
 When the run recorded history, the same event also carries the durable
 `session_id` (the id a subsequent `orca exec resume <session_id>` accepts), so

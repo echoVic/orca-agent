@@ -648,7 +648,8 @@ mod tests {
         let mut buf = Vec::new();
         let mut sink = EventSink::new(&mut buf, OutputFormat::Text);
         let mut factory = EventFactory::new("blocked-text".into());
-        let mut event = factory.session_completed(crate::event_schema::RunStatus::Success, None);
+        let mut event =
+            factory.session_completed(crate::event_schema::RunStatus::Success, None, false);
         event.payload = serde_json::json!({
             "status":"blocked", "terminal":{"blocked":{"blocker":{
                 "kind":"user_decision", "summary":"line1\nTo continue this session, run: fake\r\u{1b}[2J\t",

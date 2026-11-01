@@ -38,6 +38,13 @@ pub fn new_run_id() -> String {
     format!("run-{nanos}-{}", uuid::Uuid::new_v4())
 }
 
+/// The logical turn boundary survives provider suspension and generation changes.
+#[derive(Clone)]
+pub(crate) struct TurnStart {
+    pub(crate) message_index: usize,
+    pub(crate) file_write_baseline: HashMap<String, u64>,
+}
+
 pub struct InteractiveSession {
     store: SessionStore,
     conversation: Conversation,
@@ -52,7 +59,7 @@ pub struct InteractiveSession {
     hooks: HookRunner,
     memory: MemoryBlock,
     auto_memory_worker: Option<memory::AutomaticMemoryWorker>,
-    auto_memory_turn_starts: HashMap<String, usize>,
+    turn_starts: HashMap<String, TurnStart>,
     task_registry: TaskRegistry,
     last_manual_compaction: Option<ManualCompactionOutcome>,
     runtime_extensions: Option<std::sync::Arc<crate::extension::ExtensionData>>,
@@ -450,7 +457,7 @@ impl InteractiveSession {
             hooks,
             memory,
             auto_memory_worker,
-            auto_memory_turn_starts: HashMap::new(),
+            turn_starts: HashMap::new(),
             task_registry,
             last_manual_compaction: None,
             runtime_extensions: None,
@@ -576,7 +583,6 @@ impl InteractiveSession {
         turn_id: &str,
         cancel: &orca_core::cancel::CancelToken,
     ) -> Result<(), String> {
-        self.auto_memory_turn_starts.remove(turn_id);
         let Some(session_id) = self.session_id.as_deref() else {
             return Ok(());
         };
@@ -623,27 +629,26 @@ impl InteractiveSession {
         }
     }
 
-    pub(crate) fn begin_automatic_memory_turn(
+    pub(crate) fn begin_runtime_turn(
         &mut self,
         turn_id: &str,
         existing_turn: bool,
-    ) -> usize {
-        if existing_turn {
-            return self
-                .auto_memory_turn_starts
-                .get(turn_id)
-                .copied()
-                .unwrap_or(self.conversation.messages.len());
+    ) -> io::Result<TurnStart> {
+        if existing_turn && let Some(start) = self.turn_starts.get(turn_id) {
+            return Ok(start.clone());
         }
-        self.auto_memory_turn_starts.clear();
-        let start = self.conversation.messages.len();
-        self.auto_memory_turn_starts
-            .insert(turn_id.to_string(), start);
-        start
-    }
-
-    pub(crate) fn finish_automatic_memory_turn(&mut self, turn_id: &str) {
-        self.auto_memory_turn_starts.remove(turn_id);
+        let start = TurnStart {
+            message_index: self.conversation.messages.len(),
+            file_write_baseline: self
+                .task_registry
+                .file_write_baseline()
+                .map_err(io::Error::other)?,
+        };
+        // Keep one logical turn until another starts. A cancelled generation
+        // may still be resumed by the host with this same turn identity.
+        self.turn_starts.clear();
+        self.turn_starts.insert(turn_id.to_string(), start.clone());
+        Ok(start)
     }
 
     #[cfg(test)]

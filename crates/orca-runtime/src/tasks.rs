@@ -974,6 +974,8 @@ pub struct TaskRecord {
     pub workflow_final_summary: Option<String>,
     pub workflow_failure_count: u32,
     pub usage: Option<UsageTotals>,
+    /// Successful edit/write_file receipts, retained across task settlement.
+    pub(crate) applied_file_writes: u64,
     pub subagent_current_activity: Option<String>,
     pub subagent_activity_history: Vec<SubagentActivityEntry>,
     pub subagent_child_thread_id: Option<String>,
@@ -1452,6 +1454,8 @@ struct PersistedTaskRecord {
     #[serde(default)]
     workflow_failure_count: u32,
     usage: Option<UsageTotals>,
+    #[serde(default)]
+    applied_file_writes: u64,
     #[serde(default)]
     subagent_current_activity: Option<String>,
     #[serde(default)]
@@ -3331,6 +3335,7 @@ impl TaskRegistry {
             workflow_final_summary: None,
             workflow_failure_count: 0,
             usage: None,
+            applied_file_writes: 0,
             subagent_current_activity: None,
             subagent_activity_history: Vec::new(),
             subagent_child_thread_id: None,
@@ -3461,6 +3466,7 @@ impl TaskRegistry {
             workflow_final_summary: None,
             workflow_failure_count: 0,
             usage: None,
+            applied_file_writes: 0,
             subagent_current_activity: None,
             subagent_activity_history: Vec::new(),
             subagent_child_thread_id: None,
@@ -3595,6 +3601,7 @@ impl TaskRegistry {
             workflow_final_summary: None,
             workflow_failure_count: 0,
             usage: None,
+            applied_file_writes: 0,
             subagent_current_activity: None,
             subagent_activity_history: Vec::new(),
             subagent_child_thread_id: None,
@@ -3684,6 +3691,7 @@ impl TaskRegistry {
             workflow_final_summary: None,
             workflow_failure_count: 0,
             usage: None,
+            applied_file_writes: 0,
             subagent_current_activity: None,
             subagent_activity_history: Vec::new(),
             subagent_child_thread_id: None,
@@ -3787,6 +3795,58 @@ impl TaskRegistry {
         self.refresh_session_from_persistence()?;
         self.with_tasks(|tasks| tasks.values().cloned().collect())
             .map_err(|_| "task registry lock poisoned".into())
+    }
+
+    pub(crate) fn record_applied_write(&self, task_id: &str) -> Result<(), String> {
+        // Hosted turns without a main task use an unregistered scope identity.
+        // Their direct writes still have the transcript fallback in the controller.
+        if self.refresh_task_from_persistence(task_id)?.is_none() {
+            return Ok(());
+        }
+        self.update_task(task_id, |record| {
+            record.applied_file_writes = record.applied_file_writes.saturating_add(1);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn file_write_baseline(&self) -> Result<HashMap<String, u64>, String> {
+        Ok(self
+            .records_snapshot()?
+            .into_iter()
+            .map(|record| (record.id, record.applied_file_writes))
+            .collect())
+    }
+
+    /// Includes detached descendants after refreshing their durable receipts.
+    /// Count only this turn's writes, even when the root scope is reused.
+    pub(crate) fn task_tree_writes_applied(
+        &self,
+        root_id: &str,
+        baseline: &HashMap<String, u64>,
+    ) -> Result<bool, String> {
+        let records = self.records_snapshot()?;
+        let by_id: HashMap<_, _> = records
+            .iter()
+            .map(|record| (record.id.as_str(), record))
+            .collect();
+        for record in records.iter().filter(|record| {
+            record.applied_file_writes > baseline.get(&record.id).copied().unwrap_or(0)
+        }) {
+            let mut cursor = Some(record.id.as_str());
+            let mut visited = HashSet::new();
+            while let Some(id) = cursor {
+                if id == root_id {
+                    return Ok(true);
+                }
+                if !visited.insert(id) {
+                    break;
+                }
+                cursor = by_id
+                    .get(id)
+                    .and_then(|record| record.parent_task_id.as_deref());
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn execution_scope_lock(&self) -> std::io::Result<Option<ExclusiveFileLock>> {
@@ -6251,6 +6311,7 @@ impl PersistedTaskRecord {
             workflow_final_summary: self.workflow_final_summary,
             workflow_failure_count: self.workflow_failure_count,
             usage: self.usage,
+            applied_file_writes: self.applied_file_writes,
             subagent_current_activity: self.subagent_current_activity,
             subagent_activity_history: self.subagent_activity_history,
             subagent_child_thread_id: self.subagent_child_thread_id,
@@ -6363,6 +6424,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             workflow_final_summary: record.workflow_final_summary.clone(),
             workflow_failure_count: record.workflow_failure_count,
             usage: record.usage,
+            applied_file_writes: record.applied_file_writes,
             subagent_current_activity: record.subagent_current_activity.clone(),
             subagent_activity_history: record.subagent_activity_history.clone(),
             subagent_child_thread_id: record.subagent_child_thread_id.clone(),
@@ -7229,6 +7291,50 @@ mod tests {
     }
     use super::*;
     use crate::subagent_event_relay::RelayTaskType;
+
+    #[test]
+    fn task_tree_write_receipts_survive_worker_settlement_without_leaking_to_other_roots() {
+        let home = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("writes".into(), home.path().into()).unwrap();
+        let root = registry.create_main_session("root".into());
+        let other = registry.create_main_session("other turn".into());
+        let child =
+            registry.create_subagent_with_parent("child".into(), None, Some(root.id.clone()));
+        let leaf =
+            registry.create_subagent_with_parent("leaf".into(), None, Some(child.id.clone()));
+        assert!(
+            !registry
+                .task_tree_writes_applied(&root.id, &HashMap::new())
+                .unwrap()
+        );
+        let worker =
+            TaskRegistry::new_persistent_attached("writes".into(), home.path().into()).unwrap();
+        worker.record_applied_write(&leaf.id).unwrap();
+        worker.complete(&leaf.id, "done".into()).unwrap();
+        assert!(
+            registry
+                .task_tree_writes_applied(&root.id, &HashMap::new())
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .task_tree_writes_applied(&other.id, &HashMap::new())
+                .unwrap()
+        );
+        let baseline = registry.file_write_baseline().unwrap();
+        assert!(
+            !registry
+                .task_tree_writes_applied(&root.id, &baseline)
+                .unwrap()
+        );
+        // A new write in a reused task must still be visible in the next turn.
+        worker.record_applied_write(&leaf.id).unwrap();
+        assert!(
+            registry
+                .task_tree_writes_applied(&root.id, &baseline)
+                .unwrap()
+        );
+    }
 
     #[test]
     fn safe_path_component_never_returns_dot_path_components() {

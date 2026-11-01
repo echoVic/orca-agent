@@ -1379,6 +1379,16 @@ impl ToolExecutionActor {
             },
         };
         let result = dispatch.result;
+        if result.kind == tool_types::ToolResultKind::Success
+            && matches!(
+                execution_request.name,
+                tool_types::ToolName::Edit | tool_types::ToolName::WriteFile
+            )
+            && let Some(task_id) = root_task_id
+            && let Err(error) = task_registry.record_applied_write(task_id)
+        {
+            retain_first_io_error(&mut dispatch_event_error, Err(io::Error::other(error)));
+        }
         let status = dispatch.status;
         // The subagent child's budget receipt rides to the turn settlement
         // point so the parent operation merges exactly what the child spent.

@@ -2012,7 +2012,7 @@ mod tests {
             usage: BudgetUsage::default(),
         };
         let mut factory = EventFactory::new("run-1".to_string());
-        let draft = factory.session_completed_terminal(&terminal, None);
+        let draft = factory.session_completed_terminal(&terminal, None, false);
         let payload = &draft.payload;
         assert_eq!(payload["status"], "blocked");
     }
