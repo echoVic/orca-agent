@@ -762,6 +762,54 @@ fn exec_blocked_text_mode_prints_answer_resume_hint_with_saved_session_id() {
 }
 
 #[test]
+fn exec_blocked_text_mode_without_question_keeps_the_plain_resume_hint() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "text",
+            "--save-history",
+            "--provider",
+            "mock",
+            "report_blocker user_decision need a port",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let documents = session_documents(home.path());
+    assert_eq!(documents.len(), 1);
+    let session_id = documents[0]
+        .1
+        .iter()
+        .find(|record| record["type"] == "session.meta")
+        .and_then(|record| record["session_id"].as_str())
+        .expect("saved session id");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("blocked: user_decision — need a port"),
+        "{stdout}"
+    );
+    let hint = stdout
+        .lines()
+        .find(|line| line.starts_with("To continue this session, run:"))
+        .expect("resume hint");
+    assert_eq!(
+        hint,
+        format!("To continue this session, run: orca exec resume {session_id}")
+    );
+    assert!(!stdout.contains("<your answer>"), "{stdout}");
+}
+
+#[test]
 fn exec_report_blocker_text_mode_prints_the_reason() {
     let home = TempDir::new().expect("temporary ORCA_HOME");
     let cwd = TempDir::new().expect("temporary workspace");
@@ -924,6 +972,98 @@ fn exec_subagent_report_blocker_reports_blocked_to_parent() {
         "Subagent status: Blocked",
         "kind: environment_contradiction",
         "summary: child cannot write",
+    ] {
+        assert!(output.contains(line), "{output}");
+    }
+}
+
+#[test]
+fn exec_subagent_report_blocker_carries_its_question_to_parent() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--no-history",
+            "subagent sync report_blocker ? Can you allow writes?",
+        ])
+        .output()
+        .expect("run orca");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = parse_jsonl(&output.stdout);
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["type"], "session.completed");
+    assert_eq!(terminal["payload"]["status"], "success");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "session.completed")
+            .count(),
+        1
+    );
+    let tasks = events
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "workflow.tasks.updated")
+        .expect("task snapshot")["payload"]["tasks"]
+        .as_array()
+        .unwrap();
+    let child = tasks
+        .iter()
+        .find(|task| task["type"] == "subagent")
+        .expect("child task");
+    assert_eq!(child["status"], "blocked", "{tasks:?}");
+    let parent = tasks
+        .iter()
+        .find(|task| task["type"] == "main_session")
+        .expect("root task");
+    assert_eq!(parent["status"], "completed");
+    let listed = events
+        .iter()
+        .find(|e| e["type"] == "tool.call.completed" && e["payload"]["name"] == "task_list")
+        .expect("parent lists tasks after child blocks");
+    let listed: Value =
+        serde_json::from_str(listed["payload"]["output"].as_str().unwrap()).unwrap();
+    assert!(
+        listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == child["id"] && task["status"] == "blocked"),
+        "{listed}"
+    );
+    assert!(
+        listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == parent["id"] && task["status"] == "running"),
+        "{listed}"
+    );
+    let completed = events
+        .iter()
+        .find(|e| e["type"] == "tool.call.completed" && e["payload"]["name"] == "subagent")
+        .expect("subagent tool result");
+    assert_eq!(completed["payload"]["status"], "failed");
+    let output = completed["payload"]["output"]
+        .as_str()
+        .expect("blocked output");
+    for line in [
+        "Subagent status: Blocked",
+        "kind: environment_contradiction",
+        "summary: child cannot write",
+        "question: Can you allow writes?",
     ] {
         assert!(output.contains(line), "{output}");
     }

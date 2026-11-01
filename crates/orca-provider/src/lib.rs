@@ -1175,7 +1175,11 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
-    if prompt.trim() == "subagent sync report_blocker"
+    if prompt
+        .trim()
+        .split_once(" ? ")
+        .map_or(prompt.trim(), |(base, _)| base)
+        == "subagent sync report_blocker"
         && has_tool_results
         && !conversation.messages.iter().any(|message| {
             matches!(message,
@@ -1594,8 +1598,19 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         } else {
             (None, rest)
         };
-        let prompt = if description == "report_blocker" {
-            "report_blocker environment_contradiction child cannot write".to_string()
+        let (blocker_description, question) = description
+            .split_once(" ? ")
+            .map_or((description, None), |(description, question)| {
+                (description, Some(question))
+            });
+        let prompt = if blocker_description == "report_blocker" {
+            let mut prompt =
+                "report_blocker environment_contradiction child cannot write".to_string();
+            if let Some(question) = question {
+                prompt.push_str(" ? ");
+                prompt.push_str(question);
+            }
+            prompt
         } else if description == "mock_fail" {
             "mock_fail".to_string()
         } else if description == "schema_ok" || description == "schema_fail" {
@@ -1607,7 +1622,7 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
             "description": description,
             "prompt": prompt
         });
-        if description == "report_blocker" {
+        if blocker_description == "report_blocker" {
             arguments["subagent_type"] = serde_json::json!("explorer");
         }
         if description == "schema_ok" {
