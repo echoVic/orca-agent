@@ -1175,6 +1175,28 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
+    if prompt.trim() == "subagent sync report_blocker"
+        && has_tool_results
+        && !conversation.messages.iter().any(|message| {
+            matches!(message,
+            Message::Tool { tool_call_id, .. } if tool_call_id == "mock-tool-2")
+        })
+    {
+        let mut request = parse_mock_prompt("task_list").expect("task list request");
+        request.id = "mock-tool-2".to_string();
+        return ProviderResponse {
+            steps: vec![ProviderStep::ToolCall(request.clone())],
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls: vec![RawToolCall {
+                id: request.id,
+                function_name: request.name.as_str().to_string(),
+                arguments: request.raw_arguments.unwrap_or_default(),
+            }],
+            usage: None,
+        };
+    }
+
     if has_tool_results {
         let msg = "Mock completed after tool execution.".to_string();
         return ProviderResponse {
@@ -1565,7 +1587,9 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         } else {
             (None, rest)
         };
-        let prompt = if description == "mock_fail" {
+        let prompt = if description == "report_blocker" {
+            "report_blocker environment_contradiction child cannot write".to_string()
+        } else if description == "mock_fail" {
             "mock_fail".to_string()
         } else if description == "schema_ok" || description == "schema_fail" {
             "mock_usage".to_string()
@@ -1576,6 +1600,9 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
             "description": description,
             "prompt": prompt
         });
+        if description == "report_blocker" {
+            arguments["subagent_type"] = serde_json::json!("explorer");
+        }
         if description == "schema_ok" {
             arguments["schema"] = serde_json::json!({ "type": "string" });
         } else if description == "schema_fail" {

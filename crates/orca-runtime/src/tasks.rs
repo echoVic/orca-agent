@@ -3132,6 +3132,31 @@ impl TaskRegistry {
         })
     }
 
+    pub(crate) fn block_with_usage_and_lease(
+        &self,
+        lease: &TaskLease,
+        id: &str,
+        error: String,
+        usage: Option<UsageTotals>,
+    ) -> Result<(), TaskLeaseError> {
+        self.update_task_with_lease(lease, id, |record| {
+            record.status = TaskStatus::Blocked;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = Some(now_ms());
+            record.error = Some(error);
+            record.result = None;
+            record.usage = usage;
+            record.tool = None;
+            record.pending_tool_call = None;
+            record.pending_tool_approval_response = None;
+            record.pending_provider_response = None;
+            record.worker_pid = None;
+            record.control.pause.store(false, Ordering::Release);
+        })
+    }
+
     fn update_task_with_lease<F>(
         &self,
         lease: &TaskLease,
@@ -4937,6 +4962,31 @@ impl TaskRegistry {
     ) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::Failed;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = Some(now_ms());
+            record.error = Some(error);
+            record.result = None;
+            record.usage = usage;
+            record.tool = None;
+            record.pending_tool_call = None;
+            record.pending_tool_approval_response = None;
+            record.pending_provider_response = None;
+            record.worker_pid = None;
+            record.control.pause.store(false, Ordering::Release);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn block_with_usage(
+        &self,
+        id: &str,
+        error: String,
+        usage: Option<UsageTotals>,
+    ) -> Result<(), String> {
+        self.update_task(id, |record| {
+            record.status = TaskStatus::Blocked;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
             }

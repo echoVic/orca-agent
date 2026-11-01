@@ -1393,7 +1393,15 @@ fn run_threaded_agent_worker(
             if schema_error.is_some() {
                 status = RunStatus::Failed;
             }
-            let mut result = if status == RunStatus::Success {
+            if let RunStatus::Blocked { blocker } = &status {
+                output = blocked_subagent_output(blocker);
+            }
+            let mut result = if let RunStatus::Blocked { .. } = &status {
+                let mut result =
+                    ToolResult::failed_after_start(&tool_request, output.clone(), None);
+                result.output = Some(output.clone());
+                result
+            } else if status == RunStatus::Success {
                 ToolResult::completed(&tool_request, output.clone(), false)
             } else if status == RunStatus::Cancelled {
                 ToolResult::cancelled(
@@ -1443,6 +1451,9 @@ fn run_threaded_agent_worker(
                             estimated_cost_usd: usage.estimated_cost_usd,
                         }),
                     ),
+                    (RunStatus::Blocked { .. }, Some(task_id)) => {
+                        task_registry.block_with_usage(task_id, output.clone(), Some(usage))
+                    }
                     (_, Some(task_id)) => task_registry.fail_with_usage(
                         task_id,
                         launch
@@ -1491,8 +1502,8 @@ fn run_threaded_agent_worker(
                     RunStatus::Cancelled => RuntimeTaskStatus::Cancelled,
                     RunStatus::Failed
                     | RunStatus::ApprovalRequired
-                    | RunStatus::VerificationFailed
-                    | RunStatus::Blocked { .. } => RuntimeTaskStatus::Failed,
+                    | RunStatus::VerificationFailed => RuntimeTaskStatus::Failed,
+                    RunStatus::Blocked { .. } => RuntimeTaskStatus::Blocked,
                 }
             };
             let task = Some(started_task.with_status(task_status));
@@ -2067,6 +2078,7 @@ fn execute_acquired_sync_subagent(
         model: effective_model,
         depth: child_depth,
         emit_deltas: true,
+        headless_root: child_config.tools.headless_exec,
         allowed_tools: None,
         tool_policy_label: None,
         workflow_ipc,
@@ -2274,10 +2286,10 @@ fn execute_acquired_sync_subagent(
     let terminal_status = match output.status {
         RunStatus::Success => SurfaceSubagentTerminalStatus::Completed,
         RunStatus::Cancelled => SurfaceSubagentTerminalStatus::Cancelled,
-        RunStatus::Failed
-        | RunStatus::ApprovalRequired
-        | RunStatus::VerificationFailed
-        | RunStatus::Blocked { .. } => SurfaceSubagentTerminalStatus::Failed,
+        RunStatus::Failed | RunStatus::ApprovalRequired | RunStatus::VerificationFailed => {
+            SurfaceSubagentTerminalStatus::Failed
+        }
+        RunStatus::Blocked { .. } => SurfaceSubagentTerminalStatus::Blocked,
     };
     if let Err(error) = activity.publish_payload(SubagentActivityPayload::Completed {
         status: terminal_status,
@@ -2795,6 +2807,14 @@ fn settle_registry_task(
                 .unwrap_or_else(|| "subagent cancelled".to_string()),
             usage,
         ),
+        RunStatus::Blocked { .. } => task_registry.block_with_usage(
+            registry_task_id,
+            output
+                .event_error
+                .clone()
+                .unwrap_or_else(|| "subagent blocked".to_string()),
+            usage,
+        ),
         _ => task_registry.fail_with_usage(
             registry_task_id,
             output
@@ -2928,6 +2948,15 @@ fn unix_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn blocked_subagent_output(blocker: &orca_core::goal_runtime::BlockerSummary) -> String {
+    let kind = serde_json::to_value(blocker.kind).expect("blocker kind serializes");
+    format!(
+        "Subagent status: Blocked\nkind: {}\nsummary: {}",
+        kind.as_str().expect("snake_case kind"),
+        blocker.summary
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finish_child_output(
     tool_request: ToolRequest,
@@ -3030,6 +3059,24 @@ fn finish_child_output(
                 task: Some(completed_task),
                 status: RunStatus::Cancelled,
                 event_output: child.final_message,
+                event_error: Some(error),
+                cost_tracker,
+                child_budget_usage: child.budget_usage,
+            }
+        }
+        RunStatus::Blocked { blocker } => {
+            let mut error = blocked_subagent_output(&blocker);
+            append_worktree_outcome(&mut error, worktree.as_ref());
+            let output = error.clone();
+            let mut result = ToolResult::failed_after_start(&tool_request, output.clone(), None);
+            result.output = Some(output.clone());
+            RuntimeSubagentCallOutput {
+                result,
+                tool_request,
+                description,
+                task: Some(completed_task),
+                status: RunStatus::Blocked { blocker },
+                event_output: Some(output),
                 event_error: Some(error),
                 cost_tracker,
                 child_budget_usage: child.budget_usage,

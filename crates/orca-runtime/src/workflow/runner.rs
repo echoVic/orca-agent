@@ -2198,6 +2198,7 @@ impl WorkflowRunner {
             model: None,
             depth: 1,
             emit_deltas: true,
+            headless_root: false,
             allowed_tools: execution_policy.allowed_tools.clone(),
             tool_policy_label: execution_policy.tool_policy_label.clone(),
             workflow_ipc: Some(workflow_ipc.for_sender(call.call_path.clone())),

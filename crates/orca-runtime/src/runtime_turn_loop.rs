@@ -537,6 +537,9 @@ fn settle_children_before_return<W: io::Write>(
         if let Some(task) = records.iter().find(|task| {
             task.task_type == orca_core::task_types::TaskType::Subagent
                 && task.parent_task_id.as_deref() == owner
+                // An in-flight tool also fences replay until its checkpoint.
+                // Wait for its live worker before judging the terminal receipt.
+                && !task.status.is_active()
                 && task.continuation_indeterminate
         }) {
             return Err(io::Error::other(format!(

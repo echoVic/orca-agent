@@ -61,6 +61,11 @@ impl<'a> AgentToolPolicyContext<'a> {
         }
     }
 
+    pub(crate) fn with_headless(mut self, headless: bool) -> Self {
+        self.headless = headless;
+        self
+    }
+
     pub(crate) fn is_headless(&self) -> bool {
         self.headless
     }
@@ -138,7 +143,7 @@ pub(crate) fn provider_tool_schema_override(
         Some(mcp_registry),
         external_tools,
     );
-    let policy = if let Some(allowed_tools) = tool_policy.allowed_tools() {
+    let mut policy = if let Some(allowed_tools) = tool_policy.allowed_tools() {
         ToolPolicy::allowed(allowed_tools)
     } else if subagent_depth > 0 {
         ToolPolicy::for_subagent(subagent_type)
@@ -147,15 +152,16 @@ pub(crate) fn provider_tool_schema_override(
     } else {
         ToolPolicy::base()
     };
+    if subagent_depth > 0 && tool_policy.is_headless() && !tool_policy.is_goal_mode() {
+        policy = policy.with_report_blocker();
+    }
     Some(
         canonical_tool_definitions(&policy, &registry)
             .into_iter()
             .filter(|definition| {
                 // A policy the model cannot act on must not be advertised.
                 (definition.name != "report_blocker"
-                    || (tool_policy.is_headless()
-                        && subagent_depth == 0
-                        && !tool_policy.is_goal_mode()))
+                    || (tool_policy.is_headless() && !tool_policy.is_goal_mode()))
                     && (definition.name != "subagent"
                         || tool_policy.delegation().allows_new_children())
                     && (definition.name != "computer"
@@ -273,6 +279,12 @@ pub(crate) fn reject_disallowed_child_tool(
     mcp_registry: &McpRegistry,
     external_tools: &[ExternalToolConfig],
 ) -> Option<ToolResult> {
+    if tool_request.name == ToolName::ReportBlocker
+        && policy.is_headless()
+        && !policy.is_goal_mode()
+    {
+        return None;
+    }
     child_tool_policy_failure(
         tool_request,
         policy.allowed_tools(),
@@ -386,7 +398,8 @@ pub fn validate_tool_invocation(
     mcp_registry: &McpRegistry,
     config: &RunConfig,
 ) -> Result<(), ToolExecutionFailure> {
-    if let Some(definition) = &config.subagents.effective_definition
+    if !(invocation.effective.name == ToolName::ReportBlocker && config.tools.headless_exec)
+        && let Some(definition) = &config.subagents.effective_definition
         && let Some(failure) = child_tool_policy_failure(
             &invocation.effective,
             Some(&definition.allowed_tools),
@@ -944,22 +957,38 @@ mod tests {
     }
 
     #[test]
-    fn provider_tool_schema_override_exposes_report_blocker_only_for_headless_root() {
+    fn provider_tool_schema_override_exposes_report_blocker_to_headless_trees() {
         let registry = McpRegistry::default();
+        let readonly = vec!["read_file".to_string(), "grep".to_string()];
         for (depth, policy, expected) in [
             (0, AgentToolPolicyContext::headless(), true),
-            (1, AgentToolPolicyContext::headless(), false),
+            (1, AgentToolPolicyContext::headless(), true),
+            (2, AgentToolPolicyContext::headless(), true),
+            (
+                1,
+                AgentToolPolicyContext::goal_mode().with_headless(true),
+                false,
+            ),
+            (
+                1,
+                AgentToolPolicyContext::headless()
+                    .replace_allowed_tools(Some(&readonly), "readonly role"),
+                true,
+            ),
+            (0, AgentToolPolicyContext::unrestricted(), false),
+            (1, AgentToolPolicyContext::unrestricted(), false),
+            (1, AgentToolPolicyContext::goal_mode(), false),
             (0, AgentToolPolicyContext::goal_mode(), false),
         ] {
-            let tools = provider_tool_schema_override(
-                depth,
-                &SubagentType::General,
-                policy,
-                &registry,
-                &[],
-            )
-            .unwrap();
-            assert_eq!(schema_names(&tools).contains(&"report_blocker"), expected);
+            for role in [SubagentType::General, SubagentType::Explorer] {
+                let tools =
+                    provider_tool_schema_override(depth, &role, policy, &registry, &[]).unwrap();
+                assert_eq!(
+                    schema_names(&tools).contains(&"report_blocker"),
+                    expected,
+                    "depth={depth} role={role:?}"
+                );
+            }
         }
     }
 

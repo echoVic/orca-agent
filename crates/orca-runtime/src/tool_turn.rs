@@ -393,11 +393,19 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             .as_ref()
             .map(crate::runtime_execution_policy::RuntimeExecutionPolicySnapshot::config)
             .unwrap_or(base_config);
-        let delegation_config = tool_policy.allowed_tools().map(|allowed| {
-            let mut config = policy_config.clone();
-            config.subagents.inherited_tools = Some(allowed.to_vec());
-            config
-        });
+        // Carry the root policy through both sync batches and detached workers.
+        // Goal and workflow children must never inherit the exec capability.
+        let headless_root = tool_policy.is_headless() && !tool_policy.is_goal_mode();
+        let delegation_config = (tool_policy.allowed_tools().is_some()
+            || policy_config.tools.headless_exec != headless_root)
+            .then(|| {
+                let mut config = policy_config.clone();
+                if let Some(allowed) = tool_policy.allowed_tools() {
+                    config.subagents.inherited_tools = Some(allowed.to_vec());
+                }
+                config.tools.headless_exec = headless_root;
+                config
+            });
         let config = delegation_config.as_ref().unwrap_or(policy_config);
         let current_policy = policy_snapshot
             .as_ref()

@@ -492,6 +492,7 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         model: request.model,
         depth: child_depth,
         emit_deltas: true,
+        headless_root: config.tools.headless_exec,
         allowed_tools: None,
         tool_policy_label: None,
         workflow_ipc: None,
@@ -648,10 +649,10 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
     let terminal_status = match &child.status {
         RunStatus::Success => SurfaceSubagentTerminalStatus::Completed,
         RunStatus::Cancelled => SurfaceSubagentTerminalStatus::Cancelled,
-        RunStatus::Failed
-        | RunStatus::ApprovalRequired
-        | RunStatus::VerificationFailed
-        | RunStatus::Blocked { .. } => SurfaceSubagentTerminalStatus::Failed,
+        RunStatus::Failed | RunStatus::ApprovalRequired | RunStatus::VerificationFailed => {
+            SurfaceSubagentTerminalStatus::Failed
+        }
+        RunStatus::Blocked { .. } => SurfaceSubagentTerminalStatus::Blocked,
     };
     let completed_task = child_lifecycle
         .finish_task(child.status.clone())
@@ -817,10 +818,12 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             ));
         }
         let error = async_subagent_result_payload(error, Some(completed_task.payload()));
-        if task_registry
-            .fail_with_usage_and_lease(&task_lease, &agent_id, error, usage)
-            .is_ok()
-        {
+        let settlement = if matches!(child.status, RunStatus::Blocked { .. }) {
+            task_registry.block_with_usage_and_lease(&task_lease, &agent_id, error, usage)
+        } else {
+            task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, error, usage)
+        };
+        if settlement.is_ok() {
             return 1;
         }
     }

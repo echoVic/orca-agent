@@ -505,6 +505,7 @@ pub struct HostedTurnRequest {
     task_description: Option<String>,
     backtrack_target: bool,
     allow_goal_tools: bool,
+    headless_root: bool,
     track_goal_usage: bool,
     goal_turn_origin: orca_core::goal_runtime::GoalTurnOrigin,
     emit_session_completed: bool,
@@ -669,6 +670,7 @@ impl HostedTurnRequest {
             task_description: None,
             backtrack_target: false,
             allow_goal_tools: false,
+            headless_root: false,
             track_goal_usage: false,
             goal_turn_origin: orca_core::goal_runtime::GoalTurnOrigin::User,
             emit_session_completed: true,
@@ -697,6 +699,11 @@ impl HostedTurnRequest {
             emit_session_completed: false,
             ..Self::new(prompt)
         }
+    }
+
+    pub(crate) fn with_headless_root(mut self, headless: bool) -> Self {
+        self.headless_root = headless;
+        self
     }
 
     pub fn prompt(&self) -> &str {
@@ -915,7 +922,7 @@ impl HostedTurnRequest {
         };
         let tool_mode = if self.allow_goal_tools {
             ThreadTurnToolMode::Goal
-        } else if self.envelope == HostedOperationEnvelope::HeadlessSession {
+        } else if self.headless_root || self.envelope == HostedOperationEnvelope::HeadlessSession {
             ThreadTurnToolMode::Headless
         } else {
             ThreadTurnToolMode::Standard
