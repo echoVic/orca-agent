@@ -32,6 +32,7 @@ Today `report_blocker` is offered only to a headless root (`AgentToolPolicyConte
 depth 0). Under C a child agent gets the tool too, when its parent run is headless exec:
 
 - A headless root's subagents (depth ≥ 1) are offered `report_blocker`.
+- A custom agent gets `report_blocker` only when its definition lists it, because its frozen tool list is authoritative.
 - Interactive, ACP and server roots, and their subagents, still are not. A child of an interactive
   root reports its blocker in prose, as today.
 - Goal mode still does not get it, at any depth.

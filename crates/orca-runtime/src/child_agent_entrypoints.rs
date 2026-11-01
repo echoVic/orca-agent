@@ -129,7 +129,7 @@ where
                 .get_or_insert_with(|| format!("role '{}' tool policy", builtin.identifier()));
         }
     }
-    if request.headless_root {
+    if request.headless_root && !matches!(request.subagent_type, SubagentType::Custom(_)) {
         request
             .allowed_tools
             .get_or_insert_with(Vec::new)

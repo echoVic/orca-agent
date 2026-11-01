@@ -471,6 +471,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         if let Some(result) = reject_disallowed_child_tool(
             tool_request,
             tool_policy,
+            subagent_type,
             mcp_registry,
             &config.external_tools,
         ) {

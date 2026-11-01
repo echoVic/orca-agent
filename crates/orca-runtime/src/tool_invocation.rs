@@ -152,7 +152,11 @@ pub(crate) fn provider_tool_schema_override(
     } else {
         ToolPolicy::base()
     };
-    if subagent_depth > 0 && tool_policy.is_headless() && !tool_policy.is_goal_mode() {
+    if subagent_depth > 0
+        && !matches!(subagent_type, SubagentType::Custom(_))
+        && tool_policy.is_headless()
+        && !tool_policy.is_goal_mode()
+    {
         policy = policy.with_report_blocker();
     }
     Some(
@@ -276,10 +280,12 @@ pub(crate) fn tool_requests_from_provider_steps(steps: &[ProviderStep]) -> Vec<T
 pub(crate) fn reject_disallowed_child_tool(
     tool_request: &ToolRequest,
     policy: AgentToolPolicyContext<'_>,
+    subagent_type: &SubagentType,
     mcp_registry: &McpRegistry,
     external_tools: &[ExternalToolConfig],
 ) -> Option<ToolResult> {
     if tool_request.name == ToolName::ReportBlocker
+        && !matches!(subagent_type, SubagentType::Custom(_))
         && policy.is_headless()
         && !policy.is_goal_mode()
     {
@@ -398,8 +404,7 @@ pub fn validate_tool_invocation(
     mcp_registry: &McpRegistry,
     config: &RunConfig,
 ) -> Result<(), ToolExecutionFailure> {
-    if !(invocation.effective.name == ToolName::ReportBlocker && config.tools.headless_exec)
-        && let Some(definition) = &config.subagents.effective_definition
+    if let Some(definition) = &config.subagents.effective_definition
         && let Some(failure) = child_tool_policy_failure(
             &invocation.effective,
             Some(&definition.allowed_tools),
@@ -989,6 +994,66 @@ mod tests {
                     "depth={depth} role={role:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn provider_tool_schema_override_respects_custom_agent_report_blocker_policy() {
+        let registry = McpRegistry::default();
+        for (allowed, expected) in [
+            (vec![], false),
+            (
+                vec!["read_file".to_string(), "report_blocker".to_string()],
+                true,
+            ),
+        ] {
+            let definition =
+                orca_core::subagent_types::agent_definition::EffectiveAgentDefinition {
+                    name: "contract-proof".to_string(),
+                    description: "Prove the frozen policy".to_string(),
+                    system_prompt: "Follow the definition.".to_string(),
+                    allowed_tools: allowed,
+                    model: None,
+                };
+            let policy = AgentToolPolicyContext::new(
+                Some(&definition.allowed_tools),
+                Some("custom agent 'contract-proof'"),
+            )
+            .with_headless(true);
+            let tools = provider_tool_schema_override(
+                1,
+                &SubagentType::Custom(definition.name.clone()),
+                policy,
+                &registry,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(schema_names(&tools).contains(&"report_blocker"), expected);
+            let blocker = request(
+                ToolName::ReportBlocker,
+                ActionKind::Read,
+                None,
+                Some(r#"{"kind":"user_decision","summary":"Need input"}"#),
+            );
+            assert_eq!(
+                super::reject_disallowed_child_tool(
+                    &blocker,
+                    policy,
+                    &SubagentType::Custom(definition.name.clone()),
+                    &registry,
+                    &[],
+                )
+                .is_none(),
+                expected,
+            );
+            let mut config = config_with_external(Vec::new());
+            config.tools.headless_exec = true;
+            config.subagents.effective_definition = Some(definition);
+            let invocation = prepare_tool_invocation(&blocker, 1, &registry, &config);
+            assert_eq!(
+                validate_tool_invocation(&invocation, &registry, &config).is_ok(),
+                expected,
+            );
         }
     }
 
