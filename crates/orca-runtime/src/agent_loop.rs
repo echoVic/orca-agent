@@ -205,7 +205,7 @@ fn finish_agent_loop(
     // committed `checkpoint.created` + `operation.terminal` durably before
     // surfacing, so every other exit appends the terminal once here. The
     // journal is the source of truth for the operation's terminal fact, and
-    // the `Completed` usage is finalized from the controller before commit.
+    // terminal usage is finalized from the controller after child settlement.
     // ApprovalRequired is NOT a terminal: the operation is parked waiting
     // for approval and may resume, so no terminal is committed for it.
     if let AgentLoopOutcome::Completed(result) = &mut outcome {
@@ -213,15 +213,17 @@ fn finish_agent_loop(
             return Ok(outcome);
         }
         operation.refresh_child_budgets()?;
-        if let OperationTerminal::Completed { usage } = &mut result.terminal {
-            *usage = operation.controller.usage();
-        }
         // Hosted resumable turns let the host decide whether a cancellation
         // ends the logical turn or merely replaces its current generation.
         if !(defer_cancel_terminal
             && matches!(result.terminal, OperationTerminal::Cancelled { .. }))
         {
             operation.commit_terminal(turn_id.as_str(), result.terminal.clone())?;
+        }
+        if let OperationTerminal::Completed { usage } | OperationTerminal::Blocked { usage, .. } =
+            &mut result.terminal
+        {
+            *usage = operation.controller.usage();
         }
     }
 

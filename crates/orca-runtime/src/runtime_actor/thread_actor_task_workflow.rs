@@ -580,11 +580,7 @@ impl ThreadActor {
                 },
                 surface::OperationTerminal::Blocked {
                     blocker,
-                    usage: outcome
-                        .operation_terminal
-                        .as_ref()
-                        .and_then(|terminal| terminal.usage())
-                        .unwrap_or_default(),
+                    usage: usage.clone(),
                 },
             ),
             (None, RunStatus::Failed | RunStatus::VerificationFailed, None) => (

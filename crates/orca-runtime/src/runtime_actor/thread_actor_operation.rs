@@ -5899,7 +5899,7 @@ impl ThreadActor {
                     OperationOutcome::Completed(RunStatus::Blocked { blocker }),
                     Some(CompletedTurnOutcome {
                         status: RunStatus::Blocked { .. },
-                        terminal: Some(orca_core::budget::OperationTerminal::Blocked { usage, .. }),
+                        terminal: Some(orca_core::budget::OperationTerminal::Blocked { .. }),
                         ..
                     }),
                 ) => (
@@ -5910,7 +5910,7 @@ impl ThreadActor {
                     },
                     surface::OperationTerminal::Blocked {
                         blocker: blocker.clone(),
-                        usage: *usage,
+                        usage: surface_usage.clone(),
                     },
                 ),
                 (OperationOutcome::Stopped(terminal), Some(_completed)) => {

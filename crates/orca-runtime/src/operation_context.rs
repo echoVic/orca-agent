@@ -539,8 +539,9 @@ impl OperationContext {
         } else {
             self.refresh_child_budgets()?;
         }
-        if let OperationTerminal::Completed { usage } | OperationTerminal::Stopped { usage, .. } =
-            &mut terminal
+        if let OperationTerminal::Completed { usage }
+        | OperationTerminal::Stopped { usage, .. }
+        | OperationTerminal::Blocked { usage, .. } = &mut terminal
         {
             *usage = self.controller.usage();
         }

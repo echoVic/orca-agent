@@ -12062,7 +12062,7 @@ pub(crate) fn terminal_from_generation_stop(
             super::GenerationCompletionStatus::Blocked { blocker } => {
                 super::OperationTerminal::Blocked {
                     blocker: blocker.clone(),
-                    usage: orca_core::budget::BudgetUsage::default(),
+                    usage: usage.clone(),
                 }
             }
         },
@@ -13254,6 +13254,42 @@ mod tests {
         snapshot.foreground_operation = Some(operation);
         snapshot.interactions.push(interaction);
         (snapshot, operation_id, interaction_id)
+    }
+
+    #[test]
+    fn terminal_from_generation_stop_blocked_preserves_usage() {
+        let operation = started_operation();
+        let usage = super::super::UsageTotals {
+            input_tokens: 101,
+            output_tokens: 23,
+            cache_tokens: 7,
+            estimated_cost_usd_micros: 456,
+        };
+        let blocker = orca_core::goal_runtime::BlockerSummary {
+            kind: orca_core::goal_runtime::BlockerKind::EnvironmentContradiction,
+            summary: "workspace is read-only".to_string(),
+            fingerprint: "read-only".to_string(),
+            evidence: vec![],
+        };
+        let terminal = terminal_from_generation_stop(
+            &operation,
+            &super::super::GenerationStopReason::Completed {
+                status: super::super::GenerationCompletionStatus::Blocked {
+                    blocker: blocker.clone(),
+                },
+            },
+            &usage,
+        )
+        .unwrap();
+        let super::super::OperationTerminal::Blocked {
+            blocker: actual_blocker,
+            usage: actual_usage,
+        } = terminal
+        else {
+            panic!("expected blocked terminal");
+        };
+        assert_eq!(actual_blocker, blocker);
+        assert_eq!(actual_usage, usage);
     }
 
     #[test]

@@ -684,6 +684,9 @@ fn assert_exec_report_blocker(with_verifier: bool) {
     let terminal = events.last().expect("terminal event");
     assert_eq!(terminal["type"], "session.completed");
     assert_eq!(terminal["payload"]["status"], "blocked");
+    let usage = &terminal["payload"]["terminal"]["blocked"]["usage"];
+    assert!(usage["turns"].as_u64().expect("turn count") >= 1);
+    assert!(usage["tool_calls"].as_u64().expect("tool call count") >= 1);
     let blocker = &terminal["payload"]["terminal"]["blocked"]["blocker"];
     assert_eq!(blocker["kind"], "environment_contradiction");
     assert_eq!(blocker["summary"], "workspace is read-only");

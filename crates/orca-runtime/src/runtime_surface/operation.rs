@@ -11,7 +11,6 @@ use super::identity::{
     SurfaceWorkflowResultId, SurfaceWorkflowRunId, ThreadOwnerEpoch, UnixMillis,
 };
 use super::projection::SurfaceOperationCompletionProof;
-use orca_core::budget::BudgetUsage;
 use orca_core::goal_runtime::BlockerSummary;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -868,7 +867,7 @@ pub enum OperationTerminal {
     /// The model declared an external blocker through a terminal tool.
     Blocked {
         blocker: BlockerSummary,
-        usage: BudgetUsage,
+        usage: UsageTotals,
     },
 }
 

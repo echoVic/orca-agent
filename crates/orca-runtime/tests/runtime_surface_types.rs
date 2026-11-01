@@ -1,4 +1,3 @@
-use orca_core::budget::BudgetUsage;
 use orca_core::goal_runtime::{BlockerKind, BlockerSummary};
 use orca_runtime::surface::*;
 use std::collections::BTreeSet;
@@ -300,7 +299,12 @@ fn operation_generation_and_terminal_algebras_are_closed() {
                 fingerprint: "blocked-terminal".to_string(),
                 evidence: vec![],
             },
-            usage: BudgetUsage::default(),
+            usage: UsageTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_tokens: 0,
+                estimated_cost_usd_micros: 0,
+            },
         },
     ];
     assert_eq!(terminals.len(), 10);
