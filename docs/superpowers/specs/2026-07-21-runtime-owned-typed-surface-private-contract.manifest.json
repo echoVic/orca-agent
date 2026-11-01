@@ -172,7 +172,8 @@
       "Panicked",
       "JoinFailed",
       "AbortedByRuntimeRestart",
-      "Shutdown"
+      "Shutdown",
+      "Blocked"
     ],
     "surface_commands": [
       "ReserveOperation",
@@ -7932,7 +7933,7 @@
     "MCP malformed descriptors have one explicit diagnostic/omission disposition and cannot become binding authority",
     "operation patch inventory has exactly 21 variants including input failure, suspension rebase, and finalization settlement",
     "operation transition inventory has exactly 11 legal edges including suspension rebase and terminal projection repair",
-    "operation terminal mapping has exactly 65 exhaustive rows and contains no impossible Completed(Failed) or ExecutionFailed(Verification|Persistence) source",
+    "operation terminal mapping has exactly 66 exhaustive rows and contains no impossible Completed(Failed) or ExecutionFailed(Verification|Persistence) source",
     "Task, Workflow run, Workflow phase, Workflow agent attempt, and Subagent transitions are closed and terminal states are absorbing",
     "ACP prompt binding states and transitions are closed; reservation and terminal cursor witnesses precede bound cancellation and response writing",
     "ACP capability results pass a 4 MiB canonical construction limit below the 8 MiB surface batch limit",
@@ -10505,7 +10506,7 @@
   },
   "artifact_bundle": {
     "private_contract_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-    "private_contract_sha256": "013fbc539d3225cd713a4452059e7bdcfa942c3b4bbf3445d48dc7885139250b",
+    "private_contract_sha256": "72ec3a54e9a70a3be6358874f25b75735377bea1ce521404dbbd69d3bb0931e7",
     "parent_design_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md",
     "parent_design_commit": "89979d6062246ec4a9b98032ee62cc6d45c1e3ba",
     "parent_design_blob": "bf80af4ce1fde3607af3fd75874abddfaf79b450",
@@ -11010,6 +11011,11 @@
     "condition"
   ],
   "operation_terminal_mapping": [
+    [
+      "Completed(Blocked)",
+      "Blocked",
+      "headless exec turn ended with report_blocker"
+    ],
     [
       "Completed(Success)",
       "Succeeded",

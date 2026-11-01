@@ -1858,8 +1858,8 @@ function validateTransitions(manifest) {
   if (manifest.generation_transitions.length !== 5) {
     fail("generation_transitions must contain exactly 5 legal edges");
   }
-  if (manifest.operation_terminal_mapping.length !== 65) {
-    fail("operation_terminal_mapping must contain exactly 65 rows");
+  if (manifest.operation_terminal_mapping.length !== 66) {
+    fail("operation_terminal_mapping must contain exactly 66 rows");
   }
 }
 
@@ -2614,11 +2614,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "operation terminal mapping has exactly 65 exhaustive rows and contains no impossible Completed(Failed) or ExecutionFailed(Verification|Persistence) source",
+      "operation terminal mapping has exactly 66 exhaustive rows and contains no impossible Completed(Failed) or ExecutionFailed(Verification|Persistence) source",
       (manifest) => {
         assertCondition(
-          manifest.operation_terminal_mapping.length === 65,
-          "operation terminal mapping must contain 65 rows",
+          manifest.operation_terminal_mapping.length === 66,
+          "operation terminal mapping must contain 66 rows",
         );
         for (const row of manifest.operation_terminal_mapping) {
           if (

@@ -915,6 +915,7 @@ GenerationCompletionStatus =
   Success
   | VerificationFailed { message: SafeDiagnosticText }
   | BudgetExhausted { budget: OperationBudget }
+  | Blocked { blocker: BlockerSummary }
 
 GenerationExecutionFailureClass =
   Provider
@@ -1221,6 +1222,9 @@ OperationTerminal =
       last_generation: SurfaceGenerationId,
     }
   | Shutdown { reason: HostShutdown | ThreadClose }
+  | Blocked { blocker: BlockerSummary, usage: BudgetUsage }
+
+`Blocked` is produced only when the model ends a headless exec turn with `report_blocker`. Its legacy run status is `blocked`, exit code 5.
 
 OperationTerminalRecord {
   operation_id: SurfaceOperationId,
