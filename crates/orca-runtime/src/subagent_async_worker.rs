@@ -769,10 +769,15 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             return 0;
         }
     } else {
-        let mut error = child
-            .error
-            .or(child.final_message)
-            .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
+        let mut error = match &child.status {
+            RunStatus::Blocked { blocker } => {
+                crate::runtime_subagent_call::blocked_subagent_output(blocker)
+            }
+            _ => child
+                .error
+                .or(child.final_message)
+                .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status)),
+        };
         append_worktree_outcome(&mut error, worktree.as_ref());
         let terminal = match child.status {
             RunStatus::Cancelled => AgentTerminal::Cancelled {

@@ -1100,49 +1100,70 @@ fn blocker_task_view(home: &std::path::Path, cwd: &std::path::Path, task_id: &st
 
 #[test]
 fn exec_async_subagent_report_blocker_persists_blocked() {
-    let home = TempDir::new().unwrap();
-    let cwd = TempDir::new().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .env("ORCA_HOME", home.path())
-        .current_dir(cwd.path())
-        .args([
-            "exec",
-            "--output-format",
-            "jsonl",
-            "--provider",
-            "mock",
-            "--approval-mode",
-            "full-auto",
-            "--save-history",
-            "subagent async report_blocker",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let events = parse_jsonl(&output.stdout);
-    let launch = events
-        .iter()
-        .find(|e| e["type"] == "tool.call.completed" && e["payload"]["name"] == "subagent")
-        .unwrap();
-    let launch: Value =
-        serde_json::from_str(launch["payload"]["output"].as_str().unwrap()).unwrap();
-    let task_id = launch["agent_id"].as_str().unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        let child = blocker_task_view(home.path(), cwd.path(), task_id);
-        if child["status"] == "blocked" {
-            break;
-        }
-        assert_ne!(child["status"], "failed", "{child}");
-        assert!(
-            std::time::Instant::now() < deadline,
-            "child did not block: {child}"
+    for question in [None, Some("Can the workspace be made writable?")] {
+        let prompt = question.map_or_else(
+            || "subagent async report_blocker".to_string(),
+            |question| format!("subagent async report_blocker ? {question}"),
         );
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+            .env("ORCA_HOME", home.path())
+            .current_dir(cwd.path())
+            .args([
+                "exec",
+                "--output-format",
+                "jsonl",
+                "--provider",
+                "mock",
+                "--approval-mode",
+                "full-auto",
+                "--save-history",
+                &prompt,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events = parse_jsonl(&output.stdout);
+        let launch = events
+            .iter()
+            .find(|e| e["type"] == "tool.call.completed" && e["payload"]["name"] == "subagent")
+            .unwrap();
+        let launch: Value =
+            serde_json::from_str(launch["payload"]["output"].as_str().unwrap()).unwrap();
+        let task_id = launch["agent_id"].as_str().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let child = blocker_task_view(home.path(), cwd.path(), task_id);
+            if child["status"] == "blocked" {
+                let result = child["error"]
+                    .as_str()
+                    .or_else(|| child["result"].as_str())
+                    .expect("blocked child result");
+                for expected in [
+                    "Subagent status: Blocked",
+                    "kind: environment_contradiction",
+                    "summary: child cannot write",
+                ] {
+                    assert!(result.contains(expected), "{child}");
+                }
+                assert!(!result.contains("BlockerSummary {"), "{child}");
+                if let Some(question) = question {
+                    assert!(result.contains(&format!("question: {question}")), "{child}");
+                }
+                break;
+            }
+            assert_ne!(child["status"], "failed", "{child}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not block: {child}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }

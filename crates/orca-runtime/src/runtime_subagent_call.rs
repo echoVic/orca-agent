@@ -2948,7 +2948,7 @@ fn unix_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn blocked_subagent_output(blocker: &orca_core::goal_runtime::BlockerSummary) -> String {
+pub(crate) fn blocked_subagent_output(blocker: &orca_core::goal_runtime::BlockerSummary) -> String {
     let kind = serde_json::to_value(blocker.kind).expect("blocker kind serializes");
     let mut output = format!(
         "Subagent status: Blocked\nkind: {}\nsummary: {}",
