@@ -8,6 +8,7 @@ an issue automatically.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 CLASSES = (
@@ -29,6 +30,14 @@ PRODUCT_SIGNALS = {
     "panic": "the runtime panicked",
 }
 
+# Verifier-side signals that the task image, not the agent, is broken. Kept narrow on purpose: a
+# false positive here would hide a real capability gap.
+ENVIRONMENT_SIGNALS = {
+    "package_mirror_404": re.compile(r"(?i)\b(?:deb|security)\.debian\.org\b[^\n]*\b404\b"),
+    "missing_curl": re.compile(r"(?i)\bcurl: command not found\b"),
+    "missing_uvx": re.compile(r"(?i)\buvx: command not found\b"),
+}
+
 
 @dataclass
 class Evidence:
@@ -45,16 +54,27 @@ class Evidence:
     false_completion: bool = False
     harness_error: str | None = None
     environment_error: str | None = None
+    verifier_output: str = ""        # verifier stdout/stderr, scanned for environment signals
     product_signals: list[str] = field(default_factory=list)
     verifier_partial: bool = False   # some verifier checks passed
     cross_budget_passed: bool = False  # axis A evidence: passes with a bigger budget
+
+
+def environment_failure(verifier_output: str | None) -> str | None:
+    """Return the environment signal found in verifier output, if any."""
+    if not verifier_output:
+        return None
+    for signal, pattern in ENVIRONMENT_SIGNALS.items():
+        if pattern.search(verifier_output):
+            return signal
+    return None
 
 
 def classify(evidence: Evidence) -> str:
     """Return one class from `CLASSES` for a non-pass attempt."""
     if evidence.harness_error:
         return "harness"
-    if evidence.environment_error:
+    if evidence.environment_error or environment_failure(evidence.verifier_output):
         return "environment"
     if evidence.product_signals:
         return "product_bug"
