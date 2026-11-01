@@ -714,6 +714,9 @@ pub struct TaskHandle {
 
 #[derive(Clone, Debug)]
 pub enum MainSessionTerminalUpdate {
+    Blocked {
+        error: String,
+    },
     Completed {
         result: String,
     },
@@ -1151,6 +1154,7 @@ impl PendingSubagentResult {
     pub fn status_label(&self) -> &'static str {
         match self.status {
             TaskStatus::Completed => "completed",
+            TaskStatus::Blocked => "blocked",
             TaskStatus::Failed => "failed",
             TaskStatus::Cancelled => "cancelled",
             TaskStatus::Stopped | TaskStatus::ApprovalRequired => "stopped",
@@ -1306,7 +1310,11 @@ fn finished_child_session_transcript(
 ) -> Result<TaskTranscriptRecord, TaskTranscriptReadError> {
     let finished = matches!(
         record.status,
-        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Stopped | TaskStatus::Cancelled
+        TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::Blocked
+            | TaskStatus::Stopped
+            | TaskStatus::Cancelled
     );
     let Some(child_thread_id) = record
         .subagent_child_thread_id
@@ -2357,6 +2365,7 @@ impl TaskRegistry {
                 TaskStatus::Completed
                     | TaskStatus::Stopped
                     | TaskStatus::Failed
+                    | TaskStatus::Blocked
                     | TaskStatus::Cancelled
             ) && task.completed_at_ms.is_some()
                 && task.worker_pid.is_none()
@@ -3107,6 +3116,31 @@ impl TaskRegistry {
     ) -> Result<(), TaskLeaseError> {
         self.update_task_with_lease(lease, id, |record| {
             record.status = TaskStatus::Failed;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = Some(now_ms());
+            record.error = Some(error);
+            record.result = None;
+            record.usage = usage;
+            record.tool = None;
+            record.pending_tool_call = None;
+            record.pending_tool_approval_response = None;
+            record.pending_provider_response = None;
+            record.worker_pid = None;
+            record.control.pause.store(false, Ordering::Release);
+        })
+    }
+
+    pub(crate) fn block_with_usage_and_lease(
+        &self,
+        lease: &TaskLease,
+        id: &str,
+        error: String,
+        usage: Option<UsageTotals>,
+    ) -> Result<(), TaskLeaseError> {
+        self.update_task_with_lease(lease, id, |record| {
+            record.status = TaskStatus::Blocked;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
             }
@@ -4388,6 +4422,7 @@ impl TaskRegistry {
                     record.status,
                     TaskStatus::Completed
                         | TaskStatus::Failed
+                        | TaskStatus::Blocked
                         | TaskStatus::Cancelled
                         | TaskStatus::Stopped
                 )
@@ -4709,6 +4744,15 @@ impl TaskRegistry {
                         record.pending_tool_approval_response = None;
                         record.pending_provider_response = None;
                     }
+                    MainSessionTerminalUpdate::Blocked { error } => {
+                        record.status = TaskStatus::Blocked;
+                        record.result = None;
+                        record.error = Some(error);
+                        record.tool = None;
+                        record.pending_tool_call = None;
+                        record.pending_tool_approval_response = None;
+                        record.pending_provider_response = None;
+                    }
                     MainSessionTerminalUpdate::Failed { error } => {
                         record.status = TaskStatus::Failed;
                         record.result = None;
@@ -4918,6 +4962,31 @@ impl TaskRegistry {
     ) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::Failed;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = Some(now_ms());
+            record.error = Some(error);
+            record.result = None;
+            record.usage = usage;
+            record.tool = None;
+            record.pending_tool_call = None;
+            record.pending_tool_approval_response = None;
+            record.pending_provider_response = None;
+            record.worker_pid = None;
+            record.control.pause.store(false, Ordering::Release);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn block_with_usage(
+        &self,
+        id: &str,
+        error: String,
+        usage: Option<UsageTotals>,
+    ) -> Result<(), String> {
+        self.update_task(id, |record| {
+            record.status = TaskStatus::Blocked;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
             }
@@ -6833,6 +6902,7 @@ fn is_terminal(status: TaskStatus) -> bool {
         TaskStatus::Stopped
             | TaskStatus::Completed
             | TaskStatus::Failed
+            | TaskStatus::Blocked
             | TaskStatus::ApprovalRequired
             | TaskStatus::Cancelled
     )

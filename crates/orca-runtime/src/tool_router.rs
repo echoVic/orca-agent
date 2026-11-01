@@ -197,7 +197,7 @@ impl<'a> RuntimeToolRouter<'a> {
                 ))
             }
             RuntimeSpecialToolDispatch::ReportBlocker => {
-                if !headless || goal_mode || subagent_depth > 0 {
+                if !headless || goal_mode {
                     return Ok(RuntimeToolDispatchOutput::continue_model(
                         tool_types::ToolResult::failed(
                             execution_request,
@@ -888,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn report_blocker_dispatch_refuses_non_headless_goal_and_child_turns() {
+    fn report_blocker_dispatch_allows_headless_child_and_refuses_interactive_child() {
         let request = tool_types::ToolRequest {
             id: "refused-blocker".into(),
             name: ToolName::ReportBlocker,
@@ -896,7 +896,15 @@ mod tests {
             target: None,
             raw_arguments: Some(r#"{"kind":"external_state","summary":"waiting"}"#.into()),
         };
-        for (headless, goal_mode, depth) in [(false, false, 0), (true, true, 0), (true, false, 1)] {
+        let child = dispatch_only(&request, true, false, 1);
+        assert_eq!(child.disposition, RuntimeToolTurnDisposition::StopTurn);
+        assert!(matches!(child.status, Some(RunStatus::Blocked { .. })));
+        for (headless, goal_mode, depth) in [
+            (false, false, 0),
+            (false, false, 1),
+            (true, true, 0),
+            (true, true, 1),
+        ] {
             let output = dispatch_only(&request, headless, goal_mode, depth);
             assert_eq!(
                 output.disposition,
@@ -908,6 +916,39 @@ mod tests {
                 Some("report_blocker is only available in headless orca exec runs")
             );
             assert!(output.status.is_none());
+        }
+    }
+
+    #[test]
+    fn report_blocker_dispatch_continues_on_invalid_question() {
+        for question in ["".to_string(), "   ".to_string(), "x".repeat(1001)] {
+            let request = tool_types::ToolRequest {
+                id: "invalid-question".into(),
+                name: ToolName::ReportBlocker,
+                action: ActionKind::Agent,
+                target: None,
+                raw_arguments: Some(
+                    serde_json::json!({
+                        "kind": "user_decision", "summary": "need a port", "question": question
+                    })
+                    .to_string(),
+                ),
+            };
+            let output = dispatch_only(&request, true, false, 0);
+            assert_eq!(
+                output.disposition,
+                RuntimeToolTurnDisposition::ContinueModel
+            );
+            assert_eq!(output.result.status, ToolStatus::Failed);
+            assert!(output.status.is_none());
+            assert!(
+                output
+                    .result
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("report_blocker question")
+            );
         }
     }
 

@@ -314,6 +314,7 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
             request.allowed_tools.as_deref(),
             request.tool_policy_label.as_deref(),
         )
+        .with_headless(request.headless_root)
         .with_delegation(
             config
                 .subagents

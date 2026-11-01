@@ -2145,6 +2145,7 @@ fn shell_status_label(status: orca_core::task_types::TaskStatus) -> &'static str
     match status {
         orca_core::task_types::TaskStatus::Completed => "completed",
         orca_core::task_types::TaskStatus::Stopped => "stopped",
+        orca_core::task_types::TaskStatus::Blocked => "blocked",
         orca_core::task_types::TaskStatus::Failed => "failed",
         orca_core::task_types::TaskStatus::ApprovalRequired => "approval_required",
         orca_core::task_types::TaskStatus::Cancelled => "cancelled",

@@ -343,6 +343,7 @@ mod tests {
                 reason: "waiting for authority".to_string(),
                 evidence: vec![EvidenceItem::observation("permission denied")],
                 blocker: Some(BlockerSummary {
+                    question: None,
                     kind: BlockerKind::MissingAuthority,
                     summary: "user must grant permission".to_string(),
                     fingerprint: "authority:write".to_string(),

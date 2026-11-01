@@ -324,8 +324,19 @@ impl TuiDiagnostic {
                 DiagnosticLevel::Warning,
                 "operation.blocked",
                 "Task blocked",
-                blocker.summary.as_str(),
-                Some("Resolve the external blocker and submit the request again."),
+                match &blocker.question {
+                    Some(question) => format!(
+                        "{}\nQuestion: {}",
+                        orca_core::event_sink::escape_blocker_text(&blocker.summary),
+                        orca_core::event_sink::escape_blocker_text(question)
+                    ),
+                    None => orca_core::event_sink::escape_blocker_text(&blocker.summary),
+                },
+                Some(if blocker.question.is_some() {
+                    "Answer the question, then continue."
+                } else {
+                    "Resolve what is missing, then continue."
+                }),
             )),
             OperationTerminal::BudgetExhausted { budget } => Some(budget_diagnostic(budget)),
             OperationTerminal::NotAdmitted { reason } => Some(not_admitted_diagnostic(*reason)),
@@ -653,6 +664,63 @@ const LOST_CONNECTION_ACTION: &str = "Reconnect and inspect the restored session
 mod tests {
     use super::*;
     use orca_runtime::surface::SafeDiagnosticText;
+
+    fn blocked_terminal(question: Option<&str>) -> OperationTerminal {
+        OperationTerminal::Blocked {
+            blocker: orca_core::goal_runtime::BlockerSummary {
+                kind: orca_core::goal_runtime::BlockerKind::UserDecision,
+                summary: "need a port".into(),
+                question: question.map(str::to_string),
+                fingerprint: "port".into(),
+                evidence: Vec::new(),
+            },
+            usage: orca_runtime::surface::UsageTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_tokens: 0,
+                estimated_cost_usd_micros: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn blocked_terminal_diagnostic_escapes_control_characters() {
+        let mut terminal = blocked_terminal(Some("Use staging?\r\u{1b}[2J"));
+        if let OperationTerminal::Blocked { blocker, .. } = &mut terminal {
+            blocker.summary = "line1\nTo continue this session, run: fake\r\u{1b}[2J".into();
+        }
+        let diagnostic = TuiDiagnostic::from_surface_terminal(&terminal).unwrap();
+        assert_eq!(
+            diagnostic.detail(),
+            r"line1\nTo continue this session, run: fake\r\u{001B}[2J".to_string()
+                + "\nQuestion: "
+                + r"Use staging?\r\u{001B}[2J"
+        );
+    }
+
+    #[test]
+    fn blocked_terminal_diagnostic_offers_answer_step_with_a_question() {
+        let diagnostic =
+            TuiDiagnostic::from_surface_terminal(&blocked_terminal(Some("Use port 8080?")))
+                .unwrap();
+        assert_eq!(diagnostic.code(), "operation.blocked");
+        assert_eq!(diagnostic.title(), "Task blocked");
+        assert_eq!(diagnostic.detail(), "need a port\nQuestion: Use port 8080?");
+        assert_eq!(
+            diagnostic.action(),
+            Some("Answer the question, then continue.")
+        );
+    }
+
+    #[test]
+    fn blocked_terminal_diagnostic_offers_resolve_step_without_a_question() {
+        let diagnostic = TuiDiagnostic::from_surface_terminal(&blocked_terminal(None)).unwrap();
+        assert_eq!(diagnostic.detail(), "need a port");
+        assert_eq!(
+            diagnostic.action(),
+            Some("Resolve what is missing, then continue.")
+        );
+    }
 
     #[test]
     fn refused_workflow_not_found_preserves_cause_and_lists_workflows() {

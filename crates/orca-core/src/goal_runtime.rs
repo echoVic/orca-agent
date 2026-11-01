@@ -121,6 +121,8 @@ pub enum BlockerKind {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BlockerSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
     pub kind: BlockerKind,
     pub summary: String,
     pub fingerprint: String,
@@ -337,6 +339,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn blocker_summary_without_question_serializes_unchanged() {
+        let old = serde_json::json!({
+            "kind": "user_decision", "summary": "need a port",
+            "fingerprint": "port", "evidence": []
+        });
+        let blocker: BlockerSummary = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(blocker.question, None);
+        assert_eq!(serde_json::to_value(blocker).unwrap(), old);
+        let explicit = BlockerSummary {
+            question: None,
+            kind: BlockerKind::UserDecision,
+            summary: "need a port".into(),
+            fingerprint: "port".into(),
+            evidence: vec![],
+        };
+        assert_eq!(serde_json::to_value(explicit).unwrap(), old);
+    }
+
+    #[test]
     fn typed_goal_ids_are_unique_and_round_trip() {
         let goal_id = GoalId::new();
         let run_id = GoalRunId::new();
@@ -365,6 +386,7 @@ mod tests {
                 target: Some("DEEPSEEK_API_KEY".to_string()),
             }],
             blocker: Some(BlockerSummary {
+                question: None,
                 kind: BlockerKind::MissingAuthority,
                 summary: "the user must provide a credential".to_string(),
                 fingerprint: "missing-authority:deepseek-api-key".to_string(),

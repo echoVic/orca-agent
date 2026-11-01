@@ -1342,6 +1342,7 @@ mod tests {
                     orca_core::task_types::TaskStatus::Stopped
                         | orca_core::task_types::TaskStatus::Completed
                         | orca_core::task_types::TaskStatus::Failed
+                        | orca_core::task_types::TaskStatus::Blocked
                         | orca_core::task_types::TaskStatus::Cancelled
                 )
             }) || std::time::Instant::now() >= deadline
@@ -1357,6 +1358,7 @@ mod tests {
                     orca_core::task_types::TaskStatus::Stopped
                         | orca_core::task_types::TaskStatus::Completed
                         | orca_core::task_types::TaskStatus::Failed
+                        | orca_core::task_types::TaskStatus::Blocked
                         | orca_core::task_types::TaskStatus::Cancelled
                 )
             }),

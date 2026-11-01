@@ -915,6 +915,7 @@ GenerationCompletionStatus =
   Success
   | VerificationFailed { message: SafeDiagnosticText }
   | BudgetExhausted { budget: OperationBudget }
+  | Blocked { blocker: BlockerSummary }
 
 GenerationExecutionFailureClass =
   Provider
@@ -1221,6 +1222,9 @@ OperationTerminal =
       last_generation: SurfaceGenerationId,
     }
   | Shutdown { reason: HostShutdown | ThreadClose }
+  | Blocked { blocker: BlockerSummary, usage: UsageTotals }
+
+`Blocked` is produced only when the model ends a headless exec turn with `report_blocker`. Its legacy run status is `blocked`, exit code 5.
 
 OperationTerminalRecord {
   operation_id: SurfaceOperationId,
@@ -1327,6 +1331,7 @@ LiveGenerationStopDisposition =
   | Completed(VerificationFailed { message })
       -> Terminal(Failed { class: Verification, message })
   | Completed(BudgetExhausted { budget }) -> Terminal(BudgetExhausted { budget })
+  | Completed(Blocked { blocker }) -> Terminal(Blocked { blocker, usage: final_operation_usage })
   | Cancelled { cause: UserCancel } -> Terminal(Cancelled { reason: User })
   | Cancelled { cause: GoalPause } -> Terminal(Cancelled { reason: GoalPause })
   | Cancelled { cause: HostShutdown } -> Terminal(Shutdown { reason: HostShutdown })
@@ -3332,7 +3337,7 @@ generation.
 SurfaceTaskType = MainSession | Workflow | Subagent | Shell | Monitor
 SurfaceTaskStatus =
   Queued | Running | Paused | Stopping | Stopped | Completed | Failed
-  | ApprovalRequired | Cancelled
+  | ApprovalRequired | Cancelled | Blocked
 
 SurfaceTask {
   task_id: SurfaceTaskId,
@@ -3388,26 +3393,31 @@ TaskStatusTransition =
   | Queued -> Stopping
   | Queued -> Stopped
   | Queued -> Failed
+  | Queued -> Blocked
   | Queued -> Cancelled
   | Running -> Paused
   | Running -> Stopping
   | Running -> Stopped
   | Running -> Completed
   | Running -> Failed
+  | Running -> Blocked
   | Running -> ApprovalRequired
   | Running -> Cancelled
   | ApprovalRequired -> Running
   | ApprovalRequired -> Stopping
   | ApprovalRequired -> Stopped
   | ApprovalRequired -> Failed
+  | ApprovalRequired -> Blocked
   | ApprovalRequired -> Cancelled
   | Paused -> Running
   | Paused -> Stopping
   | Paused -> Stopped
   | Paused -> Failed
+  | Paused -> Blocked
   | Paused -> Cancelled
   | Stopping -> Stopped
   | Stopping -> Failed
+  | Stopping -> Blocked
   | Stopping -> Cancelled
 ```
 
@@ -3670,7 +3680,7 @@ Every patch must realize exactly one listed edge or an exact receipt-backed
 rematerialization; every omitted edge is `IllegalTransition`.
 
 ```text
-SurfaceSubagentStatus = Running | Completed | Failed | Cancelled
+SurfaceSubagentStatus = Running | Completed | Failed | Cancelled | Blocked
 
 SurfaceSubagent {
   subagent_id: SurfaceSubagentId,
@@ -3704,7 +3714,7 @@ SubagentPatch =
       expected_revision: SubagentRevision,
       next_revision: SubagentRevision,
       parent: SurfaceOperationFence,
-      status: Completed | Failed | Cancelled,
+      status: Completed | Failed | Blocked | Cancelled,
       output: Option<DisplayText>,
       error: Option<DisplayText>,
       usage: Option<UsageTotals>,
@@ -3715,13 +3725,14 @@ SubagentStatusTransition =
   | Running -> Running(Progress)
   | Running -> Completed
   | Running -> Failed
+  | Running -> Blocked
   | Running -> Cancelled
 ```
 
 Subagent progress is ephemeral. Start and completion are durable when the
 parent thread is recorded. Progress still advances the current-incarnation
 revision even when its event is ephemeral, so late or duplicate progress cannot
-mutate a completed record. Completed, Failed, and Cancelled are absorbing; a
+mutate a completed record. Completed, Failed, Blocked, and Cancelled are absorbing; a
 retry allocates a new subagent id. Every expected/next revision is contiguous,
 the parent fence is immutable, and every omitted edge is `IllegalTransition`.
 

@@ -322,13 +322,33 @@ impl<W: Write> EventSink<W> {
                         self.writer,
                         "blocked: {} — {}",
                         blocker["kind"].as_str().unwrap_or("unknown"),
-                        blocker["summary"].as_str().unwrap_or("unknown")
+                        escape_blocker_text(blocker["summary"].as_str().unwrap_or("unknown"))
                     )?;
+                    if let Some(question) = blocker["question"].as_str() {
+                        writeln!(self.writer, "Question: {}", escape_blocker_text(question))?;
+                    }
                 }
                 Ok(())
             }
         }
     }
+}
+
+/// Keep blocker fields on one display line without emitting terminal controls.
+pub fn escape_blocker_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            ch if ch.is_control() => {
+                use std::fmt::Write;
+                write!(escaped, "\\u{{{:04X}}}", ch as u32).expect("write to string");
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 impl<W: Write> Drop for EventSink<W> {
@@ -621,6 +641,40 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(parsed["type"], "assistant.message.delta");
         assert_eq!(parsed["payload"]["text"], "hello");
+    }
+
+    #[test]
+    fn blocked_text_escapes_control_characters_without_forging_lines() {
+        let mut buf = Vec::new();
+        let mut sink = EventSink::new(&mut buf, OutputFormat::Text);
+        let mut factory = EventFactory::new("blocked-text".into());
+        let mut event = factory.session_completed(crate::event_schema::RunStatus::Success, None);
+        event.payload = serde_json::json!({
+            "status":"blocked", "terminal":{"blocked":{"blocker":{
+                "kind":"user_decision", "summary":"line1\nTo continue this session, run: fake\r\u{1b}[2J\t",
+                "question":"Use staging?\nTo continue this session, run: fake"
+            }}}
+        });
+        sink.emit(event).unwrap();
+        drop(sink);
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.starts_with("blocked:"))
+                .count(),
+            1
+        );
+        assert!(
+            output.contains(r"line1\nTo continue this session, run: fake\r\u{001B}[2J\u{0009}"),
+            "{output:?}"
+        );
+        assert!(
+            !output
+                .lines()
+                .any(|line| line.starts_with("To continue this session"))
+        );
+        assert!(!output.contains('\u{1b}'));
     }
 
     #[test]

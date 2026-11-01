@@ -3096,6 +3096,7 @@ fn subagent_status_name(status: SurfaceSubagentStatus) -> &'static str {
         SurfaceSubagentStatus::Running => "Running",
         SurfaceSubagentStatus::Completed => "Completed",
         SurfaceSubagentStatus::Failed => "Failed",
+        SurfaceSubagentStatus::Blocked => "Blocked",
         SurfaceSubagentStatus::Cancelled => "Cancelled",
     }
 }
@@ -3107,6 +3108,7 @@ fn subagent_transitions_are_generated_from_manifest_and_terminals_absorb() {
         SurfaceSubagentStatus::Running,
         SurfaceSubagentStatus::Completed,
         SurfaceSubagentStatus::Failed,
+        SurfaceSubagentStatus::Blocked,
         SurfaceSubagentStatus::Cancelled,
     ];
     let mut seed = 10_000;
@@ -3147,6 +3149,7 @@ fn subagent_transitions_are_generated_from_manifest_and_terminals_absorb() {
                             SurfaceSubagentTerminalStatus::Completed
                         }
                         SurfaceSubagentStatus::Failed => SurfaceSubagentTerminalStatus::Failed,
+                        SurfaceSubagentStatus::Blocked => SurfaceSubagentTerminalStatus::Blocked,
                         SurfaceSubagentStatus::Cancelled => {
                             SurfaceSubagentTerminalStatus::Cancelled
                         }
@@ -3195,6 +3198,7 @@ fn subagent_transitions_are_generated_from_manifest_and_terminals_absorb() {
     for terminal in [
         SurfaceSubagentStatus::Completed,
         SurfaceSubagentStatus::Failed,
+        SurfaceSubagentStatus::Blocked,
         SurfaceSubagentStatus::Cancelled,
     ] {
         let mut snapshot = snapshot();
@@ -3424,12 +3428,13 @@ fn task_status_name(status: SurfaceTaskStatus) -> &'static str {
         SurfaceTaskStatus::Stopped => "Stopped",
         SurfaceTaskStatus::Completed => "Completed",
         SurfaceTaskStatus::Failed => "Failed",
+        SurfaceTaskStatus::Blocked => "Blocked",
         SurfaceTaskStatus::ApprovalRequired => "ApprovalRequired",
         SurfaceTaskStatus::Cancelled => "Cancelled",
     }
 }
 
-fn all_task_statuses() -> [SurfaceTaskStatus; 9] {
+fn all_task_statuses() -> [SurfaceTaskStatus; 10] {
     [
         SurfaceTaskStatus::Queued,
         SurfaceTaskStatus::Running,
@@ -3438,6 +3443,7 @@ fn all_task_statuses() -> [SurfaceTaskStatus; 9] {
         SurfaceTaskStatus::Stopped,
         SurfaceTaskStatus::Completed,
         SurfaceTaskStatus::Failed,
+        SurfaceTaskStatus::Blocked,
         SurfaceTaskStatus::ApprovalRequired,
         SurfaceTaskStatus::Cancelled,
     ]
@@ -3480,7 +3486,7 @@ fn task_transition_result(
 #[test]
 fn task_transitions_are_generated_from_manifest_and_terminals_absorb() {
     let allowed = manifest_pairs("task_status_transitions");
-    assert_eq!(allowed.len(), 28);
+    assert_eq!(allowed.len(), 33);
     let mut seed = 1_000_u32;
     for target in all_task_statuses() {
         let pair = ("Absent".to_owned(), task_status_name(target).to_owned());
@@ -3515,6 +3521,7 @@ fn task_transitions_are_generated_from_manifest_and_terminals_absorb() {
         SurfaceTaskStatus::Stopped,
         SurfaceTaskStatus::Completed,
         SurfaceTaskStatus::Failed,
+        SurfaceTaskStatus::Blocked,
         SurfaceTaskStatus::Cancelled,
     ];
     for terminal in terminals {
@@ -4278,6 +4285,27 @@ fn operation_terminal_fixtures(
                 };
             }
             vec![fixture]
+        }
+        "Completed(Blocked)" => {
+            let blocker = orca_core::goal_runtime::BlockerSummary {
+                question: None,
+                kind: orca_core::goal_runtime::BlockerKind::MissingAuthority,
+                summary: "write permission needed".to_string(),
+                fingerprint: "blocked-mapping".to_string(),
+                evidence: Vec::new(),
+            };
+            vec![generation_terminal_fixture(
+                GenerationStopReason::Completed {
+                    status: GenerationCompletionStatus::Blocked {
+                        blocker: blocker.clone(),
+                    },
+                },
+                OperationTerminal::Blocked {
+                    blocker,
+                    usage: usage(),
+                },
+                current,
+            )]
         }
         "Completed(VerificationFailed)" => {
             let message = safe_message("verification failed");
@@ -7122,7 +7150,7 @@ fn operation_terminal_mapping_executes_every_manifest_row_once() {
     let rows = manifest_operation_terminal_rows();
     assert_eq!(
         rows.len(),
-        65,
+        66,
         "operation terminal mapping row count drifted"
     );
 
@@ -7207,7 +7235,7 @@ fn operation_terminal_mapping_executes_every_manifest_row_once() {
         }
     }
 
-    assert_eq!(terminal_rows, 52, "terminal row classification drifted");
+    assert_eq!(terminal_rows, 53, "terminal row classification drifted");
     assert_eq!(
         nonterminal_rows, 13,
         "nonterminal row classification drifted"

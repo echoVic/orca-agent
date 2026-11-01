@@ -762,6 +762,7 @@ mod tests {
     fn verifier_can_block_only_with_a_non_model_fixable_blocker() {
         let mut tracker = GoalTracker::new(GoalId::new(), None);
         let blocker = BlockerSummary {
+            question: None,
             kind: BlockerKind::UserDecision,
             summary: "the user must choose the public API".to_string(),
             fingerprint: "user-decision:public-api".to_string(),

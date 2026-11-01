@@ -1153,6 +1153,7 @@ pub enum SurfaceTaskStatus {
     Failed,
     ApprovalRequired,
     Cancelled,
+    Blocked,
 }
 
 /// User-visible phase of a delegated child. This intentionally describes
@@ -1416,6 +1417,7 @@ pub enum SurfaceSubagentStatus {
     Completed,
     Failed,
     Cancelled,
+    Blocked,
 }
 
 /// Durable owner identity for a subagent projection. A detached owner is
@@ -1532,6 +1534,7 @@ pub enum SurfaceSubagentTerminalStatus {
     Completed,
     Failed,
     Cancelled,
+    Blocked,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2397,4 +2400,58 @@ pub enum SessionPatch {
         closing_commit_id: SurfaceCommitId,
         plan_digest: Sha256Digest,
     },
+}
+
+#[cfg(test)]
+mod blocked_status_tests {
+    use super::*;
+
+    #[test]
+    fn surface_task_status_subagent_statuses_round_trip() {
+        for name in ["Running", "Completed", "Failed", "Blocked", "Cancelled"] {
+            let wire = serde_json::to_string(name).unwrap();
+            let status: SurfaceSubagentStatus = serde_json::from_str(&wire).unwrap();
+            assert_eq!(serde_json::to_string(&status).unwrap(), wire);
+            if name != "Running" {
+                let terminal: SurfaceSubagentTerminalStatus = serde_json::from_str(&wire).unwrap();
+                assert_eq!(serde_json::to_string(&terminal).unwrap(), wire);
+            }
+        }
+    }
+
+    #[test]
+    fn surface_task_status_blocked_is_terminal_without_attention() {
+        let status: SurfaceTaskStatus = SurfaceTaskStatus::Blocked;
+        assert!(!matches!(
+            status,
+            SurfaceTaskStatus::Queued
+                | SurfaceTaskStatus::Running
+                | SurfaceTaskStatus::Paused
+                | SurfaceTaskStatus::Stopping
+                | SurfaceTaskStatus::ApprovalRequired
+        ));
+        assert_eq!(
+            serde_json::to_string(&SurfaceTaskStatus::Blocked).unwrap(),
+            "\"Blocked\""
+        );
+    }
+
+    #[test]
+    fn surface_task_status_reads_every_pre_blocked_value() {
+        for name in [
+            "Queued",
+            "Running",
+            "Paused",
+            "Stopping",
+            "Stopped",
+            "Completed",
+            "Failed",
+            "ApprovalRequired",
+            "Cancelled",
+        ] {
+            let wire = serde_json::to_string(name).unwrap();
+            let status: SurfaceTaskStatus = serde_json::from_str(&wire).unwrap();
+            assert_eq!(serde_json::to_string(&status).unwrap(), wire);
+        }
+    }
 }

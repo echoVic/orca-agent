@@ -129,6 +129,12 @@ where
                 .get_or_insert_with(|| format!("role '{}' tool policy", builtin.identifier()));
         }
     }
+    if request.headless_root && !matches!(request.subagent_type, SubagentType::Custom(_)) {
+        request
+            .allowed_tools
+            .get_or_insert_with(Vec::new)
+            .push("report_blocker".to_string());
+    }
     child_config.model = child_config
         .model
         .with_subagent_override(request.model.clone());

@@ -154,6 +154,7 @@ fn build_child_agent_loop_setup(
             request.allowed_tools.as_deref(),
             request.tool_policy_label.as_deref(),
         )
+        .with_headless(request.headless_root)
         .with_workflow_ipc(request.workflow_ipc.is_some()),
         &mcp_registry,
         &crate::extension::ExtensionData::new("child-session"),
@@ -313,6 +314,7 @@ mod tests {
             model: None,
             depth: 1,
             emit_deltas: false,
+            headless_root: false,
             allowed_tools: Some(allowed_tools),
             tool_policy_label: Some("custom agent desktop-audit".to_string()),
             workflow_ipc: None,

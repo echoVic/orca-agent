@@ -196,6 +196,7 @@ impl AgentLoopResult {
                 blocker: blocker.unwrap_or_else(|| {
                     // Should not happen: Blocked status always has a blocker.
                     orca_core::goal_runtime::BlockerSummary {
+                        question: None,
                         kind: orca_core::goal_runtime::BlockerKind::ExternalState,
                         summary: "blocker not available".to_string(),
                         fingerprint: String::new(),

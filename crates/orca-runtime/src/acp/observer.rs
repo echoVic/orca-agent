@@ -296,17 +296,20 @@ impl Observer {
                             }
                             SurfaceEvent::Operation(OperationPatch::Terminal { record }) => {
                                 terminal = Some(record.operation_id.clone());
-                                if matches!(sender, AcpNotificationSender::Standard(_)) {
-                                    Ok(())
-                                } else {
-                                    state_with_terminal(
-                                        &sender,
-                                        &id,
-                                        "terminal",
-                                        false,
-                                        Some(&record.terminal),
-                                    )
-                                }
+                                super::agent::emit_blocked_terminal(&id, &sender, &record.terminal)
+                                    .and_then(|()| {
+                                        if matches!(sender, AcpNotificationSender::Standard(_)) {
+                                            Ok(())
+                                        } else {
+                                            state_with_terminal(
+                                                &sender,
+                                                &id,
+                                                "terminal",
+                                                false,
+                                                Some(&record.terminal),
+                                            )
+                                        }
+                                    })
                             }
                             SurfaceEvent::Operation(_) => state(&sender, &id, "active", true),
                             SurfaceEvent::Plan(plan) => {

@@ -213,6 +213,8 @@ pub struct ChildAgentRequest {
     pub model: Option<String>,
     pub depth: u32,
     pub emit_deltas: bool,
+    /// Whether this child belongs to a headless exec root (never goal mode).
+    pub headless_root: bool,
     pub allowed_tools: Option<Vec<String>>,
     pub tool_policy_label: Option<String>,
     pub(crate) workflow_ipc: Option<WorkflowIpcContext>,
@@ -235,6 +237,7 @@ impl ChildAgentRequest {
             model,
             depth,
             emit_deltas,
+            headless_root: false,
             allowed_tools: None,
             tool_policy_label: None,
             workflow_ipc: None,

@@ -715,6 +715,163 @@ fn exec_report_blocker_with_passing_verifier_stays_blocked() {
 }
 
 #[test]
+fn exec_report_blocker_carries_question() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--no-history",
+            "--provider",
+            "mock",
+            "report_blocker user_decision need a port ? Use port 8080?",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = parse_jsonl(&output.stdout);
+    let terminal = &events.last().unwrap()["payload"]["terminal"]["blocked"]["blocker"];
+    assert_eq!(terminal["summary"], "need a port");
+    assert_eq!(terminal["question"], "Use port 8080?");
+}
+
+#[test]
+fn exec_blocked_text_mode_prints_question_without_resume_line_when_history_is_off() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "text",
+            "--no-history",
+            "--provider",
+            "mock",
+            "report_blocker user_decision need a port ? Use port 8080?",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("blocked: user_decision — need a port\nQuestion: Use port 8080?"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("orca exec resume"), "{stdout}");
+}
+
+#[test]
+fn exec_blocked_text_mode_prints_answer_resume_hint_with_saved_session_id() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "text",
+            "--save-history",
+            "--provider",
+            "mock",
+            "report_blocker user_decision need a port ? Use port 8080?",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let documents = session_documents(home.path());
+    assert_eq!(documents.len(), 1);
+    let session_id = documents[0]
+        .1
+        .iter()
+        .find(|record| record["type"] == "session.meta")
+        .and_then(|record| record["session_id"].as_str())
+        .expect("saved session id");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("blocked: user_decision — need a port\nQuestion: Use port 8080?"),
+        "{stdout}"
+    );
+    let hint = stdout
+        .lines()
+        .find(|line| line.starts_with("To continue this session, run:"))
+        .expect("resume hint");
+    assert_eq!(
+        hint,
+        format!("To continue this session, run: orca exec resume {session_id} \"<your answer>\"")
+    );
+}
+
+#[test]
+fn exec_blocked_text_mode_without_question_keeps_the_plain_resume_hint() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "text",
+            "--save-history",
+            "--provider",
+            "mock",
+            "report_blocker user_decision need a port",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let documents = session_documents(home.path());
+    assert_eq!(documents.len(), 1);
+    let session_id = documents[0]
+        .1
+        .iter()
+        .find(|record| record["type"] == "session.meta")
+        .and_then(|record| record["session_id"].as_str())
+        .expect("saved session id");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("blocked: user_decision — need a port"),
+        "{stdout}"
+    );
+    let hint = stdout
+        .lines()
+        .find(|line| line.starts_with("To continue this session, run:"))
+        .expect("resume hint");
+    assert_eq!(
+        hint,
+        format!("To continue this session, run: orca exec resume {session_id}")
+    );
+    assert!(!stdout.contains("<your answer>"), "{stdout}");
+}
+
+#[test]
 fn exec_report_blocker_text_mode_prints_the_reason() {
     let home = TempDir::new().expect("temporary ORCA_HOME");
     let cwd = TempDir::new().expect("temporary workspace");
@@ -789,4 +946,286 @@ fn assert_exec_report_blocker(with_verifier: bool) {
             .iter()
             .any(|event| event["type"] == "verification.started")
     );
+}
+
+#[test]
+fn exec_subagent_report_blocker_reports_blocked_to_parent() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--no-history",
+            "subagent sync report_blocker",
+        ])
+        .output()
+        .expect("run orca");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = parse_jsonl(&output.stdout);
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["type"], "session.completed");
+    assert_eq!(terminal["payload"]["status"], "success");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "session.completed")
+            .count(),
+        1
+    );
+    let tasks = events
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "workflow.tasks.updated")
+        .expect("task snapshot")["payload"]["tasks"]
+        .as_array()
+        .unwrap();
+    let child = tasks
+        .iter()
+        .find(|task| task["type"] == "subagent")
+        .expect("child task");
+    assert_eq!(child["status"], "blocked", "{tasks:?}");
+    let parent = tasks
+        .iter()
+        .find(|task| task["type"] == "main_session")
+        .expect("root task");
+    assert_eq!(parent["status"], "completed");
+    let listed = events
+        .iter()
+        .find(|e| e["type"] == "tool.call.completed" && e["payload"]["name"] == "task_list")
+        .expect("parent lists tasks after child blocks");
+    let listed: Value =
+        serde_json::from_str(listed["payload"]["output"].as_str().unwrap()).unwrap();
+    assert!(
+        listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == child["id"] && task["status"] == "blocked"),
+        "{listed}"
+    );
+    assert!(
+        listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == parent["id"] && task["status"] == "running"),
+        "{listed}"
+    );
+    let completed = events
+        .iter()
+        .find(|e| e["type"] == "tool.call.completed" && e["payload"]["name"] == "subagent")
+        .expect("subagent tool result");
+    assert_eq!(completed["payload"]["status"], "failed");
+    let output = completed["payload"]["output"]
+        .as_str()
+        .expect("blocked output");
+    for line in [
+        "Subagent status: Blocked",
+        "kind: environment_contradiction",
+        "summary: child cannot write",
+    ] {
+        assert!(output.contains(line), "{output}");
+    }
+}
+
+#[test]
+fn exec_subagent_report_blocker_carries_its_question_to_parent() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--no-history",
+            "subagent sync report_blocker ? Can you allow writes?",
+        ])
+        .output()
+        .expect("run orca");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = parse_jsonl(&output.stdout);
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["type"], "session.completed");
+    assert_eq!(terminal["payload"]["status"], "success");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "session.completed")
+            .count(),
+        1
+    );
+    let tasks = events
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "workflow.tasks.updated")
+        .expect("task snapshot")["payload"]["tasks"]
+        .as_array()
+        .unwrap();
+    let child = tasks
+        .iter()
+        .find(|task| task["type"] == "subagent")
+        .expect("child task");
+    assert_eq!(child["status"], "blocked", "{tasks:?}");
+    let parent = tasks
+        .iter()
+        .find(|task| task["type"] == "main_session")
+        .expect("root task");
+    assert_eq!(parent["status"], "completed");
+    let listed = events
+        .iter()
+        .find(|e| e["type"] == "tool.call.completed" && e["payload"]["name"] == "task_list")
+        .expect("parent lists tasks after child blocks");
+    let listed: Value =
+        serde_json::from_str(listed["payload"]["output"].as_str().unwrap()).unwrap();
+    assert!(
+        listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == child["id"] && task["status"] == "blocked"),
+        "{listed}"
+    );
+    assert!(
+        listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == parent["id"] && task["status"] == "running"),
+        "{listed}"
+    );
+    let completed = events
+        .iter()
+        .find(|e| e["type"] == "tool.call.completed" && e["payload"]["name"] == "subagent")
+        .expect("subagent tool result");
+    assert_eq!(completed["payload"]["status"], "failed");
+    let output = completed["payload"]["output"]
+        .as_str()
+        .expect("blocked output");
+    for line in [
+        "Subagent status: Blocked",
+        "kind: environment_contradiction",
+        "summary: child cannot write",
+        "question: Can you allow writes?",
+    ] {
+        assert!(output.contains(line), "{output}");
+    }
+}
+
+fn blocker_task_view(home: &std::path::Path, cwd: &std::path::Path, task_id: &str) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home)
+        .current_dir(cwd)
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--save-history",
+            &format!("task_read_output {task_id}"),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = parse_jsonl(&output.stdout);
+    let completed = events
+        .iter()
+        .find(|e| e["type"] == "tool.call.completed" && e["payload"]["name"] == "task_read_output")
+        .unwrap();
+    serde_json::from_str(completed["payload"]["output"].as_str().unwrap()).unwrap()
+}
+
+#[test]
+fn exec_async_subagent_report_blocker_persists_blocked() {
+    for question in [None, Some("Can the workspace be made writable?")] {
+        let prompt = question.map_or_else(
+            || "subagent async report_blocker".to_string(),
+            |question| format!("subagent async report_blocker ? {question}"),
+        );
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+            .env("ORCA_HOME", home.path())
+            .current_dir(cwd.path())
+            .args([
+                "exec",
+                "--output-format",
+                "jsonl",
+                "--provider",
+                "mock",
+                "--approval-mode",
+                "full-auto",
+                "--save-history",
+                &prompt,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events = parse_jsonl(&output.stdout);
+        let launch = events
+            .iter()
+            .find(|e| e["type"] == "tool.call.completed" && e["payload"]["name"] == "subagent")
+            .unwrap();
+        let launch: Value =
+            serde_json::from_str(launch["payload"]["output"].as_str().unwrap()).unwrap();
+        let task_id = launch["agent_id"].as_str().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let child = blocker_task_view(home.path(), cwd.path(), task_id);
+            if child["status"] == "blocked" {
+                let result = child["error"]
+                    .as_str()
+                    .or_else(|| child["result"].as_str())
+                    .expect("blocked child result");
+                for expected in [
+                    "Subagent status: Blocked",
+                    "kind: environment_contradiction",
+                    "summary: child cannot write",
+                ] {
+                    assert!(result.contains(expected), "{child}");
+                }
+                assert!(!result.contains("BlockerSummary {"), "{child}");
+                if let Some(question) = question {
+                    assert!(result.contains(&format!("question: {question}")), "{child}");
+                }
+                break;
+            }
+            assert_ne!(child["status"], "failed", "{child}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not block: {child}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
 }

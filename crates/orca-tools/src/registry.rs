@@ -1476,6 +1476,10 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                         "type": "string",
                         "description": "Short explanation of why progress is blocked (at most 2000 characters)."
                     },
+                    "question": {
+                        "type": "string",
+                        "description": "One concrete question for a person whose answer would let the work continue. Set it only when an answer would unblock the work; ask exactly one question."
+                    },
                     "evidence": {
                         "type": "array",
                         "items": {

@@ -522,6 +522,14 @@ fn steer_awaits_answer(
     }
 }
 
+fn child_execution_is_indeterminate(task: &crate::tasks::TaskRecord, now_ms: i64) -> bool {
+    let has_live_lease = task.lease_owner.is_some()
+        && task
+            .lease_expires_at_ms
+            .is_some_and(|expires| expires > now_ms);
+    task.continuation_indeterminate && !(task.status.is_active() && has_live_lease)
+}
+
 fn settle_children_before_return<W: io::Write>(
     input: &mut RuntimeTurnLoopInput<'_, '_, W>,
 ) -> io::Result<bool> {
@@ -534,10 +542,13 @@ fn settle_children_before_return<W: io::Write>(
         .or(input.request.turn_context.root_task_id);
     let live_children = || -> io::Result<Vec<String>> {
         let records = registry.records_snapshot().map_err(io::Error::other)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
         if let Some(task) = records.iter().find(|task| {
             task.task_type == orca_core::task_types::TaskType::Subagent
                 && task.parent_task_id.as_deref() == owner
-                && task.continuation_indeterminate
+                // An in-flight tool also fences replay until its checkpoint.
+                // Wait for its live worker before judging the terminal receipt.
+                && child_execution_is_indeterminate(task, now_ms)
         }) {
             return Err(io::Error::other(format!(
                 "child {} has indeterminate execution; its reservation is retained and queued siblings cannot be assumed runnable",
@@ -789,6 +800,27 @@ mod tests {
     };
     use crate::tasks::TaskRegistry;
     use crate::tool_execution::policy_for_tool_execution;
+
+    #[test]
+    fn settle_children_indeterminate_requires_a_live_lease_to_wait() {
+        let registry = TaskRegistry::new("indeterminate-children".into());
+        let limits = orca_core::subagent_config::SubagentLimits::default();
+        for (expires, expected) in [(1001, false), (999, true), (1000, true)] {
+            let id = registry
+                .execution_scope(&limits)
+                .submit_subagent("child".into(), None, None, 1)
+                .unwrap()
+                .task_id;
+            let mut task = registry.get(&id).unwrap();
+            task.status = orca_core::task_types::TaskStatus::Running;
+            task.continuation_indeterminate = true;
+            task.lease_owner = Some("worker".into());
+            task.lease_expires_at_ms = Some(expires);
+            assert_eq!(child_execution_is_indeterminate(&task, 1000), expected);
+            task.lease_owner = None;
+            assert!(child_execution_is_indeterminate(&task, 1000));
+        }
+    }
 
     fn config() -> RunConfig {
         RunConfig {

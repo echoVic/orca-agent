@@ -403,8 +403,9 @@ impl AgentController {
                 )),
             });
         }
-        let mut turn =
-            HostedTurnRequest::new(request.prompt).with_event_observer(publisher.clone());
+        let mut turn = HostedTurnRequest::new(request.prompt)
+            .with_headless_root(child_config.tools.headless_exec)
+            .with_event_observer(publisher.clone());
         if let Some(handler) = request.approval_handler {
             turn = turn.with_approval_handler(handler);
         }
@@ -841,9 +842,11 @@ impl AgentSurfacePublisher {
                     }
                     RunStatus::Failed
                     | RunStatus::ApprovalRequired
-                    | RunStatus::VerificationFailed
-                    | RunStatus::Blocked { .. } => {
+                    | RunStatus::VerificationFailed => {
                         crate::runtime_surface::SurfaceSubagentTerminalStatus::Failed
+                    }
+                    RunStatus::Blocked { .. } => {
+                        crate::runtime_surface::SurfaceSubagentTerminalStatus::Blocked
                     }
                 },
                 output: output.map(DisplayText::new),
@@ -863,12 +866,10 @@ fn publish_surface_terminal(
     let terminal_status = match status {
         RunStatus::Success => crate::runtime_surface::SurfaceSubagentTerminalStatus::Completed,
         RunStatus::Cancelled => crate::runtime_surface::SurfaceSubagentTerminalStatus::Cancelled,
-        RunStatus::Failed
-        | RunStatus::ApprovalRequired
-        | RunStatus::VerificationFailed
-        | RunStatus::Blocked { .. } => {
+        RunStatus::Failed | RunStatus::ApprovalRequired | RunStatus::VerificationFailed => {
             crate::runtime_surface::SurfaceSubagentTerminalStatus::Failed
         }
+        RunStatus::Blocked { .. } => crate::runtime_surface::SurfaceSubagentTerminalStatus::Blocked,
     };
     activity
         .emitter

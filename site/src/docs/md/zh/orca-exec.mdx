@@ -60,6 +60,8 @@ orca exec \
 
 自动化应使用进程退出状态和验证器输出作为门槛。已公开的退出码为 0（成功）、1（失败）、2（验证失败）、3（需要批准或被拒绝）、4（预算耗尽）、5（受阻）和 130（已取消）。具体约定见 `docs/harness-contract.md` 的 “Exit Codes” 部分。继续使用 `--verifier` 检查任务结果。
 
+运行受阻（退出码 5）时，`report_blocker` 可以附带一个回答后便能继续工作的问题。记录了历史的会话可用 `orca exec resume <session-id> "<你的回答>"` 继续，回答会作为恢复运行的提示词。JSONL 运行需加 `--save-history`，才能在 `session.completed` 中取得可恢复的 `session_id`；问题位于 `payload.terminal.blocked.blocker.question`。
+
 ## 中止运行
 
 orca exec 一启动就接管 SIGINT 和 SIGTERM，在任何 MCP 服务器或任务命令启动之前就已生效。收到其中一个信号后，它停止任务命令和 MCP 服务器，写入本次运行的终止记录，然后退出：SIGINT 的退出码是 130，SIGTERM 是 143。JSONL 输出的最后一个事件就是终止记录，即 status 为 cancelled 的 session.completed。

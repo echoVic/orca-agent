@@ -1967,6 +1967,7 @@ mod tests {
     fn blocked_run_status_has_correct_string_and_exit_code() {
         use crate::goal_runtime::{BlockerKind, BlockerSummary};
         let blocker = BlockerSummary {
+            question: None,
             kind: BlockerKind::EnvironmentContradiction,
             summary: "workspace is read-only".to_string(),
             fingerprint: "fp-1".to_string(),
@@ -1983,6 +1984,7 @@ mod tests {
         use crate::goal_runtime::{BlockerKind, BlockerSummary};
         let terminal = OperationTerminal::Blocked {
             blocker: BlockerSummary {
+                question: None,
                 kind: BlockerKind::EnvironmentContradiction,
                 summary: "workspace is read-only".to_string(),
                 fingerprint: "fp-1".to_string(),
@@ -2001,6 +2003,7 @@ mod tests {
         use crate::goal_runtime::{BlockerKind, BlockerSummary};
         let terminal = OperationTerminal::Blocked {
             blocker: BlockerSummary {
+                question: None,
                 kind: BlockerKind::EnvironmentContradiction,
                 summary: "workspace is read-only".to_string(),
                 fingerprint: "fp-1".to_string(),

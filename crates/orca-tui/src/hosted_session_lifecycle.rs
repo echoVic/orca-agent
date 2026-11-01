@@ -113,6 +113,7 @@ fn ensure_current_session_switchable(current: Option<&RuntimeThreadHandle>) -> R
             orca_runtime::surface::SurfaceTaskStatus::Stopped
                 | orca_runtime::surface::SurfaceTaskStatus::Completed
                 | orca_runtime::surface::SurfaceTaskStatus::Failed
+                | orca_runtime::surface::SurfaceTaskStatus::Blocked
                 | orca_runtime::surface::SurfaceTaskStatus::Cancelled
         )
     });

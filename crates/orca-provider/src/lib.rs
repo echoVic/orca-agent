@@ -1175,6 +1175,32 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
+    if prompt
+        .trim()
+        .split_once(" ? ")
+        .map_or(prompt.trim(), |(base, _)| base)
+        == "subagent sync report_blocker"
+        && has_tool_results
+        && !conversation.messages.iter().any(|message| {
+            matches!(message,
+            Message::Tool { tool_call_id, .. } if tool_call_id == "mock-tool-2")
+        })
+    {
+        let mut request = parse_mock_prompt("task_list").expect("task list request");
+        request.id = "mock-tool-2".to_string();
+        return ProviderResponse {
+            steps: vec![ProviderStep::ToolCall(request.clone())],
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls: vec![RawToolCall {
+                id: request.id,
+                function_name: request.name.as_str().to_string(),
+                arguments: request.raw_arguments.unwrap_or_default(),
+            }],
+            usage: None,
+        };
+    }
+
     if has_tool_results {
         let msg = "Mock completed after tool execution.".to_string();
         return ProviderResponse {
@@ -1510,14 +1536,21 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
 
     if let Some(rest) = prompt.strip_prefix("report_blocker ") {
         let (kind, summary) = rest.split_once(' ')?;
+        let (summary, question) = summary
+            .split_once(" ? ")
+            .map_or((summary, None), |(summary, question)| {
+                (summary, Some(question))
+            });
+        let mut arguments = serde_json::json!({ "kind": kind, "summary": summary });
+        if let Some(question) = question {
+            arguments["question"] = question.into();
+        }
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
             name: ToolName::ReportBlocker,
             action: ActionKind::Agent,
             target: None,
-            raw_arguments: Some(
-                serde_json::json!({ "kind": kind, "summary": summary }).to_string(),
-            ),
+            raw_arguments: Some(arguments.to_string()),
         });
     }
 
@@ -1565,7 +1598,20 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         } else {
             (None, rest)
         };
-        let prompt = if description == "mock_fail" {
+        let (blocker_description, question) = description
+            .split_once(" ? ")
+            .map_or((description, None), |(description, question)| {
+                (description, Some(question))
+            });
+        let prompt = if blocker_description == "report_blocker" {
+            let mut prompt =
+                "report_blocker environment_contradiction child cannot write".to_string();
+            if let Some(question) = question {
+                prompt.push_str(" ? ");
+                prompt.push_str(question);
+            }
+            prompt
+        } else if description == "mock_fail" {
             "mock_fail".to_string()
         } else if description == "schema_ok" || description == "schema_fail" {
             "mock_usage".to_string()
@@ -1576,6 +1622,9 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
             "description": description,
             "prompt": prompt
         });
+        if blocker_description == "report_blocker" {
+            arguments["subagent_type"] = serde_json::json!("explorer");
+        }
         if description == "schema_ok" {
             arguments["schema"] = serde_json::json!({ "type": "string" });
         } else if description == "schema_fail" {

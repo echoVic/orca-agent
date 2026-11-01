@@ -252,6 +252,7 @@ pub fn parse_update_intent(request: &ToolRequest) -> Result<GoalUpdateIntent, St
         GoalRequestedState::Blocked => "goal blocked state requested".to_string(),
     });
     let blocker = args.blocker.map(|blocker| BlockerSummary {
+        question: None,
         kind: blocker.kind,
         fingerprint: blocker_fingerprint(blocker.kind, &blocker.summary),
         summary: blocker.summary,

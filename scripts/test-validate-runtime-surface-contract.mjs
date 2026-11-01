@@ -383,6 +383,16 @@ expectFailure(
   );
 }
 
+for (const table of ["task_status_transitions", "subagent_status_transitions"]) {
+  const manifest = cloneManifest();
+  manifest[table].push(["Blocked", "Running"]);
+  expectFailure(
+    `${table} keeps Blocked absorbing`,
+    () => validateCandidate(manifest),
+    new RegExp(`${table} allows terminal source Blocked to transition`),
+  );
+}
+
 {
   const manifest = cloneManifest();
   manifest.operation_terminal_mapping[0][0] = "Completed(Failed)";

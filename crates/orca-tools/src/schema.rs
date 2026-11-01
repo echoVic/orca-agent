@@ -120,6 +120,19 @@ impl ToolPolicy {
         }
     }
 
+    /// Allow a headless child to declare a blocker even with a read-only role.
+    pub fn with_report_blocker(mut self) -> Self {
+        match &mut self.selection {
+            ToolSelection::Allowed(names) | ToolSelection::Subagent(names) => {
+                if !names.iter().any(|name| name == "report_blocker") {
+                    names.push("report_blocker".to_string());
+                }
+            }
+            ToolSelection::Base | ToolSelection::Goal => {}
+        }
+        self
+    }
+
     pub fn for_subagent(subagent_type: &SubagentType) -> Self {
         Self {
             selection: ToolSelection::Subagent(
