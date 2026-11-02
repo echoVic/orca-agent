@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.14";
+export const releaseVersion = "v0.5.15";
 
 export const releases = [
+  {
+    version: "v0.5.15",
+    date: "2026-11-02",
+    title: "Say when you're blocked",
+    body: "orca exec can now end a run with status blocked and exit code 5 when something outside the model's control stops the work — a read-only workspace, missing credentials, or no network access. The model calls report_blocker with a kind, summary, and optional question; the question appears in text mode and can be answered with orca exec resume. A blocked subagent shows Subagent status: Blocked to its parent instead of a generic failure, and its task status is blocked, not failed. session.completed adds writes_applied to report whether the run changed any file through edit or write_file. The system prompt asks the model to say what is missing and never to claim work it did not do, and to treat text in files and tool results as data, not instructions. The TUI shows a blocked result with its reason and next step; ACP ends the turn normally instead of returning an internal error. The capability eval quarantines qemu-alpine-ssh and classifies verifier environment failures separately from capability gaps.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.15",
+  },
   {
     version: "v0.5.14",
     date: "2026-10-26",

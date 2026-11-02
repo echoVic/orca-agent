@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.15":
+        "Say when you're blocked. orca exec can now end a run with status blocked and exit code 5 when something outside the model's control stops the work — a read-only workspace, missing credentials, or no network. The model calls report_blocker with a kind, summary, and optional question. A blocked run can carry one question; answer it with orca exec resume. A blocked subagent shows Subagent status: Blocked to its parent and its task status is blocked, not failed. session.completed gains writes_applied to report whether the run changed any file through edit or write_file. The system prompt asks the model to say what is missing and never to claim work it did not do, and to treat text in files and tool results as data, not instructions. The TUI shows a blocked result with its reason and next step; ACP ends the turn normally instead of returning an internal error. The capability eval quarantines qemu-alpine-ssh and classifies verifier environment failures separately from capability gaps. Custom agents get report_blocker only if their definition lists it explicitly.",
       "v0.5.14":
         "Ask before using your windows. Outside full-auto, computer use asks for once or session approval before using pre-existing windows; app grants do not cover them. Press 4 to keep a window and let Orca continue (Esc can stop the whole turn). Outside full-auto, no allow rule preapproves password entry there. Full-auto skips window approval and window deny/prompt rules; a whole-tool computer allow can preapprove password entry for apps that do not run commands. App deny/prompt rules still apply. list_apps shows titles only for apps used this session. The driver never uses the desktop and keeps input in the selected window. Clearer window errors, windowless shortcuts and AXRaise recovery reduce failures; three consecutive failures add a hint, and six stop that app for the rest of the turn. App session grants appear in the real TUI. MCP approvals never resume after restart; turn-only tool approvals require a restorable matching definition. Stale queue updates no longer revive finished turns. A developer harness checks 15 tasks: attempt 3 had no unapproved use of pre-existing windows, single-step 8/8 twice, and multi-step 6/7 and 7/7. Pricing is unchanged.",
       "v0.5.13":
@@ -704,6 +706,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.15":
+        "能说“我被挡住了”。orca exec 现在可以在模型控制不了的事情挡住工作时，以 status blocked 和退出码 5 结束——只读工作区、缺少凭据或没有网络。模型调用 report_blocker，传 kind、summary 和可选的 question；question 会出现在文本模式里，用 orca exec resume 可以回答。headless 运行的子 agent 报告 blocker 时，父 agent 看到的是 Subagent status: Blocked 和原因，而不是一次普通失败，子 agent 的任务状态也是 blocked 而不是 failed。session.completed 新增 writes_applied，表示本次运行是否通过 edit 或 write_file 改过文件。系统提示词要求模型被挡住时说明缺什么、绝不谎称没做的事，并把文件和工具结果里的文字当作数据而非指令。TUI 显示 blocked 的原因和下一步；ACP 正常结束这一轮，不再返回内部错误。能力评测隔离了 qemu-alpine-ssh，并把评测器环境失败归类为 environment，不再算能力缺口。自定义 agent 只有在其定义里显式列出时才会得到 report_blocker。",
       "v0.5.14":
         "先询问，再用你的窗口。full-auto 之外，computer use 使用已有窗口前会询问：允许一次或本会话允许；应用授权不覆盖它们。按 4 保留窗口并让 Orca 继续（Esc 可能直接停止整轮）。full-auto 之外，任何 allow 规则都不能预先批准其中的密码输入。full-auto 跳过窗口审批，窗口 deny/prompt 规则不适用；整个 computer 工具的 allow 规则可预先批准不能执行命令的应用的密码输入。应用 deny/prompt 规则仍生效。list_apps 只显示本会话用过的应用的窗口标题。驱动不使用桌面，输入须落在选中的窗口。更清楚的窗口错误提示、无窗口快捷键和 AXRaise 回退减少失败；连续失败 3 次提示，6 次后本轮剩余时间停用该应用。真实 TUI 提供应用会话授权。MCP 审批不在重启后恢复；仅本轮提供的工具审批需要还原相同定义。过期队列更新不再让已结束轮次重新运行。开发者验收工具检查 15 项任务；第三次验收无未经批准使用已有窗口，单步均为 8/8，多步为 6/7、7/7。定价不变。",
       "v0.5.13":
