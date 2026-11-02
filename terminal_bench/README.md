@@ -173,6 +173,7 @@ evidence path.
 | Task | Why |
 |------|-----|
 | `terminal-bench/qemu-startup` | The task image's pinned Debian `bullseye-security` packages (`libcurl4`, `libnghttp2-14`) have been superseded, so the verifier's own `apt-get install` 404s and `/tests/test.sh` aborts (`curl: command not found`, `uvx: command not found`) before it can score. See `jobs/regression-20260916/qemu-startup__fLTBLJS/verifier/test-stdout.txt`. |
+| `terminal-bench/qemu-alpine-ssh` | The verifier installs superseded Debian security packages and aborts on mirror 404s before scoring. See issue #154 and the captured diagnostics in `quarantine.json`. |
 
 Exclude quarantined tasks from a run with Harbor's own filter:
 
@@ -180,6 +181,7 @@ Exclude quarantined tasks from a run with Harbor's own filter:
 harbor run -d "terminal-bench/terminal-bench-2" \
   --agent "terminal_bench.orca_agent:OrcaInstalledAgent" \
   --exclude-task-name "terminal-bench/qemu-startup" \
+  --exclude-task-name "terminal-bench/qemu-alpine-ssh" \
   --mounts '[{"type":"bind","source":"'"$(pwd)"'/target/x86_64-unknown-linux-musl/release","target":"/mnt/orca-bin","read_only":true}]'
 ```
 
