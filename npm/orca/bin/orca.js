@@ -82,20 +82,16 @@ const env = {
   ORCA_NODE_PATH: process.env.ORCA_NODE_PATH || process.execPath
 };
 
-const child = spawn(binaryPath, process.argv.slice(2), {
-  stdio: "inherit",
-  env
-});
-
-child.on("error", (error) => {
-  console.error(error);
-  process.exit(1);
-});
-
+// Register before spawn: a fast child can announce readiness while spawn is
+// still returning. SIGINT must never take Node's default exit path in that gap.
+let child;
+const pendingSignals = new Set();
 const dispositions = signalDispositions(process.platform);
 const handledSignals = Object.keys(dispositions);
 const forwardSignal = (signal) => {
-  if (!child.killed) {
+  if (!child) {
+    pendingSignals.add(signal);
+  } else if (!child.killed) {
     child.kill(signal);
   }
 };
@@ -103,6 +99,17 @@ const forwardSignal = (signal) => {
 for (const signal of handledSignals) {
   process.on(signal, dispositions[signal] === "forward" ? () => forwardSignal(signal) : () => {});
 }
+
+child = spawn(binaryPath, process.argv.slice(2), {
+  stdio: "inherit",
+  env
+});
+child.on("error", (error) => {
+  console.error(error);
+  process.exit(1);
+});
+for (const signal of pendingSignals) forwardSignal(signal);
+pendingSignals.clear();
 
 const result = await new Promise((resolve) => {
   child.on("exit", (code, signal) => {

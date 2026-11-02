@@ -160,12 +160,12 @@ async function waitForCount(run, expected, count, timeoutMs, label) {
   }
 }
 
-async function waitForOptional(run, expected, timeoutMs) {
+async function waitForOptional(run, expected, timeoutMs, count = 1) {
   const deadline = Date.now() + timeoutMs;
-  while (terminalOccurrences(run.output(), expected) === 0 && Date.now() < deadline) {
+  while (terminalOccurrences(run.output(), expected) < count && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  return terminalOccurrences(run.output(), expected) > 0;
+  return terminalOccurrences(run.output(), expected) >= count;
 }
 
 function spawnTui(bin, args, env, timeoutMs, cwd) {
@@ -244,13 +244,25 @@ async function runReal(args) {
   const token = `ORCA_TUI_RECOVERY_${Date.now()}_${process.pid}`;
   const env = { ...process.env, ORCA_HOME: home, TERM: "xterm-256color" };
   const activeRuns = new Set();
-  const startTui = (tuiArgs) => {
+  const startTui = async (tuiArgs) => {
     const run = spawnTui(args.bin, tuiArgs, env, args.timeoutMs, cwd);
     activeRuns.add(run);
     void run.closed.then(
       () => activeRuns.delete(run),
       () => activeRuns.delete(run),
     );
+    const readyDeadline = Date.now() + args.timeoutMs;
+    while (true) {
+      const screen = terminalText(run.output()).replace(/\s+/g, " ");
+      if (screen.includes("Continue untrusted")) {
+        run.child.stdin.write("u\r");
+        console.log("TUI welcome acknowledged without trusting the workspace");
+        break;
+      }
+      if (screen.includes("Message Orca")) break;
+      if (Date.now() >= readyDeadline) throw new Error("TUI did not reach welcome or main UI");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     return run;
   };
   try {
@@ -260,18 +272,22 @@ async function runReal(args) {
       "then use bash to run exactly: cat .orca-release-token.",
       "Do not read the file with another tool or repeat its contents before bash succeeds.",
     ].join(" ");
-    const approval = startTui(["--cwd", cwd, "--mode", "suggest", approvalPrompt]);
-    await waitFor(approval, "Filesystem Permission Required", args.timeoutMs, "permission request");
-    approval.child.stdin.write("1");
-    await waitFor(approval, "Approval Required", args.timeoutMs, "tool approval");
-    approval.child.stdin.write("1");
-    if (await waitForOptional(approval, "Unsandboxed Shell Required", 10000)) {
-      approval.child.stdin.write("1");
+    const approval = await startTui(["--cwd", cwd, "--mode", "suggest", approvalPrompt]);
+    await waitFor(approval, "Capability Boundary", args.timeoutMs, "permission request");
+    approval.child.stdin.write("1\r");
+    console.log("TUI filesystem request approved");
+    await waitFor(approval, "Approve · bash", args.timeoutMs, "tool approval");
+    console.log("TUI tool approval observed");
+    const nextBoundary = terminalOccurrences(approval.output(), "Capability Boundary") + 1;
+    approval.child.stdin.write("1\r");
+    if (await waitForOptional(approval, "Capability Boundary", 10000, nextBoundary)) {
+      approval.child.stdin.write("1\r");
     }
     await waitFor(approval, token, args.timeoutMs, "approved turn terminal content");
+    console.log("TUI approved command output verified");
     await exitTui(approval);
 
-    const resumed = startTui([
+    const resumed = await startTui([
       "--cwd",
       cwd,
       "--resume",
@@ -279,9 +295,10 @@ async function runReal(args) {
       "Reply with the exact ORCA_TUI_RECOVERY token from history.",
     ]);
     await waitFor(resumed, token, args.timeoutMs, "restart recovery");
+    console.log("TUI restart recovery verified");
     await exitTui(resumed);
 
-    const cancellation = startTui([
+    const cancellation = await startTui([
       "--cwd",
       cwd,
       "Write 200 numbered lines slowly. Each line must contain ORCA_CANCEL_STREAM and no tools.",

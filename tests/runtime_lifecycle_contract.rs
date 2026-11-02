@@ -1788,6 +1788,20 @@ fn explicit_nonzero_yield_overrides_the_pipe_default() {
 #[test]
 fn caller_timeout_is_the_effective_execution_deadline() {
     let config = danger_full_access_config();
+    // Windows process-broker startup can exceed 300 ms on cold ARM64 runners.
+    // Keep the command longer than the caller deadline without timing startup.
+    let timeout_ms = if cfg!(windows) { 10_000 } else { 300 };
+    let command = match orca_platform::shell::ShellResolver::for_current_host()
+        .resolve_from_environment()
+        .expect("resolve host shell")
+        .kind()
+    {
+        orca_platform::shell::ShellKind::Posix | orca_platform::shell::ShellKind::GitBash => {
+            "sleep 30"
+        }
+        orca_platform::shell::ShellKind::PowerShell(_) => "Start-Sleep -Seconds 30",
+        orca_platform::shell::ShellKind::Cmd => "ping 127.0.0.1 -n 31 > nul",
+    };
     // One context owns the terminal service for both the launch and every
     // later observation of that command.
     let mut context = RuntimeToolActorContext::new("run-tools");
@@ -1798,11 +1812,11 @@ fn caller_timeout_is_the_effective_execution_deadline() {
         id: "tool-timeout".to_string(),
         name: ToolName::Bash,
         action: ActionKind::Shell,
-        target: Some("printf before; sleep 30; printf after".to_string()),
+        target: Some(command.to_string()),
         raw_arguments: Some(
             serde_json::json!({
-                "command": "printf before; sleep 30; printf after",
-                "timeout_ms": 300,
+                "command": command,
+                "timeout_ms": timeout_ms,
                 "yield_time_ms": 0,
             })
             .to_string(),
@@ -1837,7 +1851,7 @@ fn caller_timeout_is_the_effective_execution_deadline() {
         serde_json::from_str(result.output.as_deref().expect("terminal contract payload"))
             .expect("terminal contract is JSON");
     assert_eq!(
-        payload["effective_deadline_ms"], 300,
+        payload["effective_deadline_ms"], timeout_ms,
         "the caller deadline is the effective execution deadline: {payload}"
     );
     assert_eq!(
@@ -1858,7 +1872,7 @@ fn caller_timeout_is_the_effective_execution_deadline() {
         .to_string();
     let settled = loop {
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(15),
+            start.elapsed() < std::time::Duration::from_secs(25),
             "the deadline never stopped the command"
         );
         let record = task_registry.get(&task_id).expect("task record");

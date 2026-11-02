@@ -231,7 +231,7 @@ mod tests {
     };
 
     fn now() -> DateTime<Utc> {
-        "2026-10-20T08:00:00Z".parse().unwrap()
+        "2026-11-02T08:00:00Z".parse().unwrap()
     }
 
     fn cache(fetched_at: &str) -> PricingCache {
@@ -263,7 +263,7 @@ mod tests {
         let mut value = serde_json::json!({
             "version": CACHE_VERSION,
             "source": "https://models.dev/api.json",
-            "fetched_at": "2026-10-20T08:00:00Z",
+            "fetched_at": "2026-11-02T08:00:00Z",
             "models": {"deepseek-flash": {
                 "input_cache_miss": 0.2, "input_cache_hit": 0.004, "output": 0.8,
                 "updated": updated
@@ -307,7 +307,7 @@ mod tests {
     fn version_one_cache_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CACHE_FILE);
-        std::fs::write(&path, r#"{"version":1,"source":"https://models.dev/api.json","fetched_at":"2026-10-20T08:00:00Z","models":{"deepseek-flash":{"input_cache_miss":0.2,"input_cache_hit":0.004,"output":0.8}}}"#).unwrap();
+        std::fs::write(&path, r#"{"version":1,"source":"https://models.dev/api.json","fetched_at":"2026-11-02T08:00:00Z","models":{"deepseek-flash":{"input_cache_miss":0.2,"input_cache_hit":0.004,"output":0.8}}}"#).unwrap();
         assert!(read_cache(&path, now()).is_none());
     }
 
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn a_current_cache_overrides_builtin_prices_and_adds_models() {
-        let book = merge(Some(&cache("2026-10-20T08:00:00Z")));
+        let book = merge(Some(&cache("2026-11-02T08:00:00Z")));
         assert_eq!(book.rates_for(FLASH_MODEL), FETCHED_FLASH);
         assert_eq!(book.rates_for(PRO_MODEL), PRO_RATES);
         assert_eq!(book.rates_for("deepseek-v5-flash"), NEW_MODEL);
@@ -429,7 +429,7 @@ mod tests {
     fn cached_unknown_models_require_plausible_prices_in_every_field() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CACHE_FILE);
-        let mut cached = content_dated_cache("2026-10-20", false);
+        let mut cached = content_dated_cache("2026-11-02", false);
         for rates in [
             Rates {
                 input_cache_miss: 0.0,
@@ -470,7 +470,7 @@ mod tests {
                 "deepseek-v4-pro-exp".into(),
                 CachedRates {
                     rates,
-                    updated: "2026-10-20".parse().unwrap(),
+                    updated: "2026-11-02".parse().unwrap(),
                 },
             )]);
             write_cache(&path, &cached).unwrap();
@@ -485,7 +485,7 @@ mod tests {
     fn the_cache_round_trips_through_its_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join(CACHE_FILE);
-        let written = cache("2026-10-20T08:00:00Z");
+        let written = cache("2026-11-02T08:00:00Z");
         write_cache(&path, &written).unwrap();
         assert_eq!(read_cache(&path, now()), Some(written));
     }
@@ -495,7 +495,7 @@ mod tests {
         let current = now();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CACHE_FILE);
-        let mut future = cache("2026-10-20T08:00:00Z");
+        let mut future = cache("2026-11-02T08:00:00Z");
         future.fetched_at = current + chrono::TimeDelta::days(1) + chrono::TimeDelta::seconds(1);
         write_cache(&path, &future).unwrap();
         assert!(read_cache(&path, now()).is_none());
@@ -510,17 +510,17 @@ mod tests {
         let path = dir.path().join(CACHE_FILE);
         assert_eq!(read_cache(&path, now()), None); // missing
 
-        let mut text = serde_json::to_string(&cache("2026-10-20T08:00:00Z")).unwrap();
+        let mut text = serde_json::to_string(&cache("2026-11-02T08:00:00Z")).unwrap();
         text.truncate(text.len() / 2);
         std::fs::write(&path, text).unwrap();
         assert_eq!(read_cache(&path, now()), None); // truncated by a crash
 
-        let mut foreign = cache("2026-10-20T08:00:00Z");
+        let mut foreign = cache("2026-11-02T08:00:00Z");
         foreign.version = CACHE_VERSION + 1;
         std::fs::write(&path, serde_json::to_vec(&foreign).unwrap()).unwrap();
         assert_eq!(read_cache(&path, now()), None); // written by a newer Orca
 
-        let mut implausible = cache("2026-10-20T08:00:00Z");
+        let mut implausible = cache("2026-11-02T08:00:00Z");
         implausible.models = BTreeMap::from([(
             FLASH_MODEL.to_string(),
             CachedRates {
@@ -534,7 +534,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&implausible).unwrap()).unwrap();
         assert_eq!(read_cache(&path, now()), None); // nothing plausible left
 
-        let mut partly = cache("2026-10-20T08:00:00Z");
+        let mut partly = cache("2026-11-02T08:00:00Z");
         partly.models.insert(
             PRO_MODEL.to_string(),
             CachedRates {

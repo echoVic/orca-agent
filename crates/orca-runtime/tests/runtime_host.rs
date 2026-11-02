@@ -2789,6 +2789,12 @@ fn untracked_hosted_turn_does_not_recount_an_earlier_child_write() {
     config.approval_mode = ApprovalMode::FullAuto;
     let host = RuntimeHost::start().unwrap();
     let thread = host.start_thread(config, "turn scoped writes").unwrap();
+    // This checks receipt scope, not cold Windows filesystem throughput.
+    let wait = if cfg!(windows) {
+        Duration::from_secs(90)
+    } else {
+        BACKGROUND_WORK_TIMEOUT
+    };
     for (prompt, writes) in [
         ("subagent sync edit note.txt :: before => after", true),
         ("read note.txt", false),
@@ -2799,8 +2805,8 @@ fn untracked_hosted_turn_does_not_recount_an_earlier_child_write() {
             .unwrap();
         assert_eq!(
             operation
-                .wait_timeout(BACKGROUND_WORK_TIMEOUT)
-                .unwrap()
+                .wait_timeout(wait)
+                .expect("hosted receipt turn did not settle within its liveness budget")
                 .outcome(),
             &OperationOutcome::Completed(RunStatus::Success)
         );
