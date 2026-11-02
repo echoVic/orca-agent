@@ -261,6 +261,8 @@ async function runReal(args) {
       "Do not read the file with another tool or repeat its contents before bash succeeds.",
     ].join(" ");
     const approval = startTui(["--cwd", cwd, "--mode", "suggest", approvalPrompt]);
+    await waitFor(approval, "Continue untrusted", args.timeoutMs, "fresh workspace welcome");
+    approval.child.stdin.write("u\r");
     await waitFor(approval, "Filesystem Permission Required", args.timeoutMs, "permission request");
     approval.child.stdin.write("1");
     await waitFor(approval, "Approval Required", args.timeoutMs, "tool approval");
