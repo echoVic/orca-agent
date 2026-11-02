@@ -127,6 +127,16 @@ function initialize(run) {
   return run.readUntil((frame) => frame.id === 1, 30000, "ACP initialize");
 }
 
+function assistantText(frames, sessionId) {
+  return frames
+    .filter((frame) => frame.method === "session/update"
+      && frame.params?.sessionId === sessionId
+      && frame.params?.update?.sessionUpdate === "agent_message_chunk"
+      && frame.params?.update?.content?.type === "text")
+    .map((frame) => frame.params.update.content.text)
+    .join("");
+}
+
 async function runReal(args) {
   const home = isolatedHome();
   const cwd = path.join(home, "workspace");
@@ -148,7 +158,7 @@ async function runReal(args) {
     sessionId = created.result?.sessionId;
     if (!sessionId) throw new Error(`ACP session/new missing sessionId: ${JSON.stringify(created)}`);
     first.send({ jsonrpc: "2.0", id: 3, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text: `Reply with exactly ${token}` }] } });
-    const update = await first.readUntil((frame) => frame.method === "session/update" && JSON.stringify(frame).includes(token), args.timeoutMs, "ACP prompt update");
+    const update = await first.readUntil((frame, frames) => frame.method === "session/update" && assistantText(frames, sessionId).includes(token), args.timeoutMs, "ACP prompt update");
     const response = await first.readUntil((frame) => frame.id === 3, args.timeoutMs, "ACP prompt response");
     if (response.result?.stopReason !== "end_turn") throw new Error(`ACP prompt terminal mismatch: ${JSON.stringify(response)}`);
     if (first.frames.indexOf(update) > first.frames.indexOf(response)) throw new Error("ACP prompt response preceded terminal update flush");
@@ -158,8 +168,8 @@ async function runReal(args) {
     await initialize(resumed);
     resumed.send({ jsonrpc: "2.0", id: 4, method: "session/load", params: { sessionId, cwd, mcpServers: [] } });
     const loadResponse = await resumed.readUntil((frame) => frame.id === 4, args.timeoutMs, "ACP session/load");
-    const replay = resumed.frames.find((frame) => frame.method === "session/update" && JSON.stringify(frame).includes(token));
-    if (!replay || resumed.frames.indexOf(replay) > resumed.frames.indexOf(loadResponse)) {
+    const replayFrames = resumed.frames.slice(0, resumed.frames.indexOf(loadResponse));
+    if (!assistantText(replayFrames, sessionId).includes(token)) {
       throw new Error(`ACP load replay was not flushed before response: ${JSON.stringify(resumed.frames)}`);
     }
     resumed.send({ jsonrpc: "2.0", id: 5, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text: "Write 200 numbered lines containing ACP_CANCEL_STREAM." }] } });
