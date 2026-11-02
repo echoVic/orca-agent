@@ -2824,10 +2824,11 @@ mod tests {
         } else {
             "sleep 60"
         };
-        // Long enough that process startup cannot consume it, short enough
-        // that the test stays fast.
+        // Cold Windows broker startup can take seconds. Keep its startup
+        // margin separate from the deadline-enforcement behavior under test.
+        let deadline_ms = if cfg!(windows) { 10_000 } else { 1_500 };
         let deadline = ExecutionDeadline {
-            after: Duration::from_millis(1_500),
+            after: Duration::from_millis(deadline_ms),
             source: "caller timeout_ms",
         };
 
@@ -2843,11 +2844,11 @@ mod tests {
             started.status, "running",
             "unexpected start output: {started:?}"
         );
-        assert_eq!(started.effective_deadline_ms, Some(1_500));
+        assert_eq!(started.effective_deadline_ms, Some(deadline_ms));
         assert_eq!(started.deadline_source, Some("caller timeout_ms"));
 
         // The process must end on its own at the deadline.
-        let give_up_at = Instant::now() + Duration::from_secs(15);
+        let give_up_at = Instant::now() + Duration::from_secs(25);
         let terminal = loop {
             let observed = service
                 .read_output(&started.task_id, 8 * 1024)

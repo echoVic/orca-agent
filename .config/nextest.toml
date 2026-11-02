@@ -120,3 +120,8 @@ fail-fast = false
 test-threads = 1
 retries = 2
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Both contracts include cold process startup and durable child receipt I/O.
+[[profile.ci.overrides]]
+filter = "package(=orca-runtime) & (test(=terminal_service::tests::execution_deadline_terminates_the_process_tree_and_reports_timed_out) | (binary(=runtime_host) & test(=untracked_hosted_turn_does_not_recount_an_earlier_child_write)))"
+threads-required = 2
