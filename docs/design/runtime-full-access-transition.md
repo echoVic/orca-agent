@@ -41,6 +41,13 @@ allowing a running tool or child to gain authority retroactively.
 
 ## Entry Points
 
+New standalone TUI sessions use `FullAuto` / `TrustedHost` as their built-in
+fallback, below explicit CLI, environment, and user configuration choices. This
+default does not populate `startup_approval_mode`, so session recovery keeps its
+saved mode. Session metadata seeds the mode and active profile for older histories
+without typed settings; typed settings replace that seed during replay. An explicit
+`--yolo` or `--mode` remains a launch override applied after recovery. Shared daemon, protocol, and headless defaults stay `AutoEdit`.
+
 The following TUI paths use the same confirmation owner:
 
 - Shift+Tab mode cycling;
@@ -51,6 +58,31 @@ The following TUI paths use the same confirmation owner:
 The confirmation defaults to Cancel. A pending `/config` change keeps its model
 and reasoning choices, but none of those changes are submitted if the user
 cancels Full Access.
+
+While a tool or permission request is awaiting approval, Shift+Tab opens this
+confirmation directly from Suggest, AutoEdit, or Plan. It does nothing if the
+mode is already FullAuto. The hosted action dispatcher applies a confirmed
+`EnableFullAccess` through the typed settings surface while the turn is active,
+rather than queuing the mutation behind that turn. It mirrors committed
+settings into the shared configuration and publishes the result through the
+current attachment. Side conversations and focused children retain their
+existing settings restrictions.
+
+Settings intents carry their dispatcher order and target thread. A successful
+Full Access commit supersedes older queued mode changes for that thread while
+preserving their model and reasoning changes. Later explicit mode choices
+remain valid. Both hosted settings paths serialize runtime commit, shared
+configuration synchronization, and event publication with a dedicated settings
+lock; they do not hold the hosted state or configuration lock during runtime
+calls. Session installation and runtime binding share that ordering boundary.
+Installation retires the old settings target before the new attachment is
+announced, and a settings request rechecks its target after acquiring the lock.
+An old captured handle cannot write settings into a replacement session.
+
+Opening, canceling, or confirming Full Access does not answer an already
+pending interaction. That request retains its admission policy and must still
+be answered once. A rejected active settings change reports an error without
+resetting the waiting turn to Idle.
 
 ACP translates an allowed `full-auto` selection to `EnableFullAccess`. The
 JSONL/server startup adapter does the same for unprofiled `full-auto`, but
@@ -77,6 +109,13 @@ transition.
 
 - TUI confirmation opens from every mode-selection path and defaults to Cancel.
 - Cancel sends no mutation; confirm emits `EnableFullAccess`.
+- Approval waits support direct confirmation from Suggest, AutoEdit, and Plan;
+  default Enter and Esc leave the pending request untouched.
+- A hosted turn can commit Full Access before its pending approval is answered,
+  then resume that same turn after the user answers.
+- Rejected active Full Access leaves the pending approval visible and answerable.
+- Session installation waits for settings publication, and a captured request
+  for a replaced session is rejected before committing or mirroring settings.
 - Unconfirmed Full Access intents and generic widening patches fail closed.
 - An active operation observes `Workspace` before the commit and
   `TrustedHost` / `DangerFullAccess` after it.

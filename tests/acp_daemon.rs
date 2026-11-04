@@ -666,3 +666,52 @@ fn a_copy_of_the_stop_signal_does_not_cut_the_shutdown_short() {
         "{stderr}"
     );
 }
+
+#[test]
+fn named_acp_initializes_and_runs_a_real_session() {
+    let fixture = Fixture::new();
+    let mut child = fixture
+        .command()
+        .args([
+            "acp",
+            "--provider",
+            "mock",
+            "--cd",
+            fixture.cwd.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let frame: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            if tx.send(frame).is_err() {
+                break;
+            }
+        }
+    });
+    let mut client = WireClient {
+        process: Process(child),
+        input: Some(input),
+        output: rx,
+        reader: Some(reader),
+        frames: vec![],
+    };
+    let response = client.request(
+        1,
+        "initialize",
+        json!({"protocolVersion":1,"clientCapabilities":{}}),
+    );
+    assert_eq!(response["result"]["protocolVersion"], 1);
+    let session = client.new_session(&fixture.cwd);
+    client.prompt(3, &session, "hello from named ACP");
+    let terminal = client.until(|frame| frame["id"] == 3);
+    assert!(terminal.get("result").is_some(), "{terminal}");
+    assert!(!client.assistant_text().is_empty(), "{:?}", client.frames);
+    client.input.take();
+    assert!(client.process.wait().success());
+}

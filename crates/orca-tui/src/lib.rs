@@ -280,6 +280,7 @@ pub(crate) mod test_support {
             cwd: std::env::current_dir().ok(),
             output_format: OutputFormat::Text,
             approval_mode: ApprovalMode::Suggest,
+            startup_approval_mode: None,
             execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             provider: ProviderKind::Mock,
             verifier: None,

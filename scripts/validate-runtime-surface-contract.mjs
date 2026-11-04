@@ -1346,6 +1346,12 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     "crates/orca-tui/src/operation_controller.rs:await_queue_interaction:hosted.queue_interactions.insert",
     1,
   ],
+  // Records local ordering metadata after a typed settings commit. The map
+  // does not mutate runtime policy or resolve an interaction.
+  [
+    "crates/orca-tui/src/hosted_settings.rs:commit_hosted_settings:self.confirmed_full_access.insert",
+    1,
+  ],
   [
     "crates/orca-tui/src/queued_input.rs:replace_runtime_projection:self.composers_by_id.insert",
     1,

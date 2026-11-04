@@ -2430,6 +2430,7 @@ fn test_run_config() -> RunConfig {
         cwd: Some(std::env::current_dir().expect("cwd")),
         output_format: OutputFormat::Jsonl,
         approval_mode: ApprovalMode::FullAuto,
+        startup_approval_mode: None,
         execution_profile: orca_core::capability::ExecutionProfile::Workspace,
         provider: ProviderKind::Mock,
         verifier: None,

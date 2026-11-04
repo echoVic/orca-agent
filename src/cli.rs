@@ -26,12 +26,20 @@ pub struct Cli {
     session_picker: bool,
 
     /// Model to use (overrides config file and ORCA_MODEL env).
-    #[arg(long)]
+    #[arg(short = 'm', long)]
     model: Option<String>,
 
-    /// Approval mode to use, 'server' for stdin/stdout JSON-RPC mode, or 'acp' for Agent Client Protocol mode.
+    /// Approval mode (new TUI default: full-auto), 'server' for JSON-RPC, or 'acp' for Agent Client Protocol.
     #[arg(long = "mode", alias = "approval-mode")]
     mode: Option<String>,
+
+    /// Enable Full Access (full-auto), including host shell execution, for this session.
+    #[arg(long, conflicts_with_all = ["mode", "plan"])]
+    yolo: bool,
+
+    /// Use read-only plan mode for this session.
+    #[arg(long, conflicts_with_all = ["mode", "yolo"])]
+    plan: bool,
 
     /// API key to use (overrides config file and ORCA_API_KEY env).
     #[arg(long)]
@@ -42,17 +50,17 @@ pub struct Cli {
     base_url: Option<String>,
 
     /// Workspace directory.
-    #[arg(long)]
+    #[arg(short = 'C', long, visible_alias = "cd")]
     cwd: Option<PathBuf>,
 
     /// Provider implementation (internal, for testing).
-    #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true)]
-    provider: ProviderKind,
+    #[arg(long, value_enum, hide = true)]
+    provider: Option<ProviderKind>,
 
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Prompt to run in the default interactive placeholder.
+    /// Prompt to run in the interactive TUI.
     prompt: Vec<String>,
 }
 
@@ -66,6 +74,10 @@ enum Command {
     Storage(StorageArgs),
     /// Run a task and emit events.
     Exec(ExecArgs),
+    /// Serve the JSON-RPC app protocol over standard input and output.
+    AppServer(ProtocolArgs),
+    /// Serve Agent Client Protocol over standard input and output.
+    Acp(ProtocolArgs),
     /// Run and inspect local workflows.
     Workflow(WorkflowArgs),
     /// Inspect or update folder trust.
@@ -84,12 +96,31 @@ enum Command {
 }
 
 #[derive(Debug, Parser)]
+struct ProtocolArgs {
+    /// Workspace directory.
+    #[arg(short = 'C', long, visible_alias = "cd")]
+    cwd: Option<PathBuf>,
+    /// Model to use (overrides config file and ORCA_MODEL env).
+    #[arg(short = 'm', long)]
+    model: Option<String>,
+    /// API key to use (overrides config file and ORCA_API_KEY env).
+    #[arg(long)]
+    api_key: Option<String>,
+    /// API base URL (overrides config file and ORCA_BASE_URL env).
+    #[arg(long)]
+    base_url: Option<String>,
+    /// Provider implementation (internal, for testing).
+    #[arg(long, value_enum, hide = true)]
+    provider: Option<ProviderKind>,
+}
+
+#[derive(Debug, Parser)]
 struct DaemonArgs {
     /// Local Unix socket; defaults to ORCA_HOME/acp/daemon.sock.
     #[arg(long)]
     socket: Option<PathBuf>,
     /// The only workspace accepted by this daemon.
-    #[arg(long)]
+    #[arg(short = 'C', long, visible_alias = "cd")]
     cwd: Option<PathBuf>,
 }
 
@@ -108,7 +139,7 @@ struct AttachArgs {
     #[arg(long)]
     socket: Option<PathBuf>,
     /// Workspace, which must match the daemon.
-    #[arg(long)]
+    #[arg(short = 'C', long, visible_alias = "cd")]
     cwd: Option<PathBuf>,
     /// Run a non-interactive prompt instead of opening the TUI; permission requests are denied.
     #[arg(long = "exec", value_name = "PROMPT")]
@@ -131,12 +162,16 @@ struct StorageArgs {
 #[derive(Debug, Parser)]
 struct DoctorArgs {
     /// Workspace directory to inspect.
-    #[arg(long)]
+    #[arg(short = 'C', long, visible_alias = "cd")]
     cwd: Option<PathBuf>,
 
     /// Output format: text (human-readable) or json (stable machine-readable report).
     #[arg(long, value_enum, default_value_t = DoctorFormatArg::Text)]
     format: DoctorFormatArg,
+
+    /// Output the stable JSON report (shorthand for --format json).
+    #[arg(long, conflicts_with = "format")]
+    json: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -154,54 +189,8 @@ struct ExecArgs {
     #[command(subcommand)]
     command: Option<ExecCommand>,
 
-    /// Output format: text (human-readable) or jsonl (machine-readable).
-    #[arg(long, value_enum, default_value_t = OutputFormatArg::Text, global = true)]
-    output_format: OutputFormatArg,
-
-    /// Workspace directory.
-    #[arg(long, global = true)]
-    cwd: Option<PathBuf>,
-
-    /// Approval policy for tool actions.
-    #[arg(long = "mode", alias = "approval-mode", value_enum, global = true)]
-    approval_mode: Option<ApprovalMode>,
-
-    /// Model to use (overrides config file and DEEPSEEK_MODEL env).
-    #[arg(long, global = true)]
-    model: Option<String>,
-
-    /// API key to use (overrides config file and ORCA_API_KEY env).
-    #[arg(long, global = true)]
-    api_key: Option<String>,
-
-    /// API base URL (overrides config file and DEEPSEEK_BASE_URL env).
-    #[arg(long, global = true)]
-    base_url: Option<String>,
-
-    /// Optional verifier command to run after completion.
-    #[arg(long, global = true)]
-    verifier: Option<String>,
-
-    /// Maximum number of model turns for this run (unlimited by default).
-    #[arg(long, global = true)]
-    max_turns: Option<u32>,
-
-    /// Maximum number of tool calls for this run (unlimited by default).
-    #[arg(long, global = true)]
-    max_tool_calls: Option<u32>,
-
-    /// Maximum estimated cost in USD for this run (unlimited by default).
-    #[arg(long, global = true)]
-    max_cost_usd: Option<f64>,
-
-    /// Maximum wall-clock time in seconds for this run (unlimited by default).
-    #[arg(long, global = true)]
-    max_wall_time_secs: Option<u64>,
-
-    /// Maximum estimated USD budget for this run (legacy alias of
-    /// --max-cost-usd).
-    #[arg(long, global = true, hide = true)]
-    max_budget: Option<f64>,
+    #[command(flatten)]
+    options: ExecOptions,
 
     /// Resume a saved conversation by ID, prefix, or 'latest'.
     #[arg(long)]
@@ -227,12 +216,78 @@ struct ExecArgs {
     #[arg(long)]
     save_history: bool,
 
-    /// Provider implementation (internal, for testing).
-    #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true, global = true)]
-    provider: ProviderKind,
-
     /// Prompt to execute.
     prompt: Vec<String>,
+}
+
+// Keep values from exec and exec resume separate until they can be checked.
+// Clap global arguments overwrite their parent values during propagation.
+#[derive(Debug, Default, Parser)]
+struct ExecOptions {
+    /// Output format: text (default, human-readable) or jsonl (machine-readable).
+    #[arg(long, value_enum)]
+    output_format: Option<OutputFormatArg>,
+
+    /// Output one JSON object per event (shorthand for --output-format jsonl).
+    #[arg(long, conflicts_with = "output_format")]
+    json: bool,
+
+    /// Workspace directory.
+    #[arg(id = "exec_cwd", short = 'C', long = "cwd", visible_alias = "cd")]
+    cwd: Option<PathBuf>,
+
+    /// Approval policy for tool actions.
+    #[arg(long = "mode", alias = "approval-mode", value_enum)]
+    approval_mode: Option<ApprovalMode>,
+
+    /// Enable Full Access (full-auto), including host shell execution, for this run.
+    #[arg(id = "exec_yolo", long = "yolo", conflicts_with_all = ["approval_mode", "exec_plan"])]
+    yolo: bool,
+
+    /// Use read-only plan mode for this run.
+    #[arg(id = "exec_plan", long = "plan", conflicts_with_all = ["approval_mode", "exec_yolo"])]
+    plan: bool,
+
+    /// Model to use (overrides config file and ORCA_MODEL env).
+    #[arg(id = "exec_model", short = 'm', long = "model")]
+    model: Option<String>,
+
+    /// API key to use (overrides config file and ORCA_API_KEY env).
+    #[arg(id = "exec_api_key", long = "api-key")]
+    api_key: Option<String>,
+
+    /// API base URL (overrides config file and ORCA_BASE_URL env).
+    #[arg(id = "exec_base_url", long = "base-url")]
+    base_url: Option<String>,
+
+    /// Optional verifier command to run after completion.
+    #[arg(long)]
+    verifier: Option<String>,
+
+    /// Maximum number of model turns for this run (unlimited by default).
+    #[arg(long)]
+    max_turns: Option<u32>,
+
+    /// Maximum number of tool calls for this run (unlimited by default).
+    #[arg(long)]
+    max_tool_calls: Option<u32>,
+
+    /// Maximum estimated cost in USD for this run (unlimited by default).
+    #[arg(long)]
+    max_cost_usd: Option<f64>,
+
+    /// Maximum wall-clock time in seconds for this run (unlimited by default).
+    #[arg(long)]
+    max_wall_time_secs: Option<u64>,
+
+    /// Maximum estimated USD budget for this run (legacy alias of
+    /// --max-cost-usd).
+    #[arg(long, hide = true)]
+    max_budget: Option<f64>,
+
+    /// Provider implementation (internal, for testing).
+    #[arg(id = "exec_provider", long = "provider", value_enum, hide = true)]
+    provider: Option<ProviderKind>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -243,6 +298,9 @@ enum ExecCommand {
 
 #[derive(Debug, Parser)]
 struct ExecResumeArgs {
+    #[command(flatten)]
+    options: ExecOptions,
+
     /// Session id, prefix, or 'latest' to resume. Omit with --last to pick the most recent.
     #[arg(value_name = "SESSION_ID", required_unless_present = "last")]
     session_id: Option<String>,
@@ -272,7 +330,7 @@ struct TrustArgs {
     action: TrustAction,
 
     /// Folder to inspect or update.
-    #[arg(long)]
+    #[arg(short = 'C', long, visible_alias = "cd")]
     cwd: Option<PathBuf>,
 }
 
@@ -471,7 +529,7 @@ struct WorkflowListArgs {
 #[derive(Debug, Parser)]
 struct WorkflowRunArgs {
     /// Workspace directory.
-    #[arg(long)]
+    #[arg(short = 'C', long, visible_alias = "cd")]
     cwd: Option<PathBuf>,
 
     /// Provider implementation (internal, for testing).
@@ -479,7 +537,7 @@ struct WorkflowRunArgs {
     provider: ProviderKind,
 
     /// Model to use (overrides config file and ORCA_MODEL env).
-    #[arg(long)]
+    #[arg(short = 'm', long)]
     model: Option<String>,
 
     /// API key to use (overrides config file and ORCA_API_KEY env).
@@ -517,7 +575,7 @@ struct WorkflowWorkerArgs {
     provider: ProviderKind,
 
     /// Model to use (overrides config file and ORCA_MODEL env).
-    #[arg(long)]
+    #[arg(short = 'm', long)]
     model: Option<String>,
 
     /// API key to use (overrides config file and ORCA_API_KEY env).
@@ -626,7 +684,7 @@ struct SubagentWorkerArgs {
     provider: ProviderKind,
 
     /// Model to use (overrides config file and ORCA_MODEL env).
-    #[arg(long)]
+    #[arg(short = 'm', long)]
     model: Option<String>,
 
     /// API key to use (overrides config file and ORCA_API_KEY env).
@@ -697,8 +755,82 @@ impl From<OutputFormatArg> for OutputFormat {
     }
 }
 
+impl ExecOptions {
+    fn merge(&mut self, child: Self) -> Result<(), String> {
+        self.output_format = merge_option(
+            "--output-format",
+            self.output_format.take(),
+            child.output_format,
+        )?;
+        self.cwd = merge_option("--cwd", self.cwd.take(), child.cwd)?;
+        self.approval_mode =
+            merge_option("--mode", self.approval_mode.take(), child.approval_mode)?;
+        self.model = merge_option("--model", self.model.take(), child.model)?;
+        self.api_key = merge_option("--api-key", self.api_key.take(), child.api_key)?;
+        self.base_url = merge_option("--base-url", self.base_url.take(), child.base_url)?;
+        self.verifier = merge_option("--verifier", self.verifier.take(), child.verifier)?;
+        self.max_turns = merge_option("--max-turns", self.max_turns.take(), child.max_turns)?;
+        self.max_tool_calls = merge_option(
+            "--max-tool-calls",
+            self.max_tool_calls.take(),
+            child.max_tool_calls,
+        )?;
+        self.max_cost_usd = merge_option(
+            "--max-cost-usd",
+            self.max_cost_usd.take(),
+            child.max_cost_usd,
+        )?;
+        self.max_wall_time_secs = merge_option(
+            "--max-wall-time-secs",
+            self.max_wall_time_secs.take(),
+            child.max_wall_time_secs,
+        )?;
+        self.max_budget = merge_option("--max-budget", self.max_budget.take(), child.max_budget)?;
+        self.provider = merge_option("--provider", self.provider.take(), child.provider)?;
+        self.json |= child.json;
+        self.yolo |= child.yolo;
+        self.plan |= child.plan;
+        self.validate()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if (self.yolo && (self.plan || self.approval_mode.is_some()))
+            || (self.plan && self.approval_mode.is_some())
+        {
+            return Err("--yolo, --plan, and --mode/--approval-mode cannot be combined".into());
+        }
+        if self.json && self.output_format.is_some() {
+            return Err("--json and --output-format cannot be combined".into());
+        }
+        Ok(())
+    }
+}
+
 impl ExecArgs {
-    fn into_request(self) -> Result<orca_runtime::command::exec::ExecCommandRequest, String> {
+    fn merge_resume_options(&mut self) -> Result<(), String> {
+        if let Some(ExecCommand::Resume(args)) = &mut self.command {
+            self.options.merge(std::mem::take(&mut args.options))?;
+        }
+        self.options.validate()
+    }
+
+    fn into_request(mut self) -> Result<orca_runtime::command::exec::ExecCommandRequest, String> {
+        self.merge_resume_options()?;
+        let approval_mode = if self.options.yolo {
+            Some(ApprovalMode::FullAuto)
+        } else if self.options.plan {
+            Some(ApprovalMode::Plan)
+        } else {
+            self.options.approval_mode
+        };
+        let output_format = if self.options.json {
+            OutputFormat::Jsonl
+        } else {
+            self.options
+                .output_format
+                .unwrap_or(OutputFormatArg::Text)
+                .into()
+        };
         let (resume, continue_latest, resume_at, prompt) = match self.command {
             Some(ExecCommand::Resume(resume_args)) => {
                 if self.resume.is_some() || self.fork.is_some() || self.continue_latest {
@@ -712,36 +844,37 @@ impl ExecArgs {
                         "the 'resume' subcommand cannot be combined with --no-history".to_string(),
                     );
                 }
-                // When --last is used without an explicit prompt, clap cannot
-                // express the conditional positional meaning, so the first
-                // positional is reinterpreted as the prompt (Codex-style).
-                let (selector, prompt) = if resume_args.last && resume_args.prompt.is_empty() {
-                    (None, resume_args.session_id.into_iter().collect())
+                // With --last every positional belongs to the prompt, including
+                // the first word Clap assigned to the optional session selector.
+                let (selector, prompt) = if resume_args.last {
+                    let mut prompt = resume_args.session_id.into_iter().collect::<Vec<_>>();
+                    prompt.extend(resume_args.prompt);
+                    (Some("latest".to_string()), prompt)
                 } else {
                     (resume_args.session_id, resume_args.prompt)
                 };
-                let selector = selector.or_else(|| resume_args.last.then(|| "latest".to_string()));
+                let resume_at = merge_option("--resume-at", self.resume_at, resume_args.resume_at)?;
                 return Ok(orca_runtime::command::exec::ExecCommandRequest {
                     app_version: env!("CARGO_PKG_VERSION").to_string(),
-                    output_format: self.output_format.into(),
-                    cwd: self.cwd,
-                    approval_mode: self.approval_mode,
-                    model: self.model,
-                    api_key: self.api_key,
-                    base_url: self.base_url,
-                    verifier: self.verifier,
-                    max_budget: self.max_budget,
-                    max_turns: self.max_turns,
-                    max_tool_calls: self.max_tool_calls,
-                    max_cost_usd: self.max_cost_usd,
-                    max_wall_time_secs: self.max_wall_time_secs,
+                    output_format,
+                    cwd: self.options.cwd,
+                    approval_mode,
+                    model: self.options.model,
+                    api_key: self.options.api_key,
+                    base_url: self.options.base_url,
+                    verifier: self.options.verifier,
+                    max_budget: self.options.max_budget,
+                    max_turns: self.options.max_turns,
+                    max_tool_calls: self.options.max_tool_calls,
+                    max_cost_usd: self.options.max_cost_usd,
+                    max_wall_time_secs: self.options.max_wall_time_secs,
                     resume: selector,
-                    resume_at: resume_args.resume_at,
+                    resume_at,
                     fork: None,
                     continue_latest: false,
                     no_history: false,
                     save_history: false,
-                    provider: self.provider,
+                    provider: self.options.provider.unwrap_or(ProviderKind::DeepSeek),
                     prompt,
                 });
             }
@@ -754,27 +887,153 @@ impl ExecArgs {
         };
         Ok(orca_runtime::command::exec::ExecCommandRequest {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            output_format: self.output_format.into(),
-            cwd: self.cwd,
-            approval_mode: self.approval_mode,
-            model: self.model,
-            api_key: self.api_key,
-            base_url: self.base_url,
-            verifier: self.verifier,
-            max_budget: self.max_budget,
-            max_turns: self.max_turns,
-            max_tool_calls: self.max_tool_calls,
-            max_cost_usd: self.max_cost_usd,
-            max_wall_time_secs: self.max_wall_time_secs,
+            output_format,
+            cwd: self.options.cwd,
+            approval_mode,
+            model: self.options.model,
+            api_key: self.options.api_key,
+            base_url: self.options.base_url,
+            verifier: self.options.verifier,
+            max_budget: self.options.max_budget,
+            max_turns: self.options.max_turns,
+            max_tool_calls: self.options.max_tool_calls,
+            max_cost_usd: self.options.max_cost_usd,
+            max_wall_time_secs: self.options.max_wall_time_secs,
             resume,
             resume_at,
             fork: self.fork,
             continue_latest,
             no_history: self.no_history,
             save_history: self.save_history,
-            provider: self.provider,
+            provider: self.options.provider.unwrap_or(ProviderKind::DeepSeek),
             prompt,
         })
+    }
+}
+
+fn merge_option<T: PartialEq>(
+    name: &str,
+    root: Option<T>,
+    command: Option<T>,
+) -> Result<Option<T>, String> {
+    match (root, command) {
+        (Some(root), Some(command)) if root != command => Err(format!(
+            "conflicting {name} values before and after the subcommand"
+        )),
+        (root, command) => Ok(command.or(root)),
+    }
+}
+
+impl Cli {
+    fn normalize_options(&mut self) -> Result<(), String> {
+        if let Some(Command::Exec(args)) = &mut self.command {
+            args.merge_resume_options()?;
+        }
+        let exec_yolo = matches!(&self.command, Some(Command::Exec(args)) if args.options.yolo);
+        let exec_plan = matches!(&self.command, Some(Command::Exec(args)) if args.options.plan);
+        if (self.yolo || exec_yolo) && (self.mode.is_some() || self.plan || exec_plan) {
+            return Err("--yolo cannot be combined with --mode, --approval-mode, or --plan".into());
+        }
+        if (self.plan || exec_plan) && self.mode.is_some() {
+            return Err("--plan cannot be combined with --mode or --approval-mode".into());
+        }
+        let history_selected = self.resume.is_some()
+            || self.fork.is_some()
+            || self.continue_latest
+            || self.session_picker;
+        let legacy_protocol = matches!(self.mode.as_deref(), Some("server" | "acp"));
+        let named_protocol = matches!(self.command, Some(Command::AppServer(_) | Command::Acp(_)));
+        if legacy_protocol
+            && (self.command.is_some() || !self.prompt.is_empty() || history_selected)
+        {
+            return Err("--mode server/acp cannot be combined with a subcommand, prompt, --resume, --fork, or --continue".into());
+        }
+        if named_protocol && (history_selected || self.mode.is_some() || self.yolo || self.plan) {
+            return Err("protocol subcommands cannot be combined with --resume, --fork, --continue, --mode, --yolo, or --plan".into());
+        }
+        if self.command.is_some() && history_selected {
+            return Err("TUI --resume/--fork/--continue options cannot be combined with a subcommand; use 'exec resume' for headless recovery".into());
+        }
+        match &mut self.command {
+            Some(Command::Exec(args)) => {
+                args.options.approval_mode = merge_option(
+                    "--mode",
+                    self.mode
+                        .as_deref()
+                        .map(orca_core::config::file::parse_approval_mode_value)
+                        .transpose()?,
+                    args.options.approval_mode,
+                )?;
+                if (self.yolo || self.plan) && args.options.approval_mode.is_some() {
+                    return Err(
+                        "--yolo/--plan cannot be combined with --mode or --approval-mode".into(),
+                    );
+                }
+                args.options.yolo |= self.yolo;
+                args.options.plan |= self.plan;
+                args.options.cwd = merge_option("--cwd", self.cwd.take(), args.options.cwd.take())?;
+                args.options.model =
+                    merge_option("--model", self.model.take(), args.options.model.take())?;
+                args.options.api_key = merge_option(
+                    "--api-key",
+                    self.api_key.take(),
+                    args.options.api_key.take(),
+                )?;
+                args.options.base_url = merge_option(
+                    "--base-url",
+                    self.base_url.take(),
+                    args.options.base_url.take(),
+                )?;
+                args.options.provider = merge_option(
+                    "--provider",
+                    self.provider.take(),
+                    args.options.provider.take(),
+                )?;
+            }
+            Some(Command::AppServer(args) | Command::Acp(args)) => {
+                self.cwd = merge_option("--cwd", self.cwd.take(), args.cwd.take())?;
+                self.model = merge_option("--model", self.model.take(), args.model.take())?;
+                self.api_key = merge_option("--api-key", self.api_key.take(), args.api_key.take())?;
+                self.base_url =
+                    merge_option("--base-url", self.base_url.take(), args.base_url.take())?;
+                self.provider =
+                    merge_option("--provider", self.provider.take(), args.provider.take())?;
+            }
+            Some(Command::Daemon(args)) => {
+                args.cwd = merge_option("--cwd", self.cwd.take(), args.cwd.take())?;
+                if self.yolo {
+                    self.mode = Some("full-auto".into());
+                }
+                if self.plan {
+                    self.mode = Some("plan".into());
+                }
+            }
+            None => {
+                if self.yolo {
+                    self.mode = Some("full-auto".into());
+                }
+                if self.plan {
+                    self.mode = Some("plan".into());
+                }
+            }
+            _ if self.yolo || self.plan || self.mode.is_some() => {
+                return Err("--mode, --yolo, and --plan are supported for interactive sessions, exec, and daemon startup".into());
+            }
+            _ => {}
+        }
+        if let Some(Command::Attach(args)) = &mut self.command {
+            args.cwd = merge_option("--cwd", self.cwd.take(), args.cwd.take())?;
+        }
+        if let Some(Command::Trust(args)) = &mut self.command {
+            args.cwd = merge_option("--cwd", self.cwd.take(), args.cwd.take())?;
+        }
+        if let Some(Command::Doctor(args)) = &mut self.command {
+            if args.json {
+                args.format = DoctorFormatArg::Json;
+            }
+            args.cwd = merge_option("--cwd", self.cwd.take(), args.cwd.take())?;
+        }
+        Ok(())
     }
 }
 
@@ -819,7 +1078,11 @@ impl From<SubagentWorkerArgs> for orca_runtime::command::launch::SubagentWorkerL
 }
 
 pub fn run() -> i32 {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if let Err(message) = cli.normalize_options() {
+        eprintln!("orca: {message}");
+        return 2;
+    }
 
     let retired_history_command = matches!(
         cli.prompt.as_slice(),
@@ -850,13 +1113,22 @@ pub fn run() -> i32 {
         ));
     }
 
+    if let Some(mode) = match &cli.command {
+        Some(Command::AppServer(_)) => Some(orca_runtime::command::launch::ProtocolMode::Server),
+        Some(Command::Acp(_)) => Some(orca_runtime::command::launch::ProtocolMode::Acp),
+        _ => None,
+    } {
+        return orca_runtime::command::launch::run_protocol(protocol_request(cli, mode));
+    }
+
     match cli.command {
+        Some(Command::AppServer(_) | Command::Acp(_)) => unreachable!("protocol dispatched above"),
         Some(Command::AcpBridge(args)) => local_result(
             resolve_socket(args.socket)
                 .and_then(|socket| orca_runtime::acp::daemon::bridge(&socket)),
         ),
         Some(Command::Daemon(args)) => {
-            let config = orca_runtime::command::launch::prepare_interactive(
+            let config = orca_runtime::command::launch::prepare_daemon(
                 orca_runtime::command::launch::InteractiveLaunchRequest {
                     app_version: env!("CARGO_PKG_VERSION").into(),
                     resume: None,
@@ -868,7 +1140,7 @@ pub fn run() -> i32 {
                     mode: cli.mode,
                     api_key: cli.api_key,
                     base_url: cli.base_url,
-                    provider: cli.provider,
+                    provider: cli.provider.unwrap_or(ProviderKind::DeepSeek),
                     prompt: Vec::new(),
                 },
             );
@@ -910,7 +1182,7 @@ pub fn run() -> i32 {
                     mode: None,
                     api_key: None,
                     base_url: None,
-                    provider: cli.provider,
+                    provider: cli.provider.unwrap_or(ProviderKind::DeepSeek),
                     prompt: Vec::new(),
                 },
             );
@@ -994,7 +1266,7 @@ pub fn run() -> i32 {
                 mode: cli.mode,
                 api_key: cli.api_key,
                 base_url: cli.base_url,
-                provider: cli.provider,
+                provider: cli.provider.unwrap_or(ProviderKind::DeepSeek),
                 prompt: cli.prompt,
             };
             match orca_runtime::command::launch::prepare_interactive(request) {
@@ -1031,10 +1303,11 @@ fn protocol_request(
     orca_runtime::command::launch::ProtocolLaunchRequest {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         mode,
-        has_command: cli.command.is_some(),
+        has_command: cli.command.is_some()
+            && !matches!(cli.command, Some(Command::AppServer(_) | Command::Acp(_))),
         prompt: cli.prompt,
         cwd: cli.cwd,
-        provider: cli.provider,
+        provider: cli.provider.unwrap_or(ProviderKind::DeepSeek),
         model: cli.model,
         api_key: cli.api_key,
         base_url: cli.base_url,
@@ -1087,6 +1360,475 @@ mod tests {
                 other => panic!("expected exec command, got {other:?}"),
             },
             Err(error) => panic!("parse failed: {error}"),
+        }
+    }
+
+    #[test]
+    fn yolo_selects_full_auto_for_exec_and_resume() {
+        for args in [
+            vec!["--yolo", "fix the test"],
+            vec!["resume", "--last", "--yolo", "continue"],
+            vec!["--yolo", "--resume", "session-id", "continue"],
+        ] {
+            let request = parse_exec(&args).into_request().expect("exec request");
+            assert_eq!(request.approval_mode, Some(ApprovalMode::FullAuto));
+        }
+    }
+
+    #[test]
+    fn yolo_selects_full_auto_for_interactive_launch_and_resume() {
+        for args in [
+            vec!["orca", "--yolo"],
+            vec!["orca", "--yolo", "--continue"],
+            vec!["orca", "--resume", "session-id", "--yolo"],
+        ] {
+            let mut cli = Cli::try_parse_from(args).expect("interactive Full Access flag");
+            cli.normalize_options().expect("normalize Full Access flag");
+            assert_eq!(cli.mode.as_deref(), Some("full-auto"));
+        }
+    }
+
+    #[test]
+    fn yolo_before_exec_is_forwarded_and_rejects_cross_level_mode_conflicts() {
+        let mut cli = Cli::try_parse_from(["orca", "--yolo", "exec", "fix the test"])
+            .expect("root yolo with exec");
+        cli.normalize_options().expect("forward Full Access flag");
+        let Some(Command::Exec(args)) = cli.command else {
+            panic!("exec command");
+        };
+        assert_eq!(
+            args.into_request().unwrap().approval_mode,
+            Some(ApprovalMode::FullAuto)
+        );
+        for args in [
+            vec!["orca", "--yolo", "exec", "--mode", "suggest", "fix"],
+            vec!["orca", "--mode", "suggest", "exec", "--yolo", "fix"],
+            vec!["orca", "--mode", "server", "exec", "--yolo", "fix"],
+        ] {
+            let mut cli = Cli::try_parse_from(args).expect("separate flag scopes");
+            assert!(
+                cli.normalize_options()
+                    .unwrap_err()
+                    .contains("cannot be combined")
+            );
+        }
+    }
+
+    #[test]
+    fn yolo_is_not_silently_ignored_on_other_commands() {
+        for args in [
+            vec!["orca", "--yolo", "doctor"],
+            vec!["orca", "--yolo", "attach", "new"],
+            vec!["orca", "--yolo", "workflow", "list"],
+            vec!["orca", "--yolo", "storage"],
+        ] {
+            let mut cli = Cli::try_parse_from(args).expect("root flag");
+            assert!(cli.normalize_options().is_err());
+        }
+        let mut cli = Cli::try_parse_from(["orca", "--yolo", "daemon"]).unwrap();
+        cli.normalize_options().unwrap();
+        assert_eq!(cli.mode.as_deref(), Some("full-auto"));
+    }
+
+    #[test]
+    fn yolo_rejects_a_second_explicit_mode() {
+        for args in [
+            vec!["orca", "--yolo", "--mode", "suggest"],
+            vec!["orca", "exec", "--yolo", "--mode", "plan", "inspect"],
+            vec!["orca", "--yolo", "--mode", "acp"],
+        ] {
+            let error = Cli::try_parse_from(args).expect_err("conflicting mode");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn cli_habits_root_exec_options_are_forwarded() {
+        for argv in [
+            vec![
+                "orca",
+                "--mode",
+                "plan",
+                "--model",
+                "custom-model",
+                "--cwd",
+                "/workspace",
+                "--api-key",
+                "cli-test-key",
+                "--base-url",
+                "http://localhost:9000",
+                "--provider",
+                "mock",
+                "exec",
+                "inspect",
+            ],
+            vec![
+                "orca",
+                "exec",
+                "--mode",
+                "plan",
+                "--model",
+                "custom-model",
+                "--cwd",
+                "/workspace",
+                "--api-key",
+                "cli-test-key",
+                "--base-url",
+                "http://localhost:9000",
+                "--provider",
+                "mock",
+                "inspect",
+            ],
+            vec![
+                "orca",
+                "--mode",
+                "plan",
+                "--model",
+                "custom-model",
+                "exec",
+                "resume",
+                "latest",
+                "--cwd",
+                "/workspace",
+                "--api-key",
+                "cli-test-key",
+                "--base-url",
+                "http://localhost:9000",
+                "--provider",
+                "mock",
+                "inspect",
+            ],
+        ] {
+            let mut cli = Cli::try_parse_from(argv).unwrap();
+            cli.normalize_options().unwrap();
+            let Some(Command::Exec(args)) = cli.command else {
+                panic!("exec");
+            };
+            let request = args.into_request().unwrap();
+            assert_eq!(request.approval_mode, Some(ApprovalMode::Plan));
+            assert_eq!(request.model.as_deref(), Some("custom-model"));
+            assert_eq!(request.cwd, Some(PathBuf::from("/workspace")));
+            assert_eq!(request.api_key.as_deref(), Some("cli-test-key"));
+            assert_eq!(request.base_url.as_deref(), Some("http://localhost:9000"));
+            assert_eq!(request.provider, ProviderKind::Mock);
+        }
+    }
+
+    #[test]
+    fn cli_habits_conflicting_root_exec_values_are_rejected() {
+        for argv in [
+            vec![
+                "orca", "--mode", "suggest", "exec", "--mode", "plan", "inspect",
+            ],
+            vec![
+                "orca", "--model", "one", "exec", "--model", "two", "inspect",
+            ],
+            vec!["orca", "--cwd", "/one", "exec", "--cwd", "/two", "inspect"],
+            vec![
+                "orca",
+                "--api-key",
+                "first-test-key",
+                "exec",
+                "--api-key",
+                "second-test-key",
+                "inspect",
+            ],
+            vec![
+                "orca",
+                "--base-url",
+                "http://localhost:9000",
+                "exec",
+                "--base-url",
+                "http://localhost:9001",
+                "inspect",
+            ],
+            vec![
+                "orca",
+                "--provider",
+                "deepseek",
+                "exec",
+                "--provider",
+                "mock",
+                "inspect",
+            ],
+        ] {
+            let mut cli = Cli::try_parse_from(argv).unwrap();
+            let error = cli.normalize_options().expect_err("conflicting root value");
+            assert!(error.contains("conflict"), "{error}");
+            assert!(!error.contains("first-test-key"));
+            assert!(!error.contains("second-test-key"));
+        }
+    }
+
+    #[test]
+    fn cli_habits_equal_root_exec_values_are_accepted() {
+        let mut cli = Cli::try_parse_from([
+            "orca", "--mode", "plan", "--model", "same", "exec", "--mode", "plan", "--model",
+            "same", "inspect",
+        ])
+        .unwrap();
+        cli.normalize_options().unwrap();
+        let Some(Command::Exec(args)) = cli.command else {
+            panic!("exec");
+        };
+        let request = args.into_request().unwrap();
+        assert_eq!(request.approval_mode, Some(ApprovalMode::Plan));
+        assert_eq!(request.model.as_deref(), Some("same"));
+    }
+
+    #[test]
+    fn cli_habits_exec_last_preserves_every_prompt_word() {
+        let request = parse_exec(&["resume", "--last", "fix", "failing", "test"])
+            .into_request()
+            .unwrap();
+        assert_eq!(request.resume.as_deref(), Some("latest"));
+        assert_eq!(request.prompt, ["fix", "failing", "test"]);
+        let request = parse_exec(&["resume", "--last"]).into_request().unwrap();
+        assert!(request.prompt.is_empty());
+    }
+
+    #[test]
+    fn cli_habits_exec_resume_boundary_works_before_the_subcommand() {
+        let request = parse_exec(&["--resume-at", "message", "resume", "session", "continue"])
+            .into_request()
+            .unwrap();
+        assert_eq!(request.resume.as_deref(), Some("session"));
+        assert_eq!(request.resume_at.as_deref(), Some("message"));
+    }
+
+    #[test]
+    fn cli_habits_exec_resume_conflicting_boundaries_are_rejected() {
+        let args = parse_exec(&[
+            "--resume-at",
+            "one",
+            "resume",
+            "session",
+            "--resume-at",
+            "two",
+            "continue",
+        ]);
+        assert!(args.into_request().unwrap_err().contains("conflict"));
+    }
+
+    #[test]
+    fn cli_habits_protocol_modes_reject_history_selectors() {
+        for protocol in ["server", "acp"] {
+            for selector in [
+                vec!["--resume", "session"],
+                vec!["--fork", "session"],
+                vec!["--continue"],
+                vec!["--resume"],
+            ] {
+                let mut argv = vec!["orca", "--mode", protocol];
+                argv.extend(selector);
+                let mut cli = Cli::try_parse_from(argv).unwrap();
+                assert!(
+                    cli.normalize_options()
+                        .unwrap_err()
+                        .contains("cannot be combined")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_habits_unused_root_modes_are_rejected() {
+        for argv in [
+            vec!["orca", "--mode", "plan", "doctor"],
+            vec!["orca", "--mode", "suggest", "mcp", "list"],
+            vec!["orca", "--continue", "daemon"],
+        ] {
+            let mut cli = Cli::try_parse_from(argv).unwrap();
+            assert!(cli.normalize_options().is_err());
+        }
+    }
+
+    #[test]
+    fn cli_habits_plan_shortcut_works_before_and_after_exec() {
+        for argv in [
+            vec!["orca", "--plan", "exec", "inspect"],
+            vec!["orca", "exec", "--plan", "inspect"],
+            vec!["orca", "exec", "resume", "--last", "--plan", "inspect"],
+        ] {
+            let mut cli = Cli::try_parse_from(argv).unwrap();
+            cli.normalize_options().unwrap();
+            let Some(Command::Exec(args)) = cli.command else {
+                panic!("exec");
+            };
+            assert_eq!(
+                args.into_request().unwrap().approval_mode,
+                Some(ApprovalMode::Plan)
+            );
+        }
+        let mut cli = Cli::try_parse_from(["orca", "--plan"]).unwrap();
+        cli.normalize_options().unwrap();
+        assert_eq!(cli.mode.as_deref(), Some("plan"));
+    }
+
+    #[test]
+    fn cli_habits_named_protocol_commands_use_protocol_requests() {
+        for (name, mode) in [
+            (
+                "app-server",
+                orca_runtime::command::launch::ProtocolMode::Server,
+            ),
+            ("acp", orca_runtime::command::launch::ProtocolMode::Acp),
+        ] {
+            let mut cli = Cli::try_parse_from([
+                "orca",
+                name,
+                "--model",
+                "custom-model",
+                "--cwd",
+                "/workspace",
+                "--provider",
+                "mock",
+            ])
+            .unwrap();
+            assert!(cli.command.is_some(), "named protocol must be a subcommand");
+            cli.normalize_options().unwrap();
+            let request = protocol_request(cli, mode);
+            assert!(!request.has_command);
+            assert!(request.prompt.is_empty());
+            assert_eq!(request.model.as_deref(), Some("custom-model"));
+            assert_eq!(request.cwd, Some(PathBuf::from("/workspace")));
+            assert_eq!(request.provider, ProviderKind::Mock);
+        }
+    }
+
+    #[test]
+    fn cli_habits_json_shorthand_selects_the_documented_format() {
+        for argv in [
+            vec!["--json", "hello"],
+            vec!["resume", "--last", "--json", "hello"],
+        ] {
+            let request = parse_exec(&argv).into_request().unwrap();
+            assert_eq!(request.output_format, OutputFormat::Jsonl);
+        }
+        let mut cli = Cli::try_parse_from(["orca", "doctor", "--json"]).unwrap();
+        cli.normalize_options().unwrap();
+        let Some(Command::Doctor(args)) = cli.command else {
+            panic!("doctor");
+        };
+        assert_eq!(args.format, DoctorFormatArg::Json);
+    }
+
+    #[test]
+    fn cli_habits_familiar_model_and_directory_aliases_are_accepted() {
+        for argv in [
+            vec!["orca", "-m", "model", "-C", "/workspace"],
+            vec!["orca", "--cd", "/workspace", "exec", "-m", "model", "hello"],
+            vec![
+                "orca",
+                "exec",
+                "resume",
+                "--last",
+                "-m",
+                "model",
+                "--cd",
+                "/workspace",
+                "hello",
+            ],
+        ] {
+            let mut cli = Cli::try_parse_from(argv).unwrap();
+            cli.normalize_options().unwrap();
+            if let Some(Command::Exec(args)) = cli.command {
+                let request = args.into_request().unwrap();
+                assert_eq!(request.model.as_deref(), Some("model"));
+                assert_eq!(request.cwd, Some(PathBuf::from("/workspace")));
+            } else {
+                assert_eq!(cli.model.as_deref(), Some("model"));
+                assert_eq!(cli.cwd, Some(PathBuf::from("/workspace")));
+            }
+        }
+    }
+
+    #[test]
+    fn cli_habits_equal_options_across_all_exec_scopes_are_accepted() {
+        let mut cli = Cli::try_parse_from([
+            "orca",
+            "--mode",
+            "plan",
+            "-m",
+            "same",
+            "exec",
+            "--mode",
+            "plan",
+            "-m",
+            "same",
+            "--output-format",
+            "jsonl",
+            "--resume-at",
+            "message",
+            "resume",
+            "--last",
+            "--mode",
+            "plan",
+            "-m",
+            "same",
+            "--output-format",
+            "jsonl",
+            "--resume-at",
+            "message",
+            "inspect",
+        ])
+        .unwrap();
+        cli.normalize_options().unwrap();
+        let Some(Command::Exec(args)) = cli.command else {
+            panic!("exec");
+        };
+        let request = args.into_request().unwrap();
+        assert_eq!(request.approval_mode, Some(ApprovalMode::Plan));
+        assert_eq!(request.model.as_deref(), Some("same"));
+        assert_eq!(request.output_format, OutputFormat::Jsonl);
+        assert_eq!(request.resume_at.as_deref(), Some("message"));
+    }
+
+    #[test]
+    fn cli_habits_exec_resume_scope_conflicts_are_rejected() {
+        for (flag, first, second) in [
+            ("--model", "one", "two"),
+            ("--cwd", "/one", "/two"),
+            ("--api-key", "first-test-key", "second-test-key"),
+            ("--base-url", "http://localhost:1", "http://localhost:2"),
+            ("--provider", "deepseek", "mock"),
+            ("--mode", "plan", "full-auto"),
+            ("--output-format", "text", "jsonl"),
+            ("--max-turns", "1", "2"),
+        ] {
+            let args = parse_exec(&[flag, first, "resume", "--last", flag, second, "inspect"]);
+            let error = args.into_request().unwrap_err();
+            assert!(error.contains("conflict"), "{error}");
+            assert!(!error.contains("first-test-key") && !error.contains("second-test-key"));
+        }
+        for argv in [
+            vec![
+                "--plan",
+                "resume",
+                "--last",
+                "--mode",
+                "full-auto",
+                "inspect",
+            ],
+            vec!["--yolo", "resume", "--last", "--plan", "inspect"],
+            vec![
+                "--output-format",
+                "text",
+                "resume",
+                "--last",
+                "--json",
+                "inspect",
+            ],
+            vec![
+                "--json",
+                "resume",
+                "--last",
+                "--output-format",
+                "jsonl",
+                "inspect",
+            ],
+        ] {
+            assert!(parse_exec(&argv).into_request().is_err(), "{argv:?}");
         }
     }
 
@@ -1168,7 +1910,7 @@ mod tests {
             .filter(|argument| !argument.is_hide_set())
             .filter_map(|argument| argument.get_long())
             .collect::<Vec<_>>();
-        assert_eq!(doctor_options, ["cwd", "format"]);
+        assert_eq!(doctor_options, ["cwd", "format", "json"]);
     }
 
     #[test]

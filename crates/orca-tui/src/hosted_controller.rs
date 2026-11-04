@@ -28,9 +28,7 @@ use crate::hosted_session::{
 use crate::hosted_session_lifecycle::{
     HostedSessionAction, ensure_hosted_thread, handle_hosted_session_action,
 };
-use crate::hosted_settings::{
-    apply_hosted_settings_action, settings_intent_patches, synchronize_shared_config_from_surface,
-};
+use crate::hosted_settings::settings_intent_patches;
 use crate::hosted_side::{
     HostedSideAction, HostedSideParent, handle_hosted_side_action, hosted_config_for_active,
     shutdown_attached_side_on_controller_exit,
@@ -264,13 +262,9 @@ fn resume_startup_conversation(
         .map(|transcript| transcript.meta.title)
         .map_err(|error| format!("failed to load saved session metadata: {error}"))
         .and_then(|title| {
-            ensure_hosted_thread(thread, host, &cfg, preloaded, &title, event_tx, control)
+            ensure_hosted_thread(thread, host, config, preloaded, &title, event_tx, control)
         })
         .and_then(|_| {
-            synchronize_shared_config_from_surface(
-                thread.as_ref().expect("startup hosted thread"),
-                config,
-            )?;
             emit_typed_history_snapshot(
                 thread.as_ref().expect("startup hosted thread"),
                 &cfg.history_mode,
@@ -328,6 +322,7 @@ pub(crate) fn hosted_tui_controller_loop(
     let mut thread: Option<RuntimeThreadHandle> = None;
     let mut side_parent: Option<HostedSideParent> = None;
     let mut child_focus: Option<HostedChildFocus> = None;
+    control.bind_hosted_settings_config(config.clone());
     let mut last_idle_projection_cursor = None;
     let mut next_recap_request_id = 1_u64;
     let mut active_recap_request_id = None;
@@ -361,6 +356,7 @@ pub(crate) fn hosted_tui_controller_loop(
     }
 
     loop {
+        control.restrict_hosted_settings(side_parent.is_some() || child_focus.is_some());
         let action: Result<UserAction, ()> = if control.is_shutdown() {
             Ok(UserAction::Cancel)
         } else {
@@ -413,6 +409,14 @@ pub(crate) fn hosted_tui_controller_loop(
                     .to_string(),
             ));
             continue;
+        }
+        // These handlers can start a turn before returning to this loop.
+        // Keep direct settings unavailable throughout the attachment change.
+        if matches!(
+            &action,
+            Ok(UserAction::StartSideConversation { .. } | UserAction::FocusChildThread { .. })
+        ) {
+            control.restrict_hosted_settings(true);
         }
         if child_focus.is_some()
             && matches!(
@@ -835,6 +839,10 @@ pub(crate) fn hosted_tui_controller_loop(
                 );
             }
             Ok(UserAction::SetModel(model)) => {
+                let queued = crate::hosted_settings::QueuedSettings::decode(&model);
+                let model = queued
+                    .as_ref()
+                    .map_or(model.as_str(), |queued| queued.encoded.as_str());
                 let patches = decode_settings_intent(&model)
                     .map(settings_intent_patches)
                     .map(Ok)
@@ -853,7 +861,13 @@ pub(crate) fn hosted_tui_controller_loop(
                         continue;
                     }
                 };
-                apply_hosted_settings_action(thread.as_ref(), &config, &event_tx, patches);
+                control.apply_ordered_settings(
+                    thread.as_ref(),
+                    &config,
+                    &event_tx,
+                    patches,
+                    queued.as_ref(),
+                );
             }
             Ok(UserAction::Remember { scope, note }) => {
                 handle_hosted_context_action(

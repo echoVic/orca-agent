@@ -2512,6 +2512,7 @@ impl RuntimeThreadStartRequest {
         agent_task_registry: TaskRegistry,
     ) -> Self {
         self.config.computer_use.interactive = false;
+        self.config.startup_approval_mode = None;
         self.parent_thread_id = Some(parent_thread_id.into());
         self.agent_root_thread_id = Some(root_thread_id.into());
         self.agent_depth = depth;
@@ -2529,6 +2530,7 @@ impl RuntimeThreadStartRequest {
         self.config.history_mode = HistoryMode::Disabled;
         self.config.auto_memory = false;
         self.config.approval_mode = ApprovalMode::Plan;
+        self.config.startup_approval_mode = None;
         self.config.computer_use.interactive = false;
         self.inherited_conversation = Some(conversation);
         self.parent_thread_id = Some(parent_thread_id.into());
@@ -2720,6 +2722,27 @@ impl RuntimeThreadStartRequest {
                         })?,
                 };
                 self.restore_agent_scope_from_meta(&transcript.meta)?;
+                // Metadata seeds the policy for histories without typed settings.
+                // Replayed settings replace this seed; explicit launch overrides
+                // are still committed after recovery.
+                if let Some(mode) = transcript.meta.approval_mode {
+                    self.config.approval_mode = mode;
+                    self.config.active_permission_profile =
+                        transcript.meta.active_permission_profile.clone();
+                    self.config.execution_profile = if mode == ApprovalMode::FullAuto
+                        && self.config.active_permission_profile.is_some()
+                    {
+                        orca_core::capability::ExecutionProfile::Workspace
+                    } else {
+                        orca_core::capability::ExecutionProfile::for_approval_mode(mode)
+                    };
+                }
+                if self.agent_type.is_some() && self.config.startup_approval_mode.is_some() {
+                    return Err(RuntimeHostError::ThreadStartFailed {
+                        message: "startup approval overrides are not allowed for child sessions"
+                            .to_string(),
+                    });
+                }
                 let thread_id = transcript.meta.session_id.clone();
                 let path = transcript.path.clone();
                 self.preloaded = Some(transcript);
@@ -5835,6 +5858,7 @@ async fn run_host_supervisor(
                     (unavailable_surface_handle(host_incarnation.clone()), None)
                 };
                 let mut resident_surface = resident_surface;
+                let startup_approval_mode = actor_config.startup_approval_mode.take();
                 if let Some(resident) = resident_surface.as_mut() {
                     if let Err(error) = hydrate_run_config_from_surface_settings(
                         &mut actor_config,
@@ -5844,6 +5868,31 @@ async fn run_host_supervisor(
                             message: format!("failed to restore runtime settings: {error:?}"),
                         }));
                         continue;
+                    }
+                    if let Some(mode) = startup_approval_mode {
+                        if let Err(error) = apply_startup_approval_mode(
+                            &mut resident.coordinator,
+                            &mut actor_config,
+                            mode,
+                        ) {
+                            let _ = reply.send(Err(error));
+                            continue;
+                        }
+                        if resident.coordinator.state().snapshot().thread.persistence
+                            == surface::ThreadPersistence::RecordedCatalogued
+                        {
+                            if let Err(error) = persist_surface_settings_metadata(
+                                &thread_id,
+                                &resident.coordinator.state().snapshot().settings.effective,
+                            ) {
+                                let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
+                                    message: format!(
+                                        "failed to save startup approval settings: {error}"
+                                    ),
+                                }));
+                                continue;
+                            }
+                        }
                     }
                     // A recovered context keeps the ceiling its ledger recorded.
                     if let Err(error) =
@@ -6118,12 +6167,24 @@ async fn run_host_supervisor(
                         else {
                             continue;
                         };
+                        let actor = actors
+                            .get(&shutdown_actor.thread_id)
+                            .expect("selected runtime actor remains registered");
                         let transition = match reply_rx.try_recv() {
                             Ok(ThreadShutdownAck::Complete) => {
                                 Some((HostShutdownActorState::Settled, None))
                             }
                             Ok(ThreadShutdownAck::Retry) => {
                                 Some((HostShutdownActorState::NeedsDispatch, None))
+                            }
+                            // A concurrent thread close drains our accepted
+                            // duplicate request after closing its mailbox. The
+                            // final join below still waits for actor cleanup
+                            // and reports a real actor panic.
+                            Ok(ThreadShutdownAck::Failed(RuntimeHostError::ThreadUnavailable))
+                                if actor.command_tx.is_closed() =>
+                            {
+                                Some((HostShutdownActorState::Settled, None))
                             }
                             Ok(ThreadShutdownAck::Failed(error)) => {
                                 Some((HostShutdownActorState::Settled, Some(error)))
@@ -11361,6 +11422,81 @@ fn refresh_recovered_context_limit<L: surface::SurfaceCommitLedger>(
     Ok(())
 }
 
+/// Apply the explicit launch choice after ledger replay and before the actor
+/// can admit work. Publish the config only once the typed commit succeeds.
+fn apply_startup_approval_mode<L: surface::SurfaceCommitLedger>(
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, L>,
+    config: &mut RunConfig,
+    mode: ApprovalMode,
+) -> Result<(), RuntimeHostError> {
+    let current = &coordinator.state().snapshot().settings;
+    let mut next_settings = current.clone();
+    let mut next_config = config.clone();
+    let patch = match mode {
+        ApprovalMode::FullAuto => surface::RuntimeSettingsPatch::EnableFullAccess,
+        mode => surface::RuntimeSettingsPatch::SetApprovalMode {
+            mode: match mode {
+                ApprovalMode::Suggest => surface::SurfaceApprovalMode::Suggest,
+                ApprovalMode::AutoEdit => surface::SurfaceApprovalMode::AutoEdit,
+                ApprovalMode::Plan => surface::SurfaceApprovalMode::Plan,
+                ApprovalMode::FullAuto => unreachable!(),
+            },
+        },
+    };
+    apply_runtime_settings_patch(&mut next_config, &mut next_settings.effective, &patch).map_err(
+        |error| RuntimeHostError::ThreadStartFailed {
+            message: format!("invalid startup approval settings: {error:?}"),
+        },
+    )?;
+    if next_settings.effective == current.effective {
+        *config = next_config;
+        return Ok(());
+    }
+    let revision = current.thread_revision.get().checked_add(1);
+    let policy_epoch = current.effective.policy_epoch.get().checked_add(1);
+    next_settings.thread_revision = revision
+        .and_then(|value| surface::SettingsRevision::try_new(value).ok())
+        .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+            message: "startup settings revision overflow".to_string(),
+        })?;
+    next_settings.effective.policy_epoch = policy_epoch
+        .and_then(|value| surface::PolicyEpoch::try_new(value).ok())
+        .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+            message: "startup policy epoch overflow".to_string(),
+        })?;
+    next_settings.pending = None;
+    let batch = runtime_surface_event_batch(
+        coordinator.state().snapshot(),
+        vec![(
+            surface::SurfaceScope::Thread,
+            surface::SurfaceEvent::Settings(surface::SettingsPatch::Committed {
+                previous_revision: current.thread_revision,
+                snapshot: next_settings,
+            }),
+        )],
+        None,
+    );
+    for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+        match coordinator.commit_actor_batch(&batch) {
+            Ok(_) => {
+                *config = next_config;
+                return Ok(());
+            }
+            Err(surface::SurfaceCommitError::Ledger(
+                surface::SurfaceLedgerError::AppendFailed
+                | surface::SurfaceLedgerError::PartialAppend
+                | surface::SurfaceLedgerError::CheckpointFailed,
+            )) if attempt + 1 < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS => {}
+            Err(error) => {
+                return Err(RuntimeHostError::ThreadStartFailed {
+                    message: format!("failed to commit startup approval settings: {error:?}"),
+                });
+            }
+        }
+    }
+    unreachable!("commit loop returns on its last attempt")
+}
+
 fn initial_surface_snapshot(
     thread_id: surface::SurfaceThreadId,
     incarnation: surface::SurfaceIncarnation,
@@ -11769,6 +11905,7 @@ pub fn hydrate_run_config_from_surface_settings(
     config: &mut RunConfig,
     settings: &surface::SurfaceRuntimeSettings,
 ) -> Result<(), surface::SurfaceClientCommandError> {
+    config.startup_approval_mode = None;
     let mut restored = settings.clone();
     apply_runtime_settings_patch(
         config,
@@ -24460,6 +24597,7 @@ mod tests {
         let _home = crate::history::redirect_test_orca_home(home.path());
         let mut config = RunConfig::default();
         config.computer_use.interactive = true;
+        config.startup_approval_mode = Some(ApprovalMode::FullAuto);
         let child = RuntimeThreadStartRequest::new(config, "child").with_agent_parent(
             "parent",
             "root",
@@ -24469,6 +24607,7 @@ mod tests {
             TaskRegistry::new("root".to_string()),
         );
         assert!(!child.config.computer_use.interactive);
+        assert_eq!(child.config.startup_approval_mode, None);
     }
 
     #[test]
@@ -24676,6 +24815,72 @@ mod tests {
             digest: &surface::Sha256Digest,
         ) -> surface::CommitProbe {
             self.inner.probe_commit(commit_id, digest)
+        }
+    }
+
+    #[test]
+    fn startup_approval_mode_retries_commit_and_fails_start_without_publishing_on_failure() {
+        let cwd = tempfile::tempdir().unwrap();
+        let attempts = SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS;
+        for (append_failures, checkpoint_failures, fails) in [
+            (1, 0, false),
+            (0, 1, false),
+            (attempts, 0, true),
+            (0, attempts, true),
+        ] {
+            let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled);
+            let raw_thread_id = uuid::Uuid::now_v7();
+            let thread_id =
+                surface::SurfaceThreadId::try_from_bytes(*raw_thread_id.as_bytes()).unwrap();
+            let owner_lease = surface::ExclusiveOwnerLease::acquire_process_local_thread(
+                thread_id.clone(),
+                &HostSurfaceClock::now(),
+            )
+            .unwrap();
+            let snapshot = initial_surface_snapshot(
+                thread_id,
+                surface::SurfaceIncarnation::try_from_bytes(*raw_thread_id.as_bytes()).unwrap(),
+                surface::ThreadOwnerEpoch::new(owner_lease.owner_epoch()),
+                surface::ThreadPersistence::EphemeralAttached,
+                &config,
+                "startup approval",
+                None,
+            )
+            .unwrap();
+            let previous = snapshot.settings.clone();
+            let ledger = FlakyContextLedger {
+                inner: surface::InMemorySurfaceCommitLedger::new(snapshot.cursor.clone()),
+                append_failures,
+                checkpoint_failures,
+            };
+            let mut coordinator = surface::RuntimeCommitCoordinator::new_with_owned_lease(
+                ledger,
+                surface::SurfaceReducerState::new(snapshot),
+                owner_lease,
+            )
+            .unwrap();
+            let result =
+                apply_startup_approval_mode(&mut coordinator, &mut config, ApprovalMode::FullAuto);
+            assert_eq!(result.is_err(), fails);
+            if fails {
+                assert_eq!(config.approval_mode, ApprovalMode::Suggest);
+                assert_eq!(coordinator.state().snapshot().settings, previous);
+            } else {
+                assert_eq!(config.approval_mode, ApprovalMode::FullAuto);
+                assert_eq!(
+                    config.execution_profile,
+                    orca_core::capability::ExecutionProfile::TrustedHost
+                );
+                let settings = &coordinator.state().snapshot().settings;
+                assert_eq!(
+                    settings.thread_revision.get(),
+                    previous.thread_revision.get() + 1
+                );
+                assert_eq!(
+                    settings.effective.policy_epoch.get(),
+                    previous.effective.policy_epoch.get() + 1
+                );
+            }
         }
     }
 
@@ -27061,6 +27266,7 @@ mod tests {
             cwd: Some(cwd),
             output_format: OutputFormat::Jsonl,
             approval_mode: ApprovalMode::Suggest,
+            startup_approval_mode: None,
             execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             provider: ProviderKind::Mock,
             verifier: None,
@@ -33770,6 +33976,284 @@ mod tests {
     }
 
     #[test]
+    fn startup_mode_cannot_override_a_restored_child_policy() {
+        let cwd = tempfile::tempdir().unwrap();
+        crate::history::with_redirected_orca_home("startup-child-policy", |_| {
+            let registry = TaskRegistry::new_for_cwd("parent-task-session".into(), cwd.path());
+            let task = registry.create_subagent("saved child".into(), Some("general".into()));
+            let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+            let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).unwrap();
+            let thread = host
+                .start_thread_with_request(
+                    RuntimeThreadStartRequest::new(config.clone(), "saved child")
+                        .with_agent_parent(
+                            "parent-thread",
+                            "root-thread",
+                            1,
+                            orca_core::subagent_types::SubagentType::General,
+                            task.id.clone(),
+                            registry.clone(),
+                        ),
+                )
+                .unwrap();
+            let child_id = thread.thread_id().to_string();
+            registry.bind_subagent_thread(&task.id, &child_id).unwrap();
+            thread.shutdown().unwrap();
+            host.shutdown().unwrap();
+
+            let mut resume = config;
+            resume.history_mode = HistoryMode::Resume(child_id.clone());
+            resume.approval_mode = ApprovalMode::FullAuto;
+            resume.execution_profile = orca_core::capability::ExecutionProfile::TrustedHost;
+            resume.startup_approval_mode = Some(ApprovalMode::FullAuto);
+            let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).unwrap();
+            let result = host.start_thread(resume.clone(), "override saved child");
+            assert!(
+                matches!(result, Err(RuntimeHostError::ThreadStartFailed { ref message })
+                if message.contains("child") && message.contains("startup")),
+                "child resume must reject an explicit startup policy override"
+            );
+            resume.startup_approval_mode = None;
+            resume.approval_mode = ApprovalMode::Suggest;
+            resume.execution_profile = orca_core::capability::ExecutionProfile::Workspace;
+            let thread = host.start_thread(resume, "saved child policy").unwrap();
+            assert_eq!(
+                fresh_surface_attachment(&thread.surface())
+                    .baseline
+                    .snapshot
+                    .settings
+                    .effective
+                    .approval_mode,
+                surface::SurfaceApprovalMode::Suggest
+            );
+            thread.shutdown().unwrap();
+            host.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn startup_mode_preserves_legacy_metadata_without_typed_settings() {
+        let cwd = tempfile::tempdir().unwrap();
+        crate::history::with_redirected_orca_home("legacy-startup-mode", |_| {
+            for saved_mode in [
+                ApprovalMode::Suggest,
+                ApprovalMode::AutoEdit,
+                ApprovalMode::Plan,
+                ApprovalMode::FullAuto,
+            ] {
+                for explicit in [false, true] {
+                    let store = SessionStore::new();
+                    let meta = store.create_meta_with_permissions(
+                        cwd.path(),
+                        "mock",
+                        None,
+                        "legacy settings",
+                        None,
+                        saved_mode,
+                        Default::default(),
+                        Vec::new(),
+                    );
+                    let thread_id = meta.session_id.clone();
+                    drop(store.start_writer_from_meta(meta).unwrap());
+                    let mut config = surface_test_config(
+                        cwd.path().to_path_buf(),
+                        HistoryMode::Resume(thread_id.clone()),
+                    );
+                    config.approval_mode = ApprovalMode::FullAuto;
+                    config.execution_profile = orca_core::capability::ExecutionProfile::TrustedHost;
+                    config.startup_approval_mode = explicit.then_some(ApprovalMode::FullAuto);
+                    let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).unwrap();
+                    let thread = host
+                        .start_thread(config, "restore legacy settings")
+                        .unwrap();
+                    let settings = fresh_surface_attachment(&thread.surface())
+                        .baseline
+                        .snapshot
+                        .settings
+                        .effective
+                        .clone();
+                    let expected = if explicit {
+                        ApprovalMode::FullAuto
+                    } else {
+                        saved_mode
+                    };
+                    let mut effective = RunConfig::default();
+                    hydrate_run_config_from_surface_settings(&mut effective, &settings).unwrap();
+                    assert_eq!(effective.approval_mode, expected);
+                    assert_eq!(
+                        effective.execution_profile,
+                        orca_core::capability::ExecutionProfile::for_approval_mode(expected)
+                    );
+                    thread.shutdown().unwrap();
+                    host.shutdown().unwrap();
+                    assert_eq!(
+                        store.load_session(&thread_id).unwrap().meta.approval_mode,
+                        Some(expected)
+                    );
+                }
+            }
+
+            let store = SessionStore::new();
+            let profile = orca_core::config::ActivePermissionProfile {
+                id: "legacy-restrictive".into(),
+                extends: None,
+            };
+            let meta = store.create_meta_with_permissions(
+                cwd.path(),
+                "mock",
+                None,
+                "legacy profiled full-auto",
+                Some(profile.clone()),
+                ApprovalMode::FullAuto,
+                Default::default(),
+                Vec::new(),
+            );
+            let thread_id = meta.session_id.clone();
+            drop(store.start_writer_from_meta(meta).unwrap());
+            let mut config =
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id));
+            config.approval_mode = ApprovalMode::FullAuto;
+            config.execution_profile = orca_core::capability::ExecutionProfile::TrustedHost;
+            let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).unwrap();
+            let thread = host
+                .start_thread(config, "restore profiled settings")
+                .unwrap();
+            let mut effective = RunConfig::default();
+            hydrate_run_config_from_surface_settings(
+                &mut effective,
+                &fresh_surface_attachment(&thread.surface())
+                    .baseline
+                    .snapshot
+                    .settings
+                    .effective,
+            )
+            .unwrap();
+            assert_eq!(effective.approval_mode, ApprovalMode::FullAuto);
+            assert_eq!(effective.active_permission_profile, Some(profile));
+            assert_eq!(
+                effective.execution_profile,
+                orca_core::capability::ExecutionProfile::Workspace
+            );
+            thread.shutdown().unwrap();
+            host.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn startup_mode_overrides_recovered_settings_once_and_preserves_other_settings() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config
+            .permission_rules
+            .rules
+            .push(orca_core::approval_rules::PermissionRule::new(
+                "bash",
+                "*forbidden*",
+                orca_core::approval_types::Decision::Deny,
+            ));
+        let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).unwrap();
+        let thread = host.start_thread(config.clone(), "saved settings").unwrap();
+        let attachment = fresh_surface_attachment(&thread.surface());
+        let saved = committed_surface_value(
+            attachment
+                .client
+                .update_settings(
+                    surface_request_id(),
+                    attachment.baseline.snapshot.settings.thread_revision,
+                    surface::NonEmptyVec::try_new(vec![
+                        surface::RuntimeSettingsPatch::SetModel {
+                            model: surface::NonEmptyText::try_new(orca_core::model::FLASH_MODEL)
+                                .unwrap(),
+                        },
+                        surface::RuntimeSettingsPatch::SetReasoning {
+                            effort: surface::SurfaceReasoningEffort::High,
+                        },
+                    ])
+                    .unwrap(),
+                )
+                .unwrap(),
+        )
+        .settings;
+        let thread_id = thread.thread_id().to_string();
+        thread.shutdown().unwrap();
+        host.shutdown().unwrap();
+
+        config.history_mode = HistoryMode::Resume(thread_id);
+        // A config default alone keeps the saved thread's mode.
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.execution_profile = orca_core::capability::ExecutionProfile::TrustedHost;
+        let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).unwrap();
+        let thread = host.start_thread(config.clone(), "implicit mode").unwrap();
+        assert_eq!(
+            fresh_surface_attachment(&thread.surface())
+                .baseline
+                .snapshot
+                .settings
+                .effective
+                .approval_mode,
+            surface::SurfaceApprovalMode::Suggest,
+        );
+        thread.shutdown().unwrap();
+        host.shutdown().unwrap();
+
+        config.startup_approval_mode = Some(ApprovalMode::FullAuto);
+        let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).unwrap();
+        let thread = host.start_thread(config.clone(), "explicit mode").unwrap();
+        let attachment = fresh_surface_attachment(&thread.surface());
+        let settings = attachment.baseline.snapshot.settings.clone();
+        assert_eq!(
+            settings.effective.approval_mode,
+            surface::SurfaceApprovalMode::FullAuto
+        );
+        assert_eq!(settings.effective.model, saved.effective.model);
+        assert_eq!(
+            settings.effective.reasoning_effort,
+            saved.effective.reasoning_effort
+        );
+        assert_eq!(
+            settings.effective.permission_rules,
+            saved.effective.permission_rules
+        );
+        assert_eq!(
+            settings.thread_revision.get(),
+            saved.thread_revision.get() + 1
+        );
+        let mut shared = config.clone();
+        hydrate_run_config_from_surface_settings(&mut shared, &settings.effective).unwrap();
+        assert_eq!(shared.startup_approval_mode, None);
+        committed_surface_value(
+            attachment
+                .client
+                .update_settings(
+                    surface_request_id(),
+                    settings.thread_revision,
+                    surface::NonEmptyVec::try_new(vec![
+                        surface::RuntimeSettingsPatch::SetApprovalMode {
+                            mode: surface::SurfaceApprovalMode::Suggest,
+                        },
+                    ])
+                    .unwrap(),
+                )
+                .unwrap(),
+        );
+        thread.shutdown().unwrap();
+        host.shutdown().unwrap();
+        let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).unwrap();
+        let thread = host.start_thread(shared, "consumed launch mode").unwrap();
+        assert_eq!(
+            fresh_surface_attachment(&thread.surface())
+                .baseline
+                .snapshot
+                .settings
+                .effective
+                .approval_mode,
+            surface::SurfaceApprovalMode::Suggest,
+        );
+        thread.shutdown().unwrap();
+        host.shutdown().unwrap();
+    }
+
+    #[test]
     fn typed_settings_update_canonicalizes_alias_and_survives_restart_before_next_turn() {
         let cwd = tempfile::tempdir().unwrap();
         let (observed_tx, observed_rx) = mpsc::sync_channel(1);
@@ -37428,6 +37912,190 @@ mod tests {
             later_closed_before_recovery,
             "later actor was not joined before retrying actor recovered"
         );
+    }
+
+    #[test]
+    fn background_shutdown_retries_duplicate_close_until_worker_cleanup_finishes() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled);
+        let host = RuntimeHost::start().expect("start fixture host");
+        let handle = host.start_thread(config.clone(), "fixture handle").unwrap();
+        let thread = RuntimeThread::start(&config, "background shutdown fixture").unwrap();
+        let mut actor = ThreadActor::new(
+            thread,
+            config,
+            handle.clone(),
+            Arc::new(LegacyThreadOperationExecutor),
+            1,
+            None,
+            Duration::from_secs(30),
+            0,
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (cancel_observed_tx, cancel_observed_rx) = mpsc::sync_channel(1);
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (command_tx, mut command_rx) = tokio_mpsc::channel(2);
+        let cancel = CancelToken::new();
+        let worker_cancel = cancel.clone();
+        let worker = runtime.spawn(async move {
+            while !worker_cancel.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            cancel_observed_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            completed_tx.send(()).unwrap();
+        });
+        actor
+            .background_controller
+            .admit_task(
+                "closing-worker".to_string(),
+                HostBackgroundTask {
+                    cancel,
+                    join: worker,
+                    typed_workflow: None,
+                    typed_provider: None,
+                },
+            )
+            .expect("admit fixture background task");
+        let shutdown = runtime.spawn(async move {
+            actor
+                .shutdown_background_tasks(
+                    surface::SurfaceShutdownReason::ThreadClose,
+                    &mut command_rx,
+                )
+                .await
+        });
+        cancel_observed_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .unwrap();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        command_tx
+            .blocking_send(ThreadCommand::ShutdownThread {
+                reply: Some(reply_tx),
+                reason: surface::SurfaceShutdownReason::HostShutdown,
+            })
+            .unwrap();
+        let ack = reply_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+        let mailbox_was_open = !command_tx.is_closed();
+        let waited_for_worker = completed_rx.try_recv().is_err();
+        release_tx.send(()).unwrap();
+        runtime.block_on(shutdown).unwrap().unwrap();
+        completed_rx.try_recv().unwrap();
+        handle.shutdown().unwrap();
+        host.shutdown().unwrap();
+        assert!(
+            mailbox_was_open,
+            "workflow progress ingress must remain open during cleanup"
+        );
+        assert!(waited_for_worker, "shutdown must wait for worker cleanup");
+        assert!(command_tx.is_closed());
+        assert!(
+            matches!(ack, ThreadShutdownAck::Retry),
+            "duplicate close must retry while cleanup is in progress"
+        );
+    }
+
+    #[test]
+    fn host_shutdown_joins_actor_when_thread_close_drains_its_duplicate_request() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (cancel_observed_tx, cancel_observed_rx) = mpsc::sync_channel(1);
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(CancelAwareShutdownExecutor {
+            entered: entered_tx,
+            cancel_observed: cancel_observed_tx,
+            completed: completed_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "close thread concurrently with its host",
+            )
+            .expect("start recorded runtime thread");
+        let attachment = fresh_surface_attachment(&thread.surface());
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(&attachment.baseline.snapshot, "wait for shutdown"),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("executor did not start");
+
+        let (barrier_tx, barrier_rx) = mpsc::sync_channel(0);
+        thread
+            .command_tx
+            .try_send(ThreadCommand::SurfaceActorTestProbe {
+                operation_id,
+                reply: barrier_tx,
+            })
+            .expect("enqueue actor barrier");
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while thread.command_tx.capacity() != THREAD_COMMAND_CAPACITY {
+            assert!(Instant::now() < deadline, "actor did not enter barrier");
+            std::thread::yield_now();
+        }
+        let (thread_shutdown_tx, thread_shutdown_rx) = mpsc::sync_channel(1);
+        thread
+            .command_tx
+            .try_send(ThreadCommand::ShutdownThread {
+                reply: Some(thread_shutdown_tx),
+                reason: surface::SurfaceShutdownReason::ThreadClose,
+            })
+            .expect("queue thread close before host shutdown");
+        let (host_shutdown_tx, host_shutdown_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = host_shutdown_tx.send(host.shutdown());
+        });
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while thread.command_tx.capacity() != THREAD_COMMAND_CAPACITY - 2 {
+            assert!(
+                Instant::now() < deadline,
+                "host shutdown was not queued after thread close"
+            );
+            std::thread::yield_now();
+        }
+        barrier_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("release actor barrier");
+        assert!(matches!(
+            thread_shutdown_rx
+                .recv_timeout(SURFACE_TEST_TIMEOUT)
+                .expect("thread close did not acknowledge shutdown"),
+            ThreadShutdownAck::Complete
+        ));
+        let shutdown = host_shutdown_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("host shutdown did not join the closing actor");
+        cancel_observed_rx
+            .try_recv()
+            .expect("shutdown returned before the generation observed cancellation");
+        completed_rx
+            .try_recv()
+            .expect("shutdown returned before the generation completed");
+        assert!(thread.command_tx.is_closed());
+        assert!(shutdown.is_ok(), "host shutdown returned {shutdown:?}");
     }
 
     #[test]

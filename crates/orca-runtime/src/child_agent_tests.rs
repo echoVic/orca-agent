@@ -41,6 +41,7 @@ fn config(model: Option<&str>) -> RunConfig {
         cwd: None,
         output_format: OutputFormat::Text,
         approval_mode: ApprovalMode::Suggest,
+        startup_approval_mode: None,
         execution_profile: orca_core::capability::ExecutionProfile::Workspace,
         provider: ProviderKind::Mock,
         verifier: None,

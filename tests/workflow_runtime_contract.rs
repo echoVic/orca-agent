@@ -2388,6 +2388,7 @@ fn mock_run_config(cwd: &std::path::Path) -> RunConfig {
         cwd: Some(cwd.to_path_buf()),
         output_format: OutputFormat::Jsonl,
         approval_mode: ApprovalMode::FullAuto,
+        startup_approval_mode: None,
         execution_profile: orca_core::capability::ExecutionProfile::Workspace,
         provider: ProviderKind::Mock,
         verifier: None,

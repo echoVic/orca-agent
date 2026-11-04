@@ -28,15 +28,16 @@ use crate::surface_projection::{SessionProjectionPresentation, SurfaceProjection
 pub(crate) fn ensure_hosted_thread(
     thread: &mut Option<RuntimeThreadHandle>,
     host: &RuntimeHostHandle,
-    config: &RunConfig,
+    config: &Arc<Mutex<RunConfig>>,
     _preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     title: &str,
     event_tx: &mpsc::Sender<TuiEvent>,
     control: &TuiSurfaceTaskControl,
 ) -> Result<(), String> {
     if thread.is_none() {
+        let mut next_config = config.lock().unwrap().clone();
         let request = offer_prestarted_mcp(
-            RuntimeThreadStartRequest::new(config.clone(), title),
+            RuntimeThreadStartRequest::new(next_config.clone(), title),
             control,
         );
         #[cfg(test)]
@@ -48,17 +49,41 @@ pub(crate) fn ensure_hosted_thread(
         let started = host
             .start_thread_with_request(request)
             .map_err(|error| format!("failed to initialize conversation history: {error}"))?;
-        #[cfg(test)]
-        {
-            *_preloaded.lock().unwrap() = None;
+        // Read the runtime without holding the config or installation locks.
+        // Legacy unrecorded threads do not expose a typed settings snapshot.
+        if started.session_id().is_some() {
+            let snapshot = match TuiSurfaceActions::new(started.typed_surface()).read_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    reap_hosted_thread(started);
+                    return Err(format!("failed to read initial runtime settings: {error}"));
+                }
+            };
+            if let Err(error) = orca_runtime::runtime_host::hydrate_run_config_from_surface_settings(
+                &mut next_config,
+                &snapshot.settings.effective,
+            ) {
+                reap_hosted_thread(started);
+                return Err(format!(
+                    "failed to apply initial runtime settings: {error:?}"
+                ));
+            }
         }
+        next_config.startup_approval_mode = None;
         notify_recovered_background_approvals_for_tui(
             &TuiSurfaceActions::new(started.typed_surface()),
             event_tx,
         );
         // It has the MCP servers that started with the TUI, lent, until it
         // is announced as the conversation's (`announce_runtime_ready`).
-        *thread = Some(started);
+        control.with_hosted_session_install(&started.clone(), || {
+            *config.lock().unwrap() = next_config;
+            #[cfg(test)]
+            {
+                *_preloaded.lock().unwrap() = None;
+            }
+            *thread = Some(started);
+        });
     }
     Ok(())
 }
@@ -96,6 +121,7 @@ pub(crate) fn start_new_hosted_session(
         config,
         preloaded,
         pending_workflow_notifications,
+        control,
     )?;
     Ok(projection)
 }
@@ -195,6 +221,7 @@ pub(crate) fn preflight_started_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_hosted_session(
     thread: &mut Option<RuntimeThreadHandle>,
     started: RuntimeThreadHandle,
@@ -202,6 +229,7 @@ fn install_hosted_session(
     config: &Arc<Mutex<RunConfig>>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    control: &TuiSurfaceTaskControl,
 ) -> Result<(), String> {
     let snapshot = match TuiSurfaceActions::new(started.typed_surface()).read_snapshot() {
         Ok(snapshot) => snapshot,
@@ -219,10 +247,13 @@ fn install_hosted_session(
             "failed to apply restored runtime settings: {error:?}"
         ));
     }
-    let previous = thread.replace(started);
-    *config.lock().unwrap() = next_config;
-    *preloaded.lock().unwrap() = None;
-    pending_workflow_notifications.clear();
+    let previous = control.with_hosted_session_install(&started.clone(), || {
+        let previous = thread.replace(started);
+        *config.lock().unwrap() = next_config;
+        *preloaded.lock().unwrap() = None;
+        pending_workflow_notifications.clear();
+        previous
+    });
     if let Some(previous) = previous {
         reap_hosted_thread(previous);
     }
@@ -267,6 +298,7 @@ pub(crate) fn start_forked_hosted_session(
         config,
         preloaded,
         pending_workflow_notifications,
+        control,
     )?;
     Ok((mode, projection))
 }
@@ -320,6 +352,7 @@ pub(crate) fn switch_saved_hosted_session(
         config,
         preloaded,
         pending_workflow_notifications,
+        control,
     )?;
     Ok((mode, projection))
 }
@@ -688,6 +721,7 @@ pub(crate) fn resume_latest_active_goal_hosted(
         config,
         preloaded,
         pending_workflow_notifications,
+        control,
     ) {
         let _ = event_tx.send(TuiEvent::Error(error));
         return;
@@ -724,6 +758,150 @@ mod tests {
     #[test]
     fn no_current_session_is_switchable() {
         assert!(super::ensure_current_session_switchable(None).is_ok());
+    }
+
+    #[test]
+    fn new_session_install_waits_for_full_access_publication() {
+        let _home = crate::test_support::isolate_orca_home();
+        let mut run_config = crate::test_support::test_run_config();
+        run_config.history_mode = HistoryMode::Record;
+        let config = Arc::new(Mutex::new(run_config.clone()));
+        let runtime = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+        let host = runtime.handle();
+        let old = host
+            .start_thread(run_config.clone(), "old session")
+            .unwrap();
+        let started = host
+            .start_thread(run_config.clone(), "new session")
+            .unwrap();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        control.bind_hosted_settings_config(config.clone());
+        let (event_tx, event_rx) = mpsc::bounded(0);
+        control.bind_prompt_queue_runtime(old.clone(), &event_tx);
+        let first = {
+            let control = control.clone();
+            let old = old.clone();
+            let config = config.clone();
+            std::thread::spawn(move || {
+                control.apply_ordered_settings(
+                    Some(&old),
+                    &config,
+                    &event_tx,
+                    vec![orca_runtime::surface::RuntimeSettingsPatch::EnableFullAccess],
+                    None,
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while config.lock().unwrap().approval_mode
+            != orca_core::approval_types::ApprovalMode::FullAuto
+        {
+            assert!(std::time::Instant::now() < deadline, "Full Access commit");
+            std::thread::yield_now();
+        }
+        let (installing_tx, installing_rx) = mpsc::bounded(1);
+        let install = {
+            let config = config.clone();
+            let control = control.clone();
+            std::thread::spawn(move || {
+                let mut thread = Some(old);
+                installing_tx.send(()).unwrap();
+                super::install_hosted_session(
+                    &mut thread,
+                    started,
+                    run_config,
+                    &config,
+                    &Arc::new(Mutex::new(None)),
+                    &crate::bridge::PendingWorkflowNotifications::new(),
+                    &control,
+                )
+                .unwrap();
+                thread.unwrap()
+            })
+        };
+        installing_rx.recv().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_millis(150);
+        let mut installed_before_publication = false;
+        while std::time::Instant::now() < deadline {
+            installed_before_publication |= config.lock().unwrap().approval_mode
+                != orca_core::approval_types::ApprovalMode::FullAuto;
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            TuiEvent::SettingsUpdated { .. }
+        ));
+        assert!(first.join().unwrap());
+        let new = install.join().unwrap();
+        let final_mode = config.lock().unwrap().approval_mode;
+        new.shutdown().unwrap();
+        runtime.shutdown().unwrap();
+        assert!(
+            !installed_before_publication,
+            "new session replaced config during old Full Access publication"
+        );
+        assert_eq!(final_mode, orca_core::approval_types::ApprovalMode::Suggest);
+    }
+
+    #[test]
+    fn full_access_for_replaced_session_cannot_write_new_session_config() {
+        let _home = crate::test_support::isolate_orca_home();
+        let mut run_config = crate::test_support::test_run_config();
+        run_config.history_mode = HistoryMode::Record;
+        let config = Arc::new(Mutex::new(run_config.clone()));
+        let runtime = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+        let host = runtime.handle();
+        let old = host
+            .start_thread(run_config.clone(), "old session")
+            .unwrap();
+        let started = host
+            .start_thread(run_config.clone(), "new session")
+            .unwrap();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        control.bind_hosted_settings_config(config.clone());
+        control.bind_prompt_queue_runtime(old.clone(), &event_tx);
+        let mut thread = Some(old.clone());
+        let preloaded = Arc::new(Mutex::new(None));
+        let pending = crate::bridge::PendingWorkflowNotifications::new();
+
+        super::install_hosted_session(
+            &mut thread,
+            started,
+            run_config,
+            &config,
+            &preloaded,
+            &pending,
+            &control,
+        )
+        .unwrap();
+        // This is the dispatcher's captured old target, before the new
+        // attachment is announced. It must not mirror into the new config.
+        let applied = control.apply_ordered_settings(
+            Some(&old),
+            &config,
+            &event_tx,
+            vec![orca_runtime::surface::RuntimeSettingsPatch::EnableFullAccess],
+            None,
+        );
+        let mode = config.lock().unwrap().approval_mode;
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        let settings_events = events
+            .iter()
+            .filter(|event| matches!(event, TuiEvent::SettingsUpdated { .. }))
+            .count();
+        thread.unwrap().shutdown().unwrap();
+        runtime.shutdown().unwrap();
+        assert!(
+            !applied,
+            "old Full Access request was applied after replacement"
+        );
+        assert_eq!(mode, orca_core::approval_types::ApprovalMode::Suggest);
+        assert_eq!(settings_events, 0);
+        assert!(matches!(
+            events.as_slice(),
+            [TuiEvent::Error(message)] if message == "settings target is no longer in view"
+        ));
     }
 
     #[test]

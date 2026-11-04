@@ -941,6 +941,7 @@ mod tests {
             output_format: OutputFormat::Text,
             execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             approval_mode: ApprovalMode::Suggest,
+            startup_approval_mode: None,
             provider: ProviderKind::Mock,
             verifier: None,
             model: ModelSelection::parse(None).expect("model"),

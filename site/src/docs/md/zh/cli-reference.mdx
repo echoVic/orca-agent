@@ -19,7 +19,9 @@ orca [OPTIONS] [PROMPT]...
 orca [OPTIONS] COMMAND
 ```
 
-直接运行 `orca` 会打开交互式 TUI，也可以把提示词作为位置参数传入。
+直接运行 `orca` 会打开交互式 TUI。没有配置模式时，新会话默认使用 `full-auto`
+（yolo）；显式模式优先，恢复会话沿用保存的模式，除非明确覆盖。也可以把提示词
+作为位置参数传入。
 可见的根命令如下：
 
 | 命令 | 用途 |
@@ -27,20 +29,32 @@ orca [OPTIONS] COMMAND
 | `orca doctor` | 检查本地配置、凭据、目录信任和沙箱就绪状态。 |
 | `orca storage` | 检查会话磁盘占用，预览或执行归档清理策略。 |
 | `orca exec` | 非交互执行任务，输出文本或 JSONL 事件。 |
+| `orca app-server` | 通过标准输入输出提供 JSON-RPC app 协议。 |
+| `orca acp` | 通过标准输入输出提供 Agent Client Protocol。 |
 | `orca workflow` | 执行和检查本地持久化工作流。 |
 | `orca trust` | 查看或更新目录信任。 |
 | `orca mcp` | 在用户配置中添加、列出、查看、删除、登录或登出 MCP 服务器。 |
 
 根选项包括 `--resume [SESSION_ID]`、`--fork ID`、`--continue`、
-`--model MODEL`、`--mode MODE`、`--api-key KEY`、`--base-url URL`
-和 `--cwd PATH`。交互式运行使用审批模式（`suggest`、`auto-edit`、
-`full-auto` 或 `plan`）。`--mode server` 与 `--mode acp` 则选择协议传输，
-不能与提示词或子命令一起使用。
+`-m` / `--model MODEL`、`--mode MODE`、`--yolo`、`--plan`、`--api-key KEY`、
+`--base-url URL` 和 `-C` / `--cwd` / `--cd PATH`。`--yolo` 选择 `full-auto`，
+`--plan` 选择只读规划模式。两个快捷选项不能同时使用，也不能与 `--mode` 组合。
+
+协议入口使用 `orca app-server` 或 `orca acp`。旧的 `--mode server` 与
+`--mode acp` 继续可用。协议启动会拒绝提示词、历史选择参数（`--resume`、
+`--fork`、`--continue`）和审批模式快捷选项。命名协议命令接受放在子命令前后
+的模型、目录、密钥和 base URL 参数。
+
+`exec` 的公共参数（`--mode`、模型、目录、密钥、base URL）可以放在 `exec`
+前后，也可以放在 `exec resume` 后面。根层、`exec` 与 `resume` 层的显式值
+不同会报错，相同值可以重复。CLI 参数优先于配置和环境变量。模型、密钥和 endpoint 的帮助
+统一使用 `ORCA_MODEL`、`ORCA_API_KEY`、`ORCA_BASE_URL`；对应的 `DEEPSEEK_*`
+兼容别名仍然可用。
 
 ## `orca doctor`
 
 ```text
-orca doctor [--cwd PATH] [--format text|json]
+orca doctor [--cwd PATH] [--json | --format text|json]
 ```
 
 `doctor` 是本地只读的运行前检查。它不会连接模型服务、启动 MCP、配置沙箱
@@ -58,7 +72,7 @@ JSON 是稳定的机器接口，字段使用 camelCase，例如 `schemaVersion`�
 
 ```bash
 orca doctor
-orca doctor --cwd ./project --format json
+orca doctor --cd ./project --json
 ```
 
 ## `orca storage`
@@ -82,9 +96,12 @@ orca exec [OPTIONS] resume [SESSION_ID] [PROMPT]...
 | 选项 | 含义 |
 | --- | --- |
 | `--output-format TEXT\|JSONL` | 人类可读输出，或每行一个 JSON 事件。 |
-| `--cwd PATH` | 工作区目录。 |
+| `--json` | `--output-format jsonl` 的简写。 |
+| `-C` / `--cwd` / `--cd PATH` | 工作区目录。 |
 | `--mode suggest\|auto-edit\|full-auto\|plan` | 工具操作的审批策略。 |
-| `--model MODEL` | 覆盖模型。 |
+| `--yolo` | 选择 Full Access，覆盖配置或恢复的模式。 |
+| `--plan` | 选择只读规划，覆盖配置或恢复的模式。 |
+| `-m` / `--model MODEL` | 覆盖模型。 |
 | `--api-key KEY` | 覆盖 API 密钥。 |
 | `--base-url URL` | 覆盖 API endpoint。 |
 | `--verifier COMMAND` | 任务完成后执行的验证命令。 |
@@ -103,9 +120,17 @@ orca exec [OPTIONS] resume [SESSION_ID] [PROMPT]...
 
 ```bash
 orca exec "修复失败的测试" --verifier "cargo test"
-orca exec --output-format jsonl --max-turns 20 "重构解析器" > run.jsonl
+orca --plan exec --json --max-turns 20 "分析解析器" > run.jsonl
 orca exec resume SESSION_ID --resume-at MESSAGE_ID "从检查点继续"
+orca exec resume --last fix failing test
 ```
+
+`exec resume --last` 后的每个位置参数都属于提示词，不会消耗会话 ID。
+`--resume-at` 可以放在 `resume` 前后；两处传入不同的消息边界会报错。
+
+`doctor --json` 输出单个 JSON 报告，`exec --json` 输出 JSONL 事件，MCP
+`list` / `get --json` 保持原有 JSON 输出。使用快捷选项时不要同时传入对应的
+显式格式选项。
 
 需要保存输出时使用 shell 重定向；CLI 没有单独的输出路径选项。
 

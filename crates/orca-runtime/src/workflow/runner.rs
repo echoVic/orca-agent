@@ -4388,6 +4388,7 @@ mod tests {
             cwd: None,
             output_format: OutputFormat::Jsonl,
             approval_mode: ApprovalMode::FullAuto,
+            startup_approval_mode: None,
             execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             provider: ProviderKind::Mock,
             verifier: None,

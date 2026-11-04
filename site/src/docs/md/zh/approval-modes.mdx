@@ -9,11 +9,16 @@
 | plan | 只读。写入、网络、Shell、元数据写入和子 Agent 能力均被拒绝。 |
 | suggest | 工作区写入上限；运行时要求审批的地方仍需审批。 |
 | auto-edit | 工作区写入上限；按正常编辑策略执行。 |
-| full-auto | 最宽的能力上限；仍受平台沙箱和配置拒绝规则约束。 |
+| full-auto | Full Access，使用受信任主机执行；仍受操作系统权限和配置拒绝规则约束。 |
 
-选择能完成任务的最窄模式。尤其是 full-auto 不能绕过操作系统隔离、工作区信任或被拒绝的根目录。
+选择能完成任务的最窄模式。Full Access 在 Orca 的工作区沙箱之外执行主机工具；它不能覆盖操作系统权限、工作区信任或显式拒绝。
 
 ## 选择模式
+
+没有配置模式时，新 TUI 会话默认使用 `full-auto`（yolo），直接运行 `orca` 即开启
+Full Access，不再弹出模式确认。显式 CLI、环境变量和用户配置中的模式优先。恢复会话
+沿用会话保存的模式，除非通过 `--yolo` 或 `--mode` 覆盖。无界面的 `exec` 和共享
+daemon 默认使用 `auto-edit`；attach TUI 使用 daemon 的策略。
 
 无头运行使用 --mode：
 
@@ -21,10 +26,26 @@
 orca exec --mode plan "检查架构并提出修改建议"
 orca exec --mode suggest "修复失败的单元测试"
 orca exec --mode auto-edit "应用已审查的格式化改动"
-orca exec --mode full-auto "在一次性沙箱中执行任务"
+orca exec --mode full-auto "使用主机权限完成任务"
 ~~~
 
-根交互命令同样接受 --mode。其值既可以为 TUI 会话选择审批模式，也可以选择 server 或 acp 协议传输；选择传输时不要再组合任务提示词或子命令。
+`--yolo` 是 `--mode full-auto` 的简写，用于明确选择在启动或恢复会话时开启 Full Access：
+
+~~~bash
+orca --yolo
+orca --yolo --continue
+orca --resume SESSION_ID --yolo
+orca exec --yolo "完成任务"
+orca exec resume --last --yolo "继续任务"
+~~~
+
+传入 `--yolo` 后直接为当前会话选择模式，不再弹出 Full Access 二次确认。它会覆盖配置中的模式，但不修改配置文件。不要同时传入 `--mode`。也可以把它放在 `exec` 前面（`orca --yolo exec "完成任务"`），或用于启动 daemon（`orca --yolo daemon`）；attach 会话使用 daemon 的设置。
+
+只读规划可以直接使用 `orca --plan` 或 `orca exec --plan "分析架构"`，覆盖配置
+或恢复的模式。`--plan`、`--yolo`、`--mode` 三者互斥。
+
+根交互命令同样接受 `--mode`。协议客户端使用 `orca app-server` 或 `orca acp`；
+旧的 `--mode server` 与 `--mode acp` 继续可用。协议启动会拒绝提示词和历史选择参数。
 
 配置文件使用顶层 mode 字段，环境变量使用 ORCA_MODE：
 
@@ -40,7 +61,7 @@ CLI 选项优先于环境变量、受信任项目配置、用户配置和内置�
 
 ## 在 TUI 中修改
 
-`Shift+Tab` 依次切换模式：suggest → auto-edit → full-auto → plan。切到 full-auto 前会要求你明确确认 Full Access。状态栏左侧显示当前模式（`⇧Tab suggest`）。
+`Shift+Tab` 依次切换模式：suggest → auto-edit → full-auto → plan。切到 full-auto 前会要求你明确确认 Full Access。等待审批时，`Shift+Tab` 直接打开 Full Access 确认；已经开启时保持当前模式。状态栏左侧显示当前模式（`⇧Tab suggest`）。
 
 使用 /mode 查看或设置当前模式：
 
@@ -53,7 +74,7 @@ CLI 选项优先于环境变量、受信任项目配置、用户配置和内置�
 /plan off
 ~~~
 
-设置变更通过运行时应用，而不是修改本地提示词。模式变更只对当前会话生效，不会被保存。任务正等待审批时，应按界面展示的工具、目标和作用域作出决定，不要把切换模式当作捷径。
+设置变更通过运行时应用。模式变更记录在当前会话的运行时设置中，恢复会话时会继续使用；不会修改用户配置文件中的默认模式。确认 Full Access 后，等待审批的轮次也能立即应用设置。原来的请求仍需要你按界面展示的工具、目标和作用域回答一次；下一次工具调用使用新策略。取消 Full Access 会返回原来的待审批请求。
 
 ## 处理审批
 

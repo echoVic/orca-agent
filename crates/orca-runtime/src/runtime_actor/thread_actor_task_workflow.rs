@@ -1748,6 +1748,13 @@ impl ThreadActor {
                                     self.commit_surface_workflow_progress(fence, &progress),
                                 );
                             }
+                            // Keep the host waiting while background workers
+                            // flush progress and finish cancellation cleanup.
+                            Some(ThreadCommand::ShutdownThread { reply, .. }) => {
+                                if let Some(reply) = reply {
+                                    let _ = reply.send(ThreadShutdownAck::Retry);
+                                }
+                            }
                             Some(command) => Self::reject_thread_command_unavailable(command),
                             None => {}
                         }

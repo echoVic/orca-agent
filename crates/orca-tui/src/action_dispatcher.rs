@@ -201,6 +201,21 @@ fn route_action(
     // the legacy operation controller.
     let controller = surface_control;
     match action {
+        UserAction::SetModel(encoded) => {
+            let encoded = controller.stamp_settings_action(encoded);
+            if !controller.try_apply_active_full_access(&encoded) {
+                match enqueue_action(
+                    UserAction::SetModel(encoded),
+                    command_tx,
+                    &mut pending.commands,
+                    backlog_capacity,
+                ) {
+                    EnqueueResult::Queued => {}
+                    EnqueueResult::Disconnected => return false,
+                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                }
+            }
+        }
         UserAction::RespondToInteraction { key, response } => {
             // The frozen mutation inventory retains the historical `broker`
             // family name. This alias is the typed surface control itself; it

@@ -258,3 +258,22 @@ fn doctor_reports_which_prices_estimates_use() {
         "{detail}"
     );
 }
+
+#[test]
+fn doctor_json_shorthand_and_directory_alias_produce_the_stable_report() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir(&cwd).unwrap();
+    let legacy = run_doctor(&home, &cwd, &["--format", "json"]);
+    let short = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", &home)
+        .args(["doctor", "--json", "--cd", cwd.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(short.status.code(), legacy.status.code());
+    let legacy: Value = serde_json::from_slice(&legacy.stdout).unwrap();
+    let short: Value = serde_json::from_slice(&short.stdout).unwrap();
+    assert_eq!(short, legacy);
+    assert!(!home.exists(), "doctor must remain read-only");
+}

@@ -49,6 +49,7 @@ mod tests {
             cwd: None,
             output_format,
             approval_mode: orca_core::approval_types::ApprovalMode::Suggest,
+            startup_approval_mode: None,
             execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             provider: ProviderKind::Mock,
             verifier: None,

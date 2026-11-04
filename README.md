@@ -66,8 +66,11 @@ re-parsing; legacy string commands use the resolved shell dialect.
 ```bash
 export DEEPSEEK_API_KEY=sk-...
 
-orca                                      # open the terminal UI
+orca                                      # open the terminal UI (Full Access by default)
+orca --yolo                               # start with Full Access (full-auto)
+orca --yolo --continue                    # resume the latest session with Full Access
 orca exec "fix the failing test"          # run headlessly
+orca exec --yolo "finish the task"        # run headlessly with Full Access
 printf '%s' "$INSTRUCTION" | orca exec   # keep arbitrary prompt text out of argv
 orca exec --verifier "cargo test" "fix it" # verify before finishing
 orca exec resume SESSION_ID "continue"    # resume a headless session
@@ -75,7 +78,9 @@ orca exec resume --last "continue"        # resume the most recent session
 orca exec resume SID --resume-at MID "continue"  # resume up to a message boundary
 orca --resume [SESSION_ID]                # resume a saved conversation
 orca --fork SESSION_ID                    # fork a saved conversation
-orca --mode=acp                           # connect an ACP client
+orca acp                                  # connect an ACP client
+orca app-server                           # serve the JSON-RPC app protocol
+orca --plan exec --json -C ./project "inspect it"  # read-only JSONL run
 orca doctor                               # check the key, trust, and sandbox locally
 ```
 
@@ -97,6 +102,11 @@ continue untrusted: trust lets Orca load the project's configuration,
 instructions, skills, agents, and workflows, and never enables or bypasses the
 OS sandbox. Then type a task and press `Enter`.
 
+New TUI sessions default to Full Access (`full-auto`, also called yolo) when no
+mode is configured. An explicit `--mode`, `ORCA_MODE`, or user config mode takes
+precedence. Resuming keeps the conversation’s saved mode; use `--yolo` to force
+Full Access on resume. Headless `exec` and shared daemons default to `auto-edit`.
+
 - **Mention and command.** `@` mentions files, skills, plugins, and MCP
   resources; `$` inserts a skill; `/` opens the command menu; `?` lists every
   key. `Ctrl+V` attaches a clipboard image.
@@ -115,11 +125,13 @@ OS sandbox. Then type a task and press `Enter`.
   stops the whole turn instead. On a window panel, press `4` to keep the
   window and let Orca continue. An MCP tool can also be always
   allowed, alone or with its whole server, as a rule saved to your config. `Shift+Tab` cycles
-  `suggest` → `auto-edit` → `full-auto` → `plan`. Entering `full-auto` asks for
-  an explicit Full Access confirmation; the running task picks it up at its
-  next tool call, while tools already running and subagents already launched
-  keep their original policy. Mode changes last for the session and are never
-  saved.
+  `suggest` → `auto-edit` → `full-auto` → `plan`. While waiting for approval,
+  `Shift+Tab` opens Full Access confirmation directly. Confirming applies
+  `full-auto` without waiting for the turn to finish; answer the original
+  pending request once to continue. The next tool call uses the new policy,
+  while tools already admitted and subagents already launched keep their
+  original policy. Mode changes are recorded in the current conversation and restored on resume;
+  they do not change the default mode in your config.
 - **Background work.** `/tasks` shows the tasks dock under the conversation,
   where background turns, subagents, commands, monitors, and workflow children
   appear. `/agents` opens the Agent Workspace with each task's live
@@ -219,8 +231,8 @@ recall, storage, privacy, and deletion.
 - Exposes stable JSONL, app-server, and Agent Client Protocol (ACP) contracts
   for editors, harnesses, and CI.
 
-Configuration priority is environment variables, CLI arguments, config files,
-then defaults. Run `orca --help` or `orca exec --help` for the full command
+Configuration priority is CLI arguments, environment variables, trusted project
+configuration, user configuration, then defaults. Run `orca --help` or `orca exec --help` for the full command
 surface. User configuration lives at `~/.orca/config.toml`; trusted projects
 can also provide `.orca/config.toml`, `AGENTS.md`, rules, skills, and workflows.
 

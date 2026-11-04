@@ -609,6 +609,7 @@ fn test_config(history_mode: HistoryMode) -> RunConfig {
         cwd: None,
         output_format: OutputFormat::Text,
         approval_mode: ApprovalMode::Suggest,
+        startup_approval_mode: None,
         execution_profile: orca_core::capability::ExecutionProfile::Workspace,
         provider: ProviderKind::Mock,
         verifier: None,
@@ -753,7 +754,7 @@ done
         ensure_hosted_thread(
             &mut thread,
             &host_handle,
-            &config.lock().unwrap().clone(),
+            &config,
             &preloaded,
             "First MCP session",
             &event_tx,
@@ -3768,6 +3769,64 @@ fn picker_resume_requires_authoritative_session_reset() {
 }
 
 #[test]
+fn startup_yolo_is_consumed_before_later_picker_session_switches() {
+    with_orca_home(|_| {
+        let mut source = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+        source.send(UserAction::Submit("saved suggest session".to_string()));
+        let source_id =
+            match source.recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(_))) {
+                TuiEvent::MentionRuntimeReady(thread) => thread.session_id().unwrap().to_string(),
+                _ => unreachable!(),
+            };
+        source.recv_until(
+            |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success"),
+        );
+        source.send(UserAction::SetModel(
+            orca_core::model::FLASH_MODEL.to_string(),
+        ));
+        source.recv_until(|event| {
+            if let TuiEvent::Error(message) | TuiEvent::OperationRejected(message) = event {
+                panic!("source settings: {message}");
+            }
+            matches!(event, TuiEvent::SettingsUpdated { model, .. }
+                if model == orca_core::model::FLASH_MODEL)
+        });
+        source.shutdown();
+
+        let mut cfg = test_config(HistoryMode::Record);
+        cfg.approval_mode = ApprovalMode::FullAuto;
+        cfg.execution_profile = orca_core::capability::ExecutionProfile::TrustedHost;
+        cfg.startup_approval_mode = Some(ApprovalMode::FullAuto);
+        let mut harness = HostedTuiHarness::start(cfg, None);
+        harness.send(UserAction::Submit("first yolo task".to_string()));
+        harness.recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(_)));
+        harness.recv_until(
+            |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success"),
+        );
+        assert_eq!(
+            harness.config.lock().unwrap().startup_approval_mode,
+            None,
+            "the first hosted start must consume the shared launch intent"
+        );
+        harness.send(UserAction::ResumeSavedSession {
+            session_id: source_id.clone(),
+        });
+        harness.recv_until(|event| {
+            if let TuiEvent::Error(message) | TuiEvent::OperationRejected(message) = event {
+                panic!("picker switch: {message}");
+            }
+            matches!(event, TuiEvent::SessionProjectionReset(projection)
+            if projection.session_id.as_deref() == Some(source_id.as_str()))
+        });
+        assert_eq!(
+            harness.config.lock().unwrap().approval_mode,
+            ApprovalMode::Suggest
+        );
+        harness.shutdown();
+    });
+}
+
+#[test]
 fn picker_resume_restores_runtime_settings_before_next_submit() {
     with_orca_home(|_| {
         let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
@@ -4241,6 +4300,221 @@ fn hosted_canonical_permission_uses_operation_fence_and_resumes_turn() {
             terminal,
             TuiEvent::SessionCompleted { status } if status == "success"
         ));
+        harness.shutdown();
+    });
+}
+
+#[test]
+fn hosted_approval_wait_allows_full_access_and_then_resumes_the_same_turn() {
+    for (permission, mode) in [
+        (true, ApprovalMode::Suggest),
+        (true, ApprovalMode::AutoEdit),
+        (false, ApprovalMode::Suggest),
+    ] {
+        with_orca_home(|home| {
+            let mut config = test_config(HistoryMode::Record);
+            config.approval_mode = mode;
+            config.cwd = Some(home.to_path_buf());
+            std::fs::write(home.join("approval.txt"), "old").unwrap();
+            let mut harness = HostedTuiHarness::start(config.clone(), None);
+            harness.send(UserAction::Submit(if permission {
+                "request_network_permissions_then_done example.com".to_string()
+            } else {
+                "edit approval.txt :: old => new".to_string()
+            }));
+            let approval = harness.recv_until(|event| {
+                matches!(
+                    event,
+                    TuiEvent::PermissionApprovalNeeded { .. } | TuiEvent::ApprovalNeeded { .. }
+                )
+            });
+            let key = match &approval {
+                TuiEvent::PermissionApprovalNeeded { key, .. }
+                | TuiEvent::ApprovalNeeded { key, .. } => key.clone(),
+                _ => unreachable!(),
+            };
+            let mut state = AppState::new(
+                harness.action_tx.clone(),
+                "test".into(),
+                "mock".into(),
+                "/tmp".into(),
+            );
+            state.approval_mode = mode;
+            state.update(approval);
+            crate::key_event_actions::handle_key_event_preflight(
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                &mut state,
+                &config,
+                &harness.action_tx,
+                &mut VimState::new(false),
+                false,
+                || Ok(()),
+            )
+            .unwrap();
+            assert!(state.full_access_confirmation.is_some());
+            for code in [KeyCode::Up, KeyCode::Enter] {
+                crate::full_access_confirmation_actions::handle_full_access_confirmation_key(
+                    &KeyEvent::new(code, KeyModifiers::NONE),
+                    &mut state,
+                    &harness.action_tx,
+                );
+            }
+            let updated = harness.recv_until(|event| {
+                matches!(
+                    event,
+                    TuiEvent::SettingsUpdated { .. } | TuiEvent::OperationRejected(_)
+                )
+            });
+            assert!(
+                matches!(
+                    &updated,
+                    TuiEvent::SettingsUpdated {
+                        approval_mode: ApprovalMode::FullAuto,
+                        ..
+                    }
+                ),
+                "{updated:?}"
+            );
+            state.update(updated);
+            assert_eq!(state.approval_mode, ApprovalMode::FullAuto);
+            assert_eq!(state.status, AppStatus::WaitingApproval);
+            assert_eq!(
+                state.approval_dialog.as_ref().unwrap().interaction,
+                Some(key)
+            );
+            let applied = harness.config.lock().unwrap().clone();
+            assert_eq!(
+                applied.execution_profile,
+                orca_core::capability::ExecutionProfile::TrustedHost
+            );
+            assert!(applied.active_permission_profile.is_none());
+
+            // The request admitted under the old policy still needs its answer.
+            resolve_approval_option(&mut state, &harness.action_tx, ApprovalOption::Once);
+            let terminal =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            assert!(matches!(
+                terminal,
+                TuiEvent::SessionCompleted { status } if status == "success"
+            ));
+            if !permission {
+                assert_eq!(
+                    std::fs::read_to_string(home.join("approval.txt")).unwrap(),
+                    "new"
+                );
+            }
+            harness.shutdown();
+        });
+    }
+}
+
+#[test]
+fn hosted_full_access_supersedes_older_queued_mode_but_keeps_reasoning_change() {
+    with_orca_home(|_| {
+        let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+        harness.send(UserAction::Submit(
+            "request_network_permissions_then_done example.com".to_string(),
+        ));
+        let approval =
+            harness.recv_until(|event| matches!(event, TuiEvent::PermissionApprovalNeeded { .. }));
+        let mut state = AppState::new(
+            harness.action_tx.clone(),
+            "test".into(),
+            "mock".into(),
+            "/tmp".into(),
+        );
+        state.update(approval);
+        harness.send(UserAction::SetModel(
+            crate::slash_command_actions::encode_settings_intent(
+                None,
+                Some(orca_core::config::ReasoningEffort::High),
+                Some(ApprovalMode::AutoEdit),
+            ),
+        ));
+        harness.send(UserAction::SetModel(
+            crate::slash_command_actions::encode_confirmed_full_access_intent(None, None),
+        ));
+        let full_access =
+            harness.recv_until(|event| matches!(event, TuiEvent::SettingsUpdated { .. }));
+        state.update(full_access);
+        assert_eq!(state.approval_mode, ApprovalMode::FullAuto);
+        resolve_approval_option(&mut state, &harness.action_tx, ApprovalOption::Once);
+        harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+        let older_settings =
+            harness.recv_until(|event| matches!(event, TuiEvent::SettingsUpdated { .. }));
+        state.update(older_settings);
+        assert_eq!(
+            state.reasoning_effort,
+            orca_core::config::ReasoningEffort::High
+        );
+        assert_eq!(state.approval_mode, ApprovalMode::FullAuto);
+        assert_eq!(
+            harness.config.lock().unwrap().approval_mode,
+            ApprovalMode::FullAuto
+        );
+        let runtime = harness.runtime.controller().runtime_thread().unwrap();
+        let snapshot = crate::surface_actions::TuiSurfaceActions::new(runtime.typed_surface())
+            .read_snapshot()
+            .unwrap();
+        assert_eq!(
+            snapshot.settings.effective.approval_mode,
+            orca_runtime::surface::SurfaceApprovalMode::FullAuto
+        );
+
+        // A later intentional mode change remains available.
+        harness.send(UserAction::SetModel(
+            crate::slash_command_actions::encode_settings_intent(
+                None,
+                None,
+                Some(ApprovalMode::Plan),
+            ),
+        ));
+        let later_settings =
+            harness.recv_until(|event| matches!(event, TuiEvent::SettingsUpdated { .. }));
+        state.update(later_settings);
+        assert_eq!(state.approval_mode, ApprovalMode::Plan);
+        harness.shutdown();
+    });
+}
+
+#[test]
+fn rejected_active_full_access_keeps_the_pending_approval_answerable() {
+    with_orca_home(|_| {
+        let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+        harness.send(UserAction::Submit(
+            "request_network_permissions_then_done example.com".to_string(),
+        ));
+        let approval =
+            harness.recv_until(|event| matches!(event, TuiEvent::PermissionApprovalNeeded { .. }));
+        let mut state = AppState::new(
+            harness.action_tx.clone(),
+            "test".into(),
+            "mock".into(),
+            "/tmp".into(),
+        );
+        state.update(approval);
+        let key = state.approval_dialog.as_ref().unwrap().interaction.clone();
+        harness.runtime.controller().restrict_hosted_settings(true);
+        harness.send(UserAction::SetModel(
+            crate::slash_command_actions::encode_confirmed_full_access_intent(None, None),
+        ));
+        let rejected = harness.recv_until(|event| {
+            matches!(
+                event,
+                TuiEvent::Error(_)
+                    | TuiEvent::OperationRejected(_)
+                    | TuiEvent::SettingsUpdated { .. }
+            )
+        });
+        state.update(rejected);
+        assert_eq!(state.status, AppStatus::WaitingApproval);
+        assert_eq!(state.approval_dialog.as_ref().unwrap().interaction, key);
+        assert_eq!(
+            harness.config.lock().unwrap().approval_mode,
+            ApprovalMode::Suggest
+        );
+        resolve_approval_option(&mut state, &harness.action_tx, ApprovalOption::Once);
+        harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
         harness.shutdown();
     });
 }

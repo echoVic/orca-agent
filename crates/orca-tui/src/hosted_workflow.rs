@@ -33,7 +33,7 @@ pub(crate) fn handle_hosted_workflow_action(
             if let Err(error) = ensure_hosted_thread(
                 thread,
                 host,
-                &cfg,
+                config,
                 preloaded,
                 &format!("Run saved workflow `{name}`"),
                 event_tx,

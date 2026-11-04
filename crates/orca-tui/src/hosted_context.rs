@@ -34,12 +34,11 @@ pub(crate) fn handle_hosted_context_action(
         HostedContextAction::Remember { scope, note } => {
             let context = format!("[Pinned remembered note]\n{}", note.trim());
             let thread_was_missing = thread.is_none();
-            let cfg = config.lock().unwrap().clone();
             if thread.is_none()
                 && let Err(error) = ensure_hosted_thread(
                     thread,
                     host,
-                    &cfg,
+                    config,
                     preloaded,
                     "Remembered context",
                     event_tx,
@@ -56,6 +55,7 @@ pub(crate) fn handle_hosted_context_action(
                     control,
                 );
             }
+            let cfg = config.lock().unwrap().clone();
             if let Some(runtime_thread) = thread.as_ref() {
                 let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
                 let cwd = cfg
@@ -166,6 +166,82 @@ mod tests {
         assert!(preloaded.lock().unwrap().is_none());
 
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn first_project_remember_uses_recovered_workspace() {
+        let _home = crate::test_support::isolate_orca_home();
+        let saved_root = tempfile::tempdir().unwrap();
+        let saved_root = saved_root.path().canonicalize().unwrap();
+        let launch_root = tempfile::tempdir().unwrap();
+        let mut cfg = crate::test_support::test_run_config();
+        cfg.history_mode = HistoryMode::Record;
+        cfg.cwd = Some(saved_root.clone());
+        let source_host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+        let source = source_host
+            .handle()
+            .start_thread(cfg, "saved workspace")
+            .unwrap();
+        let session_id = source.session_id().unwrap().to_string();
+        TuiSurfaceActions::new(source.typed_surface())
+            .update_settings(
+                orca_runtime::surface::NonEmptyVec::try_new(vec![
+                    orca_runtime::surface::RuntimeSettingsPatch::SetModel {
+                        model: orca_runtime::surface::NonEmptyText::try_new(
+                            orca_core::model::FLASH_MODEL.to_string(),
+                        )
+                        .unwrap(),
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        source.shutdown().unwrap();
+        source_host.shutdown().unwrap();
+        let mut cfg = crate::test_support::test_run_config();
+        cfg.history_mode = HistoryMode::Resume(session_id.clone());
+        cfg.cwd = Some(launch_root.path().canonicalize().unwrap());
+        let config = Arc::new(Mutex::new(cfg));
+        let preloaded = Arc::new(Mutex::new(Some(
+            history::load_session(&session_id).unwrap(),
+        )));
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+        let mut thread = None;
+        handle_hosted_context_action(
+            HostedContextAction::Remember {
+                scope: TuiMemoryScope::Project,
+                note: "persist in the recovered project".to_string(),
+            },
+            &mut thread,
+            &host.handle(),
+            &config,
+            &preloaded,
+            &event_tx,
+            &control,
+        );
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        thread.take().unwrap().shutdown().unwrap();
+        host.shutdown().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TuiEvent::Error(_))),
+            "{events:?}"
+        );
+        assert!(
+            orca_runtime::memory::load_for_cwd(&saved_root)
+                .project
+                .as_deref()
+                .is_some_and(|memory| memory.contains("persist in the recovered project")),
+            "the remembered note belongs to the recovered workspace"
+        );
+        assert!(
+            orca_runtime::memory::load_for_cwd(launch_root.path())
+                .project
+                .is_none()
+        );
     }
 
     #[test]

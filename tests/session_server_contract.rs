@@ -10516,3 +10516,37 @@ done
     }
     server
 }
+
+#[test]
+fn named_app_server_streams_a_real_turn_using_subcommand_options() {
+    let cwd = tempdir().unwrap();
+    let mut child = orca_command()
+        .args([
+            "app-server",
+            "--provider",
+            "mock",
+            "--cwd",
+            cwd.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin_mut(),
+        "{}",
+        json!({"id":"named", "op":"submit", "prompt":"hello from named server"})
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let events = parse_jsonl(&output.stdout);
+    assert!(has_event(&events, "message_delta"));
+    let completed = events
+        .iter()
+        .find(|event| event["id"] == "named" && event["event"] == "turn_completed")
+        .unwrap();
+    assert_eq!(completed["status"], "success");
+}

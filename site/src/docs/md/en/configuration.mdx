@@ -31,6 +31,10 @@ For an individual setting, precedence is:
 4. User `config.toml`
 5. Built-in default
 
+The built-in approval mode is `full-auto` (yolo) for a new TUI session and
+`auto-edit` for headless `exec` and shared daemons. A resumed conversation keeps
+its saved mode unless the launch explicitly selects `--mode` or `--yolo`.
+
 ## Minimal user configuration
 
 ```toml

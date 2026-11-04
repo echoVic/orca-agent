@@ -233,12 +233,14 @@ mod tests {
     use super::RendererInputRouter;
     use crate::composer_textarea::textarea_text;
     use crate::input_event_actions::BatchedInputEvent;
-    use crate::protocol::UserAction;
+    use crate::protocol::{
+        TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse, UserAction,
+    };
     use crate::selection::{SelectionGranularity, SelectionPos, TranscriptSelection};
     use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
     use crate::test_support::test_run_config;
     use crate::theme::Theme;
-    use crate::types::{AppState, PlanApprovalDialog};
+    use crate::types::{AppState, AppStatus, PlanApprovalDialog};
     use crate::vim::{VimMode, VimState};
 
     struct Fixture {
@@ -336,6 +338,179 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         })
+    }
+
+    #[test]
+    fn waiting_approval_can_confirm_full_access_without_answering_the_pending_request() {
+        for (permission, mode) in [
+            (false, ApprovalMode::Suggest),
+            (false, ApprovalMode::AutoEdit),
+            (true, ApprovalMode::Suggest),
+            (true, ApprovalMode::AutoEdit),
+            (true, ApprovalMode::Plan),
+        ] {
+            for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                let mut fixture = Fixture::new();
+                fixture.state.approval_mode = mode;
+                let key = TuiInteractionKey::new(
+                    orca_core::cancel::OperationIdAllocator::new().allocate(),
+                    "blocked-command",
+                    if permission {
+                        TuiInteractionKind::Permission
+                    } else {
+                        TuiInteractionKind::Approval
+                    },
+                );
+                fixture.state.update(if permission {
+                    TuiEvent::PermissionApprovalNeeded {
+                        key: key.clone(),
+                        tool: "bash".into(),
+                        target: Some("example.com".into()),
+                        preview: None,
+                        permission_kind:
+                            orca_runtime::runtime_permission::RuntimePermissionRequestKind::NetworkBlock,
+                    }
+                } else {
+                    TuiEvent::ApprovalNeeded {
+                        key: key.clone(),
+                        tool: "bash".into(),
+                        target: Some("touch result.txt".into()),
+                        preview: None,
+                    }
+                });
+                fixture
+                    .route(
+                        BatchedInputEvent::Event(Event::Key(KeyEvent::new(
+                            KeyCode::BackTab,
+                            modifiers,
+                        ))),
+                        Instant::now(),
+                        || Ok(()),
+                    )
+                    .unwrap();
+
+                assert!(
+                    fixture.state.full_access_confirmation.is_some(),
+                    "Shift+Tab must open Full Access while awaiting approval"
+                );
+                assert_eq!(fixture.state.status, AppStatus::WaitingApproval);
+                assert_eq!(fixture.state.approval_mode, mode);
+                assert_eq!(
+                    fixture.state.approval_dialog.as_ref().unwrap().interaction,
+                    Some(key.clone())
+                );
+                assert!(fixture.action_rx.try_recv().is_err());
+
+                // Default Enter and Esc return without answering the request.
+                for cancel in [KeyCode::Enter, KeyCode::Esc] {
+                    fixture
+                        .route(
+                            BatchedInputEvent::Event(Event::Key(KeyEvent::new(
+                                cancel,
+                                KeyModifiers::NONE,
+                            ))),
+                            Instant::now(),
+                            || Ok(()),
+                        )
+                        .unwrap();
+                    assert!(fixture.state.full_access_confirmation.is_none());
+                    assert_eq!(fixture.state.status, AppStatus::WaitingApproval);
+                    assert!(fixture.action_rx.try_recv().is_err());
+                    if cancel == KeyCode::Enter {
+                        fixture
+                            .route(
+                                BatchedInputEvent::Event(Event::Key(KeyEvent::new(
+                                    KeyCode::BackTab,
+                                    modifiers,
+                                ))),
+                                Instant::now(),
+                                || Ok(()),
+                            )
+                            .unwrap();
+                    }
+                }
+
+                for code in [KeyCode::BackTab, KeyCode::Up, KeyCode::Enter] {
+                    fixture
+                        .route(
+                            BatchedInputEvent::Event(Event::Key(KeyEvent::new(
+                                code,
+                                KeyModifiers::NONE,
+                            ))),
+                            Instant::now(),
+                            || Ok(()),
+                        )
+                        .unwrap();
+                }
+                let UserAction::SetModel(encoded) = fixture.action_rx.try_recv().unwrap() else {
+                    panic!("confirmation must submit a settings change");
+                };
+                let intent =
+                    crate::slash_command_actions::decode_settings_intent(&encoded).unwrap();
+                assert!(intent.full_access_confirmed);
+                assert_eq!(intent.approval_mode, Some(ApprovalMode::FullAuto));
+                assert_eq!(
+                    crate::hosted_settings::settings_intent_patches(intent),
+                    vec![orca_runtime::surface::RuntimeSettingsPatch::EnableFullAccess]
+                );
+                assert_eq!(
+                    fixture.state.approval_dialog.as_ref().unwrap().interaction,
+                    Some(key)
+                );
+                assert!(fixture.action_rx.try_recv().is_err());
+                fixture.state.approval_mode = ApprovalMode::FullAuto;
+                fixture
+                    .route(
+                        BatchedInputEvent::Event(Event::Key(KeyEvent::new(
+                            KeyCode::BackTab,
+                            modifiers,
+                        ))),
+                        Instant::now(),
+                        || Ok(()),
+                    )
+                    .unwrap();
+                assert!(fixture.state.full_access_confirmation.is_none());
+                assert!(fixture.action_rx.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn waiting_approval_tab_still_selects_an_option_before_enter_answers_it() {
+        let mut fixture = Fixture::new();
+        fixture.state.update(TuiEvent::ApprovalNeeded {
+            key: TuiInteractionKey::new(
+                orca_core::cancel::OperationIdAllocator::new().allocate(),
+                "approval",
+                TuiInteractionKind::Approval,
+            ),
+            tool: "edit".into(),
+            target: Some("result.txt".into()),
+            preview: None,
+        });
+        for code in [KeyCode::Tab, KeyCode::Enter] {
+            fixture
+                .route(
+                    BatchedInputEvent::Event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE))),
+                    Instant::now(),
+                    || Ok(()),
+                )
+                .unwrap();
+            if code == KeyCode::Tab {
+                assert_eq!(fixture.state.approval_dialog.as_ref().unwrap().selected, 1);
+                assert!(fixture.state.full_access_confirmation.is_none());
+                assert!(fixture.action_rx.try_recv().is_err());
+            }
+        }
+        assert!(matches!(
+            fixture.action_rx.try_recv(),
+            Ok(UserAction::RespondToInteraction {
+                response: TuiInteractionResponse::Approval(true),
+                ..
+            })
+        ));
+        assert!(fixture.state.approval_dialog.is_none());
+        assert_eq!(fixture.state.status, AppStatus::Running);
     }
 
     #[test]

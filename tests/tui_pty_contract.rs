@@ -16,6 +16,242 @@ const PROMPT: &str = "typed TUI PTY submit";
 const ASSISTANT_SENTINEL: &str = "Mock runtime completed the headless harness contract.";
 
 #[test]
+fn tui_defaults_to_full_access_and_preserves_the_mode_when_resuming() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let outside = tempfile::tempdir().expect("outside workspace");
+    orca_core::config::folder_trust::set_trust_with_config_dir(
+        cwd.path(),
+        home.path(),
+        orca_core::config::folder_trust::TrustLevel::Trusted,
+    )
+    .expect("trust workspace");
+
+    for resume in [false, true] {
+        let marker = outside.path().join(if resume {
+            "resumed-default.txt"
+        } else {
+            "default.txt"
+        });
+        let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
+        command
+            .env_remove("ORCA_SHELL")
+            .env_remove("ORCA_MODE")
+            .args(["--provider", "mock", "--cwd"])
+            .arg(cwd.path());
+        if resume {
+            command.arg("--continue");
+        }
+        let completed = if resume {
+            "RESUMED_HOST_ACCESS_COMPLETED"
+        } else {
+            "DEFAULT_HOST_ACCESS_COMPLETED"
+        };
+        // Encode the sentinel so only the new tool result contains it, never
+        // the prompt or the earlier completion replayed from saved history.
+        let encoded: String = completed
+            .bytes()
+            .map(|byte| format!("\\{byte:03o}"))
+            .collect();
+        command.arg(format!(
+            "bash echo DEFAULT_HOST_ACCESS > \"{}\" && printf '{encoded}'",
+            marker.display()
+        ));
+        let mut process =
+            PtyProcess::spawn_command(command, home.path()).expect("spawn default TUI");
+        let mut output = Vec::new();
+        if !resume {
+            accept_new_workspace(&mut process, &mut output);
+        }
+        assert_screen_shows_wrapped_token(
+            &process,
+            &mut output,
+            completed,
+            "default TUI did not execute the new tool without approval",
+        );
+        assert_screen_shows(
+            &process,
+            &mut output,
+            "full-auto",
+            "default TUI did not show Full Access",
+        );
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap().trim(),
+            "DEFAULT_HOST_ACCESS"
+        );
+        arm_idle_exit(&mut process, &mut output);
+        let status = process.wait_for_exit(Duration::from_secs(5));
+        process.close_io_and_join();
+        assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+    }
+}
+
+#[test]
+fn tui_resume_preserves_saved_suggest_despite_the_full_access_default() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(home.path().join("config.toml"), "mode = \"suggest\"\n").unwrap();
+    record_suggest_with_model_settings(home.path(), cwd.path());
+    std::fs::remove_file(home.path().join("config.toml")).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
+    command
+        .env_remove("ORCA_MODE")
+        .args(["--continue", "--provider", "mock", "--cwd"])
+        .arg(cwd.path())
+        .arg("resume the saved suggest settings");
+    let mut process = PtyProcess::spawn_command(command, home.path()).expect("resume suggest TUI");
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    receive_until(
+        &process,
+        &mut output,
+        ASSISTANT_SENTINEL,
+        Duration::from_secs(10),
+        "resumed TUI did not complete",
+    );
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "⇧Tab suggest",
+        "TUI reset the saved mode to its default",
+    );
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
+fn tui_yolo_resumes_with_full_auto_without_a_mode_confirmation() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let outside = tempfile::tempdir().expect("outside workspace");
+    std::fs::write(home.path().join("config.toml"), "mode = \"suggest\"\n")
+        .expect("suggest config");
+    orca_core::config::folder_trust::set_trust_with_config_dir(
+        cwd.path(),
+        home.path(),
+        orca_core::config::folder_trust::TrustLevel::Trusted,
+    )
+    .expect("trust workspace");
+    record_suggest_with_model_settings(home.path(), cwd.path());
+    let marker = outside.path().join("tui-yolo.txt");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
+    command
+        .env_remove("ORCA_SHELL")
+        .args(["--yolo", "--continue", "--provider", "mock", "--cwd"])
+        .arg(cwd.path())
+        .arg(format!(
+            "bash echo TUI_HOST_ACCESS > \"{}\"",
+            marker.display()
+        ));
+    let mut process = PtyProcess::spawn_command(command, home.path()).expect("spawn yolo TUI");
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    receive_until(
+        &process,
+        &mut output,
+        "Mock completed after tool execution.",
+        Duration::from_secs(10),
+        "yolo TUI did not finish its tool without an approval",
+    );
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "full-auto",
+        "yolo TUI did not show full-auto",
+    );
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap().trim(),
+        "TUI_HOST_ACCESS"
+    );
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
+fn exec_yolo_overrides_saved_runtime_settings_on_resume() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let outside = tempfile::tempdir().expect("outside workspace");
+    std::fs::write(home.path().join("config.toml"), "mode = \"suggest\"\n").unwrap();
+    record_suggest_with_model_settings(home.path(), cwd.path());
+    let marker = outside.path().join("exec-yolo-settings.txt");
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env_remove("ORCA_SHELL")
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "resume",
+            "--last",
+            "--yolo",
+            "--output-format",
+            "jsonl",
+        ])
+        .args(["--provider", "mock", "--cwd"])
+        .arg(cwd.path())
+        .arg(format!(
+            "bash echo SETTINGS_HOST_ACCESS > \"{}\"",
+            marker.display()
+        ))
+        .output()
+        .expect("resume exec with saved settings");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let started = events
+        .iter()
+        .find(|event| event["type"] == "session.started")
+        .unwrap();
+    assert_eq!(started["payload"]["approval_mode"], "full-auto");
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap().trim(),
+        "SETTINGS_HOST_ACCESS"
+    );
+}
+
+fn record_suggest_with_model_settings(home: &std::path::Path, cwd: &std::path::Path) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
+    command
+        .env_remove("ORCA_MODE")
+        .args(["--provider", "mock", "--cwd"])
+        .arg(cwd)
+        .arg("remember settings task");
+    let mut source = PtyProcess::spawn_command(command, home).expect("spawn source suggest TUI");
+    let mut output = Vec::new();
+    accept_new_workspace(&mut source, &mut output);
+    receive_until(
+        &source,
+        &mut output,
+        ASSISTANT_SENTINEL,
+        Duration::from_secs(10),
+        "source task did not finish",
+    );
+    source
+        .write(b"/model deepseek-flash\r")
+        .expect("change model");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::fs::read_to_string(home.join("config.toml"))
+            .is_ok_and(|config| config.contains("model = \"deepseek-flash\""))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "model settings did not commit");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    arm_idle_exit(&mut source, &mut output);
+    let status = source.wait_for_exit(Duration::from_secs(5));
+    source.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "source TUI exited with {status}");
+}
+
+#[test]
 fn tui_submit_renders_and_restores_the_terminal() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");
@@ -791,7 +1027,7 @@ fn tui_side_toggle_keeps_transcripts_visible_without_resubmitting() {
     assert_screen_shows(
         &process,
         &mut output,
-        "⇧Tab auto-edit Side · Ctrl+/",
+        "⇧Tab full-auto Side · Ctrl+/",
         "TUI did not restore the parent status line",
     );
     assert_screen_shows(

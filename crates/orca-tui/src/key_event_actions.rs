@@ -1744,11 +1744,26 @@ where
     if key.code == KeyCode::BackTab
         && matches!(
             state.status,
-            AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+            AppStatus::Idle
+                | AppStatus::Running
+                | AppStatus::WaitingApproval
+                | AppStatus::WaitingUserInput
         )
     {
         vim_state.cancel_pending_command();
-        cycle_approval_mode(state, action_tx);
+        if state.status == AppStatus::WaitingApproval {
+            if state.approval_mode != orca_core::approval_types::ApprovalMode::FullAuto {
+                crate::full_access_confirmation_actions::request_settings_change(
+                    state,
+                    action_tx,
+                    None,
+                    None,
+                    Some(orca_core::approval_types::ApprovalMode::FullAuto),
+                );
+            }
+        } else {
+            cycle_approval_mode(state, action_tx);
+        }
         return Ok(KeyEventFlow::Continue);
     }
 

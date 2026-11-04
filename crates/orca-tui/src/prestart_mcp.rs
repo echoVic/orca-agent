@@ -637,7 +637,7 @@ mod tests {
             crate::hosted_session_lifecycle::ensure_hosted_thread(
                 &mut thread,
                 &host.handle(),
-                &config,
+                &Arc::new(Mutex::new(config)),
                 &Arc::new(Mutex::new(None)),
                 "hello",
                 &event_tx,

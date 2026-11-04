@@ -620,6 +620,7 @@ mod tests {
             api_key: None,
             base_url: None,
             approval_mode: ApprovalMode::Suggest,
+            startup_approval_mode: None,
             execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             output_format: OutputFormat::Jsonl,
             verifier: None,

@@ -83,20 +83,15 @@ pub(crate) fn handle_hosted_queued_prompt(
     control: &TuiSurfaceTaskControl,
     host: &RuntimeHostHandle,
 ) {
-    let cfg = config.lock().unwrap().clone();
     let rejection_prompt = prompt.clone();
     let submitted = SubmittedTurn::user_with_mentions(prompt, bindings, images);
     let rejection_bindings = submitted.rejection_bindings();
     let rejection_images = submitted.rejection_images();
     let thread_was_missing = thread.is_none();
-    let cwd = cfg
-        .cwd
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     if let Err(error) = ensure_hosted_thread(
         thread,
         host,
-        &cfg,
+        config,
         preloaded,
         submitted.prompt(),
         event_tx,
@@ -119,6 +114,11 @@ pub(crate) fn handle_hosted_queued_prompt(
     if !thread_was_missing {
         title_new_conversation(runtime_thread, submitted.prompt(), event_tx);
     }
+    let cfg = config.lock().unwrap().clone();
+    let cwd = cfg
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let roots = cfg
         .runtime_workspace_roots
         .clone()
@@ -175,17 +175,12 @@ pub(crate) fn handle_hosted_submitted_turn(
     let rejection_bindings = submitted_turn.rejection_bindings();
     let rejection_images = submitted_turn.rejection_images();
     let queued_id = submitted_turn.queued_id();
-    let cfg = config.lock().unwrap().clone();
     let thread_was_missing = thread.is_none();
-    let cwd = cfg
-        .cwd
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let title_seed = submitted_turn.title_seed(submitted_turn.prompt());
     if let Err(error) = ensure_hosted_thread(
         thread,
         host,
-        &cfg,
+        config,
         preloaded,
         &title_seed,
         event_tx,
@@ -209,6 +204,11 @@ pub(crate) fn handle_hosted_submitted_turn(
     if !thread_was_missing && rejection_prompt.is_some() {
         title_new_conversation(runtime_thread, &title_seed, event_tx);
     }
+    let cfg = config.lock().unwrap().clone();
+    let cwd = cfg
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let workspace_roots = cfg
         .runtime_workspace_roots
         .clone()
@@ -340,6 +340,90 @@ mod tests {
             semantic_events: Vec::new(),
             path: std::env::temp_dir().join("hosted-submission-preserved.jsonl"),
         }
+    }
+
+    #[test]
+    fn first_submission_resumes_with_yolo_and_recovered_settings() {
+        let _home = crate::test_support::isolate_orca_home();
+        let saved_root = tempfile::tempdir().unwrap();
+        let saved_root = saved_root.path().canonicalize().unwrap();
+        let launch_root = tempfile::tempdir().unwrap();
+        let mut saved_config = crate::test_support::test_run_config();
+        saved_config.history_mode = HistoryMode::Record;
+        saved_config.cwd = Some(saved_root.clone());
+        saved_config.runtime_workspace_roots = Some(vec![saved_root.clone()]);
+        let source_host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+        let source = source_host
+            .handle()
+            .start_thread(saved_config, "saved suggest settings")
+            .unwrap();
+        let session_id = source.session_id().unwrap().to_string();
+        crate::surface_actions::TuiSurfaceActions::new(source.typed_surface())
+            .update_settings(
+                orca_runtime::surface::NonEmptyVec::try_new(vec![
+                    orca_runtime::surface::RuntimeSettingsPatch::SetModel {
+                        model: orca_runtime::surface::NonEmptyText::try_new(
+                            orca_core::model::FLASH_MODEL.to_string(),
+                        )
+                        .unwrap(),
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        source.shutdown().unwrap();
+        source_host.shutdown().unwrap();
+
+        let mut launch_config = crate::test_support::test_run_config();
+        launch_config.history_mode = HistoryMode::Resume(session_id.clone());
+        launch_config.cwd = Some(launch_root.path().canonicalize().unwrap());
+        launch_config.approval_mode = orca_core::approval_types::ApprovalMode::FullAuto;
+        launch_config.startup_approval_mode =
+            Some(orca_core::approval_types::ApprovalMode::FullAuto);
+        let config = Arc::new(Mutex::new(launch_config));
+        let preloaded = Arc::new(Mutex::new(Some(
+            history::load_session(&session_id).unwrap(),
+        )));
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+        let mut thread = None;
+        super::handle_hosted_submitted_turn(
+            SubmittedTurn::user("first resumed prompt".to_string()),
+            &config,
+            &preloaded,
+            &mut thread,
+            &event_tx,
+            &control,
+            &pending,
+            &host.handle(),
+        );
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        thread.take().unwrap().shutdown().unwrap();
+        host.shutdown().unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                TuiEvent::SessionCompleted { status } if status == "success"
+            )),
+            "the first resumed submission must use restored settings: {events:?}"
+        );
+        let effective = config.lock().unwrap();
+        assert_eq!(effective.cwd.as_ref(), Some(&saved_root));
+        assert_eq!(
+            effective.runtime_workspace_roots.as_ref(),
+            Some(&vec![saved_root])
+        );
+        assert_eq!(
+            effective.model.as_deref(),
+            Some(orca_core::model::FLASH_MODEL)
+        );
+        assert_eq!(
+            effective.approval_mode,
+            orca_core::approval_types::ApprovalMode::FullAuto
+        );
+        assert_eq!(effective.startup_approval_mode, None);
     }
 
     #[test]

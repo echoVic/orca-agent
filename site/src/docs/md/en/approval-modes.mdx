@@ -11,12 +11,19 @@ denial. When multiple permission rules match, the strictest result wins.
 | plan | Read-only. Write, network, shell, metadata-write, and child-agent capability are denied. |
 | suggest | Workspace-write ceiling with approval required where the runtime asks for it. |
 | auto-edit | Workspace-write ceiling with the normal edit policy. |
-| full-auto | Broadest capability ceiling; still subject to the platform sandbox and configured denials. |
+| full-auto | Full Access using trusted host execution; still subject to OS permissions and configured denials. |
 
-Choose the narrowest mode that can complete the task. In particular, full-auto
-is not permission to bypass OS isolation, workspace trust, or denied roots.
+Choose the narrowest mode that can complete the task. Full Access runs host
+tools without Orca's workspace sandbox; it does not override OS permissions,
+workspace trust, or explicit denials.
 
 ## Select a mode
+
+New TUI sessions default to `full-auto` (yolo) when no mode is configured;
+`orca` enters Full Access without a mode confirmation. Explicit CLI, environment,
+and user configuration choices take precedence. Resuming preserves the saved
+conversation mode unless `--yolo` or `--mode` overrides it. Headless `exec` and
+shared daemons default to `auto-edit`; an attached TUI uses the daemon’s policy.
 
 For a headless run, use --mode:
 
@@ -24,12 +31,33 @@ For a headless run, use --mode:
 orca exec --mode plan "Inspect the architecture and propose changes"
 orca exec --mode suggest "Fix the failing unit test"
 orca exec --mode auto-edit "Apply the reviewed formatter changes"
-orca exec --mode full-auto "Run the disposable sandbox task"
+orca exec --mode full-auto "Complete the task with host access"
 ~~~
 
-The root interactive command also accepts --mode. Its value can select an
-approval mode for a TUI session, or the server and acp protocol transports; do
-not combine a transport selection with a task prompt or subcommand.
+Use `--yolo` as shorthand for `--mode full-auto` when you explicitly want
+Full Access at startup or when resuming a saved conversation:
+
+~~~bash
+orca --yolo
+orca --yolo --continue
+orca --resume SESSION_ID --yolo
+orca exec --yolo "Complete the task"
+orca exec resume --last --yolo "Continue the task"
+~~~
+
+`--yolo` selects the mode for this session without a separate Full Access
+confirmation. It overrides the configured mode without changing the config
+file. Do not combine it with `--mode`. The flag also works
+before `exec` (`orca --yolo exec "Complete the task"`) and when starting a daemon
+(`orca --yolo daemon`). An attached session uses the daemon's settings.
+
+Use `--plan` for read-only planning: `orca --plan` or
+`orca exec --plan "Inspect the architecture"`. It overrides the configured or
+resumed mode. `--plan`, `--yolo`, and `--mode` are mutually exclusive.
+
+The root interactive command also accepts `--mode`. Protocol clients can use
+`orca app-server` or `orca acp`; the legacy `--mode server` and `--mode acp`
+forms remain supported. Protocol startup rejects prompts and history selectors.
 
 The configuration file uses a top-level mode value, and the environment
 override is ORCA_MODE:
@@ -49,7 +77,9 @@ configuration, and built-in defaults.
 
 `Shift+Tab` cycles the mode: suggest → auto-edit → full-auto → plan. Entering
 full-auto asks for an explicit Full Access confirmation first. The status bar
-shows the active mode on its left (`⇧Tab suggest`).
+shows the active mode on its left (`⇧Tab suggest`). While waiting on an approval,
+`Shift+Tab` opens Full Access confirmation directly. If Full Access is already
+enabled, this shortcut leaves the mode unchanged.
 
 Use /mode to inspect the active mode or set one explicitly:
 
@@ -63,9 +93,12 @@ Use /mode to inspect the active mode or set one explicitly:
 ~~~
 
 The settings change is applied through the runtime, not by editing a local
-prompt. A mode change applies to this session only and is not saved. When a
-task is waiting on an approval, resolve that approval based on the displayed
-tool, target, and scope rather than changing mode as a shortcut.
+prompt. A mode change is recorded in this conversation’s runtime settings; it
+does not change the default mode in the user config file. Confirmed
+Full Access can take effect while the turn is waiting on approval. The original
+request still needs your answer based on its displayed tool, target, and scope;
+the next tool call uses the new policy. Canceling Full Access returns to that
+pending request.
 
 ## Answer an approval
 

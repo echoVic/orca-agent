@@ -87,6 +87,7 @@ fn test_config(cwd: PathBuf) -> RunConfig {
         cwd: Some(cwd),
         output_format: OutputFormat::Jsonl,
         approval_mode: orca_core::approval_types::ApprovalMode::FullAuto,
+        startup_approval_mode: None,
         execution_profile: orca_core::capability::ExecutionProfile::Workspace,
         provider: ProviderKind::Mock,
         verifier: None,

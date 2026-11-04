@@ -53,8 +53,11 @@ PowerShell 5.1 仅适用于不需要 AppContainer 隔离的显式配置。协议
 ```bash
 export DEEPSEEK_API_KEY=sk-...
 
-orca                                      # 打开终端界面
+orca                                      # 打开终端界面，默认 Full Access
+orca --yolo                               # 以 Full Access（full-auto）启动
+orca --yolo --continue                    # 开启 Full Access 并恢复最近会话
 orca exec "修复失败的测试"                 # 无界面运行
+orca exec --yolo "完成任务"                # 使用 Full Access 无界面运行
 printf '%s' "$INSTRUCTION" | orca exec   # 提示词不出现在命令行参数里
 orca exec --verifier "cargo test" "修复它" # 完成前执行验证
 orca exec resume SESSION_ID "继续"        # 恢复无界面会话
@@ -62,7 +65,9 @@ orca exec resume --last "继续"            # 恢复最近的会话
 orca exec resume SID --resume-at MID "继续"  # 恢复到消息边界为止
 orca --resume [SESSION_ID]                # 恢复保存的会话
 orca --fork SESSION_ID                    # 分叉保存的会话
-orca --mode=acp                           # 连接 ACP 客户端
+orca acp                                  # 连接 ACP 客户端
+orca app-server                           # 提供 JSON-RPC app 协议
+orca --plan exec --json -C ./project "分析代码"  # 只读 JSONL 运行
 orca doctor                               # 在本地检查密钥、目录信任和沙箱
 ```
 
@@ -79,10 +84,14 @@ Orca 还提供可选的[共享 ACP 会话](docs/acp-daemon.md)（Unix 上的 `or
 信任后 Orca 才会加载项目自带的配置、指令、skills、agents 和 workflows，它不会开启、也不会绕过操作系统沙箱。
 之后输入任务并按 `Enter`。
 
+没有配置模式时，新 TUI 会话默认使用 Full Access（`full-auto`，即 yolo）。显式的
+`--mode`、`ORCA_MODE` 或用户配置中的模式优先；恢复会话时沿用会话保存的模式，
+需要强制开启 Full Access 时传入 `--yolo`。无界面的 `exec` 和共享 daemon 默认使用 `auto-edit`。
+
 - **引用与命令。** `@` 引用文件、skills、插件和 MCP 资源；`$` 插入 skill；`/` 打开命令菜单；`?` 列出全部按键。`Ctrl+V` 粘贴剪贴板里的图片。
 - **查看进展。** 回复以 `●` 标记，思考过程折叠成一行 `⋯ thinking`，每个工具调用的输出显示在 `│` 竖线下方。`Ctrl+O` 展开最近一条折叠的输出，`Ctrl+Shift+O` 全部展开。状态栏显示审批模式、模型和推理强度、上下文剩余比例以及用量。
 - **引导运行中的轮次。** `Esc` 中断。`Enter` 把追加消息排进队列，等下一轮发送；`Ctrl+Enter` 把它直接送进正在运行的轮次（需要支持 kitty 键盘协议的终端）；`Ctrl+B` 把当前轮次放到后台。
-- **审批工具调用。** 需要审批的调用会把输入框变成审批面板：允许一次、允许这个调用（同一工具、同一目标以后不再询问）、本会话内允许该工具，或拒绝。`Esc` 表示拒绝；本轮已经执行过 computer 调用后，Esc 会直接停止整轮。窗口面板上，按 `4` 保留窗口并让 Orca 继续。MCP 工具还可以选择总是允许这个工具或它所在的整个服务器，作为规则保存到你的配置里。`Shift+Tab` 依次切换 `suggest` → `auto-edit` → `full-auto` → `plan`。进入 `full-auto` 前需要明确确认 Full Access；正在运行的任务会在下一次工具调用时生效，已经在运行的工具和已经启动的子代理继续使用原来的策略。模式变更只作用于当前会话，不会保存。
+- **审批工具调用。** 需要审批的调用会把输入框变成审批面板：允许一次、允许这个调用（同一工具、同一目标以后不再询问）、本会话内允许该工具，或拒绝。`Esc` 表示拒绝；本轮已经执行过 computer 调用后，Esc 会直接停止整轮。窗口面板上，按 `4` 保留窗口并让 Orca 继续。MCP 工具还可以选择总是允许这个工具或它所在的整个服务器，作为规则保存到你的配置里。`Shift+Tab` 依次切换 `suggest` → `auto-edit` → `full-auto` → `plan`；等待审批时则直接打开 Full Access 确认。确认后无需等当前轮次结束就能切到 `full-auto`，再回答一次原来的待审批请求即可继续。下一次工具调用使用新策略，已经准入的工具和已经启动的子代理继续使用原来的策略。模式变更记录在当前会话中，恢复时继续使用；不会修改用户配置中的默认模式。
 - **后台工作。** `/tasks` 显示对话下方的任务 dock，后台轮次、子代理、命令、监控任务和 Workflow child 都在这里。`/agents` 打开 Agent Workspace，可以查看每个任务的实时对话或记录，并执行它能安全执行的操作：停止、恢复、重试或追加消息。你空闲时后台 agent 完成，Orca 会带着它们的结果继续对话。`/workflows` 保留 Workflow 运行树。
 - **MCP 服务器。** TUI 一打开，配置里的服务器就在后台开始连接。`/mcp` 显示每个服务器的状态、工具和 prompts，可以重新连接、登录或退出登录；每个 MCP prompt 都是一条斜杠命令：`/mcp__<server>__<prompt>`。
 - **macOS 上的 computer use。** 在 macOS 14 及以上，TUI 主会话可以观察和操作其他应用，用来检查界面、在没有命令行接口的应用里做事，或在你指定的应用里完成工作。应用可授权一次、本会话或保存为规则；在 `full-auto` 之外，你原先开着的窗口另行询问，应用授权不覆盖它们。按 `4` 保留窗口并让 Orca 继续（Esc 可能直接停止整轮）。密码输入单独询问，适用的整个工具规则预先批准时除外。只显示本会话用过的应用的窗口标题。系统权限和前台切换见 [Computer Use](https://orcaagent.dev/docs/#computer-use)。
@@ -128,7 +137,7 @@ Orca 还提供可选的[共享 ACP 会话](docs/acp-daemon.md)（Unix 上的 `or
 - 为编辑器、测试框架和 CI 提供稳定的 JSONL、app-server 与 Agent Client
   Protocol（ACP）协议。
 
-配置优先级依次为环境变量、命令行参数、配置文件和默认值。运行 `orca --help`
+配置优先级依次为命令行参数、环境变量、受信任项目配置、用户配置和默认值。运行 `orca --help`
 或 `orca exec --help` 查看完整命令。用户配置位于 `~/.orca/config.toml`；
 受信任的项目还可以提供 `.orca/config.toml`、`AGENTS.md`、规则、Skills 和工作流。
 

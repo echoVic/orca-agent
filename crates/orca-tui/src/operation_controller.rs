@@ -44,6 +44,8 @@ impl TuiSurfaceTaskControl {
 struct HostedOperationState {
     inner: Mutex<HostedOperationInner>,
     surface_presentation_transition: Mutex<()>,
+    settings_order: Mutex<crate::hosted_settings::HostedSettingsOrder>,
+    next_settings_sequence: std::sync::atomic::AtomicU64,
     changed: Condvar,
 }
 
@@ -66,6 +68,9 @@ struct HostedOperationInner {
     surface_terminal_deliveries: HashSet<orca_runtime::surface::SurfaceOperationId>,
     queue_event_tx: Arc<Mutex<Option<Sender<TuiEvent>>>>,
     queue_runtime: Option<orca_runtime::runtime_host::RuntimeThreadHandle>,
+    settings_config: Option<Arc<Mutex<orca_core::config::RunConfig>>>,
+    settings_target_thread_id: Option<String>,
+    settings_restricted: bool,
     queue_watcher_stop: Option<Arc<AtomicBool>>,
     queue_interactions:
         HashMap<TuiInteractionKey, std::sync::mpsc::SyncSender<io::Result<TuiInteractionResponse>>>,
@@ -385,6 +390,165 @@ impl TuiSurfaceTaskControl {
         ))
     }
 
+    pub(crate) fn bind_hosted_settings_config(
+        &self,
+        config: Arc<Mutex<orca_core::config::RunConfig>>,
+    ) {
+        let _order = self
+            .hosted
+            .settings_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.lock_hosted().settings_config = Some(config);
+    }
+
+    pub(crate) fn restrict_hosted_settings(&self, restricted: bool) {
+        let _order = self
+            .hosted
+            .settings_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.lock_hosted().settings_restricted = restricted;
+    }
+
+    pub(crate) fn with_hosted_session_install<R>(
+        &self,
+        started: &orca_runtime::runtime_host::RuntimeThreadHandle,
+        install: impl FnOnce() -> R,
+    ) -> R {
+        let _order = self
+            .hosted
+            .settings_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = install();
+        // Retire the old settings target before the new attachment is
+        // announced. A dispatcher may still have captured its old handle.
+        self.lock_hosted().settings_target_thread_id = Some(started.thread_id().to_string());
+        result
+    }
+
+    pub(crate) fn stamp_settings_action(&self, encoded: String) -> String {
+        let thread_id = self
+            .lock_hosted()
+            .queue_runtime
+            .as_ref()
+            .map(|runtime| runtime.thread_id().to_string());
+        crate::hosted_settings::QueuedSettings {
+            sequence: self
+                .hosted
+                .next_settings_sequence
+                .fetch_add(1, Ordering::Relaxed),
+            thread_id,
+            encoded,
+        }
+        .encode()
+    }
+
+    pub(crate) fn apply_ordered_settings(
+        &self,
+        thread: Option<&orca_runtime::runtime_host::RuntimeThreadHandle>,
+        config: &Arc<Mutex<orca_core::config::RunConfig>>,
+        event_tx: &Sender<TuiEvent>,
+        patches: Vec<orca_runtime::surface::RuntimeSettingsPatch>,
+        queued: Option<&crate::hosted_settings::QueuedSettings>,
+    ) -> bool {
+        // Serialize the runtime commit, config mirror, and event publication
+        // across the dispatcher and hosted controller. No hosted/config lock
+        // is held while calling the runtime.
+        let mut order = self
+            .hosted
+            .settings_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (target_changed, restricted) = {
+            let hosted = self.lock_hosted();
+            (
+                hosted
+                    .settings_target_thread_id
+                    .as_deref()
+                    .is_some_and(|id| {
+                        thread.map(orca_runtime::runtime_host::RuntimeThreadHandle::thread_id)
+                            != Some(id)
+                    }),
+                hosted.settings_restricted || hosted.focused_child_surface.is_some(),
+            )
+        };
+        if target_changed {
+            let _ = event_tx.send(TuiEvent::Error(
+                "settings target is no longer in view".to_string(),
+            ));
+            return false;
+        }
+        if restricted
+            && patches.contains(&orca_runtime::surface::RuntimeSettingsPatch::EnableFullAccess)
+        {
+            let _ = event_tx.send(TuiEvent::Error(
+                "this command is unavailable in a side conversation; return to main first"
+                    .to_string(),
+            ));
+            return false;
+        }
+        order.commit_hosted_settings(thread, config, event_tx, patches, queued)
+    }
+
+    /// A foreground turn keeps the hosted controller busy, including while
+    /// waiting on approval. Apply confirmed Full Access through the typed
+    /// settings surface now instead of queuing it behind that same turn.
+    /// Other settings and idle changes retain the controller's ordering.
+    pub(crate) fn try_apply_active_full_access(&self, encoded: &str) -> bool {
+        let queued = crate::hosted_settings::QueuedSettings::decode(encoded);
+        let encoded = queued
+            .as_ref()
+            .map_or(encoded, |queued| queued.encoded.as_str());
+        let Some(intent) = crate::slash_command_actions::decode_settings_intent(encoded) else {
+            return false;
+        };
+        if !intent.full_access_confirmed
+            || intent.approval_mode != Some(orca_core::approval_types::ApprovalMode::FullAuto)
+        {
+            return false;
+        }
+        let (runtime, config, event_tx, restricted) = {
+            let hosted = self.lock_hosted();
+            let (Some(runtime), Some(config)) =
+                (hosted.queue_runtime.clone(), hosted.settings_config.clone())
+            else {
+                return false;
+            };
+            let Some(event_tx) = hosted
+                .queue_event_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            else {
+                return false;
+            };
+            let restricted = hosted.settings_restricted
+                || hosted.focused_child_surface.is_some()
+                || runtime.parent_thread_id().is_some();
+            (runtime, config, event_tx, restricted)
+        };
+        if !runtime.is_busy() {
+            return false;
+        }
+        if restricted {
+            let _ = event_tx.send(TuiEvent::Error(
+                "this command is unavailable in a side conversation; return to main first"
+                    .to_string(),
+            ));
+            return true;
+        }
+        self.apply_ordered_settings(
+            Some(&runtime),
+            &config,
+            &event_tx,
+            crate::hosted_settings::settings_intent_patches(intent),
+            queued.as_ref(),
+        );
+        true
+    }
+
     /// The runtime thread in view. `None` before the conversation starts.
     #[cfg(test)]
     pub(crate) fn runtime_thread(&self) -> Option<orca_runtime::runtime_host::RuntimeThreadHandle> {
@@ -605,6 +769,11 @@ impl TuiSurfaceTaskControl {
         runtime: orca_runtime::runtime_host::RuntimeThreadHandle,
         event_tx: &Sender<TuiEvent>,
     ) -> Option<Arc<AtomicBool>> {
+        let _order = self
+            .hosted
+            .settings_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut hosted = self.lock_hosted();
         let watcher_needs_restart = hosted
             .queue_runtime
@@ -627,6 +796,7 @@ impl TuiSurfaceTaskControl {
         {
             previous.detach_prompt_queue_surface();
         }
+        hosted.settings_target_thread_id = Some(runtime.thread_id().to_string());
         hosted.queue_runtime = Some(runtime);
         *hosted
             .queue_event_tx

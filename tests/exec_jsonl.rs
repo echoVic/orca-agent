@@ -1303,3 +1303,109 @@ fn exec_async_subagent_report_blocker_persists_blocked() {
         }
     }
 }
+
+#[test]
+fn root_exec_mode_json_and_common_options_reach_the_runtime() {
+    for mode in ["plan", "full-auto"] {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        std::fs::write(cwd.path().join("note.txt"), "before").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+            .env("ORCA_HOME", home.path())
+            .env("ORCA_MODE", "suggest")
+            .args([
+                "--mode",
+                mode,
+                "-m",
+                "deepseek-v4-pro",
+                "-C",
+                cwd.path().to_str().unwrap(),
+                "--provider",
+                "mock",
+                "exec",
+                "--json",
+                "--no-history",
+                "edit note.txt :: before => after",
+            ])
+            .output()
+            .unwrap();
+        let expected_status = if mode == "plan" { 3 } else { 0 };
+        assert_eq!(output.status.code(), Some(expected_status), "{output:?}");
+        let events = parse_jsonl(&output.stdout);
+        assert_eq!(events[0]["payload"]["approval_mode"], mode);
+        assert_eq!(
+            find_event(&events, "model.routed")["payload"]["requested_model"],
+            "deepseek-v4-pro"
+        );
+        let expected = if mode == "full-auto" {
+            "after"
+        } else {
+            "before"
+        };
+        assert_eq!(
+            std::fs::read_to_string(cwd.path().join("note.txt")).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn exec_last_multiword_prompt_resumes_the_saved_session_with_an_explicit_mode() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let initial = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--json",
+            "--save-history",
+            "--provider",
+            "mock",
+            "--mode",
+            "suggest",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(initial.status.code(), Some(0), "{initial:?}");
+    let initial_events = parse_jsonl(&initial.stdout);
+    let session = find_event(&initial_events, "session.completed")["payload"]["session_id"]
+        .as_str()
+        .unwrap();
+    let resumed = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "--plan",
+            "exec",
+            "resume",
+            "--last",
+            "--json",
+            "--provider",
+            "mock",
+            "fix",
+            "failing",
+            "test",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(resumed.status.code(), Some(0), "{resumed:?}");
+    let events = parse_jsonl(&resumed.stdout);
+    assert_eq!(events[0]["payload"]["approval_mode"], "plan");
+    assert_eq!(
+        find_event(&events, "session.completed")["payload"]["session_id"],
+        session
+    );
+    let documents = session_documents(home.path());
+    assert_eq!(documents.len(), 1);
+    assert!(
+        documents[0]
+            .1
+            .iter()
+            .any(|record| record["type"] == "conversation.message"
+                && record["message"]["content"] == "fix failing test"),
+        "saved prompt: {:?}",
+        documents[0].1
+    );
+}

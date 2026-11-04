@@ -252,11 +252,10 @@ pub(crate) fn handle_hosted_goal_action(
                 }
             };
             let objective = materialized.objective().to_string();
-            let cfg = config.lock().unwrap().clone();
             let thread_was_missing = thread.is_none();
-            if let Err(error) =
-                ensure_hosted_thread(thread, host, &cfg, preloaded, &objective, event_tx, control)
-            {
+            if let Err(error) = ensure_hosted_thread(
+                thread, host, config, preloaded, &objective, event_tx, control,
+            ) {
                 let _ = event_tx.send(TuiEvent::OperationRejected(error));
                 return;
             }
@@ -302,9 +301,8 @@ pub(crate) fn handle_hosted_goal_action(
             };
             let objective = materialized.objective().to_string();
             if thread.is_none() {
-                let cfg = config.lock().unwrap().clone();
                 if let Err(error) = ensure_hosted_thread(
-                    thread, host, &cfg, preloaded, &objective, event_tx, control,
+                    thread, host, config, preloaded, &objective, event_tx, control,
                 ) {
                     let _ = event_tx.send(TuiEvent::OperationRejected(error));
                     return;
@@ -343,11 +341,10 @@ pub(crate) fn handle_hosted_goal_action(
                 return;
             };
             if thread.is_none() {
-                let cfg = config.lock().unwrap().clone();
                 if let Err(error) = ensure_hosted_thread(
                     thread,
                     host,
-                    &cfg,
+                    config,
                     preloaded,
                     "clear Goal",
                     event_tx,
@@ -383,11 +380,10 @@ pub(crate) fn handle_hosted_goal_action(
                 return;
             };
             if thread.is_none() {
-                let cfg = config.lock().unwrap().clone();
                 if let Err(error) = ensure_hosted_thread(
                     thread,
                     host,
-                    &cfg,
+                    config,
                     preloaded,
                     "pause Goal",
                     event_tx,

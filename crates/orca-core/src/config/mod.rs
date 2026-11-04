@@ -447,6 +447,9 @@ pub struct RunConfig {
     pub cwd: Option<PathBuf>,
     pub output_format: OutputFormat,
     pub approval_mode: ApprovalMode,
+    /// Explicit launch selection, consumed after restoring session settings.
+    /// It must not follow later session switches or delegated work.
+    pub startup_approval_mode: Option<ApprovalMode>,
     pub execution_profile: crate::capability::ExecutionProfile,
     pub provider: ProviderKind,
     pub verifier: Option<String>,
@@ -496,6 +499,7 @@ impl Default for RunConfig {
             cwd: None,
             output_format: OutputFormat::Text,
             approval_mode,
+            startup_approval_mode: None,
             execution_profile: crate::capability::ExecutionProfile::for_approval_mode(
                 approval_mode,
             ),
@@ -573,6 +577,7 @@ impl DelegationSnapshot {
 
     pub fn apply_to(&self, config: &mut RunConfig, child_model_override: Option<String>) {
         config.approval_mode = self.approval_mode;
+        config.startup_approval_mode = None;
         config.execution_profile = self.execution_profile;
         config.active_permission_profile = self.active_permission_profile.clone();
         config.permission_profiles = self.permission_profiles.clone();
@@ -1123,6 +1128,7 @@ mod tests {
             cwd: None,
             output_format: OutputFormat::Text,
             approval_mode: ApprovalMode::FullAuto,
+            startup_approval_mode: None,
             execution_profile: crate::capability::ExecutionProfile::Workspace,
             provider: ProviderKind::DeepSeekFixture,
             verifier: None,
@@ -1220,6 +1226,7 @@ mod tests {
             cwd: None,
             output_format: OutputFormat::Text,
             approval_mode: ApprovalMode::Suggest,
+            startup_approval_mode: None,
             execution_profile: crate::capability::ExecutionProfile::Workspace,
             provider: crate::config::ProviderKind::Mock,
             verifier: None,
@@ -1305,6 +1312,7 @@ mod tests {
             cwd: Some(PathBuf::from("/workspace")),
             output_format: OutputFormat::Jsonl,
             approval_mode: ApprovalMode::Plan,
+            startup_approval_mode: Some(ApprovalMode::FullAuto),
             execution_profile: crate::capability::ExecutionProfile::ReadOnly,
             provider: ProviderKind::Mock,
             verifier: None,
@@ -1382,6 +1390,7 @@ mod tests {
             parent.additional_working_directories
         );
         assert_eq!(parent.approval_mode, ApprovalMode::Plan);
+        assert_eq!(parent.startup_approval_mode, None);
         assert_eq!(parent.model.as_deref(), Some(FLASH_MODEL));
     }
 

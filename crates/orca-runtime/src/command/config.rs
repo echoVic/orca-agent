@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use orca_core::approval_types::ApprovalMode;
 use orca_core::config::file::{ConfigOverrides, FileConfig, load_effective_config};
 use orca_core::config::{BudgetConfig, HistoryMode, OutputFormat, ProviderKind, RunConfig};
 use orca_core::model::ModelSelection;
@@ -23,6 +24,8 @@ pub struct RunConfigRequest {
     pub history_mode: HistoryMode,
     pub show_session_picker: bool,
     pub budget: BudgetConfig,
+    /// Launch-specific fallback; configured and explicitly selected modes take precedence.
+    pub default_approval_mode: ApprovalMode,
     pub overrides: ConfigOverrides,
     pub desktop_notifications: DesktopNotifications,
 }
@@ -40,6 +43,7 @@ impl RunConfigRequest {
             history_mode: HistoryMode::Record,
             show_session_picker: false,
             budget: BudgetConfig::default(),
+            default_approval_mode: ApprovalMode::default(),
             overrides: ConfigOverrides::default(),
             desktop_notifications: DesktopNotifications::FromConfig,
         }
@@ -62,6 +66,7 @@ pub fn assemble_run_config(
     request: RunConfigRequest,
     file: FileConfig,
 ) -> Result<RunConfig, String> {
+    let approval_mode = file.mode.unwrap_or(request.default_approval_mode);
     let model = ModelSelection::parse_with_models(file.model.clone(), file.models.clone())?;
     let desktop_notifications = match request.desktop_notifications {
         DesktopNotifications::FromConfig => file.desktop_notifications,
@@ -73,9 +78,10 @@ pub fn assemble_run_config(
         prompt: request.prompt,
         cwd: request.runtime_cwd,
         output_format: request.output_format,
-        approval_mode: file.mode.unwrap_or_default(),
+        approval_mode,
+        startup_approval_mode: request.overrides.mode,
         execution_profile: orca_core::capability::ExecutionProfile::for_approval_mode(
-            file.mode.unwrap_or_default(),
+            approval_mode,
         ),
         provider: request.provider,
         verifier: request.verifier,
@@ -192,6 +198,26 @@ output = 2.0
         let config = assemble_run_config(request, FileConfig::default()).unwrap();
 
         assert_eq!(config.approval_mode, ApprovalMode::AutoEdit);
+        assert_eq!(config.startup_approval_mode, None);
+    }
+
+    #[test]
+    fn only_an_explicit_mode_is_reapplied_after_session_recovery() {
+        let file = FileConfig {
+            mode: Some(ApprovalMode::FullAuto),
+            ..FileConfig::default()
+        };
+        let implicit = assemble_run_config(
+            RunConfigRequest::new("test", PathBuf::from("/workspace")),
+            file.clone(),
+        )
+        .unwrap();
+        assert_eq!(implicit.startup_approval_mode, None);
+
+        let mut request = RunConfigRequest::new("test", PathBuf::from("/workspace"));
+        request.overrides.mode = Some(ApprovalMode::FullAuto);
+        let explicit = assemble_run_config(request, file).unwrap();
+        assert_eq!(explicit.startup_approval_mode, Some(ApprovalMode::FullAuto));
     }
 
     #[test]
@@ -262,6 +288,7 @@ output = 2.0
                 max_cost_usd_micros: Some(2_500_000),
                 ..BudgetConfig::default()
             },
+            default_approval_mode: ApprovalMode::default(),
             overrides: ConfigOverrides::default(),
             desktop_notifications: DesktopNotifications::FromConfig,
         };

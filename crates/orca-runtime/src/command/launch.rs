@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use base64::Engine;
 
+use orca_core::approval_types::ApprovalMode;
 use orca_core::config::file::{ConfigOverrides, parse_approval_mode_value};
 use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
 
@@ -72,6 +73,18 @@ pub struct SubagentWorkerLaunchRequest {
 }
 
 pub fn prepare_interactive(request: InteractiveLaunchRequest) -> Result<RunConfig, String> {
+    prepare_interactive_with_default(request, ApprovalMode::FullAuto)
+}
+
+/// A daemon owns shared sessions and retains the non-TUI default policy.
+pub fn prepare_daemon(request: InteractiveLaunchRequest) -> Result<RunConfig, String> {
+    prepare_interactive_with_default(request, ApprovalMode::default())
+}
+
+fn prepare_interactive_with_default(
+    request: InteractiveLaunchRequest,
+    default_approval_mode: ApprovalMode,
+) -> Result<RunConfig, String> {
     let resume_like = request.resume.is_some() as u8
         + request.fork.is_some() as u8
         + request.continue_latest as u8;
@@ -101,6 +114,7 @@ pub fn prepare_interactive(request: InteractiveLaunchRequest) -> Result<RunConfi
     config_request.provider = request.provider;
     config_request.history_mode = history_mode;
     config_request.show_session_picker = request.session_picker;
+    config_request.default_approval_mode = default_approval_mode;
     config_request.overrides = ConfigOverrides {
         model: request.model,
         mode,
@@ -340,6 +354,78 @@ mod tests {
         assert_eq!(
             prepare_interactive(request).unwrap_err(),
             "--resume, --fork, and --continue are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn tui_launch_defaults_to_full_access_without_a_persisted_override() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let request = InteractiveLaunchRequest {
+            app_version: "test".into(),
+            resume: None,
+            fork: None,
+            continue_latest: false,
+            session_picker: false,
+            cwd: Some(cwd.path().into()),
+            model: None,
+            mode: None,
+            api_key: Some("test-key".into()),
+            base_url: None,
+            provider: ProviderKind::Mock,
+            prompt: Vec::new(),
+        };
+        let daemon = prepare_daemon(request.clone()).expect("daemon config");
+        assert_eq!(daemon.approval_mode, ApprovalMode::AutoEdit);
+        assert_eq!(
+            daemon.execution_profile,
+            orca_core::capability::ExecutionProfile::Workspace
+        );
+        assert_eq!(daemon.startup_approval_mode, None);
+        let config = prepare_interactive(request.clone()).expect("interactive config");
+        assert_eq!(
+            config.approval_mode,
+            orca_core::approval_types::ApprovalMode::FullAuto
+        );
+        assert_eq!(
+            config.execution_profile,
+            orca_core::capability::ExecutionProfile::TrustedHost
+        );
+        assert_eq!(config.startup_approval_mode, None);
+        assert!(!home.path().join("config.toml").exists());
+
+        for mode in ["suggest", "auto-edit", "plan"] {
+            std::fs::write(
+                home.path().join("config.toml"),
+                format!("mode = \"{mode}\"\n"),
+            )
+            .unwrap();
+            let configured = prepare_interactive(request.clone()).expect("configured TUI");
+            assert_eq!(configured.approval_mode.as_str(), mode);
+            assert_eq!(configured.startup_approval_mode, None);
+        }
+        for mode in ["suggest", "auto-edit", "plan"] {
+            let explicit = prepare_interactive(InteractiveLaunchRequest {
+                mode: Some(mode.into()),
+                ..request.clone()
+            })
+            .expect("explicit TUI mode");
+            assert_eq!(explicit.approval_mode.as_str(), mode);
+            assert_eq!(explicit.startup_approval_mode, Some(explicit.approval_mode));
+        }
+        let explicit = prepare_interactive(InteractiveLaunchRequest {
+            mode: Some("full-auto".into()),
+            ..request
+        })
+        .expect("explicit Full Access");
+        assert_eq!(
+            explicit.approval_mode,
+            orca_core::approval_types::ApprovalMode::FullAuto
+        );
+        assert_eq!(
+            explicit.startup_approval_mode,
+            Some(orca_core::approval_types::ApprovalMode::FullAuto)
         );
     }
 

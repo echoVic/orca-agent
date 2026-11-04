@@ -89,6 +89,7 @@ use crate::protocol::AttachedTuiEvent;
 use crate::protocol::SessionAttachmentId;
 #[cfg(test)]
 use crate::protocol::TuiEvent;
+#[cfg(test)]
 use crate::protocol::UserAction;
 use crate::renderer_interaction_acks::RendererInteractionAckOwner;
 use crate::renderer_loop::RendererLoopOwner;
@@ -114,6 +115,7 @@ use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationPro
 use crate::terminal_session::PendingTerminalSession;
 #[cfg(test)]
 use crate::theme::Theme;
+#[cfg(test)]
 use crate::transcript_state::ChatMessage;
 use crate::tui_run_lifecycle::finish_tui_run;
 #[cfg(test)]

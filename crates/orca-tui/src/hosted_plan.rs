@@ -9,7 +9,7 @@ use orca_runtime::history;
 use orca_runtime::runtime_host::{RuntimeHostHandle, RuntimeThreadHandle};
 
 use crate::bridge;
-use crate::hosted_settings::{apply_hosted_settings_action, surface_approval_mode};
+use crate::hosted_settings::surface_approval_mode;
 use crate::hosted_submission::handle_hosted_submitted_turn;
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::protocol::TuiEvent;
@@ -48,8 +48,13 @@ pub(crate) fn handle_hosted_plan_action(
                     mode: surface_approval_mode(approval_mode),
                 }
             };
-            let settings_applied =
-                apply_hosted_settings_action(thread.as_ref(), config, event_tx, vec![mode_patch]);
+            let settings_applied = control.apply_ordered_settings(
+                thread.as_ref(),
+                config,
+                event_tx,
+                vec![mode_patch],
+                None,
+            );
             if !settings_applied {
                 control.cancel_surface_activation();
                 return;

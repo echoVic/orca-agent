@@ -20,28 +20,45 @@ orca [OPTIONS] [PROMPT]...
 orca [OPTIONS] COMMAND
 ```
 
-Running `orca` opens the interactive TUI. A prompt may be supplied as
-positional text. The visible root commands are:
+Running `orca` opens the interactive TUI, defaulting to `full-auto` (yolo) for
+a new session when no mode is configured. Explicit modes take precedence, and
+resuming preserves the saved mode unless overridden. A prompt may be supplied
+as positional text. The visible root commands are:
 
 | Command | Purpose |
 | --- | --- |
 | `orca doctor` | Inspect local configuration, credentials, folder trust, and sandbox readiness. |
 | `orca storage` | Inspect session disk usage and preview or apply archive retention. |
 | `orca exec` | Run a non-interactive task and emit text or JSONL events. |
+| `orca app-server` | Serve the JSON-RPC app protocol on stdio. |
+| `orca acp` | Serve Agent Client Protocol on stdio. |
 | `orca workflow` | Run and inspect persisted local workflows. |
 | `orca trust` | Show or update folder trust. |
 | `orca mcp` | Add, list, show, remove, log in to, or log out of MCP servers in the user config. |
 
-Root options are `--resume [SESSION_ID]`, `--fork <ID>`, `--continue`,
-`--model <MODEL>`, `--mode <MODE>`, `--api-key <KEY>`, `--base-url <URL>`, and
-`--cwd <PATH>`. Use an approval mode (`suggest`, `auto-edit`, `full-auto`, or
-`plan`) for an interactive run. `--mode server` and `--mode acp` instead select
-a protocol transport and cannot be combined with a prompt or subcommand.
+Root options include `--resume [SESSION_ID]`, `--fork ID`, `--continue`,
+`-m` / `--model MODEL`, `--mode MODE`, `--yolo`, `--plan`, `--api-key KEY`,
+`--base-url URL`, and `-C` / `--cwd` / `--cd PATH`. `--yolo` selects `full-auto`;
+`--plan` selects read-only planning. The two shortcuts are mutually exclusive
+and cannot be combined with `--mode`.
+
+Protocol clients can use `orca app-server` or `orca acp`. Legacy `--mode server`
+and `--mode acp` remain supported. Protocol startup rejects prompts, history
+selectors (`--resume`, `--fork`, `--continue`), and approval-mode shortcuts.
+Named protocol commands accept model, directory, key, and base URL options
+before or after the subcommand.
+
+For `exec`, common options (`--mode`, model, directory, key, and base URL) work
+before or after `exec`, including after `exec resume`. Different explicit values
+across the root, `exec`, and `resume` scopes are rejected; equal values are accepted. CLI values
+override configuration and environment values. Model, key, and endpoint help uses
+`ORCA_MODEL`, `ORCA_API_KEY`, and `ORCA_BASE_URL`; the corresponding `DEEPSEEK_*`
+compatibility aliases remain supported.
 
 ## `orca doctor`
 
 ```text
-orca doctor [--cwd PATH] [--format text|json]
+orca doctor [--cwd PATH] [--json | --format text|json]
 ```
 
 `doctor` is a local, read-only preflight. It never contacts the provider,
@@ -60,7 +77,7 @@ camelCase fields such as `schemaVersion` and `folder-trust` check IDs.
 
 ```bash
 orca doctor
-orca doctor --cwd ./project --format json
+orca doctor --cd ./project --json
 ```
 
 ## `orca storage`
@@ -84,10 +101,13 @@ The supported execution options are:
 
 | Option | Meaning |
 | --- | --- |
-| `--output-format TEXT|JSONL` | Human-readable output or one JSON object per event. |
-| `--cwd PATH` | Workspace directory. |
-| `--mode suggest|auto-edit|full-auto|plan` | Approval policy for tool actions. |
-| `--model MODEL` | Model override. |
+| `--output-format TEXT\|JSONL` | Human-readable output or one JSON object per event. |
+| `--json` | Shorthand for `--output-format jsonl`. |
+| `-C` / `--cwd` / `--cd PATH` | Workspace directory. |
+| `--mode suggest\|auto-edit\|full-auto\|plan` | Approval policy for tool actions. |
+| `--yolo` | Select Full Access, overriding configured or recovered modes. |
+| `--plan` | Select read-only planning, overriding configured or recovered modes. |
+| `-m` / `--model MODEL` | Model override. |
 | `--api-key KEY` | API key override. |
 | `--base-url URL` | API endpoint override. |
 | `--verifier COMMAND` | Command to run after the task. |
@@ -106,9 +126,18 @@ Examples:
 
 ```bash
 orca exec "Fix the failing test" --verifier "cargo test"
-orca exec --output-format jsonl --max-turns 20 "Refactor the parser" > run.jsonl
+orca --plan exec --json --max-turns 20 "Inspect the parser" > run.jsonl
 orca exec resume SESSION_ID --resume-at MESSAGE_ID "Continue from the checkpoint"
+orca exec resume --last fix failing test
 ```
+
+With `exec resume --last`, every positional word belongs to the prompt; no
+session ID is consumed. `--resume-at` works before or after `resume`; conflicting
+message boundaries are rejected.
+
+`doctor --json` emits one JSON report, `exec --json` emits JSONL events, and MCP
+`list` / `get --json` keep their existing JSON output. Each shorthand must be used
+without the corresponding explicit format option.
 
 Use shell redirection for an output file. The CLI does not have a separate
 output-path option.

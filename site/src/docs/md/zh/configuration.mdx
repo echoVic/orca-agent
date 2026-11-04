@@ -27,6 +27,10 @@ PowerShell 5.1 的 `>` 就会这样写）或解析不了的，Orca 启动时会�
 4. 用户 `config.toml`
 5. 内置默认值
 
+审批模式的内置默认值：新 TUI 会话使用 `full-auto`（yolo），无界面的 `exec`
+和共享 daemon 使用 `auto-edit`。恢复会话沿用会话保存的模式，除非启动时明确
+传入 `--mode` 或 `--yolo`。
+
 ## 最小用户配置
 
 ```toml

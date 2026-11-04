@@ -3,9 +3,9 @@
   "package": "@blade-ai/orca",
   "website": "https://orcaagent.dev",
   "commands": {
-    "root": ["doctor", "storage", "exec", "workflow", "trust", "mcp", "daemon", "acp-bridge", "attach"],
+    "root": ["doctor", "storage", "exec", "app-server", "acp", "workflow", "trust", "mcp", "daemon", "acp-bridge", "attach"],
     "doctor": {
-      "options": ["--cwd", "--format"],
+      "options": ["--cwd", "--format", "--json"],
       "subcommands": []
     },
     "storage": {
@@ -15,8 +15,11 @@
     "exec": {
       "options": [
         "--output-format",
+        "--json",
         "--cwd",
         "--mode",
+        "--yolo",
+        "--plan",
         "--model",
         "--api-key",
         "--base-url",
@@ -33,6 +36,14 @@
         "--save-history"
       ],
       "subcommands": ["resume"]
+    },
+    "app-server": {
+      "options": ["--cwd", "--model", "--api-key", "--base-url"],
+      "subcommands": []
+    },
+    "acp": {
+      "options": ["--cwd", "--model", "--api-key", "--base-url"],
+      "subcommands": []
     },
     "workflow": {
       "options": [],

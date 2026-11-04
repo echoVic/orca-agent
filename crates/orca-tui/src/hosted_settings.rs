@@ -11,6 +11,83 @@ use crate::protocol::TuiEvent;
 use crate::slash_command_actions::SettingsIntent;
 use crate::surface_actions::TuiSurfaceActions;
 
+const QUEUED_SETTINGS_PREFIX: &str = "__orca_queued_settings__:";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct QueuedSettings {
+    pub sequence: u64,
+    pub thread_id: Option<String>,
+    pub encoded: String,
+}
+
+impl QueuedSettings {
+    pub(crate) fn encode(&self) -> String {
+        format!(
+            "{QUEUED_SETTINGS_PREFIX}{}",
+            serde_json::to_string(self).expect("settings envelope")
+        )
+    }
+
+    pub(crate) fn decode(encoded: &str) -> Option<Self> {
+        serde_json::from_str(encoded.strip_prefix(QUEUED_SETTINGS_PREFIX)?).ok()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct HostedSettingsOrder {
+    confirmed_full_access: std::collections::HashMap<String, u64>,
+}
+
+impl HostedSettingsOrder {
+    pub(crate) fn commit_hosted_settings(
+        &mut self,
+        thread: Option<&RuntimeThreadHandle>,
+        config: &Arc<Mutex<RunConfig>>,
+        event_tx: &mpsc::Sender<TuiEvent>,
+        mut patches: Vec<RuntimeSettingsPatch>,
+        queued: Option<&QueuedSettings>,
+    ) -> bool {
+        let thread_id = thread.map(RuntimeThreadHandle::thread_id);
+        if let Some(queued) = queued {
+            if queued
+                .thread_id
+                .as_deref()
+                .is_some_and(|id| Some(id) != thread_id)
+            {
+                report_settings_rejection(
+                    thread,
+                    event_tx,
+                    "settings target is no longer in view".into(),
+                );
+                return false;
+            }
+            if thread_id
+                .and_then(|id| self.confirmed_full_access.get(id))
+                .is_some_and(|confirmed| queued.sequence < *confirmed)
+            {
+                // Preserve independent model/effort changes from the old request.
+                patches.retain(|patch| {
+                    !matches!(
+                        patch,
+                        RuntimeSettingsPatch::SetApprovalMode { .. }
+                            | RuntimeSettingsPatch::EnableFullAccess
+                    )
+                });
+            }
+        }
+        let confirms_full_access = patches.contains(&RuntimeSettingsPatch::EnableFullAccess);
+        let applied = apply_hosted_settings_action(thread, config, event_tx, patches);
+        if applied
+            && confirms_full_access
+            && let (Some(thread_id), Some(queued)) = (thread_id, queued)
+        {
+            self.confirmed_full_access
+                .insert(thread_id.to_string(), queued.sequence);
+        }
+        applied
+    }
+}
+
 pub(crate) fn settings_intent_patches(
     intent: SettingsIntent,
 ) -> Vec<orca_runtime::surface::RuntimeSettingsPatch> {
@@ -112,23 +189,6 @@ pub(crate) fn settings_updated_from_surface(
     })
 }
 
-pub(crate) fn synchronize_shared_config_from_surface(
-    thread: &RuntimeThreadHandle,
-    config: &Arc<Mutex<RunConfig>>,
-) -> Result<(), String> {
-    let snapshot = crate::surface_actions::TuiSurfaceActions::new(thread.typed_surface())
-        .read_snapshot()
-        .map_err(|error| format!("failed to read runtime settings: {error}"))?;
-    let mut config = config
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    orca_runtime::runtime_host::hydrate_run_config_from_surface_settings(
-        &mut config,
-        &snapshot.settings.effective,
-    )
-    .map_err(|error| format!("failed to apply runtime settings: {error:?}"))
-}
-
 pub(crate) fn apply_hosted_settings_action(
     thread: Option<&RuntimeThreadHandle>,
     config: &Arc<Mutex<RunConfig>>,
@@ -150,9 +210,11 @@ pub(crate) fn apply_hosted_settings_action(
         .map(|config| config.approval_mode != orca_core::approval_types::ApprovalMode::FullAuto)
         .unwrap_or(true);
     if unconfirmed_full_access {
-        let _ = event_tx.send(TuiEvent::OperationRejected(
+        report_settings_rejection(
+            thread,
+            event_tx,
             "Full Access requires explicit confirmation".to_string(),
-        ));
+        );
         return false;
     }
     let persist_model = patches
@@ -173,14 +235,14 @@ pub(crate) fn apply_hosted_settings_action(
         let settings = match actions.update_settings(patches) {
             Ok(settings) => settings,
             Err(error) => {
-                let _ = event_tx.send(TuiEvent::OperationRejected(error.to_string()));
+                report_settings_rejection(Some(thread), event_tx, error.to_string());
                 return false;
             }
         };
         let settings_event = match settings_updated_from_surface(&settings.effective) {
             Ok(event) => event,
             Err(error) => {
-                let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                report_settings_rejection(Some(thread), event_tx, error);
                 return false;
             }
         };
@@ -254,11 +316,13 @@ pub(crate) fn apply_hosted_settings_action(
                         orca_core::approval_types::ApprovalMode::Plan
                     }
                 };
+                cfg.startup_approval_mode = Some(cfg.approval_mode);
                 cfg.execution_profile =
                     orca_core::capability::ExecutionProfile::for_approval_mode(cfg.approval_mode);
             }
             orca_runtime::surface::RuntimeSettingsPatch::EnableFullAccess => {
                 cfg.approval_mode = orca_core::approval_types::ApprovalMode::FullAuto;
+                cfg.startup_approval_mode = Some(cfg.approval_mode);
                 cfg.execution_profile = orca_core::capability::ExecutionProfile::TrustedHost;
                 cfg.active_permission_profile = None;
             }
@@ -274,6 +338,21 @@ pub(crate) fn apply_hosted_settings_action(
     let effort = persist_effort.then_some(cfg.reasoning_effort);
     persist_user_settings_values(model.as_deref(), effort, event_tx);
     true
+}
+
+fn report_settings_rejection(
+    thread: Option<&RuntimeThreadHandle>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    message: String,
+) {
+    // A rejected settings mutation does not end the active turn or answer
+    // its pending interaction. OperationRejected would reset the UI to Idle.
+    let event = if thread.is_some_and(RuntimeThreadHandle::is_busy) {
+        TuiEvent::Error(message)
+    } else {
+        TuiEvent::OperationRejected(message)
+    };
+    let _ = event_tx.send(event);
 }
 
 /// Persist the applied model and reasoning-effort choices to the user-owned
@@ -373,6 +452,73 @@ mod tests {
         assert_eq!(after.reasoning_effort, before.reasoning_effort);
         assert_eq!(after.approval_mode, before.approval_mode);
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn prestart_mode_change_supersedes_launch_intent_before_first_turn() {
+        let _home = crate::test_support::isolate_orca_home();
+        for (initial_mode, patch, expected) in [
+            (
+                ApprovalMode::FullAuto,
+                RuntimeSettingsPatch::SetApprovalMode {
+                    mode: SurfaceApprovalMode::Suggest,
+                },
+                ApprovalMode::Suggest,
+            ),
+            (
+                ApprovalMode::Suggest,
+                RuntimeSettingsPatch::EnableFullAccess,
+                ApprovalMode::FullAuto,
+            ),
+        ] {
+            let mut cfg = crate::test_support::test_run_config();
+            cfg.history_mode = orca_core::config::HistoryMode::Record;
+            cfg.approval_mode = initial_mode;
+            cfg.startup_approval_mode = Some(initial_mode);
+            cfg.execution_profile =
+                orca_core::capability::ExecutionProfile::for_approval_mode(initial_mode);
+            let config = Arc::new(Mutex::new(cfg));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, _event_rx) = mpsc::unbounded();
+            assert!(super::apply_hosted_settings_action(
+                None,
+                &config,
+                &event_tx,
+                vec![patch]
+            ));
+            assert!(super::apply_hosted_settings_action(
+                None,
+                &config,
+                &event_tx,
+                vec![RuntimeSettingsPatch::SetReasoning {
+                    effort: SurfaceReasoningEffort::Low
+                },]
+            ));
+            let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+            let control = crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test();
+            let mut thread = None;
+            crate::hosted_session_lifecycle::ensure_hosted_thread(
+                &mut thread,
+                &host.handle(),
+                &config,
+                &preloaded,
+                "first turn",
+                &event_tx,
+                &control,
+            )
+            .unwrap();
+            let mode = config.lock().unwrap().approval_mode;
+            thread.take().unwrap().shutdown().unwrap();
+            host.shutdown().unwrap();
+            assert_eq!(
+                mode, expected,
+                "the latest explicit mode must supersede launch intent"
+            );
+            assert_eq!(
+                config.lock().unwrap().reasoning_effort,
+                ReasoningEffort::Low
+            );
+        }
     }
 
     #[test]
@@ -615,6 +761,127 @@ mod tests {
             ),
             "unexpected events: {events:?}"
         );
+    }
+
+    #[test]
+    fn full_access_commit_and_mirror_wait_for_earlier_settings_publication() {
+        let _home = crate::test_support::isolate_orca_home();
+        let mut run_config = crate::test_support::test_run_config();
+        run_config.history_mode = orca_core::config::HistoryMode::Record;
+        let config = Arc::new(Mutex::new(run_config));
+        let runtime = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+        let thread = runtime
+            .handle()
+            .start_thread(config.lock().unwrap().clone(), "settings ordering")
+            .unwrap();
+        let control = crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test();
+        // A rendezvous channel holds the first transaction at publication.
+        let (event_tx, event_rx) = mpsc::bounded(0);
+        let first = {
+            let control = control.clone();
+            let thread = thread.clone();
+            let config = config.clone();
+            let event_tx = event_tx.clone();
+            std::thread::spawn(move || {
+                control.apply_ordered_settings(
+                    Some(&thread),
+                    &config,
+                    &event_tx,
+                    vec![RuntimeSettingsPatch::SetReasoning {
+                        effort: orca_runtime::surface::SurfaceReasoningEffort::High,
+                    }],
+                    None,
+                )
+            })
+        };
+        let actions = crate::surface_actions::TuiSurfaceActions::new(thread.typed_surface());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if actions
+                .read_snapshot()
+                .unwrap()
+                .settings
+                .effective
+                .reasoning_effort
+                == orca_runtime::surface::SurfaceReasoningEffort::High
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first settings commit"
+            );
+            std::thread::yield_now();
+        }
+        let (started_tx, started_rx) = mpsc::bounded(1);
+        let second = {
+            let control = control.clone();
+            let thread = thread.clone();
+            let config = config.clone();
+            let event_tx = event_tx.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                control.apply_ordered_settings(
+                    Some(&thread),
+                    &config,
+                    &event_tx,
+                    vec![RuntimeSettingsPatch::EnableFullAccess],
+                    None,
+                )
+            })
+        };
+        started_rx.recv().unwrap();
+        // Read without consuming either publication. The second transaction
+        // must not reach the runtime while the first still owns publication.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+        let mut observed_early_full_access = false;
+        while std::time::Instant::now() < deadline {
+            observed_early_full_access |= actions
+                .read_snapshot()
+                .unwrap()
+                .settings
+                .effective
+                .approval_mode
+                == SurfaceApprovalMode::FullAuto;
+            std::thread::yield_now();
+        }
+        let first_event = event_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let second_event = event_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(first.join().unwrap());
+        assert!(second.join().unwrap());
+        let final_mode = actions
+            .read_snapshot()
+            .unwrap()
+            .settings
+            .effective
+            .approval_mode;
+        let mirrored_mode = config.lock().unwrap().approval_mode;
+        thread.shutdown().unwrap();
+        runtime.shutdown().unwrap();
+        assert!(
+            !observed_early_full_access,
+            "Full Access overtook pending publication"
+        );
+        assert!(matches!(
+            first_event,
+            TuiEvent::SettingsUpdated {
+                approval_mode: ApprovalMode::Suggest,
+                ..
+            }
+        ));
+        assert!(matches!(
+            second_event,
+            TuiEvent::SettingsUpdated {
+                approval_mode: ApprovalMode::FullAuto,
+                ..
+            }
+        ));
+        assert_eq!(final_mode, SurfaceApprovalMode::FullAuto);
+        assert_eq!(mirrored_mode, ApprovalMode::FullAuto);
     }
 
     #[test]
