@@ -1,13 +1,15 @@
-# Orca
+# Orca Agent
 
-터미널을 위한 DeepSeek 네이티브 코딩 에이전트입니다.
+Orca Agent는 터미널을 위한 DeepSeek 네이티브 코딩 에이전트입니다.
 
-Orca에 작업을 주면 코드를 읽고, 파일을 수정하고, 명령을 실행하고, 결과를 검증한 뒤
+Orca Agent에 작업을 주면 코드를 읽고, 파일을 수정하고, 명령을 실행하고, 결과를 검증한 뒤
 작업이 끝나거나 사용자의 판단이 필요할 때까지 계속 진행합니다. 대화형 작업에는 TUI를,
 스크립트와 CI에는 `orca exec`를 사용할 수 있습니다. Orca는 Rust로 작성되었으며
 로컬에서 실행되고 MIT 라이선스로 제공됩니다.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md)
+
+> **이름에 관하여.** Orca Agent는 "Orca"라는 이름의 다른 프로젝트와 무관합니다. 여기에는 stablyai/orca 데스크톱 에이전트 오케스트레이터, Plotly의 `orca` 패키지, GNOME Orca 화면 낭독기가 포함됩니다. 이 저장소는 [orcaagent.dev](https://orcaagent.dev/)의 DeepSeek 네이티브 터미널 코딩 에이전트입니다.
 
 [웹사이트](https://orcaagent.dev/) · [변경 기록](https://orcaagent.dev/changelog/) · [릴리스](https://github.com/echoVic/orca-agent/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
 

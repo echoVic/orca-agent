@@ -1,13 +1,15 @@
-# Orca
+# Orca Agent
 
-Tác nhân lập trình dành cho terminal, được thiết kế riêng cho DeepSeek.
+Orca Agent là tác nhân lập trình dành cho terminal, được thiết kế riêng cho DeepSeek.
 
-Hãy giao cho Orca một nhiệm vụ. Orca sẽ đọc mã, chỉnh sửa tệp, chạy lệnh,
+Hãy giao cho Orca Agent một nhiệm vụ. Orca sẽ đọc mã, chỉnh sửa tệp, chạy lệnh,
 kiểm tra kết quả và tiếp tục cho đến khi hoàn thành hoặc cần quyết định của bạn.
 Dùng TUI cho công việc tương tác hoặc `orca exec` cho script và CI. Orca được
 viết bằng Rust, chạy cục bộ và phát hành theo giấy phép MIT.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md)
+
+> **Tên gọi.** Orca Agent không liên quan đến các dự án khác có tên "Orca", bao gồm trình điều phối tác nhân máy tính để bàn stablyai/orca, gói `orca` của Plotly và trình đọc màn hình GNOME Orca. Kho lưu trữ này là tác nhân lập trình terminal native cho DeepSeek tại [orcaagent.dev](https://orcaagent.dev/).
 
 [Trang web](https://orcaagent.dev/) · [Nhật ký thay đổi](https://orcaagent.dev/changelog/) · [Bản phát hành](https://github.com/echoVic/orca-agent/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
 

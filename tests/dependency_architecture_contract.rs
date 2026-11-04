@@ -55,7 +55,7 @@ fn target_source<'a>(package: &'a Value, kind: &str, name: &str) -> &'a str {
 #[test]
 fn cargo_metadata_enforces_the_thin_root_dependency_graph() {
     let metadata = cargo_metadata();
-    let root = package(&metadata, "blade-deepseek");
+    let root = package(&metadata, "orca-agent");
     assert_eq!(
         normal_dependencies(root),
         ["clap", "orca-core", "orca-runtime", "orca-tui"]
@@ -94,7 +94,7 @@ fn tui_does_not_depend_on_provider() {
 #[test]
 fn cargo_metadata_enforces_binary_and_library_target_ownership() {
     let metadata = cargo_metadata();
-    let root = package(&metadata, "blade-deepseek");
+    let root = package(&metadata, "orca-agent");
     let runtime = package(&metadata, "orca-runtime");
     let tui = package(&metadata, "orca-tui");
 

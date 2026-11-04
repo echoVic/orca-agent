@@ -1,4 +1,4 @@
-# Orca
+# Orca Agent
 
 [![Latest release](https://img.shields.io/github/v/release/echoVic/orca-agent)](https://github.com/echoVic/orca-agent/releases/latest)
 [![npm](https://img.shields.io/npm/v/@blade-ai/orca)](https://www.npmjs.com/package/@blade-ai/orca)
@@ -7,18 +7,20 @@
 [![Windows CI](https://img.shields.io/github/actions/workflow/status/echoVic/orca-agent/windows-ci.yml?branch=main&label=windows)](https://github.com/echoVic/orca-agent/actions/workflows/windows-ci.yml)
 [![GitHub stars](https://img.shields.io/github/stars/echoVic/orca-agent)](https://github.com/echoVic/orca-agent/stargazers)
 
-A DeepSeek-native coding agent for your terminal.
+Orca Agent is a DeepSeek-native coding agent for your terminal.
 
-Give Orca a task and it reads code, edits files, runs commands, verifies the
+Give Orca Agent a task and it reads code, edits files, runs commands, verifies the
 result, and keeps working until the task is done or it needs you. Use the TUI
 for interactive work or `orca exec` for scripts and CI. Orca is built in Rust,
 runs locally, and is MIT licensed.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md)
 
+> **Naming.** Orca Agent is unrelated to other projects named "Orca", including the stablyai/orca desktop agent orchestrator, Plotly's `orca` package, and the GNOME Orca screen reader. This repository is the DeepSeek-native terminal coding agent at [orcaagent.dev](https://orcaagent.dev/).
+
 [Website](https://orcaagent.dev/) · [Changelog](https://orcaagent.dev/changelog/) · [Releases](https://github.com/echoVic/orca-agent/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
 
-![Orca's first run: trust the workspace, then enter a DeepSeek API key](docs/demo.gif)
+![Orca Agent's first run: trust the workspace, then enter a DeepSeek API key](docs/demo.gif)
 
 ## Install
 

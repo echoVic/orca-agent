@@ -21,7 +21,7 @@ function capture(relative, pattern, label) {
 
 const cargoVersion = capture("Cargo.toml", /^version\s*=\s*"([^"]+)"/m, "Cargo version");
 const checks = [
-  ["Cargo.lock root package", capture("Cargo.lock", /name = "blade-deepseek"\nversion = "([^"]+)"/, "Cargo.lock root version")],
+  ["Cargo.lock root package", capture("Cargo.lock", /name = "orca-agent"\nversion = "([^"]+)"/, "Cargo.lock root version")],
   ["npm/orca package", JSON.parse(read("npm/orca/package.json")).version],
   ["site releaseVersion", capture("site/src/shared.ts", /releaseVersion = "v([^"]+)"/, "site releaseVersion")],
   ["site latest release entry", capture("site/src/shared.ts", /version: "v([^"]+)"/, "site latest release")],

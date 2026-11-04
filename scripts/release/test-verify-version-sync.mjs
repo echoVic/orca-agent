@@ -23,7 +23,7 @@ function invoke() {
 
 try {
   write("Cargo.toml", '[package]\nversion = "1.2.3"\n');
-  write("Cargo.lock", '[[package]]\nname = "blade-deepseek"\nversion = "1.2.3"\n');
+  write("Cargo.lock", '[[package]]\nname = "orca-agent"\nversion = "1.2.3"\n');
   write("npm/orca/package.json", '{"version":"1.2.3"}\n');
   write("site/src/shared.ts", 'export const releaseVersion = "v1.2.3";\nconst releases = [{ version: "v1.2.3" }];\n');
   write("site/src/changelog/Changelog.tsx", 'const notes = { "v1.2.3": "ok" };\n');

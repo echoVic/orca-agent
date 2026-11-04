@@ -277,29 +277,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blade-deepseek"
-version = "0.5.16"
-dependencies = [
- "base64 0.23.1",
- "clap",
- "crossterm",
- "libc",
- "orca-approval",
- "orca-core",
- "orca-mcp",
- "orca-platform",
- "orca-provider",
- "orca-runtime",
- "orca-tools",
- "orca-tui",
- "orca-windows-sandbox",
- "serde_json",
- "tempfile",
- "toml 1.1.7+spec-1.1.0",
- "uuid",
-]
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2480,6 +2457,29 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "orca-agent"
+version = "0.5.16"
+dependencies = [
+ "base64 0.23.1",
+ "clap",
+ "crossterm",
+ "libc",
+ "orca-approval",
+ "orca-core",
+ "orca-mcp",
+ "orca-platform",
+ "orca-provider",
+ "orca-runtime",
+ "orca-tools",
+ "orca-tui",
+ "orca-windows-sandbox",
+ "serde_json",
+ "tempfile",
+ "toml 1.1.7+spec-1.1.0",
+ "uuid",
+]
 
 [[package]]
 name = "orca-approval"

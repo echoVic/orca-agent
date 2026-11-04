@@ -15,21 +15,21 @@ const canonicalUrl = `${canonicalOrigin}/changelog/`;
 
 const seoCopy: Record<Locale, SeoEntry> = {
   en: {
-    title: "Orca changelog",
+    title: "Orca Agent changelog",
     description:
-      "Every Orca release in one place: what shipped, when, and a link to the full GitHub release notes.",
-    ogTitle: "Orca changelog",
+      "Every Orca Agent release in one place: what shipped, when, and a link to the full GitHub release notes.",
+    ogTitle: "Orca Agent changelog",
     ogDescription:
-      "Every Orca release in one place: what shipped, when, and a link to the full GitHub release notes.",
-    imageAlt: "Orca terminal coding agent product preview",
+      "Every Orca Agent release in one place: what shipped, when, and a link to the full GitHub release notes.",
+    imageAlt: "Orca Agent terminal coding agent product preview",
     locale: "en_US",
   },
   zh: {
-    title: "Orca 更新日志",
-    description: "Orca 每一个版本：发了什么、何时发布，附 GitHub Release 完整说明链接。",
-    ogTitle: "Orca 更新日志",
-    ogDescription: "Orca 每一个版本：发了什么、何时发布，附 GitHub Release 完整说明链接。",
-    imageAlt: "Orca 终端代码智能体产品预览",
+    title: "Orca Agent 更新日志",
+    description: "Orca Agent 每一个版本：发了什么、何时发布，附 GitHub Release 完整说明链接。",
+    ogTitle: "Orca Agent 更新日志",
+    ogDescription: "Orca Agent 每一个版本：发了什么、何时发布，附 GitHub Release 完整说明链接。",
+    imageAlt: "Orca Agent 终端代码智能体产品预览",
     locale: "zh_CN",
   },
 };
@@ -38,7 +38,7 @@ const copy = {
   en: {
     langName: "English",
     aria: {
-      home: "Orca home",
+      home: "Orca Agent home",
       language: "Language",
     },
     nav: {
@@ -50,7 +50,7 @@ const copy = {
     },
     header: {
       eyebrow: "Changelog",
-      title: "Every Orca release, in order.",
+      title: "Every Orca Agent release, in order.",
       subtitle:
         "Versions follow semver; each entry links to the full GitHub Release notes for verification commands, breaking changes, and migration tips.",
       latestLabel: "latest",
@@ -62,7 +62,7 @@ const copy = {
       links: [
         {
           title: "Terminal coding agent",
-          body: "Use Orca as a local terminal coding agent for verifier-gated repository work.",
+          body: "Use Orca Agent as a local terminal coding agent for verifier-gated repository work.",
           href: links.terminalCodingAgent,
         },
         {
@@ -666,7 +666,7 @@ const copy = {
   zh: {
     langName: "中文",
     aria: {
-      home: "Orca 首页",
+      home: "Orca Agent 首页",
       language: "语言",
     },
     nav: {
@@ -678,7 +678,7 @@ const copy = {
     },
     header: {
       eyebrow: "更新日志",
-      title: "Orca 历次发布。",
+      title: "Orca Agent 历次发布。",
       subtitle:
         "版本遵循 semver；每条记录都链接到 GitHub Release 的完整说明，含校验命令、breaking change 与迁移提示。",
       latestLabel: "最新",
@@ -690,7 +690,7 @@ const copy = {
       links: [
         {
           title: "Terminal coding agent",
-          body: "把 Orca 作为本地终端代码智能体，用 verifier-gated 流程处理真实仓库任务。",
+          body: "把 Orca Agent 作为本地终端代码智能体，用 verifier-gated 流程处理真实仓库任务。",
           href: links.terminalCodingAgent,
         },
         {
@@ -1304,7 +1304,7 @@ function Changelog() {
       <header className="nav">
         <a className="brand" href={links.home} aria-label={t.aria.home}>
           <img className="brand-mark" src="/orca-icon.svg" alt="" aria-hidden="true" />
-          <span>Orca</span>
+          <span>Orca Agent</span>
         </a>
         <div className="nav-actions">
           <nav aria-label="Main navigation">
@@ -1394,7 +1394,7 @@ function Changelog() {
       <footer>
         <a className="foot-brand" href={links.home}>
           <img className="brand-mark" src="/orca-icon.svg" alt="" aria-hidden="true" />
-          <span>Orca</span>
+          <span>Orca Agent</span>
         </a>
         <div className="links">
           <a href={links.github} rel="noreferrer">

@@ -7,26 +7,26 @@ const intentPages = [
   {
     path: "terminal-coding-agent/",
     url: "https://orcaagent.dev/terminal-coding-agent/",
-    title: "Terminal coding agent for DeepSeek",
-    terms: ["orca terminal", "terminal coding agent", "orca agent"],
+    title: "Orca Agent - Terminal coding agent for DeepSeek",
+    terms: ["orca terminal", "terminal coding agent", "orca agent", "Orca Agent"],
   },
   {
     path: "deepseek-coding-agent/",
     url: "https://orcaagent.dev/deepseek-coding-agent/",
-    title: "DeepSeek coding agent",
-    terms: ["deepseek orca", "DeepSeek coding agent", "DeepSeek-native"],
+    title: "Orca Agent - DeepSeek coding agent",
+    terms: ["deepseek orca", "DeepSeek coding agent", "DeepSeek-native", "Orca Agent"],
   },
   {
     path: "github/",
     url: "https://orcaagent.dev/github/",
-    title: "Orca GitHub coding workflows",
-    terms: ["orca github", "GitHub workflows", "verifier-gated"],
+    title: "Orca Agent - GitHub coding workflows",
+    terms: ["orca github", "GitHub workflows", "verifier-gated", "Orca Agent"],
   },
   {
     path: "mcp/",
     url: "https://orcaagent.dev/mcp/",
-    title: "Orca MCP tools",
-    terms: ["orca mcp", "MCP tools", "spec-driven tools"],
+    title: "Orca Agent - MCP tools",
+    terms: ["orca mcp", "MCP tools", "spec-driven tools", "Orca Agent"],
   },
 ];
 const indexHtml = readFileSync(new URL("index.html", root), "utf8");
@@ -79,6 +79,20 @@ includes('<script type="application/ld+json">', "Missing JSON-LD block");
 includes('"@type": "SoftwareApplication"', "Missing SoftwareApplication schema");
 includes('"@type": "WebSite"', "Missing WebSite schema");
 includes('"@type": "Organization"', "Missing Organization schema");
+// The homepage must present the product identity as "Orca Agent" so the
+// brand and the orcaagent.dev entity resolve to distinct, unambiguous names.
+includes(
+  "<title>Orca Agent - DeepSeek-native terminal coding agent</title>",
+  "Homepage title must use the Orca Agent product name",
+);
+includes(
+  '<meta property="og:site_name" content="Orca Agent" />',
+  "Homepage og:site_name must be Orca Agent",
+);
+check(
+  /<meta\s+name="description"\s+content="Orca Agent is/.test(indexHtml),
+  "Homepage meta description must start with Orca Agent is",
+);
 
 check(robotsTxt.includes("User-agent: *"), "robots.txt missing user agent rule");
 check(robotsTxt.includes("Allow: /"), "robots.txt missing allow rule");
@@ -137,7 +151,7 @@ check(
   "changelog page missing og:url",
 );
 check(
-  changelogHtml.includes('<title>Orca changelog</title>'),
+  changelogHtml.includes('<title>Orca Agent changelog</title>'),
   "changelog page missing title",
 );
 check(
@@ -173,6 +187,7 @@ check(
   readme.includes("https://t.me/+11No1w5ZbTMyZTQ1"),
   "README missing official Telegram group",
 );
+check(readme.includes("# Orca Agent"), "README H1 must use the Orca Agent product name");
 check(
   /\.hero-copy\s*\{[^}]*align-self:\s*start;/s.test(styles),
   "Hero copy must stay top-aligned while the terminal animation grows",
@@ -187,16 +202,17 @@ check(
 const requiredHomepageSource = [
   ["Quick Start", "Homepage missing English quick start section"],
   ["Common dev tasks", "Homepage missing English use-case section"],
-  ["Why teams pick Orca", "Homepage missing English comparison section"],
+  ["Why teams pick Orca Agent", "Homepage missing English comparison section"],
   ["Frequently asked questions", "Homepage missing English FAQ section"],
   ["快速上手", "Homepage missing Chinese quick start section"],
   ["常见开发任务", "Homepage missing Chinese use-case section"],
-  ["为什么选择 Orca", "Homepage missing Chinese comparison section"],
+  ["为什么选择 Orca Agent", "Homepage missing Chinese comparison section"],
   ["常见问题", "Homepage missing Chinese FAQ section"],
   ['code: ["orca"]', "Quick start must launch the interactive TUI with orca"],
   ["guides you through the DeepSeek API key", "Quick start must describe guided key setup"],
   ["进入交互式终端", "Chinese quick start must describe entering the interactive terminal"],
   ["terminal coding agent", "Homepage missing terminal coding agent phrase"],
+  ["Orca Agent", "Homepage must use the Orca Agent product name"],
 ];
 
 for (const [needle, message] of requiredHomepageSource) {

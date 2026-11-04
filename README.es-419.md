@@ -1,13 +1,15 @@
-# Orca
+# Orca Agent
 
-Un agente de programación nativo para DeepSeek, diseñado para tu terminal.
+Orca Agent es un agente de programación nativo para DeepSeek, diseñado para tu terminal.
 
-Dale una tarea a Orca y leerá el código, editará archivos, ejecutará comandos,
+Dale una tarea a Orca Agent y leerá el código, editará archivos, ejecutará comandos,
 verificará el resultado y seguirá trabajando hasta terminar o necesitar tu decisión.
 Usa la TUI para trabajo interactivo o `orca exec` para scripts y CI. Orca está
 escrito en Rust, se ejecuta localmente y usa la licencia MIT.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md)
+
+> **Nombre.** Orca Agent no está relacionado con otros proyectos llamados "Orca", incluidos el orquestador de agentes de escritorio stablyai/orca, el paquete `orca` de Plotly y el lector de pantalla GNOME Orca. Este repositorio es el agente de programación de terminal nativo para DeepSeek en [orcaagent.dev](https://orcaagent.dev/).
 
 [Sitio web](https://orcaagent.dev/) · [Cambios](https://orcaagent.dev/changelog/) · [Versiones](https://github.com/echoVic/orca-agent/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
 

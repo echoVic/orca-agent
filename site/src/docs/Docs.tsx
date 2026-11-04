@@ -28,23 +28,23 @@ const canonicalUrl = `${canonicalOrigin}/docs/`;
 
 const seoCopy: Record<Locale, SeoEntry> = {
   en: {
-    title: "Orca Docs — DeepSeek-native terminal coding agent documentation",
+    title: "Orca Agent Docs — DeepSeek-native terminal coding agent documentation",
     description:
-      "Complete Orca documentation: CLI reference, TUI commands, approval modes, goal mode, workflows, MCP integration, context management, and DeepSeek model configuration.",
-    ogTitle: "Orca Docs — Complete reference for the DeepSeek-native coding agent",
+      "Complete Orca Agent documentation: CLI reference, TUI commands, approval modes, goal mode, workflows, MCP integration, context management, and DeepSeek model configuration.",
+    ogTitle: "Orca Agent Docs — Complete reference for the DeepSeek-native coding agent",
     ogDescription:
-      "Explore every Orca module: CLI flags, TUI sessions, approval modes, goal mode, workflows, MCP tools, context window, prefix cache, and the full configuration surface.",
-    imageAlt: "Orca terminal coding agent documentation preview",
+      "Explore every Orca Agent module: CLI flags, TUI sessions, approval modes, goal mode, workflows, MCP tools, context window, prefix cache, and the full configuration surface.",
+    imageAlt: "Orca Agent terminal coding agent documentation preview",
     locale: "en_US",
   },
   zh: {
-    title: "Orca 文档 — DeepSeek 原生终端代码智能体参考",
+    title: "Orca Agent 文档 — DeepSeek 原生终端代码智能体参考",
     description:
-      "完整的 Orca 使用文档：CLI 参考、TUI 命令、审批模式、持久目标、工作流、MCP 集成、上下文管理、DeepSeek 模型配置等。",
-    ogTitle: "Orca 文档 — DeepSeek 原生代码智能体完整参考",
+      "完整的 Orca Agent 文档：CLI 参考、TUI 命令、审批模式、持久目标、工作流、MCP 集成、上下文管理、DeepSeek 模型配置等。",
+    ogTitle: "Orca Agent 文档 — DeepSeek 原生代码智能体完整参考",
     ogDescription:
-      "探索 Orca 各个模块：CLI 参数、TUI 会话、审批模式、Goal 模式、Workflow、MCP 工具、上下文窗口、前缀缓存及完整配置项。",
-    imageAlt: "Orca 终端代码智能体文档预览",
+      "探索 Orca Agent 各个模块：CLI 参数、TUI 会话、审批模式、Goal 模式、Workflow、MCP 工具、上下文窗口、前缀缓存及完整配置项。",
+    imageAlt: "Orca Agent 终端代码智能体文档预览",
     locale: "zh_CN",
   },
 };
@@ -58,14 +58,14 @@ const navCopy: Record<
   }
 > = {
   en: {
-    aria: { home: "Orca home", nav: "Main navigation", language: "Language", langName: "English" },
+    aria: { home: "Orca Agent home", nav: "Main navigation", language: "Language", langName: "English" },
     nav: { home: "Home", docs: "Docs", changelog: "Changelog", install: "Install", github: "GitHub" },
-    brand: "Orca",
+    brand: "Orca Agent",
   },
   zh: {
-    aria: { home: "Orca 首页", nav: "主导航", language: "语言", langName: "中文" },
+    aria: { home: "Orca Agent 首页", nav: "主导航", language: "语言", langName: "中文" },
     nav: { home: "首页", docs: "文档", changelog: "更新日志", install: "安装", github: "GitHub" },
-    brand: "Orca",
+    brand: "Orca Agent",
   },
 };
 
@@ -306,7 +306,7 @@ export default function Docs() {
     }
   };
 
-  const pageTitle = locale === "zh" ? "Orca 文档" : "Orca Documentation";
+  const pageTitle = locale === "zh" ? "Orca Agent 文档" : "Orca Agent Documentation";
   const t = navCopy[locale];
 
   let content: ReactNode;

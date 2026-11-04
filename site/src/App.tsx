@@ -26,23 +26,23 @@ const canonicalUrl = `${canonicalOrigin}/`;
 
 const seoCopy = {
   en: {
-    title: "Orca - DeepSeek-native terminal coding agent",
+    title: "Orca Agent - DeepSeek-native terminal coding agent",
     description:
-      "Orca is a DeepSeek-native local terminal coding agent for long-context coding, multi-turn tool use, prefix-cache friendly prompts, persistent goals, resumable history, and approval-aware automation.",
-    ogTitle: "Orca - DeepSeek-native terminal coding agent",
+      "Orca Agent is a DeepSeek-native local terminal coding agent for long-context coding, multi-turn tool use, prefix-cache friendly prompts, persistent goals, resumable history, and approval-aware automation.",
+    ogTitle: "Orca Agent - DeepSeek-native terminal coding agent",
     ogDescription:
-      "Run DeepSeek-native coding work locally with long context, multi-turn tools, prefix-cache friendly prompts, persistent goals, resumable history, and verifier-gated automation.",
-    imageAlt: "Orca terminal coding agent product preview",
+      "Orca Agent runs DeepSeek-native coding work locally with long context, multi-turn tools, prefix-cache friendly prompts, persistent goals, resumable history, and verifier-gated automation.",
+    imageAlt: "Orca Agent terminal coding agent product preview",
     locale: "en_US",
   },
   zh: {
-    title: "Orca - DeepSeek 原生终端代码智能体",
+    title: "Orca Agent - DeepSeek 原生终端代码智能体",
     description:
-      "Orca 是 DeepSeek 原生的本地终端代码智能体，支持长上下文编码、多轮工具调用、前缀缓存友好提示词、持久 goal、可恢复历史和审批可控自动化。",
-    ogTitle: "Orca - DeepSeek 原生终端代码智能体",
+      "Orca Agent 是 DeepSeek 原生的本地终端代码智能体，支持长上下文编码、多轮工具调用、前缀缓存友好提示词、持久 goal、可恢复历史和审批可控自动化。",
+    ogTitle: "Orca Agent - DeepSeek 原生终端代码智能体",
     ogDescription:
-      "在本地终端运行 DeepSeek 原生代码任务，覆盖长上下文、多轮工具、前缀缓存友好提示词、持久 goal、可恢复历史和 verifier 校验自动化。",
-    imageAlt: "Orca 终端代码智能体产品预览",
+      "Orca Agent 在本地终端运行 DeepSeek 原生代码任务，覆盖长上下文、多轮工具、前缀缓存友好提示词、持久 goal、可恢复历史和 verifier 校验自动化。",
+    imageAlt: "Orca Agent 终端代码智能体产品预览",
     locale: "zh_CN",
   },
 } as const;
@@ -51,10 +51,10 @@ const copy = {
   en: {
     langName: "English",
     aria: {
-      home: "Orca home",
+      home: "Orca Agent home",
       nav: "Main navigation",
       language: "Language",
-      tui: "Orca TUI preview",
+      tui: "Orca Agent TUI preview",
       commands: "Command examples",
       install: "Install commands",
     },
@@ -71,9 +71,9 @@ const copy = {
     },
     hero: {
       pill: `${releaseVersion} · Rust-native`,
-      titlePrefix: "A",
+      titlePrefix: "Orca Agent —",
       titleHighlight: "DeepSeek-native",
-      titleSuffix: "coding agent, in your terminal",
+      titleSuffix: "terminal coding agent",
       subtitle:
         "Orca is a local terminal coding agent built around DeepSeek: long-context coding, multi-turn tool use, prefix-cache friendly prompts, resumable history, persistent goals, and approval-aware automation in one Rust binary.",
       primary: "Get started",
@@ -128,7 +128,7 @@ const copy = {
       eyebrow: "Quick Start",
       title: "Install once, then just run orca.",
       subtitle:
-        "After installation, start Orca from your terminal. The first run guides you through the DeepSeek API key, then drops you straight into the interactive coding TUI.",
+        "After installation, start Orca Agent from your terminal. The first run guides you through the DeepSeek API key, then drops you straight into the interactive coding TUI.",
       steps: [
         {
           k: "01",
@@ -138,7 +138,7 @@ const copy = {
         },
         {
           k: "02",
-          title: "Run Orca",
+          title: "Run Orca Agent",
           body: "Launch the TUI. If no API key is configured yet, Orca opens the setup flow and saves it for future sessions.",
           code: ["orca"],
         },
@@ -227,7 +227,7 @@ const copy = {
       configPriority: "Priority: env vars > CLI args > config file > defaults",
     },
     comparison: {
-      eyebrow: "Why teams pick Orca",
+      eyebrow: "Why teams pick Orca Agent",
       title: "A local DeepSeek workflow, not another chat window.",
       columns: [
         {
@@ -247,7 +247,7 @@ const copy = {
           ],
         },
         {
-          title: "Orca",
+          title: "Orca Agent",
           items: [
             "DeepSeek routing, max reasoning effort, and prefix-cache-friendly prompts are first-class.",
             "Persistent goals, workflows, and verifier gates keep long tasks moving.",
@@ -261,8 +261,8 @@ const copy = {
       title: "Answers before you install.",
       items: [
         {
-          q: "Does Orca only work with DeepSeek?",
-          a: "Orca is tuned for DeepSeek V4 and gives the best experience there, but the config can point at an OpenAI-compatible endpoint when your team needs that.",
+          q: "Does Orca Agent only work with DeepSeek?",
+          a: "Orca Agent is tuned for DeepSeek V4 and gives the best experience there, but the config can point at an OpenAI-compatible endpoint when your team needs that.",
         },
         {
           q: "Will my session history be lost?",
@@ -277,8 +277,8 @@ const copy = {
           a: "A /goal survives restarts, auto-continues successful turns, and requires an explicit complete or blocked audit before Orca stops.",
         },
         {
-          q: "Which platforms does Orca support?",
-          a: "Orca ships native binaries for macOS, Linux, and Windows on arm64 and x64, plus an npm package that wraps the binary.",
+          q: "Which platforms does Orca Agent support?",
+          a: "Orca Agent ships native binaries for macOS, Linux, and Windows on arm64 and x64, plus an npm package that wraps the binary.",
         },
         {
           q: "How does the sandbox protect my machine?",
@@ -289,8 +289,12 @@ const copy = {
           a: "Approval modes decide how tool calls are gated. Suggest mode asks before writes, auto-edit allows edits but still asks for shell and network, and full-auto runs everything within policy. You can also grant a tool once or for the session.",
         },
         {
-          q: "Can Orca use MCP tools?",
-          a: "Yes. Orca supports the Model Context Protocol: add stdio or HTTP servers with orca mcp, and their tools appear in the same approval-aware registry as built-in tools.",
+          q: "Can Orca Agent use MCP tools?",
+          a: "Yes. Orca Agent supports the Model Context Protocol: add stdio or HTTP servers with orca mcp, and their tools appear in the same approval-aware registry as built-in tools.",
+        },
+        {
+          q: "Is Orca Agent the same as other projects named Orca?",
+          a: "No. Orca Agent is the DeepSeek-native terminal coding agent in this repository, published at orcaagent.dev. The stablyai/orca desktop app, Plotly's orca package, and the GNOME Orca screen reader are unrelated projects.",
         },
       ],
     },
@@ -305,7 +309,7 @@ const copy = {
     install: {
       eyebrow: "Install",
       title: "Use npm, or install the native binary directly.",
-      cardLabel: "Install Orca",
+      cardLabel: "Install Orca Agent",
       methodLabel: "Install method",
       copy: "Copy",
       copied: "✓ Copied",
@@ -329,10 +333,10 @@ const copy = {
   zh: {
     langName: "中文",
     aria: {
-      home: "Orca 首页",
+      home: "Orca Agent 首页",
       nav: "主导航",
       language: "语言",
-      tui: "Orca TUI 预览",
+      tui: "Orca Agent TUI 预览",
       commands: "命令示例",
       install: "安装命令",
     },
@@ -349,9 +353,9 @@ const copy = {
     },
     hero: {
       pill: `${releaseVersion} · Rust 原生`,
-      titlePrefix: "面向终端的",
+      titlePrefix: "Orca Agent —",
       titleHighlight: "DeepSeek 原生",
-      titleSuffix: "代码智能体",
+      titleSuffix: "终端编程智能体",
       subtitle:
         "Orca 是围绕 DeepSeek 构建的本地终端代码智能体：长上下文编码、多轮工具调用、前缀缓存友好提示词、可恢复历史、持久 goal，以及带审批策略的自动化，都内建在一个 Rust 二进制里。",
       primary: "开始使用",
@@ -416,7 +420,7 @@ const copy = {
         },
         {
           k: "02",
-          title: "运行 Orca",
+          title: "运行 Orca Agent",
           body: "启动 TUI。如果还没有配置 API key，Orca 会打开初始化引导，并为之后的会话保存配置。",
           code: ["orca"],
         },
@@ -504,7 +508,7 @@ const copy = {
       configPriority: "优先级：环境变量 > CLI 参数 > 配置文件 > 默认值",
     },
     comparison: {
-      eyebrow: "为什么选择 Orca",
+      eyebrow: "为什么选择 Orca Agent",
       title: "不是再开一个聊天窗口，而是本地 DeepSeek 开发工作流。",
       columns: [
         {
@@ -524,7 +528,7 @@ const copy = {
           ],
         },
         {
-          title: "Orca",
+          title: "Orca Agent",
           items: [
             "DeepSeek 路由、max reasoning effort 和前缀缓存友好提示词是一等能力。",
             "持久 goal、workflow 和 verifier gate 能支撑更长任务。",
@@ -538,8 +542,8 @@ const copy = {
       title: "安装前先把疑虑说清楚。",
       items: [
         {
-          q: "Orca 只能用 DeepSeek 吗？",
-          a: "Orca 针对 DeepSeek V4 做了调优，在 DeepSeek 上体验最好；如果团队需要，也可以把配置指向 OpenAI-compatible endpoint。",
+          q: "Orca Agent 只能用 DeepSeek 吗？",
+          a: "Orca Agent 针对 DeepSeek V4 做了调优，在 DeepSeek 上体验最好；如果团队需要，也可以把配置指向 OpenAI-compatible endpoint。",
         },
         {
           q: "会话历史会不会丢？",
@@ -554,8 +558,8 @@ const copy = {
           a: "/goal 会跨重启保留，成功后自动继续，并要求 Orca 明确审计为 complete 或 blocked 后才停止。",
         },
         {
-          q: "Orca 支持哪些平台？",
-          a: "Orca 提供 macOS、Linux、Windows 的 arm64 / x64 原生二进制，以及一个封装二进制的 npm 包。",
+          q: "Orca Agent 支持哪些平台？",
+          a: "Orca Agent 提供 macOS、Linux、Windows 的 arm64 / x64 原生二进制，以及一个封装二进制的 npm 包。",
         },
         {
           q: "沙箱怎么保护我的电脑？",
@@ -566,8 +570,12 @@ const copy = {
           a: "审批模式决定工具调用的门槛。suggest 模式在写入前询问，auto-edit 允许编辑但仍询问 shell 和网络，full-auto 在策略范围内全自动运行。也可以对单个工具授予一次或整会话权限。",
         },
         {
-          q: "Orca 能用 MCP 工具吗？",
-          a: "可以。Orca 支持 Model Context Protocol：用 orca mcp 添加 stdio 或 HTTP 服务器，它们的工具会和内置工具一样出现在同一个带审批的注册表里。",
+          q: "Orca Agent 能用 MCP 工具吗？",
+          a: "可以。Orca Agent 支持 Model Context Protocol：用 orca mcp 添加 stdio 或 HTTP 服务器，它们的工具会和内置工具一样出现在同一个带审批的注册表里。",
+        },
+        {
+          q: "Orca Agent 和别的 Orca 项目是同一个吗？",
+          a: "不是。Orca Agent 是本仓库的 DeepSeek 原生终端编程智能体，官网为 orcaagent.dev。stablyai/orca 桌面端、Plotly 的 orca 包和 GNOME Orca 屏幕阅读器都是无关项目。",
         },
       ],
     },
@@ -582,7 +590,7 @@ const copy = {
     install: {
       eyebrow: "安装",
       title: "使用 npm，或直接安装原生二进制。",
-      cardLabel: "安装 Orca",
+      cardLabel: "安装 Orca Agent",
       methodLabel: "安装方式",
       copy: "复制",
       copied: "✓ 已复制",
@@ -1109,7 +1117,7 @@ function App() {
       <header className="nav">
         <a className="brand" href="#top" aria-label={t.aria.home}>
           <img className="brand-mark" src="/orca-icon.svg" alt="" aria-hidden="true" />
-          <span>Orca</span>
+          <span>Orca Agent</span>
         </a>
         <div className="nav-actions">
           <nav aria-label={t.aria.nav}>
@@ -1153,7 +1161,8 @@ function App() {
             {t.hero.pill}
           </span>
           <h1>
-            {t.hero.titlePrefix} <span className="grad">{t.hero.titleHighlight}</span>{" "}
+            {t.hero.titlePrefix} <span className="grad">{t.hero.titleHighlight}</span>
+            {locale === "zh" ? "" : " "}
             {t.hero.titleSuffix}
           </h1>
           <p className="subtitle">{t.hero.subtitle}</p>
@@ -1527,7 +1536,7 @@ function App() {
       <footer>
         <a className="foot-brand" href="#top">
           <img className="brand-mark" src="/orca-icon.svg" alt="" aria-hidden="true" />
-          <span>Orca</span>
+          <span>Orca Agent</span>
         </a>
         <div className="links">
           <a href={links.github} rel="noreferrer">

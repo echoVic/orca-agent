@@ -7,7 +7,7 @@ use orca_core::config::{OutputFormat, ProviderKind};
 #[derive(Debug, Parser)]
 #[command(name = "orca")]
 #[command(version)]
-#[command(about = "A DeepSeek-native coding agent.")]
+#[command(about = "Orca Agent: a DeepSeek-native terminal coding agent.")]
 pub struct Cli {
     /// Resume a saved conversation in TUI mode; omit the selector to open the picker.
     #[arg(long, num_args = 0..=1, default_missing_value = "")]

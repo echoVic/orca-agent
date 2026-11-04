@@ -58,10 +58,10 @@ windows-sys = "0.61"
 arboard = { version = "3", features = ["wayland-data-control"] }
 
 [package]
-name = "blade-deepseek"
+name = "orca-agent"
 version = "0.5.16"
 edition = "2024"
-description = "Orca: a DeepSeek-native coding agent"
+description = "Orca Agent: a DeepSeek-native terminal coding agent"
 license = "MIT"
 repository = "https://github.com/echoVic/orca-agent"
 default-run = "orca"

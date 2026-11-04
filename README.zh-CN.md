@@ -1,12 +1,14 @@
-# Orca
+# Orca Agent
 
-为终端打造的 DeepSeek 原生编程智能体。
+Orca Agent 是为终端打造的 DeepSeek 原生编程智能体。
 
-给 Orca 一个任务，它会读取代码、编辑文件、运行命令、验证结果，并持续工作，
+给 Orca Agent 一个任务，它会读取代码、编辑文件、运行命令、验证结果，并持续工作，
 直到任务完成或需要你的决定。交互式工作使用 TUI，脚本和 CI 使用 `orca exec`。
 Orca 使用 Rust 构建，在本地运行，并采用 MIT 许可证。
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md)
+
+> **命名说明。** Orca Agent 与名称同为 Orca 的其他项目无关，包括 stablyai/orca 桌面智能体编排器、Plotly 的 `orca` 包和 GNOME Orca 屏幕阅读器。本仓库是 [orcaagent.dev](https://orcaagent.dev/) 上的 DeepSeek 原生终端编程智能体。
 
 [官网](https://orcaagent.dev/) · [更新日志](https://orcaagent.dev/changelog/) · [版本发布](https://github.com/echoVic/orca-agent/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
 

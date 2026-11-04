@@ -1,13 +1,15 @@
-# Orca
+# Orca Agent
 
-ターミナル向けの DeepSeek ネイティブなコーディングエージェントです。
+Orca Agent は、ターミナル向けの DeepSeek ネイティブなコーディングエージェントです。
 
-Orca にタスクを渡すと、コードの読み取り、ファイルの編集、コマンドの実行、
+Orca Agent にタスクを渡すと、コードの読み取り、ファイルの編集、コマンドの実行、
 結果の検証を行い、完了するか判断が必要になるまで作業を続けます。
 対話的な作業には TUI、スクリプトや CI には `orca exec` を使用できます。
 Orca は Rust 製で、ローカルで動作し、MIT ライセンスで提供されます。
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md)
+
+> **命名について。** Orca Agent は、「Orca」という名前の他のプロジェクトとは一切関係ありません。これには stablyai/orca のデスクトップエージェントオーケストレーター、Plotly の `orca` パッケージ、GNOME Orca スクリーンリーダーが含まれます。このリポジトリは [orcaagent.dev](https://orcaagent.dev/) にある DeepSeek ネイティブのターミナル向けコーディングエージェントです。
 
 [Web サイト](https://orcaagent.dev/) · [変更履歴](https://orcaagent.dev/changelog/) · [リリース](https://github.com/echoVic/orca-agent/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
 
