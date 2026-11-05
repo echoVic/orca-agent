@@ -637,7 +637,7 @@ async fn call_streaming_async_with_output_budget(
             Some(max_output_tokens) => {
                 let timeout = bounded_timeout.expect("bounded output requires a bounded timeout");
                 // The bounded facade owns its timeout and partial fallback.
-                let default_budget = http_client::RetryBudget::new(1, timeout, None);
+                let default_budget = http_client::RetryBudget::new(5, timeout, None);
                 deepseek_http::call_streaming_async_bounded_with_retry_budget(
                     conversation,
                     config,

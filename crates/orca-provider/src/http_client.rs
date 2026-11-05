@@ -340,21 +340,11 @@ pub fn execute_with_retry_budget(
     let client = client()?;
     let mut attempt: u32 = 0;
     loop {
-        let mut request = build_request(client)
+        let request = build_request(client)
             .build()
             .map_err(|e| format!("request build failed: {e}"))?;
-        let key = quota_key(request.url(), request.headers());
-        admit_blocking(key, budget, cancel)?;
-        if let Some(remaining) = budget.remaining_time()? {
-            *request.timeout_mut() = Some(
-                request
-                    .timeout()
-                    .copied()
-                    .unwrap_or(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-                    .min(remaining),
-            );
-        }
-        match client.execute(request) {
+        let (result, key) = send_built_blocking_request(client, request, cancel, budget)?;
+        match result {
             Ok(resp) => {
                 let status = resp.status();
                 if !is_retryable_status(status.as_u16()) {
@@ -405,9 +395,7 @@ pub async fn execute_streaming_with_retry_budget(
         let request = build_request(client)
             .build()
             .map_err(|e| format!("request build failed: {e}"))?;
-        let key = quota_key(request.url(), request.headers());
-        admit_async(key, budget, cancel).await?;
-        let result = send_built_streaming_request(client, request, cancel, budget).await?;
+        let (result, key) = send_built_streaming_request(client, request, cancel, budget).await?;
         match result {
             Ok(resp) => {
                 let status = resp.status();
@@ -466,11 +454,8 @@ pub(crate) async fn execute_streaming_once_with_budget(
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build_split();
     let request = request.map_err(|e| format!("request build failed: {e}"))?;
-    let key = quota_key(request.url(), request.headers());
-    admit_async(key, budget, cancel).await?;
-    let response = send_built_streaming_request(&client, request, cancel, budget)
-        .await?
-        .map_err(|error| format!("request failed after 1 attempt: {error}"))?;
+    let (result, key) = send_built_streaming_request(&client, request, cancel, budget).await?;
+    let response = result.map_err(|error| format!("request failed after 1 attempt: {error}"))?;
     let status = response.status();
     if is_retryable_status(status.as_u16()) {
         extend_cooldown(key, response.headers());
@@ -487,28 +472,196 @@ pub(crate) async fn execute_streaming_once_with_budget(
     Ok(response)
 }
 
+// Redirects are explicit so every transport hop uses the same admission gate
+// and actual-send budget. The returned key belongs to the final destination,
+// including its remaining credentials, so Retry-After cools the correct quota.
+fn redirect_target(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    previous: &reqwest::Url,
+) -> Result<Option<reqwest::Url>, String> {
+    if !status.is_redirection() {
+        return Ok(None);
+    }
+    if !matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
+        return Err("unsupported provider redirect status".into());
+    }
+    let location = headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or("provider redirect missing valid Location")?;
+    let next = previous
+        .join(location)
+        .map_err(|_| "provider redirect has invalid Location")?;
+    if !matches!(next.scheme(), "http" | "https")
+        || !next.username().is_empty()
+        || next.password().is_some()
+    {
+        return Err("provider redirect has unsupported target".into());
+    }
+    Ok(Some(next))
+}
+
+fn prepare_redirect(
+    status: reqwest::StatusCode,
+    next: &reqwest::Url,
+    previous: &reqwest::Url,
+    method: &mut reqwest::Method,
+    headers: &mut reqwest::header::HeaderMap,
+) -> bool {
+    let drop_body = status.as_u16() == 303
+        || (matches!(status.as_u16(), 301 | 302) && *method == reqwest::Method::POST);
+    if drop_body {
+        if *method != reqwest::Method::HEAD {
+            *method = reqwest::Method::GET;
+        }
+        for name in [
+            "content-type",
+            "content-length",
+            "content-encoding",
+            "transfer-encoding",
+        ] {
+            headers.remove(name);
+        }
+    }
+    headers.remove(reqwest::header::HOST);
+    if next.origin() != previous.origin() {
+        let sensitive: Vec<_> = headers
+            .iter()
+            .filter(|(_, value)| value.is_sensitive())
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in sensitive {
+            headers.remove(name);
+        }
+        for name in [
+            "authorization",
+            "cookie",
+            "cookie2",
+            "proxy-authorization",
+            "www-authenticate",
+            "x-api-key",
+            "api-key",
+            "referer",
+        ] {
+            headers.remove(name);
+        }
+    }
+    drop_body
+}
+
+fn request_retry_budget(
+    budget: &RetryBudget,
+    timeout: Option<Duration>,
+) -> Result<RetryBudget, String> {
+    let mut scoped = budget.clone();
+    if let Some(timeout) = timeout {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or("provider request timeout out of range")?;
+        scoped.deadline = Some(
+            scoped
+                .deadline
+                .map_or(deadline, |existing| existing.min(deadline)),
+        );
+    }
+    Ok(scoped)
+}
+
+type HttpSendResult<T> = Result<(Result<T, reqwest::Error>, [u8; 32]), String>;
+
+fn send_built_blocking_request(
+    client: &BlockingClient,
+    mut request: reqwest::blocking::Request,
+    cancel: &CancelToken,
+    budget: &RetryBudget,
+) -> HttpSendResult<BlockingResponse> {
+    let scoped = request_retry_budget(
+        budget,
+        Some(
+            request
+                .timeout()
+                .copied()
+                .unwrap_or(Duration::from_secs(REQUEST_TIMEOUT_SECS)),
+        ),
+    )?;
+    let budget = &scoped;
+    loop {
+        let key = quota_key(request.url(), request.headers());
+        admit_blocking(key, budget, cancel)?;
+        *request.timeout_mut() = budget.remaining_time()?;
+        let replay = request.try_clone();
+        match client.execute(request) {
+            Ok(response) => {
+                let Some(next) =
+                    redirect_target(response.status(), response.headers(), response.url())?
+                else {
+                    return Ok((Ok(response), key));
+                };
+                let mut follow = replay.ok_or("provider redirect body cannot be replayed")?;
+                let mut method = follow.method().clone();
+                let previous = follow.url().clone();
+                if prepare_redirect(
+                    response.status(),
+                    &next,
+                    &previous,
+                    &mut method,
+                    follow.headers_mut(),
+                ) {
+                    *follow.body_mut() = None;
+                }
+                *follow.method_mut() = method;
+                *follow.url_mut() = next;
+                request = follow;
+            }
+            Err(error) => return Ok((Err(error), key)),
+        }
+    }
+}
+
 async fn send_built_streaming_request(
     client: &Client,
     mut request: reqwest::Request,
     cancel: &CancelToken,
     budget: &RetryBudget,
-) -> Result<Result<Response, reqwest::Error>, String> {
-    if cancel.is_cancelled() {
-        return Err("request cancelled".into());
-    }
-    if let Some(remaining) = budget.remaining_time()? {
-        *request.timeout_mut() = Some(
-            request
-                .timeout()
-                .copied()
-                .unwrap_or(remaining)
-                .min(remaining),
-        );
-    }
-    tokio::select! {
-        biased;
-        _ = wait_for_cancel(cancel) => Err("request cancelled".into()),
-        result = client.execute(request) => Ok(result),
+) -> HttpSendResult<Response> {
+    let scoped = request_retry_budget(budget, request.timeout().copied())?;
+    let budget = &scoped;
+    loop {
+        let key = quota_key(request.url(), request.headers());
+        admit_async(key, budget, cancel).await?;
+        *request.timeout_mut() = budget.remaining_time()?;
+        let replay = request.try_clone();
+        let result = tokio::select! {
+            biased;
+            _ = wait_for_cancel(cancel) => return Err("request cancelled".into()),
+            result = client.execute(request) => result,
+        };
+        match result {
+            Ok(response) => {
+                let Some(next) =
+                    redirect_target(response.status(), response.headers(), response.url())?
+                else {
+                    return Ok((Ok(response), key));
+                };
+                let mut follow = replay.ok_or("provider redirect body cannot be replayed")?;
+                let mut method = follow.method().clone();
+                let previous = follow.url().clone();
+                if prepare_redirect(
+                    response.status(),
+                    &next,
+                    &previous,
+                    &mut method,
+                    follow.headers_mut(),
+                ) {
+                    *follow.body_mut() = None;
+                }
+                *follow.method_mut() = method;
+                *follow.url_mut() = next;
+                request = follow;
+            }
+            Err(error) => return Ok((Err(error), key)),
+        }
     }
 }
 
@@ -587,6 +740,292 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Instant;
+
+    fn redirect_server(
+        status: u16,
+        location: &str,
+        max_requests: usize,
+    ) -> (String, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/start", listener.local_addr().unwrap());
+        let location = location.to_string();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut requests = Vec::new();
+            while requests.len() < max_requests && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let count = stream.read(&mut chunk).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    let size = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + size {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                let final_hop =
+                    request.starts_with("POST /final ") || request.starts_with("GET /final ");
+                requests.push(request);
+                if final_hop {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .unwrap();
+                } else {
+                    write!(stream, "HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redirect_review_streaming_preserves_post_or_switches_to_get_and_charges_hops() {
+        let client = streaming_client().unwrap();
+        for status in [301, 302, 303, 307, 308] {
+            let (url, server) = redirect_server(status, "/final", 2);
+            let budget = RetryBudget::new(5, Duration::from_secs(1), None);
+            let response = execute_streaming_with_retry_budget(
+                &client,
+                |c| c.post(&url).bearer_auth("same-origin").body("payload"),
+                &CancelToken::new(),
+                &budget,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok", "status {status}");
+            assert_eq!(budget.attempts(), 2);
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests[1]
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer same-origin")
+            );
+            if status == 307 || status == 308 {
+                assert!(requests[1].starts_with("POST /final "));
+                assert!(requests[1].ends_with("payload"));
+            } else {
+                assert!(requests[1].starts_with("GET /final "));
+                assert!(!requests[1].contains("content-length: 7"));
+                assert!(!requests[1].ends_with("payload"));
+            }
+        }
+    }
+
+    #[test]
+    fn redirect_review_blocking_preserves_post_and_counts_every_hop() {
+        let (url, server) = redirect_server(308, "/final", 2);
+        let budget = RetryBudget::new(5, Duration::from_secs(1), None);
+        let response = execute_with_retry_budget(
+            |c| c.post(&url).body("payload"),
+            &budget,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        assert_eq!(response.text().unwrap(), "ok");
+        assert_eq!(budget.attempts(), 2);
+        let requests = server.join().unwrap();
+        assert!(requests[1].starts_with("POST /final "));
+        assert!(requests[1].ends_with("payload"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redirect_review_loop_cannot_bypass_actual_send_cap() {
+        let (url, server) = redirect_server(307, "/start", 3);
+        let client = streaming_client().unwrap();
+        let budget = RetryBudget::new(3, Duration::from_secs(1), None);
+        let error = execute_streaming_with_retry_budget(
+            &client,
+            |c| c.post(&url).body("payload"),
+            &CancelToken::new(),
+            &budget,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("send budget"), "{error}");
+        assert_eq!(budget.attempts(), 3);
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redirect_review_cross_origin_drops_credentials() {
+        let (destination, target) = redirect_server(307, "/final", 1);
+        let final_url = destination.replace("/start", "/final");
+        let (url, source) = redirect_server(307, &final_url, 1);
+        let client = streaming_client().unwrap();
+        let budget = RetryBudget::new(5, Duration::from_secs(1), None);
+        let response = execute_streaming_with_retry_budget(
+            &client,
+            |c| {
+                c.post(&url)
+                    .bearer_auth("secret")
+                    .header("cookie", "secret-cookie")
+                    .header("x-api-key", "secret-key")
+                    .body("payload")
+            },
+            &CancelToken::new(),
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.text().await.unwrap(), "ok");
+        source.join().unwrap();
+        let requests = target.join().unwrap();
+        let request = requests[0].to_ascii_lowercase();
+        assert!(!request.contains("secret"), "{request}");
+        assert_eq!(budget.attempts(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redirect_review_summary_once_follows_redirect_with_shared_budget() {
+        let (url, server) = redirect_server(307, "/final", 2);
+        let client = streaming_client().unwrap();
+        let budget = RetryBudget::new(2, Duration::from_secs(1), None);
+        let response = execute_streaming_once_with_budget(
+            client.post(&url).body("payload"),
+            &CancelToken::new(),
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.text().await.unwrap(), "ok");
+        assert_eq!(budget.attempts(), 2);
+        assert!(server.join().unwrap()[1].ends_with("payload"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redirect_review_malformed_and_non_http_locations_fail_without_extra_send() {
+        let client = streaming_client().unwrap();
+        for location in [
+            "file:///tmp/secret",
+            "http://[",
+            "http://user:password@localhost/final",
+        ] {
+            let (url, server) = redirect_server(307, location, 1);
+            let budget = RetryBudget::new(5, Duration::from_secs(1), None);
+            let error = execute_streaming_with_retry_budget(
+                &client,
+                |c| c.get(&url),
+                &CancelToken::new(),
+                &budget,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("redirect"), "{error}");
+            assert!(!error.contains(location));
+            assert_eq!(budget.attempts(), 1);
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redirect_review_destination_cooldown_preserves_cancellation_and_deadline() {
+        let client = streaming_client().unwrap();
+        for cancel_wait in [false, true] {
+            let destination = format!(
+                "http://127.0.0.1:9/final-{}",
+                if cancel_wait { "cancel" } else { "deadline" }
+            );
+            let destination_url = reqwest::Url::parse(&destination).unwrap();
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("retry-after", "1".parse().unwrap());
+            extend_cooldown(
+                quota_key(&destination_url, &reqwest::header::HeaderMap::new()),
+                &headers,
+            );
+            let (url, server) = redirect_server(307, &destination, 1);
+            let cancel = CancelToken::new();
+            let budget = RetryBudget::new(
+                5,
+                Duration::from_secs(2),
+                if cancel_wait {
+                    None
+                } else {
+                    Some(Instant::now() + Duration::from_millis(500))
+                },
+            );
+            let cancel_clone = cancel.clone();
+            let canceller = tokio::spawn(async move {
+                if cancel_wait {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    cancel_clone.cancel();
+                }
+            });
+            let error =
+                execute_streaming_with_retry_budget(&client, |c| c.get(&url), &cancel, &budget)
+                    .await
+                    .unwrap_err();
+            if cancel_wait {
+                assert_eq!(error, "request cancelled");
+            } else {
+                assert!(error.contains("deadline"), "{error}");
+            }
+            assert_eq!(budget.attempts(), 1);
+            assert_eq!(server.join().unwrap().len(), 1);
+            canceller.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redirect_review_request_timeout_bounds_destination_cooldown_wait() {
+        let destination = reqwest::Url::parse("http://127.0.0.1:9/request-timeout-final").unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "1".parse().unwrap());
+        extend_cooldown(
+            quota_key(&destination, &reqwest::header::HeaderMap::new()),
+            &headers,
+        );
+        let (url, server) = redirect_server(307, destination.as_str(), 1);
+        let client = streaming_client().unwrap();
+        let budget = RetryBudget::new(5, Duration::from_secs(2), None);
+        let started = Instant::now();
+        let error = execute_streaming_with_retry_budget(
+            &client,
+            |c| c.get(&url).timeout(Duration::from_millis(200)),
+            &CancelToken::new(),
+            &budget,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "cooldown outlived request timeout: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(budget.attempts(), 1);
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
 
     #[test]
     fn gateway_5xx_codes_outside_the_old_allow_list_are_retryable() {

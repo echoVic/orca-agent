@@ -444,7 +444,8 @@ pub async fn call_streaming_async_bounded(
 ) -> ProviderResponse {
     // The outer timeout owns this facade's partial-report fallback. Only a
     // caller-supplied operation budget also bounds the transport deadline.
-    let budget = RetryBudget::new(1, timeout, None);
+    // One logical response may follow redirects; the transport does not retry it.
+    let budget = RetryBudget::new(5, timeout, None);
     call_streaming_async_bounded_with_retry_budget(
         conversation,
         config,
@@ -566,7 +567,7 @@ pub fn call_summary(
                     cancel,
                     &mut |_| {},
                     &RetryBudget::new(
-                        1,
+                        5,
                         Duration::from_secs(120),
                         Some(std::time::Instant::now() + Duration::from_secs(120)),
                     ),
@@ -1222,6 +1223,176 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
+
+    fn summary_redirect_fixture() -> (
+        Conversation,
+        ProviderConfig,
+        std::thread::JoinHandle<Vec<String>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut bodies = Vec::new();
+            while bodies.len() < 2 && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                bodies.push(read_http_request_body(&mut stream));
+                if bodies.len() == 1 {
+                    stream.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /redirected/completions\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"redirected summary\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                }
+            }
+            bodies
+        });
+        let mut conversation = Conversation::new();
+        conversation.add_user("summarize evidence".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+            max_output_tokens: None,
+        };
+        (conversation, config, server)
+    }
+
+    #[test]
+    fn redirect_review_production_summary_allows_budgeted_redirect() {
+        let (conversation, config, server) = summary_redirect_fixture();
+        let response = call_summary(&conversation, &config, 256, None);
+        assert_eq!(
+            response.assistant_content.as_deref(),
+            Some("redirected summary"),
+            "{:?}",
+            response.steps
+        );
+        let bodies = server.join().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redirect_review_production_bounded_facade_allows_budgeted_redirect() {
+        let (conversation, config, server) = summary_redirect_fixture();
+        let response = call_streaming_async_bounded(
+            &conversation,
+            &config,
+            &CancelToken::new(),
+            256,
+            Duration::from_secs(1),
+            |_| {},
+        )
+        .await;
+        assert_eq!(
+            response.assistant_content.as_deref(),
+            Some("redirected summary"),
+            "{:?}",
+            response.steps
+        );
+        let bodies = server.join().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[test]
+    fn redirect_review_production_streaming_worker_allows_budgeted_redirect() {
+        let (conversation, config, server) = summary_redirect_fixture();
+        let mut call = crate::start_streaming_bounded(
+            orca_core::config::ProviderKind::DeepSeek,
+            &conversation,
+            &config,
+            CancelToken::new(),
+            256,
+            Duration::from_secs(1),
+        );
+        let response = loop {
+            match call.recv_timeout(Duration::from_secs(2)).unwrap() {
+                crate::ProviderStreamEvent::Step(delivery) => drop(delivery),
+                crate::ProviderStreamEvent::Completed(response) => break response,
+            }
+        };
+        assert_eq!(
+            response.assistant_content.as_deref(),
+            Some("redirected summary"),
+            "{:?}",
+            response.steps
+        );
+        let bodies = server.join().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[test]
+    fn redirect_review_production_summary_does_not_retry_transient_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        read_http_request_body(&mut stream);
+                        stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            let quiet_deadline = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < quiet_deadline {
+                match listener.accept() {
+                    Ok(_) => panic!("summary unexpectedly retried a transient response"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        });
+        let mut conversation = Conversation::new();
+        conversation.add_user("summarize evidence".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+            max_output_tokens: None,
+        };
+        let response = call_summary(&conversation, &config, 256, None);
+        assert!(response.steps.iter().any(
+            |step| matches!(step, ProviderStep::Error(error) if error.message.contains("503"))
+        ));
+        server.join().unwrap();
+    }
 
     #[test]
     fn deepseek_errors_are_classified_for_attempt_retry_bits_spec_ut() {

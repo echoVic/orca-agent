@@ -4,6 +4,35 @@ use std::process::{Command, Stdio};
 use serde_json::Value;
 use tempfile::TempDir;
 
+fn platform_history_truncation_command() -> &'static str {
+    #[cfg(windows)]
+    {
+        r#"bash Get-ChildItem -LiteralPath $env:ORCA_HOME -Recurse -Filter '*.jsonl' -File | ForEach-Object { $file = [System.IO.File]::Open($_.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite); try { $file.SetLength(0); if ($file.Length -ne 0) { throw 'history truncation failed' }; [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'truncation-observed.txt'), 'truncated') } finally { $file.Dispose() } }"#
+    }
+    #[cfg(not(windows))]
+    {
+        r#"bash find "$ORCA_HOME/sessions" -name '*.jsonl' -type f -exec sh -c ': > "$1"; test ! -s "$1" && printf "truncated" > truncation-observed.txt' sh {} \;"#
+    }
+}
+
+fn platform_shell_write_command() -> &'static str {
+    #[cfg(windows)]
+    {
+        "bash [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'note.txt'), 'shell content')"
+    }
+    #[cfg(not(windows))]
+    {
+        "bash printf 'shell content' > note.txt"
+    }
+}
+
+fn platform_configure_fixture_shell(command: &mut Command) {
+    #[cfg(windows)]
+    command.env("ORCA_SHELL", "pwsh.exe");
+    #[cfg(not(windows))]
+    command.env("ORCA_SHELL", "/bin/sh");
+}
+
 fn assert_observed_workspace_change(observation: &Value, path: &str) {
     assert_eq!(observation["attribution"], "unknown");
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
@@ -36,7 +65,9 @@ fn assert_observed_workspace_change(observation: &Value, path: &str) {
 fn exec_truncated_history_never_advertises_recoverability() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
+    platform_configure_fixture_shell(&mut command);
+    let output = command
         .env("ORCA_HOME", home.path())
         .current_dir(cwd.path())
         .args([
@@ -46,7 +77,7 @@ fn exec_truncated_history_never_advertises_recoverability() {
             "mock",
             "--yolo",
             "--save-history",
-            "bash find \"$ORCA_HOME\" -name '*.jsonl' -type f -exec sh -c ': > \"$1\"' sh {} \\;",
+            platform_history_truncation_command(),
         ])
         .output()
         .unwrap();
@@ -55,6 +86,11 @@ fn exec_truncated_history_never_advertises_recoverability() {
     assert_eq!(payload["resumable"], false, "{output:?}");
     assert_eq!(payload["resume_unavailable_reason"], "history_write_failed");
     assert!(payload["resume"].is_null());
+    assert_eq!(
+        std::fs::read_to_string(cwd.path().join("truncation-observed.txt")).unwrap(),
+        "truncated",
+        "fixture shell must confirm zero-length history before later records append"
+    );
 }
 
 #[test]
@@ -97,7 +133,9 @@ fn exec_observes_shell_write_from_preexisting_dirty_content_without_write_receip
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
     std::fs::write(cwd.path().join("note.txt"), "preexisting dirty content").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
+    platform_configure_fixture_shell(&mut command);
+    let output = command
         .env("ORCA_HOME", home.path())
         .current_dir(cwd.path())
         .args([
@@ -107,7 +145,7 @@ fn exec_observes_shell_write_from_preexisting_dirty_content_without_write_receip
             "mock",
             "--yolo",
             "--no-history",
-            "bash printf 'shell content' > note.txt",
+            platform_shell_write_command(),
         ])
         .output()
         .unwrap();
