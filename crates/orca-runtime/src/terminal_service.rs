@@ -2500,10 +2500,15 @@ mod tests {
                 "(printf ready > ready; while [ ! -e release ]; do sleep 0.01; done; printf leaked > leaked) & wait"
             }
             orca_platform::shell::ShellKind::PowerShell(_) => {
-                "$child = Start-Process powershell.exe -PassThru -ArgumentList '-NoProfile', '-Command', 'Set-Content ready ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content leaked leaked'; $child.WaitForExit()"
+                "$shell = (Get-Process -Id $PID).Path; $child = Start-Process $shell -PassThru -ArgumentList '-NoProfile', '-Command', 'Set-Content ready ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content leaked leaked'; $child.WaitForExit()"
             }
             orca_platform::shell::ShellKind::Cmd => {
-                r#"powershell.exe -NoProfile -Command "$child = Start-Process powershell.exe -PassThru -ArgumentList '-NoProfile', '-Command', 'Set-Content ready ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content leaked leaked'; $child.WaitForExit()""#
+                std::fs::write(
+                    temp.path().join("stop-child.cmd"),
+                    "@echo off\r\n>ready echo ready\r\n:waiting\r\nif exist release goto released\r\ngoto waiting\r\n:released\r\n>leaked echo leaked\r\n",
+                )
+                .expect("write native Cmd child fixture");
+                "cmd.exe /D /C stop-child.cmd & ver > nul"
             }
         };
         let started = start(
@@ -2532,6 +2537,42 @@ mod tests {
         assert!(
             !marker.exists(),
             "background child survived service shutdown"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drop_process_tree_fixture_accepts_available_native_windows_shells() {
+        let resolver = orca_platform::shell::ShellResolver::for_current_host();
+        let mut checked = 0;
+        for candidate in ["pwsh.exe", "powershell.exe", "cmd.exe"] {
+            let Ok(shell) = resolver.resolve(Some(candidate)) else {
+                continue;
+            };
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "terminal_service::tests::drop_joins_supervisor_and_kills_process_tree",
+                    "--nocapture",
+                ])
+                .env("ORCA_SHELL", shell.executable())
+                .output()
+                .expect("run shutdown fixture with the resolved native shell");
+            assert!(
+                output.status.success(),
+                "{candidate}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{candidate}: the exact shutdown regression must actually run"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "at least one native Windows shell must be available"
         );
     }
 

@@ -62,3 +62,14 @@ macOS 发布全量第一次运行 4,844 项：4,842 项通过、2 项失败、10
 最终 shell 审查补充：`bash -lc/-ec` 内联绝对命令被误绑定为脚本，`bash -e verify.sh` 则遗漏快照保护并产生实际 false pass。修复前便携回归组 3 项运行、1 项失败及 2 项错误；区分 shell 的 `-c` 与 errexit 后完整 Python 3.13 套件 101 项通过（26.041s）。首版测试硬编码 `/usr/bin/test` 在 macOS 不存在，修正为按实际 executable 查找，未修改生产逻辑绕过测试。关闭进程树 fixture 按 ShellResolver 实际 Posix/GitBash/PowerShell/Cmd 方言选择门控脚本，生产关闭逻辑保持原样，修正后的聚焦关闭回归通过（1.136s）。
 
 最终 macOS 全量运行 4,844 项全部通过、106 项跳过（983.609s），Clippy 及格式检查通过，已有 Clippy warnings 保留。该全量运行发生在最后一次仅测试的 shell 方言选择修正之前；最终平台证据必须来自新的 PR SHA 和合并后的 exact-main CI。
+
+
+最终 Linux PR 门禁 41974056642 在后台 provider 停止用例失败（1,847 通过、1 失败、22 跳过），保留原始失败。该用例在 v0.5.16 已使用 1,000ms 自然完成窗口；在收到后台 Running 事件后延迟停止动作 1,200ms，稳定复现同一个 `stopped task update: Timeout`（RED 12.288s）。改用已有 release-marker Mock 流，让请求在取消前持续等待，保留延迟停止和重复停止断言，GREEN 1 项通过（2.624s）。此证据确认固定窗口不能保证动作执行时任务仍在运行，不能证明失败 CI 的具体调度原因；生产取消路径未修改。
+
+最后的 Windows 测试审查修正关闭 fixture 的 Cmd 嵌套引号及对 Windows PowerShell 的隐含依赖：PowerShell 子进程使用当前实际 executable，Cmd 用原生 `.cmd` 门控子脚本，不经过 PowerShell。新增原生 Windows 子测试在各可用 pwsh.exe/powershell.exe/cmd.exe 下启动独立测试进程验证关闭，不修改进程环境或生产参数路径。macOS 仅验证 POSIX 分支；其他分支必须由最终 SHA 的 Windows 门禁确认。
+
+
+本地收尾编译期间可用磁盘空间降到不足 1GiB；仅删除 2026-11-04 中断编译遗留的五组 runtime `.rcgu.o` 可再生对象文件（清单留存在本地），保留当前完成产物、源码和测试日志，继续最终验证。
+
+
+修正后的完整源码经最后一次 POSIX 关闭回归编译运行通过（`<local-evidence>/orca-v0.5.17-native-shutdown-final.log`）；TUI delayed-stop 门控回归、runtime/Windows 边界校验及版本一致性通过。新增 Windows shell 子进程矩阵尚待最终 PR CI 原生验证，不以 macOS 通过替代。
