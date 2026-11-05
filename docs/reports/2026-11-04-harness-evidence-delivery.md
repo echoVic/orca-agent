@@ -73,3 +73,9 @@ macOS 发布全量第一次运行 4,844 项：4,842 项通过、2 项失败、10
 
 
 修正后的完整源码经最后一次 POSIX 关闭回归编译运行通过（`<local-evidence>/orca-v0.5.17-native-shutdown-final.log`）；TUI delayed-stop 门控回归、runtime/Windows 边界校验及版本一致性通过。新增 Windows shell 子进程矩阵尚待最终 PR CI 原生验证，不以 macOS 通过替代。
+
+### 发布复核：PowerShell 测试子进程显式工作目录
+
+最终候选 `1fdc146f` 的 CodeRabbit 审查指出：PowerShell shutdown 夹具通过绝对解释器路径调用 `Start-Process`，应显式指定临时工作目录。官方文档称绝对 `FilePath` 的默认目录为可执行程序所在目录；PowerShell 7.5.4 与 6.0.0 源码则在未指定目录时设置 `CurrentFileSystemLocation`。保留这一证据差异，不声称已经在本机复现 Windows 失败。夹具添加 `-WorkingDirectory (Get-Location).Path`，让 ready/release/leaked 标记位置确定；现有 Windows 独立进程回归仍必须实际运行每种可用原生 shell 的 shutdown 测试。该修正仅影响测试，不修改生产进程启动或取消行为。
+
+`1fdc146f` 的最终原生 macOS TUI 门禁 1,848 项通过、24 项跳过、1 项 nextest 输出管道清理观察，耗时 231.665 秒。独立检查将观察定位到既有 `workspace_status::tests::snapshot_reads_real_branch_and_detached_head`，1 项通过且再次标记 leaky；不能作为内存泄漏结论。记录保存在发布验证日志中。

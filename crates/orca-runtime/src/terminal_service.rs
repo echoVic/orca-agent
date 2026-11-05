@@ -2500,7 +2500,7 @@ mod tests {
                 "(printf ready > ready; while [ ! -e release ]; do sleep 0.01; done; printf leaked > leaked) & wait"
             }
             orca_platform::shell::ShellKind::PowerShell(_) => {
-                "$shell = (Get-Process -Id $PID).Path; $child = Start-Process $shell -PassThru -ArgumentList '-NoProfile', '-Command', 'Set-Content ready ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content leaked leaked'; $child.WaitForExit()"
+                "$shell = (Get-Process -Id $PID).Path; $child = Start-Process $shell -WorkingDirectory (Get-Location).Path -PassThru -ArgumentList '-NoProfile', '-Command', 'Set-Content ready ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content leaked leaked'; $child.WaitForExit()"
             }
             orca_platform::shell::ShellKind::Cmd => {
                 std::fs::write(
