@@ -1,6 +1,6 @@
 {
   "name": "@blade-ai/orca",
-  "version": "0.5.16",
+  "version": "0.5.17",
   "description": "Orca Agent: a DeepSeek-native terminal coding agent.",
   "keywords": [
     "orca",

@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.16";
+export const releaseVersion = "v0.5.17";
 
 export const releases = [
+  {
+    version: "v0.5.17",
+    date: "2026-11-05",
+    title: "Recover with evidence, retry within a budget",
+    body: "New TUI sessions start with Full Access, and --yolo selects full-auto for launches and resumes. Pending approvals can switch the active session to Full Access. Headless completion reports whether history is actually durable and resumable, unresolved child blockers, and bounded workspace changes made through tools or shell commands. Provider retries share a cooldown, send limit and wait budget. Compression and streamed responses record observed usage and latency, capability evals retain configuration and independent verifier evidence, and models without direct vision retain descriptions of tool screenshots.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.17",
+  },
   {
     version: "v0.5.16",
     date: "2026-11-02",
