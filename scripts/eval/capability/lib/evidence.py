@@ -124,10 +124,30 @@ def verifier_bindings(item, workspace: Path) -> list[tuple[str, Path, str]]:
     """Bind programs and declared readonly inputs, never infer outputs from existence.
 
     @verifier/ names are scenario-owned files excluded from the agent fixture.
-    Relative interpreter scripts and direct executable commands retain legacy syntax.
+    Relative and absolute interpreter scripts are frozen, including env wrappers.
+    Absolute system executables remain live; unsupported env options fail closed.
     Other file arguments need readonly_inputs; they otherwise remain live outputs.
     """
     bindings = {}
+
+    def bind_program(token, script=False):
+        candidate = workspace / token
+        if Path(token).is_absolute():
+            if candidate.is_relative_to(workspace):
+                relative = str(candidate.relative_to(workspace))
+            elif candidate.is_relative_to(item.fixture):
+                # A source fixture and its prepared workspace may differ.
+                relative = "absolute-scripts/" + digest(token) + "/" + candidate.name
+            elif script:
+                relative = "absolute-scripts/" + digest(token) + "/" + candidate.name
+            else:
+                # System executables remain live; interpreter scripts are frozen.
+                return
+        else:
+            relative = token
+        if candidate.is_file() or (script and Path(token).is_absolute()):
+            bindings[token] = (token, candidate, relative)
+
     for token in item.readonly_inputs:
         path = workspace / token
         # Missing inputs are unknown while hashing a source fixture or a dry run.
@@ -138,35 +158,57 @@ def verifier_bindings(item, workspace: Path) -> list[tuple[str, Path, str]]:
         lexer.whitespace_split = True
         lexer.commenters = ""
         tokens = list(lexer)
-        expect_program, interpreter = True, False
+        expect_program, interpreter, env_wrapper, env_unset_arg = True, False, False, False
         for token in tokens:
             if token in {"&&", "||", ";", "|"}:
-                expect_program, interpreter = True, False
+                expect_program, interpreter, env_wrapper, env_unset_arg = True, False, False, False
                 continue
+            if env_wrapper:
+                if env_unset_arg:
+                    env_unset_arg = False
+                    continue
+                if token in {"-i", "--ignore-environment"} or token.startswith("--unset="):
+                    continue
+                if token in {"-u", "--unset"}:
+                    env_unset_arg = True
+                    continue
+                if token == "--":
+                    env_wrapper = False
+                    continue
+                if token.startswith("-"):
+                    raise ValueError(f"unsupported env verifier option: {token}")
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
+                    continue
+                env_wrapper = False
             if token.startswith("@verifier/"):
                 relative = token.removeprefix("@verifier/")
                 if item.verifier_root is None or Path(relative).is_absolute() or ".." in Path(relative).parts:
                     raise ValueError(f"invalid independent verifier path: {token}")
                 path = item.verifier_root / relative
                 bindings[token] = (token, path, "external/" + relative)
+                expect_program, interpreter = False, False
             elif token.startswith("/artifacts/"):
                 relative = token.removeprefix("/artifacts/")
                 if not relative or ".." in Path(relative).parts:
                     raise ValueError(f"invalid hidden artifact path: {token}")
                 bindings[token] = (token, workspace.parent / relative, "artifacts/" + relative)
+                expect_program, interpreter = False, False
             elif expect_program:
-                candidate = workspace / token
-                if not Path(token).is_absolute() and candidate.is_file():
-                    bindings[token] = (token, candidate, token)
-                interpreter = bool(re.fullmatch(r"(?:python[0-9.]*|bash|sh|node|ruby|perl)", Path(token).name))
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
+                    continue
+                bind_program(token)
+                name = Path(token).name
+                if name == "env":
+                    env_wrapper = True
+                    continue
+                interpreter = bool(re.fullmatch(r"(?:python[0-9.]*|bash|sh|node|ruby|perl)", name))
                 expect_program = False
             elif interpreter and not token.startswith("-"):
-                candidate = workspace / token
-                if not Path(token).is_absolute() and candidate.is_file():
-                    bindings[token] = (token, candidate, token)
+                bind_program(token, script=True)
                 interpreter = False
             elif interpreter and token in {"-m", "-c", "-e"}:
                 interpreter = False
+
     return sorted(bindings.values())
 
 

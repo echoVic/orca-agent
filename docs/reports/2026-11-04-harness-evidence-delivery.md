@@ -48,3 +48,13 @@
 重复 resume 已用门控 executor 稳定复现：等待真实 successor generation 启动后，重复请求返回 RuntimeUnavailable，RED 1 项失败（0.445s）。修复仅在当前代未取消、无 pending control、已启动的 RecoveryReplacement 具有对应 predecessor ack 时回放原确认；新增 current-generation interrupt 仍走当前 fence 的新提交。两个门控回归 GREEN（0.405s/0.534s），不把 ARM64 失败归为偶发或增加超时。HTTPS 降级与 JPEG SOF 长度也有独立 RED/GREEN；Windows headless fixture 使用内置 powershell.exe。最终 macOS TUI 1,848 项通过（1 项输出管道清理标记、24 项跳过），PTY 40 项通过；全工作区和新的 Linux/Windows CI 仍在运行。
 
 公开报告中的 `<local-evidence>` 是本地留存标记，文件未上传到仓库，不能作为读者可访问的日志链接。发布 CI 证据以 PR160 和对应 workflow run 为准。绝对路径 verifier 命令兼容性另有回归：修复前 `/usr/bin/diff` 和 `/bin/sh` 被误绑定到快照，3 个新增用例记录 1 项失败、2 项错误，修复后完整 Python 3.13 套件 93 项通过（20.791s）；现在保留绝对系统命令，继续快照相对脚本及声明只读输入。
+
+
+最终 verifier 审查补充：`env python3 verify.py` 与指向工作区的绝对脚本路径曾遗漏快照及完整性保护，实际替换脚本可产生 false pass。env 组 RED 3 项运行、4 个断言失败（含 2 个不支持参数子用例）；绝对路径组 RED 5 项运行、2 项失败。现在保留绝对系统可执行文件，冻结相对及绝对解释器脚本，解析 env 的 ignore/unset/赋值/`--`，无法支持的 relocation/split 等选项提前失败。完整 Python 3.13 套件 97 项通过（25.389s）。实际构建 CLI 的 Mock 场景各重复两次：成功组 2 次独立验收通过，故意失败组 2 次独立验收失败；两个统计组各两次，实际端点及 reasoning 首 delta（12/9/8/9 ms）保留。这不是付费模型能力测量。
+
+
+macOS 发布全量第一次运行 4,844 项：4,842 项通过、2 项失败、106 项跳过（957.074s）。`command/exec/read` 测试漏发后续读取请求，stdout/stderr 错开时被动等待超时；实际协议诊断证明第二次 read 可取回完整 stderr。`drop_joins_supervisor_and_kills_process_tree` 原 fixture 在固定 500 ms 后写 marker，不能区分繁忙机器在 Drop 前已写与 Drop 后存活；相同二进制独立复查 1 项通过（1.055s）。修正测试为 stdout/stderr 两阶段门控及关闭后才释放后台子进程，不提高超时、不修改生产终止逻辑；最终运行结果以对应 PR/workflow 为准。
+
+2026-11-05 最终门控修正：macOS 全工作区曾记录 4,842 通过、2 失败（无框架重试）；这两项没有记作成功。流式 command/exec 测试的被动等待不符合后续分块需要再次 read 的协议；stdout/stderr 分别门控后，旧 helper 稳定 RED，恢复主动 read 后相关 41 项通过。进程关闭测试原来的固定子进程延迟可能在 Drop 前到期；现在仅在 Drop 返回后放行写入。临时保留服务而不关闭时回归稳定 RED，正常关闭 GREEN。生产协议和进程终止逻辑未改动，最终全工作区复跑另记。
+
+独立审查补充：同名 fixture 原件与 prepare 后工作区脚本发生快照覆盖，可把 `[7, 0]` 误变成 `[0, 0]`；隐藏 verifier 后的绝对输出路径也可能误当脚本冻结。两项新增回归均先实际 RED，修复 source 身份命名及消费脚本后的解析状态后，完整 Python 套件 99 项通过（56.461s）。此前 97 项记录保留为历史证据。

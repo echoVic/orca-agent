@@ -94,16 +94,84 @@ for script in Path('.').rglob('*.py'):
         self.assertEqual(shlex.split(command)[0], "/bin/sh")
         self.assertEqual(Path(shlex.split(command)[1]), self.root / "attempt/verifier/verify.sh")
 
-    def test_absolute_interpreter_script_is_left_as_external_command(self):
+    def test_absolute_interpreter_script_is_snapshotted(self):
         script = self.root / "system-verifier.sh"
         script.write_text('test "$(cat result.txt)" = correct\n')
         command = "/bin/sh " + shlex.quote(str(script))
         item = self.item(verify=[command])
-        self.assertEqual(evidence.verifier_bindings(item, item.fixture), [])
+        bindings = evidence.verifier_bindings(item, item.fixture)
+        self.assertEqual(len(bindings), 1)
+        self.assertEqual(bindings[0][1], script)
         result = self.local(item, "Path('result.txt').write_text('correct')")
         self.assertEqual(result.final_verification, "passed")
         saved = json.loads((self.root / "attempt/attempt.json").read_text())
-        self.assertEqual(saved["verifier"][0]["command"], command)
+        frozen = Path(shlex.split(saved["verifier"][0]["command"])[1])
+        self.assertTrue(frozen.is_relative_to(self.root / "attempt/verifier"))
+        self.assertEqual(frozen.read_text(), script.read_text())
+
+    def test_env_wrapped_verifier_cannot_be_replaced_with_false_pass(self):
+        item = self.item(verify=["/usr/bin/env python3 -B verify.py"])
+        (item.fixture / "verify.py").write_text("raise SystemExit(7)\n")
+        result = self.local(item, "Path('verify.py').write_text('raise SystemExit(0)\\n')")
+        self.assertEqual(result.final_verification, "failed")
+        self.assertEqual(result.failure_class, "harness")
+        saved = json.loads((self.root / "attempt/attempt.json").read_text())
+        self.assertEqual(saved["verifier"][0]["exit"], 7)
+        self.assertEqual((self.root / "attempt/verifier/verify.py").read_text(), "raise SystemExit(7)\n")
+
+    def test_env_options_and_assignments_retain_script_snapshot(self):
+        item = self.item(verify=["/usr/bin/env -i -u UNUSED CHECK=correct /bin/sh verify.sh"])
+        (item.fixture / "verify.sh").write_text('test "$(cat result.txt)" = "$CHECK"\n')
+        result = self.local(item, "Path('result.txt').write_text('correct')")
+        self.assertEqual(result.final_verification, "passed")
+        command = json.loads((self.root / "attempt/attempt.json").read_text())["verifier"][0]["command"]
+        self.assertIn(str(self.root / "attempt/verifier/verify.sh"), shlex.split(command))
+
+    def test_absolute_workspace_script_cannot_produce_false_pass(self):
+        script = self.root / "attempt/workspace/verify.py"
+        item = self.item(verify=["/usr/bin/env python3 -B " + shlex.quote(str(script))])
+        (item.fixture / "verify.py").write_text("raise SystemExit(7)\n")
+        result = self.local(item, "Path('verify.py').write_text('raise SystemExit(0)\\n')")
+        self.assertEqual(result.final_verification, "failed")
+        self.assertEqual(result.failure_class, "harness")
+        saved = json.loads((self.root / "attempt/attempt.json").read_text())
+        self.assertEqual(saved["verifier"][0]["exit"], 7)
+
+    def test_fixture_and_workspace_scripts_keep_distinct_snapshot_identities(self):
+        item = self.item()
+        source = item.fixture / "verify.sh"
+        source.write_text("exit 7\n")
+        item.verify = ["/bin/sh " + shlex.quote(str(source)), "/bin/sh verify.sh"]
+        attempt = self.root / "attempt"
+        workspace = attempt / "workspace"
+        shutil.copytree(item.fixture, workspace)
+        (workspace / "verify.sh").write_text("exit 0\n")
+        commands, frozen = backend.snapshot_verifiers(item, workspace, attempt)
+        results = [subprocess.run(["/bin/sh", "-c", command], cwd=workspace).returncode
+                   for command in commands]
+        self.assertEqual(results, [7, 0])
+        self.assertEqual(backend.changed_protected(frozen, backend.snapshot_evidence(attempt / "verifier")), [])
+        self.assertNotEqual(shlex.split(commands[0])[1], shlex.split(commands[1])[1])
+
+    def test_hidden_interpreter_script_keeps_absolute_output_live(self):
+        hidden = self.root / "case/verifiers"
+        hidden.mkdir(parents=True)
+        (hidden / "verify.py").write_text("from pathlib import Path\nimport sys\nraise SystemExit(0 if Path(sys.argv[1]).read_text() == 'correct' else 7)\n")
+        output = self.root / "attempt/workspace/result.txt"
+        item = self.item(verifier_root="verifiers", verify=["python3 -B @verifier/verify.py " + shlex.quote(str(output))])
+        (item.fixture / "result.txt").write_text("wrong")
+        result = self.local(item, "Path('result.txt').write_text('correct')")
+        self.assertEqual(result.final_verification, "passed")
+        self.assertIsNone(result.harness_error)
+        saved = json.loads((self.root / "attempt/attempt.json").read_text())
+        self.assertEqual(shlex.split(saved["verifier"][0]["command"])[-1], str(output))
+
+    def test_unsupported_env_relocation_and_split_fail_closed(self):
+        for command in ("env -C elsewhere python3 verify.py", "env -S 'python3 verify.py'"):
+            with self.subTest(command=command):
+                item = self.item(verify=[command])
+                with self.assertRaisesRegex(ValueError, "unsupported env"):
+                    evidence.verifier_bindings(item, item.fixture)
 
     def test_executable_verifier_mode_is_preserved(self):
         item=self.item(verify=["scripts/verify.sh"])

@@ -2487,24 +2487,37 @@ mod tests {
     fn drop_joins_supervisor_and_kills_process_tree() {
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("leaked");
+        let ready = temp.path().join("ready");
+        let release = temp.path().join("release");
         let overlay = TurnPermissionOverlay::default();
         let (service, _) = service(temp.path());
+        let command = if cfg!(windows) {
+            "$child = Start-Process powershell.exe -PassThru -ArgumentList '-NoProfile', '-Command', 'Set-Content ready ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content leaked leaked'; $child.WaitForExit()"
+        } else {
+            "(printf ready > ready; while [ ! -e release ]; do sleep 0.01; done; printf leaked > leaked) & wait"
+        };
         let started = start(
             &service,
-            request(
-                "(sleep 0.5; printf leaked > leaked) & wait",
-                temp.path(),
-                &overlay,
-                ShellTerminalMode::pipe(),
-            ),
+            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
             Duration::from_millis(50),
             8 * 1024,
             || false,
         )
         .expect("start process tree");
         assert_eq!(started.status, "running", "{started:?}");
-
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "background child never became ready"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!marker.exists(), "child wrote before the shutdown boundary");
+        // A fixed sleep in the child can expire before Drop runs on a busy host.
+        // Release it only after shutdown returns, so a marker proves survival.
         drop(service);
+        std::fs::write(release, "release").expect("release any surviving child");
         thread::sleep(Duration::from_millis(700));
         assert!(
             !marker.exists(),
