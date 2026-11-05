@@ -240,7 +240,26 @@ pub fn start_streaming(
     config: &ProviderConfig,
     cancel: CancelToken,
 ) -> ProviderStreamingCall {
-    start_streaming_with_output_budget(kind, conversation, config, cancel, None, None)
+    start_streaming_with_output_budget(kind, conversation, config, cancel, None, None, None)
+}
+
+/// Reuse this budget for every retry of one logical provider operation.
+pub fn start_streaming_with_retry_budget(
+    kind: ProviderKind,
+    conversation: &Conversation,
+    config: &ProviderConfig,
+    cancel: CancelToken,
+    retry_budget: http_client::RetryBudget,
+) -> ProviderStreamingCall {
+    start_streaming_with_output_budget(
+        kind,
+        conversation,
+        config,
+        cancel,
+        None,
+        None,
+        Some(retry_budget),
+    )
 }
 
 /// Starts a normal provider stream with a bounded completion budget. DeepSeek
@@ -262,6 +281,28 @@ pub fn start_streaming_bounded(
         cancel,
         Some(max_output_tokens.clamp(1, 2_048)),
         Some(timeout),
+        None,
+    )
+}
+
+/// Bounded finalization reuses the logical retry budget, including its deadline.
+pub fn start_streaming_bounded_with_retry_budget(
+    kind: ProviderKind,
+    conversation: &Conversation,
+    config: &ProviderConfig,
+    cancel: CancelToken,
+    max_output_tokens: u32,
+    timeout: Duration,
+    retry_budget: http_client::RetryBudget,
+) -> ProviderStreamingCall {
+    start_streaming_with_output_budget(
+        kind,
+        conversation,
+        config,
+        cancel,
+        Some(max_output_tokens.clamp(1, 2_048)),
+        Some(timeout),
+        Some(retry_budget),
     )
 }
 
@@ -272,6 +313,7 @@ fn start_streaming_with_output_budget(
     cancel: CancelToken,
     max_output_tokens: Option<u32>,
     bounded_timeout: Option<Duration>,
+    retry_budget: Option<http_client::RetryBudget>,
 ) -> ProviderStreamingCall {
     let conversation = conversation.clone();
     let config = config.clone();
@@ -301,6 +343,7 @@ fn start_streaming_with_output_budget(
                 &worker_cancel,
                 max_output_tokens,
                 bounded_timeout,
+                retry_budget.as_ref(),
                 move |step| {
                     let _ = send_worker_step(&step_tx, &step_cancel, step);
                 },
@@ -333,8 +376,17 @@ pub async fn call_streaming_async(
     cancel: &CancelToken,
     on_step: impl FnMut(&ProviderStep) + Send,
 ) -> ProviderResponse {
-    call_streaming_async_with_output_budget(kind, conversation, config, cancel, None, None, on_step)
-        .await
+    call_streaming_async_with_output_budget(
+        kind,
+        conversation,
+        config,
+        cancel,
+        None,
+        None,
+        None,
+        on_step,
+    )
+    .await
 }
 
 async fn call_streaming_async_with_output_budget(
@@ -344,6 +396,7 @@ async fn call_streaming_async_with_output_budget(
     cancel: &CancelToken,
     max_output_tokens: Option<u32>,
     bounded_timeout: Option<Duration>,
+    retry_budget: Option<&http_client::RetryBudget>,
     mut on_step: impl FnMut(&ProviderStep) + Send,
 ) -> ProviderResponse {
     match kind {
@@ -582,19 +635,35 @@ async fn call_streaming_async_with_output_budget(
         }
         ProviderKind::DeepSeek => match max_output_tokens {
             Some(max_output_tokens) => {
-                deepseek_http::call_streaming_async_bounded(
+                let timeout = bounded_timeout.expect("bounded output requires a bounded timeout");
+                // The bounded facade owns its timeout and partial fallback.
+                let default_budget = http_client::RetryBudget::new(1, timeout, None);
+                deepseek_http::call_streaming_async_bounded_with_retry_budget(
                     conversation,
                     config,
                     cancel,
                     max_output_tokens,
-                    bounded_timeout.expect("bounded output requires a bounded timeout"),
+                    timeout,
+                    retry_budget.unwrap_or(&default_budget),
                     on_step,
                 )
                 .await
             }
-            None => {
-                deepseek_http::call_streaming_async(conversation, config, cancel, on_step).await
-            }
+            None => match retry_budget {
+                Some(budget) => {
+                    deepseek_http::call_streaming_async_with_retry_budget(
+                        conversation,
+                        config,
+                        cancel,
+                        budget,
+                        on_step,
+                    )
+                    .await
+                }
+                None => {
+                    deepseek_http::call_streaming_async(conversation, config, cancel, on_step).await
+                }
+            },
         },
     }
 }
@@ -2875,5 +2944,114 @@ mod tests {
             Some(ProviderStep::ToolCall(request)) if request.name == ToolName::Bash
         ));
         assert!(response.assistant_content.is_none());
+    }
+
+    #[test]
+    fn shared_retry_bounded_final_report_keeps_supplied_send_budget() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let count = sends.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let server_done = done.clone();
+        let server = std::thread::spawn(move || {
+            while !server_done.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        let mut bytes = Vec::new();
+                        let mut chunk = [0; 4096];
+                        while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let n = socket.read(&mut chunk).unwrap();
+                            if n == 0 {
+                                break;
+                            }
+                            bytes.extend_from_slice(&chunk[..n]);
+                        }
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let _ = socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        });
+        let config = ProviderConfig {
+            api_key: Some("bounded-test-quota".into()),
+            base_url: Some(base),
+            model: None,
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(vec![]),
+            mcp_registry: None,
+            external_tools: vec![],
+            max_output_tokens: Some(128),
+        };
+        let mut conversation = Conversation::new();
+        conversation.add_user("final report".into());
+        let budget = http_client::RetryBudget::new(2, Duration::from_secs(2), None);
+        for _ in 0..3 {
+            let mut stream = start_streaming_with_output_budget(
+                ProviderKind::DeepSeek,
+                &conversation,
+                &config,
+                CancelToken::new(),
+                Some(128),
+                Some(Duration::from_secs(2)),
+                Some(budget.clone()),
+            );
+            loop {
+                if matches!(
+                    stream.recv_timeout(Duration::from_secs(3)).unwrap(),
+                    ProviderStreamEvent::Completed(_)
+                ) {
+                    break;
+                }
+            }
+        }
+        let expired = http_client::RetryBudget::new(
+            5,
+            Duration::from_secs(120),
+            Some(std::time::Instant::now()),
+        );
+        let mut stream = start_streaming_bounded_with_retry_budget(
+            ProviderKind::DeepSeek,
+            &conversation,
+            &config,
+            CancelToken::new(),
+            128,
+            Duration::from_secs(2),
+            expired.clone(),
+        );
+        let response = loop {
+            match stream.recv_timeout(Duration::from_secs(3)).unwrap() {
+                ProviderStreamEvent::Completed(response) => break response,
+                ProviderStreamEvent::Step(_) => {}
+            }
+        };
+        assert!(response.error().unwrap().message.contains("deadline"));
+        assert_eq!(
+            expired.attempts(),
+            0,
+            "expired operation must not send a final report"
+        );
+        done.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            2,
+            "final-report retries must share the supplied send budget"
+        );
+        assert_eq!(budget.attempts(), 2);
     }
 }

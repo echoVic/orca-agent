@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "id": "C-multi-constraint-compacted",
+  "axis": "C",
+  "rung": 7,
+  "difficulty": {
+    "level": 7,
+    "constraints": 7
+  },
+  "backend": "local",
+  "fixture": "../C-multi-constraint-full/fixture",
+  "prepare": "../../generators/multi_constraint.py",
+  "prepare_env": {
+    "CAPABILITY_CONTEXT_VARIANT": "compacted"
+  },
+  "prompt": "prompts/task.md",
+  "verify": [
+    "python3 verify.py"
+  ],
+  "provider": "mock",
+  "evaluation": {
+    "split": "holdout",
+    "suite_id": "multi-constraint-v1",
+    "variant": "compacted"
+  },
+  "evidence": [
+    {
+      "id": "multi",
+      "source": "docs/CONTEXT.md",
+      "contains": "owner approval pending"
+    }
+  ],
+  "limits": {
+    "wall_seconds": 60,
+    "verify_seconds": 10
+  }
+}

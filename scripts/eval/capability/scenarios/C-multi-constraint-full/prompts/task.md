@@ -1,0 +1,1 @@
+Inspect the context in docs and write answer.json with path, limit, forbidden, unresolved, support, opposition and decision. Preserve exact values and both sides of the evidence. Do not use the network or delete archives.

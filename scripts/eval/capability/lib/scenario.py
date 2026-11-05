@@ -53,6 +53,9 @@ class Scenario:
     command: str = "exec"
     script: str = "workflow.js"
     path: Path | None = None
+    execution: dict = field(default_factory=dict)
+    evaluation: dict = field(default_factory=dict)
+    evidence: list[dict] = field(default_factory=list)
 
     @property
     def difficulty_value(self) -> float:
@@ -105,6 +108,19 @@ def load(path: Path) -> Scenario:
         if not prepare_path.is_file():
             raise ScenarioError(f"{path}: prepare script not found: {prepare_path}")
         prepare = prepare_path
+    execution = dict(raw.get("execution") or {})
+    from .evidence import validate_execution
+    try:
+        validate_execution(execution)
+    except ValueError as error:
+        raise ScenarioError(f"{path}: {error}") from error
+    evaluation = dict(raw.get("evaluation") or {})
+    if evaluation.get("split", "unknown") not in {"holdout", "tuning", "unknown"}:
+        raise ScenarioError(f"{path}: split must be holdout, tuning or unknown")
+    constraints = list(raw.get("evidence") or [])
+    for constraint in constraints:
+        if not all(isinstance(constraint.get(key), str) and constraint[key] for key in ("id", "source", "contains")):
+            raise ScenarioError(f"{path}: evidence needs id, source and contains")
     return Scenario(
         id=raw["id"],
         axis=raw["axis"],
@@ -126,7 +142,7 @@ def load(path: Path) -> Scenario:
         workspace_mode=str(raw.get("workspace_mode") or "rw"),
         command=command,
         script=script,
-        path=path,
+        path=path, execution=execution, evaluation=evaluation, evidence=constraints,
     )
 
 

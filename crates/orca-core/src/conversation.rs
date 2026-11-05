@@ -40,6 +40,91 @@ impl ConversationTarget {
 pub const MISSING_TOOL_TERMINAL_ERROR: &str = "Tool invocation outcome is indeterminate because its terminal result was missing from recovered history. Inspect external state before retrying.";
 pub const IMAGE_ANALYSIS_MESSAGE_PREFIX: &str = "[Image analysis:";
 
+/// Recognizes the complete persisted image-sidecar record format. Callers must
+/// also require an attachment-free User message; human text merely mentioning
+/// the prefix is not an internal observation.
+pub fn is_internal_image_analysis(content: &str) -> bool {
+    fn is_digest(value: &str) -> bool {
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+    let Some((key, body)) = content
+        .strip_prefix(IMAGE_ANALYSIS_MESSAGE_PREFIX)
+        .and_then(|rest| rest.split_once("]\n"))
+    else {
+        return false;
+    };
+    if !is_digest(key) {
+        return false;
+    }
+    // Older saved descriptions used a textual body and a matching close.
+    // Require the close to be the final line so trailing human prose is kept.
+    if let Some(description) = body.strip_suffix(&format!("\n[/Image analysis:{key}]")) {
+        return !description.trim().is_empty()
+            && !description.contains(IMAGE_ANALYSIS_MESSAGE_PREFIX)
+            && !description.contains("[/Image analysis:");
+    }
+    let Ok(serde_json::Value::Object(record)) = serde_json::from_str(body) else {
+        return false;
+    };
+    // Preserve additive observation fields. The required schema identifies the
+    // record; derived snapshot metadata, when present, must be a valid pair.
+    let plain_record = !record.contains_key("snapshot_status") && !record.contains_key("grounding");
+    let refreshed_record = record
+        .get("snapshot_status")
+        .and_then(|value| value.as_str())
+        .is_some_and(|status| matches!(status, "latest_retained_snapshot" | "historical_snapshot"))
+        && record
+            .get("grounding")
+            .and_then(|value| value.as_str())
+            .is_some_and(|grounding| !grounding.trim().is_empty());
+    if !(plain_record || refreshed_record)
+        || record.get("trust").and_then(|value| value.as_str())
+            != Some("untrusted_observation_data")
+        || !record
+            .get("description")
+            .is_some_and(|value| value.is_string())
+        || !record.get("query").is_some_and(|value| value.is_string())
+        || !record
+            .get("image_count")
+            .and_then(|value| value.as_u64())
+            .is_some_and(|count| count > 0)
+    {
+        return false;
+    }
+    match record.get("provenance") {
+        Some(serde_json::Value::Null) => plain_record,
+        Some(serde_json::Value::Object(provenance)) => {
+            provenance.get("kind").and_then(|value| value.as_str()) == Some("tool_snapshot")
+                && ["tool_call_id", "observation"].iter().all(|field| {
+                    provenance
+                        .get(*field)
+                        .is_some_and(|value| value.is_string())
+                })
+                && ["observation_id", "snapshot_id"].iter().all(|field| {
+                    provenance
+                        .get(*field)
+                        .and_then(|value| value.as_str())
+                        .is_some_and(is_digest)
+                })
+                && provenance
+                    .get("observation_ordinal")
+                    .is_some_and(|value| value.is_u64())
+                && ["tool_name", "tool_arguments"].iter().all(|field| {
+                    provenance
+                        .get(*field)
+                        .is_some_and(|value| value.is_null() || value.is_string())
+                })
+                && provenance
+                    .get("images")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|images| {
+                        images.len() as u64 == record["image_count"].as_u64().unwrap()
+                    })
+        }
+        _ => false,
+    }
+}
+
 // Deliveries that earlier versions pinned: background task and subagent
 // notices, parent guidance to a subagent, task wait results, and budget
 // soft-landing reminders. Every turn holding one was kept whole by
@@ -640,16 +725,21 @@ impl Conversation {
 
     pub fn last_user_message(&self) -> Option<&str> {
         self.messages.iter().rev().find_map(|msg| match msg {
-            Message::User { content, .. } => Some(content.as_str()),
+            Message::User {
+                content, images, ..
+            } if !images.is_empty() || !is_internal_image_analysis(content) => {
+                Some(content.as_str())
+            }
             _ => None,
         })
     }
 
     pub fn backtrack_last_user(&mut self) -> Option<String> {
-        let index = self
-            .messages
-            .iter()
-            .rposition(|message| matches!(message, Message::User { pinned: false, .. }))?;
+        let index = self.messages.iter().rposition(|message| {
+            matches!(message,
+                Message::User { content, images, pinned: false }
+                    if !images.is_empty() || !is_internal_image_analysis(content))
+        })?;
         let prompt = match &self.messages[index] {
             Message::User { content, .. } => content.clone(),
             _ => unreachable!("rposition only matches user messages"),
@@ -1278,6 +1368,186 @@ mod tests {
         conv.add_assistant(Some("notification reply".to_string()), None, vec![]);
 
         assert_eq!(conv.backtrack_last_user(), Some("first".to_string()));
+        assert_eq!(conv.messages.len(), 1);
+    }
+
+    #[test]
+    fn retry_review_backtrack_skips_complete_internal_image_records() {
+        let mut conv = Conversation::new();
+        conv.add_system("system".into());
+        conv.add_user("inspect this window".into());
+        conv.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "capture".into(),
+                function_name: "screen.capture".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        conv.add_tool_result("capture".into(), "window snapshot".into());
+        for provenance in [
+            serde_json::Value::Null,
+            serde_json::json!({
+                "kind": "tool_snapshot", "tool_call_id": "capture", "observation": "window snapshot",
+                "observation_ordinal": 0, "observation_id": "b".repeat(64), "snapshot_id": "c".repeat(64),
+                "tool_name": "screen.capture", "tool_arguments": "{}",
+                "images": [{ "image_number": 1, "width": 1280, "height": 720 }]
+            }),
+        ] {
+            let mut record = serde_json::json!({
+                "trust": "untrusted_observation_data", "description": "Save button",
+                "query": "inspect this window", "image_count": 1, "provenance": provenance,
+            });
+            conv.add_user(format!("[Image analysis:{}]\n{record}", "a".repeat(64)));
+            record["additional_observation"] = serde_json::json!({"elapsed_ms": 12});
+            conv.add_user(format!("[Image analysis:{}]\n{record}", "a".repeat(64)));
+        }
+        conv.add_assistant(Some("found it".into()), None, vec![]);
+        assert_eq!(
+            conv.backtrack_last_user().as_deref(),
+            Some("inspect this window")
+        );
+        assert_eq!(
+            conv.messages.len(),
+            1,
+            "backtrack removes the human turn and all derived observations"
+        );
+    }
+
+    #[test]
+    fn retry_review_last_user_skips_internal_records_and_keeps_human_text() {
+        let key = "a".repeat(64);
+        let mut conv = Conversation::new();
+        conv.add_user("human prompt".into());
+        conv.add_user(format!(
+            "[Image analysis:{key}]\n{}",
+            serde_json::json!({
+                "trust": "untrusted_observation_data", "description": "saved image",
+                "query": "human prompt", "image_count": 1, "provenance": null,
+            })
+        ));
+        assert_eq!(conv.last_user_message(), Some("human prompt"));
+        conv.add_user(format!(
+            "[Image analysis:{key}]\nsaved legacy image\n[/Image analysis:{key}]"
+        ));
+        assert_eq!(conv.last_user_message(), Some("human prompt"));
+        conv.add_user("[Image analysis:ordinary human question".into());
+        assert_eq!(
+            conv.last_user_message(),
+            Some("[Image analysis:ordinary human question")
+        );
+    }
+
+    #[test]
+    fn retry_review_backtrack_skips_complete_legacy_analysis_only() {
+        let key = "a".repeat(64);
+        let record =
+            format!("[Image analysis:{key}]\nImage #1: saved description\n[/Image analysis:{key}]");
+        let mut conv = Conversation::new();
+        conv.add_user("human prompt".into());
+        conv.add_user(record.clone());
+        assert_eq!(conv.backtrack_last_user().as_deref(), Some("human prompt"));
+        for malformed in [
+            format!("[Image analysis:{key}]\nImage #1: saved description"),
+            record.replace(
+                &format!("[/Image analysis:{key}]"),
+                &format!("[/Image analysis:{}]", "b".repeat(64)),
+            ),
+            format!("{record}\nhuman follow-up"),
+            format!("[Image analysis:{key}]\n\n[/Image analysis:{key}]"),
+        ] {
+            let mut conv = Conversation::new();
+            conv.add_user("human prompt".into());
+            conv.add_user(malformed.clone());
+            assert_eq!(conv.backtrack_last_user(), Some(malformed));
+        }
+    }
+
+    #[test]
+    fn retry_review_backtrack_preserves_ordinary_or_malformed_analysis_text() {
+        let header = format!("[Image analysis:{}]", "a".repeat(64));
+        let record = r#"{"trust":"untrusted_observation_data","description":"Save button","query":"inspect","image_count":1,"provenance":null}"#;
+        for text in [
+            "[Image analysis:please explain this syntax".to_string(),
+            format!("{header}\nnot JSON"),
+            format!("{header}\n[]"),
+            format!("{header}\n{{\"trust\":\"untrusted_observation_data\"}}"),
+            format!(
+                "{header}\n{}",
+                record.replace("\"image_count\":1", "\"image_count\":\"1\"")
+            ),
+            format!(
+                "{header}\n{}",
+                record.replace("\"description\":\"Save button\"", "\"description\":false")
+            ),
+            format!(
+                "{header}\n{}",
+                record.replace("untrusted_observation_data", "ordinary_user_text")
+            ),
+            format!(
+                "{header}\n{}",
+                record.replace("\"query\":\"inspect\"", "\"query\":null")
+            ),
+            format!(
+                "{header}\n{}",
+                record.replace("\"image_count\":1", "\"image_count\":0")
+            ),
+            format!(
+                "{header}\n{}",
+                record.replace("\"provenance\":null", "\"provenance\":\"tool_snapshot\"")
+            ),
+            format!(
+                "{header}\n{}",
+                record.replace("\"provenance\":null", "\"provenance\":{}")
+            ),
+            format!(
+                "{header}\n{}",
+                record.replace(
+                    "\"provenance\":null",
+                    "\"provenance\":{\"kind\":\"tool_snapshot\"}"
+                )
+            ),
+            format!(
+                "{header}\n{}",
+                record.replace("\"provenance\":null", "\"human\":true")
+            ),
+            format!("{header} extra text\n{record}"),
+            format!("[Image analysis:short]\n{record}"),
+            format!("[Image analysis:{}]\n{record}", "z".repeat(64)),
+            format!("{header}\n{record}\nhuman follow-up"),
+        ] {
+            let mut conv = Conversation::new();
+            conv.add_user("earlier human prompt".into());
+            conv.add_user(text.clone());
+            assert_eq!(conv.backtrack_last_user(), Some(text));
+            assert_eq!(conv.messages.len(), 1);
+        }
+    }
+
+    #[test]
+    fn retry_review_backtrack_keeps_analysis_formatted_user_with_attachments() {
+        let prompt = format!(
+            "[Image analysis:{}]\n{}",
+            "a".repeat(64),
+            serde_json::json!({
+                "trust": "untrusted_observation_data", "description": "Save button",
+                "query": "inspect", "image_count": 1, "provenance": null,
+            })
+        );
+        let mut conv = Conversation::new();
+        conv.add_user("earlier human prompt".into());
+        conv.add_user_with_images(
+            prompt.clone(),
+            vec![ImageInput {
+                source: ImageSource::Url {
+                    url: "https://example.com/image.png".into(),
+                },
+                detail: ImageDetail::Auto,
+            }],
+        );
+        assert_eq!(conv.last_user_message(), Some(prompt.as_str()));
+        assert_eq!(conv.backtrack_last_user(), Some(prompt));
         assert_eq!(conv.messages.len(), 1);
     }
 

@@ -1451,9 +1451,8 @@ fn run_threaded_agent_worker(
                             estimated_cost_usd: usage.estimated_cost_usd,
                         }),
                     ),
-                    (RunStatus::Blocked { .. }, Some(task_id)) => {
-                        task_registry.block_with_usage(task_id, output.clone(), Some(usage))
-                    }
+                    (RunStatus::Blocked { blocker }, Some(task_id)) => task_registry
+                        .block_summary_with_usage(task_id, blocker.clone(), Some(usage)),
                     (_, Some(task_id)) => task_registry.fail_with_usage(
                         task_id,
                         launch
@@ -2790,7 +2789,7 @@ fn settle_registry_task(
         output.event_error = Some(message);
     }
     let usage = Some(output.cost_tracker.totals());
-    let settlement = match output.status {
+    let settlement = match &output.status {
         RunStatus::Success => task_registry.complete_with_usage(
             registry_task_id,
             output
@@ -2807,14 +2806,9 @@ fn settle_registry_task(
                 .unwrap_or_else(|| "subagent cancelled".to_string()),
             usage,
         ),
-        RunStatus::Blocked { .. } => task_registry.block_with_usage(
-            registry_task_id,
-            output
-                .event_error
-                .clone()
-                .unwrap_or_else(|| "subagent blocked".to_string()),
-            usage,
-        ),
+        RunStatus::Blocked { blocker } => {
+            task_registry.block_summary_with_usage(registry_task_id, blocker.clone(), usage)
+        }
         _ => task_registry.fail_with_usage(
             registry_task_id,
             output

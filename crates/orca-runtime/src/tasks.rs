@@ -976,6 +976,7 @@ pub struct TaskRecord {
     pub usage: Option<UsageTotals>,
     /// Successful edit/write_file receipts, retained across task settlement.
     pub(crate) applied_file_writes: u64,
+    pub(crate) blocker: Option<orca_core::goal_runtime::BlockerSummary>,
     pub subagent_current_activity: Option<String>,
     pub subagent_activity_history: Vec<SubagentActivityEntry>,
     pub subagent_child_thread_id: Option<String>,
@@ -1457,6 +1458,8 @@ struct PersistedTaskRecord {
     #[serde(default)]
     applied_file_writes: u64,
     #[serde(default)]
+    blocker: Option<orca_core::goal_runtime::BlockerSummary>,
+    #[serde(default)]
     subagent_current_activity: Option<String>,
     #[serde(default)]
     subagent_activity_history: Vec<SubagentActivityEntry>,
@@ -1694,6 +1697,7 @@ impl TaskRegistry {
                 }
                 if !is_terminal(record.status) && (projection.resumable || projection.indeterminate)
                 {
+                    record.blocker = None;
                     record.status = TaskStatus::Failed;
                     record.completed_at_ms = Some(now_ms());
                     record.worker_pid = None;
@@ -2972,6 +2976,7 @@ impl TaskRegistry {
             if record.stop_requested {
                 return Err(TaskLeaseError::Fenced);
             }
+            record.blocker = None;
             record.status = TaskStatus::Running;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
@@ -3094,6 +3099,7 @@ impl TaskRegistry {
         usage: Option<UsageTotals>,
     ) -> Result<(), TaskLeaseError> {
         self.update_task_with_lease(lease, id, |record| {
+            record.blocker = None;
             record.status = TaskStatus::Completed;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
@@ -3119,6 +3125,7 @@ impl TaskRegistry {
         usage: Option<UsageTotals>,
     ) -> Result<(), TaskLeaseError> {
         self.update_task_with_lease(lease, id, |record| {
+            record.blocker = None;
             record.status = TaskStatus::Failed;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
@@ -3141,9 +3148,11 @@ impl TaskRegistry {
         lease: &TaskLease,
         id: &str,
         error: String,
+        blocker: orca_core::goal_runtime::BlockerSummary,
         usage: Option<UsageTotals>,
     ) -> Result<(), TaskLeaseError> {
         self.update_task_with_lease(lease, id, |record| {
+            record.blocker = Some(blocker);
             record.status = TaskStatus::Blocked;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
@@ -3336,6 +3345,7 @@ impl TaskRegistry {
             workflow_failure_count: 0,
             usage: None,
             applied_file_writes: 0,
+            blocker: None,
             subagent_current_activity: None,
             subagent_activity_history: Vec::new(),
             subagent_child_thread_id: None,
@@ -3467,6 +3477,7 @@ impl TaskRegistry {
             workflow_failure_count: 0,
             usage: None,
             applied_file_writes: 0,
+            blocker: None,
             subagent_current_activity: None,
             subagent_activity_history: Vec::new(),
             subagent_child_thread_id: None,
@@ -3544,6 +3555,7 @@ impl TaskRegistry {
         record.deadline_source =
             inherited_deadline.map(|_| "inherited ancestor deadline".to_string());
         if parent_cancelled {
+            record.blocker = None;
             record.status = TaskStatus::Stopping;
             record.started_at_ms = Some(now_ms());
             record.control.cancel.cancel();
@@ -3602,6 +3614,7 @@ impl TaskRegistry {
             workflow_failure_count: 0,
             usage: None,
             applied_file_writes: 0,
+            blocker: None,
             subagent_current_activity: None,
             subagent_activity_history: Vec::new(),
             subagent_child_thread_id: None,
@@ -3692,6 +3705,7 @@ impl TaskRegistry {
             workflow_failure_count: 0,
             usage: None,
             applied_file_writes: 0,
+            blocker: None,
             subagent_current_activity: None,
             subagent_activity_history: Vec::new(),
             subagent_child_thread_id: None,
@@ -3849,6 +3863,36 @@ impl TaskRegistry {
         Ok(false)
     }
 
+    pub(crate) fn task_tree_blockers(
+        &self,
+        root_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let records = self.records_snapshot()?;
+        let by_id: HashMap<_, _> = records.iter().map(|r| (r.id.as_str(), r)).collect();
+        let mut blockers = vec![];
+        for record in records.iter().filter(|r| r.status == TaskStatus::Blocked) {
+            let mut cursor = Some(record.id.as_str());
+            let mut visited = HashSet::new();
+            while let Some(id) = cursor {
+                if id == root_id {
+                    let mut value = record.blocker.as_ref().and_then(|b| serde_json::to_value(b).ok())
+                        .unwrap_or_else(|| serde_json::json!({"kind": null, "summary": record.error, "evidence": []}));
+                    value["task_id"] = serde_json::json!(record.id);
+                    value["parent_task_id"] = serde_json::json!(record.parent_task_id);
+                    value["resolution"] = serde_json::json!("unresolved");
+                    blockers.push(value);
+                    break;
+                }
+                if !visited.insert(id) {
+                    break;
+                }
+                cursor = by_id.get(id).and_then(|r| r.parent_task_id.as_deref());
+            }
+        }
+        blockers.sort_by(|a, b| a["task_id"].as_str().cmp(&b["task_id"].as_str()));
+        Ok(blockers)
+    }
+
     pub(crate) fn execution_scope_lock(&self) -> std::io::Result<Option<ExclusiveFileLock>> {
         self.persistence
             .as_ref()
@@ -3927,6 +3971,7 @@ impl TaskRegistry {
             if is_terminal(record.status) || record.control.cancel.is_cancelled() {
                 return Ok(((), false));
             }
+            record.blocker = None;
             record.status = TaskStatus::Queued;
             record.wait_reason = Some(reason);
             queued = true;
@@ -4636,6 +4681,7 @@ impl TaskRegistry {
                 return Err(task_state_error("mark_running", record.status));
             }
 
+            record.blocker = None;
             record.status = TaskStatus::Running;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
@@ -4700,6 +4746,7 @@ impl TaskRegistry {
                 return Err(task_state_error("record_retry", record.status));
             }
             record.retry_count = record.retry_count.saturating_add(1);
+            record.blocker = None;
             record.status = TaskStatus::Running;
             record.error = Some(error.clone());
             record.result = None;
@@ -4786,6 +4833,7 @@ impl TaskRegistry {
             }
 
             if record.stop_requested || record.control.cancel.is_cancelled() {
+                record.blocker = None;
                 record.status = TaskStatus::Stopped;
                 record.result = Some("cancelled".to_string());
                 record.error = None;
@@ -4796,6 +4844,7 @@ impl TaskRegistry {
             } else {
                 match update {
                     MainSessionTerminalUpdate::Completed { result } => {
+                        record.blocker = None;
                         record.status = TaskStatus::Completed;
                         record.result = Some(result);
                         record.error = None;
@@ -4814,6 +4863,7 @@ impl TaskRegistry {
                         record.pending_provider_response = None;
                     }
                     MainSessionTerminalUpdate::Failed { error } => {
+                        record.blocker = None;
                         record.status = TaskStatus::Failed;
                         record.result = None;
                         record.error = Some(error);
@@ -4827,6 +4877,7 @@ impl TaskRegistry {
                         pending_tool_call,
                         pending_provider_response,
                     } => {
+                        record.blocker = None;
                         record.status = TaskStatus::ApprovalRequired;
                         record.result = Some(summary);
                         record.error = None;
@@ -4914,6 +4965,11 @@ impl TaskRegistry {
                 }
                 let previous_pid = tasks.get(id).and_then(|record| record.worker_pid);
                 let previous_status = tasks.get(id).expect("validated task record").status;
+                let previous_blocker = tasks
+                    .get(id)
+                    .expect("validated task record")
+                    .blocker
+                    .clone();
                 let previous_started_at =
                     tasks.get(id).expect("validated task record").started_at_ms;
                 let previous_completed_at = tasks
@@ -4926,6 +4982,7 @@ impl TaskRegistry {
                     .publication_revision;
                 let record = tasks.get_mut(id).expect("validated task record");
                 record.worker_pid = Some(pid);
+                record.blocker = None;
                 record.status = TaskStatus::Running;
                 if record.started_at_ms.is_none() {
                     record.started_at_ms = Some(now_ms());
@@ -4937,6 +4994,7 @@ impl TaskRegistry {
                     let record = tasks.get_mut(id).expect("validated task record");
                     record.worker_pid = previous_pid;
                     record.status = previous_status;
+                    record.blocker = previous_blocker;
                     record.started_at_ms = previous_started_at;
                     record.completed_at_ms = previous_completed_at;
                     record.publication_revision = previous_publication_revision;
@@ -4974,6 +5032,7 @@ impl TaskRegistry {
         usage: Option<UsageTotals>,
     ) -> Result<(), String> {
         self.update_task(id, |record| {
+            record.blocker = None;
             record.status = TaskStatus::Completed;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
@@ -5004,6 +5063,7 @@ impl TaskRegistry {
         error: String,
     ) -> Result<(), String> {
         self.update_task(id, |record| {
+            record.blocker = None;
             record.status = TaskStatus::Failed;
             record.continuation_indeterminate = true;
             record.completed_at_ms = Some(now_ms());
@@ -5021,6 +5081,7 @@ impl TaskRegistry {
         usage: Option<UsageTotals>,
     ) -> Result<(), String> {
         self.update_task(id, |record| {
+            record.blocker = None;
             record.status = TaskStatus::Failed;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
@@ -5039,19 +5100,20 @@ impl TaskRegistry {
         })
     }
 
-    pub(crate) fn block_with_usage(
+    pub(crate) fn block_summary_with_usage(
         &self,
         id: &str,
-        error: String,
+        blocker: orca_core::goal_runtime::BlockerSummary,
         usage: Option<UsageTotals>,
     ) -> Result<(), String> {
         self.update_task(id, |record| {
+            record.error = Some(blocker.summary.clone());
+            record.blocker = Some(blocker);
             record.status = TaskStatus::Blocked;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
             }
             record.completed_at_ms = Some(now_ms());
-            record.error = Some(error);
             record.result = None;
             record.usage = usage;
             record.tool = None;
@@ -5146,6 +5208,7 @@ impl TaskRegistry {
         usage: Option<UsageTotals>,
     ) -> Result<(), String> {
         self.update_task(id, |record| {
+            record.blocker = None;
             record.status = TaskStatus::ApprovalRequired;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
@@ -5244,6 +5307,7 @@ impl TaskRegistry {
                 return Ok((None, false));
             };
 
+            record.blocker = None;
             record.status = TaskStatus::Running;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
@@ -5270,6 +5334,8 @@ impl TaskRegistry {
             {
                 return Ok(());
             }
+
+            record.blocker = None;
 
             record.status = TaskStatus::Stopped;
             if record.started_at_ms.is_none() {
@@ -5301,6 +5367,7 @@ impl TaskRegistry {
         usage: Option<UsageTotals>,
     ) -> Result<(), String> {
         self.update_task(id, |record| {
+            record.blocker = None;
             record.status = TaskStatus::Stopped;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
@@ -5531,6 +5598,7 @@ impl TaskRegistry {
             if is_terminal(record.status) {
                 return Err(task_state_error("request_stop", record.status));
             }
+            record.blocker = None;
             record.status = TaskStatus::Stopping;
             record.stop_requested = true;
             record.lease_epoch = record.lease_epoch.saturating_add(1);
@@ -5553,6 +5621,8 @@ impl TaskRegistry {
                 return Err(task_state_error("request_pause", record.status));
             }
 
+            record.blocker = None;
+
             record.status = TaskStatus::Paused;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
@@ -5571,6 +5641,7 @@ impl TaskRegistry {
                 return Err(task_state_error("request_resume", record.status));
             }
 
+            record.blocker = None;
             record.status = TaskStatus::Running;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
@@ -5784,6 +5855,7 @@ impl TaskRegistry {
             if !lease_is_current {
                 return Ok((false, false));
             }
+            record.blocker = None;
             record.status = TaskStatus::Failed;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
@@ -6312,6 +6384,7 @@ impl PersistedTaskRecord {
             workflow_failure_count: self.workflow_failure_count,
             usage: self.usage,
             applied_file_writes: self.applied_file_writes,
+            blocker: self.blocker,
             subagent_current_activity: self.subagent_current_activity,
             subagent_activity_history: self.subagent_activity_history,
             subagent_child_thread_id: self.subagent_child_thread_id,
@@ -6425,6 +6498,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             workflow_failure_count: record.workflow_failure_count,
             usage: record.usage,
             applied_file_writes: record.applied_file_writes,
+            blocker: record.blocker.clone(),
             subagent_current_activity: record.subagent_current_activity.clone(),
             subagent_activity_history: record.subagent_activity_history.clone(),
             subagent_child_thread_id: record.subagent_child_thread_id.clone(),
@@ -6577,6 +6651,7 @@ impl PersistedProviderStep {
 }
 
 fn fail_invalid_pending_provider_response(record: &mut TaskRecord, error: &serde_json::Error) {
+    record.blocker = None;
     record.status = TaskStatus::Failed;
     if record.started_at_ms.is_none() {
         record.started_at_ms = Some(now_ms());
@@ -7074,6 +7149,7 @@ fn mark_interrupted_if_active(record: &mut TaskRecord) -> bool {
     }
     if record.task_type == TaskType::Subagent && record.subagent_launch_intent.is_some() {
         if !record.subagent_execution_started {
+            record.blocker = None;
             record.status = TaskStatus::Queued;
             record.started_at_ms = None;
             record.completed_at_ms = None;
@@ -7082,6 +7158,7 @@ fn mark_interrupted_if_active(record: &mut TaskRecord) -> bool {
             record.lease_expires_at_ms = None;
             return true;
         }
+        record.blocker = None;
         record.status = TaskStatus::Failed;
         record.continuation_indeterminate = true;
         record.completed_at_ms = Some(now_ms());
@@ -7092,6 +7169,7 @@ fn mark_interrupted_if_active(record: &mut TaskRecord) -> bool {
         record.control.cancel.cancel();
         return true;
     }
+    record.blocker = None;
     record.status = TaskStatus::Failed;
     if record.started_at_ms.is_none() {
         record.started_at_ms = Some(now_ms());
@@ -7291,6 +7369,60 @@ mod tests {
     }
     use super::*;
     use crate::subagent_event_relay::RelayTaskType;
+
+    #[test]
+    fn current_blockers_survive_reload_exclude_other_roots_and_clear_on_completion() {
+        use orca_core::goal_runtime::{BlockerKind, BlockerSummary};
+        let home = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("blockers".into(), home.path().into()).unwrap();
+        let root = registry.create_main_session("root".into());
+        let other = registry.create_main_session("other".into());
+        let child =
+            registry.create_subagent_with_parent("child".into(), None, Some(root.id.clone()));
+        let worker =
+            TaskRegistry::new_persistent_attached("blockers".into(), home.path().into()).unwrap();
+        worker
+            .block_summary_with_usage(
+                &child.id,
+                BlockerSummary {
+                    kind: BlockerKind::UserDecision,
+                    summary: "choose target".into(),
+                    question: Some("Which target?".into()),
+                    fingerprint: "target".into(),
+                    evidence: vec![],
+                },
+                None,
+            )
+            .unwrap();
+        let blockers = registry.task_tree_blockers(&root.id).unwrap();
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0]["question"], "Which target?");
+        assert!(registry.task_tree_blockers(&other.id).unwrap().is_empty());
+        worker.complete(&child.id, "resolved".into()).unwrap();
+        assert!(registry.task_tree_blockers(&root.id).unwrap().is_empty());
+        assert!(
+            registry
+                .records_snapshot()
+                .unwrap()
+                .iter()
+                .find(|r| r.id == child.id)
+                .unwrap()
+                .blocker
+                .is_none()
+        );
+        let reloaded =
+            TaskRegistry::new_persistent_attached("blockers".into(), home.path().into()).unwrap();
+        assert!(
+            reloaded
+                .records_snapshot()
+                .unwrap()
+                .iter()
+                .find(|r| r.id == child.id)
+                .unwrap()
+                .blocker
+                .is_none()
+        );
+    }
 
     #[test]
     fn task_tree_write_receipts_survive_worker_settlement_without_leaking_to_other_roots() {
@@ -7686,6 +7818,7 @@ mod tests {
         let task = registry.create_subagent("detached child".to_string(), Some("general".into()));
         let mut record = registry.get(&task.id).expect("task record");
         record.id = "task-1".to_string();
+        record.blocker = None;
         record.status = TaskStatus::Completed;
         record.completed_at_ms = Some(10);
         record.worker_pid = None;
@@ -8167,6 +8300,7 @@ mod tests {
             let mut record = template.clone();
             record.id = id.to_string();
             record.task_type = task_type;
+            record.blocker = None;
             record.status = TaskStatus::Running;
             record.started_at_ms = Some(20);
             record.publication_revision = 4;

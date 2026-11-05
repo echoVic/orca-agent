@@ -1,14 +1,13 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use orca_core::cancel::CancelToken;
 use orca_core::provider_types::{ProviderError, ProviderErrorKind};
+use orca_provider::http_client::RetryBudget;
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 const STREAM_CLOSED_MAX_ATTEMPTS: u32 = 2;
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(8);
 const DEFAULT_JITTER_FACTOR: f64 = 0.1;
-const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProviderRetryDecision {
@@ -52,6 +51,18 @@ impl ProviderRetryPolicy {
         ProviderRetryDecision::RetryAfter(self.backoff(completed_attempts - 1))
     }
 
+    pub(crate) fn decide_with_budget(
+        &self,
+        error: &ProviderError,
+        completed_attempts: u32,
+        budget: &RetryBudget,
+    ) -> ProviderRetryDecision {
+        if !budget.can_retry() {
+            return ProviderRetryDecision::Stop;
+        }
+        self.decide(error, completed_attempts)
+    }
+
     fn backoff(&self, retry_index: u32) -> Duration {
         let multiplier = 2_f64.powi(retry_index.min(30) as i32);
         let base = self.initial_backoff.as_secs_f64() * multiplier;
@@ -59,18 +70,6 @@ impl ProviderRetryPolicy {
         let jitter = 1.0 + (jitter_value() * 2.0 - 1.0) * self.jitter_factor;
         Duration::from_secs_f64((capped * jitter).max(0.0))
     }
-}
-
-pub(crate) fn wait_for_provider_retry(delay: Duration, cancel: &CancelToken) -> bool {
-    let deadline = std::time::Instant::now() + delay;
-    while !cancel.is_cancelled() {
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return true;
-        }
-        std::thread::sleep((deadline - now).min(CANCELLATION_POLL_INTERVAL));
-    }
-    false
 }
 
 fn jitter_value() -> f64 {
@@ -131,5 +130,117 @@ mod tests {
             ProviderRetryDecision::RetryAfter(_)
         ));
         assert_eq!(policy.decide(&error, 2), ProviderRetryDecision::Stop);
+    }
+
+    #[test]
+    fn shared_retry_nested_runtime_and_http_bound_actual_sends() {
+        use orca_core::{
+            cancel::CancelToken,
+            config::{ProviderKind, ReasoningEffort},
+            conversation::Conversation,
+        };
+        use orca_provider::{ProviderConfig, ProviderStreamEvent};
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let count = sends.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !server_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        let mut bytes = Vec::new();
+                        let mut chunk = [0; 4096];
+                        while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let n = socket.read(&mut chunk).unwrap();
+                            if n == 0 {
+                                break;
+                            }
+                            bytes.extend_from_slice(&chunk[..n]);
+                        }
+                        let end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                        let length = String::from_utf8_lossy(&bytes[..end])
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|v| v.parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        while bytes.len() < end + length {
+                            let n = socket.read(&mut chunk).unwrap();
+                            if n == 0 {
+                                break;
+                            }
+                            bytes.extend_from_slice(&chunk[..n]);
+                        }
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let _ = socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            }
+        });
+        let config = ProviderConfig {
+            api_key: Some("test-quota".into()),
+            base_url: Some(base),
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: Some(vec![]),
+            mcp_registry: None,
+            external_tools: vec![],
+            max_output_tokens: Some(128),
+        };
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".into());
+        let cancel = CancelToken::new();
+        let policy = ProviderRetryPolicy::default();
+        let mut completed = 0;
+        let budget = orca_provider::http_client::RetryBudget::default();
+        loop {
+            completed += 1;
+            let mut stream = orca_provider::start_streaming_with_retry_budget(
+                ProviderKind::DeepSeek,
+                &conversation,
+                &config,
+                cancel.clone(),
+                budget.clone(),
+            );
+            let response = loop {
+                match stream.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    ProviderStreamEvent::Step(_) => {}
+                    ProviderStreamEvent::Completed(response) => break response,
+                }
+            };
+            if policy.decide_with_budget(response.error().unwrap(), completed, &budget)
+                == ProviderRetryDecision::Stop
+            {
+                break;
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            5,
+            "one logical operation must never multiply runtime retries by HTTP retries"
+        );
     }
 }

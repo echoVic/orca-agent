@@ -17,6 +17,7 @@ use orca_core::tool_types::{ToolName, ToolRequest};
 
 use crate::ProviderConfig;
 use crate::context::render_internal_context;
+use crate::http_client::RetryBudget;
 use crate::tool_schema::{deepseek_strict_tools_schema_for_endpoint, deepseek_tools_schema};
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
@@ -384,9 +385,36 @@ pub async fn call_streaming_async(
     conversation: &Conversation,
     config: &ProviderConfig,
     cancel: &CancelToken,
+    on_step: impl FnMut(&ProviderStep),
+) -> ProviderResponse {
+    call_streaming_async_with_retry_budget(
+        conversation,
+        config,
+        cancel,
+        &RetryBudget::default(),
+        on_step,
+    )
+    .await
+}
+
+pub async fn call_streaming_async_with_retry_budget(
+    conversation: &Conversation,
+    config: &ProviderConfig,
+    cancel: &CancelToken,
+    budget: &RetryBudget,
     mut on_step: impl FnMut(&ProviderStep),
 ) -> ProviderResponse {
-    match request_chat_streaming(conversation, config, cancel, &mut on_step).await {
+    match request_chat_streaming_with_budget(
+        conversation,
+        config,
+        cancel,
+        &mut on_step,
+        budget,
+        None,
+        false,
+    )
+    .await
+    {
         Ok(response) => response,
         Err(error) => {
             let (error, usage) = error.into_provider_error();
@@ -412,6 +440,30 @@ pub async fn call_streaming_async_bounded(
     cancel: &CancelToken,
     max_tokens: u32,
     timeout: Duration,
+    on_step: impl FnMut(&ProviderStep),
+) -> ProviderResponse {
+    // The outer timeout owns this facade's partial-report fallback. Only a
+    // caller-supplied operation budget also bounds the transport deadline.
+    let budget = RetryBudget::new(1, timeout, None);
+    call_streaming_async_bounded_with_retry_budget(
+        conversation,
+        config,
+        cancel,
+        max_tokens,
+        timeout,
+        &budget,
+        on_step,
+    )
+    .await
+}
+
+pub async fn call_streaming_async_bounded_with_retry_budget(
+    conversation: &Conversation,
+    config: &ProviderConfig,
+    cancel: &CancelToken,
+    max_tokens: u32,
+    timeout: Duration,
+    retry_budget: &RetryBudget,
     mut on_step: impl FnMut(&ProviderStep),
 ) -> ProviderResponse {
     let mut config = config.clone();
@@ -421,6 +473,7 @@ pub async fn call_streaming_async_bounded(
         &config,
         cancel,
         &mut on_step,
+        retry_budget,
         Some(max_tokens.clamp(1, 2_048)),
         true,
     );
@@ -455,13 +508,23 @@ pub async fn call_streaming_async_bounded(
     }
 }
 
+#[cfg(test)]
 async fn request_chat_streaming(
     conversation: &Conversation,
     config: &ProviderConfig,
     cancel: &CancelToken,
     on_step: &mut impl FnMut(&ProviderStep),
 ) -> Result<ProviderResponse, DeepSeekRequestError> {
-    request_chat_streaming_with_budget(conversation, config, cancel, on_step, None, false).await
+    request_chat_streaming_with_budget(
+        conversation,
+        config,
+        cancel,
+        on_step,
+        &RetryBudget::default(),
+        None,
+        false,
+    )
+    .await
 }
 
 /// The `max_tokens` a chat request reserves for its reply: the runtime's
@@ -502,6 +565,11 @@ pub fn call_summary(
                     &config,
                     cancel,
                     &mut |_| {},
+                    &RetryBudget::new(
+                        1,
+                        Duration::from_secs(120),
+                        Some(std::time::Instant::now() + Duration::from_secs(120)),
+                    ),
                     Some(max_tokens.clamp(1, 2_048)),
                     false,
                 ))
@@ -528,6 +596,7 @@ async fn request_chat_streaming_with_budget(
     config: &ProviderConfig,
     cancel: &CancelToken,
     on_step: &mut impl FnMut(&ProviderStep),
+    retry_budget: &RetryBudget,
     summary_budget: Option<u32>,
     accept_truncated_partial: bool,
 ) -> Result<ProviderResponse, DeepSeekRequestError> {
@@ -570,19 +639,21 @@ async fn request_chat_streaming_with_budget(
     let mut accumulated_usage = None;
     loop {
         let response_result = if summary_budget.is_some() {
-            crate::http_client::execute_streaming_once(
+            crate::http_client::execute_streaming_once_with_budget(
                 streaming_client
                     .post(&url)
                     .bearer_auth(api_key)
                     .json(&request),
                 cancel,
+                retry_budget,
             )
             .await
         } else {
-            crate::http_client::execute_streaming_with_retry(
+            crate::http_client::execute_streaming_with_retry_budget(
                 &streaming_client,
                 |client| client.post(&url).bearer_auth(api_key).json(&request),
                 cancel,
+                retry_budget,
             )
             .await
         };
@@ -596,10 +667,11 @@ async fn request_chat_streaming_with_budget(
                     && is_strict_schema_rejection(&error) =>
             {
                 request.tools = Some(tools.clone());
-                crate::http_client::execute_streaming_with_retry(
+                crate::http_client::execute_streaming_with_retry_budget(
                     &streaming_client,
                     |client| client.post(&url).bearer_auth(api_key).json(&request),
                     cancel,
+                    retry_budget,
                 )
                 .await
                 .map_err(|error| DeepSeekRequestError::with_usage(error, accumulated_usage))?
@@ -787,19 +859,25 @@ fn request_chat(
         reasoning_effort: Some(config.reasoning_effort),
     };
 
+    let retry_budget = RetryBudget::default();
+    let cancel = CancelToken::new();
     let mut accumulated_usage = None;
     for empty_attempt in 0..=EMPTY_RESPONSE_RETRIES {
-        let response = match crate::http_client::execute_with_retry(|client| {
-            client.post(&url).bearer_auth(api_key).json(&request)
-        }) {
+        let response = match crate::http_client::execute_with_retry_budget(
+            |client| client.post(&url).bearer_auth(api_key).json(&request),
+            &retry_budget,
+            &cancel,
+        ) {
             Ok(response) => response,
             // Strict mode is Beta; if the server rejects the strict schema, retry
             // once with the plain tool list rather than failing the whole turn.
             Err(error) if strict_applied && is_strict_schema_rejection(&error) => {
                 request.tools = Some(tools.clone());
-                crate::http_client::execute_with_retry(|client| {
-                    client.post(&url).bearer_auth(api_key).json(&request)
-                })
+                crate::http_client::execute_with_retry_budget(
+                    |client| client.post(&url).bearer_auth(api_key).json(&request),
+                    &retry_budget,
+                    &cancel,
+                )
                 .map_err(|error| DeepSeekRequestError::with_usage(error, accumulated_usage))?
             }
             Err(error) => {
@@ -2569,6 +2647,7 @@ mod tests {
             &config,
             &cancel,
             &mut |_| {},
+            &RetryBudget::default(),
             Some(256),
             true,
         )

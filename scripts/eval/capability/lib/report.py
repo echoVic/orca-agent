@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -29,6 +30,9 @@ def summarize(pairs: list[tuple[dict, list[dict]]]) -> dict:
             "pass_rate": round(passes / trials, 4) if trials else None,
             "wilson": [round(value, 4) for value in metrics.wilson(passes, trials)],
             "cost": metrics.cost_per_pass(attempts),
+            "outcome_variance": round((passes / trials) * (1-passes / trials) * trials / (trials-1), 6) if trials > 1 else "unknown",
+            "false_completions": sum(bool(a.get("false_completion")) for a in attempts),
+            "discovered_attempts": sum(bool(a.get("discoveries")) for a in attempts),
         }
         axis["scenarios"].append(entry)
         for attempt in attempts:
@@ -134,6 +138,38 @@ def render_markdown(run: dict) -> str:
                   f"mean pass rate {run['diff']['mean_pass_rate'][0]} → {run['diff']['mean_pass_rate'][1]}", ""]
         for change in run["diff"]["transitions"]:
             lines.append(f"- {change['change']}: `{change['id']}`")
+    lines += ["", "## Evidence and repeated attempts", ""]
+    for group in run.get("aggregation", {}).get("groups", []):
+        lines.append(f"- {group['scenario_id']} ({group['split']}, {group['suite_id']}): "
+                     f"{group['passes']}/{group['attempts']} pass; variance {group['outcome_variance']}; "
+                     f"95% CI {group['wilson']}; cost/pass {group['cost']['cost_usd_per_pass']}; "
+                     f"false completions {group['false_completions']}; discovered attempts {group['discoveries']}")
+    for item in run.get("scenarios", []):
+        for index, attempt in enumerate(item.get("attempts", []), 1):
+            lines.append(f"- {item['id']} attempt {index}: final verifier {attempt.get('final_verification', 'unknown')}; "
+                         f"first-discovery evidence {json.dumps(attempt.get('discoveries', []), sort_keys=True)}")
+    lines += ["", "## Compression and provider observations", "",
+              "Measurements are per emitted completion event across all attempts, including failures. "
+              "Means/totals are unknown if any recorded event lacks the field; observed_mean/observed_total "
+              "show known subsets with observation counts. No events means unknown measurements, "
+              "not proof of zero compactions or provider calls.", "",
+              "before_tokens_est/after_tokens_est are local token estimates. prefix_reuse_estimate is "
+              "not service KV cache proof; summary usage/cache ratios use returned service metadata when available.", "",
+              "Provider elapsed_ms covers the logical provider call, including retry waits; first_delta_ms "
+              "is time to the first nonempty streamed delta. first_delta_kind distinguishes reasoning, message "
+              "or tool-call deltas (current runtime values: reasoning/text/tool). These are provider measurements, "
+              "not task wall time or per-token generation time.", "",
+              "Summary estimated_cost_usd is reported separately and not added to cumulative attempt cost. "
+              "Cost/pass retains the usage.updated/session.completed cumulative-cost basis; summary expenses "
+              "outside that stream are not included. Estimates are not invoices.", ""]
+    for group in run.get("aggregation", {}).get("groups", []):
+        lines.append(f"- {group['scenario_id']} ({group['split']}, {group['suite_id']}): "
+                     f"{json.dumps(group.get('observations', metrics.observation_stats([])), sort_keys=True)}")
+    for item in run.get("scenarios", []):
+        for index, attempt in enumerate(item.get("attempts", []), 1):
+            lines.append(f"- {item['id']} attempt {index}: compactions "
+                         f"{json.dumps(attempt.get('compactions', 'unknown'), sort_keys=True)}; "
+                         f"provider observations {json.dumps(attempt.get('provider_observations', 'unknown'), sort_keys=True)}")
     lines += ["", "## How to reproduce", "", "```",
               f"python3 scripts/eval/capability/run.py --record --out {run['out']}", "```", ""]
     return "\n".join(lines)
@@ -195,3 +231,56 @@ def scoreboard_append(path: Path, run: dict) -> None:
         }
     )
     path.write_text(json.dumps({"schema_version": 1, "runs": entries}, indent=2) + "\n", encoding="utf-8")
+
+
+def aggregate_runs(runs: list[dict]) -> dict:
+    """Pool comparable attempts only; never mix tuning with fixed holdout measurements."""
+    from . import evidence
+    groups = {}
+    for run in runs:
+        evaluation = run.get("evaluation", {})
+        for item in run.get("scenarios", []):
+            for attempt in item.get("attempts", []):
+                config = {**run.get("protocol", {}), **attempt.get("protocol", {})}
+                meta = next((row for row in evaluation.get("scenarios", []) if row["id"] == item["id"]), evaluation)
+                comparison = {key: config.get(key, meta.get("identity", {}).get(key, "unknown")) for key in (
+                    "source_commit", "binary_sha256", "requested_model", "reasoning_effort",
+                    "observed_requested_model", "observed_reasoning_effort", "backend",
+                    "response_model", "provider_fingerprint", "engine_fingerprint", "provider_fixture_sha256",
+                    "sampling", "budget", "tool_schema_sha256", "fixture_sha256", "verifier_sha256", "provider",
+                    "scenario_sha256", "prompt_sha256", "prepare_sha256", "verifier_command_sha256", "source_fixture_sha256")}
+                origin = config.get("endpoint_identity", "unknown")
+                fixture = config.get("provider_fixture_sha256", "unknown")
+                stable_endpoint = config.get("endpoint_comparison_identity")
+                # Only our explicitly identified local mock may normalize an
+                # ephemeral port. Real and legacy/unknown fixtures keep origin.
+                controlled_mock = (config.get("provider") == "mock" and config.get("backend") == "local"
+                    and isinstance(fixture, str) and re.fullmatch(r"[0-9a-f]{64}", fixture)
+                    and isinstance(origin, str) and re.fullmatch(r"http://127\.0\.0\.1:[0-9]+", origin)
+                    and stable_endpoint == "controlled-mock:" + fixture)
+                comparison["endpoint_comparison_identity"] = stable_endpoint if controlled_mock else origin
+                split, suite = meta.get("split", "unknown"), meta.get("suite_id", "unknown")
+                manifest = evaluation.get("manifest_sha256", "unknown")
+                # Unknown manifests do not establish that two run sets are comparable.
+                if manifest == "unknown": manifest = "unknown:" + run.get("run_id", "unknown")
+                key = evidence.digest([item["id"], split, suite, manifest, comparison])
+                group = groups.setdefault(key, {"scenario_id": item["id"], "split": split, "suite_id": suite,
+                    "manifest_sha256": manifest, "requested_model": comparison["requested_model"],
+                    "configuration": comparison, "endpoint_identities": set(), "run_ids": set(), "rows": []})
+                group["run_ids"].add(run.get("run_id", "unknown"))
+                group["endpoint_identities"].add(origin)
+                group["rows"].append(attempt)
+    output = []
+    for group in groups.values():
+        rows = group.pop("rows")
+        n = len(rows); passes = sum(row.get("outcome") == "pass" for row in rows)
+        rate = passes / n
+        group.update(attempts=n, passes=passes, pass_rate=round(rate, 4),
+                     outcome_variance=round(rate * (1-rate) * n / (n-1), 6) if n > 1 else "unknown",
+                     wilson=[round(v, 4) for v in metrics.wilson(passes, n)], cost=metrics.cost_per_pass(rows),
+                     false_completions=sum(bool(r.get("false_completion")) for r in rows),
+                     discoveries=sum(bool(r.get("discoveries")) for r in rows),
+                     observations=metrics.observation_stats(rows),
+                     run_ids=sorted(group["run_ids"]), endpoint_identities=sorted(group["endpoint_identities"]))
+        output.append(group)
+    return {"groups": output, "interval": "95% Wilson; descriptive repeated attempts, not deterministic cloud output proof"}

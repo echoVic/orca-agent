@@ -1,0 +1,8 @@
+{"type": "context.compaction.started", "payload": {"reason": "input_budget_pressure"}}
+{"type": "context.compacted", "payload": {"reason": "input_budget_pressure", "strategy": "deep", "before_messages": 20, "after_messages": 6, "collapsed_messages": 14, "observation": {"before_tokens_est": 12000, "after_tokens_est": 3000, "elapsed_ms": 50, "summary_requests": [{"purpose": "summary", "provider": "fixture", "model": "fixture-model", "outcome": "succeeded", "summary_cache_hit": false, "usage": {"input_tokens": 1000, "output_tokens": 50, "cache_tokens": 500}, "estimated_cost_usd": 0.004, "cache_hit_ratio": 0.5}], "summary_usage": {"input_tokens": 1000, "output_tokens": 50, "cache_tokens": 500}, "summary_usage_complete": true, "estimated_cost_usd": 0.004, "cache_hit_ratio": 0.5, "prefix_reuse_estimate": {"before_tokens_est": 12000, "after_tokens_est": 3000, "unchanged_prefix_messages": 1, "unchanged_prefix_bytes": 2048, "unchanged_prefix_tokens_est": 512}}}}
+{"type": "provider.response.completed", "payload": {"observation": {"elapsed_ms": 200, "first_delta_ms": 40, "first_delta_kind": "reasoning"}}}
+{"type": "model.response.completed", "payload": {"observation": {"elapsed_ms": 400, "first_delta_ms": null, "first_delta_kind": null}}}
+{"type": "context.compacted", "payload": {"reason": "manual", "strategy": "micro"}}
+{"type": "provider.response.completed", "payload": {}}
+{"type": "usage.updated", "payload": {"input_tokens": 201, "output_tokens": 31, "estimated_cost_usd": 0.01}}
+{"type": "session.completed", "payload": {"status": "completed"}}

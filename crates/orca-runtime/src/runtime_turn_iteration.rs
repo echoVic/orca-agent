@@ -66,6 +66,7 @@ impl RuntimeTurnIterationStep {
             match self.opening_step.open(RuntimeTurnOpeningInput {
                 actor: input.actor,
                 operation: &mut *input.operation,
+                cancel: input.loop_state.cancel,
                 provider: input.provider_context.provider,
                 context_config: input.provider_context.context_config,
                 provider_config: input.provider_context.provider_config,

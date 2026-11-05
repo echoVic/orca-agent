@@ -229,6 +229,7 @@ pub struct ThreadTurnContext<'a> {
     prompt: String,
     memory_start: usize,
     file_write_baseline: std::collections::HashMap<String, u64>,
+    workspace_baseline: crate::workspace_observation::Snapshot,
     parts: InteractiveSessionRuntimeParts<'a>,
 }
 
@@ -261,6 +262,7 @@ struct PreparedThreadTurn<'a, 'session, W: io::Write> {
 
 struct ThreadTurnCompletion {
     cwd: PathBuf,
+    workspace_observation: serde_json::Value,
     memory_start: usize,
     status: RunStatus,
     end_reason: crate::lifecycle::TurnEndReason,
@@ -341,6 +343,7 @@ pub struct ThreadTurnRequest {
     root_task_id: Option<String>,
     options: ControllerRunOptions,
     emit_session_completed: bool,
+    collect_completion_evidence: bool,
     steer_handle: Option<ThreadSteerHandle>,
     execution_policy: Option<RuntimeExecutionPolicyHandle>,
     approval_handler: Option<Arc<dyn RuntimeApprovalHandler + Send + Sync>>,
@@ -498,6 +501,8 @@ impl<'a> ThreadTurnContext<'a> {
         let turn_start = session.begin_runtime_turn(
             request.turn_id().as_str(),
             request.prompt_placement() == ThreadTurnPromptPlacement::ExistingTurn,
+            &cwd,
+            request.collects_completion_evidence() && config.output_format == OutputFormat::Jsonl,
         )?;
         let mut parts = session.runtime_parts();
         if let Some(writer) = parts.writer.as_deref_mut() {
@@ -547,6 +552,7 @@ impl<'a> ThreadTurnContext<'a> {
             prompt,
             memory_start: turn_start.message_index,
             file_write_baseline: turn_start.file_write_baseline,
+            workspace_baseline: turn_start.workspace_baseline,
             parts,
         })
     }
@@ -749,6 +755,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             prompt,
             memory_start,
             file_write_baseline,
+            workspace_baseline,
             parts,
         } = context;
         let main_session_task = ThreadTurnMainSessionTask::from_request(
@@ -939,6 +946,14 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
         let background_workflows =
             RuntimeBackgroundWorkflows::from_vec(std::mem::take(background_workflows));
         Ok(PreparedThreadTurnOutcome::Completed(ThreadTurnCompletion {
+            workspace_observation: workspace_baseline.compare(&if request
+                .collects_completion_evidence()
+                && config.output_format == OutputFormat::Jsonl
+            {
+                crate::workspace_observation::Snapshot::capture(&cwd)
+            } else {
+                Default::default()
+            }),
             cwd,
             memory_start,
             status,
@@ -1008,6 +1023,60 @@ fn turn_writes_applied(messages: &[Message]) -> bool {
 }
 
 impl ThreadTurnCompletion {
+    fn add_completion_context(
+        &self,
+        draft: &mut orca_core::event_schema::EventDraft,
+        session: &InteractiveSession,
+        request: &ThreadTurnRequest,
+        transcript_committed: bool,
+    ) -> io::Result<()> {
+        let resumable = transcript_committed && session.session_id().is_some();
+        draft.payload["resumable"] = serde_json::json!(resumable);
+        if resumable {
+            draft
+                .payload
+                .as_object_mut()
+                .unwrap()
+                .remove("resume_unavailable_reason");
+            draft.payload["resume"] = serde_json::json!({
+                "session_id": session.session_id(), "command": "orca exec resume",
+            });
+        } else {
+            draft.payload["resume_unavailable_reason"] =
+                serde_json::json!(if session.history_requested() {
+                    "history_write_failed"
+                } else {
+                    "history_disabled"
+                });
+        }
+        draft.payload["workspace_observation"] = self.workspace_observation.clone();
+        let blockers = request
+            .root_task_id()
+            .or_else(|| self.main_session_task.as_ref().map(|task| task.id.as_str()))
+            .map(|root| session.task_registry().task_tree_blockers(root))
+            .transpose()
+            .map_err(io::Error::other)?
+            .unwrap_or_default();
+        let mut blockers = blockers;
+        if let Some(orca_core::budget::OperationTerminal::Blocked { blocker, .. }) =
+            self.terminal.as_ref()
+        {
+            if let Some(root) = request
+                .root_task_id()
+                .or_else(|| self.main_session_task.as_ref().map(|t| t.id.as_str()))
+            {
+                blockers.retain(|b| b["task_id"].as_str() != Some(root));
+                let mut value = serde_json::to_value(blocker).map_err(io::Error::other)?;
+                value["task_id"] = serde_json::json!(root);
+                value["parent_task_id"] = serde_json::Value::Null;
+                value["resolution"] = serde_json::json!("unresolved");
+                blockers.push(value);
+            }
+        }
+        draft.payload["blockers"] = serde_json::json!(blockers);
+        Ok(())
+    }
+
     fn commit<W: io::Write>(
         self,
         config: &RunConfig,
@@ -1031,7 +1100,7 @@ impl ThreadTurnCompletion {
                 orca_core::budget::OperationTerminal::Stopped { .. }
             )
         {
-            let _ =
+            let transcript_committed =
                 session.complete_with_error_durable(self.status.as_str(), self.error.as_deref());
             if let Some(task) = self.main_session_task.as_ref() {
                 task.finish_and_emit(
@@ -1043,13 +1112,16 @@ impl ThreadTurnCompletion {
                 )?;
                 task.emit_all(events, sink)?;
             }
+            let mut draft = events.session_completed_with_verification(
+                self.status.clone(),
+                session.session_id(),
+                self.verification.as_ref(),
+                self.writes_applied,
+            );
+            self.add_completion_context(&mut draft, session, request, transcript_committed)?;
+            session.record_completion_context(&draft.payload);
             if request.emit_session_completed() {
-                sink.emit(events.session_completed_with_verification(
-                    self.status.clone(),
-                    session.session_id(),
-                    self.verification.as_ref(),
-                    self.writes_applied,
-                ))?;
+                sink.emit(draft)?;
             }
             return Ok(self.status);
         }
@@ -1068,21 +1140,24 @@ impl ThreadTurnCompletion {
             )?;
             task.emit_all(events, sink)?;
         }
+        let mut draft = if let Some(terminal) = self.terminal.as_ref() {
+            events.session_completed_terminal_with_verification(
+                terminal,
+                session.session_id(),
+                self.verification.as_ref(),
+                self.writes_applied,
+            )
+        } else {
+            events.session_completed(
+                self.status.clone(),
+                session.session_id(),
+                self.writes_applied,
+            )
+        };
+        self.add_completion_context(&mut draft, session, request, transcript_committed)?;
+        session.record_completion_context(&draft.payload);
         if request.emit_session_completed() {
-            if let Some(terminal) = self.terminal.as_ref() {
-                sink.emit(events.session_completed_terminal_with_verification(
-                    terminal,
-                    session.session_id(),
-                    self.verification.as_ref(),
-                    self.writes_applied,
-                ))?;
-            } else {
-                sink.emit(events.session_completed(
-                    self.status.clone(),
-                    session.session_id(),
-                    self.writes_applied,
-                ))?;
-            }
+            sink.emit(draft)?;
         }
         if crate::memory::automatic_memory_capture_is_eligible(
             config,
@@ -1187,6 +1262,7 @@ impl ThreadTurnRequest {
             root_task_id: None,
             options: ControllerRunOptions::default(),
             emit_session_completed: true,
+            collect_completion_evidence: false,
             steer_handle: None,
             execution_policy: None,
             approval_handler: None,
@@ -1305,6 +1381,15 @@ impl ThreadTurnRequest {
     pub fn with_session_completed_event(mut self, emit: bool) -> Self {
         self.emit_session_completed = emit;
         self
+    }
+
+    pub(crate) fn with_completion_evidence(mut self, collect: bool) -> Self {
+        self.collect_completion_evidence = collect;
+        self
+    }
+
+    fn collects_completion_evidence(&self) -> bool {
+        self.emit_session_completed || self.collect_completion_evidence
     }
 
     pub fn emit_session_completed(&self) -> bool {
@@ -2649,6 +2734,110 @@ mod tests {
             terminal_notifications: false,
             auto_memory: false,
         }
+    }
+
+    #[test]
+    fn completion_history_write_failure_never_advertises_resume() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.history_mode = HistoryMode::Record;
+        let mut session =
+            InteractiveSession::new_with_preloaded(&config, "history failure", None).unwrap();
+        let path = session.runtime_parts().writer.unwrap().path().to_path_buf();
+        // An actual persistence failure, not a mocked durability flag.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let committed = session.complete_with_error_durable("success", None);
+        assert!(!committed);
+        let completion = ThreadTurnCompletion {
+            cwd: cwd.path().into(),
+            workspace_observation: serde_json::Value::Null,
+            memory_start: 0,
+            status: RunStatus::Success,
+            end_reason: crate::lifecycle::TurnEndReason::Unclassified,
+            error: None,
+            usage: UsageTotals::default(),
+            main_session_task: None,
+            background_workflows: RuntimeBackgroundWorkflows::from_vec(vec![]),
+            terminal: None,
+            verification: None,
+            writes_applied: false,
+        };
+        let mut events = EventFactory::new("failure".into());
+        let mut draft = events.session_completed(RunStatus::Success, session.session_id(), false);
+        completion
+            .add_completion_context(
+                &mut draft,
+                &session,
+                &ThreadTurnRequest::new("hello"),
+                committed,
+            )
+            .unwrap();
+        assert_eq!(draft.payload["resumable"], false);
+        assert_eq!(
+            draft.payload["resume_unavailable_reason"],
+            "history_write_failed"
+        );
+        assert!(draft.payload["resume"].is_null());
+    }
+
+    #[test]
+    fn completion_history_append_failure_retains_recording_intent() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.history_mode = HistoryMode::Record;
+        let mut session =
+            InteractiveSession::new_with_preloaded(&config, "history failure", None).unwrap();
+        let path = session.runtime_parts().writer.unwrap().path().to_path_buf();
+        // An actual persistence failure, not a mocked durability flag.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        session.append_message(&orca_core::conversation::Message::user(
+            "append after file failure".to_string(),
+        ));
+        assert!(
+            !session.history_recording(),
+            "failed writer must be dropped"
+        );
+        assert!(session.history_requested());
+        let committed = session.complete_with_error_durable("success", None);
+        assert!(!committed);
+        let completion = ThreadTurnCompletion {
+            cwd: cwd.path().into(),
+            workspace_observation: serde_json::Value::Null,
+            memory_start: 0,
+            status: RunStatus::Success,
+            end_reason: crate::lifecycle::TurnEndReason::Unclassified,
+            error: None,
+            usage: UsageTotals::default(),
+            main_session_task: None,
+            background_workflows: RuntimeBackgroundWorkflows::from_vec(vec![]),
+            terminal: None,
+            verification: None,
+            writes_applied: false,
+        };
+        let mut events = EventFactory::new("failure".into());
+        let mut draft = events.session_completed(RunStatus::Success, session.session_id(), false);
+        completion
+            .add_completion_context(
+                &mut draft,
+                &session,
+                &ThreadTurnRequest::new("hello"),
+                committed,
+            )
+            .unwrap();
+        assert_eq!(draft.payload["resumable"], false);
+        assert_eq!(
+            draft.payload["resume_unavailable_reason"],
+            "history_write_failed"
+        );
+        assert!(draft.payload["resume"].is_null());
     }
 
     #[test]

@@ -10,6 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import math
+import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -20,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import scenario as scenario_lib
-from . import triage
+from . import triage, evidence as evidence_lib
 
 REPO = Path(__file__).resolve().parents[4]
 DEFAULT_BINARY = REPO / "target" / "release" / "orca"
@@ -51,6 +54,11 @@ class Attempt:
     verifier_partial: bool = False
     cross_budget_passed: bool = False
     artifacts: dict = field(default_factory=dict)
+    protocol: dict = field(default_factory=dict)
+    discoveries: list[dict] = field(default_factory=list)
+    compactions: list[dict] = field(default_factory=list)
+    provider_observations: list[dict] = field(default_factory=list)
+    final_verification: str = "unknown"
 
     def as_dict(self) -> dict:
         return dict(self.__dict__)
@@ -122,48 +130,142 @@ def hash_protected(root: Path) -> dict[str, str]:
     return digests
 
 
-def parse_events(path: Path) -> dict:
-    """Read `orca exec --output-format jsonl` output: tool calls, output tokens, terminal status."""
-    tool_calls = 0
-    tokens_out = None
-    tokens_in = None
-    cost_usd = None
-    terminal = None
+def event_observation(value, required: tuple[str, ...], numeric: tuple[str, ...]) -> dict:
+    """Retain additive measurement fields; unavailable values stay unknown, including nulls."""
+    def known(item):
+        if item is None:
+            return "unknown"
+        if isinstance(item, dict):
+            return {key: known(value) for key, value in item.items()}
+        if isinstance(item, list):
+            return [known(value) for value in item]
+        if isinstance(item, float) and not math.isfinite(item):
+            return "unknown"
+        return item
+    observation = known(value) if isinstance(value, dict) else {}
+    for key in required:
+        observation.setdefault(key, "unknown")
+    for key in numeric:
+        item = observation.get(key)
+        if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item) or item < 0:
+            observation[key] = "unknown"
+    if "first_delta_kind" in required and (not isinstance(observation["first_delta_kind"], str) or not observation["first_delta_kind"]):
+        observation["first_delta_kind"] = "unknown"
+    return observation
+
+
+def parse_events(path: Path, constraints: list[dict] | None = None) -> dict:
+    """Parse real JSONL records. Discovery requires a successful paired tool result."""
+    result = {"tool_calls": None, "tokens_out": None, "tokens_in": None, "cost_usd": None,
+              "terminal": None, "discoveries": [], "compactions": [], "provider_observations": []}
     if not path.exists():
-        return {"tool_calls": None, "tokens_out": None, "tokens_in": None, "cost_usd": None, "terminal": None}
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if '"tool.call.requested"' in line:
-            tool_calls += 1
-            continue
-        if '"usage.updated"' in line:
-            # Cumulative per run: the last event wins.
-            try:
-                payload = json.loads(line).get("payload") or {}
-            except json.JSONDecodeError:
-                continue
-            tokens_in = payload.get("input_tokens", tokens_in)
-            tokens_out = payload.get("output_tokens", tokens_out)
-            cost_usd = payload.get("estimated_cost_usd", cost_usd)
-            continue
-        if '"session.completed"' not in line and '"usage"' not in line:
-            continue
+        return result
+    result["tool_calls"] = 0
+    calls, found = {}, set()
+    for index, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
         try:
             record = json.loads(line)
-        except json.JSONDecodeError:
+        except ValueError:
             continue
+        if not isinstance(record, dict): continue
+        kind = record.get("type") or record.get("event")
         payload = record.get("payload") or {}
-        terminal = terminal or payload.get("status")
-        usage = payload.get("usage") or {}
-        if usage.get("output_tokens") is not None:
-            tokens_out = usage["output_tokens"]
-        if usage.get("input_tokens") is not None:
-            tokens_in = usage["input_tokens"]
-        if payload.get("output_tokens") is not None:
-            tokens_out = payload["output_tokens"]
-        if payload.get("input_tokens") is not None:
-            tokens_in = payload["input_tokens"]
-    return {"tool_calls": tool_calls, "tokens_out": tokens_out, "tokens_in": tokens_in,
-            "cost_usd": cost_usd, "terminal": terminal}
+        if not isinstance(payload, dict): continue
+        if kind == "tool.call.requested":
+            result["tool_calls"] += 1
+            if isinstance(payload.get("id"), str):
+                calls[payload["id"]] = (payload, result["tool_calls"])
+        elif kind == "tool.call.completed":
+            call_id = payload.get("id")
+            pair = calls.get(call_id) if isinstance(call_id, str) else None
+            if (not pair or payload.get("status") != "completed" or payload.get("error")
+                    or payload.get("exit_code") not in (None, 0)):
+                continue
+            request, count = pair
+            if request.get("name") not in {"read_file", "grep", "file_search"}:
+                continue
+            location = json.dumps({key: request.get(key) for key in ("target", "raw_arguments")})
+            output = payload.get("output")
+            if not isinstance(output, str): output = json.dumps(output)
+            for constraint in constraints or []:
+                if constraint["id"] in found: continue
+                source = constraint["source"]
+                source_pattern = r"(?<![\w./-])" + re.escape(source) + r"(?![\w./-])"
+                if not re.search(source_pattern, location) and not re.search(source_pattern, output):
+                    continue
+                if constraint["contains"] not in output: continue
+                found.add(constraint["id"])
+                result["discoveries"].append({"constraint_id": constraint["id"], "source": source,
+                    "tool_call_id": payload["id"], "tool_name": request.get("name"), "event_line": index,
+                    "tool_calls_to_discovery": count,
+                    "tokens_in_to_discovery": result["tokens_in"] if result["tokens_in"] is not None else "unknown",
+                    "tokens_out_to_discovery": result["tokens_out"] if result["tokens_out"] is not None else "unknown",
+                    "token_basis": "last observed cumulative usage before discovery; not exact attribution",
+                    "output_sha256": hashlib.sha256(output.encode()).hexdigest()})
+        elif kind in {"usage.updated", "session.completed"}:
+            usage = payload.get("usage") or payload
+            if not isinstance(usage, dict):
+                usage = {}
+            for key in ("tokens_in", "tokens_out", "cost_usd"):
+                source = {"tokens_in": "input_tokens", "tokens_out": "output_tokens", "cost_usd": "estimated_cost_usd"}[key]
+                value = usage.get(source)
+                if not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+                    result[key] = value
+            if kind == "session.completed": result["terminal"] = payload.get("status")
+        elif kind == "context.compacted":
+            observation = event_observation(payload.get("observation"), (
+                "before_tokens_est", "after_tokens_est", "elapsed_ms", "summary_requests", "summary_usage",
+                "summary_usage_complete", "estimated_cost_usd", "cache_hit_ratio", "prefix_reuse_estimate"),
+                ("before_tokens_est", "after_tokens_est", "elapsed_ms", "estimated_cost_usd", "cache_hit_ratio"))
+            result["compactions"].append({"event_line": index, "type": kind,
+                **{key: payload.get(key) if payload.get(key) is not None else "unknown" for key in (
+                    "reason", "strategy", "before_messages", "after_messages", "collapsed_messages")},
+                "observation": observation})
+        elif kind in {"provider.response.completed", "model.response.completed"}:
+            result["provider_observations"].append({"event_line": index, "type": kind,
+                "observation": event_observation(payload.get("observation"),
+                    ("elapsed_ms", "first_delta_ms", "first_delta_kind"), ("elapsed_ms", "first_delta_ms"))})
+        elif isinstance(kind, str) and kind.startswith("context.compaction."):
+            result["compactions"].append({"event_line": index, "type": kind})
+    return result
+
+
+def protected_evidence(item, workspace: Path) -> dict[str, str]:
+    hashes = hash_protected(workspace)
+    paths = evidence_lib.verifier_paths(item, workspace) + evidence_lib.verifier_paths(item, item.fixture)
+    paths += [p for p in (item.path, item.prepare) if p is not None]
+    # Scenario/prepare/verifier input files are observed in addition to the existing tests guard.
+    for path in paths:
+        hashes[str(path.resolve())] = evidence_lib.file_sha(path)
+    return hashes
+
+
+def changed_protected(before: dict, after: dict) -> list[str]:
+    return sorted(path for path, digest in before.items() if after.get(path) != digest)
+
+
+def snapshot_verifiers(item, workspace: Path, attempt_dir: Path, container: bool = False) -> tuple[list[str], dict]:
+    """Copy actual verifier inputs before agent execution; observe snapshots for tampering too."""
+    directory = attempt_dir / "verifier"
+    directory.mkdir(exist_ok=True)
+    replacements, hashes = {}, {}
+    for original in evidence_lib.verifier_paths(item, workspace):
+        if not original.is_relative_to(workspace):
+            continue
+        relative = str(original.relative_to(workspace))
+        snapshot = directory / relative
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(original, snapshot)
+        hashes[str(snapshot.resolve())] = evidence_lib.file_sha(snapshot)
+        replacements[relative] = str(Path("/artifacts/verifier") / relative) if container else str(snapshot)
+    commands = []
+    for command in item.verify:
+        tokens = shlex.split(command)
+        for source, target in replacements.items():
+            if source in tokens:
+                command = re.sub(r"(?<![\w./-])" + re.escape(source) + r"(?![\w./-])", shlex.quote(target), command)
+        commands.append(command)
+    return commands, hashes
 
 
 def run_local(
@@ -171,10 +273,19 @@ def run_local(
     attempt_dir: Path,
     binary: Path = DEFAULT_BINARY,
     provider: str | None = None,
+    execution: dict | None = None,
 ) -> Attempt:
     """One attempt of a `local` scenario; artifacts go under `attempt_dir`."""
     attempt_dir.mkdir(parents=True, exist_ok=True)
     provider = provider or scenario.provider
+    config = dict(scenario.execution)
+    config.update(execution or {})
+    evidence_lib.validate_execution(config)
+    if scenario.command == "goal" and config:
+        raise BackendError("goal episode does not support explicit execution overrides")
+    if scenario.command == "workflow" and set(config).intersection(evidence_lib.BUDGET_KEYS):
+        raise BackendError("workflow does not support exec budget overrides")
+    attempt_protocol = evidence_lib.execution_protocol(config)
     started = time.monotonic()
     workspace = attempt_dir / "workspace"
     home = attempt_dir / "home"
@@ -184,7 +295,7 @@ def run_local(
     if not (workspace / ".git").exists():
         subprocess.run(["git", "init", "-q", str(workspace)], capture_output=True, timeout=30)
     if scenario.prepare is not None:
-        prepare_process_env = {**os.environ, **scenario.prepare_env}
+        prepare_process_env = {**os.environ, "CAPABILITY_EXTERNAL_DB": str(attempt_dir / "external-state.sqlite"), **scenario.prepare_env}
         prepared = subprocess.run(
             [sys.executable, str(scenario.prepare)], cwd=workspace, capture_output=True, text=True,
             timeout=120, env=prepare_process_env,
@@ -269,7 +380,11 @@ def run_local(
             artifacts={"goal_outcome": str(attempt_dir / "goal-outcome.json")},
         )
 
-    protected = hash_protected(workspace)
+    protected = protected_evidence(scenario, workspace)
+    verifier_commands, snapshot_hashes = snapshot_verifiers(scenario, workspace, attempt_dir)
+    protected.update(snapshot_hashes)
+    attempt_protocol.update(evidence_lib.scenario_identity(scenario, workspace))
+    attempt_protocol.update(binary_sha256=evidence_lib.file_sha(binary), provider=provider, backend="local")
     mock = None
     stdout_path = attempt_dir / "agent.stdout.jsonl"
     stderr_path = attempt_dir / "agent.stderr.txt"
@@ -283,14 +398,31 @@ def run_local(
             mock = MockProvider(attempt_dir / "provider-requests.jsonl")
         argv = (
             [str(binary), "exec", "--mode", "full-auto", "--output-format", "jsonl",
-             "--cwd", str(workspace), "--", scenario.prompt]
+             "--cwd", str(workspace), *evidence_lib.exec_options(config), "--", scenario.prompt]
             if scenario.command == "exec"
             else [str(binary), "workflow", "run", str(workspace / scenario.script), "--cwd", str(workspace)]
         )
+        env = agent_env(home, provider, mock, extra_path=workspace / ".faultbin")
+        env["CAPABILITY_EXTERNAL_DB"] = str(attempt_dir / "external-state.sqlite")
+        if config.get("reasoning_effort") is not None: env["ORCA_REASONING_EFFORT"] = config["reasoning_effort"]
+        if config.get("model") is not None: env["ORCA_MODEL"] = config["model"]
+        if config.get("endpoint") is not None: env["ORCA_BASE_URL"] = config["endpoint"]
+        # A mock run must always stay on the offline endpoint, even with an explicit URL override.
+        if mock is not None:
+            env["ORCA_BASE_URL"] = f"http://127.0.0.1:{mock.port}"
+            # Fingerprint the actual scripted fixture and its response-affecting
+            # watch configuration; the listening port is provenance, not behavior.
+            script_sha = evidence_lib.file_sha(MOCK_PROVIDER)
+            fixture_sha = evidence_lib.digest({"script_sha256": script_sha,
+                "mock_watch": env.get("MOCK_WATCH", "")}) if script_sha != "unknown" else "unknown"
+            attempt_protocol["provider_fixture_sha256"] = fixture_sha
+            if fixture_sha != "unknown":
+                attempt_protocol["endpoint_comparison_identity"] = "controlled-mock:" + fixture_sha
+        attempt_protocol["endpoint_identity"] = evidence_lib.endpoint_identity(env.get("ORCA_BASE_URL"))
         with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
             process = subprocess.run(
                 argv,
-                env=agent_env(home, provider, mock, extra_path=workspace / ".faultbin"),
+                env=env,
                 cwd=workspace,
                 stdout=stdout,
                 stderr=stderr,
@@ -325,15 +457,16 @@ def run_local(
         if mock:
             mock.stop()
     wall = time.monotonic() - started
-    events = parse_events(stdout_path) if scenario.command == "exec" else {"tool_calls": None, "tokens_out": None,
+    events = parse_events(stdout_path, scenario.evidence) if scenario.command == "exec" else {"tool_calls": None, "tokens_out": None,
                                                                           "tokens_in": None, "cost_usd": None,
                                                                           "terminal": None}
 
+    attempt_protocol = evidence_lib.attach_provider(attempt_protocol, attempt_dir / "provider-requests.jsonl")
     verify_started = time.monotonic()
     verifier_results: list[dict] = []
     verifier_outputs: list[str] = []
-    for index, command in enumerate(scenario.verify):
-        verify_process_env = {**os.environ, "CAPABILITY_ORCA_BIN": str(binary), **scenario.verify_env}
+    for index, command in enumerate(verifier_commands):
+        verify_process_env = {**os.environ, "CAPABILITY_ORCA_BIN": str(binary), "CAPABILITY_EXTERNAL_DB": str(attempt_dir / "external-state.sqlite"), **scenario.verify_env}
         try:
             result = subprocess.run(
                 ["bash", "-lc", command], cwd=workspace, capture_output=True, text=True,
@@ -352,8 +485,9 @@ def run_local(
         verifier_outputs.append(output)
     verify_seconds = time.monotonic() - verify_started
 
-    after = hash_protected(workspace)
-    tampered = sorted(path for path, digest in protected.items() if after.get(path) != digest)
+    after = protected_evidence(scenario, workspace)
+    after.update({path: evidence_lib.file_sha(Path(path)) for path in snapshot_hashes})
+    tampered = changed_protected(protected, after)
     failures = [item for item in verifier_results if item["exit"] != 0]
     verifier_partial = 0 < len(failures) < len(verifier_results)
 
@@ -389,6 +523,10 @@ def run_local(
                 "tampered": tampered,
                 "verifier": verifier_results,
                 "events": events,
+                "compactions": events.get("compactions", []),
+                "provider_observations": events.get("provider_observations", []),
+                "protocol": attempt_protocol,
+                "final_verification": "passed" if not failures and not tampered else "failed",
                 "wall_seconds": round(wall, 2),
                 "verify_seconds": round(verify_seconds, 2),
             },
@@ -411,14 +549,18 @@ def run_local(
         false_completion=(agent_exit == 0 and bool(failures)),
         harness_error=f"protected files were modified: {tampered}" if tampered else None,
         verifier_partial=verifier_partial and (agent_exit == 0),
+        protocol=attempt_protocol, discoveries=events.get("discoveries", []),
+        compactions=events.get("compactions", []), provider_observations=events.get("provider_observations", []),
+        final_verification="passed" if not failures and not tampered else "failed",
         artifacts={"workspace": str(workspace), "agent_stdout": str(stdout_path)},
     )
 
 
-def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provider: str | None = None) -> Attempt:
+def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provider: str | None = None, execution: dict | None = None) -> Attempt:
     """Run one attempt inside a Linux container (the design's `docker` backend for B/D)."""
     attempt_dir.mkdir(parents=True, exist_ok=True)
     provider = provider or scenario.provider
+    config = dict(scenario.execution); config.update(execution or {})
     if scenario.provider == "mock" or provider == "mock":
         raise BackendError("the docker backend needs a real provider (no host-network mock wiring yet)")
     if not scenario.image:
@@ -447,7 +589,10 @@ def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provi
             return Attempt(outcome="error", failure_class="environment", wall_seconds=0.0, verify_seconds=0.0,
                            environment_error=f"prepare failed: {prepared.stderr.strip()[:200]}")
     (attempt_dir / "prompt.txt").write_text(scenario.prompt, encoding="utf-8")
-    protected = hash_protected(workspace)
+    protected = protected_evidence(scenario, workspace)
+    attempt_protocol = evidence_lib.execution_protocol(config)
+    attempt_protocol.update(evidence_lib.scenario_identity(scenario, workspace))
+    attempt_protocol["binary_sha256"] = evidence_lib.file_sha(musl)
     mounts = [
         "-v", f"{workspace}:/workspace:{'ro' if scenario.workspace_mode == 'ro' else 'rw'}",
         "-v", f"{musl.parent}:/mnt/orca-bin:ro",
@@ -460,6 +605,13 @@ def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provi
         "exec /mnt/orca-bin/orca exec --mode full-auto --output-format jsonl --cwd /workspace "
         "--api-key \"$DEEPSEEK_API_KEY\" -- \"$(cat /artifacts/prompt.txt)\""
     )
+    if config:
+        options = shlex.join(evidence_lib.exec_options(config))
+        agent_command = agent_command.replace('--api-key', options + ' --api-key', 1)
+    config_env = []
+    for config_key, env_name in (("model", "ORCA_MODEL"), ("reasoning_effort", "ORCA_REASONING_EFFORT"), ("endpoint", "ORCA_BASE_URL")):
+        if config.get(config_key) is not None:
+            config_env += ["-e", f"{env_name}={config[config_key]}"]
     agent_exit: int | None = None
     stdout_path = attempt_dir / "agent.stdout.jsonl"
     stderr_path = attempt_dir / "agent.stderr.txt"
@@ -467,7 +619,7 @@ def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provi
         with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
             process = subprocess.run(
                 ["docker", "run", "--rm", *mounts, "-e", "ORCA_HOME=/home/orca",
-                 "-e", f"DEEPSEEK_API_KEY={key}", "-w", "/workspace", scenario.image,
+                 "-e", f"DEEPSEEK_API_KEY={key}", *config_env, "-w", "/workspace", scenario.image,
                  "bash", "-lc", agent_command],
                 stdout=stdout, stderr=stderr, timeout=scenario.limits.get("wall_seconds", 1800),
             )
@@ -475,7 +627,7 @@ def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provi
     except subprocess.TimeoutExpired:
         agent_exit = None
     wall = time.monotonic() - started
-    events = parse_events(stdout_path)
+    events = parse_events(stdout_path, scenario.evidence)
     verify_started = time.monotonic()
     verify_command = " && ".join(scenario.verify)
     verify_env = {
@@ -494,8 +646,8 @@ def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provi
     verifier_output = verify_process.stdout + verify_process.stderr
     (attempt_dir / "verify.log").write_text(verifier_output, encoding="utf-8")
     verify_seconds = time.monotonic() - verify_started
-    after = hash_protected(workspace)
-    tampered = sorted(path for path, digest in protected.items() if after.get(path) != digest)
+    after = protected_evidence(scenario, workspace)
+    tampered = changed_protected(protected, after)
     outcome = "pass" if verify_process.returncode == 0 and not tampered else "fail"
     evidence = triage.Evidence(outcome=outcome, wall_seconds=wall, wall_limit=scenario.limits.get("wall_seconds", 1800),
                                agent_exit_code=agent_exit, tool_calls=events.get("tool_calls"),
@@ -508,6 +660,7 @@ def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provi
     (attempt_dir / "attempt.json").write_text(json.dumps({
         "outcome": outcome, "failure_class": failure_class, "agent_exit": agent_exit, "tampered": tampered,
         "verifier": [{"command": verify_command, "exit": verify_process.returncode}], "events": events,
+        "compactions": events.get("compactions", []), "provider_observations": events.get("provider_observations", []),
         "wall_seconds": round(wall, 2), "verify_seconds": round(verify_seconds, 2)}, indent=2) + "\n",
         encoding="utf-8")
     return Attempt(outcome=outcome, failure_class=failure_class, wall_seconds=wall, verify_seconds=verify_seconds,
@@ -515,4 +668,7 @@ def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provi
                    tokens_in=events.get("tokens_in"), cost_usd=events.get("cost_usd"),
                    false_completion=(agent_exit == 0 and verify_process.returncode != 0),
                    harness_error=f"protected files were modified: {tampered}" if tampered else None,
+                   protocol=attempt_protocol, discoveries=events.get("discoveries", []),
+                   compactions=events.get("compactions", []), provider_observations=events.get("provider_observations", []),
+                   final_verification="passed" if outcome == "pass" else "failed",
                    artifacts={"workspace": str(workspace), "agent_stdout": str(stdout_path)})

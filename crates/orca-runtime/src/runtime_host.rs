@@ -940,6 +940,7 @@ impl HostedTurnRequest {
             .with_goal_turn_origin(self.goal_turn_origin)
             .with_options(self.options)
             .with_deferred_cancel_terminal(true)
+            .with_completion_evidence(self.envelope == HostedOperationEnvelope::HeadlessSession)
             .with_session_completed_event(
                 self.envelope == HostedOperationEnvelope::Turn
                     && self.emit_session_completed
@@ -23403,7 +23404,7 @@ fn run_headless_session(
         // last-committed message id first, then journal checkpoint +
         // terminal. Nothing is written here so the boundary can never be
         // duplicated or come after the terminal.
-        if let Some(terminal) = terminal {
+        let mut completion = if let Some(terminal) = terminal {
             // Legacy statuses that predate typed terminals keep their own
             // session status: approval-required and verification-failed are
             // distinct outcomes, not generic runtime failures. Typed stops
@@ -23415,28 +23416,32 @@ fn run_headless_session(
                 status,
                 RunStatus::ApprovalRequired | RunStatus::VerificationFailed
             ) {
-                sink.emit(events.session_completed_terminal_with_verification(
+                events.session_completed_terminal_with_verification(
                     terminal,
                     thread.session().session_id(),
                     verification.as_ref(),
                     *writes_applied,
-                ))?;
+                )
             } else {
-                sink.emit(events.session_completed_with_verification(
+                events.session_completed_with_verification(
                     status,
                     thread.session().session_id(),
                     verification.as_ref(),
                     *writes_applied,
-                ))?;
+                )
             }
         } else {
-            sink.emit(events.session_completed_with_verification(
+            events.session_completed_with_verification(
                 status,
                 thread.session().session_id(),
                 verification.as_ref(),
                 *writes_applied,
-            ))?;
-        }
+            )
+        };
+        thread
+            .session()
+            .apply_completion_context(&mut completion.payload);
+        sink.emit(completion)?;
     }
     Ok(outcome)
 }

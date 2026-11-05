@@ -42,6 +42,15 @@ impl SessionRecordSnapshot {
         })
     }
 
+    pub(super) fn from_file(path: &Path, file: File) -> io::Result<Self> {
+        let encoded_bytes = file.metadata()?.len();
+        Ok(Self {
+            file: Arc::new(file),
+            path: path.to_path_buf(),
+            encoded_bytes,
+        })
+    }
+
     pub fn records(&self, images: HydrateImages) -> io::Result<SessionRecords> {
         SessionRecords::from_snapshot(self, None, images)
     }

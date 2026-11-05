@@ -110,13 +110,51 @@ def budget_transitions(rows: list[dict]) -> dict:
 
 
 def cost_per_pass(attempts: list[dict]) -> dict:
-    passes = [a for a in attempts if a.get("outcome") == "pass"]
-    if not passes:
-        return {"passes": 0, "tokens_out_per_pass": None, "wall_seconds_per_pass": None}
-    tokens = [a.get("tokens_out") for a in passes if a.get("tokens_out") is not None]
-    wall = [a.get("wall_seconds") for a in passes if a.get("wall_seconds") is not None]
-    return {
-        "passes": len(passes),
-        "tokens_out_per_pass": (sum(tokens) / len(tokens)) if tokens else None,
-        "wall_seconds_per_pass": (sum(wall) / len(wall)) if wall else None,
-    }
+    passes = sum(a.get("outcome") == "pass" for a in attempts)
+    result = {"passes": passes}
+    for key in ("tokens_in", "tokens_out", "cost_usd", "wall_seconds"):
+        values = [a[key] for a in attempts if isinstance(a.get(key), (int, float)) and math.isfinite(a[key]) and a[key] >= 0]
+        total = sum(values)
+        result[f"{key}_per_pass"] = total / passes if passes and len(values) == len(attempts) else "unknown"
+        result[f"{key}_observed_attempts"] = len(values)
+        if key == "cost_usd":
+            result["observed_cost_usd"] = total
+            result["cost_observed_attempts"] = len(values)
+    result["cost_basis"] = "observed attempt costs (runtime estimates when emitted); includes failures"
+    return result
+
+
+def observation_stats(attempts: list[dict]) -> dict:
+    """Descriptive per-completion-event measurements, including failed attempts."""
+    compactions = [event for attempt in attempts for event in attempt.get("compactions", [])
+                   if event.get("type") == "context.compacted"]
+    providers = [event for attempt in attempts for event in attempt.get("provider_observations", [])]
+
+    def measurements(events, key):
+        values = []
+        for event in events:
+            observation = event.get("observation")
+            value = observation.get(key) if isinstance(observation, dict) else None
+            if not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+                values.append(value)
+        complete = bool(events) and len(values) == len(events)
+        return {"observed_events": len(values), "missing_events": len(events) - len(values),
+                "mean": sum(values) / len(values) if complete else "unknown",
+                "total": sum(values) if complete else "unknown",
+                "observed_mean": sum(values) / len(values) if values else "unknown",
+                "observed_total": sum(values) if values else "unknown"}
+
+    compaction = {"completed_events": len(compactions),
+                  "attempts_with_records": sum("compactions" in attempt for attempt in attempts)}
+    compaction.update({key: measurements(compactions, key) for key in (
+        "before_tokens_est", "after_tokens_est", "elapsed_ms", "estimated_cost_usd", "cache_hit_ratio")})
+    provider = {"completed_events": len(providers),
+                "attempts_with_records": sum("provider_observations" in attempt for attempt in attempts),
+                "first_delta_kind_counts": {}}
+    provider.update({key: measurements(providers, key) for key in ("elapsed_ms", "first_delta_ms")})
+    for event in providers:
+        observation = event.get("observation")
+        kind = observation.get("first_delta_kind") if isinstance(observation, dict) else None
+        kind = kind if isinstance(kind, str) and kind else "unknown"
+        provider["first_delta_kind_counts"][kind] = provider["first_delta_kind_counts"].get(kind, 0) + 1
+    return {"compaction": compaction, "provider": provider}

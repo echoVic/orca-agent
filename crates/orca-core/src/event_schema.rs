@@ -1261,6 +1261,8 @@ impl EventFactory {
     ) -> EventDraft {
         let mut payload = json!({
             "status": status,
+            "resumable": false,
+            "resume_unavailable_reason": if session_id.is_some() { "history_not_confirmed" } else { "history_disabled" },
             "writes_applied": writes_applied
         });
         insert_completion_proof(&mut payload, verification);
@@ -1308,6 +1310,8 @@ impl EventFactory {
         let mut payload = json!({
             "status": status,
             "terminal": terminal,
+            "resumable": false,
+            "resume_unavailable_reason": if session_id.is_some() { "history_not_confirmed" } else { "history_disabled" },
             "writes_applied": writes_applied,
         });
         insert_completion_proof(&mut payload, verification);
@@ -1501,6 +1505,17 @@ mod tests {
         assert_eq!(e.payload["approval_mode"], "read-only");
         assert_eq!(e.payload["provider"], "mock");
         assert!(e.payload["verifier"].is_null());
+    }
+
+    #[test]
+    fn completion_without_history_explicitly_reports_nonresumable() {
+        let mut factory = EventFactory::new("recovery".into());
+        let event = factory.session_completed(RunStatus::Success, None, false);
+        assert_eq!(event.payload["resumable"], false);
+        assert_eq!(
+            event.payload["resume_unavailable_reason"],
+            "history_disabled"
+        );
     }
 
     #[test]

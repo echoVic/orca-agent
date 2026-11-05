@@ -4,6 +4,124 @@ use std::process::{Command, Stdio};
 use serde_json::Value;
 use tempfile::TempDir;
 
+fn assert_observed_workspace_change(observation: &Value, path: &str) {
+    assert_eq!(observation["attribution"], "unknown");
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    {
+        assert_eq!(observation["changed"], true);
+        assert!(
+            observation["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["path"] == path)
+        );
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    {
+        let _ = path;
+        assert!(observation["changed"].is_null());
+        assert_eq!(observation["complete"], false);
+        assert!(
+            observation["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "safe_directory_traversal_unavailable")
+        );
+    }
+}
+
+#[test]
+fn exec_truncated_history_never_advertises_recoverability() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--json",
+            "--provider",
+            "mock",
+            "--yolo",
+            "--save-history",
+            "bash find \"$ORCA_HOME\" -name '*.jsonl' -type f -exec sh -c ': > \"$1\"' sh {} \\;",
+        ])
+        .output()
+        .unwrap();
+    let events = parse_jsonl(&output.stdout);
+    let payload = &find_event(&events, "session.completed")["payload"];
+    assert_eq!(payload["resumable"], false, "{output:?}");
+    assert_eq!(payload["resume_unavailable_reason"], "history_write_failed");
+    assert!(payload["resume"].is_null());
+}
+
+#[test]
+fn exec_completion_exposes_actual_recovery_and_workspace_observation() {
+    for save in [false, true] {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        std::fs::write(cwd.path().join("note.txt"), "before").unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
+        command
+            .env("ORCA_HOME", home.path())
+            .current_dir(cwd.path())
+            .args(["exec", "--json", "--provider", "mock", "--yolo"]);
+        if save {
+            command.arg("--save-history");
+        } else {
+            command.arg("--no-history");
+        }
+        let output = command
+            .arg("edit note.txt :: before => after")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let events = parse_jsonl(&output.stdout);
+        let payload = &find_event(&events, "session.completed")["payload"];
+        assert_eq!(payload["resumable"], save);
+        if save {
+            assert!(payload["resume"]["session_id"].as_str().is_some());
+            assert_eq!(payload["resume"]["command"], "orca exec resume");
+        } else {
+            assert_eq!(payload["resume_unavailable_reason"], "history_disabled");
+            assert!(payload["resume"].is_null());
+        }
+        assert_observed_workspace_change(&payload["workspace_observation"], "note.txt");
+    }
+}
+
+#[test]
+fn exec_observes_shell_write_from_preexisting_dirty_content_without_write_receipt() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    std::fs::write(cwd.path().join("note.txt"), "preexisting dirty content").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--json",
+            "--provider",
+            "mock",
+            "--yolo",
+            "--no-history",
+            "bash printf 'shell content' > note.txt",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let events = parse_jsonl(&output.stdout);
+    let payload = &find_event(&events, "session.completed")["payload"];
+    assert_eq!(payload["writes_applied"], false);
+    assert_observed_workspace_change(&payload["workspace_observation"], "note.txt");
+    assert_eq!(
+        std::fs::read_to_string(cwd.path().join("note.txt")).unwrap(),
+        "shell content"
+    );
+}
+
 #[test]
 fn exec_session_completed_reports_writes_applied_false_without_writes() {
     let workspace = TempDir::new().expect("temporary workspace");
@@ -296,6 +414,18 @@ fn exec_emits_usage_event_when_provider_reports_usage() {
     assert_eq!(usage["payload"]["cache_tokens"], 10);
     assert_eq!(usage["payload"]["total_tokens"], 150);
     assert!(usage["payload"]["estimated_cost_usd"].as_f64().unwrap() > 0.0);
+    let observation = &find_event(&events, "model.response.completed")["payload"]["observation"];
+    let elapsed = observation["elapsed_ms"]
+        .as_u64()
+        .expect("provider elapsed time");
+    let first = observation["first_delta_ms"]
+        .as_u64()
+        .expect("first streamed delta");
+    assert!(first <= elapsed, "{observation}");
+    assert!(matches!(
+        observation["first_delta_kind"].as_str(),
+        Some("reasoning" | "text" | "tool")
+    ));
 }
 
 #[test]
@@ -779,6 +909,57 @@ fn shell_escape(path: &std::path::Path) -> String {
 }
 
 #[test]
+fn exec_blocked_jsonl_resume_uses_advertised_durable_session() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--json",
+            "--save-history",
+            "--provider",
+            "mock",
+            "report_blocker user_decision need a port ? Use port 8080?",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5), "{output:?}");
+    let events = parse_jsonl(&output.stdout);
+    let payload = &find_event(&events, "session.completed")["payload"];
+    assert_eq!(payload["resumable"], true);
+    let session_id = payload["resume"]["session_id"].as_str().unwrap();
+    let resumed = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "resume",
+            session_id,
+            "--json",
+            "--provider",
+            "mock",
+            "Yes, use port 8080",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(resumed.status.code(), Some(0), "{resumed:?}");
+    let events = parse_jsonl(&resumed.stdout);
+    let payload = &find_event(&events, "session.completed")["payload"];
+    assert_eq!(payload["status"], "success");
+    assert_eq!(payload["resume"]["session_id"], session_id);
+    assert!(payload["blockers"].as_array().unwrap().is_empty());
+    let documents = session_documents(home.path());
+    assert!(
+        documents
+            .iter()
+            .flat_map(|(_, records)| records)
+            .any(|record| record.to_string().contains("Yes, use port 8080"))
+    );
+}
+
+#[test]
 fn exec_report_blocker_ends_blocked_with_exit_5() {
     assert_exec_report_blocker(false);
 }
@@ -1069,6 +1250,14 @@ fn exec_subagent_report_blocker_reports_blocked_to_parent() {
         .find(|task| task["type"] == "subagent")
         .expect("child task");
     assert_eq!(child["status"], "blocked", "{tasks:?}");
+    let blockers = terminal["payload"]["blockers"]
+        .as_array()
+        .expect("aggregated blockers");
+    assert_eq!(blockers.len(), 1);
+    assert_eq!(blockers[0]["task_id"], child["id"]);
+    assert_eq!(blockers[0]["kind"], "environment_contradiction");
+    assert_eq!(blockers[0]["summary"], "child cannot write");
+    assert_eq!(blockers[0]["resolution"], "unresolved");
     let parent = tasks
         .iter()
         .find(|task| task["type"] == "main_session")
