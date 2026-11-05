@@ -823,8 +823,14 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             ));
         }
         let error = async_subagent_result_payload(error, Some(completed_task.payload()));
-        let settlement = if matches!(child.status, RunStatus::Blocked { .. }) {
-            task_registry.block_with_usage_and_lease(&task_lease, &agent_id, error, usage)
+        let settlement = if let RunStatus::Blocked { blocker } = &child.status {
+            task_registry.block_with_usage_and_lease(
+                &task_lease,
+                &agent_id,
+                error,
+                blocker.clone(),
+                usage,
+            )
         } else {
             task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, error, usage)
         };

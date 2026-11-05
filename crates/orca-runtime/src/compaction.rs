@@ -1,6 +1,7 @@
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::OutputFormat;
@@ -174,12 +175,67 @@ pub(crate) enum RuntimeCompactionRetryDecision {
     SurfaceError,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeCompactionOutcome {
     trigger: RuntimeCompactionTrigger,
     before_messages: usize,
     after_messages: usize,
     strategy: RuntimeCompactionStrategy,
+    observation: Option<serde_json::Value>,
+}
+
+// Pricing stays in runtime, beside the existing price book; provider keeps the
+// actual response usage even when the summary is not adopted.
+fn compaction_observation_payload(
+    observation: &context::CompactionObservation,
+) -> serde_json::Value {
+    use orca_core::provider_types::Usage;
+    let mut payload =
+        serde_json::to_value(observation).expect("serializable compaction observation");
+    let mut known = None::<Usage>;
+    let mut complete = true;
+    let mut cost = 0.0;
+    for (request, item) in observation.summary_requests.iter().zip(
+        payload["summary_requests"]
+            .as_array_mut()
+            .expect("summary request array"),
+    ) {
+        if !request.summary_cache_hit {
+            if let Some(usage) = request.usage {
+                let total = known.get_or_insert(Usage::default());
+                total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+                total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+                total.cache_tokens = total.cache_tokens.saturating_add(usage.cache_tokens);
+            } else {
+                complete = false;
+            }
+        }
+        let request_cost = if request.summary_cache_hit {
+            Some(0.0)
+        } else {
+            request.usage.map(|usage| {
+                let mut tracker = crate::cost::CostTracker::new(Some(&request.model));
+                tracker.add_usage(usage).estimated_cost_usd
+            })
+        };
+        if let Some(request_cost) = request_cost {
+            cost += request_cost;
+        }
+        item["estimated_cost_usd"] = serde_json::json!(request_cost);
+        item["cache_hit_ratio"] = serde_json::json!(request.usage.and_then(|usage| {
+            (usage.input_tokens > 0).then(|| usage.cache_tokens as f64 / usage.input_tokens as f64)
+        }));
+    }
+    payload["summary_usage"] = serde_json::json!(known);
+    payload["summary_usage_complete"] = serde_json::json!(complete);
+    payload["estimated_cost_usd"] = serde_json::json!(complete.then_some(cost));
+    // A partial set of requests is not an aggregate service cache hit ratio.
+    payload["cache_hit_ratio"] = serde_json::json!(
+        known
+            .filter(|usage| complete && usage.input_tokens > 0)
+            .map(|usage| usage.cache_tokens as f64 / usage.input_tokens as f64)
+    );
+    payload
 }
 
 impl RuntimeCompactionOutcome {
@@ -472,6 +528,7 @@ impl RuntimeCompactionTask {
             before_messages: self.before_messages(),
             after_messages,
             strategy: RuntimeCompactionStrategy::from_compaction_kind(kind),
+            observation: None,
         }
     }
 
@@ -483,6 +540,7 @@ impl RuntimeCompactionTask {
             before_messages: self.before_messages(),
             after_messages: self.before_messages(),
             strategy: RuntimeCompactionStrategy::None,
+            observation: None,
         }
     }
 
@@ -492,6 +550,54 @@ impl RuntimeCompactionTask {
 
     pub(crate) fn before_messages(&self) -> usize {
         self.before_messages
+    }
+}
+
+/// Own the deadline for the whole compaction, including hooks and every
+/// hierarchical summary request. Cancelling this token never cancels the
+/// operation token; manual compaction keeps using its original token directly.
+struct CompactionDeadlineCancellation {
+    token: CancelToken,
+    stop: mpsc::Sender<()>,
+    watcher: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CompactionDeadlineCancellation {
+    fn new(source: Option<&CancelToken>, deadline: Instant) -> Self {
+        let token = CancelToken::new();
+        if Instant::now() >= deadline || source.is_some_and(CancelToken::is_cancelled) {
+            token.cancel();
+        }
+        let source = source.cloned();
+        let watched_token = token.clone();
+        let (stop, stopped) = mpsc::channel();
+        let watcher = std::thread::spawn(move || {
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || source.as_ref().is_some_and(CancelToken::is_cancelled) {
+                    watched_token.cancel();
+                    return;
+                }
+                match stopped.recv_timeout(remaining.min(Duration::from_millis(5))) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+        });
+        Self {
+            token,
+            stop,
+            watcher: Some(watcher),
+        }
+    }
+}
+
+impl Drop for CompactionDeadlineCancellation {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(watcher) = self.watcher.take() {
+            let _ = watcher.join();
+        }
     }
 }
 
@@ -505,6 +611,8 @@ pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
     sink: &'a mut EventSink<W>,
     history_writer: Option<&'a mut SessionWriter>,
     cancel: Option<&'a CancelToken>,
+    deadline: Option<Instant>,
+    deadline_cancel: Option<CompactionDeadlineCancellation>,
 }
 
 impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
@@ -528,12 +636,46 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             sink,
             history_writer,
             cancel: None,
+            deadline: None,
+            deadline_cancel: None,
         }
     }
 
     pub(crate) fn with_cancel(mut self, cancel: &'a CancelToken) -> Self {
         self.cancel = Some(cancel);
+        self.deadline_cancel = None;
         self
+    }
+
+    pub(crate) fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
+        self.deadline_cancel = None;
+        self
+    }
+
+    fn start_deadline_cancellation(&mut self) {
+        if self.deadline_cancel.is_none() {
+            self.deadline_cancel = self
+                .deadline
+                .map(|deadline| CompactionDeadlineCancellation::new(self.cancel, deadline));
+        }
+    }
+
+    fn cancel_token(&self) -> Option<&CancelToken> {
+        self.deadline_cancel
+            .as_ref()
+            .map(|scope| {
+                // Close the watcher scheduling gap between summary requests.
+                if self.cancel.is_some_and(CancelToken::is_cancelled)
+                    || self
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    scope.token.cancel();
+                }
+                &scope.token
+            })
+            .or(self.cancel)
     }
 
     pub(crate) fn compact_if_needed(
@@ -623,6 +765,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         conversation: &mut Conversation,
         trigger: RuntimeCompactionTrigger,
     ) -> io::Result<RuntimeCompactionAdoption> {
+        self.start_deadline_cancellation();
         let before_messages = conversation.messages.len();
         let budget_hook_context = HookContext {
             cwd: &self.turn_context.cwd.display().to_string(),
@@ -633,7 +776,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             after_messages: None,
             usage: None,
         };
-        let budget_hook = if let Some(cancel) = self.cancel {
+        let budget_hook = if let Some(cancel) = self.cancel_token() {
             self.hooks
                 .run_with_cancel(HookEvent::OnBudgetWarning, budget_hook_context, cancel)
         } else {
@@ -680,6 +823,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         conversation: &mut Conversation,
         trigger: RuntimeCompactionTrigger,
     ) -> io::Result<(RuntimeCompactionOutcome, RuntimeCompactionAdoption)> {
+        self.start_deadline_cancellation();
         let before_messages = conversation.messages.len();
         let task = RuntimeCompactionTask::start(trigger, before_messages);
         let before = context::measure_prompt(conversation, self.provider_config);
@@ -703,7 +847,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         } else {
             self.context_config
         };
-        let compaction = if let Some(cancel) = self.cancel {
+        let mut compaction = if let Some(cancel) = self.cancel_token() {
             context::compact_with_summary_cancellable(
                 self.provider,
                 conversation,
@@ -722,8 +866,15 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         let after = context::measure_prompt(&compaction.conversation, self.provider_config);
         if after.estimated >= before.estimated {
             // Nothing shrank: keep the history as it was, and persist nothing.
+            compaction.observation.measure_retained_history(
+                conversation,
+                conversation,
+                self.provider_config,
+            );
+            let mut outcome = task.unchanged();
+            outcome.observation = Some(compaction_observation_payload(&compaction.observation));
             return Ok((
-                task.unchanged(),
+                outcome,
                 RuntimeCompactionAdoption {
                     adopted: false,
                     prompt_tokens: before.tokens,
@@ -731,7 +882,8 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             ));
         }
         let after_messages = compaction.conversation.messages.len();
-        let outcome = task.finish(after_messages, &compaction.kind);
+        let mut outcome = task.finish(after_messages, &compaction.kind);
+        outcome.observation = Some(compaction_observation_payload(&compaction.observation));
         let details = outcome.details();
         if outcome.should_persist_summary_state(self.turn_context.emit_deltas)
             && let Some(writer) = self.history_writer.as_deref_mut()
@@ -766,14 +918,18 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
     fn emit_compaction_completed(&mut self, outcome: &RuntimeCompactionOutcome) -> io::Result<()> {
         if self.turn_context.emit_deltas {
             let details = outcome.details();
-            self.sink.emit(self.events.context_compacted(
+            let mut draft = self.events.context_compacted(
                 details.reason.as_str(),
                 details.strategy.as_str(),
                 details.before_messages,
                 details.after_messages,
                 details.collapsed_messages,
                 details.status_text,
-            ))?;
+            );
+            if let Some(observation) = &outcome.observation {
+                draft.payload["observation"] = observation.clone();
+            }
+            self.sink.emit(draft)?;
         }
         Ok(())
     }
@@ -793,7 +949,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             after_messages,
             usage: None,
         };
-        let result = if let Some(cancel) = self.cancel {
+        let result = if let Some(cancel) = self.cancel_token() {
             self.hooks.run_with_cancel(event, context, cancel)
         } else {
             self.hooks.run(event, context)
@@ -814,6 +970,124 @@ mod tests {
     use orca_core::config::ReasoningEffort;
     use orca_core::hook_types::HookConfig;
     use std::fs;
+
+    #[test]
+    fn compaction_deadline_cancellation_propagates_source_without_cancelling_it_on_expiry() {
+        let source = CancelToken::new();
+        let scope = CompactionDeadlineCancellation::new(
+            Some(&source),
+            Instant::now() + Duration::from_secs(10),
+        );
+        source.cancel();
+        let timeout = Instant::now() + Duration::from_secs(1);
+        while !scope.token.is_cancelled() {
+            assert!(
+                Instant::now() < timeout,
+                "source cancellation was not propagated"
+            );
+            std::thread::yield_now();
+        }
+        drop(scope);
+        let fresh_source = CancelToken::new();
+        let expired = CompactionDeadlineCancellation::new(Some(&fresh_source), Instant::now());
+        assert!(expired.token.is_cancelled());
+        drop(expired);
+        assert!(
+            !fresh_source.is_cancelled(),
+            "deadline must not cancel the operation token"
+        );
+    }
+
+    #[test]
+    fn compaction_deadline_cancellation_drop_interrupts_long_wait() {
+        let started = Instant::now();
+        let scope = CompactionDeadlineCancellation::new(None, started + Duration::from_secs(60));
+        drop(scope);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "scope teardown waited for the compaction deadline"
+        );
+    }
+
+    #[test]
+    fn compaction_observation_aggregates_actual_usage_and_prices_auxiliary_model() {
+        use orca_core::provider_types::Usage;
+        let usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 25,
+            cache_tokens: 768,
+        };
+        let config = bare_provider_config();
+        let mut conversation = Conversation::new();
+        conversation.add_system("system".to_string());
+        conversation.add_user("evidence".to_string());
+        conversation.record_usage_anchor(100_000, 50_000, conversation.messages.len());
+        let mut observation = context::compact_with_summary(
+            orca_core::config::ProviderKind::Mock,
+            &conversation,
+            &context::ContextConfig::default(),
+            &config,
+        )
+        .observation;
+        observation.summary_requests = vec![
+            context::SummaryRequestObservation {
+                purpose: "delta".to_string(),
+                provider: "deepseek".to_string(),
+                model: orca_core::model::auxiliary_model().to_string(),
+                outcome: "succeeded",
+                summary_cache_hit: false,
+                usage: Some(usage),
+            },
+            context::SummaryRequestObservation {
+                purpose: "rebuild_baseline".to_string(),
+                provider: "deepseek".to_string(),
+                model: orca_core::model::auxiliary_model().to_string(),
+                outcome: "cancelled",
+                summary_cache_hit: false,
+                usage: Some(usage),
+            },
+            context::SummaryRequestObservation {
+                purpose: "delta".to_string(),
+                provider: "deepseek".to_string(),
+                model: orca_core::model::auxiliary_model().to_string(),
+                outcome: "cache_hit",
+                summary_cache_hit: true,
+                usage: None,
+            },
+        ];
+        let payload = compaction_observation_payload(&observation);
+        assert_eq!(
+            payload["before_tokens_est"],
+            context::wire_equivalent_tokens(&conversation, &config)
+        );
+        assert_ne!(payload["before_tokens_est"], 100_000);
+        assert_eq!(payload["summary_usage"]["input_tokens"], 2000);
+        assert_eq!(payload["summary_usage"]["output_tokens"], 50);
+        assert_eq!(payload["summary_usage"]["cache_tokens"], 1536);
+        assert_eq!(payload["summary_usage_complete"], true);
+        assert_eq!(payload["cache_hit_ratio"], 0.768);
+        let mut tracker = crate::cost::CostTracker::new(Some(orca_core::model::auxiliary_model()));
+        let expected = tracker.add_usage(usage).estimated_cost_usd * 2.0;
+        assert_eq!(payload["estimated_cost_usd"], expected);
+        assert_eq!(payload["summary_requests"][2]["estimated_cost_usd"], 0.0);
+        assert!(payload["summary_requests"][2]["cache_hit_ratio"].is_null());
+        observation.summary_requests[1].usage = None;
+        let payload = compaction_observation_payload(&observation);
+        assert_eq!(payload["summary_usage"]["input_tokens"], 1000);
+        assert_eq!(payload["summary_usage_complete"], false);
+        assert!(payload["estimated_cost_usd"].is_null());
+        assert!(payload["cache_hit_ratio"].is_null());
+        assert!(payload["summary_requests"][1]["estimated_cost_usd"].is_null());
+        observation.summary_requests[0].usage = Some(Usage::default());
+        observation.summary_requests.truncate(1);
+        let payload = compaction_observation_payload(&observation);
+        assert_eq!(payload["summary_usage_complete"], true);
+        assert_eq!(payload["estimated_cost_usd"], 0.0);
+        assert!(
+            payload["cache_hit_ratio"].is_null(),
+            "zero input has no ratio"
+        );
+    }
 
     struct CompactionLifecycleAuditWriter {
         output: Vec<u8>,
@@ -1014,6 +1288,7 @@ mod tests {
             );
         }
         let before_messages = conversation.messages.len();
+        let before_tokens_est = context::wire_equivalent_tokens(&conversation, &provider_config);
 
         RuntimeCompactionStep::new(
             orca_core::config::ProviderKind::Mock,
@@ -1045,6 +1320,23 @@ mod tests {
         assert_eq!(emitted[0]["payload"]["reason"], "prompt_too_long_recovery");
         assert_eq!(emitted[0]["payload"]["before_messages"], before_messages);
         let event = &emitted[1];
+        let observation = &event["payload"]["observation"];
+        assert!(
+            observation.is_object(),
+            "compaction must publish structured observation"
+        );
+        assert_eq!(observation["before_tokens_est"], before_tokens_est);
+        assert_eq!(
+            observation["after_tokens_est"],
+            context::wire_equivalent_tokens(&conversation, &provider_config)
+        );
+        assert!(observation["elapsed_ms"].is_u64());
+        assert!(observation["summary_requests"].is_array());
+        assert!(
+            observation["cache_hit_ratio"].is_null(),
+            "missing service usage is unknown, never a local prefix estimate"
+        );
+        assert!(observation["prefix_reuse_estimate"].is_object());
 
         assert_eq!(event["payload"]["before_messages"], before_messages);
         assert_eq!(
@@ -1535,6 +1827,23 @@ mod tests {
             assert_eq!(payload["before_messages"], 2);
             assert_eq!(payload["after_messages"], 2);
             assert_eq!(payload["collapsed_messages"], 0);
+            let observation = &payload["observation"];
+            assert_eq!(
+                observation["before_tokens_est"],
+                observation["after_tokens_est"]
+            );
+            assert_eq!(
+                observation["after_tokens_est"],
+                context::wire_equivalent_tokens(&conversation, &provider_config)
+            );
+            assert_eq!(observation["summary_requests"], serde_json::json!([]));
+            assert!(observation["summary_usage"].is_null());
+            assert!(observation["cache_hit_ratio"].is_null());
+            assert_eq!(observation["estimated_cost_usd"], 0.0);
+            assert_eq!(
+                observation["prefix_reuse_estimate"]["unchanged_prefix_messages"],
+                2
+            );
         }
     }
 

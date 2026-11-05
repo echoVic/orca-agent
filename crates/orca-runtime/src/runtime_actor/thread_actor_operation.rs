@@ -8180,6 +8180,42 @@ impl ThreadActor {
                         acknowledgement,
                     );
                 }
+                // A duplicate can arrive after the queued resume has installed its successor.
+                // New control on that successor must take the current-generation path below.
+                if !active.generation.cancel.is_cancelled() && operation.pending_control.is_none() {
+                    let acknowledgement = operation
+                        .generations
+                        .last()
+                        .filter(|generation| {
+                            generation.fence == fence
+                                && generation.attempt
+                                    == surface::GenerationAttempt::RecoveryReplacement
+                                && generation.phase == surface::GenerationPhase::Started
+                                && generation.started_witness.is_some()
+                        })
+                        .and_then(|generation| generation.predecessor.as_ref())
+                        .and_then(|predecessor| {
+                            self.resident_surface
+                                .coordinator
+                                .state()
+                                .control_intent_acknowledgement(
+                                    &operation.operation_id,
+                                    &surface::PendingControlIntent::ResumeAfterInterruptedStop {
+                                        generation_fence: predecessor.clone(),
+                                    },
+                                )
+                        });
+                    if let Some(acknowledgement) = acknowledgement {
+                        return Self::replayed_jsonl_turn_control(
+                            request_id,
+                            operation.operation_id,
+                            legacy_turn_id,
+                            &action,
+                            surface::JsonlResolvedTurnControlStatus::Resumed,
+                            acknowledgement,
+                        );
+                    }
+                }
                 if !active.generation.cancel.is_cancelled()
                     || !matches!(
                         operation.pending_control,
@@ -9216,5 +9252,431 @@ impl ThreadActor {
         active.surface_terminalization.is_some()
             || active.surface_execution_failure.is_some()
             || active.generation.cancel.is_cancelled()
+    }
+}
+
+#[cfg(test)]
+mod jsonl_resume_generation_regression_tests {
+    use super::*;
+    use std::sync::mpsc::{Receiver, Sender};
+
+    const GATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    struct GatedJsonlResumeExecutor {
+        entered: Sender<(GenerationFence, bool, CancelToken)>,
+        releases: Mutex<Vec<Receiver<()>>>,
+    }
+
+    impl ThreadOperationExecutor for GatedJsonlResumeExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let index = generation.fence().generation_id().as_u64() as usize;
+            let releases = self
+                .releases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let release = releases.get(index).ok_or_else(|| {
+                io::Error::other("duplicate resume started an unexpected generation")
+            })?;
+            self.entered
+                .send((
+                    generation.fence(),
+                    generation.resumes_existing_turn(),
+                    cancel.clone(),
+                ))
+                .map_err(|_| io::Error::other("resume regression entry receiver closed"))?;
+            release.recv_timeout(GATE_TIMEOUT).map_err(|_| {
+                io::Error::other("resume regression generation gate was not released")
+            })?;
+            // The first generation cannot observe cancellation until resume is committed.
+            let status = if cancel.is_cancelled() {
+                RunStatus::Cancelled
+            } else {
+                RunStatus::Success
+            };
+            thread.lifecycle_mut().finish_task(status.clone());
+            Ok(status.into())
+        }
+    }
+
+    struct ReleaseGenerationGates(Vec<Sender<()>>);
+
+    impl Drop for ReleaseGenerationGates {
+        fn drop(&mut self) {
+            // Unblock both executors before RuntimeHost's Drop joins them on assertion failure.
+            for release in &self.0 {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    fn request_id() -> surface::SurfaceRequestId {
+        surface::SurfaceRequestId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap()
+    }
+
+    fn attach_jsonl(handle: &surface::RuntimeSurfaceHandle) -> surface::FreshSurfaceAttachment {
+        match handle.attach_fresh(surface::FreshAttachRequest {
+            request_id: request_id(),
+            role: surface::SurfaceAttachmentRole::Jsonl,
+            requested_capabilities: BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+            ]),
+            interaction_capabilities: BTreeSet::new(),
+        }) {
+            surface::AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("attach JSONL generation regression client"),
+        }
+    }
+
+    fn committed<T>(reply: surface::MutationReply<T>) -> T {
+        match reply {
+            surface::MutationReply::Committed { value, .. } => value,
+            _ => panic!("JSONL generation regression mutation did not commit"),
+        }
+    }
+
+    fn resolved_control(
+        result: surface::JsonlTurnControlResult,
+    ) -> (
+        surface::CommittedMutation,
+        surface::JsonlTurnControlledOutput,
+    ) {
+        match result {
+            surface::JsonlTurnControlResult::Resolved {
+                mutation: surface::MutationReply::Committed { mutation, value },
+            } => (mutation, value),
+            _ => panic!("JSONL generation regression control did not resolve and commit"),
+        }
+    }
+
+    #[test]
+    fn jsonl_duplicate_resume_after_actual_generation_restart_replays_committed_ack() {
+        run_gated_jsonl_resume(false);
+    }
+
+    #[test]
+    fn jsonl_current_generation_interrupt_resume_is_not_replayed_from_predecessor() {
+        run_gated_jsonl_resume(true);
+    }
+
+    fn run_gated_jsonl_resume(interrupt_successor: bool) {
+        let _ = crate::history::claim_isolated_test_orca_home_if_unset();
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let generation_count = if interrupt_successor { 3 } else { 2 };
+        let (release_senders, release_receivers): (Vec<_>, Vec<_>) =
+            (0..generation_count).map(|_| mpsc::channel()).unzip();
+        let host = RuntimeHost::start_with_executor(Arc::new(GatedJsonlResumeExecutor {
+            entered: entered_tx,
+            releases: Mutex::new(release_receivers),
+        }))
+        .expect("start gated JSONL resume host");
+        let gates = ReleaseGenerationGates(release_senders);
+        let thread = host
+            .start_thread(
+                RunConfig {
+                    cwd: Some(cwd.path().to_path_buf()),
+                    output_format: orca_core::config::OutputFormat::Jsonl,
+                    history_mode: HistoryMode::Record,
+                    tools: orca_core::config::ToolConfig {
+                        shell_enforcement_decision: Some(
+                            orca_core::capability::SandboxEnforcementDecision::new(
+                                orca_core::capability::EnforcementState::Enforced,
+                                "test-sandbox",
+                                Vec::new(),
+                            ),
+                        ),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                "duplicate JSONL resume across actual generation restart",
+            )
+            .expect("start recorded JSONL resume thread");
+        let connection_id =
+            surface::SurfaceConnectionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let handle = thread
+            .jsonl_surface_for_connection(connection_id)
+            .expect("bind JSONL connection");
+        let attachment = attach_jsonl(&handle);
+        let snapshot = &attachment.baseline.snapshot;
+        let legacy_turn_id =
+            surface::LegacyTurnId(surface::DisplayText::new(TurnId::new().to_string()));
+        let reserved = committed(
+            attachment
+                .client
+                .reserve_operation(
+                    request_id(),
+                    surface::OperationRequestIntent {
+                        correlation: surface::OperationIngressCorrelation::JsonlThreadTurn {
+                            rpc_id_digest: surface::Sha256Digest::new(
+                                Sha256::digest(b"gated-jsonl-resume").into(),
+                            ),
+                            legacy_turn_id: legacy_turn_id.clone(),
+                        },
+                        kind: surface::OperationKind::UserTurn,
+                        input: Some(surface::SurfaceInputRequest {
+                            blocks: surface::NonEmptyVec::try_new(vec![
+                                surface::SurfaceInputRequestBlock::Text {
+                                    text: surface::DisplayText::new(
+                                        "resume before cancellation checkpoint",
+                                    ),
+                                },
+                            ])
+                            .unwrap(),
+                        }),
+                        replayability: surface::ReplayabilityRequest::CaptureReplayableCapsule,
+                        settings_preparation: surface::OperationSettingsPreparation::UseCurrent {
+                            expected_settings_revision: snapshot.settings.thread_revision,
+                            expected_policy_epoch: snapshot.settings.effective.policy_epoch,
+                        },
+                    },
+                )
+                .expect("reserve gated JSONL turn"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        assert!(matches!(
+            committed(
+                attachment
+                    .client
+                    .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id,)
+                    .expect("admit gated JSONL turn")
+            ),
+            surface::AdmissionOutput::Admitted { .. }
+        ));
+        let (first_runtime_fence, first_is_resume, first_cancel) = entered_rx
+            .recv_timeout(GATE_TIMEOUT)
+            .expect("first generation entry");
+        assert!(!first_is_resume);
+        assert!(!first_cancel.is_cancelled());
+        let initial = attach_jsonl(&handle).baseline.snapshot;
+        let initial_operation = initial.foreground_operation.as_ref().unwrap();
+        assert_eq!(initial_operation.operation_id, operation_id);
+        assert_eq!(initial_operation.generations.len(), 1);
+        let first_surface_fence = initial_operation.generations[0].fence.clone();
+        let control = |action| {
+            host.handle().control_jsonl_turn(
+                attachment.client.clone(),
+                request_id(),
+                Some(attachment.client.thread_id().clone()),
+                legacy_turn_id.clone(),
+                action,
+            )
+        };
+        let (_, interrupt) = resolved_control(
+            control(surface::JsonlTurnControlAction::Interrupt)
+                .expect("interrupt first generation before checkpoint"),
+        );
+        assert_eq!(
+            interrupt.echo.status,
+            surface::JsonlResolvedTurnControlStatus::Interrupted
+        );
+        assert!(first_cancel.is_cancelled());
+        let (_, first_resume) = resolved_control(
+            control(surface::JsonlTurnControlAction::Resume)
+                .expect("commit first resume before cancellation checkpoint"),
+        );
+        assert_eq!(
+            first_resume.echo.status,
+            surface::JsonlResolvedTurnControlStatus::Resumed
+        );
+        let queued = attach_jsonl(&handle).baseline.snapshot;
+        let queued_operation = queued.foreground_operation.as_ref().unwrap();
+        assert_eq!(queued_operation.generations.len(), 1);
+        assert!(matches!(&queued_operation.pending_control,
+            Some(surface::PendingControlIntent::ResumeAfterInterruptedStop { generation_fence })
+                if generation_fence == &first_surface_fence));
+
+        gates.0[0]
+            .send(())
+            .expect("release first cancellation checkpoint");
+        let (second_runtime_fence, second_is_resume, second_cancel) = entered_rx
+            .recv_timeout(GATE_TIMEOUT)
+            .expect("actual successor generation entry");
+        assert_eq!(second_runtime_fence, first_runtime_fence.next());
+        assert!(second_is_resume);
+        assert!(!second_cancel.is_cancelled());
+        let restarted = attach_jsonl(&handle).baseline.snapshot;
+        let restarted_operation = restarted.foreground_operation.as_ref().unwrap();
+        assert_eq!(restarted_operation.operation_id, operation_id);
+        assert_eq!(restarted_operation.generations.len(), 2);
+        assert_eq!(
+            restarted_operation.generations[0].phase,
+            surface::GenerationPhase::Stopped
+        );
+        let successor = &restarted_operation.generations[1];
+        assert_eq!(successor.predecessor.as_ref(), Some(&first_surface_fence));
+        assert_eq!(
+            successor.attempt,
+            surface::GenerationAttempt::RecoveryReplacement
+        );
+        assert_eq!(successor.phase, surface::GenerationPhase::Started);
+        assert_eq!(
+            successor.logical_turn_id,
+            restarted_operation.generations[0].logical_turn_id
+        );
+        assert!(successor.started_witness.is_some());
+        assert!(restarted_operation.pending_control.is_none());
+
+        if interrupt_successor {
+            // A new interrupt on the successor must create a new resume intent, not replay generation 0.
+            let (new_interrupt_mutation, new_interrupt) = resolved_control(
+                control(surface::JsonlTurnControlAction::Interrupt)
+                    .expect("interrupt actual successor"),
+            );
+            assert_eq!(
+                new_interrupt_mutation.disposition,
+                surface::MutationDisposition::Accepted
+            );
+            assert_eq!(
+                new_interrupt.echo.status,
+                surface::JsonlResolvedTurnControlStatus::Interrupted
+            );
+            assert!(second_cancel.is_cancelled());
+            let interrupted = attach_jsonl(&handle).baseline.snapshot;
+            assert!(
+                matches!(&interrupted.foreground_operation.as_ref().unwrap().pending_control,
+                Some(surface::PendingControlIntent::Interrupt { generation_fence })
+                    if generation_fence == &successor.fence)
+            );
+            let (new_resume_mutation, new_resume) = resolved_control(
+                control(surface::JsonlTurnControlAction::Resume)
+                    .expect("resume newly interrupted successor"),
+            );
+            assert_eq!(
+                new_resume_mutation.disposition,
+                surface::MutationDisposition::Accepted
+            );
+            assert_eq!(new_resume.operation_id, operation_id);
+            assert_eq!(
+                new_resume.echo.status,
+                surface::JsonlResolvedTurnControlStatus::Resumed
+            );
+            assert_ne!(new_resume.committed_cursor, first_resume.committed_cursor);
+            let newly_queued = attach_jsonl(&handle).baseline.snapshot;
+            let newly_queued_operation = newly_queued.foreground_operation.as_ref().unwrap();
+            assert_eq!(newly_queued_operation.generations.len(), 2);
+            assert_eq!(newly_queued.cursor, new_resume.committed_cursor);
+            assert!(matches!(&newly_queued_operation.pending_control,
+                Some(surface::PendingControlIntent::ResumeAfterInterruptedStop { generation_fence })
+                    if generation_fence == &successor.fence));
+            let (current_replay_mutation, current_replay) = resolved_control(
+                control(surface::JsonlTurnControlAction::Resume)
+                    .expect("replay current queued resume"),
+            );
+            assert_eq!(
+                current_replay_mutation.disposition,
+                surface::MutationDisposition::AlreadyApplied
+            );
+            assert_eq!(current_replay.committed_cursor, new_resume.committed_cursor);
+            assert_eq!(
+                attach_jsonl(&handle).baseline.snapshot.cursor,
+                newly_queued.cursor
+            );
+
+            gates.0[1]
+                .send(())
+                .expect("release successor cancellation checkpoint");
+            let (third_runtime_fence, third_is_resume, third_cancel) = entered_rx
+                .recv_timeout(GATE_TIMEOUT)
+                .expect("second actual generation restart");
+            assert_eq!(third_runtime_fence, second_runtime_fence.next());
+            assert!(third_is_resume);
+            assert!(!third_cancel.is_cancelled());
+            let restarted_again = attach_jsonl(&handle).baseline.snapshot;
+            let restarted_again_operation = restarted_again.foreground_operation.as_ref().unwrap();
+            assert_eq!(restarted_again_operation.operation_id, operation_id);
+            assert_eq!(restarted_again_operation.generations.len(), 3);
+            let third_generation = &restarted_again_operation.generations[2];
+            assert_eq!(
+                third_generation.predecessor.as_ref(),
+                Some(&successor.fence)
+            );
+            assert_eq!(
+                third_generation.attempt,
+                surface::GenerationAttempt::RecoveryReplacement
+            );
+            assert_eq!(third_generation.phase, surface::GenerationPhase::Started);
+            assert_eq!(third_generation.logical_turn_id, successor.logical_turn_id);
+            assert!(restarted_again_operation.pending_control.is_none());
+            let (latest_replay_mutation, latest_replay) = resolved_control(
+                control(surface::JsonlTurnControlAction::Resume)
+                    .expect("replay immediate predecessor after second restart"),
+            );
+            assert_eq!(
+                latest_replay_mutation.disposition,
+                surface::MutationDisposition::AlreadyApplied
+            );
+            assert_eq!(latest_replay.committed_cursor, new_resume.committed_cursor);
+            assert_ne!(
+                latest_replay.committed_cursor,
+                first_resume.committed_cursor
+            );
+            let after_latest_replay = attach_jsonl(&handle).baseline.snapshot;
+            assert_eq!(after_latest_replay.cursor, restarted_again.cursor);
+            assert_eq!(
+                after_latest_replay.foreground_operation.as_ref(),
+                Some(restarted_again_operation)
+            );
+            assert!(!third_cancel.is_cancelled());
+        } else {
+            // Sending only after actual successor entry forces the ordering seen on Windows ARM64.
+            let (duplicate_mutation, duplicate) = resolved_control(control(surface::JsonlTurnControlAction::Resume)
+                .expect("duplicate resume after actual generation restart must replay its committed acknowledgement"));
+            assert_eq!(duplicate.operation_id, operation_id);
+            assert_eq!(duplicate.echo, first_resume.echo);
+            assert_eq!(duplicate.committed_cursor, first_resume.committed_cursor);
+            assert_eq!(
+                duplicate_mutation.disposition,
+                surface::MutationDisposition::AlreadyApplied
+            );
+            let after_duplicate = attach_jsonl(&handle).baseline.snapshot;
+            assert_eq!(after_duplicate.cursor, restarted.cursor);
+            assert_eq!(
+                after_duplicate.foreground_operation.as_ref(),
+                Some(restarted_operation)
+            );
+            assert!(!second_cancel.is_cancelled());
+        }
+
+        gates.0[generation_count - 1]
+            .send(())
+            .expect("release successful successor");
+        let deadline = Instant::now() + GATE_TIMEOUT;
+        let terminal_snapshot = loop {
+            let current = attach_jsonl(&handle).baseline.snapshot;
+            if current.operation_history.iter().any(|operation| {
+                operation.operation_id == operation_id && operation.terminal.is_some()
+            }) {
+                break current;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "resumed operation did not reach terminal history"
+            );
+            std::thread::yield_now();
+        };
+        let terminals = terminal_snapshot
+            .operation_history
+            .iter()
+            .filter(|operation| operation.operation_id == operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].generations.len(), generation_count);
+        assert!(matches!(
+            &terminals[0].terminal.as_ref().unwrap().terminal,
+            surface::OperationTerminal::Succeeded { .. }
+        ));
+        host.shutdown()
+            .expect("shutdown JSONL resume regression host");
     }
 }

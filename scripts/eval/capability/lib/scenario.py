@@ -53,6 +53,11 @@ class Scenario:
     command: str = "exec"
     script: str = "workflow.js"
     path: Path | None = None
+    execution: dict = field(default_factory=dict)
+    evaluation: dict = field(default_factory=dict)
+    evidence: list[dict] = field(default_factory=list)
+    readonly_inputs: list[str] = field(default_factory=list)
+    verifier_root: Path | None = None
 
     @property
     def difficulty_value(self) -> float:
@@ -105,6 +110,33 @@ def load(path: Path) -> Scenario:
         if not prepare_path.is_file():
             raise ScenarioError(f"{path}: prepare script not found: {prepare_path}")
         prepare = prepare_path
+    execution = dict(raw.get("execution") or {})
+    from .evidence import validate_execution
+    try:
+        validate_execution(execution)
+    except ValueError as error:
+        raise ScenarioError(f"{path}: {error}") from error
+    evaluation = dict(raw.get("evaluation") or {})
+    if evaluation.get("split", "unknown") not in {"holdout", "tuning", "unknown"}:
+        raise ScenarioError(f"{path}: split must be holdout, tuning or unknown")
+    constraints = list(raw.get("evidence") or [])
+    seen_evidence = set()
+    for constraint in constraints:
+        if not isinstance(constraint, dict):
+            raise ScenarioError(f"{path}: evidence must be an object")
+        if not all(isinstance(constraint.get(key), str) and constraint[key] for key in ("id", "source", "contains")):
+            raise ScenarioError(f"{path}: evidence needs id, source and contains")
+        if constraint["id"] in seen_evidence:
+            raise ScenarioError(f"{path}: duplicate evidence id {constraint['id']}")
+        seen_evidence.add(constraint["id"])
+    readonly_inputs = raw.get("readonly_inputs", [])
+    if not isinstance(readonly_inputs, list) or any(not isinstance(p, str) or not p or Path(p).is_absolute() or ".." in Path(p).parts for p in readonly_inputs):
+        raise ScenarioError(f"{path}: readonly_inputs must be workspace-relative paths")
+    verifier_root = (root / raw["verifier_root"]).resolve() if raw.get("verifier_root") else None
+    if verifier_root is not None and (not verifier_root.is_dir() or verifier_root.is_relative_to(fixture)):
+        raise ScenarioError(f"{path}: verifier_root must be a directory outside the fixture")
+    if not raw["verify"] or any(not isinstance(c, str) or not c.strip() for c in raw["verify"]):
+        raise ScenarioError(f"{path}: verify must contain nonempty commands")
     return Scenario(
         id=raw["id"],
         axis=raw["axis"],
@@ -126,15 +158,20 @@ def load(path: Path) -> Scenario:
         workspace_mode=str(raw.get("workspace_mode") or "rw"),
         command=command,
         script=script,
-        path=path,
+        path=path, execution=execution, evaluation=evaluation, evidence=constraints,
+        readonly_inputs=list(readonly_inputs), verifier_root=verifier_root,
     )
 
 
 def discover(root: Path) -> list[Scenario]:
     """Every `scenario.json` under `root`, sorted by axis and rung."""
-    found = []
+    found, ids = [], set()
     for path in sorted(Path(root).rglob("scenario.json")):
-        found.append(load(path))
+        item = load(path)
+        if item.id in ids:
+            raise ScenarioError(f"{path}: duplicate scenario id {item.id}")
+        ids.add(item.id)
+        found.append(item)
     return sorted(found, key=lambda s: (s.axis, s.rung, s.id))
 
 

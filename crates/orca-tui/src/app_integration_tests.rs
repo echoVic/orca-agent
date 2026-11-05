@@ -4116,11 +4116,15 @@ fn hosted_tui_background_handoff_without_capacity_completes_successfully() {
 
 #[test]
 fn hosted_tui_backgrounded_canonical_provider_can_be_stopped_once() {
-    with_orca_home(|_| {
+    with_orca_home(|home| {
         let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
-        harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
+        let release_marker = home.join("release-stop-backgrounded-provider");
+        harness.send(UserAction::Submit(format!(
+            "mock_stream_release_marker {}",
+            release_marker.display()
+        )));
         harness.recv_until(|event| {
-                matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started."))
+                matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock release-marker stream started."))
             });
 
         harness.send(UserAction::BackgroundCurrentTurn);
@@ -4138,6 +4142,8 @@ fn hosted_tui_backgrounded_canonical_provider_can_be_stopped_once() {
             }
         };
 
+        // Exercise a stop after the old fixed-duration stream would have finished.
+        std::thread::sleep(Duration::from_millis(1200));
         harness.send(UserAction::StopTask {
             task_id: task.id.clone(),
         });

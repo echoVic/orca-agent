@@ -776,6 +776,54 @@ pub enum CompactionKind {
 pub struct CompactionResult {
     pub conversation: Conversation,
     pub kind: CompactionKind,
+    pub observation: CompactionObservation,
+}
+
+/// Local prompt measurements and returned service metadata. Missing service
+/// usage remains unknown; a local summary-cache hit made no service request.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CompactionObservation {
+    pub before_tokens_est: usize,
+    pub after_tokens_est: usize,
+    pub elapsed_ms: u64,
+    pub summary_requests: Vec<SummaryRequestObservation>,
+    pub prefix_reuse_estimate: Option<crate::prompt_cache::PrefixReuseMetrics>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SummaryRequestObservation {
+    pub purpose: String,
+    pub provider: String,
+    pub model: String,
+    pub outcome: &'static str,
+    pub summary_cache_hit: bool,
+    pub usage: Option<Usage>,
+}
+
+impl CompactionObservation {
+    fn new() -> Self {
+        Self {
+            before_tokens_est: 0,
+            after_tokens_est: 0,
+            elapsed_ms: 0,
+            summary_requests: vec![],
+            prefix_reuse_estimate: None,
+        }
+    }
+
+    /// Recompute against the retained history when the runtime rejects a
+    /// candidate. Already returned summary usage is deliberately untouched.
+    pub fn measure_retained_history(
+        &mut self,
+        before: &Conversation,
+        after: &Conversation,
+        config: &ProviderConfig,
+    ) {
+        self.before_tokens_est = wire_equivalent_tokens(before, config);
+        self.after_tokens_est = wire_equivalent_tokens(after, config);
+        self.prefix_reuse_estimate =
+            crate::prompt_cache::measure_deepseek_prefix_reuse(before, config, after, config).ok();
+    }
 }
 
 pub fn compact_with_summary(
@@ -816,6 +864,33 @@ fn compact_with_summary_inner(
     provider_config: &ProviderConfig,
     cancel: Option<&CancelToken>,
 ) -> CompactionResult {
+    let started = Instant::now();
+    let mut observation = CompactionObservation::new();
+    let (compacted, kind) = compact_with_summary_observed(
+        provider_kind,
+        conversation,
+        context_config,
+        provider_config,
+        cancel,
+        &mut observation,
+    );
+    observation.measure_retained_history(conversation, &compacted, provider_config);
+    observation.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    CompactionResult {
+        conversation: compacted,
+        kind,
+        observation,
+    }
+}
+
+fn compact_with_summary_observed(
+    provider_kind: ProviderKind,
+    conversation: &Conversation,
+    context_config: &ContextConfig,
+    provider_config: &ProviderConfig,
+    cancel: Option<&CancelToken>,
+    observation: &mut CompactionObservation,
+) -> (Conversation, CompactionKind) {
     let normalized = normalized_for_compaction(conversation);
     // Measure the history the usage anchor was recorded on: a repair that
     // moves messages before its boundary would drop the anchor from the
@@ -824,10 +899,7 @@ fn compact_with_summary_inner(
     let measured = measure_prompt(conversation, provider_config);
     let pressure = context_pressure_for_tokens(measured.tokens, context_config);
     if !pressure.should_soft_compact && !pressure.should_hard_compact {
-        return CompactionResult {
-            conversation: normalized,
-            kind: CompactionKind::LocalTruncation,
-        };
+        return (normalized, CompactionKind::LocalTruncation);
     }
     let micro_target = context_config.soft_limit().saturating_mul(9) / 10;
     // Pressure is the provider's count; trim on that scale too, or a count
@@ -846,10 +918,7 @@ fn compact_with_summary_inner(
     if count(&micro_compacted) <= micro_target {
         let mut conversation = micro_compacted;
         conversation.clear_usage_anchor();
-        return CompactionResult {
-            conversation,
-            kind: CompactionKind::LocalTruncation,
-        };
+        return (conversation, CompactionKind::LocalTruncation);
     }
     // Deep compaction reads original evidence, including outputs that a trial
     // micro pass would have shortened.
@@ -859,13 +928,11 @@ fn compact_with_summary_inner(
         context_config,
         provider_config,
         cancel,
+        observation,
     ) {
         Some((mut conversation, summary)) => {
             conversation.clear_usage_anchor();
-            CompactionResult {
-                conversation,
-                kind: CompactionKind::RemoteSummary(summary),
-            }
+            (conversation, CompactionKind::RemoteSummary(summary))
         }
         None => {
             let mut conversation = local_compaction(
@@ -875,10 +942,7 @@ fn compact_with_summary_inner(
                 tools_schema_tokens_with_counter(provider_config, &DefaultTokenCounter),
             );
             conversation.clear_usage_anchor();
-            CompactionResult {
-                conversation,
-                kind: CompactionKind::LocalTruncation,
-            }
+            (conversation, CompactionKind::LocalTruncation)
         }
     }
 }
@@ -901,6 +965,7 @@ fn summarize_collapsed_messages(
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
     cancel: Option<&CancelToken>,
+    observation: &mut CompactionObservation,
 ) -> Option<(Conversation, String)> {
     let CompactionPartition {
         prefix,
@@ -934,7 +999,7 @@ fn summarize_collapsed_messages(
         }) {
         rendered.text.trim().to_string()
     } else {
-        hierarchical_summary(
+        hierarchical_summary_observed(
             provider_kind,
             provider_config,
             SUMMARY_PURPOSE_DELTA,
@@ -942,6 +1007,7 @@ fn summarize_collapsed_messages(
             budget.min(SUMMARY_OUTPUT_TOKENS),
             cancel,
             &mut requests_left,
+            observation,
         )?
     };
 
@@ -963,7 +1029,7 @@ fn summarize_collapsed_messages(
     if needs_rebuild {
         let combined = summary_parts(&summary).join("\n\n");
         // A failed/cancelled rebuild must not install a partially merged state.
-        summary.baseline = Some(hierarchical_summary(
+        summary.baseline = Some(hierarchical_summary_observed(
             provider_kind,
             provider_config,
             SUMMARY_PURPOSE_REBUILD,
@@ -971,6 +1037,7 @@ fn summarize_collapsed_messages(
             budget.min(SUMMARY_OUTPUT_TOKENS),
             cancel,
             &mut requests_left,
+            observation,
         )?);
         summary.deltas.clear();
     }
@@ -1052,8 +1119,8 @@ fn compaction_units(messages: &[Message]) -> Vec<CompactionUnit> {
         .enumerate()
         .skip(leading_system_count(messages))
     {
-        let opens_turn = matches!(message, Message::User { content, .. }
-            if !content.starts_with(orca_core::conversation::IMAGE_ANALYSIS_MESSAGE_PREFIX));
+        let opens_turn = matches!(message, Message::User { content, images, .. }
+            if !images.is_empty() || !orca_core::conversation::is_internal_image_analysis(content));
         if units.is_empty() || opens_turn || matches!(message, Message::Assistant { .. }) {
             units.push(CompactionUnit {
                 range: index..index + 1,
@@ -1197,6 +1264,9 @@ fn render_summary_evidence(messages: &[Message]) -> String {
     format_messages(&messages)
 }
 
+// Preserve the existing unit-test helper contract; production carries one
+// accumulator through the full hierarchy.
+#[cfg(test)]
 fn hierarchical_summary(
     provider_kind: ProviderKind,
     provider_config: &ProviderConfig,
@@ -1205,6 +1275,28 @@ fn hierarchical_summary(
     output_tokens: usize,
     cancel: Option<&CancelToken>,
     requests_left: &mut usize,
+) -> Option<String> {
+    hierarchical_summary_observed(
+        provider_kind,
+        provider_config,
+        purpose,
+        text,
+        output_tokens,
+        cancel,
+        requests_left,
+        &mut CompactionObservation::new(),
+    )
+}
+
+fn hierarchical_summary_observed(
+    provider_kind: ProviderKind,
+    provider_config: &ProviderConfig,
+    purpose: &str,
+    text: &str,
+    output_tokens: usize,
+    cancel: Option<&CancelToken>,
+    requests_left: &mut usize,
+    observation: &mut CompactionObservation,
 ) -> Option<String> {
     let chunks = summary_chunks(text);
     if chunks.len() > *requests_left || cancel.is_some_and(CancelToken::is_cancelled) {
@@ -1219,6 +1311,7 @@ fn hierarchical_summary(
             output_tokens,
             cancel,
             requests_left,
+            observation,
         );
     }
     let mut summaries = Vec::with_capacity(chunks.len());
@@ -1231,13 +1324,14 @@ fn hierarchical_summary(
             output_tokens.min(SUMMARY_OUTPUT_TOKENS),
             cancel,
             requests_left,
+            observation,
         )?);
     }
     let merged = summaries.join("\n\n");
     if DefaultTokenCounter.count_text(&merged) >= DefaultTokenCounter.count_text(text) {
         return None;
     }
-    hierarchical_summary(
+    hierarchical_summary_observed(
         provider_kind,
         provider_config,
         SUMMARY_PURPOSE_REBUILD,
@@ -1245,6 +1339,7 @@ fn hierarchical_summary(
         output_tokens,
         cancel,
         requests_left,
+        observation,
     )
 }
 
@@ -1308,6 +1403,7 @@ fn request_summary(
     output_tokens: usize,
     cancel: Option<&CancelToken>,
     requests_left: &mut usize,
+    observation: &mut CompactionObservation,
 ) -> Option<String> {
     if *requests_left == 0 || cancel.is_some_and(CancelToken::is_cancelled) {
         return None;
@@ -1323,6 +1419,16 @@ fn request_summary(
         && let Some(cached) = crate::summary_cache::lookup(&cache_key)
     {
         emit_summary_telemetry(purpose, true, rendered);
+        observation
+            .summary_requests
+            .push(SummaryRequestObservation {
+                purpose: purpose.to_string(),
+                provider: provider_kind.as_str().to_string(),
+                model: orca_core::model::auxiliary_model().to_string(),
+                outcome: "cache_hit",
+                summary_cache_hit: true,
+                usage: None,
+            });
         return Some(bounded_summary(&cached, output_tokens));
     }
     emit_summary_telemetry(purpose, false, rendered);
@@ -1369,11 +1475,49 @@ fn request_summary(
     } else {
         crate::call(provider_kind, &summary_conversation, &summary_config)
     };
-    if cancel.is_some_and(CancelToken::is_cancelled) {
-        return None;
+    let summary =
+        observed_summary_response(provider_kind, purpose, &response, cancel, observation)?;
+    let summary = bounded_summary(&summary, output_tokens);
+    if provider_kind == ProviderKind::DeepSeek {
+        crate::summary_cache::store(&cache_key, &summary);
     }
+    Some(summary)
+}
+
+fn observed_summary_response(
+    provider_kind: ProviderKind,
+    purpose: &str,
+    response: &ProviderResponse,
+    cancel: Option<&CancelToken>,
+    observation: &mut CompactionObservation,
+) -> Option<String> {
+    // Capture returned usage before cancellation/error/empty/tool-call checks:
+    // rejected summaries can still have consumed provider tokens.
+    let request_index = observation.summary_requests.len();
+    observation
+        .summary_requests
+        .push(SummaryRequestObservation {
+            purpose: purpose.to_string(),
+            provider: provider_kind.as_str().to_string(),
+            model: orca_core::model::auxiliary_model().to_string(),
+            outcome: if cancel.is_some_and(CancelToken::is_cancelled)
+                || response
+                    .error()
+                    .is_some_and(|error| error.kind == ProviderErrorKind::Cancelled)
+            {
+                "cancelled"
+            } else {
+                "failed"
+            },
+            summary_cache_hit: false,
+            usage: response.usage,
+        });
     if let Some(usage) = response.usage {
         emit_summary_usage_telemetry(purpose, usage);
+    }
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        observation.summary_requests[request_index].outcome = "cancelled";
+        return None;
     }
     if let Some(error) = response.error() {
         if std::env::var_os(SUMMARY_DEBUG_ENV).is_some() {
@@ -1387,15 +1531,13 @@ fn request_summary(
     }
     let summary = response
         .assistant_content
+        .as_ref()
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty())?;
     if !response.tool_calls.is_empty() {
         return None;
     }
-    let summary = bounded_summary(&summary, output_tokens);
-    if provider_kind == ProviderKind::DeepSeek {
-        crate::summary_cache::store(&cache_key, &summary);
-    }
+    observation.summary_requests[request_index].outcome = "succeeded";
     Some(summary)
 }
 
@@ -2077,6 +2219,454 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
+    fn observation_sse(summary: &str, usage: Option<Usage>) -> String {
+        let mut body = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "choices": [{"delta": {"content": summary}, "finish_reason": "stop"}]
+            })
+        );
+        if let Some(usage) = usage {
+            body.push_str(&format!("data: {}\n\n", serde_json::json!({
+                "choices": [], "usage": {
+                    "prompt_tokens": usage.input_tokens, "completion_tokens": usage.output_tokens,
+                    "prompt_cache_hit_tokens": usage.cache_tokens
+                }
+            })));
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    fn observation_summary_server(
+        bodies: Vec<String>,
+    ) -> (ProviderConfig, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind summary fixture");
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for body in bodies {
+                let started = Instant::now();
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                started.elapsed() < Duration::from_secs(10),
+                                "missing summary request"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept summary fixture: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let count = stream.read(&mut buffer).expect("read summary request");
+                    assert!(count > 0, "incomplete summary request");
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(header_end) =
+                        request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= header_end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        (
+            ProviderConfig {
+                api_key: Some("local-fixture-key".to_string()),
+                base_url: Some(format!("http://{address}")),
+                model: Some(orca_core::model::PRO_MODEL.to_string()),
+                reasoning_effort: ReasoningEffort::Max,
+                tools_override: Some(vec![]),
+                mcp_registry: None,
+                external_tools: vec![],
+                max_output_tokens: None,
+            },
+            server,
+        )
+    }
+
+    #[test]
+    fn compaction_observation_preserves_hierarchical_usage_and_summary_cache_hits() {
+        let first = Usage {
+            input_tokens: 100,
+            output_tokens: 3,
+            cache_tokens: 40,
+        };
+        let second = Usage {
+            input_tokens: 200,
+            output_tokens: 5,
+            cache_tokens: 100,
+        };
+        let rebuild = Usage {
+            input_tokens: 80,
+            output_tokens: 2,
+            cache_tokens: 0,
+        };
+        let (config, server) = observation_summary_server(vec![
+            observation_sse("first facts", Some(first)),
+            observation_sse("second facts", Some(second)),
+            observation_sse("merged facts", Some(rebuild)),
+        ]);
+        let text = "evidence ".repeat(5000);
+        assert_eq!(
+            summary_chunks(&text).len(),
+            2,
+            "fixture requires two chunks and rebuild"
+        );
+        let mut observation = CompactionObservation::new();
+        let mut budget = MAX_SUMMARY_REQUESTS;
+        let summary = hierarchical_summary_observed(
+            ProviderKind::DeepSeek,
+            &config,
+            SUMMARY_PURPOSE_DELTA,
+            &text,
+            64,
+            None,
+            &mut budget,
+            &mut observation,
+        )
+        .expect("summary");
+        server.join().expect("summary fixture");
+        assert_eq!(summary, "merged facts");
+        assert_eq!(observation.summary_requests.len(), 3);
+        assert_eq!(
+            observation
+                .summary_requests
+                .iter()
+                .map(|r| r.usage)
+                .collect::<Vec<_>>(),
+            vec![Some(first), Some(second), Some(rebuild)]
+        );
+        assert_eq!(
+            observation.summary_requests[2].purpose,
+            SUMMARY_PURPOSE_REBUILD
+        );
+        assert!(
+            observation
+                .summary_requests
+                .iter()
+                .all(|r| r.outcome == "succeeded"
+                    && r.model == orca_core::model::auxiliary_model()
+                    && !r.summary_cache_hit)
+        );
+        let mut cached = CompactionObservation::new();
+        let mut budget = MAX_SUMMARY_REQUESTS;
+        assert_eq!(
+            hierarchical_summary_observed(
+                ProviderKind::DeepSeek,
+                &config,
+                SUMMARY_PURPOSE_DELTA,
+                &text,
+                64,
+                None,
+                &mut budget,
+                &mut cached
+            )
+            .as_deref(),
+            Some("merged facts")
+        );
+        assert_eq!(cached.summary_requests.len(), 3);
+        assert!(
+            cached
+                .summary_requests
+                .iter()
+                .all(|r| r.summary_cache_hit && r.usage.is_none() && r.outcome == "cache_hit")
+        );
+    }
+
+    #[test]
+    fn compaction_observation_keeps_earlier_usage_when_later_remote_summary_fails() {
+        let usage = Usage {
+            input_tokens: 40,
+            output_tokens: 2,
+            cache_tokens: 10,
+        };
+        let failure_usage = Usage {
+            input_tokens: 70,
+            output_tokens: 1,
+            cache_tokens: 20,
+        };
+        let (config, server) = observation_summary_server(vec![
+            observation_sse("first facts", Some(usage)),
+            format!(
+                "data: {}\n\ndata: invalid-json\n\n",
+                serde_json::json!({"choices": [],
+                "usage": {"prompt_tokens": 70, "completion_tokens": 1, "prompt_cache_hit_tokens": 20}})
+            ),
+        ]);
+        let text = "failure ".repeat(5000);
+        assert_eq!(summary_chunks(&text).len(), 2);
+        let mut observation = CompactionObservation::new();
+        let mut budget = MAX_SUMMARY_REQUESTS;
+        assert!(
+            hierarchical_summary_observed(
+                ProviderKind::DeepSeek,
+                &config,
+                SUMMARY_PURPOSE_DELTA,
+                &text,
+                64,
+                None,
+                &mut budget,
+                &mut observation
+            )
+            .is_none()
+        );
+        server.join().unwrap();
+        assert_eq!(observation.summary_requests.len(), 2);
+        assert_eq!(observation.summary_requests[0].usage, Some(usage));
+        assert_eq!(observation.summary_requests[1].usage, Some(failure_usage));
+        assert_eq!(observation.summary_requests[1].outcome, "failed");
+    }
+
+    #[test]
+    fn pr160_cancelled_summary_outcome_after_usage_telemetry() {
+        const CHILD_ENV: &str = "ORCA_PR160_CANCEL_SUMMARY_CHILD";
+        const CANCELLED_ACK: &str = "pr160-summary-cancelled";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let usage = Usage {
+                input_tokens: 110,
+                output_tokens: 7,
+                cache_tokens: 55,
+            };
+            let response = ProviderResponse {
+                steps: vec![],
+                assistant_content: Some("usable summary".to_string()),
+                assistant_reasoning: None,
+                tool_calls: vec![],
+                usage: Some(usage),
+            };
+            let cancel = CancelToken::new();
+            let cancel_from_stdin = cancel.clone();
+            let canceller = std::thread::spawn(move || {
+                let mut signal = [0];
+                std::io::stdin().read_exact(&mut signal).unwrap();
+                cancel_from_stdin.cancel();
+                let mut stdout = std::io::stdout().lock();
+                writeln!(stdout, "{CANCELLED_ACK}").unwrap();
+                stdout.flush().unwrap();
+            });
+            // Keep telemetry blocked until the parent observes cancellation.
+            let purpose = "delta".repeat(1_000_000);
+            let mut observation = CompactionObservation::new();
+            assert!(
+                observed_summary_response(
+                    ProviderKind::DeepSeek,
+                    &purpose,
+                    &response,
+                    Some(&cancel),
+                    &mut observation,
+                )
+                .is_none()
+            );
+            canceller.join().unwrap();
+            assert_eq!(observation.summary_requests.len(), 1);
+            assert_eq!(observation.summary_requests[0].usage, Some(usage));
+            assert_eq!(observation.summary_requests[0].outcome, "cancelled");
+            return;
+        }
+
+        use std::io::BufRead;
+        use std::process::{Child, Command, Stdio};
+        struct KillChildOnDrop(Child);
+        impl Drop for KillChildOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut child = KillChildOnDrop(
+            Command::new(std::env::current_exe().unwrap())
+                .env(CHILD_ENV, "1")
+                .env(SUMMARY_DEBUG_ENV, "1")
+                .args([
+                    "--exact",
+                    "context::tests::pr160_cancelled_summary_outcome_after_usage_telemetry",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let (prefix_tx, prefix_rx) = mpsc::channel();
+        let (drain_tx, drain_rx) = mpsc::channel();
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        let mut stderr = child.0.stderr.take().unwrap();
+        let stderr_reader = std::thread::spawn(move || {
+            let mut prefix = [0; 64];
+            stderr.read_exact(&mut prefix).unwrap();
+            prefix_tx.send(prefix).unwrap();
+            drain_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            let mut output = Vec::new();
+            stderr.read_to_end(&mut output).unwrap();
+            let _ = stderr_tx.send(output);
+        });
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let mut stdout = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        let stdout_reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            let mut ack = Some(ack_tx);
+            loop {
+                let mut line = String::new();
+                if stdout.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                // libtest's unterminated "test ... " prefix shares this line.
+                if line.trim_end().ends_with(CANCELLED_ACK)
+                    && let Some(sender) = ack.take()
+                {
+                    let _ = sender.send(());
+                }
+                output.push_str(&line);
+            }
+            let _ = stdout_tx.send(output);
+        });
+        let prefix = prefix_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("summary telemetry prefix before deadline");
+        assert!(String::from_utf8_lossy(&prefix).starts_with("orca.remote_summary_usage"));
+        child.0.stdin.take().unwrap().write_all(b"x").unwrap();
+        ack_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("cancellation acknowledgement before draining telemetry");
+        drain_tx.send(()).unwrap();
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "summary child failed to exit after cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let stderr = stderr_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        let stdout = stdout_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        stderr_reader.join().unwrap();
+        stdout_reader.join().unwrap();
+        assert!(
+            status.success(),
+            "cancelled summary observation regression: {stdout}\n{}",
+            String::from_utf8_lossy(&stderr[stderr.len().saturating_sub(2_000)..]),
+        );
+    }
+
+    #[test]
+    fn compaction_observation_preserves_usage_on_cancelled_and_rejected_responses() {
+        let usage = Usage {
+            input_tokens: 110,
+            output_tokens: 7,
+            cache_tokens: 55,
+        };
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        for (steps, content, cancel, expected) in [
+            (
+                vec![],
+                Some("usable summary".to_string()),
+                Some(&cancelled),
+                "cancelled",
+            ),
+            (
+                vec![ProviderStep::Error(
+                    orca_core::provider_types::ProviderError::new(
+                        ProviderErrorKind::Cancelled,
+                        "cancelled while streaming",
+                    ),
+                )],
+                None,
+                None,
+                "cancelled",
+            ),
+            (
+                vec![ProviderStep::Error(
+                    orca_core::provider_types::ProviderError::other("failed"),
+                )],
+                None,
+                None,
+                "failed",
+            ),
+            (vec![], Some("  ".to_string()), None, "failed"),
+        ] {
+            let response = ProviderResponse {
+                steps,
+                assistant_content: content,
+                assistant_reasoning: None,
+                tool_calls: vec![],
+                usage: Some(usage),
+            };
+            let mut observation = CompactionObservation::new();
+            assert!(
+                observed_summary_response(
+                    ProviderKind::DeepSeek,
+                    "delta",
+                    &response,
+                    cancel,
+                    &mut observation
+                )
+                .is_none()
+            );
+            assert_eq!(observation.summary_requests.len(), 1);
+            assert_eq!(observation.summary_requests[0].usage, Some(usage));
+            assert_eq!(observation.summary_requests[0].outcome, expected);
+        }
+    }
+
+    #[test]
+    fn compaction_observation_records_missing_service_usage_as_unknown() {
+        let (config, server) = observation_summary_server(vec![observation_sse("facts", None)]);
+        let mut observation = CompactionObservation::new();
+        let mut budget = MAX_SUMMARY_REQUESTS;
+        assert_eq!(
+            request_summary(
+                ProviderKind::DeepSeek,
+                &config,
+                "delta",
+                &RenderedSummaryDelta::from_plain("missing usage fixture".to_string()),
+                64,
+                None,
+                &mut budget,
+                &mut observation
+            )
+            .as_deref(),
+            Some("facts")
+        );
+        server.join().unwrap();
+        assert_eq!(observation.summary_requests.len(), 1);
+        assert!(observation.summary_requests[0].usage.is_none());
+        assert!(!observation.summary_requests[0].summary_cache_hit);
+    }
     struct FixedCounter;
 
     impl TokenCounter for FixedCounter {
@@ -3396,6 +3986,7 @@ mod tests {
             &config,
             &provider_config,
             None,
+            &mut CompactionObservation::new(),
         )
         .expect("small collapsed deltas must be kept instead of falling back to local truncation");
 

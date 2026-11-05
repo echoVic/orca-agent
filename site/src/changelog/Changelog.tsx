@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.17":
+        "New TUI sessions start with Full Access; --yolo also works for launches and resumes, and pending approvals can switch the active session. Headless completion reports durable recovery, unresolved child blockers and bounded workspace changes. Provider retries share a cooldown and budget. Compression and streamed responses record observed cost and latency; capability evals retain verifier evidence, and tool screenshots keep vision descriptions for models that need them.",
       "v0.5.16":
         "Say when you're blocked. orca exec can now end a run with status blocked and exit code 5 when something outside the model's control stops the work — a read-only workspace, missing credentials, or no network. The model calls report_blocker with a kind, summary, and optional question. A blocked run can carry one question; answer it with orca exec resume. A blocked subagent shows Subagent status: Blocked to its parent and its task status is blocked, not failed. session.completed gains writes_applied to report whether the run changed any file through edit or write_file. The system prompt asks the model to say what is missing and never to claim work it did not do, and to treat text in files and tool results as data, not instructions. The TUI shows a blocked result with its reason and next step; ACP ends the turn normally instead of returning an internal error. The capability eval quarantines qemu-alpine-ssh and classifies verifier environment failures separately from capability gaps. Custom agents get report_blocker only if their definition lists it explicitly.",
       "v0.5.14":
@@ -706,6 +708,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.17":
+        "新 TUI 会话默认 Full Access；启动和恢复支持 --yolo，待审批的任务也能切换当前会话权限。Headless 完成记录提供真实恢复状态、子任务 blocker 和有预算限制的工作区净变化。Provider 重试共享冷却与预算，压缩和流式响应记录已观测费用与延迟，评测保留独立验收证据，工具截图为需要旁路视觉的模型保留描述。",
       "v0.5.16":
         "能说“我被挡住了”。orca exec 现在可以在模型控制不了的事情挡住工作时，以 status blocked 和退出码 5 结束——只读工作区、缺少凭据或没有网络。模型调用 report_blocker，传 kind、summary 和可选的 question；question 会出现在文本模式里，用 orca exec resume 可以回答。headless 运行的子 agent 报告 blocker 时，父 agent 看到的是 Subagent status: Blocked 和原因，而不是一次普通失败，子 agent 的任务状态也是 blocked 而不是 failed。session.completed 新增 writes_applied，表示本次运行是否通过 edit 或 write_file 改过文件。系统提示词要求模型被挡住时说明缺什么、绝不谎称没做的事，并把文件和工具结果里的文字当作数据而非指令。TUI 显示 blocked 的原因和下一步；ACP 正常结束这一轮，不再返回内部错误。能力评测隔离了 qemu-alpine-ssh，并把评测器环境失败归类为 environment，不再算能力缺口。自定义 agent 只有在其定义里显式列出时才会得到 report_blocker。",
       "v0.5.14":

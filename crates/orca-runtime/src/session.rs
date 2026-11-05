@@ -43,6 +43,7 @@ pub fn new_run_id() -> String {
 pub(crate) struct TurnStart {
     pub(crate) message_index: usize,
     pub(crate) file_write_baseline: HashMap<String, u64>,
+    pub(crate) workspace_baseline: crate::workspace_observation::Snapshot,
 }
 
 pub struct InteractiveSession {
@@ -60,6 +61,8 @@ pub struct InteractiveSession {
     memory: MemoryBlock,
     auto_memory_worker: Option<memory::AutomaticMemoryWorker>,
     turn_starts: HashMap<String, TurnStart>,
+    completion_context: Option<serde_json::Value>,
+    history_requested: bool,
     task_registry: TaskRegistry,
     last_manual_compaction: Option<ManualCompactionOutcome>,
     runtime_extensions: Option<std::sync::Arc<crate::extension::ExtensionData>>,
@@ -458,6 +461,8 @@ impl InteractiveSession {
             memory,
             auto_memory_worker,
             turn_starts: HashMap::new(),
+            completion_context: None,
+            history_requested: !matches!(config.history_mode, HistoryMode::Disabled),
             task_registry,
             last_manual_compaction: None,
             runtime_extensions: None,
@@ -501,6 +506,15 @@ impl InteractiveSession {
         self.writer
             .as_ref()
             .map(SessionWriter::conversation_records)
+    }
+
+    pub(crate) fn history_requested(&self) -> bool {
+        self.history_requested
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history_recording(&self) -> bool {
+        self.writer.is_some()
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -629,15 +643,57 @@ impl InteractiveSession {
         }
     }
 
+    pub(crate) fn record_completion_context(&mut self, payload: &serde_json::Value) {
+        let mut context = serde_json::Map::new();
+        for key in [
+            "resumable",
+            "resume",
+            "resume_unavailable_reason",
+            "workspace_observation",
+            "blockers",
+        ] {
+            if let Some(value) = payload.get(key) {
+                context.insert(key.into(), value.clone());
+            }
+        }
+        self.completion_context = Some(serde_json::Value::Object(context));
+    }
+
+    pub(crate) fn apply_completion_context(&self, payload: &mut serde_json::Value) {
+        if let (Some(context), Some(payload)) = (
+            self.completion_context.as_ref().and_then(|v| v.as_object()),
+            payload.as_object_mut(),
+        ) {
+            for key in [
+                "resumable",
+                "resume",
+                "resume_unavailable_reason",
+                "workspace_observation",
+                "blockers",
+            ] {
+                payload.remove(key);
+            }
+            payload.extend(context.clone());
+        }
+    }
+
     pub(crate) fn begin_runtime_turn(
         &mut self,
         turn_id: &str,
         existing_turn: bool,
+        cwd: &Path,
+        observe_workspace: bool,
     ) -> io::Result<TurnStart> {
         if existing_turn && let Some(start) = self.turn_starts.get(turn_id) {
             return Ok(start.clone());
         }
+        self.completion_context = None;
         let start = TurnStart {
+            workspace_baseline: if observe_workspace {
+                crate::workspace_observation::Snapshot::capture(cwd)
+            } else {
+                Default::default()
+            },
             message_index: self.conversation.messages.len(),
             file_write_baseline: self
                 .task_registry

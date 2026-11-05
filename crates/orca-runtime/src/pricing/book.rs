@@ -326,7 +326,8 @@ mod tests {
 
     #[test]
     fn a_current_cache_overrides_builtin_prices_and_adds_models() {
-        let book = merge(Some(&cache("2026-11-02T08:00:00Z")));
+        let current = format!("{}T08:00:00Z", rates::builtin_as_of());
+        let book = merge(Some(&cache(&current)));
         assert_eq!(book.rates_for(FLASH_MODEL), FETCHED_FLASH);
         assert_eq!(book.rates_for(PRO_MODEL), PRO_RATES);
         assert_eq!(book.rates_for("deepseek-v5-flash"), NEW_MODEL);

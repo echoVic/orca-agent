@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{ProviderKind, RunConfig};
-use orca_core::conversation::Conversation;
+use orca_core::conversation::{Conversation, assistant_message_has_payload};
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::model::{ImageRouteDecision, VISION_MODEL};
@@ -30,7 +30,9 @@ use crate::compaction::{
 use crate::cost::CostTracker;
 use crate::extension::RuntimeExtensionContext;
 use crate::hooks::{HookRunner, conversation_with_hook_context};
+#[cfg(test)]
 use crate::image_routing::prepare_image_conversation;
+use crate::image_routing::prepare_image_conversation_with_usage;
 #[cfg(test)]
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -40,7 +42,7 @@ use crate::lifecycle::{
 use crate::memory::MemoryBlock;
 use crate::model_response::RuntimeModelResponse;
 use crate::operation_context::OperationContext;
-use crate::provider_retry::{ProviderRetryDecision, ProviderRetryPolicy, wait_for_provider_retry};
+use crate::provider_retry::{ProviderRetryDecision, ProviderRetryPolicy};
 use crate::provider_stream::RuntimeProviderSuspension;
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_directive::conversation_with_runtime_system_messages;
@@ -73,6 +75,27 @@ pub(crate) struct RuntimeProviderResponseStep;
 pub(crate) struct RuntimeProviderResponseResultStep;
 pub(crate) struct RuntimeTurnProviderCycleStep {
     provider_error_step: RuntimeProviderErrorStep,
+}
+
+fn attach_provider_observation(
+    draft: &mut orca_core::event_schema::EventDraft,
+    response: &RuntimeModelResponse,
+) {
+    if let Some(observation) = &response.observation {
+        draft.payload["observation"] =
+            serde_json::to_value(observation).expect("provider observation serializes");
+    }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+// Convert only configured remaining time to an absolute deadline.
+fn retry_deadline_from_remaining(now: Instant, remaining: Option<Duration>) -> Option<Instant> {
+    // Overflow of a finite limit must not turn into an unlimited operation.
+    // Fail closed at now; ordinary representable deadlines remain exact.
+    remaining.map(|remaining| now.checked_add(remaining).unwrap_or(now))
 }
 
 const PROVIDER_STEP_BATCH_LIMIT: usize = 32;
@@ -429,61 +452,98 @@ impl RuntimeProviderTurnStep {
             conversation,
             history_writer: history_writer.as_deref_mut(),
         })?;
-        let prepared_images = prepare_image_conversation(
+        let mut image_io_error = None;
+        let mut image_usage_error = None;
+        let mut image_budget_stop = None;
+        let prepared_images = prepare_image_conversation_with_usage(
             conversation,
             input.image_route,
             input.provider,
             input.provider_config,
             input.cancel,
+            |usage| {
+                let settled = (|| -> io::Result<()> {
+                    if let Some(usage) = usage.filter(|usage| !usage.is_empty()) {
+                        let main_model = input.provider_config.model.as_deref();
+                        let spent_before =
+                            crate::cost::usd_to_micros(cost_tracker.totals().estimated_cost_usd);
+                        cost_tracker.set_model(Some(VISION_MODEL));
+                        let recorded = input.actor.record_usage(usage, cost_tracker, None);
+                        cost_tracker.set_model(main_model);
+                        let totals = match recorded {
+                            Ok(totals) => totals,
+                            Err(error) => {
+                                image_usage_error = Some(error);
+                                return Ok(());
+                            }
+                        };
+                        let spent_total = crate::cost::usd_to_micros(totals.estimated_cost_usd);
+                        let delta = spent_total.saturating_sub(spent_before);
+                        if delta > 0 {
+                            // Each returned response is a separate bill, even
+                            // when this turn is retried after preparation fails.
+                            let accounting_id = format!(
+                                "image-analysis:{}",
+                                orca_core::thread_identity::ConversationItemId::new()
+                            );
+                            if let Err(stop) = input
+                                .operation
+                                .record_cost_usd_micros(delta, &accounting_id)?
+                            {
+                                image_budget_stop = Some(stop);
+                            }
+                        }
+                        // The response that exhausted the budget (or failed)
+                        // still publishes its confirmed cumulative usage.
+                        if emit_deltas {
+                            sink.emit(events.usage_updated(totals))?;
+                            if let Some(writer) = history_writer.as_deref_mut() {
+                                writer.append_usage(totals)?;
+                            }
+                        }
+                    }
+                    if image_budget_stop.is_none()
+                        && let Err(stop) = input.operation.sync_wall_time()?
+                    {
+                        image_budget_stop = Some(stop);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = settled {
+                    image_io_error = Some(error);
+                }
+                if image_io_error.is_some()
+                    || image_usage_error.is_some()
+                    || image_budget_stop.is_some()
+                {
+                    Err("image analysis stopped during usage settlement".to_string())
+                } else {
+                    Ok(())
+                }
+            },
         );
-        let analysis_usage = match &prepared_images {
-            Ok(prepared) => prepared.usage,
-            Err(error) => error.usage,
-        };
-        if let Some(usage) = analysis_usage
-            && !usage.is_empty()
-        {
-            let main_model = input.provider_config.model.as_deref();
-            let spent_before = crate::cost::usd_to_micros(cost_tracker.totals().estimated_cost_usd);
-            cost_tracker.set_model(Some(VISION_MODEL));
-            let totals = match input.actor.record_usage(usage, cost_tracker, None) {
-                Ok(totals) => totals,
-                Err(error) => {
-                    cost_tracker.set_model(main_model);
-                    return Ok(RuntimeProviderTurnOutput::terminal(error));
-                }
-            };
-            cost_tracker.set_model(main_model);
-            let spent_total = crate::cost::usd_to_micros(totals.estimated_cost_usd);
-            let delta = spent_total.saturating_sub(spent_before);
-            if delta > 0
-                && let Err(stop) = input.operation.record_cost_usd_micros(
-                    delta,
-                    &format!("image-analysis:{}", input.turn_context.turn_id),
-                )?
-            {
-                let terminal = input.operation.commit_budget_stop_with_boundary(
-                    input.turn_context.turn_id.as_str(),
-                    events.run_id(),
-                    history_writer.as_deref_mut(),
-                    &totals,
-                    None,
-                    stop,
-                )?;
-                return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
-                    status: RunStatus::Failed,
-                    reason: TurnEndReason::CostBudgetExhausted,
-                    message: "budget stopped during image analysis".to_string(),
-                    max_cost_usd_micros: 0,
-                    terminal: Some(terminal),
-                }));
-            }
-            if emit_deltas {
-                sink.emit(events.usage_updated(totals))?;
-                if let Some(writer) = history_writer.as_deref_mut() {
-                    writer.append_usage(totals)?;
-                }
-            }
+        if let Some(error) = image_io_error {
+            return Err(error);
+        }
+        if let Some(stop) = image_budget_stop {
+            let terminal = input.operation.commit_budget_stop_with_boundary(
+                input.turn_context.turn_id.as_str(),
+                events.run_id(),
+                history_writer.as_deref_mut(),
+                &cost_tracker.totals(),
+                None,
+                stop,
+            )?;
+            return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
+                status: RunStatus::Failed,
+                reason: TurnEndReason::CostBudgetExhausted,
+                message: "budget stopped during image analysis".to_string(),
+                max_cost_usd_micros: 0,
+                terminal: Some(terminal),
+            }));
+        }
+        if let Some(error) = image_usage_error {
+            return Ok(RuntimeProviderTurnOutput::terminal(error));
         }
         let prepared_images = match prepared_images {
             Ok(prepared) => prepared,
@@ -540,6 +600,27 @@ impl RuntimeProviderTurnStep {
                 .append_prompt_cache_checkpoint(input.turn_context.turn_id.clone(), checkpoint)?;
         }
         let retry_policy = ProviderRetryPolicy::default();
+        // Refresh live wall time after hooks/image preparation before deriving
+        // the request deadline from the operation's remaining budget.
+        let _ = input.operation.controller.sync_wall_time();
+        let remaining_wall_time = input
+            .operation
+            .controller
+            .spec()
+            .max_wall_time_ms
+            .map(|limit| {
+                Duration::from_millis(
+                    limit.saturating_sub(input.operation.controller.usage().wall_time_ms),
+                )
+            });
+        let retry_deadline = retry_deadline_from_remaining(Instant::now(), remaining_wall_time);
+        let retry_budget = orca_provider::http_client::RetryBudget::new(
+            5,
+            Duration::from_secs(120),
+            retry_deadline,
+        );
+        let request_started = Instant::now();
+        let mut first_delta = None;
         let mut completed_attempts = 0_u32;
         let mut failed_attempt_usage = None;
         let (mut response, response_identity) = loop {
@@ -547,20 +628,22 @@ impl RuntimeProviderTurnStep {
             let response_identity = ModelResponseIdentity::new(input.turn_context.turn_id.clone());
             let mut stream =
                 if crate::investigation_convergence::summary_prompt_present(&model_conversation) {
-                    orca_provider::start_streaming_bounded(
+                    orca_provider::start_streaming_bounded_with_retry_budget(
                         input.provider,
                         &model_conversation,
                         &request_config,
                         input.cancel.clone(),
                         crate::investigation_convergence::FINAL_REPORT_MAX_TOKENS,
                         crate::investigation_convergence::FINAL_REPORT_TIMEOUT,
+                        retry_budget.clone(),
                     )
                 } else {
-                    orca_provider::start_streaming(
+                    orca_provider::start_streaming_with_retry_budget(
                         input.provider,
                         &model_conversation,
                         &request_config,
                         input.cancel.clone(),
+                        retry_budget.clone(),
                     )
                 };
             let mut step_batcher = ProviderStepBatcher::new(
@@ -570,6 +653,23 @@ impl RuntimeProviderTurnStep {
             let response = loop {
                 match stream.recv_timeout(Duration::from_millis(10)) {
                     Ok(ProviderStreamEvent::Step(delivery)) => {
+                        if first_delta.is_none() {
+                            let kind = match delivery.step() {
+                                ProviderStep::ReasoningDelta(text) if !text.is_empty() => {
+                                    Some("reasoning")
+                                }
+                                ProviderStep::MessageDelta(text) if !text.is_empty() => {
+                                    Some("text")
+                                }
+                                ProviderStep::ToolCallProgress(_) | ProviderStep::ToolCall(_) => {
+                                    Some("tool")
+                                }
+                                _ => None,
+                            };
+                            if let Some(kind) = kind {
+                                first_delta = Some((elapsed_millis(request_started), kind));
+                            }
+                        }
                         step_batcher.push(delivery.step().clone())?;
                         emit_provider_delta(
                             delivery.step(),
@@ -614,17 +714,24 @@ impl RuntimeProviderTurnStep {
                 break (response, response_identity);
             };
             let ProviderRetryDecision::RetryAfter(delay) =
-                retry_policy.decide(error, completed_attempts)
+                retry_policy.decide_with_budget(error, completed_attempts, &retry_budget)
             else {
                 break (response, response_identity);
             };
             if let Some(ingress) = input.turn_context.provider_response_ingress() {
                 ingress.commit_provider_attempt_failure(&response_identity, &error.message)?;
             }
-            merge_provider_usage(&mut failed_attempt_usage, response.usage);
-            if !wait_for_provider_retry(delay, input.cancel) {
-                return cancelled_provider_turn(emit_deltas, events, sink);
+            if retry_budget.wait_blocking(delay, input.cancel).is_err() {
+                // Settle this response and earlier failed-attempt usage below
+                // before returning the cancellation terminal.
+                break (response, response_identity);
             }
+            merge_provider_usage(&mut failed_attempt_usage, response.usage);
+        };
+        let observation = crate::model_response::ProviderResponseObservation {
+            elapsed_ms: elapsed_millis(request_started),
+            first_delta_ms: first_delta.map(|(ms, _)| ms),
+            first_delta_kind: first_delta.map(|(_, kind)| kind),
         };
         let attempt_usage = response.usage;
         merge_provider_usage(&mut response.usage, failed_attempt_usage);
@@ -743,9 +850,9 @@ impl RuntimeProviderTurnStep {
             return cancelled_provider_turn(emit_deltas, events, sink);
         }
 
-        Ok(RuntimeProviderTurnOutput::response(
-            RuntimeModelResponse::from_parts(response, response_identity),
-        ))
+        let mut response = RuntimeModelResponse::from_parts(response, response_identity);
+        response.observation = Some(observation);
+        Ok(RuntimeProviderTurnOutput::response(response))
     }
 
     pub(crate) fn handle_provider_error<W: io::Write>(
@@ -821,26 +928,34 @@ impl RuntimeProviderResponseStep {
             ingress.commit_response(&mut response)?;
         }
         let completed_response = response.completed();
+        let mut completion_event = events.model_response_completed(&completed_response);
+        attach_provider_observation(&mut completion_event, &response);
         let response = response.response;
-        if response.tool_calls.is_empty() {
-            let final_message = response.assistant_content.clone();
-            record_assistant_response_for_agent(
-                conversation,
-                &completed_response,
-                step_snapshot.turn_context.emit_deltas,
-                events,
-                sink,
-            )?;
-            return Ok(RuntimeProviderResponseOutcome::Success { final_message });
+        // Validate before publishing; a failed semantic append must not leave
+        // a live-only assistant message or advance the plan's assistant age.
+        if !assistant_message_has_payload(
+            completed_response.assistant_content.as_deref(),
+            &completed_response.tool_calls,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "assistant response did not contain content or tool calls",
+            ));
         }
-
+        if step_snapshot.turn_context.emit_deltas {
+            sink.emit(completion_event)?;
+        }
         record_assistant_response_for_agent(
             conversation,
             &completed_response,
-            step_snapshot.turn_context.emit_deltas,
+            false,
             events,
             sink,
         )?;
+        if response.tool_calls.is_empty() {
+            let final_message = response.assistant_content.clone();
+            return Ok(RuntimeProviderResponseOutcome::Success { final_message });
+        }
 
         let tool_requests = tool_requests_from_provider_steps(&response.steps);
         match run_tool_turns(RuntimeToolTurnsContext {
@@ -987,7 +1102,9 @@ impl RuntimeTurnProviderCycleStep {
                     input.events,
                     input.sink,
                     history_writer,
-                ),
+                )
+                .with_cancel(capabilities.cancel)
+                .with_deadline(input.operation.remaining_deadline()?),
                 conversation,
             )?
         };
@@ -1752,6 +1869,434 @@ mod tests {
     }
 
     #[test]
+    fn shared_retry_first_delta_observation_includes_retry_wait() {
+        let mut lifecycle = crate::lifecycle::RuntimeSessionLifecycle::new(
+            "provider-runtime-system-directive".to_string(),
+        );
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle);
+        let mut conversation = Conversation::new();
+        conversation.add_system("base system".to_string());
+        conversation.add_user("mock_stream_flaky_once retry-observation-section-two".to_string());
+        let runtime_system_messages = vec!["runtime directive context".to_string()];
+        let context_config = context::ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::FLASH_MODEL),
+            &ModelRuntimeConfig::default(),
+            orca_core::config::ReasoningEffort::default(),
+        );
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: Some(orca_core::model::PRO_MODEL.to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+            max_output_tokens: None,
+        };
+        let hooks = HookRunner::default();
+        let cancel = CancelToken::new();
+        let mut cost_tracker = CostTracker::new(None);
+        let mut events = EventFactory::new("provider-runtime-system-directive".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+
+        let result = RuntimeProviderTurnStep::new()
+            .run(RuntimeProviderTurnInput {
+                actor: &mut actor,
+                operation: &mut crate::operation_context::OperationContext::for_tests(
+                    orca_core::budget::BudgetSpec::default(),
+                    "provider-turn-test",
+                ),
+                provider: ProviderKind::Mock,
+                runtime_system_messages: runtime_system_messages.as_slice(),
+                provider_config: &provider_config,
+                image_route: ImageRouteDecision::None,
+                turn_context: RuntimeTurnContext::new(
+                    Path::new("."),
+                    "mock_stream_flaky_once retry-observation-section-two",
+                    0,
+                    true,
+                    &orca_core::subagent_types::SubagentType::General,
+                ),
+                hooks: &hooks,
+                cancel: &cancel,
+                context_config: &context_config,
+                io: RuntimeProviderTurnIo {
+                    conversation: &mut conversation,
+                    cost_tracker: &mut cost_tracker,
+                    events: &mut events,
+                    sink: &mut sink,
+                    history_writer: None,
+                },
+            })
+            .expect("provider turn");
+
+        let RuntimeProviderTurnOutput::Response(response) = result else {
+            panic!("provider turn must return a response");
+        };
+        let mut draft = events.model_response_completed(&response.completed());
+        attach_provider_observation(&mut draft, &response);
+        let observation = &draft.payload["observation"];
+        assert_eq!(observation["first_delta_kind"], "reasoning");
+        let first = observation["first_delta_ms"]
+            .as_u64()
+            .expect("first delta latency");
+        let elapsed = observation["elapsed_ms"].as_u64().expect("logical latency");
+        assert!(
+            elapsed >= 225,
+            "runtime retry wait must count towards elapsed latency"
+        );
+        assert!(first <= elapsed);
+    }
+
+    #[test]
+    fn retry_review_unrepresentable_finite_deadline_rejects_retry_wait() {
+        let now = Instant::now();
+        let deadline = retry_deadline_from_remaining(now, Some(Duration::MAX));
+        let budget =
+            orca_provider::http_client::RetryBudget::new(5, Duration::from_secs(120), deadline);
+        assert!(
+            budget
+                .wait_blocking(Duration::ZERO, &CancelToken::new())
+                .is_err(),
+            "a finite unrepresentable deadline must reject even a zero wait instead of becoming unlimited"
+        );
+        assert!(!budget.can_retry());
+        assert_eq!(budget.attempts(), 0);
+    }
+
+    #[test]
+    fn retry_review_normal_and_exhausted_deadlines_keep_their_bounds() {
+        let now = Instant::now();
+        assert_eq!(retry_deadline_from_remaining(now, None), None);
+        assert_eq!(
+            retry_deadline_from_remaining(now, Some(Duration::from_millis(100))),
+            Some(now + Duration::from_millis(100))
+        );
+        let expired = orca_provider::http_client::RetryBudget::new(
+            5,
+            Duration::from_secs(120),
+            retry_deadline_from_remaining(now, Some(Duration::ZERO)),
+        );
+        assert!(!expired.can_retry());
+        assert!(
+            expired
+                .wait_blocking(Duration::ZERO, &CancelToken::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn retry_review_cancelled_retry_wait_settles_current_usage_once() {
+        assert_cancelled_retry_usage(
+            1,
+            Usage {
+                input_tokens: 22,
+                output_tokens: 6,
+                cache_tokens: 14,
+            },
+        );
+    }
+
+    #[test]
+    fn retry_review_cancelled_retry_wait_settles_prior_and_current_usage_once() {
+        assert_cancelled_retry_usage(
+            2,
+            Usage {
+                input_tokens: 44,
+                output_tokens: 12,
+                cache_tokens: 28,
+            },
+        );
+    }
+
+    fn assert_cancelled_retry_usage(cancel_after: usize, expected: Usage) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        #[derive(Debug)]
+        struct CancelRetryIngress {
+            cancel: CancelToken,
+            failures: AtomicUsize,
+            cancel_after: usize,
+        }
+        impl crate::runtime_surface::RuntimeProviderResponseIngress for CancelRetryIngress {
+            fn commit_response(&self, _: &mut RuntimeModelResponse) -> io::Result<()> {
+                Ok(())
+            }
+            fn commit_provider_step(
+                &self,
+                _: &ModelResponseIdentity,
+                _: &ProviderStep,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn commit_tool_results(
+                &self,
+                _: &[orca_core::tool_types::ToolResult],
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn commit_provider_attempt_failure(
+                &self,
+                _: &ModelResponseIdentity,
+                _: &str,
+            ) -> io::Result<()> {
+                if self.failures.fetch_add(1, Ordering::SeqCst) + 1 == self.cancel_after {
+                    self.cancel.cancel();
+                }
+                Ok(())
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let server_sends = sends.clone();
+        let server = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !server_stop.load(Ordering::SeqCst) && Instant::now() < until {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(socket) => socket,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                let end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                let length = String::from_utf8_lossy(&bytes[..end])
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|v| v.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < end + length {
+                    let n = socket.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                server_sends.fetch_add(1, Ordering::SeqCst);
+                // A completed empty response bills usage; each logical attempt performs one recovery send.
+                let body = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3,\"prompt_cache_hit_tokens\":7}}\n\ndata: [DONE]\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let mut lifecycle =
+            crate::lifecycle::RuntimeSessionLifecycle::new(format!("cancel-retry-{cancel_after}"));
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle);
+        let mut conversation = Conversation::new();
+        conversation.add_user("inspect".into());
+        let config = ProviderConfig {
+            api_key: Some("test-cancel-quota".into()),
+            base_url: Some(base_url),
+            model: Some(orca_core::model::PRO_MODEL.into()),
+            reasoning_effort: Default::default(),
+            tools_override: Some(vec![]),
+            mcp_registry: None,
+            external_tools: vec![],
+            max_output_tokens: None,
+        };
+        let context_config = context::ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::PRO_MODEL),
+            &ModelRuntimeConfig::default(),
+            Default::default(),
+        );
+        let cancel = CancelToken::new();
+        let ingress = CancelRetryIngress {
+            cancel: cancel.clone(),
+            failures: AtomicUsize::new(0),
+            cancel_after,
+        };
+        let mut tracker = CostTracker::new(Some(orca_core::model::PRO_MODEL));
+        let mut operation = OperationContext::for_tests(
+            orca_core::budget::BudgetSpec::default(),
+            &format!("cancel-retry-{cancel_after}"),
+        );
+        let mut events = EventFactory::new(format!("cancel-retry-{cancel_after}"));
+        let mut output = Vec::new();
+        let hooks = HookRunner::default();
+        let result = RuntimeProviderTurnStep::new().run(RuntimeProviderTurnInput {
+            actor: &mut actor,
+            operation: &mut operation,
+            provider: ProviderKind::DeepSeek,
+            runtime_system_messages: &[],
+            provider_config: &config,
+            image_route: ImageRouteDecision::None,
+            turn_context: RuntimeTurnContext::new(
+                Path::new("."),
+                "inspect",
+                0,
+                true,
+                &SubagentType::General,
+            )
+            .with_provider_response_ingress(Some(&ingress)),
+            hooks: &hooks,
+            cancel: &cancel,
+            context_config: &context_config,
+            io: RuntimeProviderTurnIo {
+                conversation: &mut conversation,
+                cost_tracker: &mut tracker,
+                events: &mut events,
+                sink: &mut EventSink::new(&mut output, OutputFormat::Jsonl),
+                history_writer: None,
+            },
+        });
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let RuntimeProviderTurnOutput::Terminal(error) = result.unwrap() else {
+            panic!("expected cancelled terminal")
+        };
+        assert_eq!(error.status, RunStatus::Cancelled);
+        assert_eq!(ingress.failures.load(Ordering::SeqCst), cancel_after);
+        assert_eq!(sends.load(Ordering::SeqCst), cancel_after * 2);
+        let totals = tracker.totals();
+        assert_eq!(
+            (
+                totals.input_tokens,
+                totals.output_tokens,
+                totals.cache_tokens
+            ),
+            (
+                expected.input_tokens,
+                expected.output_tokens,
+                expected.cache_tokens
+            ),
+            "every billed failed attempt must settle exactly once"
+        );
+        let mut expected_tracker = CostTracker::new(Some(orca_core::model::PRO_MODEL));
+        let expected_cost = expected_tracker.add_usage(expected).estimated_cost_usd;
+        assert!((totals.estimated_cost_usd - expected_cost).abs() < 1e-12);
+        assert_eq!(
+            operation.controller.usage().cost_usd_micros,
+            crate::cost::usd_to_micros(expected_cost)
+        );
+        let records: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            records
+                .iter()
+                .any(|record| record["type"] == "usage.updated"),
+            "cancelled wait still emits settled usage"
+        );
+    }
+
+    #[test]
+    fn retry_review_actual_refreshed_tool_analysis_backtracks_human_prompt() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("find save".into());
+        conversation.add_assistant(
+            None,
+            None,
+            vec![orca_core::conversation::RawToolCall {
+                id: "capture".into(),
+                function_name: "mcp__screen__capture".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        conversation.messages.push(Message::Tool {
+            tool_call_id: "capture".into(), content: "screenshot taken".into(),
+            images: vec![orca_core::conversation::ImageInput {
+                source: orca_core::conversation::ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jwioAAAAASUVORK5CYII=".into(),
+                }, detail: orca_core::conversation::ImageDetail::Auto,
+            }], terminal: None, pinned: false,
+        });
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: Some(orca_core::model::PRO_MODEL.into()),
+            reasoning_effort: Default::default(),
+            tools_override: Some(vec![]),
+            mcp_registry: None,
+            external_tools: vec![],
+            max_output_tokens: None,
+        };
+        let prepared = prepare_image_conversation(
+            &conversation,
+            ImageRouteDecision::DescribeThenContinue,
+            ProviderKind::Mock,
+            &config,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        assert_eq!(prepared.persisted_analyses.len(), 1);
+        let analysis = prepared.persisted_analyses[0].content_str().unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(analysis.split_once('\n').unwrap().1).unwrap();
+        assert!(record.as_object().unwrap().len() >= 7);
+        assert_eq!(record["snapshot_status"], "latest_retained_snapshot");
+        assert!(orca_core::conversation::is_internal_image_analysis(
+            analysis
+        ));
+        let mut historical = record.clone();
+        historical["snapshot_status"] = serde_json::json!("historical_snapshot");
+        historical["additional_observation"] = serde_json::json!({"elapsed_ms": 12});
+        let header = analysis.split_once('\n').unwrap().0.to_string();
+        for malformed in [
+            {
+                let mut r = record.clone();
+                r["grounding"] = serde_json::Value::Null;
+                r
+            },
+            {
+                let mut r = record.clone();
+                r["snapshot_status"] = serde_json::json!("current_live_window");
+                r
+            },
+            {
+                let mut r = record.clone();
+                r.as_object_mut().unwrap().remove("grounding");
+                r
+            },
+        ] {
+            let text = format!("{header}\n{malformed}");
+            let mut human = Conversation::new();
+            human.add_user("earlier".into());
+            human.add_user(text.clone());
+            assert_eq!(human.backtrack_last_user(), Some(text));
+        }
+        conversation.messages.extend(prepared.persisted_analyses);
+        conversation.add_user(format!("{header}\n{historical}"));
+        assert_eq!(conversation.last_user_message(), Some("find save"));
+        assert_eq!(
+            conversation.backtrack_last_user().as_deref(),
+            Some("find save")
+        );
+        assert!(conversation.messages.is_empty());
+    }
+
+    #[test]
     fn provider_turn_describes_images_before_calling_a_non_vision_model() {
         let mut lifecycle =
             crate::lifecycle::RuntimeSessionLifecycle::new("provider-image-route".to_string());
@@ -1822,24 +2367,31 @@ mod tests {
         let RuntimeProviderTurnOutput::Response(response) = result else {
             panic!("provider turn must return a response");
         };
-        assert!(
-            response
-                .response
-                .assistant_content
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Image #1: test image attachment")
-        );
+        assert!(response.response.error().is_none());
         assert!(conversation.messages.iter().any(|message| {
             matches!(
                 message,
-                Message::System { content, .. } if content.starts_with("[Image analysis:")
+                Message::User { content, .. } if content.starts_with("[Image analysis:")
+                    && content.contains("Image #1: test image attachment")
+                    && content.contains("untrusted_observation_data")
             )
+        }));
+        assert!(!conversation.messages.iter().any(|message| {
+            matches!(message, Message::System { content, .. }
+                if content.starts_with("[Image analysis:"))
         }));
         assert!(matches!(
             &conversation.messages[0],
             Message::User { images, .. } if images.len() == 1
         ));
+        assert_eq!(
+            conversation.backtrack_last_user().as_deref(),
+            Some("mock_system_echo")
+        );
+        assert!(
+            conversation.messages.is_empty(),
+            "backtrack removes the actual human image turn"
+        );
     }
 
     #[test]
@@ -1939,6 +2491,158 @@ mod tests {
     }
 
     #[test]
+    fn review_completion_append_failure_does_not_mutate_live_assistant_or_plan_age() {
+        use orca_core::event_schema::{EventEnvelope, EventPublicationStore};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Default)]
+        struct CompletionStore {
+            fail: AtomicBool,
+            committed: Mutex<Vec<EventEnvelope>>,
+        }
+        impl EventPublicationStore for CompletionStore {
+            fn reserve_through(&self, _next_seq_exclusive: u64) -> io::Result<()> {
+                Ok(())
+            }
+            fn append_semantic_event(&self, event: &EventEnvelope) -> io::Result<()> {
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err(io::Error::other("completion semantic append failed"));
+                }
+                self.committed.lock().unwrap().push(event.clone());
+                Ok(())
+            }
+        }
+
+        for tool_response in [false, true] {
+            let store = Arc::new(CompletionStore::default());
+            store.fail.store(true, Ordering::SeqCst);
+            let publication_store: Arc<dyn EventPublicationStore> = store.clone();
+            let mut events = EventFactory::with_publication_store(
+                "review-completion-append".into(),
+                0,
+                publication_store,
+            );
+            let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+            let mut conversation = Conversation::new();
+            conversation.add_user("original query".into());
+            conversation.replace_plan_state("[in_progress] finish work".into());
+            for _ in 1..orca_core::conversation::PLAN_REMINDER_AFTER_TURNS {
+                conversation.internal_context.note_assistant_turn();
+            }
+            let context_before = format!("{:?}", conversation.internal_context);
+            let config = config();
+            let cwd = tempfile::tempdir().unwrap();
+            let instructions = ProjectInstructions::default();
+            let memory = MemoryBlock::default();
+            let mcp_registry = McpRegistry::default();
+            let hooks = HookRunner::default();
+            let mut cost_tracker = CostTracker::new(None);
+            let cancel = CancelToken::new();
+            let task_registry = TaskRegistry::new("review-completion-append".into());
+            let mut background_workflows = Vec::new();
+            let mut sampling_state = RuntimeSamplingRequestState::new();
+            let policy = policy_for_tool_execution(&config);
+            let mut operation = OperationContext::for_tests(
+                orca_core::budget::BudgetSpec::default(),
+                "review-completion-append",
+            );
+            let response = runtime_response(ProviderResponse {
+                steps: vec![],
+                assistant_content: Some("completed response".into()),
+                assistant_reasoning: None,
+                tool_calls: if tool_response {
+                    vec![orca_core::conversation::RawToolCall {
+                        id: "call-review".into(),
+                        function_name: "read_file".into(),
+                        arguments: "{}".into(),
+                    }]
+                } else {
+                    vec![]
+                },
+                usage: None,
+            });
+            let mut step = RuntimeProviderResponseStep::new();
+            let mut handle = |response, conversation: &mut Conversation| {
+                step.handle(
+                    response,
+                    RuntimeProviderResponseInput {
+                        step_context: RuntimeStepContext::new(
+                            &config,
+                            cwd.path(),
+                            AgentToolPolicyContext::unrestricted(),
+                            0,
+                            true,
+                            &policy,
+                            &instructions,
+                            &memory,
+                            &mcp_registry,
+                            &hooks,
+                            &cancel,
+                            &task_registry,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        ),
+                        sampling_state: &mut sampling_state,
+                        operation: &mut operation,
+                        io: RuntimeProviderResponseIo {
+                            events: &mut events,
+                            sink: &mut sink,
+                            conversation,
+                            history_writer: None,
+                            cost_tracker: &mut cost_tracker,
+                            background_workflows: &mut background_workflows,
+                            checkpoint_observer: None,
+                        },
+                    },
+                    RuntimeProviderResponseExecutors {
+                        workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                        batch_child_executor: unused_child_executor::<io::Sink>,
+                    },
+                )
+            };
+            let error = match handle(response.clone(), &mut conversation) {
+                Err(error) => error,
+                Ok(_) => panic!("semantic completion append must fail"),
+            };
+            assert_eq!(error.to_string(), "completion semantic append failed");
+            assert_eq!(
+                conversation.messages.len(),
+                1,
+                "failed completion cannot leave a live-only assistant response"
+            );
+            assert!(
+                matches!(&conversation.messages[0], Message::User { content, .. }
+                if content == "original query")
+            );
+            assert_eq!(
+                format!("{:?}", conversation.internal_context),
+                context_before,
+                "failed completion must not advance plan age"
+            );
+            assert!(store.committed.lock().unwrap().is_empty());
+            if !tool_response {
+                store.fail.store(false, Ordering::SeqCst);
+                assert!(matches!(
+                    handle(response, &mut conversation).unwrap(),
+                    RuntimeProviderResponseOutcome::Success { .. }
+                ));
+                assert_eq!(
+                    conversation.messages.len(),
+                    2,
+                    "retry records the assistant exactly once"
+                );
+                assert_eq!(store.committed.lock().unwrap().len(), 1);
+            }
+            drop(handle);
+            assert!(tool_response || !sink.writer_mut().is_empty());
+        }
+    }
+
+    #[test]
     fn provider_response_step_records_final_assistant_message() {
         let config = config();
         let response = ProviderResponse {
@@ -1950,7 +2654,8 @@ mod tests {
         };
         let cwd = tempfile::tempdir().expect("cwd");
         let mut events = EventFactory::new("provider-response-final".to_string());
-        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
         let mut conversation = Conversation::new();
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
@@ -1982,9 +2687,15 @@ mod tests {
             None,
         );
 
+        let mut response = runtime_response(response);
+        response.observation = Some(crate::model_response::ProviderResponseObservation {
+            elapsed_ms: 300,
+            first_delta_ms: Some(275),
+            first_delta_kind: Some("text"),
+        });
         let outcome = RuntimeProviderResponseStep::new()
             .handle(
-                runtime_response(response),
+                response,
                 RuntimeProviderResponseInput {
                     step_context,
                     sampling_state: &mut sampling_state,
@@ -2021,6 +2732,28 @@ mod tests {
         assert!(
             matches!(&conversation.messages[0], Message::Assistant { content, tool_calls, .. }
                 if content.as_deref() == Some("done") && tool_calls.is_empty())
+        );
+
+        drop(sink);
+        let completed: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["type"] == "model.response.completed")
+            .collect();
+        assert_eq!(
+            completed.len(),
+            1,
+            "emit one enriched canonical completion event"
+        );
+        assert_eq!(completed[0]["payload"]["observation"]["elapsed_ms"], 300);
+        assert_eq!(
+            completed[0]["payload"]["observation"]["first_delta_ms"],
+            275
+        );
+        assert_eq!(
+            completed[0]["payload"]["observation"]["first_delta_kind"],
+            "text"
         );
     }
 

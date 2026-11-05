@@ -11,5 +11,6 @@
   "limits": {"wall_seconds": 600, "verify_seconds": 180},
   "anti_cheat": ["tests_unmodified"],
   "diagnostics": ["workspace_diff", "test_log", "trajectory"],
+  "readonly_inputs": ["tests"],
   "provider": "deepseek"
 }

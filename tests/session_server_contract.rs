@@ -6200,9 +6200,12 @@ fn server_mode_command_exec_read_drains_streaming_output() {
     let workspace = tempdir().expect("workspace");
     let release_marker = workspace.path().join("command-release");
     let release_marker_arg = release_marker.to_str().expect("release marker path");
+    let stderr_marker = workspace.path().join("command-stderr-release");
+    let stderr_marker_arg = stderr_marker.to_str().expect("stderr marker path");
     let windows_command = format!(
-        "while (!(Test-Path -LiteralPath {})) {{ Start-Sleep -Milliseconds 50 }}; Write-Host -NoNewline 'read-out'; Write-Error 'read-err'; Start-Sleep -Seconds 30",
-        powershell_path(&release_marker)
+        "while (!(Test-Path -LiteralPath {})) {{ Start-Sleep -Milliseconds 50 }}; Write-Host -NoNewline 'read-out'; while (!(Test-Path -LiteralPath {})) {{ Start-Sleep -Milliseconds 50 }}; Write-Error 'read-err'; Start-Sleep -Seconds 30",
+        powershell_path(&release_marker),
+        powershell_path(&stderr_marker)
     );
     let mut child = orca_command()
         .args([
@@ -6226,9 +6229,9 @@ fn server_mode_command_exec_read_drains_streaming_output() {
             "method": "command/exec",
             "params": {
                 "command": platform_command_with_args(
-                    "while [ ! -e \"$1\" ]; do sleep 0.05; done; printf 'read-out'; printf 'read-err' >&2; sleep 30",
+                    "while [ ! -e \"$1\" ]; do sleep 0.05; done; printf 'read-out'; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf 'read-err' >&2; sleep 30",
                     &windows_command,
-                    &[release_marker_arg]
+                    &[release_marker_arg, stderr_marker_arg]
                 ),
                 "processId": "read-1",
                 "streamStdoutStderr": true
@@ -6239,7 +6242,6 @@ fn server_mode_command_exec_read_drains_streaming_output() {
     }
     let started = child.expect_event("cmd", "command_exec_started");
     assert_eq!(started["processId"], "read-1");
-    std::fs::write(&release_marker, "release").expect("write release marker");
 
     {
         let stdin = child.stdin_mut();
@@ -6258,6 +6260,15 @@ fn server_mode_command_exec_read_drains_streaming_output() {
         .expect("command_exec_read event");
     assert_eq!(read_ack["processId"], "read-1");
     assert_eq!(read_ack["status"], "running");
+    // Release stdout only after the read acknowledgement, then stderr only after
+    // stdout is observed. The streams cannot accidentally arrive in one read.
+    std::fs::write(&release_marker, "release").expect("write release marker");
+    read_events.extend(read_command_exec_output_until(
+        &mut child,
+        "read-1",
+        |stdout, _stderr| stdout.contains("read-out"),
+    ));
+    std::fs::write(&stderr_marker, "release").expect("write stderr marker");
     let saw_stdout = command_exec_events_contain(&read_events, "stdout", "read-out");
     let saw_stderr = command_exec_events_contain(&read_events, "stderr", "read-err");
     if !saw_stdout || !saw_stderr {
@@ -10287,20 +10298,46 @@ fn read_command_exec_output_until(
 ) -> Vec<Value> {
     let mut stdout_text = String::new();
     let mut stderr_text = String::new();
-    client.drain_events_until_matching("command/exec streaming output", |event| {
-        if event["event"] == "command_exec_output_delta" && event["processId"] == process_id {
-            let stream = event["stream"].as_str().unwrap_or_default();
-            let delta = event["delta"].as_str().unwrap_or_default();
-            match stream {
-                "stdout" => stdout_text.push_str(delta),
-                "stderr" => stderr_text.push_str(delta),
-                other => panic!("unexpected command/exec stream {other}: {event}"),
+    let mut collected = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    // Each read returns on its first output. Keep polling for later chunks; the
+    // server's input loop does not push output while it waits for a new request.
+    static NEXT_POLL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let poll_id = NEXT_POLL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let request_id = format!("command-read-poll-{process_id}-{poll_id}");
+        let request = json!({
+            "id": request_id,
+            "method": "command/exec/read",
+            "params": {"processId": process_id, "timeoutMs": 100}
+        });
+        let stdin = client.stdin_mut();
+        writeln!(stdin, "{request}").expect("write command/exec/read poll");
+        stdin.flush().expect("flush command/exec/read poll");
+        let events = client.drain_events_until_event_or_error(&request_id, "command_exec_read");
+        for event in &events {
+            assert!(
+                event["id"] != request_id || event["event"] != "error",
+                "command/exec/read poll failed: {event}"
+            );
+            if event["event"] == "command_exec_output_delta" && event["processId"] == process_id {
+                let delta = event["delta"].as_str().unwrap_or_default();
+                match event["stream"].as_str().unwrap_or_default() {
+                    "stdout" => stdout_text.push_str(delta),
+                    "stderr" => stderr_text.push_str(delta),
+                    other => panic!("unexpected command/exec stream {other}: {event}"),
+                }
             }
-            predicate(&stdout_text, &stderr_text)
-        } else {
-            false
         }
-    })
+        collected.extend(events);
+        if predicate(&stdout_text, &stderr_text) {
+            return collected;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "command/exec/read did not observe expected output before deadline; events={collected:?}"
+        );
+    }
 }
 
 fn assert_command_exec_delta_seen(events: &[Value], stream: &str, expected_delta: &str) {

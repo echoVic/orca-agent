@@ -88,6 +88,30 @@
       "crates/orca-core/src/workspace_identity.rs",
       "unix_libc_process",
       2
+    ],
+    [
+      "thread-store-completion-unix-api",
+      "crates/orca-runtime/src/thread_store/writer.rs",
+      "unix_std_api",
+      3
+    ],
+    [
+      "thread-store-completion-nofollow-flags",
+      "crates/orca-runtime/src/thread_store/writer.rs",
+      "unix_libc_process",
+      2
+    ],
+    [
+      "workspace-observation-safe-unix-traversal",
+      "crates/orca-runtime/src/workspace_observation.rs",
+      "unix_std_api",
+      7
+    ],
+    [
+      "workspace-observation-nofollow-flags",
+      "crates/orca-runtime/src/workspace_observation.rs",
+      "unix_libc_process",
+      3
     ]
   ],
   "deferred_boundaries": [

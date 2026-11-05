@@ -2487,28 +2487,92 @@ mod tests {
     fn drop_joins_supervisor_and_kills_process_tree() {
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("leaked");
+        let ready = temp.path().join("ready");
+        let release = temp.path().join("release");
         let overlay = TurnPermissionOverlay::default();
         let (service, _) = service(temp.path());
+        let command = match orca_platform::shell::ShellResolver::for_current_host()
+            .resolve_from_environment()
+            .expect("resolve host shell")
+            .kind()
+        {
+            orca_platform::shell::ShellKind::Posix | orca_platform::shell::ShellKind::GitBash => {
+                "(printf ready > ready; while [ ! -e release ]; do sleep 0.01; done; printf leaked > leaked) & wait"
+            }
+            orca_platform::shell::ShellKind::PowerShell(_) => {
+                "$shell = (Get-Process -Id $PID).Path; $child = Start-Process $shell -WorkingDirectory (Get-Location).Path -PassThru -ArgumentList '-NoProfile', '-Command', 'Set-Content ready ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content leaked leaked'; $child.WaitForExit()"
+            }
+            orca_platform::shell::ShellKind::Cmd => {
+                std::fs::write(
+                    temp.path().join("stop-child.cmd"),
+                    "@echo off\r\n>ready echo ready\r\n:waiting\r\nif exist release goto released\r\ngoto waiting\r\n:released\r\n>leaked echo leaked\r\n",
+                )
+                .expect("write native Cmd child fixture");
+                "cmd.exe /D /C stop-child.cmd & ver > nul"
+            }
+        };
         let started = start(
             &service,
-            request(
-                "(sleep 0.5; printf leaked > leaked) & wait",
-                temp.path(),
-                &overlay,
-                ShellTerminalMode::pipe(),
-            ),
+            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
             Duration::from_millis(50),
             8 * 1024,
             || false,
         )
         .expect("start process tree");
         assert_eq!(started.status, "running", "{started:?}");
-
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "background child never became ready"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!marker.exists(), "child wrote before the shutdown boundary");
+        // A fixed sleep in the child can expire before Drop runs on a busy host.
+        // Release it only after shutdown returns, so a marker proves survival.
         drop(service);
+        std::fs::write(release, "release").expect("release any surviving child");
         thread::sleep(Duration::from_millis(700));
         assert!(
             !marker.exists(),
             "background child survived service shutdown"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drop_process_tree_fixture_accepts_available_native_windows_shells() {
+        let resolver = orca_platform::shell::ShellResolver::for_current_host();
+        let mut checked = 0;
+        for candidate in ["pwsh.exe", "powershell.exe", "cmd.exe"] {
+            let Ok(shell) = resolver.resolve(Some(candidate)) else {
+                continue;
+            };
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "terminal_service::tests::drop_joins_supervisor_and_kills_process_tree",
+                    "--nocapture",
+                ])
+                .env("ORCA_SHELL", shell.executable())
+                .output()
+                .expect("run shutdown fixture with the resolved native shell");
+            assert!(
+                output.status.success(),
+                "{candidate}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{candidate}: the exact shutdown regression must actually run"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "at least one native Windows shell must be available"
         );
     }
 

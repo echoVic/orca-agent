@@ -164,6 +164,22 @@ including whitespace. A merged event keeps the first event's envelope, so `seq`
 values remain monotonic but may skip values. `model.response.completed` carries
 the full response text in `assistant_reasoning` and `assistant_content`.
 
+Its optional `payload.observation` reports logical provider `elapsed_ms`,
+`first_delta_ms`, and `first_delta_kind` (`reasoning`, `text`, or `tool`). The
+first delta is the first delivered nonempty reasoning/text or tool event and
+may precede visible answer text. Missing deltas remain null; these values do
+not isolate transport latency, model latency, or runtime overhead.
+
+`context.compacted.payload.observation` reports local `before_tokens_est` and
+`after_tokens_est`, elapsed time, summary requests with outcome and returned
+usage, and local prefix reuse estimates. Runtime adds confirmed summary cost
+estimates and service cache ratios. Failed, cancelled, and rejected summaries
+retain known usage. Local prefix estimates are distinct from service cache
+metadata. Missing usage stays null and incomplete totals are labelled; summary
+cost is separate from the main cumulative attempt cost stream and is not charged
+to the runtime operation cost counter. Summary requests still share operation
+cancellation and deadline controls.
+
 ## Event Types
 
 - `session.started`
@@ -202,10 +218,14 @@ context compaction and background provider handoff; later user turns count only
 new writes. Writes made through shell commands are not detected. This field does
 not affect the status or exit code.
 
-When the run recorded history, the same event also carries the durable
-`session_id` (the id a subsequent `orca exec resume <session_id>` accepts), so
-a harness can continue a budget-exhausted or failed session without parsing the
-transcript. In text mode, a non-success exit prints the exact resume command:
+The event explicitly reports `resumable`. It is true only after the completion
+record has been successfully synced to saved history and a `session_id` is
+available. `resume` then contains `session_id` and the command prefix
+`orca exec resume`; pass the id as a separate argument and, when needed, the
+answer as the following prompt. Otherwise `resume_unavailable_reason` explains
+`history_disabled`, `history_write_failed`, or `history_not_confirmed` for a
+completion emitted outside the normal turn commit path. An allocated id alone
+is not recovery evidence. In text mode, a non-success exit prints the resume command:
 
 ```text
 To continue this session, run: orca exec resume <session-id>
@@ -219,6 +239,31 @@ run's prompt, alongside the recorded `report_blocker` call. JSONL runs need
 `session.completed`. Text output prints `Question: <question>` after the
 `blocked: <kind> — <summary>` line and adds `"<your answer>"` to the resume hint.
 Without recorded history, it prints the reason and question without a resume hint.
+
+JSONL completion also carries `workspace_observation`, a best-effort content
+hash comparison of the workspace before and after the logical turn. Its
+`changed` value describes net changes and `attribution` is always `unknown`:
+shell commands, another process, or another task can change the same workspace.
+A write followed by restoration is no net change. This evidence is independent
+of `writes_applied`, verification, status, and exit code.
+
+Observation is bounded to 8,192 entries, 32 MiB total, 2 MiB per file, depth 32
+and 250 ms per snapshot. It excludes `.git`, `target`, `node_modules`, and
+`.orca`; symlinks and special files are not followed. All filesystem operations run in a background observer. A deadline returns incomplete evidence without waiting for a stalled read; at most one observer per process may remain outstanding. Further observations report `observation_worker_busy` until it finishes. `excluded_directories`
+and `limitations` expose the scope. Apple, Linux and Android traversal uses directory
+handles and no-follow opens with identity checks. Other targets currently return
+`safe_directory_traversal_unavailable` with no file evidence. `complete: false` prevents a negative claim:
+`changed` is null when an incomplete scan found no comparable hash delta.
+It reports hashes and relative paths, never file contents. TUI turns and turns
+without JSONL completion do not incur workspace scans.
+
+`blockers` aggregates current unresolved blocked tasks within the current task
+tree, including descendants reloaded from persistent worker records. Each entry
+contains `task_id`, `parent_task_id`, `kind`, `summary`, optional `question`,
+evidence and `resolution: unresolved`. Old records without structured details
+report unknown kind instead of guessing from error text. Tasks that have since
+completed or retried are excluded. A blocked child does not by itself change the
+parent's final status; the parent may complete independent work.
 
 A resumed run appends to the original transcript and owns a fresh budget scope:
 the previous invocation's `max_budget` ceiling does not carry over, while its
@@ -404,7 +449,7 @@ The default (and only production) provider is DeepSeek. Internal test providers 
   from ACP plus TUI clipboard images, dragged or pasted paths/`file://` URLs,
   and image file mentions. Flash, including an unset or `auto` model (which
   routes to `deepseek-flash`), receives images directly; Pro first persists a
-  task-aware Flash vision analysis, strips unsupported binary blocks from the
+  task-aware Flash vision analysis as untrusted User data, including tool snapshots, strips unsupported binary blocks from the
   coding-model request, and fails the complete turn if analysis fails.
 - TUI clipboard input: background decoding produces fenced `[Image #N]`
   attachments that survive queueing, queue edits, and submission rejection;
@@ -414,7 +459,7 @@ The default (and only production) provider is DeepSeek. Internal test providers 
   zoomable and pannable viewer.
 - Streaming: SSE with real-time reasoning/content deltas
 - Authentication: `DEEPSEEK_API_KEY` (required)
-- HTTP retry: 3 attempts with exponential backoff for 429/5xx status codes
+- HTTP retry: up to 3 retries after the initial send, with exponential backoff and integer/date `Retry-After`; runtime, transport and response recovery share a logical send/wait budget. Same-process endpoint-path and credential digests share 429/503 cooldown.
 - Timeout: 30s connect, 120s request, 300s streaming
 - `finish_reason=length` → error (response truncated)
 - `finish_reason=content_filter` → error (content blocked)

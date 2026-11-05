@@ -27,7 +27,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 sys.path.insert(0, str(HERE))
 
-from lib import backend, metrics, report, scenario  # noqa: E402
+from lib import backend, metrics, report, scenario, evidence  # noqa: E402
 from axes import axis_a  # noqa: E402
 
 SCENARIO_ROOT = HERE / "scenarios"
@@ -44,13 +44,26 @@ def binary_sha(path: Path) -> str | None:
 
 
 def protocol(args, binary: Path) -> dict:
-    return {
-        "source_commit": subprocess_output(["git", "rev-parse", "--short", "HEAD"]) or "unknown",
-        "binary": str(binary),
-        "binary_sha256": (binary_sha(binary) or "unknown")[:16],
-        "model": "deepseek-flash (effort max)" if (args.provider or "") != "mock" else "mock",
-        "host": sys.platform,
-    }
+    block = evidence.execution_protocol(evidence.execution_config(args=args))
+    block.update(source_commit=subprocess_output(["git", "rev-parse", "HEAD"]) or "unknown",
+                 binary=str(binary), binary_sha256=binary_sha(binary) or "unknown", host=sys.platform)
+    block["provider"] = args.provider or "scenario value"
+    return block
+
+
+def dry_run(args, items, binary):
+    out = Path(args.out)
+    if not out.is_absolute(): out = REPO / out
+    out = out / f"plan-{time.time_ns()}"
+    out.mkdir(parents=True, exist_ok=True)
+    plan = {"execution": "dry-run", "protocol": protocol(args, binary),
+            "evaluation": evidence.suite_metadata(items, args),
+            "scenarios": [{"id": item.id, "backend": item.backend, "provider": args.provider or item.provider,
+                           "protocol": evidence.execution_protocol(evidence.execution_config(item, args)),
+                           "identity": evidence.scenario_identity(item)} for item in items]}
+    (out / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+    print(f"dry run: {out / 'plan.json'}")
+    return 0
 
 
 def subprocess_output(command: list[str]) -> str | None:
@@ -104,9 +117,11 @@ def run_axis_a(args) -> int:
 
 def run_scenarios(args, scenarios: list[scenario.Scenario], binary: Path) -> dict:
     started = time.strftime("%Y-%m-%dT%H:%M:%S")
-    run_id = time.strftime("%Y%m%d-%H%M%S")
+    run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1000000000:09d}"
     out = (Path(args.out) if Path(args.out).is_absolute() else REPO / args.out) / run_id
     out.mkdir(parents=True, exist_ok=True)
+    evaluation = evidence.suite_metadata(scenarios, args)
+    configs = {item.id: evidence.execution_config(item, args) for item in scenarios}
     pairs = []
     product_findings: list[tuple[str, str]] = []
     spent_usd = 0.0
@@ -117,12 +132,13 @@ def run_scenarios(args, scenarios: list[scenario.Scenario], binary: Path) -> dic
             break
         attempts = []
         for attempt_index in range(args.k):
+            if spent_usd >= spent_limit: break
             attempt_dir = out / "per-scenario" / item.id / f"attempt-{attempt_index + 1}"
             if item.backend not in ("local", "docker"):
                 print(f"skip {item.id}: backend `{item.backend}` not implemented yet", flush=True)
                 continue
             runner = backend.run_docker if item.backend == "docker" else backend.run_local
-            attempt = runner(item, attempt_dir, binary=binary, provider=args.provider)
+            attempt = runner(item, attempt_dir, binary=binary, provider=args.provider, execution=configs[item.id])
             spent_usd += (
                 attempt.cost_usd
                 if attempt.cost_usd is not None
@@ -149,11 +165,9 @@ def run_scenarios(args, scenarios: list[scenario.Scenario], binary: Path) -> dic
                     attempts,
                 )
             )
-    providers = {item.provider for item in scenarios}
     protocol_block = protocol(args, binary)
-    protocol_block["model"] = "mock" if providers == {"mock"} else "deepseek-flash (effort max)"
     run = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run_id,
         "started_at": started,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -161,7 +175,10 @@ def run_scenarios(args, scenarios: list[scenario.Scenario], binary: Path) -> dic
         "k": args.k,
         "out": str(out),
         "protocol": protocol_block,
-        "spend_usd": round(spent_usd, 3),
+        "evaluation": evaluation,
+        "budget_spend_usd_estimate": round(spent_usd, 6),
+        "budget_spend_basis": "observed cost when available; fallback token pricing for stop guard only",
+        "cost": metrics.cost_per_pass([a for _, attempts in pairs for a in attempts]),
         "summary": report.summarize(pairs),
         "product_findings": product_findings,
         "scenarios": [
@@ -180,6 +197,7 @@ def run_scenarios(args, scenarios: list[scenario.Scenario], binary: Path) -> dic
         baseline = report.latest_run(root, exclude=run["run_id"]) if args.against == "last" else _find_run(root, args.against)
         if baseline:
             run["diff"] = report.diff(run, baseline)
+    run["aggregation"] = report.aggregate_runs([run])
     report.write(out, run)
     print(f"\nreport: {out/'report.md'}")
     if args.record:
@@ -241,6 +259,17 @@ def main() -> int:
     parser.add_argument("--binary", default=str(backend.DEFAULT_BINARY))
     parser.add_argument("--provider", default=None, help="mock | deepseek (default: scenario value)")
     parser.add_argument("--out", default=str(DEFAULT_OUT))
+    parser.add_argument("--model", help="requested model passed to the execution backend")
+    parser.add_argument("--reasoning-effort", choices=["low", "high", "max"])
+    parser.add_argument("--endpoint", help="base URL; reports retain only origin")
+    parser.add_argument("--max-turns", type=int)
+    parser.add_argument("--max-tool-calls", type=int)
+    parser.add_argument("--max-cost-usd", type=float)
+    parser.add_argument("--max-wall-time-secs", type=int)
+    parser.add_argument("--split", choices=["holdout", "tuning"], default=None)
+    parser.add_argument("--suite-id", default=None)
+    parser.add_argument("--dry-run", action="store_true", help="write metadata/plan without starting binary or provider")
+    parser.add_argument("--aggregate", action="append", help="existing run root to aggregate, repeatable; no execution")
     parser.add_argument("--record", action="store_true", help="append the scoreboard and a dated report")
     parser.add_argument("--max-usd", type=float, default=None,
                         help="stop before the next scenario when the estimated spend exceeds this")
@@ -252,6 +281,15 @@ def main() -> int:
     parser.add_argument("--issue", help="print an issue body for a scenario from the latest run")
     args = parser.parse_args()
 
+    if args.aggregate:
+        roots = dict.fromkeys(Path(directory).resolve() for directory in args.aggregate)
+        seen_paths = set()
+        runs = [r for directory in roots for r in report.load_runs(directory, seen_paths)]
+        output = Path(args.out)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "aggregate.json").write_text(json.dumps(report.aggregate_runs(runs), indent=2) + "\n")
+        print(f"aggregation: {output / 'aggregate.json'}")
+        return 0
     discovered = scenario.discover(SCENARIO_ROOT)
     if args.list:
         for item in discovered:
@@ -265,10 +303,11 @@ def main() -> int:
         return run_axis_a(args)
 
     binary = Path(args.binary)
-    if not binary.exists():
+    if not binary.exists() and not args.dry_run:
         print(f"binary not found: {binary}", file=sys.stderr)
         return 2
-    args.k = args.k or PROFILES[args.profile]
+    args.k = args.k if args.k is not None else PROFILES[args.profile]
+    if args.k < 1: parser.error("--k must be positive")
 
     if args.failures == "last":
         root = args.out if Path(args.out).is_absolute() else REPO / args.out
@@ -292,6 +331,7 @@ def main() -> int:
     if args.profile == "smoke" and len(selected) > 5:
         print(f"smoke profile covers at most 5 scenarios (selected {len(selected)})", file=sys.stderr)
         return 2
+    if args.dry_run: return dry_run(args, selected, binary)
     run_scenarios(args, selected, binary)
     return 0
 

@@ -2215,6 +2215,7 @@ mod tests {
 
         let result = RuntimeTurnOpeningStep::new()
             .open(RuntimeTurnOpeningInput {
+                cancel: &CancelToken::new(),
                 actor: &mut actor,
                 operation: &mut crate::operation_context::OperationContext::for_tests(
                     orca_core::budget::BudgetSpec::default(),
@@ -2298,6 +2299,7 @@ mod tests {
 
         let result = RuntimeTurnOpeningStep::new()
             .open(RuntimeTurnOpeningInput {
+                cancel: &CancelToken::new(),
                 actor: &mut actor,
                 operation: &mut crate::operation_context::OperationContext::for_tests(
                     orca_core::budget::BudgetSpec::default(),
@@ -2393,6 +2395,7 @@ mod tests {
 
             let result = RuntimeTurnOpeningStep::new()
                 .open(RuntimeTurnOpeningInput {
+                    cancel: &CancelToken::new(),
                     actor: &mut actor,
                     operation: &mut crate::operation_context::OperationContext::for_tests(
                         orca_core::budget::BudgetSpec::default(),

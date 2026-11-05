@@ -24,6 +24,7 @@ mod child_permission;
 pub mod command;
 pub mod compaction;
 mod computer_use;
+mod workspace_observation;
 pub use compaction::{
     TuiAgentProviderErrorAction, TuiAgentTurnCompactionInput, TuiAgentTurnCompactionOutcome,
     TuiAgentTurnCompactionState, handle_tui_agent_provider_error, run_tui_agent_turn_compaction,

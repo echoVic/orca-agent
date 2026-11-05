@@ -12,7 +12,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orca_core::budget::{BudgetSpec, BudgetStop, BudgetUsage, OperationTerminal};
 
@@ -288,6 +288,26 @@ impl OperationContext {
         self.append_budget_usage("", None)?;
         self.journal.flush()?;
         Ok(result)
+    }
+
+    /// Capture one deadline for the entire bounded activity, after refreshing
+    /// live usage. A finite duration that Instant cannot represent must not
+    /// silently become an unlimited budget.
+    pub(crate) fn remaining_deadline(&mut self) -> io::Result<Option<Instant>> {
+        let _ = self.controller.sync_wall_time();
+        let Some(limit) = self.controller.spec().max_wall_time_ms else {
+            return Ok(None);
+        };
+        let remaining = limit.saturating_sub(self.controller.usage().wall_time_ms);
+        Instant::now()
+            .checked_add(Duration::from_millis(remaining))
+            .map(Some)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "operation wall-time deadline cannot be represented",
+                )
+            })
     }
 
     fn child_budget_path(&self) -> PathBuf {

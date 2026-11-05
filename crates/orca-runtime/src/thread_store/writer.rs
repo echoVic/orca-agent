@@ -129,6 +129,44 @@ pub(crate) fn write_prompt_queue_snapshot(
     write_durable_record(path, &SessionRecord::PromptQueueSnapshot(snapshot.clone()))
 }
 
+fn open_completion_history_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT, matching the no-follow resume reader.
+        options.custom_flags(0x0020_0000);
+        // Exclude FILE_SHARE_DELETE so recovery cannot read a replacement
+        // while completion validates and writes the pinned transcript.
+        options.share_mode(0x0000_0001 | 0x0000_0002);
+    }
+    let file = options.open(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT: reject the opened object before reading or writing.
+        if file.metadata()?.file_attributes() & 0x0000_0400 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "history is a reparse point",
+            ));
+        }
+    }
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "history is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1010,7 +1048,11 @@ fn redact_keyed_secret_values(value: &str) -> String {
         let content_end = if let Some(quote) = quote {
             quoted_value_end(bytes, content_start, quote)
         } else {
-            unquoted_value_end(bytes, content_start)
+            unquoted_value_end(
+                bytes,
+                content_start,
+                key_is_in_url_query(&value[..key_start]),
+            )
         };
         if content_start == content_end {
             index += 1;
@@ -1036,7 +1078,9 @@ fn key_start_before_delimiter(bytes: &[u8], delimiter_index: usize) -> usize {
     let mut start = delimiter_index;
     while start > 0 {
         let previous = bytes[start - 1];
-        if previous.is_ascii_whitespace() || matches!(previous, b'{' | b'[' | b',' | b';' | b'(') {
+        if previous.is_ascii_whitespace()
+            || matches!(previous, b'{' | b'[' | b',' | b';' | b'(' | b'?' | b'&')
+        {
             break;
         }
         start -= 1;
@@ -1083,10 +1127,27 @@ fn quoted_value_end(bytes: &[u8], mut index: usize, quote: u8) -> usize {
     index
 }
 
-fn unquoted_value_end(bytes: &[u8], mut index: usize) -> usize {
+fn key_is_in_url_query(prefix: &str) -> bool {
+    let token = prefix
+        .rsplit(|ch: char| {
+            ch.is_whitespace() || matches!(ch, '\"' | '\'' | '{' | '[' | '(' | ',' | ';')
+        })
+        .next()
+        .unwrap_or(prefix);
+    let Some(scheme_end) = token.find("://") else {
+        return false;
+    };
+    let Some(query_start) = token.find('?') else {
+        return false;
+    };
+    scheme_end < query_start && !token.contains('#')
+}
+
+fn unquoted_value_end(bytes: &[u8], mut index: usize, url_query: bool) -> usize {
     while index < bytes.len()
         && !bytes[index].is_ascii_whitespace()
         && !matches!(bytes[index], b',' | b'}' | b']' | b';')
+        && !(url_query && matches!(bytes[index], b'&' | b'#'))
     {
         index += 1;
     }
@@ -1430,14 +1491,84 @@ impl SessionWriter {
     }
 
     pub fn complete_with_error(&mut self, status: &str, error: Option<&str>) -> io::Result<()> {
-        write_record(
+        // Keep lock order identical to conversation appends (ledger, then file).
+        let records = self
+            .conversation_records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let expected_boundary = records
+            .iter()
+            .rev()
+            .find_map(|record| record.item_id.as_ref().map(|id| id.as_str().to_string()));
+        // Completion may attest resumability only after checking the transcript
+        // under its append lock. Recreating a deleted/truncated log is insufficient.
+        let _lock = acquire_file_lock(&self.path)?;
+        let mut file = open_completion_history_file(&self.path)?;
+        if let Some(expected_session) = &self.session_id {
+            let mut meta_matches = false;
+            let mut boundary_present = expected_boundary.is_none();
+            let snapshot =
+                super::reader::SessionRecordSnapshot::from_file(&self.path, file.try_clone()?)?;
+            for candidate in snapshot.records(HydrateImages::NotToolMessages)? {
+                match candidate? {
+                    SessionRecord::Meta(meta) => {
+                        if meta.session_id != *expected_session {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "history session metadata changed",
+                            ));
+                        }
+                        meta_matches = true;
+                    }
+                    SessionRecord::Message { id, .. } => {
+                        boundary_present |=
+                            id.as_ref().map(|id| id.as_str()) == expected_boundary.as_deref();
+                    }
+                    SessionRecord::SemanticEvent { event } => {
+                        if let Some(record) = conversation_record_from_semantic_event(&event)? {
+                            boundary_present |= record.item_id.as_ref().map(|id| id.as_str())
+                                == expected_boundary.as_deref();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !meta_matches || !boundary_present {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "history metadata or resume boundary missing",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let opened = file.metadata()?;
+                let current = open_regular_history_file(&self.path)?.metadata()?;
+                if opened.dev() != current.dev() || opened.ino() != current.ino() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "history file replaced during completion",
+                    ));
+                }
+            }
+        }
+        // Repair is a mutation: reject invalid recovery evidence first.
+        repair_incomplete_final_record(&mut file)?;
+        let line = encode_record_line(
             &self.path,
             &SessionRecord::Completed {
                 status: status.to_string(),
                 completed_at: Utc::now(),
                 error: error.map(str::to_string),
             },
-        )
+        )?;
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&line)?;
+        file.flush()?;
+        file.sync_data()?;
+        #[cfg(not(test))]
+        let _ = session_index::touch_path_force(&self.path);
+        Ok(())
     }
 
     pub(crate) fn append_checkpoint(
@@ -1865,6 +1996,142 @@ mod tests {
             session_id: None,
         };
         (directory, path, writer)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn completion_handle_prevents_transcript_replacement_until_closed() {
+        let (_directory, path, _writer) = new_transcript();
+        let pinned = open_completion_history_file(&path).unwrap();
+        let renamed = path.with_extension("renamed.jsonl");
+        assert!(
+            fs::rename(&path, &renamed).is_err(),
+            "open completion handle must deny delete sharing"
+        );
+        drop(pinned);
+        fs::rename(&path, &renamed).unwrap();
+    }
+
+    #[test]
+    fn completion_repairs_a_valid_recovery_tail_after_validation() {
+        for partial in [false, true] {
+            let (_directory, path, mut writer) = new_transcript();
+            writer.session_id = Some("resume-usage".into());
+            writer.enter_turn(TurnId::new());
+            writer
+                .append_message(&Message::user("durable boundary".into()))
+                .unwrap();
+            let mut bytes = fs::read(&path).unwrap();
+            if partial {
+                bytes.extend_from_slice(b"{\"type\":\"session.usage\"");
+            } else {
+                assert_eq!(bytes.pop(), Some(b'\n'));
+            }
+            fs::write(&path, bytes).unwrap();
+            writer.complete("failed").unwrap();
+            assert!(matches!(read_records(&path).unwrap().last(),
+                Some(SessionRecord::Completed { status, .. }) if status == "failed"));
+        }
+    }
+
+    #[test]
+    fn completion_rejection_preserves_unterminated_history_bytes() {
+        for mismatched_meta in [false, true] {
+            for tail in [b"{\"type\":\"usage\"".as_slice(), b"{}".as_slice()] {
+                let (_directory, path, mut writer) = new_transcript();
+                writer.session_id = Some("resume-usage".into());
+                let original_meta = fs::read(&path).unwrap();
+                writer.enter_turn(TurnId::new());
+                writer
+                    .append_message(&Message::user("durable boundary".into()))
+                    .unwrap();
+                let mut replacement = if mismatched_meta {
+                    String::from_utf8(fs::read(&path).unwrap())
+                        .unwrap()
+                        .replace("resume-usage", "different-session")
+                        .into_bytes()
+                } else {
+                    original_meta
+                };
+                replacement.extend_from_slice(tail);
+                fs::write(&path, &replacement).unwrap();
+                assert!(writer.complete("failed").is_err());
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    replacement,
+                    "rejecting invalid recovery evidence must not repair or truncate its bytes"
+                );
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn completion_rejects_symlink_history_like_the_resume_reader() {
+        let (_directory, path, mut writer) = new_transcript();
+        writer.session_id = Some("resume-usage".into());
+        writer.enter_turn(TurnId::new());
+        writer
+            .append_message(&Message::user("durable boundary".into()))
+            .unwrap();
+        let target = path.with_extension("target.jsonl");
+        fs::rename(&path, &target).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &path) {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                return; // Windows without symlink privilege cannot construct this fixture.
+            }
+            panic!("create reparse fixture: {error}");
+        }
+        assert!(open_history_reader(&path).is_err());
+        let before = fs::read(&target).unwrap();
+        assert!(writer.complete("success").is_err());
+        assert_eq!(fs::read(&target).unwrap(), before);
+    }
+
+    #[test]
+    fn completion_rejects_missing_or_changed_recovery_records() {
+        for damage in ["deleted", "truncated", "metadata", "boundary"] {
+            let (_directory, path, mut writer) = new_transcript();
+            writer.session_id = Some("resume-usage".into());
+            writer.enter_turn(TurnId::new());
+            writer
+                .append_message(&Message::user("durable boundary".to_string()))
+                .unwrap();
+            let mut meta = read_session_meta(&path).unwrap();
+            match damage {
+                "deleted" => fs::remove_file(&path).unwrap(),
+                "truncated" => fs::write(&path, "").unwrap(),
+                "metadata" => {
+                    meta.session_id = "different-session".into();
+                    rewrite_records_unlocked(&path, [Ok(SessionRecord::Meta(meta))]).unwrap();
+                }
+                "boundary" => {
+                    rewrite_records_unlocked(&path, [Ok(SessionRecord::Meta(meta))]).unwrap()
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                writer.complete("success").is_err(),
+                "accepted {damage} history"
+            );
+            if damage == "deleted" {
+                assert!(!path.exists(), "completion recreated deleted log");
+            }
+        }
+        let (_directory, path, mut writer) = new_transcript();
+        writer.session_id = Some("resume-usage".into());
+        writer.enter_turn(TurnId::new());
+        writer
+            .append_message(&Message::user("durable boundary".to_string()))
+            .unwrap();
+        writer.complete("success").unwrap();
+        assert_eq!(
+            read_transcript(&path).unwrap().meta.session_id,
+            "resume-usage"
+        );
     }
 
     #[test]
@@ -2462,6 +2729,44 @@ mod tests {
         assert_eq!(
             redact_sensitive_text(r#"{"refresh_token": "abc"}"#),
             r#"{"refresh_token": "<redacted>"}"#
+        );
+    }
+
+    #[test]
+    fn non_url_keyed_values_redact_the_entire_value_with_query_punctuation() {
+        assert_eq!(
+            redact_keyed_secret_values("api_key=ordinary&suffix#remainder"),
+            "api_key=<redacted>"
+        );
+        assert_eq!(
+            redact_keyed_secret_values("token: ordinary#remainder&suffix"),
+            "token: <redacted>"
+        );
+    }
+
+    #[test]
+    fn sensitive_url_query_values_are_redacted_without_erasing_other_parameters() {
+        // Encode credential bytes so reserved query punctuation remains in the
+        // value, rather than becoming a parameter or fragment delimiter.
+        let encode_value = |value: &str| {
+            value
+                .bytes()
+                .map(|byte| format!("%{byte:02X}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            redact_sensitive_text(&format!(
+                "https://example.invalid/?api_key={}&view=normal#part",
+                encode_value("ordinaryValue123&region=us&view=normal#part&view=normal#part")
+            )),
+            "https://example.invalid/?api_key=<redacted>&view=normal#part"
+        );
+        assert_eq!(
+            redact_sensitive_text(&format!(
+                "see https://example.invalid/?view=normal&token={}#part",
+                encode_value("{{SECRET_lotbkusr}}")
+            )),
+            "see https://example.invalid/?view=normal&token=<redacted>#part"
         );
     }
 
