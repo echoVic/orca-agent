@@ -2491,10 +2491,20 @@ mod tests {
         let release = temp.path().join("release");
         let overlay = TurnPermissionOverlay::default();
         let (service, _) = service(temp.path());
-        let command = if cfg!(windows) {
-            "$child = Start-Process powershell.exe -PassThru -ArgumentList '-NoProfile', '-Command', 'Set-Content ready ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content leaked leaked'; $child.WaitForExit()"
-        } else {
-            "(printf ready > ready; while [ ! -e release ]; do sleep 0.01; done; printf leaked > leaked) & wait"
+        let command = match orca_platform::shell::ShellResolver::for_current_host()
+            .resolve_from_environment()
+            .expect("resolve host shell")
+            .kind()
+        {
+            orca_platform::shell::ShellKind::Posix | orca_platform::shell::ShellKind::GitBash => {
+                "(printf ready > ready; while [ ! -e release ]; do sleep 0.01; done; printf leaked > leaked) & wait"
+            }
+            orca_platform::shell::ShellKind::PowerShell(_) => {
+                "$child = Start-Process powershell.exe -PassThru -ArgumentList '-NoProfile', '-Command', 'Set-Content ready ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content leaked leaked'; $child.WaitForExit()"
+            }
+            orca_platform::shell::ShellKind::Cmd => {
+                r#"powershell.exe -NoProfile -Command "$child = Start-Process powershell.exe -PassThru -ArgumentList '-NoProfile', '-Command', 'Set-Content ready ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content leaked leaked'; $child.WaitForExit()""#
+            }
         };
         let started = start(
             &service,

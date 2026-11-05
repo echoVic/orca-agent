@@ -201,12 +201,16 @@ def verifier_bindings(item, workspace: Path) -> list[tuple[str, Path, str]]:
                 if name == "env":
                     env_wrapper = True
                     continue
-                interpreter = bool(re.fullmatch(r"(?:python[0-9.]*|bash|sh|node|ruby|perl)", name))
+                interpreter = name if re.fullmatch(r"(?:python[0-9.]*|bash|sh|node|ruby|perl)", name) else False
                 expect_program = False
             elif interpreter and not token.startswith("-"):
                 bind_program(token, script=True)
                 interpreter = False
-            elif interpreter and token in {"-m", "-c", "-e"}:
+            elif interpreter and (
+                (interpreter in {"bash", "sh"} and re.fullmatch(r"-[a-z]*c[a-z]*", token))
+                or (interpreter not in {"bash", "sh"} and token in {"-m", "-c", "-e"})
+            ):
+                # Shell -e is errexit; only -c (including -lc/-ec) consumes code.
                 interpreter = False
 
     return sorted(bindings.values())

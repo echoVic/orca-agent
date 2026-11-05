@@ -58,3 +58,7 @@ macOS 发布全量第一次运行 4,844 项：4,842 项通过、2 项失败、10
 2026-11-05 最终门控修正：macOS 全工作区曾记录 4,842 通过、2 失败（无框架重试）；这两项没有记作成功。流式 command/exec 测试的被动等待不符合后续分块需要再次 read 的协议；stdout/stderr 分别门控后，旧 helper 稳定 RED，恢复主动 read 后相关 41 项通过。进程关闭测试原来的固定子进程延迟可能在 Drop 前到期；现在仅在 Drop 返回后放行写入。临时保留服务而不关闭时回归稳定 RED，正常关闭 GREEN。生产协议和进程终止逻辑未改动，最终全工作区复跑另记。
 
 独立审查补充：同名 fixture 原件与 prepare 后工作区脚本发生快照覆盖，可把 `[7, 0]` 误变成 `[0, 0]`；隐藏 verifier 后的绝对输出路径也可能误当脚本冻结。两项新增回归均先实际 RED，修复 source 身份命名及消费脚本后的解析状态后，完整 Python 套件 99 项通过（56.461s）。此前 97 项记录保留为历史证据。
+
+最终 shell 审查补充：`bash -lc/-ec` 内联绝对命令被误绑定为脚本，`bash -e verify.sh` 则遗漏快照保护并产生实际 false pass。修复前便携回归组 3 项运行、1 项失败及 2 项错误；区分 shell 的 `-c` 与 errexit 后完整 Python 3.13 套件 101 项通过（26.041s）。首版测试硬编码 `/usr/bin/test` 在 macOS 不存在，修正为按实际 executable 查找，未修改生产逻辑绕过测试。关闭进程树 fixture 按 ShellResolver 实际 Posix/GitBash/PowerShell/Cmd 方言选择门控脚本，生产关闭逻辑保持原样，修正后的聚焦关闭回归通过（1.136s）。
+
+最终 macOS 全量运行 4,844 项全部通过、106 项跳过（983.609s），Clippy 及格式检查通过，已有 Clippy warnings 保留。该全量运行发生在最后一次仅测试的 shell 方言选择修正之前；最终平台证据必须来自新的 PR SHA 和合并后的 exact-main CI。

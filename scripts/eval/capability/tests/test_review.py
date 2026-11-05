@@ -166,6 +166,26 @@ for script in Path('.').rglob('*.py'):
         saved = json.loads((self.root / "attempt/attempt.json").read_text())
         self.assertEqual(shlex.split(saved["verifier"][0]["command"])[-1], str(output))
 
+    def test_combined_shell_inline_flags_keep_absolute_code_live(self):
+        test_binary = shutil.which("test")
+        self.assertIsNotNone(test_binary)
+        for flags in ("-lc", "-ec"):
+            with self.subTest(flags=flags):
+                code = shlex.quote(test_binary) + ' "$(cat result.txt)" = correct'
+                command = "/bin/bash " + flags + " " + shlex.quote(code)
+                item = self.item(verify=[command])
+                result = self.local(item, "Path('result.txt').write_text('correct')", flags[1:])
+                self.assertEqual(result.final_verification, "passed")
+
+    def test_shell_errexit_retains_script_snapshot(self):
+        item = self.item(verify=["/bin/bash -e verify.sh"])
+        (item.fixture / "verify.sh").write_text("exit 7\n")
+        result = self.local(item, "Path('verify.sh').write_text(" + repr("exit 0\n") + ")")
+        self.assertEqual(result.final_verification, "failed")
+        self.assertEqual(result.failure_class, "harness")
+        saved = json.loads((self.root / "attempt/attempt.json").read_text())
+        self.assertEqual(saved["verifier"][0]["exit"], 7)
+
     def test_unsupported_env_relocation_and_split_fail_closed(self):
         for command in ("env -C elsewhere python3 verify.py", "env -S 'python3 verify.py'"):
             with self.subTest(command=command):
