@@ -79,3 +79,10 @@ macOS 发布全量第一次运行 4,844 项：4,842 项通过、2 项失败、10
 最终候选 `1fdc146f` 的 CodeRabbit 审查指出：PowerShell shutdown 夹具通过绝对解释器路径调用 `Start-Process`，应显式指定临时工作目录。官方文档称绝对 `FilePath` 的默认目录为可执行程序所在目录；PowerShell 7.5.4 与 6.0.0 源码则在未指定目录时设置 `CurrentFileSystemLocation`。保留这一证据差异，不声称已经在本机复现 Windows 失败。夹具添加 `-WorkingDirectory (Get-Location).Path`，让 ready/release/leaked 标记位置确定；现有 Windows 独立进程回归仍必须实际运行每种可用原生 shell 的 shutdown 测试。该修正仅影响测试，不修改生产进程启动或取消行为。
 
 `1fdc146f` 的最终原生 macOS TUI 门禁 1,848 项通过、24 项跳过、1 项 nextest 输出管道清理观察，耗时 231.665 秒。独立检查将观察定位到既有 `workspace_status::tests::snapshot_reads_real_branch_and_detached_head`，1 项通过且再次标记 leaky；不能作为内存泄漏结论。记录保存在发布验证日志中。
+
+
+### 最后完整复审的评测修正
+
+完整审查候选 `84074277` 的 Linux PR 门禁 [41978066032](https://github.com/echoVic/orca-agent/actions/runs/41978066032) 全部通过：TUI 1,848 项（22 跳过）、PTY 40 项、workspace 4,604 项（3 跳过、4 项输出管道清理标记）；其后 runtime/subagent 聚焦门禁通过。四个清理标记分别为 `a_detached_stop_before_the_launch_records_a_worker_waits_for_it`、`a_stop_during_worker_launch_waits_for_the_worker_and_stops_it`、`reaper_fails_current_worker_that_exits_without_terminal_publication`、`foreground_interrupt_does_not_stop_registered_async_subagent_worker`，不能据此认定内存泄漏。此结果先于以下 Python/文档修正，最终 main 门禁仍需绑定实际合并 SHA。
+
+完整复审新增两项评测缺陷并经过 RED/GREEN：provider 采样捕获把 bool 及 NaN/Infinity 当作数值，5 个失败子用例复现后改为仅保留整数及有限浮点数；Python skin 的 Agent 按提示运行 unittest 会在声明只读的 tests 中生成字节码，常规 Python 3.13 下实际测试运行使最终验证失败。macOS 系统 Python 默认将缓存写到系统目录，前两次未复现，因此回归显式选择运行套件的 Python 解释器并清除继承缓存设置。Local Agent 环境禁用字节码写入后完整 Python 3.13 套件 **103 项通过（28.979s）**；源文件新增、修改和权限变化仍被保护，不排除缓存目录来绕过完整性检查。SQLite 回归使用显式关闭的连接。GitHub 读者可访问的研究报告源码链接固定到采纳前基线，路径清单改为仓库相对路径；发行说明的日志恢复保证明确限定为 JSONL。

@@ -57,7 +57,7 @@ The aggregation key also checks `scenario_sha256`, `prompt_sha256`, `prepare_sha
 
 Port-grouping RED reran the evidence module with real loopback fixtures: six assertion failures plus one missing-field error. GREEN then ran all 60 tests, followed by the built debug Orca CLI against the mock provider for `S0-smoke-pass,S0-smoke-fail --k 2`: two groups with two attempts each, two passes and two expected verifier failures. Actual ports remain recorded; the failed group retains observed cost and reports per-pass cost as `unknown` because it has no passes. Existing mock subprocess teardown can emit a ResourceWarning after kill; the test does not claim process cleanup correctness.
 
-Only files listed in `CHANGED_FILES.txt` are owned by this evaluation change. All edits used shell/Python; no commit or push was performed.
+`CHANGED_FILES.txt` lists the repository-relative paths changed by the capability evaluation work in PR160.
 
 ## PR160 correctness patch
 
@@ -76,3 +76,5 @@ Six regression tests exercise real `report.diff` with both outcome directions, s
 Read-only Docker checks found CLI 29.8.2 and configured context `orbstack`, but both `docker version` and `docker info` exited 1: `~/.orbstack/run/docker.sock` does not exist. The default `/var/run/docker.sock` is also absent. No engine was started, container executed or image fetched. Docker coverage remains offline command/mount translation plus real verifier subprocesses; native GUI behavior is untested.
 
 Absolute system executables remain live. Relative and absolute interpreter scripts, including `env`-wrapped commands, use independent snapshots and protected-file hashes. Supported `env` forms include ignore-environment, unset, assignments and `--`; relocation, split-string and other unsupported options fail before agent execution. Actual execution regressions replace live scripts with a false-pass program and check that the frozen verifier still fails; the complete Python suite now has 97 tests. Locally retained historical test counts above are execution notes, not repository-hosted logs; rerun the test command or consult PR160 workflow evidence for reproducible checks.
+
+The agent environment disables Python bytecode writes during local execution, so running the Python skin's prescribed unittest command does not create files inside protected tests. Source additions, edits and permission changes remain guarded. Captured sampling values reject booleans and nonfinite floats, preserving strict JSON output and finite integer/float observations.

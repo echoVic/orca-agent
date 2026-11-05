@@ -102,7 +102,7 @@ def agent_env(home: Path, provider: str, mock: MockProvider | None, extra_path: 
         for key, value in os.environ.items()
         if not key.startswith(("ORCA_", "DEEPSEEK_", "OPENAI_", "ANTHROPIC_")) and key != "NODE_OPTIONS"
     }
-    env.update(ORCA_HOME=str(home), TERM="xterm-256color")
+    env.update(ORCA_HOME=str(home), TERM="xterm-256color", PYTHONDONTWRITEBYTECODE="1")
     if extra_path is not None and extra_path.is_dir():
         env["PATH"] = f"{extra_path}:{env.get('PATH', '')}"
     if provider == "mock":

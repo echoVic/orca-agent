@@ -1,5 +1,6 @@
 """PR160 correctness regressions; actual scripts, no paid providers or Docker daemon."""
 import argparse
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -383,7 +384,7 @@ for script in Path('.').rglob('*.py'):
         for script in ("prepare.py","app.py","verify.py"):
             proc=subprocess.run([sys.executable,"-B",str(fixture/script)],cwd=self.root,env=env,capture_output=True,text=True)
             self.assertEqual(proc.returncode,0,proc.stderr)
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db:
             self.assertEqual(db.execute("SELECT state FROM tickets").fetchone(),("closed",))
 
     def test_goal_final_verification_and_protocol_artifact(self):
@@ -427,6 +428,31 @@ for script in Path('.').rglob('*.py'):
         sample=self.sample();sample["scenarios"]*=2
         with self.assertRaisesRegex(ValueError,"duplicate scenario"):
             report.aggregate_runs([sample])
+
+    def test_provider_sampling_rejects_bool_and_nonfinite_captures(self):
+        capture = self.root / "provider.jsonl"
+        invalid = (True, False, float("nan"), float("inf"), -float("inf"))
+        for value in invalid:
+            with self.subTest(value=value):
+                capture.write_text(json.dumps({"request": {key: value for key in ("temperature", "top_p", "seed")}}) + "\n")
+                protocol = evidence.attach_provider({}, capture)
+                self.assertEqual(protocol["sampling"], {key: "unknown" for key in ("temperature", "top_p", "seed")})
+                json.dumps(protocol, allow_nan=False)
+        capture.write_text(json.dumps({"request": {"temperature": 0.2, "top_p": 1.0, "seed": 17}}) + "\n")
+        self.assertEqual(evidence.attach_provider({}, capture)["sampling"], {"temperature": 0.2, "top_p": 1.0, "seed": 17})
+
+    def test_python_skin_agent_unittest_does_not_tamper_with_readonly_tests(self):
+        item = scenario.load(HERE / "scenarios/H-1-python-skin/scenario.json")
+        item.provider = "mock"
+        action = "p=Path('summary.py'); p.write_text(p.read_text().replace('raise NotImplementedError(\"implement summarize\")', 'return Summary(sum(values), min(values) if values else 0, max(values) if values else 0, len(values))'))\nimport subprocess\nsubprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests'], check=True)"
+        with patch.dict(os.environ):
+            os.environ.pop("PYTHONDONTWRITEBYTECODE", None)
+            os.environ.pop("PYTHONPYCACHEPREFIX", None)
+            os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]
+            result = self.local(item, action)
+        self.assertEqual(result.final_verification, "passed")
+        self.assertEqual(result.outcome, "pass")
+        self.assertFalse(any((self.root / "attempt/workspace/tests").rglob("*.pyc")))
 
     def test_python_skin_readonly_tests_load_editable_application(self):
         item=scenario.load(HERE/"scenarios/H-1-python-skin/scenario.json")

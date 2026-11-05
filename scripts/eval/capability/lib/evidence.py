@@ -262,8 +262,9 @@ def provider_metadata(path: Path) -> dict:
                 if isinstance(request.get("model"), str): models.add(request["model"])
                 if isinstance(request.get("reasoning_effort"), str): efforts.add(request["reasoning_effort"])
                 for key in sampling:
-                    if request.get(key) is not None and isinstance(request[key], (int, float)):
-                        sampling[key].append(request[key])
+                    value = request.get(key)
+                    if (isinstance(value, int) and not isinstance(value, bool)) or (isinstance(value, float) and math.isfinite(value)):
+                        sampling[key].append(value)
                 if isinstance(request.get("tools"), list): schemas.add(digest(request["tools"]))
             if isinstance(response, dict):
                 if isinstance(response.get("model"), str): responses.add(response["model"])
