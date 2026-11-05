@@ -15,7 +15,7 @@
   },
   "prompt": "prompts/task.md",
   "verify": [
-    "python3 verify.py"
+    "python3 -B @verifier/verify.py"
   ],
   "provider": "mock",
   "evaluation": {
@@ -33,5 +33,6 @@
   "limits": {
     "wall_seconds": 60,
     "verify_seconds": 10
-  }
+  },
+  "verifier_root": "../C-multi-constraint-full/verifier"
 }

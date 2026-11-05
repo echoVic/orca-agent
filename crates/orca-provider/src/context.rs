@@ -1516,6 +1516,7 @@ fn observed_summary_response(
         emit_summary_usage_telemetry(purpose, usage);
     }
     if cancel.is_some_and(CancelToken::is_cancelled) {
+        observation.summary_requests[request_index].outcome = "cancelled";
         return None;
     }
     if let Some(error) = response.error() {
@@ -2436,6 +2437,149 @@ mod tests {
         assert_eq!(observation.summary_requests[0].usage, Some(usage));
         assert_eq!(observation.summary_requests[1].usage, Some(failure_usage));
         assert_eq!(observation.summary_requests[1].outcome, "failed");
+    }
+
+    #[test]
+    fn pr160_cancelled_summary_outcome_after_usage_telemetry() {
+        const CHILD_ENV: &str = "ORCA_PR160_CANCEL_SUMMARY_CHILD";
+        const CANCELLED_ACK: &str = "pr160-summary-cancelled";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let usage = Usage {
+                input_tokens: 110,
+                output_tokens: 7,
+                cache_tokens: 55,
+            };
+            let response = ProviderResponse {
+                steps: vec![],
+                assistant_content: Some("usable summary".to_string()),
+                assistant_reasoning: None,
+                tool_calls: vec![],
+                usage: Some(usage),
+            };
+            let cancel = CancelToken::new();
+            let cancel_from_stdin = cancel.clone();
+            let canceller = std::thread::spawn(move || {
+                let mut signal = [0];
+                std::io::stdin().read_exact(&mut signal).unwrap();
+                cancel_from_stdin.cancel();
+                let mut stdout = std::io::stdout().lock();
+                writeln!(stdout, "{CANCELLED_ACK}").unwrap();
+                stdout.flush().unwrap();
+            });
+            // Keep telemetry blocked until the parent observes cancellation.
+            let purpose = "delta".repeat(1_000_000);
+            let mut observation = CompactionObservation::new();
+            assert!(
+                observed_summary_response(
+                    ProviderKind::DeepSeek,
+                    &purpose,
+                    &response,
+                    Some(&cancel),
+                    &mut observation,
+                )
+                .is_none()
+            );
+            canceller.join().unwrap();
+            assert_eq!(observation.summary_requests.len(), 1);
+            assert_eq!(observation.summary_requests[0].usage, Some(usage));
+            assert_eq!(observation.summary_requests[0].outcome, "cancelled");
+            return;
+        }
+
+        use std::io::BufRead;
+        use std::process::{Child, Command, Stdio};
+        struct KillChildOnDrop(Child);
+        impl Drop for KillChildOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut child = KillChildOnDrop(
+            Command::new(std::env::current_exe().unwrap())
+                .env(CHILD_ENV, "1")
+                .env(SUMMARY_DEBUG_ENV, "1")
+                .args([
+                    "--exact",
+                    "context::tests::pr160_cancelled_summary_outcome_after_usage_telemetry",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let (prefix_tx, prefix_rx) = mpsc::channel();
+        let (drain_tx, drain_rx) = mpsc::channel();
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        let mut stderr = child.0.stderr.take().unwrap();
+        let stderr_reader = std::thread::spawn(move || {
+            let mut prefix = [0; 64];
+            stderr.read_exact(&mut prefix).unwrap();
+            prefix_tx.send(prefix).unwrap();
+            drain_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            let mut output = Vec::new();
+            stderr.read_to_end(&mut output).unwrap();
+            let _ = stderr_tx.send(output);
+        });
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let mut stdout = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        let stdout_reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            let mut ack = Some(ack_tx);
+            loop {
+                let mut line = String::new();
+                if stdout.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                // libtest's unterminated "test ... " prefix shares this line.
+                if line.trim_end().ends_with(CANCELLED_ACK)
+                    && let Some(sender) = ack.take()
+                {
+                    let _ = sender.send(());
+                }
+                output.push_str(&line);
+            }
+            let _ = stdout_tx.send(output);
+        });
+        let prefix = prefix_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("summary telemetry prefix before deadline");
+        assert!(String::from_utf8_lossy(&prefix).starts_with("orca.remote_summary_usage"));
+        child.0.stdin.take().unwrap().write_all(b"x").unwrap();
+        ack_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("cancellation acknowledgement before draining telemetry");
+        drain_tx.send(()).unwrap();
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "summary child failed to exit after cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let stderr = stderr_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        let stdout = stdout_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        stderr_reader.join().unwrap();
+        stdout_reader.join().unwrap();
+        assert!(
+            status.success(),
+            "cancelled summary observation regression: {stdout}\n{}",
+            String::from_utf8_lossy(&stderr[stderr.len().saturating_sub(2_000)..]),
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ fn platform_shell_write_command() -> &'static str {
 
 fn platform_configure_fixture_shell(command: &mut Command) {
     #[cfg(windows)]
-    command.env("ORCA_SHELL", "pwsh.exe");
+    command.env("ORCA_SHELL", "powershell.exe");
     #[cfg(not(windows))]
     command.env("ORCA_SHELL", "/bin/sh");
 }

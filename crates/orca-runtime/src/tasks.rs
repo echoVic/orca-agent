@@ -3870,7 +3870,51 @@ impl TaskRegistry {
         let records = self.records_snapshot()?;
         let by_id: HashMap<_, _> = records.iter().map(|r| (r.id.as_str(), r)).collect();
         let mut blockers = vec![];
+        let mut continuations = HashMap::new();
         for record in records.iter().filter(|r| r.status == TaskStatus::Blocked) {
+            if record.task_type == TaskType::Subagent
+                && let Some(projection) = record.continuation_projection()
+            {
+                // A moved latest_task_id only proves admission. Retain the old
+                // blocker until both the authoritative attempt and its task
+                // have settled successfully, including detached settlement.
+                let continuation = continuations
+                    .entry(projection.continuation_id.clone())
+                    .or_insert_with(|| {
+                        self.continuation_store
+                            .load_record(&projection.continuation_id)
+                            .ok()
+                            .flatten()
+                    });
+                // Unavailable or corrupt continuation evidence cannot resolve
+                // a blocker. Keep historical records intact for inspection.
+                if let Some(continuation) = continuation.as_ref()
+                    && continuation.parent_session_id == self.session_id
+                    && continuation.parent_task_id == record.parent_task_id
+                    && continuation.status == ContinuationStatus::Completed
+                    && matches!(
+                        continuation.terminal.as_ref(),
+                        Some(AgentTerminal::Completed { .. })
+                    )
+                    && continuation
+                        .current_attempt
+                        .resumed_from_attempt_id
+                        .is_some()
+                    && continuation.current_attempt.attempt_id != projection.attempt_id
+                    && continuation.revision > projection.revision
+                    && let Some(replacement) = by_id.get(continuation.latest_task_id.as_str())
+                    && replacement.id != record.id
+                    && replacement.task_type == TaskType::Subagent
+                    && replacement.status == TaskStatus::Completed
+                    && replacement.parent_task_id == continuation.parent_task_id
+                    && replacement.continuation_projection().as_ref()
+                        == Some(&TaskContinuationProjection::from(
+                            &ContinuationProjection::from(continuation),
+                        ))
+                {
+                    continue;
+                }
+            }
             let mut cursor = Some(record.id.as_str());
             let mut visited = HashSet::new();
             while let Some(id) = cursor {
@@ -5107,7 +5151,16 @@ impl TaskRegistry {
         usage: Option<UsageTotals>,
     ) -> Result<(), String> {
         self.update_task(id, |record| {
-            record.error = Some(blocker.summary.clone());
+            record.error = Some(
+                match blocker
+                    .question
+                    .as_deref()
+                    .filter(|question| !question.is_empty())
+                {
+                    Some(question) => format!("{}\n{question}", blocker.summary),
+                    None => blocker.summary.clone(),
+                },
+            );
             record.blocker = Some(blocker);
             record.status = TaskStatus::Blocked;
             if record.started_at_ms.is_none() {
@@ -6498,7 +6551,17 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             workflow_failure_count: record.workflow_failure_count,
             usage: record.usage,
             applied_file_writes: record.applied_file_writes,
-            blocker: record.blocker.clone(),
+            blocker: record.blocker.as_ref().map(|blocker| {
+                let mut blocker = blocker.clone();
+                blocker.summary = redact_sensitive_text(&blocker.summary);
+                blocker.question = blocker.question.as_deref().map(redact_sensitive_text);
+                blocker.fingerprint = redact_sensitive_text(&blocker.fingerprint);
+                for evidence in &mut blocker.evidence {
+                    evidence.summary = redact_sensitive_text(&evidence.summary);
+                    evidence.target = evidence.target.as_deref().map(redact_sensitive_text);
+                }
+                blocker
+            }),
             subagent_current_activity: record.subagent_current_activity.clone(),
             subagent_activity_history: record.subagent_activity_history.clone(),
             subagent_child_thread_id: record.subagent_child_thread_id.clone(),
@@ -7369,6 +7432,87 @@ mod tests {
     }
     use super::*;
     use crate::subagent_event_relay::RelayTaskType;
+
+    #[test]
+    fn persisted_blocker_redacts_all_text_fields() {
+        use orca_core::goal_runtime::{BlockerKind, BlockerSummary, EvidenceItem};
+        let home = tempfile::tempdir().unwrap();
+        let registry =
+            TaskRegistry::new_persistent("secret-blockers".into(), home.path().into()).unwrap();
+        let task = registry.create_main_session("root".into());
+        registry
+            .block_summary_with_usage(
+                &task.id,
+                BlockerSummary {
+                    kind: BlockerKind::MissingAuthority,
+                    summary: "api_key=summary-secret".into(),
+                    question: Some("token=question-secret".into()),
+                    fingerprint: "password=fingerprint-secret api_key=fingerprint-check".into(),
+                    evidence: vec![EvidenceItem {
+                        kind: orca_core::goal_runtime::EvidenceKind::Observation,
+                        summary: "secret=evidence-secret".into(),
+                        target: Some(
+                            "https://example.invalid/?api_key=ordinaryValue123&region=us".into(),
+                        ),
+                    }],
+                },
+                None,
+            )
+            .unwrap();
+        let encoded = std::fs::read_to_string(
+            registry
+                .persistence
+                .as_ref()
+                .unwrap()
+                .session_tasks_path("secret-blockers"),
+        )
+        .unwrap();
+        for secret in [
+            "summary-secret",
+            "question-secret",
+            "fingerprint-check",
+            "evidence-secret",
+            "ordinaryValue123&region=us",
+        ] {
+            assert!(
+                !encoded.contains(secret),
+                "persisted blocker contains {secret}: {encoded}"
+            );
+        }
+        assert!(encoded.contains("redacted"));
+    }
+
+    #[test]
+    fn blocked_child_notification_preserves_question() {
+        use orca_core::goal_runtime::{BlockerKind, BlockerSummary};
+        let registry = TaskRegistry::new("blocked-notification".into());
+        let task = registry.create_subagent("child".into(), None);
+        registry
+            .block_summary_with_usage(
+                &task.id,
+                BlockerSummary {
+                    kind: BlockerKind::UserDecision,
+                    summary: "select deployment".into(),
+                    question: Some("Which target should be deployed?".into()),
+                    fingerprint: "target".into(),
+                    evidence: vec![],
+                },
+                None,
+            )
+            .unwrap();
+        let record = registry
+            .records_snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == task.id)
+            .unwrap();
+        assert!(
+            record
+                .error
+                .unwrap()
+                .contains("Which target should be deployed?")
+        );
+    }
 
     #[test]
     fn current_blockers_survive_reload_exclude_other_roots_and_clear_on_completion() {
@@ -11359,5 +11503,382 @@ while :; do :; done
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    mod continuation_blocker_tests {
+        use super::*;
+        use crate::agent_continuation::{
+            AgentCheckpoint, AgentPromptId, ChildAgentCoordinator, ChildConversationSnapshot,
+            ContinuationCompatibility, ContinuationLease, CreateContinuationInput,
+            PreparedContinuation, ResumeContinuationInput,
+        };
+        use crate::subagent::SubagentIsolation;
+        use orca_core::conversation::Conversation;
+        use orca_core::goal_runtime::{BlockerKind, BlockerSummary};
+
+        fn blocker() -> BlockerSummary {
+            BlockerSummary {
+                kind: BlockerKind::UserDecision,
+                summary: "choose target".into(),
+                question: Some("Which target?".into()),
+                fingerprint: "target".into(),
+                evidence: vec![],
+            }
+        }
+
+        fn checkpoint(attempt_id: AgentAttemptId, sequence: u64) -> AgentCheckpoint {
+            let (conversation, last_tool_boundary) =
+                ChildConversationSnapshot::try_capture_safe(&Conversation::new(), 1).unwrap();
+            let mut checkpoint = AgentCheckpoint {
+                checkpoint_id: AgentCheckpointId::new(),
+                attempt_id,
+                sequence,
+                conversation,
+                turn: 0,
+                usage: BudgetUsage::default(),
+                last_tool_boundary,
+                created_at_ms: now_ms(),
+                digest: Sha256Digest::new([0; 32]),
+            };
+            checkpoint.digest = checkpoint.computed_digest().unwrap();
+            checkpoint
+        }
+
+        fn blocked_continuation(
+            registry: &TaskRegistry,
+            parent_id: &str,
+        ) -> (TaskHandle, ChildAgentCoordinator, PreparedContinuation) {
+            let child = registry.create_subagent_with_parent(
+                "blocked child".into(),
+                Some("general".into()),
+                Some(parent_id.into()),
+            );
+            registry.mark_running(&child.id).unwrap();
+            let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+            let prepared = coordinator
+                .create(CreateContinuationInput {
+                    continuation_id: None,
+                    parent_task_id: Some(parent_id.into()),
+                    task_id: child.id.clone(),
+                    prompt_id: AgentPromptId::new(),
+                    compatibility: ContinuationCompatibility {
+                        subagent_type: "general".into(),
+                        frozen_agent: None,
+                        model: None,
+                        isolation: SubagentIsolation::None,
+                        effective_cwd: std::env::temp_dir().display().to_string(),
+                        worktree: None,
+                        compatibility_hash: Sha256Digest::new([7; 32]),
+                    },
+                })
+                .unwrap();
+            let lease = coordinator.acquire(&prepared).unwrap();
+            let projection = coordinator
+                .commit_checkpoint(
+                    &lease,
+                    lease.revision,
+                    checkpoint(lease.attempt_id.clone(), 0),
+                )
+                .unwrap();
+            coordinator
+                .commit_terminal(
+                    &lease,
+                    projection.revision,
+                    AgentTerminal::Failed {
+                        error: "choose target".into(),
+                    },
+                )
+                .unwrap();
+            registry
+                .block_summary_with_usage(&child.id, blocker(), None)
+                .unwrap();
+            (child, coordinator, prepared)
+        }
+
+        fn resume(
+            registry: &TaskRegistry,
+            coordinator: &ChildAgentCoordinator,
+            source: &PreparedContinuation,
+        ) -> (TaskHandle, PreparedContinuation, ContinuationLease) {
+            let child = registry.create_subagent_with_parent(
+                "resumed child".into(),
+                Some("general".into()),
+                source.parent_task_id.clone(),
+            );
+            let resumed = coordinator
+                .prepare_resume(ResumeContinuationInput {
+                    selector: source.continuation_id.to_string(),
+                    parent_task_id: source.parent_task_id.clone(),
+                    task_id: child.id.clone(),
+                    prompt_id: AgentPromptId::new(),
+                    compatibility: source.compatibility.clone(),
+                })
+                .unwrap();
+            assert_ne!(resumed.attempt_id, source.attempt_id);
+            assert_ne!(child.id, source.latest_task_id);
+            assert_eq!(resumed.continuation_id, source.continuation_id);
+            let lease = coordinator.acquire(&resumed).unwrap();
+            registry.mark_running(&child.id).unwrap();
+            (child, resumed, lease)
+        }
+
+        fn blocker_ids(registry: &TaskRegistry, root_id: &str) -> Vec<String> {
+            registry
+                .task_tree_blockers(root_id)
+                .unwrap()
+                .into_iter()
+                .map(|blocker| blocker["task_id"].as_str().unwrap().to_owned())
+                .collect()
+        }
+
+        #[test]
+        fn task_tree_blockers_successful_resume_resolves_only_its_predecessor() {
+            for persistent in [false, true] {
+                let home = tempfile::tempdir().unwrap();
+                let registry = if persistent {
+                    TaskRegistry::new_persistent("resume-blockers".into(), home.path().into())
+                        .unwrap()
+                } else {
+                    TaskRegistry::new("resume-blockers-local".into())
+                };
+                let root = registry.create_main_session("root".into());
+                let branch = registry.create_subagent_with_parent(
+                    "branch".into(),
+                    None,
+                    Some(root.id.clone()),
+                );
+                let other_root = registry.create_main_session("other root".into());
+                let (old, _, source) = blocked_continuation(&registry, &branch.id);
+                let (unrelated, _, _) = blocked_continuation(&registry, &branch.id);
+                let (foreign, _, _) = blocked_continuation(&registry, &other_root.id);
+                let worker = if persistent {
+                    TaskRegistry::new_persistent_attached(
+                        "resume-blockers".into(),
+                        home.path().into(),
+                    )
+                    .unwrap()
+                } else {
+                    registry.clone()
+                };
+                let coordinator = ChildAgentCoordinator::new(worker.clone()).unwrap();
+                let (replacement, _, lease) = resume(&worker, &coordinator, &source);
+                assert!(blocker_ids(&registry, &root.id).contains(&old.id));
+
+                coordinator
+                    .commit_terminal(
+                        &lease,
+                        lease.revision,
+                        AgentTerminal::Completed {
+                            result: Some("resolved".into()),
+                        },
+                    )
+                    .unwrap();
+                // A continuation terminal alone does not prove task settlement succeeded.
+                assert!(blocker_ids(&registry, &root.id).contains(&old.id));
+                if persistent {
+                    let task_lease = worker.acquire_task_lease(&replacement.id).unwrap();
+                    worker
+                        .complete_with_usage_and_lease(
+                            &task_lease,
+                            &replacement.id,
+                            "resolved".into(),
+                            None,
+                        )
+                        .unwrap();
+                } else {
+                    worker.complete(&replacement.id, "resolved".into()).unwrap();
+                }
+                assert_eq!(blocker_ids(&registry, &root.id), vec![unrelated.id.clone()]);
+                assert_eq!(
+                    blocker_ids(&registry, &other_root.id),
+                    vec![foreign.id.clone()]
+                );
+                // Historical attempt evidence remains available for inspection.
+                let historical = registry.get(&old.id).unwrap();
+                assert_eq!(historical.status, TaskStatus::Blocked);
+                assert!(historical.blocker.is_some());
+                if persistent {
+                    let reloaded = TaskRegistry::new_persistent_attached(
+                        "resume-blockers".into(),
+                        home.path().into(),
+                    )
+                    .unwrap();
+                    assert_eq!(blocker_ids(&reloaded, &root.id), vec![unrelated.id]);
+                }
+            }
+        }
+
+        #[test]
+        fn task_tree_blockers_unsuccessful_resume_keeps_predecessor() {
+            for outcome in ["failed", "blocked", "cancelled", "indeterminate"] {
+                let registry = TaskRegistry::new(format!("resume-blockers-{outcome}"));
+                let root = registry.create_main_session("root".into());
+                let (old, coordinator, source) = blocked_continuation(&registry, &root.id);
+                let (replacement, _, lease) = resume(&registry, &coordinator, &source);
+                assert_eq!(blocker_ids(&registry, &root.id), vec![old.id.clone()]);
+                let terminal = match outcome {
+                    "cancelled" => AgentTerminal::Cancelled { reason: None },
+                    "indeterminate" => AgentTerminal::Indeterminate {
+                        reason: "unknown".into(),
+                    },
+                    _ => AgentTerminal::Failed {
+                        error: "still blocked".into(),
+                    },
+                };
+                coordinator
+                    .commit_terminal(&lease, lease.revision, terminal)
+                    .unwrap();
+                match outcome {
+                    "blocked" => registry
+                        .block_summary_with_usage(&replacement.id, blocker(), None)
+                        .unwrap(),
+                    "cancelled" => registry.stop(&replacement.id, "cancelled".into()).unwrap(),
+                    "indeterminate" => registry
+                        .mark_execution_indeterminate(&replacement.id, "unknown".into())
+                        .unwrap(),
+                    _ => registry.fail(&replacement.id, "failed".into()).unwrap(),
+                }
+                let ids = blocker_ids(&registry, &root.id);
+                assert!(ids.contains(&old.id), "{outcome} hid the predecessor");
+                assert_eq!(ids.len(), if outcome == "blocked" { 2 } else { 1 });
+            }
+        }
+
+        #[test]
+        fn task_tree_blockers_successful_retry_resolves_all_earlier_blocked_attempts() {
+            let registry = TaskRegistry::new("resume-blockers-retry".into());
+            let root = registry.create_main_session("root".into());
+            let (old, coordinator, source) = blocked_continuation(&registry, &root.id);
+            let (second, second_source, second_lease) = resume(&registry, &coordinator, &source);
+            let projection = coordinator
+                .commit_checkpoint(
+                    &second_lease,
+                    second_lease.revision,
+                    checkpoint(second_lease.attempt_id.clone(), 1),
+                )
+                .unwrap();
+            coordinator
+                .commit_terminal(
+                    &second_lease,
+                    projection.revision,
+                    AgentTerminal::Failed {
+                        error: "still blocked".into(),
+                    },
+                )
+                .unwrap();
+            registry
+                .block_summary_with_usage(&second.id, blocker(), None)
+                .unwrap();
+            assert_eq!(blocker_ids(&registry, &root.id).len(), 2);
+            let (third, _, third_lease) = resume(&registry, &coordinator, &second_source);
+            assert_eq!(blocker_ids(&registry, &root.id).len(), 2);
+            coordinator
+                .commit_terminal(
+                    &third_lease,
+                    third_lease.revision,
+                    AgentTerminal::Completed {
+                        result: Some("resolved".into()),
+                    },
+                )
+                .unwrap();
+            registry.complete(&third.id, "resolved".into()).unwrap();
+            assert!(blocker_ids(&registry, &root.id).is_empty());
+            assert_eq!(registry.get(&old.id).unwrap().status, TaskStatus::Blocked);
+        }
+
+        #[test]
+        fn task_tree_blockers_unrelated_parent_resume_cannot_resolve_predecessor() {
+            let registry = TaskRegistry::new("resume-blockers-parent".into());
+            let root = registry.create_main_session("root".into());
+            let other = registry.create_main_session("other".into());
+            let (old, coordinator, source) = blocked_continuation(&registry, &root.id);
+            let unrelated = registry.create_subagent_with_parent(
+                "wrong parent".into(),
+                None,
+                Some(other.id.clone()),
+            );
+            assert!(matches!(
+                coordinator.prepare_resume(ResumeContinuationInput {
+                    selector: source.continuation_id.to_string(),
+                    parent_task_id: Some(other.id.clone()),
+                    task_id: unrelated.id.clone(),
+                    prompt_id: AgentPromptId::new(),
+                    compatibility: source.compatibility.clone(),
+                }),
+                Err(AgentContinuationError::TaskBindingMismatch { .. })
+            ));
+            registry
+                .complete(&unrelated.id, "unrelated success".into())
+                .unwrap();
+            assert_eq!(blocker_ids(&registry, &root.id), vec![old.id.clone()]);
+
+            let (replacement, _, lease) = resume(&registry, &coordinator, &source);
+            coordinator
+                .commit_terminal(
+                    &lease,
+                    lease.revision,
+                    AgentTerminal::Completed {
+                        result: Some("resolved".into()),
+                    },
+                )
+                .unwrap();
+            registry
+                .complete(&replacement.id, "resolved".into())
+                .unwrap();
+            // An imported mirror under another parent must not inherit that resolution.
+            registry
+                .update_task(&old.id, |record| {
+                    record.parent_task_id = Some(other.id.clone());
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(blocker_ids(&registry, &other.id), vec![old.id]);
+        }
+
+        #[test]
+        fn task_tree_blockers_completed_task_without_successful_continuation_keeps_predecessor() {
+            let registry = TaskRegistry::new("resume-blockers-failed-terminal".into());
+            let root = registry.create_main_session("root".into());
+            let (old, coordinator, source) = blocked_continuation(&registry, &root.id);
+            let (replacement, _, lease) = resume(&registry, &coordinator, &source);
+            coordinator
+                .commit_terminal(
+                    &lease,
+                    lease.revision,
+                    AgentTerminal::Failed {
+                        error: "resume failed".into(),
+                    },
+                )
+                .unwrap();
+            registry
+                .complete(&replacement.id, "stale success mirror".into())
+                .unwrap();
+            assert_eq!(blocker_ids(&registry, &root.id), vec![old.id]);
+        }
+
+        #[test]
+        fn task_tree_blockers_same_attempt_mirror_is_not_a_successful_supersession() {
+            let registry = TaskRegistry::new("resume-blockers-same-attempt".into());
+            let root = registry.create_main_session("root".into());
+            let (old, coordinator, source) = blocked_continuation(&registry, &root.id);
+            let (replacement, _, lease) = resume(&registry, &coordinator, &source);
+            let mut projection = coordinator
+                .commit_terminal(
+                    &lease,
+                    lease.revision,
+                    AgentTerminal::Completed {
+                        result: Some("resolved".into()),
+                    },
+                )
+                .unwrap();
+            registry
+                .complete(&replacement.id, "resolved".into())
+                .unwrap();
+            projection.latest_task_id = old.id.clone();
+            registry
+                .install_continuation_projection(&old.id, &projection)
+                .unwrap();
+            assert_eq!(blocker_ids(&registry, &root.id), vec![old.id]);
+        }
     }
 }

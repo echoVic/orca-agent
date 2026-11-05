@@ -70,11 +70,36 @@ def _scenario_attempts(run: dict) -> dict:
 
 def diff(current: dict, baseline: dict) -> dict:
     now, before = _scenario_attempts(current), _scenario_attempts(baseline)
+    # Recompute from source records; saved/caller-supplied aggregation may be stale.
+    # Use the same key and controlled-mock normalization as repeated-run pooling.
+    def comparable_groups(run):
+        groups = {}
+        for group in aggregate_runs([run])["groups"]:
+            groups.setdefault(group["scenario_id"], []).append(group)
+        return groups
+    current_groups, baseline_groups = comparable_groups(current), comparable_groups(baseline)
+    def known(group):
+        config = group["configuration"]
+        required = ("source_commit", "binary_sha256", "requested_model", "reasoning_effort",
+                    "backend", "provider", "endpoint_comparison_identity", "scenario_sha256",
+                    "prompt_sha256", "fixture_sha256", "verifier_sha256")
+        return (group["manifest_sha256"] and not group["manifest_sha256"].startswith("unknown")
+                and group["split"] in {"holdout", "tuning"}
+                and group["suite_id"] not in {None, "", "unknown"}
+                and all(config.get(key) not in (None, "", "unknown") for key in required)
+                and isinstance(config.get("budget"), dict)
+                and all(config["budget"].get(key) not in (None, "", "unknown") for key in
+                        ("max_turns", "max_tool_calls", "max_cost_usd", "max_wall_time_secs")))
     transitions = []
     for scenario_id, scenario in now.items():
         old = before.get(scenario_id)
         if old is None:
             transitions.append({"id": scenario_id, "change": "new"})
+            continue
+        left, right = baseline_groups.get(scenario_id, []), current_groups.get(scenario_id, [])
+        if (len(left) != 1 or len(right) != 1 or not known(left[0]) or not known(right[0])
+                or left[0]["comparison_key"] != right[0]["comparison_key"]):
+            transitions.append({"id": scenario_id, "change": "incomparable"})
             continue
         old_pass = all(attempt["outcome"] == "pass" for attempt in old["attempts"])
         new_pass = all(attempt["outcome"] == "pass" for attempt in scenario["attempts"])
@@ -135,7 +160,10 @@ def render_markdown(run: dict) -> str:
             lines.append(f"- `{scenario_id}`: {signal}")
     if run.get("diff"):
         lines += ["", "## Diff vs baseline", "", f"Baseline: `{run['diff']['baseline_run']}` · "
-                  f"mean pass rate {run['diff']['mean_pass_rate'][0]} → {run['diff']['mean_pass_rate'][1]}", ""]
+                  f"descriptive mean pass rate {run['diff']['mean_pass_rate'][0]} → {run['diff']['mean_pass_rate'][1]}",
+                  "Means cover each run's scenarios; they are not a matched improvement estimate. "
+                  "Fixed/regressed requires one matching known comparison group per scenario. "
+                  "Changed, incomplete or mixed identities are incomparable.", ""]
         for change in run["diff"]["transitions"]:
             lines.append(f"- {change['change']}: `{change['id']}`")
     lines += ["", "## Evidence and repeated attempts", ""]
@@ -183,9 +211,14 @@ def write(out: Path, run: dict) -> tuple[Path, Path]:
     return out / "run.json", report
 
 
-def load_runs(root: Path) -> list[dict]:
+def load_runs(root: Path, seen_paths: set | None = None) -> list[dict]:
     runs = []
+    seen_paths = set() if seen_paths is None else seen_paths
     for path in sorted(Path(root).glob("*/run.json")):
+        resolved = path.resolve()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
         try:
             runs.append(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
@@ -236,10 +269,23 @@ def scoreboard_append(path: Path, run: dict) -> None:
 def aggregate_runs(runs: list[dict]) -> dict:
     """Pool comparable attempts only; never mix tuning with fixed holdout measurements."""
     from . import evidence
-    groups = {}
-    for run in runs:
+    groups, seen = {}, {}
+    for run_index, run in enumerate(runs):
+        run_id = run.get("run_id")
+        # Known IDs identify saved runs. Unknown IDs do not establish sameness.
+        if isinstance(run_id, str) and run_id and run_id != "unknown":
+            identity = evidence.digest(run)
+            if run_id in seen:
+                if seen[run_id] != identity:
+                    raise ValueError(f"conflicting run id: {run_id}")
+                continue
+            seen[run_id] = identity
         evaluation = run.get("evaluation", {})
+        scenario_ids = set()
         for item in run.get("scenarios", []):
+            if item["id"] in scenario_ids:
+                raise ValueError(f"duplicate scenario id in run: {item['id']}")
+            scenario_ids.add(item["id"])
             for attempt in item.get("attempts", []):
                 config = {**run.get("protocol", {}), **attempt.get("protocol", {})}
                 meta = next((row for row in evaluation.get("scenarios", []) if row["id"] == item["id"]), evaluation)
@@ -262,10 +308,10 @@ def aggregate_runs(runs: list[dict]) -> dict:
                 split, suite = meta.get("split", "unknown"), meta.get("suite_id", "unknown")
                 manifest = evaluation.get("manifest_sha256", "unknown")
                 # Unknown manifests do not establish that two run sets are comparable.
-                if manifest == "unknown": manifest = "unknown:" + run.get("run_id", "unknown")
+                if manifest == "unknown": manifest = "unknown:" + (run_id if isinstance(run_id, str) and run_id and run_id != "unknown" else str(run_index))
                 key = evidence.digest([item["id"], split, suite, manifest, comparison])
                 group = groups.setdefault(key, {"scenario_id": item["id"], "split": split, "suite_id": suite,
-                    "manifest_sha256": manifest, "requested_model": comparison["requested_model"],
+                    "manifest_sha256": manifest, "comparison_key": key, "requested_model": comparison["requested_model"],
                     "configuration": comparison, "endpoint_identities": set(), "run_ids": set(), "rows": []})
                 group["run_ids"].add(run.get("run_id", "unknown"))
                 group["endpoint_identities"].add(origin)

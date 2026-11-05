@@ -183,6 +183,11 @@ class ReportTests(unittest.TestCase):
     def test_failed_ids_and_diff(self):
         current = self.sample_run()
         self.assertEqual(report.failed_ids(current), ["b"])
+        current["evaluation"] = {"manifest_sha256": "fixed", "split": "holdout", "suite_id": "fixed-v1"}
+        current["protocol"].update(binary_sha256="binary", requested_model="mock", reasoning_effort="low",
+            backend="local", provider="mock", endpoint_identity="http://127.0.0.1:12345",
+            scenario_sha256="scenario", prompt_sha256="prompt", fixture_sha256="fixture", verifier_sha256="verifier",
+            budget={"max_turns": 7, "max_tool_calls": 11, "max_cost_usd": 0.75, "max_wall_time_secs": 30})
         baseline = json.loads(json.dumps(current))
         baseline["run_id"] = "r0"
         baseline["scenarios"][1]["attempts"][0]["outcome"] = "pass"

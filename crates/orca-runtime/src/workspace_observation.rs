@@ -9,6 +9,10 @@ const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 const MAX_ENTRIES: usize = 8192;
 const EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules", ".orca"];
+static OBSERVATION_WORKER_BUSY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static TEST_CAPTURE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Bounded, best-effort observation. A hash delta has no task attribution and
 /// makes no claim about whether the requested work is correct.
@@ -20,22 +24,80 @@ pub(crate) struct Snapshot {
 }
 impl Snapshot {
     pub(crate) fn capture(root: &Path) -> Self {
-        let mut snapshot = Self {
-            observed: true,
-            ..Self::default()
-        };
-        // Other targets must not fall back to pathname recursion: it cannot
-        // prevent an ancestor from being replaced by a symlink during a scan.
-        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
-        unix_walk::capture(&mut snapshot, root);
-        #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-        {
-            let _ = root;
+        #[cfg(test)]
+        let _serial = TEST_CAPTURE_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::capture_operation(root, |root| {
+            let mut snapshot = Self {
+                observed: true,
+                ..Self::default()
+            };
+            // All filesystem operations, including root metadata and directory
+            // enumeration, may block. Keep them off the operation's thread.
+            #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+            unix_walk::capture(&mut snapshot, &root);
+            #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+            {
+                let _ = root;
+                snapshot
+                    .limitations
+                    .insert("safe_directory_traversal_unavailable");
+            }
             snapshot
-                .limitations
-                .insert("safe_directory_traversal_unavailable");
+        })
+    }
+    fn capture_operation(
+        root: &Path,
+        operation: impl FnOnce(std::path::PathBuf) -> Self + Send + 'static,
+    ) -> Self {
+        use std::sync::atomic::Ordering;
+        struct WorkerGuard;
+        impl Drop for WorkerGuard {
+            fn drop(&mut self) {
+                OBSERVATION_WORKER_BUSY.store(false, Ordering::Release);
+            }
         }
-        snapshot
+        fn unavailable(reason: &'static str) -> Snapshot {
+            Snapshot {
+                observed: true,
+                limitations: BTreeSet::from([reason]),
+                ..Snapshot::default()
+            }
+        }
+        // A regular-file read cannot be reliably cancelled. At most one
+        // outstanding observer is allowed per process, so stalled backends
+        // cannot accumulate detached threads or open directory handles.
+        if OBSERVATION_WORKER_BUSY
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return unavailable("observation_worker_busy");
+        }
+        let guard = WorkerGuard;
+        let root = root.to_owned();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let started = std::time::Instant::now();
+        if std::thread::Builder::new()
+            .name("orca-workspace-observer".into())
+            .spawn(move || {
+                let snapshot = operation(root);
+                drop(guard);
+                let _ = sender.send(snapshot);
+            })
+            .is_err()
+        {
+            return unavailable("observation_worker_unavailable");
+        }
+        match receiver
+            .recv_timeout(std::time::Duration::from_millis(250).saturating_sub(started.elapsed()))
+        {
+            Ok(snapshot) => snapshot,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => unavailable("observation_budget"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                unavailable("observation_worker_failed")
+            }
+        }
     }
     pub(crate) fn compare(&self, after: &Self) -> Value {
         let mut limitations: BTreeSet<_> = self
@@ -456,6 +518,50 @@ mod unix_walk {
 ))]
 mod tests {
     use super::*;
+    #[test]
+    fn blocked_observation_returns_unknown_within_deadline_and_limits_workers() {
+        // Cargo tests share a process. Serialize against every real capture,
+        // including captures performed by other runtime tests.
+        let _serial = TEST_CAPTURE_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        let releaser = std::thread::spawn(move || {
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(650));
+            let _ = release_tx.send(());
+        });
+        let snapshot = Snapshot::capture_operation(Path::new("unused"), move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Snapshot {
+                observed: true,
+                ..Snapshot::default()
+            }
+        });
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        let evidence = snapshot.compare(&snapshot);
+        assert_eq!(evidence["complete"], false);
+        assert_eq!(evidence["changed"], Value::Null);
+        assert!(snapshot.limitations.contains("observation_budget"));
+        let other = Snapshot::capture_operation(Path::new("unused"), |_| {
+            panic!("must not start a second blocked worker")
+        });
+        assert!(other.limitations.contains("observation_worker_busy"));
+        releaser.join().unwrap();
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while OBSERVATION_WORKER_BUSY.load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < cleanup_deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(!OBSERVATION_WORKER_BUSY.load(std::sync::atomic::Ordering::Acquire));
+    }
+
     #[test]
     fn observes_shell_changes_without_claiming_authority_or_success() {
         let dir = tempfile::tempdir().unwrap();

@@ -499,6 +499,9 @@ fn redirect_target(
     {
         return Err("provider redirect has unsupported target".into());
     }
+    if previous.scheme() == "https" && next.scheme() == "http" {
+        return Err("provider redirect would downgrade HTTPS to plaintext".into());
+    }
     Ok(Some(next))
 }
 
@@ -711,12 +714,50 @@ fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<Duration> 
     if let Ok(seconds) = value.parse::<u64>() {
         return Some(Duration::from_secs(seconds));
     }
-    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
-    Some(
-        (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
-            .to_std()
-            .unwrap_or(Duration::ZERO),
+    let now = chrono::Utc::now();
+    let date = chrono::DateTime::parse_from_rfc2822(value)
+        .ok()
+        .map(|date| date.with_timezone(&chrono::Utc))
+        .or_else(|| parse_rfc850_http_date(value, now))
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y")
+                .ok()
+                .map(|date| date.and_utc())
+        })?;
+    Some((date - now).to_std().unwrap_or(Duration::ZERO))
+}
+
+fn parse_rfc850_http_date(
+    value: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::Datelike;
+    use chrono::format::{Parsed, StrftimeItems, parse};
+
+    let mut parsed = Parsed::new();
+    parse(
+        &mut parsed,
+        value,
+        StrftimeItems::new("%A, %d-%b-%y %H:%M:%S GMT"),
     )
+    .ok()?;
+    // HTTP's two-digit year has a sliding 50-year future window. Resolve
+    // the century before validating the weekday; chrono's fixed %y pivot
+    // would otherwise interpret a valid 2071 date as 1971.
+    let cutoff = now.checked_add_months(chrono::Months::new(600))?;
+    let mut year = cutoff.year().div_euclid(100) * 100 + parsed.year_mod_100()?;
+    if year > cutoff.year()
+        || (year == cutoff.year()
+            && (parsed.month()?, parsed.day()?, parsed.to_naive_time().ok()?)
+                > (cutoff.month(), cutoff.day(), cutoff.time()))
+    {
+        year -= 100;
+    }
+    parsed.set_year(i64::from(year)).ok()?;
+    parsed
+        .to_naive_datetime_with_offset(0)
+        .ok()
+        .map(|date| date.and_utc())
 }
 
 fn is_retryable_error(err: &reqwest::Error) -> bool {
@@ -740,6 +781,48 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Instant;
+
+    #[test]
+    fn redirect_review_rejects_https_downgrades_and_preserves_secure_targets() {
+        let secure = reqwest::Url::parse("https://provider.invalid/start").unwrap();
+        for status in [301, 302, 303, 307, 308] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::LOCATION,
+                "http://provider.invalid/next".parse().unwrap(),
+            );
+            let result = redirect_target(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                &headers,
+                &secure,
+            );
+            assert!(
+                result.is_err(),
+                "HTTPS request must reject a plaintext redirect"
+            );
+            headers.insert(
+                reqwest::header::LOCATION,
+                "https://destination.invalid/next".parse().unwrap(),
+            );
+            assert!(
+                redirect_target(
+                    reqwest::StatusCode::from_u16(status).unwrap(),
+                    &headers,
+                    &secure
+                )
+                .unwrap()
+                .is_some()
+            );
+        }
+        let local = reqwest::Url::parse("http://127.0.0.1/start").unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::LOCATION, "/next".parse().unwrap());
+        assert!(
+            redirect_target(reqwest::StatusCode::TEMPORARY_REDIRECT, &headers, &local)
+                .unwrap()
+                .is_some()
+        );
+    }
 
     fn redirect_server(
         status: u16,
@@ -1410,6 +1493,62 @@ mod tests {
             arrivals
         });
         (url, requests, server)
+    }
+
+    fn assert_pr160_http_date_delay(format: &str) {
+        let date = (chrono::Utc::now() + chrono::Duration::seconds(120))
+            .format(format)
+            .to_string();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", date.parse().unwrap());
+        let delay = retry_after_header(&headers).expect("valid HTTP-date must be honored");
+        assert!(
+            (Duration::from_secs(115)..=Duration::from_secs(120)).contains(&delay),
+            "Retry-After {date:?} produced {delay:?} instead of the requested delay"
+        );
+    }
+
+    #[test]
+    fn pr160_retry_after_imf_fixdate() {
+        assert_pr160_http_date_delay("%a, %d %b %Y %H:%M:%S GMT");
+    }
+
+    #[test]
+    fn pr160_retry_after_rfc850() {
+        assert_pr160_http_date_delay("%A, %d-%b-%y %H:%M:%S GMT");
+    }
+
+    #[test]
+    fn pr160_retry_after_asctime() {
+        assert_pr160_http_date_delay("%a %b %e %H:%M:%S %Y");
+    }
+
+    #[test]
+    fn pr160_retry_after_rfc850_uses_http_fifty_year_window() {
+        use chrono::{Datelike, TimeZone};
+        let now = chrono::Utc::now();
+        // RFC 850 has a sliding HTTP year window, unlike a fixed 1970 pivot.
+        let future = chrono::Utc
+            .with_ymd_and_hms(now.year() + 45, 1, 1, 0, 0, 0)
+            .unwrap();
+        let value = future.format("%A, %d-%b-%y %H:%M:%S GMT").to_string();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", value.parse().unwrap());
+        let delay = retry_after_header(&headers).expect("valid RFC 850 date");
+        let expected = (future - now).to_std().unwrap();
+        assert!(delay <= expected && expected - delay < Duration::from_secs(5));
+
+        let past = chrono::Utc
+            .with_ymd_and_hms(now.year() - 40, 1, 1, 0, 0, 0)
+            .unwrap();
+        headers.insert(
+            "retry-after",
+            past.format("%A, %d-%b-%y %H:%M:%S GMT")
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(retry_after_header(&headers), Some(Duration::ZERO));
     }
 
     #[test]

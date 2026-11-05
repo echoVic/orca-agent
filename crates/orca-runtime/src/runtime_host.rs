@@ -940,7 +940,10 @@ impl HostedTurnRequest {
             .with_goal_turn_origin(self.goal_turn_origin)
             .with_options(self.options)
             .with_deferred_cancel_terminal(true)
-            .with_completion_evidence(self.envelope == HostedOperationEnvelope::HeadlessSession)
+            .with_completion_evidence(
+                self.envelope == HostedOperationEnvelope::HeadlessSession
+                    || self.operation_kind == HostedOperationKind::GoalRun,
+            )
             .with_session_completed_event(
                 self.envelope == HostedOperationEnvelope::Turn
                     && self.emit_session_completed
@@ -22495,7 +22498,7 @@ impl ThreadActor {
                                     if active.request.operation_kind()
                                         == &HostedOperationKind::GoalRun
                                     {
-                                        let completion_event = match terminal {
+                                        let mut completion_event = match terminal {
                                             Some(
                                                 orca_core::budget::OperationTerminal::Stopped {
                                                     ..
@@ -22519,6 +22522,9 @@ impl ThreadActor {
                                                     writes_applied,
                                                 ),
                                         };
+                                        result.state.thread.session().apply_completion_context(
+                                            &mut completion_event.payload,
+                                        );
                                         observe_runtime_event(
                                             active.request.event_observer().as_deref(),
                                             completion_event,
@@ -22943,14 +22949,17 @@ impl ThreadActor {
                 writes_applied,
                 ..
             }) => {
-                observe_runtime_event(
-                    active.request.event_observer().as_deref(),
-                    result.state.events.session_completed(
-                        status.clone(),
-                        result.state.thread.session().session_id(),
-                        writes_applied,
-                    ),
+                let mut completion_event = result.state.events.session_completed(
+                    status.clone(),
+                    result.state.thread.session().session_id(),
+                    writes_applied,
                 );
+                result
+                    .state
+                    .thread
+                    .session()
+                    .apply_completion_context(&mut completion_event.payload);
+                observe_runtime_event(active.request.event_observer().as_deref(), completion_event);
                 OperationOutcome::Completed(status.clone())
             }
             GenerationTaskOutcome::ExecutionFailed { kind, message } => {
@@ -25603,6 +25612,177 @@ mod tests {
         list_request.join().unwrap();
         start_request.join().unwrap();
         host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[derive(Default)]
+    struct GoalCompletionObserver(Mutex<Vec<orca_core::event_schema::EventEnvelope>>);
+
+    impl EventObserver for GoalCompletionObserver {
+        fn observe(&self, event: &orca_core::event_schema::EventEnvelope) -> io::Result<()> {
+            if event.event_type == orca_core::event_schema::EventType::SessionCompleted {
+                self.0.lock().unwrap().push(event.clone());
+            }
+            Ok(())
+        }
+    }
+
+    struct GoalCompletionContextExecutor {
+        context: SyncSender<Value>,
+        corrupt_history: bool,
+    }
+
+    impl ThreadOperationExecutor for GoalCompletionContextExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            events: &mut EventFactory,
+            writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let registry = thread.session().task_registry();
+            let child = registry.create_subagent_with_parent(
+                "completion blocker".to_string(),
+                None,
+                request.root_task_id.clone(),
+            );
+            registry
+                .block_summary_with_usage(
+                    &child.id,
+                    orca_core::goal_runtime::BlockerSummary {
+                        question: None,
+                        kind: orca_core::goal_runtime::BlockerKind::MissingAuthority,
+                        summary: "child still needs write permission".to_string(),
+                        fingerprint: "goal-completion-context".to_string(),
+                        evidence: Vec::new(),
+                    },
+                    None,
+                )
+                .map_err(io::Error::other)?;
+            if self.corrupt_history {
+                let path = thread
+                    .session_mut()
+                    .runtime_parts()
+                    .writer
+                    .unwrap()
+                    .path()
+                    .to_path_buf();
+                // Keep event appends writable but remove the required metadata;
+                // the real durable completion must reject this truncated log.
+                let raw = fs::read_to_string(&path)?;
+                let (_, records) = raw.split_once('\n').expect("history metadata line");
+                fs::write(&path, records)?;
+            }
+            // Execute the real controller, which records completion context even
+            // though GoalRun suppresses its own session.completed event.
+            let outcome = LegacyThreadOperationExecutor
+                .run_turn(thread, request, generation, events, writer, cancel)?;
+            let mut context = serde_json::json!({});
+            thread.session().apply_completion_context(&mut context);
+            self.context.send(context).unwrap();
+            Ok(outcome)
+        }
+    }
+
+    fn assert_goal_run_completion_context(
+        prompt: &str,
+        plan_mode: bool,
+        corrupt_history: bool,
+        status: RunStatus,
+    ) {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        fs::write(cwd.path().join("note.txt"), "before").unwrap();
+        let (context_tx, context_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(GoalCompletionContextExecutor {
+            context: context_tx,
+            corrupt_history,
+        }))
+        .unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        if plan_mode {
+            config.approval_mode = ApprovalMode::Plan;
+        }
+        let thread = host
+            .start_thread(config, "Goal completion context")
+            .unwrap();
+        let session_id = thread.session_id().unwrap().to_string();
+        let runtime = thread.goal_runtime().unwrap();
+        runtime
+            .create(CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "inspect note.txt".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .unwrap();
+        let observer = Arc::new(GoalCompletionObserver::default());
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new(prompt)
+                    .with_operation_kind(HostedOperationKind::GoalRun)
+                    .with_goal_tools(true)
+                    .with_goal_usage_tracking(true)
+                    .with_session_completed_event(false)
+                    .with_event_observer(observer.clone()),
+                io::sink(),
+            )
+            .unwrap();
+        let terminal = operation.wait_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+        let context = context_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+        let completed = observer.0.lock().unwrap().clone();
+        host.shutdown().unwrap();
+        assert_eq!(terminal.outcome(), &OperationOutcome::Completed(status));
+        assert_eq!(completed.len(), 1, "GoalRun must publish one completion");
+        assert_eq!(context["resumable"], !corrupt_history);
+        if corrupt_history {
+            assert_eq!(context["resume_unavailable_reason"], "history_write_failed");
+            assert!(context["resume"].is_null());
+        } else {
+            assert_eq!(context["resume"]["session_id"], session_id);
+        }
+        assert_eq!(context["blockers"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            completed[0].payload["resumable"], context["resumable"],
+            "GoalRun completion lost the controller's durable recovery context"
+        );
+        for key in [
+            "resume",
+            "resume_unavailable_reason",
+            "workspace_observation",
+            "blockers",
+        ] {
+            assert_eq!(
+                completed[0].payload.get(key),
+                context.get(key),
+                "lost {key}"
+            );
+        }
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        {
+            assert_eq!(context["workspace_observation"]["complete"], true);
+            assert_eq!(context["workspace_observation"]["changed"], false);
+        }
+    }
+
+    #[test]
+    fn goal_run_failed_completion_preserves_controller_context() {
+        assert_goal_run_completion_context("mock_fail", false, false, RunStatus::Failed);
+    }
+
+    #[test]
+    fn goal_run_rejected_continuation_preserves_controller_context() {
+        // A successful real read reaches legacy continuation admission. Plan
+        // mode rejects the successor and clears goal context before completion.
+        assert_goal_run_completion_context("read note.txt", true, false, RunStatus::Success);
+    }
+
+    #[test]
+    fn goal_run_failed_history_reports_actual_unavailable_reason() {
+        assert_goal_run_completion_context("mock_fail", false, true, RunStatus::Failed);
     }
 
     #[test]

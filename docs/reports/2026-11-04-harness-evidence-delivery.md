@@ -33,3 +33,16 @@
 验证在原生 macOS 上完成，包括日志与目录 symlink 回归；Windows reparse point 分支未做原生运行验证，Linux/Android 分支未交叉编译或运行。TUI 库的 1 项 `leaky` 尚未定位具体测试，保留为输出管道清理问题；该标记不能证明内存泄漏。未调用付费端点、真实 GUI 或发布流程。预先精简上下文场景验证约束与最终状态，不能证明运行时自动压缩保真。摘要费用单独记录；现有 cost/pass 的累计 usage 流若没有包含摘要调用，费用分子也没有包含它，不能称作全成本。未知用量不填零，估价不是账单；内部发送未返回 usage 时，数值只覆盖已观测用量，不能证明费用完整。共享冷却是进程内控制，不能代表跨进程或账户全局配额。首 delta 包含 reasoning/tool，不能称为首个可见答案 token；数据也不能隔离 Rust overhead 或证明性能收益。
 
 完整复制合法内部分析且无附件的人类输入仍缺少来源元数据可区分，严格格式识别不是密码学来源证明。截图描述是快照证据，执行坐标操作前仍需核对当前窗口与几何。失败或取消时本轮部分描述未持久化，再次尝试可能重复产生 sidecar 费用。非前缀裁剪、重排或旧记录缺少绑定字段时，保守地重新描述也可能增加费用。目录观察有预算及平台限制，可能漏掉净变化；文件被修改后恢复不产生净差异。持久化确认描述完成瞬间的日志，不能承诺其他进程之后不删除或修改它。
+
+
+## 2026-11-05 发布审查补充
+
+目标版本为 v0.5.17。原实现阶段的结果及平台限制保留在上文；以下发布审查证据另行记录，不把旧运行当成最终发布门禁。
+
+发布审查修复了：完成语义记录追加失败后的内存 assistant/计划年龄漂移；在验证历史之前修剪尾记录；Windows 完成句柄允许路径被替换；已成功恢复的 continuation 前一次 blocked 记录继续阻止完成；GoalRun 失败完成缺少 controller 证据；持久化 blocker 文本未统一脱敏及父任务通知遗漏 question；目录观察工作线程超时后重复启动；截图旁路多响应费用未逐次结算与丢弃图片后遗漏保存描述；Retry-After 的旧 HTTP 日期及摘要取消后的已知用量；评测 verifier 与被测工作区共置、只读输入完整性和比较身份不一致。相应新增回归保留实际 RED 记录。
+
+独立复核 provider 库 259 项通过，runtime 受影响回归 147 项通过，capability Python 90 项通过。目录观察用普通 cargo 并行 8 线程运行 13 项通过。HTTP/execution/runtime/Windows 边界校验器及自身测试、版本/npm 校验脚本、站点 build/SEO 共 13 个门禁通过。Python ResourceWarning 保留；Docker daemon 在本机不可用，未声称容器隔离经过原生验证。
+
+旧发布候选 5421c5d 的 Linux 和 Windows x64 仅价格缓存日期 fixture 失败，Windows ARM64 的重复 resume 在 generation 重启后返回 RuntimeUnavailable。这些失败未作为通过证据；修复后须在新的提交上重新运行 CI。TUI pipe-cleanup 标记已定位为 workspace_status::tests::snapshot_reads_real_branch_and_detached_head，在 v0.5.16 已存在，独立运行未复现；全局 pre-commit watchdog 是线索，不能确认根因或内存泄漏。
+
+重复 resume 已用门控 executor 稳定复现：等待真实 successor generation 启动后，重复请求返回 RuntimeUnavailable，RED 1 项失败（0.445s）。修复仅在当前代未取消、无 pending control、已启动的 RecoveryReplacement 具有对应 predecessor ack 时回放原确认；新增 current-generation interrupt 仍走当前 fence 的新提交。两个门控回归 GREEN（0.405s/0.534s），不把 ARM64 失败归为偶发或增加超时。HTTPS 降级与 JPEG SOF 长度也有独立 RED/GREEN；Windows headless fixture 使用内置 powershell.exe。最终 macOS 和新的 Linux/Windows CI 尚待完成。

@@ -113,7 +113,7 @@ def cost_per_pass(attempts: list[dict]) -> dict:
     passes = sum(a.get("outcome") == "pass" for a in attempts)
     result = {"passes": passes}
     for key in ("tokens_in", "tokens_out", "cost_usd", "wall_seconds"):
-        values = [a[key] for a in attempts if isinstance(a.get(key), (int, float)) and math.isfinite(a[key]) and a[key] >= 0]
+        values = [a[key] for a in attempts if not isinstance(a.get(key), bool) and isinstance(a.get(key), (int, float)) and math.isfinite(a[key]) and a[key] >= 0]
         total = sum(values)
         result[f"{key}_per_pass"] = total / passes if passes and len(values) == len(attempts) else "unknown"
         result[f"{key}_observed_attempts"] = len(values)

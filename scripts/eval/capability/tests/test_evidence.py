@@ -256,7 +256,7 @@ with urllib.request.urlopen(urllib.request.Request(os.environ["ORCA_BASE_URL"] +
             "opposition": "trial lost 2 records", "decision": "hold"}
         path = workspace / "answer.json"
         def verify():
-            return subprocess.run([sys.executable, str(workspace / "verify.py")], cwd=workspace, capture_output=True, text=True).returncode
+            return subprocess.run([sys.executable, str(HERE / "scenarios/C-multi-constraint-full/verifier/verify.py")], cwd=workspace, capture_output=True, text=True).returncode
         path.write_text(json.dumps(answer)); self.assertEqual(verify(), 0)
         for key in answer:
             with self.subTest(key=key):
@@ -385,7 +385,7 @@ with urllib.request.urlopen(urllib.request.Request(os.environ["ORCA_BASE_URL"] +
             (workspace / "answer.json").write_text(json.dumps({"path":"exports/weekly.csv", "limit":137,
                 "forbidden":["network", "delete archives"], "unresolved":"owner approval pending",
                 "support":"trial reduced latency by 8 ms", "opposition":"trial lost 2 records", "decision":"hold"}))
-            verify = subprocess.run([sys.executable, "-B", str(item.fixture / "verify.py")], cwd=workspace, capture_output=True)
+            verify = subprocess.run([sys.executable, "-B", str(item.verifier_root / "verify.py")], cwd=workspace, capture_output=True)
             self.assertEqual(verify.returncode, 0)
         self.assertGreater(len((self.root / "full/docs/CONTEXT.md").read_text()),
                            100 * len((self.root / "compacted/docs/CONTEXT.md").read_text()))
@@ -433,6 +433,8 @@ with urllib.request.urlopen(urllib.request.Request(os.environ["ORCA_BASE_URL"] +
         saved = json.loads((self.root / "docker/attempt.json").read_text())
         self.assertEqual(saved["provider_observations"], result.provider_observations)
         self.assertEqual(saved["compactions"], result.compactions)
+        self.assertEqual(saved["protocol"], result.protocol)
+        self.assertEqual(saved["final_verification"], result.final_verification)
 
 
     def test_completed_compactions_retain_measurement_and_unknowns(self):

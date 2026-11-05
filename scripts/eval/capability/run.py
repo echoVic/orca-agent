@@ -282,7 +282,9 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.aggregate:
-        runs = [r for directory in args.aggregate for r in report.load_runs(Path(directory))]
+        roots = dict.fromkeys(Path(directory).resolve() for directory in args.aggregate)
+        seen_paths = set()
+        runs = [r for directory in roots for r in report.load_runs(directory, seen_paths)]
         output = Path(args.out)
         output.mkdir(parents=True, exist_ok=True)
         (output / "aggregate.json").write_text(json.dumps(report.aggregate_runs(runs), indent=2) + "\n")

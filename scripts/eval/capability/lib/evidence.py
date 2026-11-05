@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import shlex
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -106,14 +107,78 @@ def exec_options(config: dict) -> list[str]:
     return argv
 
 
+def file_identity(path: Path) -> str:
+    """Guard file type and permissions as well as bytes; do not follow symlink changes."""
+    try:
+        mode = path.lstat().st_mode
+        if path.is_symlink():
+            return digest([mode, str(path.readlink())])
+        if path.is_dir():
+            return digest([mode, "directory"])
+        return digest([mode, file_sha(path)])
+    except OSError:
+        return UNKNOWN
+
+
+def verifier_bindings(item, workspace: Path) -> list[tuple[str, Path, str]]:
+    """Bind programs and declared readonly inputs, never infer outputs from existence.
+
+    @verifier/ names are scenario-owned files excluded from the agent fixture.
+    Relative interpreter scripts and direct executable commands retain legacy syntax.
+    Other file arguments need readonly_inputs; they otherwise remain live outputs.
+    """
+    bindings = {}
+    for token in item.readonly_inputs:
+        path = workspace / token
+        # Missing inputs are unknown while hashing a source fixture or a dry run.
+        # snapshot_verifiers requires them to exist after prepare, before execution.
+        bindings[token] = (token, path, token)
+    for command in item.verify:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+        expect_program, interpreter = True, False
+        for token in tokens:
+            if token in {"&&", "||", ";", "|"}:
+                expect_program, interpreter = True, False
+                continue
+            if token.startswith("@verifier/"):
+                relative = token.removeprefix("@verifier/")
+                if item.verifier_root is None or Path(relative).is_absolute() or ".." in Path(relative).parts:
+                    raise ValueError(f"invalid independent verifier path: {token}")
+                path = item.verifier_root / relative
+                bindings[token] = (token, path, "external/" + relative)
+            elif token.startswith("/artifacts/"):
+                relative = token.removeprefix("/artifacts/")
+                if not relative or ".." in Path(relative).parts:
+                    raise ValueError(f"invalid hidden artifact path: {token}")
+                bindings[token] = (token, workspace.parent / relative, "artifacts/" + relative)
+            elif expect_program:
+                candidate = workspace / token
+                if candidate.is_file():
+                    bindings[token] = (token, candidate, token)
+                interpreter = bool(re.fullmatch(r"(?:python[0-9.]*|bash|sh|node|ruby|perl)", Path(token).name))
+                expect_program = False
+            elif interpreter and not token.startswith("-"):
+                candidate = workspace / token
+                if candidate.is_file():
+                    bindings[token] = (token, candidate, token)
+                interpreter = False
+            elif interpreter and token in {"-m", "-c", "-e"}:
+                interpreter = False
+    return sorted(bindings.values())
+
+
 def verifier_paths(item, workspace: Path) -> list[Path]:
     paths = []
-    for command in item.verify:
-        for token in shlex.split(command):
-            candidate = workspace / token
-            # Commands are hashed separately; only actual file inputs count as verifier bytes.
-            if not token.startswith("-") and candidate.is_file():
-                paths.append(candidate)
+    for _, path, _ in verifier_bindings(item, workspace):
+        if path.is_dir():
+            paths.extend(p for p in path.rglob("*") if p.is_file())
+        else:
+            paths.append(path)
+    if item.verifier_root is not None:
+        paths.extend(p for p in item.verifier_root.rglob("*") if p.is_file())
     return sorted(set(paths))
 
 

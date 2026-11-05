@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{ProviderKind, RunConfig};
-use orca_core::conversation::Conversation;
+use orca_core::conversation::{Conversation, assistant_message_has_payload};
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::model::{ImageRouteDecision, VISION_MODEL};
@@ -30,7 +30,9 @@ use crate::compaction::{
 use crate::cost::CostTracker;
 use crate::extension::RuntimeExtensionContext;
 use crate::hooks::{HookRunner, conversation_with_hook_context};
+#[cfg(test)]
 use crate::image_routing::prepare_image_conversation;
+use crate::image_routing::prepare_image_conversation_with_usage;
 #[cfg(test)]
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -450,61 +452,98 @@ impl RuntimeProviderTurnStep {
             conversation,
             history_writer: history_writer.as_deref_mut(),
         })?;
-        let prepared_images = prepare_image_conversation(
+        let mut image_io_error = None;
+        let mut image_usage_error = None;
+        let mut image_budget_stop = None;
+        let prepared_images = prepare_image_conversation_with_usage(
             conversation,
             input.image_route,
             input.provider,
             input.provider_config,
             input.cancel,
+            |usage| {
+                let settled = (|| -> io::Result<()> {
+                    if let Some(usage) = usage.filter(|usage| !usage.is_empty()) {
+                        let main_model = input.provider_config.model.as_deref();
+                        let spent_before =
+                            crate::cost::usd_to_micros(cost_tracker.totals().estimated_cost_usd);
+                        cost_tracker.set_model(Some(VISION_MODEL));
+                        let recorded = input.actor.record_usage(usage, cost_tracker, None);
+                        cost_tracker.set_model(main_model);
+                        let totals = match recorded {
+                            Ok(totals) => totals,
+                            Err(error) => {
+                                image_usage_error = Some(error);
+                                return Ok(());
+                            }
+                        };
+                        let spent_total = crate::cost::usd_to_micros(totals.estimated_cost_usd);
+                        let delta = spent_total.saturating_sub(spent_before);
+                        if delta > 0 {
+                            // Each returned response is a separate bill, even
+                            // when this turn is retried after preparation fails.
+                            let accounting_id = format!(
+                                "image-analysis:{}",
+                                orca_core::thread_identity::ConversationItemId::new()
+                            );
+                            if let Err(stop) = input
+                                .operation
+                                .record_cost_usd_micros(delta, &accounting_id)?
+                            {
+                                image_budget_stop = Some(stop);
+                            }
+                        }
+                        // The response that exhausted the budget (or failed)
+                        // still publishes its confirmed cumulative usage.
+                        if emit_deltas {
+                            sink.emit(events.usage_updated(totals))?;
+                            if let Some(writer) = history_writer.as_deref_mut() {
+                                writer.append_usage(totals)?;
+                            }
+                        }
+                    }
+                    if image_budget_stop.is_none()
+                        && let Err(stop) = input.operation.sync_wall_time()?
+                    {
+                        image_budget_stop = Some(stop);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = settled {
+                    image_io_error = Some(error);
+                }
+                if image_io_error.is_some()
+                    || image_usage_error.is_some()
+                    || image_budget_stop.is_some()
+                {
+                    Err("image analysis stopped during usage settlement".to_string())
+                } else {
+                    Ok(())
+                }
+            },
         );
-        let analysis_usage = match &prepared_images {
-            Ok(prepared) => prepared.usage,
-            Err(error) => error.usage,
-        };
-        if let Some(usage) = analysis_usage
-            && !usage.is_empty()
-        {
-            let main_model = input.provider_config.model.as_deref();
-            let spent_before = crate::cost::usd_to_micros(cost_tracker.totals().estimated_cost_usd);
-            cost_tracker.set_model(Some(VISION_MODEL));
-            let totals = match input.actor.record_usage(usage, cost_tracker, None) {
-                Ok(totals) => totals,
-                Err(error) => {
-                    cost_tracker.set_model(main_model);
-                    return Ok(RuntimeProviderTurnOutput::terminal(error));
-                }
-            };
-            cost_tracker.set_model(main_model);
-            let spent_total = crate::cost::usd_to_micros(totals.estimated_cost_usd);
-            let delta = spent_total.saturating_sub(spent_before);
-            if delta > 0
-                && let Err(stop) = input.operation.record_cost_usd_micros(
-                    delta,
-                    &format!("image-analysis:{}", input.turn_context.turn_id),
-                )?
-            {
-                let terminal = input.operation.commit_budget_stop_with_boundary(
-                    input.turn_context.turn_id.as_str(),
-                    events.run_id(),
-                    history_writer.as_deref_mut(),
-                    &totals,
-                    None,
-                    stop,
-                )?;
-                return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
-                    status: RunStatus::Failed,
-                    reason: TurnEndReason::CostBudgetExhausted,
-                    message: "budget stopped during image analysis".to_string(),
-                    max_cost_usd_micros: 0,
-                    terminal: Some(terminal),
-                }));
-            }
-            if emit_deltas {
-                sink.emit(events.usage_updated(totals))?;
-                if let Some(writer) = history_writer.as_deref_mut() {
-                    writer.append_usage(totals)?;
-                }
-            }
+        if let Some(error) = image_io_error {
+            return Err(error);
+        }
+        if let Some(stop) = image_budget_stop {
+            let terminal = input.operation.commit_budget_stop_with_boundary(
+                input.turn_context.turn_id.as_str(),
+                events.run_id(),
+                history_writer.as_deref_mut(),
+                &cost_tracker.totals(),
+                None,
+                stop,
+            )?;
+            return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
+                status: RunStatus::Failed,
+                reason: TurnEndReason::CostBudgetExhausted,
+                message: "budget stopped during image analysis".to_string(),
+                max_cost_usd_micros: 0,
+                terminal: Some(terminal),
+            }));
+        }
+        if let Some(error) = image_usage_error {
+            return Ok(RuntimeProviderTurnOutput::terminal(error));
         }
         let prepared_images = match prepared_images {
             Ok(prepared) => prepared,
@@ -892,21 +931,20 @@ impl RuntimeProviderResponseStep {
         let mut completion_event = events.model_response_completed(&completed_response);
         attach_provider_observation(&mut completion_event, &response);
         let response = response.response;
-        if response.tool_calls.is_empty() {
-            let final_message = response.assistant_content.clone();
-            record_assistant_response_for_agent(
-                conversation,
-                &completed_response,
-                false,
-                events,
-                sink,
-            )?;
-            if step_snapshot.turn_context.emit_deltas {
-                sink.emit(completion_event)?;
-            }
-            return Ok(RuntimeProviderResponseOutcome::Success { final_message });
+        // Validate before publishing; a failed semantic append must not leave
+        // a live-only assistant message or advance the plan's assistant age.
+        if !assistant_message_has_payload(
+            completed_response.assistant_content.as_deref(),
+            &completed_response.tool_calls,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "assistant response did not contain content or tool calls",
+            ));
         }
-
+        if step_snapshot.turn_context.emit_deltas {
+            sink.emit(completion_event)?;
+        }
         record_assistant_response_for_agent(
             conversation,
             &completed_response,
@@ -914,8 +952,9 @@ impl RuntimeProviderResponseStep {
             events,
             sink,
         )?;
-        if step_snapshot.turn_context.emit_deltas {
-            sink.emit(completion_event)?;
+        if response.tool_calls.is_empty() {
+            let final_message = response.assistant_content.clone();
+            return Ok(RuntimeProviderResponseOutcome::Success { final_message });
         }
 
         let tool_requests = tool_requests_from_provider_steps(&response.steps);
@@ -2448,6 +2487,158 @@ mod tests {
             RuntimeProviderErrorResult::ContinueTurn | RuntimeProviderErrorResult::ContinueLoop => {
                 panic!("provider error failure should return loop result")
             }
+        }
+    }
+
+    #[test]
+    fn review_completion_append_failure_does_not_mutate_live_assistant_or_plan_age() {
+        use orca_core::event_schema::{EventEnvelope, EventPublicationStore};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Default)]
+        struct CompletionStore {
+            fail: AtomicBool,
+            committed: Mutex<Vec<EventEnvelope>>,
+        }
+        impl EventPublicationStore for CompletionStore {
+            fn reserve_through(&self, _next_seq_exclusive: u64) -> io::Result<()> {
+                Ok(())
+            }
+            fn append_semantic_event(&self, event: &EventEnvelope) -> io::Result<()> {
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err(io::Error::other("completion semantic append failed"));
+                }
+                self.committed.lock().unwrap().push(event.clone());
+                Ok(())
+            }
+        }
+
+        for tool_response in [false, true] {
+            let store = Arc::new(CompletionStore::default());
+            store.fail.store(true, Ordering::SeqCst);
+            let publication_store: Arc<dyn EventPublicationStore> = store.clone();
+            let mut events = EventFactory::with_publication_store(
+                "review-completion-append".into(),
+                0,
+                publication_store,
+            );
+            let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+            let mut conversation = Conversation::new();
+            conversation.add_user("original query".into());
+            conversation.replace_plan_state("[in_progress] finish work".into());
+            for _ in 1..orca_core::conversation::PLAN_REMINDER_AFTER_TURNS {
+                conversation.internal_context.note_assistant_turn();
+            }
+            let context_before = format!("{:?}", conversation.internal_context);
+            let config = config();
+            let cwd = tempfile::tempdir().unwrap();
+            let instructions = ProjectInstructions::default();
+            let memory = MemoryBlock::default();
+            let mcp_registry = McpRegistry::default();
+            let hooks = HookRunner::default();
+            let mut cost_tracker = CostTracker::new(None);
+            let cancel = CancelToken::new();
+            let task_registry = TaskRegistry::new("review-completion-append".into());
+            let mut background_workflows = Vec::new();
+            let mut sampling_state = RuntimeSamplingRequestState::new();
+            let policy = policy_for_tool_execution(&config);
+            let mut operation = OperationContext::for_tests(
+                orca_core::budget::BudgetSpec::default(),
+                "review-completion-append",
+            );
+            let response = runtime_response(ProviderResponse {
+                steps: vec![],
+                assistant_content: Some("completed response".into()),
+                assistant_reasoning: None,
+                tool_calls: if tool_response {
+                    vec![orca_core::conversation::RawToolCall {
+                        id: "call-review".into(),
+                        function_name: "read_file".into(),
+                        arguments: "{}".into(),
+                    }]
+                } else {
+                    vec![]
+                },
+                usage: None,
+            });
+            let mut step = RuntimeProviderResponseStep::new();
+            let mut handle = |response, conversation: &mut Conversation| {
+                step.handle(
+                    response,
+                    RuntimeProviderResponseInput {
+                        step_context: RuntimeStepContext::new(
+                            &config,
+                            cwd.path(),
+                            AgentToolPolicyContext::unrestricted(),
+                            0,
+                            true,
+                            &policy,
+                            &instructions,
+                            &memory,
+                            &mcp_registry,
+                            &hooks,
+                            &cancel,
+                            &task_registry,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        ),
+                        sampling_state: &mut sampling_state,
+                        operation: &mut operation,
+                        io: RuntimeProviderResponseIo {
+                            events: &mut events,
+                            sink: &mut sink,
+                            conversation,
+                            history_writer: None,
+                            cost_tracker: &mut cost_tracker,
+                            background_workflows: &mut background_workflows,
+                            checkpoint_observer: None,
+                        },
+                    },
+                    RuntimeProviderResponseExecutors {
+                        workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                        batch_child_executor: unused_child_executor::<io::Sink>,
+                    },
+                )
+            };
+            let error = match handle(response.clone(), &mut conversation) {
+                Err(error) => error,
+                Ok(_) => panic!("semantic completion append must fail"),
+            };
+            assert_eq!(error.to_string(), "completion semantic append failed");
+            assert_eq!(
+                conversation.messages.len(),
+                1,
+                "failed completion cannot leave a live-only assistant response"
+            );
+            assert!(
+                matches!(&conversation.messages[0], Message::User { content, .. }
+                if content == "original query")
+            );
+            assert_eq!(
+                format!("{:?}", conversation.internal_context),
+                context_before,
+                "failed completion must not advance plan age"
+            );
+            assert!(store.committed.lock().unwrap().is_empty());
+            if !tool_response {
+                store.fail.store(false, Ordering::SeqCst);
+                assert!(matches!(
+                    handle(response, &mut conversation).unwrap(),
+                    RuntimeProviderResponseOutcome::Success { .. }
+                ));
+                assert_eq!(
+                    conversation.messages.len(),
+                    2,
+                    "retry records the assistant exactly once"
+                );
+                assert_eq!(store.committed.lock().unwrap().len(), 1);
+            }
+            drop(handle);
+            assert!(tool_response || !sink.writer_mut().is_empty());
         }
     }
 

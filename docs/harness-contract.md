@@ -176,7 +176,9 @@ usage, and local prefix reuse estimates. Runtime adds confirmed summary cost
 estimates and service cache ratios. Failed, cancelled, and rejected summaries
 retain known usage. Local prefix estimates are distinct from service cache
 metadata. Missing usage stays null and incomplete totals are labelled; summary
-cost is separate from the main cumulative attempt cost stream.
+cost is separate from the main cumulative attempt cost stream and is not charged
+to the runtime operation cost counter. Summary requests still share operation
+cancellation and deadline controls.
 
 ## Event Types
 
@@ -247,7 +249,7 @@ of `writes_applied`, verification, status, and exit code.
 
 Observation is bounded to 8,192 entries, 32 MiB total, 2 MiB per file, depth 32
 and 250 ms per snapshot. It excludes `.git`, `target`, `node_modules`, and
-`.orca`; symlinks and special files are not followed. `excluded_directories`
+`.orca`; symlinks and special files are not followed. All filesystem operations run in a background observer. A deadline returns incomplete evidence without waiting for a stalled read; at most one observer per process may remain outstanding. Further observations report `observation_worker_busy` until it finishes. `excluded_directories`
 and `limitations` expose the scope. Apple, Linux and Android traversal uses directory
 handles and no-follow opens with identity checks. Other targets currently return
 `safe_directory_traversal_unavailable` with no file evidence. `complete: false` prevents a negative claim:
