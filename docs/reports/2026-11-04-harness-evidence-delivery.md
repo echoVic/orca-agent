@@ -1,6 +1,6 @@
 # Orca Harness 证据改进交付
 
-日期：2026-11-04。范围来自 [月度采纳评估](2026-11-04-wiki-orca-recommendations.md) 前五项及 [实施计划](../superpowers/plans/2026-11-04-harness-evidence.md)。基线为 `5f1dafd959f8d2e35fc7589e45cce5e9517fa8b0`，工作树为 `/Users/bytedance/.codex/worktrees/harness-evidence/blade-deepseek`。本批未提交或推送。
+日期：2026-11-04。范围来自 [月度采纳评估](2026-11-04-wiki-orca-recommendations.md) 前五项及 [实施计划](../superpowers/plans/2026-11-04-harness-evidence.md)。基线为 `5f1dafd959f8d2e35fc7589e45cce5e9517fa8b0`，工作树为独立的 `harness-evidence` checkout。本批未提交或推送。
 
 ## 行为变化
 
@@ -19,11 +19,11 @@
 
 最终工作区与独立 TUI 门禁均已执行完成。验证结果如下：
 
-- 全工作区 `cargo nextest run --workspace --all-targets --offline --locked --profile ci --retries 0`：4,799 项运行，4,798 项通过、1 项失败、106 项跳过；测试阶段 1,228.745 秒。唯一失败为 `server_mode_command_exec_uses_session_network_domain_grants` 的本地代理等待超时。完整日志：`/private/tmp/orca-harness-workspace-nextest-final2.log`。相同最终代码与 PATH 随后的独立 `ci-serial --retries 0` 复现通过（10.974 秒），日志：`/private/tmp/orca-harness-network-grant-recheck.log`；因此不能表述成一次全量零失败，保留时序稳定性缺口。`ci` 默认跳过的 `orca_tui` 与 `tui_pty_contract` 另跑串行门禁，ignored/平台测试仍不计为运行通过。
-- 独立 `ci-serial --retries 0` TUI 库门禁：1,848 项通过、24 项跳过；nextest 标记 1 项 `leaky`，表示测试退出后仍有继承输出管道未及时关闭，退出码仍为 0。日志：`/private/tmp/orca-harness-tui-lib-final.log`。PTY 契约 40 项通过、0 项失败，日志：`/private/tmp/orca-harness-tui-pty-final.log`。这些是终端契约验证，不是原生 GUI 验证。
-- 跨模块 nextest 聚焦回归 65 项通过、0 项失败，覆盖 24 项 image routing、24 项 compaction、2 项自动压缩 deadline、12 项工作区观测及 3 项网络权限契约。完整内部图片记录的识别和目录句柄安全遍历包含在这次验证中；取消重试的已知用量结算及有限 deadline 回归另有独立 GREEN 记录，并在随后全量运行中通过（`/private/tmp/orca-retry-green.log`）。日志：`/private/tmp/orca-harness-integration-final.log`。
+- 全工作区 `cargo nextest run --workspace --all-targets --offline --locked --profile ci --retries 0`：4,799 项运行，4,798 项通过、1 项失败、106 项跳过；测试阶段 1,228.745 秒。唯一失败为 `server_mode_command_exec_uses_session_network_domain_grants` 的本地代理等待超时。本地留存日志：`<local-evidence>/orca-harness-workspace-nextest-final2.log`。相同最终代码与 PATH 随后的独立 `ci-serial --retries 0` 复现通过（10.974 秒），日志：`<local-evidence>/orca-harness-network-grant-recheck.log`；因此不能表述成一次全量零失败，保留时序稳定性缺口。`ci` 默认跳过的 `orca_tui` 与 `tui_pty_contract` 另跑串行门禁，ignored/平台测试仍不计为运行通过。
+- 独立 `ci-serial --retries 0` TUI 库门禁：1,848 项通过、24 项跳过；nextest 标记 1 项 `leaky`，表示测试退出后仍有继承输出管道未及时关闭，退出码仍为 0。日志：`<local-evidence>/orca-harness-tui-lib-final.log`。PTY 契约 40 项通过、0 项失败，日志：`<local-evidence>/orca-harness-tui-pty-final.log`。这些是终端契约验证，不是原生 GUI 验证。
+- 跨模块 nextest 聚焦回归 65 项通过、0 项失败，覆盖 24 项 image routing、24 项 compaction、2 项自动压缩 deadline、12 项工作区观测及 3 项网络权限契约。完整内部图片记录的识别和目录句柄安全遍历包含在这次验证中；取消重试的已知用量结算及有限 deadline 回归另有独立 GREEN 记录，并在随后全量运行中通过（`<local-evidence>/orca-retry-green.log`）。日志：`<local-evidence>/orca-harness-integration-final.log`。
 - 实际 `exec_jsonl` 集成测试 38 项通过，包含保存/禁用历史、blocked 后按广告命令恢复、shell 修改原有 dirty 内容以及截断历史。完成持久化聚焦测试 20 项通过；新增日志 symlink 拒绝测试 1 项通过。
-- capability Python 测试 60 项通过。刚构建的实际 Mock CLI 冒烟使用两个场景各两次：成功场景 2 次通过，故意失败场景 2 次独立 verifier 失败，记录 2 次 false completion。两个场景各聚合为一组两次，实际地址和首 delta 观测已进入报告。最终 run：`/private/tmp/orca-eval-real-smoke-final3/20261104-230434-349083000/run.json`，四次首 delta 均为 reasoning。这些是 harness 验证，不能用作云模型能力得分。
+- capability Python 测试 60 项通过。刚构建的实际 Mock CLI 冒烟使用两个场景各两次：成功场景 2 次通过，故意失败场景 2 次独立 verifier 失败，记录 2 次 false completion。两个场景各聚合为一组两次，实际地址和首 delta 观测已进入报告。本地留存 run：`<local-evidence>/orca-eval-real-smoke-final3/20261104-230434-349083000/run.json`，四次首 delta 均为 reasoning。这些是 harness 验证，不能用作云模型能力得分。
 - `cargo fmt --all -- --check`、`git diff --check` 通过。HTTP client、execution broker、runtime surface 的三个边界校验器及三个自身测试脚本全部通过；HTTP 校验器自身测试 78 项、execution broker 自身测试 2 项通过。
 
 此前被中断的 `cargo test --workspace` 日志中有 3 项网络权限测试失败，其中 login shell 的 `nvm.sh` 初始化在运行 curl 前超时。最终使用包含 Node 的受控 PATH，并按仓库 CI nextest 配置及 `--retries 0` 验证；这 3 项已在上述独立聚焦运行中通过。中断日志不作为整套工作区通过的依据。 首次最终 nextest 编译另因 `No space left on device` 退出，未开始测试。清理项目 `target/debug/incremental` 可再生缓存后，关闭增量缓存，以 `-j 2` 重跑；没有修改源码或依赖锁文件来绕过错误。受控 PATH 下的 Mock 启动曾超时；使用已有 Python 3.13 显式路径后最终四次 CLI 冒烟完成，此次重跑未修改 Mock 源码。
@@ -41,8 +41,10 @@
 
 发布审查修复了：完成语义记录追加失败后的内存 assistant/计划年龄漂移；在验证历史之前修剪尾记录；Windows 完成句柄允许路径被替换；已成功恢复的 continuation 前一次 blocked 记录继续阻止完成；GoalRun 失败完成缺少 controller 证据；持久化 blocker 文本未统一脱敏及父任务通知遗漏 question；目录观察工作线程超时后重复启动；截图旁路多响应费用未逐次结算与丢弃图片后遗漏保存描述；Retry-After 的旧 HTTP 日期及摘要取消后的已知用量；评测 verifier 与被测工作区共置、只读输入完整性和比较身份不一致。相应新增回归保留实际 RED 记录。
 
-独立复核 provider 库 259 项通过，runtime 受影响回归 147 项通过，capability Python 90 项通过。目录观察用普通 cargo 并行 8 线程运行 13 项通过。HTTP/execution/runtime/Windows 边界校验器及自身测试、版本/npm 校验脚本、站点 build/SEO 共 13 个门禁通过。Python ResourceWarning 保留；Docker daemon 在本机不可用，未声称容器隔离经过原生验证。
+独立复核 provider 库 259 项通过，runtime 受影响回归 147 项通过，capability Python 93 项通过。目录观察用普通 cargo 并行 8 线程运行 13 项通过。HTTP/execution/runtime/Windows 边界校验器及自身测试、版本/npm 校验脚本、站点 build/SEO 共 14 个门禁通过。Python ResourceWarning 保留；Docker daemon 在本机不可用，未声称容器隔离经过原生验证。
 
 旧发布候选 5421c5d 的 Linux 和 Windows x64 仅价格缓存日期 fixture 失败，Windows ARM64 的重复 resume 在 generation 重启后返回 RuntimeUnavailable。这些失败未作为通过证据；修复后须在新的提交上重新运行 CI。TUI pipe-cleanup 标记已定位为 workspace_status::tests::snapshot_reads_real_branch_and_detached_head，在 v0.5.16 已存在，独立运行未复现；全局 pre-commit watchdog 是线索，不能确认根因或内存泄漏。
 
-重复 resume 已用门控 executor 稳定复现：等待真实 successor generation 启动后，重复请求返回 RuntimeUnavailable，RED 1 项失败（0.445s）。修复仅在当前代未取消、无 pending control、已启动的 RecoveryReplacement 具有对应 predecessor ack 时回放原确认；新增 current-generation interrupt 仍走当前 fence 的新提交。两个门控回归 GREEN（0.405s/0.534s），不把 ARM64 失败归为偶发或增加超时。HTTPS 降级与 JPEG SOF 长度也有独立 RED/GREEN；Windows headless fixture 使用内置 powershell.exe。最终 macOS 和新的 Linux/Windows CI 尚待完成。
+重复 resume 已用门控 executor 稳定复现：等待真实 successor generation 启动后，重复请求返回 RuntimeUnavailable，RED 1 项失败（0.445s）。修复仅在当前代未取消、无 pending control、已启动的 RecoveryReplacement 具有对应 predecessor ack 时回放原确认；新增 current-generation interrupt 仍走当前 fence 的新提交。两个门控回归 GREEN（0.405s/0.534s），不把 ARM64 失败归为偶发或增加超时。HTTPS 降级与 JPEG SOF 长度也有独立 RED/GREEN；Windows headless fixture 使用内置 powershell.exe。最终 macOS TUI 1,848 项通过（1 项输出管道清理标记、24 项跳过），PTY 40 项通过；全工作区和新的 Linux/Windows CI 仍在运行。
+
+公开报告中的 `<local-evidence>` 是本地留存标记，文件未上传到仓库，不能作为读者可访问的日志链接。发布 CI 证据以 PR160 和对应 workflow run 为准。绝对路径 verifier 命令兼容性另有回归：修复前 `/usr/bin/diff` 和 `/bin/sh` 被误绑定到快照，3 个新增用例记录 1 项失败、2 项错误，修复后完整 Python 3.13 套件 93 项通过（20.791s）；现在保留绝对系统命令，继续快照相对脚本及声明只读输入。

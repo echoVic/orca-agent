@@ -156,13 +156,13 @@ def verifier_bindings(item, workspace: Path) -> list[tuple[str, Path, str]]:
                 bindings[token] = (token, workspace.parent / relative, "artifacts/" + relative)
             elif expect_program:
                 candidate = workspace / token
-                if candidate.is_file():
+                if not Path(token).is_absolute() and candidate.is_file():
                     bindings[token] = (token, candidate, token)
                 interpreter = bool(re.fullmatch(r"(?:python[0-9.]*|bash|sh|node|ruby|perl)", Path(token).name))
                 expect_program = False
             elif interpreter and not token.startswith("-"):
                 candidate = workspace / token
-                if candidate.is_file():
+                if not Path(token).is_absolute() and candidate.is_file():
                     bindings[token] = (token, candidate, token)
                 interpreter = False
             elif interpreter and token in {"-m", "-c", "-e"}:

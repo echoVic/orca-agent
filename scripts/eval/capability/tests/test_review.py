@@ -76,6 +76,35 @@ for script in Path('.').rglob('*.py'):
                 self.assertNotIn("expected.txt",shlex.split(command))
                 self.assertEqual((self.root/expected/"verifier/expected.txt").read_text(),"correct\n")
 
+    def test_absolute_system_program_keeps_live_output_and_snapshotted_input(self):
+        item = self.item(verify=["/usr/bin/diff result.txt expected.txt"], readonly_inputs=["expected.txt"])
+        (item.fixture / "expected.txt").write_text("correct\n")
+        result = self.local(item, "Path('result.txt').write_text('correct\\n')")
+        self.assertEqual(result.final_verification, "passed")
+        command = json.loads((self.root / "attempt/attempt.json").read_text())["verifier"][0]["command"]
+        self.assertEqual(shlex.split(command)[0], "/usr/bin/diff")
+        self.assertEqual((self.root / "attempt/verifier/expected.txt").read_text(), "correct\n")
+
+    def test_absolute_interpreter_keeps_relative_script_snapshotted(self):
+        item = self.item(verify=["/bin/sh verify.sh"])
+        (item.fixture / "verify.sh").write_text('test "$(cat result.txt)" = correct\n')
+        result = self.local(item, "Path('result.txt').write_text('correct')")
+        self.assertEqual(result.final_verification, "passed")
+        command = json.loads((self.root / "attempt/attempt.json").read_text())["verifier"][0]["command"]
+        self.assertEqual(shlex.split(command)[0], "/bin/sh")
+        self.assertEqual(Path(shlex.split(command)[1]), self.root / "attempt/verifier/verify.sh")
+
+    def test_absolute_interpreter_script_is_left_as_external_command(self):
+        script = self.root / "system-verifier.sh"
+        script.write_text('test "$(cat result.txt)" = correct\n')
+        command = "/bin/sh " + shlex.quote(str(script))
+        item = self.item(verify=[command])
+        self.assertEqual(evidence.verifier_bindings(item, item.fixture), [])
+        result = self.local(item, "Path('result.txt').write_text('correct')")
+        self.assertEqual(result.final_verification, "passed")
+        saved = json.loads((self.root / "attempt/attempt.json").read_text())
+        self.assertEqual(saved["verifier"][0]["command"], command)
+
     def test_executable_verifier_mode_is_preserved(self):
         item=self.item(verify=["scripts/verify.sh"])
         script=item.fixture/"scripts/verify.sh";script.parent.mkdir()
