@@ -102,7 +102,7 @@ pub(crate) fn execute_runtime_normal_tool(
         &invocation.mcp_registry,
         &invocation.external_tools,
         invocation.output_truncation,
-        invocation.shell_timeout_secs,
+        invocation.effective_shell_timeout_secs(),
         context.mcp_elicitation_handler,
         invocation.config.execution_profile,
         || context.cancel.is_cancelled(),
@@ -207,8 +207,8 @@ fn execute_bash(
         after: Duration::from_millis(timeout_ms),
         source: "caller timeout_ms",
     });
-    let admin_deadline = (invocation.shell_timeout_secs > 0).then(|| ExecutionDeadline {
-        after: Duration::from_secs(invocation.shell_timeout_secs),
+    let admin_deadline = Some(ExecutionDeadline {
+        after: Duration::from_secs(invocation.effective_shell_timeout_secs()),
         source: "administrator command cap",
     });
     let mut execution_deadline = match (caller_deadline, admin_deadline) {

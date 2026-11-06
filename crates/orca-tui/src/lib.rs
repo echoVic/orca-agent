@@ -73,6 +73,7 @@ mod plan_approval_actions;
 mod plan_panel;
 mod presentation;
 mod prestart_mcp;
+mod process_interrupt;
 mod protocol;
 mod queued_input;
 mod queued_input_actions;

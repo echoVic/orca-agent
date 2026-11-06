@@ -14,6 +14,10 @@ use orca_core::tool_types::{
 use crate::process;
 
 const MAX_EXTERNAL_TOOL_ENV_ARGS_BYTES: usize = 64 * 1024;
+/// A grandchild may inherit the external tool's stdout/stderr pipe and keep it
+/// open after the tool exits. Bound the post-exit drain so a wait cannot hang
+/// on that inherited descriptor.
+const EXTERNAL_TOOL_IO_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 // Security: only loads from ORCA_HOME/tools/ (user-controlled), never from
 // project-level directories, to prevent repo poisoning attacks.
@@ -243,11 +247,12 @@ pub fn execute_external_tool_with_policy_or_cancel_with_profile(
         );
     }
 
-    let output = match process::wait_for_child_output_or_cancel(
+    let output = match process::wait_for_child_output_or_cancel_with_drain_timeout(
         child,
         process_job,
         shell_timeout,
         &should_cancel,
+        EXTERNAL_TOOL_IO_DRAIN_TIMEOUT,
     ) {
         Ok(output) => output,
         Err(error) => {

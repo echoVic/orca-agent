@@ -232,6 +232,7 @@ struct ShellSession {
     requested_terminal: ShellTerminalMode,
     effective_terminal: ShellTerminalMode,
     capability_receipt: CapabilityReceipt,
+    interrupt_pgid: u32,
 }
 
 struct SpawnedShellChild {
@@ -471,7 +472,9 @@ impl RuntimeShellSessionManager {
                         false,
                     )
                 });
-                if let Err(error) = tasks.mark_worker_spawned(&task.id, child.id()?) {
+                let interrupt_pgid = child.id()?;
+                orca_tools::process::global_process_interrupt_handle().register(interrupt_pgid);
+                if let Err(error) = tasks.mark_worker_spawned(&task.id, interrupt_pgid) {
                     cleanup_failed_shell_start(
                         child,
                         process_job,
@@ -480,6 +483,7 @@ impl RuntimeShellSessionManager {
                         stdout_handle,
                         stderr_handle,
                     );
+                    orca_tools::process::global_process_interrupt_handle().clear(interrupt_pgid);
                     let error = io::Error::other(error);
                     let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
                     return Err(error);
@@ -501,6 +505,7 @@ impl RuntimeShellSessionManager {
                         requested_terminal,
                         effective_terminal,
                         capability_receipt: capability_receipt.clone(),
+                        interrupt_pgid,
                     },
                 );
                 return Ok(ShellSessionHandle {
@@ -596,7 +601,9 @@ impl RuntimeShellSessionManager {
                     cfg!(unix) && effective_terminal.is_pty(),
                 )
             });
-            if let Err(error) = tasks.mark_worker_spawned(&task.id, child.id()?) {
+            let interrupt_pgid = child.id()?;
+            orca_tools::process::global_process_interrupt_handle().register(interrupt_pgid);
+            if let Err(error) = tasks.mark_worker_spawned(&task.id, interrupt_pgid) {
                 cleanup_failed_shell_start(
                     child,
                     process_job,
@@ -605,6 +612,7 @@ impl RuntimeShellSessionManager {
                     stdout_handle,
                     stderr_handle,
                 );
+                orca_tools::process::global_process_interrupt_handle().clear(interrupt_pgid);
                 let error = io::Error::other(error);
                 let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
                 return Err(error);
@@ -626,6 +634,7 @@ impl RuntimeShellSessionManager {
                     requested_terminal,
                     effective_terminal,
                     capability_receipt: capability_receipt.clone(),
+                    interrupt_pgid,
                 },
             );
 
@@ -1332,6 +1341,7 @@ impl ShellSession {
             self.child.wait()
         } else {
             let status = self.child.wait()?;
+            orca_tools::process::global_process_interrupt_handle().clear(self.interrupt_pgid);
             self.drain_windows_terminal_output();
             self.stop_and_join_readers();
             Ok(status)
@@ -1419,14 +1429,33 @@ impl ShellSession {
     }
 
     fn terminate_child_tree(&mut self) {
+        // Two-phase stop: let the shell forward SIGTERM to its children, give
+        // it the same short grace Codex uses, then make the stop uncatchable.
+        // A process stuck in a network syscall cannot defer the second signal.
+        #[cfg(unix)]
+        {
+            const SIGTERM: i32 = 15;
+            const SIGKILL: i32 = 9;
+            const TERM_GRACE: Duration = Duration::from_millis(50);
+            let pgid = -(self.interrupt_pgid as i32);
+            let sent = unsafe { libc::kill(pgid, SIGTERM) } == 0;
+            if sent {
+                thread::sleep(TERM_GRACE);
+                unsafe {
+                    let _ = libc::kill(pgid, SIGKILL);
+                }
+            }
+        }
         let _ = self.process_job.terminate(137);
         #[cfg(not(windows))]
         self.child.kill();
+        orca_tools::process::global_process_interrupt_handle().clear(self.interrupt_pgid);
     }
 }
 
 impl Drop for ShellSession {
     fn drop(&mut self) {
+        orca_tools::process::global_process_interrupt_handle().clear(self.interrupt_pgid);
         self.stdin.close();
         if !self.is_workspace_owned() {
             self.join_readers();

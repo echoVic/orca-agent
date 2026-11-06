@@ -11,6 +11,7 @@ use crossbeam_channel::Sender;
 use orca_core::cancel::{OperationId, OperationIdAllocator};
 
 use crate::prestart_mcp::{McpServers, PrestartedMcp};
+use crate::process_interrupt::ProcessInterruptHandle;
 use crate::protocol::{
     SubmitToken, TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse,
 };
@@ -24,6 +25,7 @@ use crate::surface_projection::{SurfaceProjectionState, TuiStreamDeliveryWaterma
 pub(crate) struct TuiSurfaceTaskControl {
     hosted: Arc<HostedOperationState>,
     surface_ids: Arc<OperationIdAllocator>,
+    process_interrupt: ProcessInterruptHandle,
 }
 
 impl TuiSurfaceTaskControl {
@@ -31,6 +33,7 @@ impl TuiSurfaceTaskControl {
         Self {
             hosted: Arc::new(HostedOperationState::default()),
             surface_ids: Arc::new(OperationIdAllocator::default()),
+            process_interrupt: ProcessInterruptHandle::shared_with_runtime(),
         }
     }
 
@@ -191,6 +194,10 @@ impl TuiSurfaceTaskControl {
     }
 
     pub(crate) fn interrupt_current(&self) -> io::Result<bool> {
+        // First stop the OS process group directly. A shell blocked in a TCP
+        // recv cannot be reached through a degraded session write, and a
+        // cancellation token only asks the runtime to stop the next turn.
+        self.process_interrupt.force_kill();
         let mut hosted = self.lock_hosted();
         if cancel_surface_if_active_checked(&mut hosted)? {
             return Ok(true);

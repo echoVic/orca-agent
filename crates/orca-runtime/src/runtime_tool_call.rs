@@ -30,6 +30,11 @@ use crate::tasks::TaskRegistry;
 use crate::terminal_service::TerminalService;
 
 const READONLY_TOOL_TIMEOUT_SECS: u64 = 120;
+/// A configured shell timeout of zero means "use the built-in cap", never
+/// "run forever": a command blocked in an uninterruptible network syscall must
+/// still expire. Ten minutes mirrors the long-but-bounded default used by the
+/// Codex exec path.
+pub(crate) const DEFAULT_SHELL_TIMEOUT_HARD_CAP_SECS: u64 = 10 * 60;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const NORMAL_TOOL_MESSAGE_CAPACITY: usize = 32;
 const NORMAL_TOOL_ADMISSION_PENDING: u8 = 0;
@@ -127,6 +132,16 @@ impl RuntimeNormalToolInvocation {
         };
         clone.request = request.clone();
         clone
+    }
+
+    /// The shell timeout actually applied to commands. Zero is normalized to
+    /// the hard cap so no command path can wait forever by default.
+    pub(crate) fn effective_shell_timeout_secs(&self) -> u64 {
+        if self.shell_timeout_secs == 0 {
+            DEFAULT_SHELL_TIMEOUT_HARD_CAP_SECS
+        } else {
+            self.shell_timeout_secs
+        }
     }
 
     pub(crate) fn with_git_metadata_write_session(
@@ -1601,6 +1616,18 @@ pub(crate) mod tests {
         );
         assert_eq!(output.result.status, ToolStatus::Cancelled);
         assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn zero_shell_timeout_uses_the_hard_cap_instead_of_running_forever() {
+        let mut invocation = normal_invocation("bash", InterruptSemantics::WaitForTerminal);
+        invocation.shell_timeout_secs = 0;
+        assert_eq!(
+            invocation.effective_shell_timeout_secs(),
+            DEFAULT_SHELL_TIMEOUT_HARD_CAP_SECS
+        );
+        invocation.shell_timeout_secs = 120;
+        assert_eq!(invocation.effective_shell_timeout_secs(), 120);
     }
 
     #[test]

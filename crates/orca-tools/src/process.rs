@@ -2,7 +2,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -19,13 +19,127 @@ use orca_core::capability::{
 };
 use orca_core::execution_broker::{ExecutionBroker, LaunchError};
 use orca_core::retained_output::{
-    DEFAULT_RETAINED_OUTPUT_BYTES, RetainedOutputSnapshot, read_to_retained,
+    DEFAULT_RETAINED_OUTPUT_BYTES, RetainedOutput, RetainedOutputSnapshot, read_to_retained,
 };
 use orca_platform::process::ProcessJob;
 use orca_platform::process::read_child_pipe_interruptibly;
 use orca_platform::shell::ShellSpec;
 
 pub const DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM: usize = DEFAULT_RETAINED_OUTPUT_BYTES;
+
+/// A process group the user can stop at the OS level, independent of any
+/// transcript or event persistence. The TUI and the runtime share one
+/// process-wide handle so Esc reaches a shell that is stuck in a network
+/// syscall even when session persistence is degraded.
+#[derive(Clone, Debug, Default)]
+pub struct ProcessInterruptHandle {
+    pgid: Arc<Mutex<Option<u32>>>,
+}
+
+impl ProcessInterruptHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records the current process group. A later registration supersedes the
+    /// previous one because the TUI can only be showing one foreground
+    /// command at a time.
+    pub fn register(&self, pgid: u32) {
+        *self
+            .pgid
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pgid);
+    }
+
+    /// Clears the handle only when it still belongs to `pgid`, so a finished
+    /// process cannot erase a newer registration.
+    pub fn clear(&self, pgid: u32) {
+        let mut current = self
+            .pgid
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *current == Some(pgid) {
+            *current = None;
+        }
+    }
+
+    pub fn current(&self) -> Option<u32> {
+        *self
+            .pgid
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Kills the registered process group with SIGKILL (or the platform
+    /// equivalent) without consulting durable state. Returns whether a
+    /// signal was delivered.
+    pub fn force_kill(&self) -> bool {
+        let Some(pgid) = self.current() else {
+            return false;
+        };
+        let delivered = force_kill_process_group(pgid);
+        if delivered {
+            self.clear(pgid);
+        }
+        delivered
+    }
+}
+
+static GLOBAL_PROCESS_INTERRUPT: OnceLock<ProcessInterruptHandle> = OnceLock::new();
+
+pub fn global_process_interrupt_handle() -> &'static ProcessInterruptHandle {
+    GLOBAL_PROCESS_INTERRUPT.get_or_init(ProcessInterruptHandle::new)
+}
+
+/// The shared slot behind [`global_process_interrupt_handle`]. Callers that
+/// keep their own typed wrapper can hold exactly this `Arc` and therefore see
+/// the runtime's registration.
+pub fn global_process_interrupt_pgid() -> Arc<Mutex<Option<u32>>> {
+    Arc::clone(&global_process_interrupt_handle().pgid)
+}
+
+/// Delivers an uncatchable stop to a process group. The negative pid targets
+/// the whole group, including children that still share the shell's group.
+pub fn force_kill_process_group(pgid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SIGKILL cannot be deferred by an uninterruptible network wait once
+        // the kernel returns to user space; unlike SIGTERM/SIGINT it leaves no
+        // ESC-deferred window.
+        return unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) } == 0;
+    }
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new("taskkill")
+            .args(["/PID", &pgid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
+/// How long output readers may keep draining after the child exits. A
+/// grandchild that inherited the pipe can otherwise keep the reader alive
+/// forever and make `wait` appear hung.
+const PROCESS_IO_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct ProcessInterruptRegistration {
+    pgid: u32,
+}
+
+impl ProcessInterruptRegistration {
+    fn new(pgid: u32) -> Self {
+        global_process_interrupt_handle().register(pgid);
+        Self { pgid }
+    }
+}
+
+impl Drop for ProcessInterruptRegistration {
+    fn drop(&mut self) {
+        global_process_interrupt_handle().clear(self.pgid);
+    }
+}
 
 /// All production tool subprocesses enter through the execution broker. The
 /// returned receipt is deliberately available to callers even when the
@@ -304,6 +418,26 @@ pub fn wait_for_child_output_or_cancel(
         timeout,
         should_cancel,
         DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM,
+        PROCESS_IO_DRAIN_TIMEOUT,
+    )
+}
+
+/// Like [`wait_for_child_output_or_cancel`], but with an explicit bound on
+/// how long inherited pipe readers may keep draining after the child exits.
+pub fn wait_for_child_output_or_cancel_with_drain_timeout(
+    child: Child,
+    process_job: ProcessJob,
+    timeout: Option<Duration>,
+    should_cancel: impl Fn() -> bool,
+    drain_timeout: Duration,
+) -> io::Result<CommandOutput> {
+    wait_for_child_output_with_limit(
+        child,
+        process_job,
+        timeout,
+        should_cancel,
+        DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM,
+        drain_timeout,
     )
 }
 
@@ -320,6 +454,7 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
         Some(timeout),
         should_cancel,
         max_retained_bytes_per_stream,
+        PROCESS_IO_DRAIN_TIMEOUT,
     )
 }
 
@@ -329,6 +464,7 @@ fn wait_for_child_output_with_limit(
     timeout: Option<Duration>,
     should_cancel: impl Fn() -> bool,
     max_retained_bytes_per_stream: usize,
+    drain_timeout: Duration,
 ) -> io::Result<CommandOutput> {
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
@@ -350,16 +486,20 @@ fn wait_for_child_output_with_limit(
         return Err(error);
     }
 
+    let registration = ProcessInterruptRegistration::new(child.id());
     let reader_stop = Arc::new(AtomicBool::new(false));
+    let drain_deadline = Arc::new(Mutex::new(None::<Instant>));
     let stdout_handle = spawn_stoppable_reader(
         stdout,
         max_retained_bytes_per_stream,
         Arc::clone(&reader_stop),
+        Arc::clone(&drain_deadline),
     );
     let stderr_handle = spawn_stoppable_reader(
         stderr,
         max_retained_bytes_per_stream,
         Arc::clone(&reader_stop),
+        Arc::clone(&drain_deadline),
     );
 
     let status = wait_for_child_and_readers(
@@ -369,11 +509,24 @@ fn wait_for_child_output_with_limit(
         should_cancel,
         || stdout_handle.is_finished() && stderr_handle.is_finished(),
         reader_stop.as_ref(),
+        &drain_deadline,
+        drain_timeout,
     );
 
-    reader_stop.store(true, Ordering::Release);
-    let stdout = join_reader(stdout_handle, "stdout");
-    let stderr = join_reader(stderr_handle, "stderr");
+    stop_reader_drain(reader_stop.as_ref(), &drain_deadline, drain_timeout);
+    let stdout = join_reader_until(
+        stdout_handle,
+        "stdout",
+        drain_deadline.as_ref(),
+        max_retained_bytes_per_stream,
+    );
+    let stderr = join_reader_until(
+        stderr_handle,
+        "stderr",
+        drain_deadline.as_ref(),
+        max_retained_bytes_per_stream,
+    );
+    drop(registration);
     let (status, termination) = status?;
     let stdout = stdout?;
     let stderr = stderr?;
@@ -450,16 +603,23 @@ where
         return Err(error);
     }
 
+    let registration = ProcessInterruptRegistration::new(child.id());
     let reader_stop = Arc::new(AtomicBool::new(false));
+    let drain_deadline = Arc::new(Mutex::new(None::<Instant>));
     let stdout_handle = spawn_bounded_line_reader(
         stdout,
         max_line_bytes,
         initial,
         on_line,
         Arc::clone(&reader_stop),
+        Arc::clone(&drain_deadline),
     );
-    let stderr_handle =
-        spawn_stoppable_reader(stderr, max_retained_stderr_bytes, Arc::clone(&reader_stop));
+    let stderr_handle = spawn_stoppable_reader(
+        stderr,
+        max_retained_stderr_bytes,
+        Arc::clone(&reader_stop),
+        Arc::clone(&drain_deadline),
+    );
     let status = wait_for_child_and_readers(
         &mut child,
         &process_job,
@@ -467,13 +627,25 @@ where
         should_cancel,
         || stdout_handle.is_finished() && stderr_handle.is_finished(),
         reader_stop.as_ref(),
+        &drain_deadline,
+        PROCESS_IO_DRAIN_TIMEOUT,
     );
 
-    reader_stop.store(true, Ordering::Release);
+    stop_reader_drain(
+        reader_stop.as_ref(),
+        &drain_deadline,
+        PROCESS_IO_DRAIN_TIMEOUT,
+    );
     let stdout = stdout_handle
         .join()
         .map_err(|_| io::Error::other("stdout line reader thread panicked"));
-    let stderr = join_reader(stderr_handle, "stderr");
+    let stderr = join_reader_until(
+        stderr_handle,
+        "stderr",
+        drain_deadline.as_ref(),
+        max_retained_stderr_bytes,
+    );
+    drop(registration);
     let (status, termination) = status?;
     let stdout = stdout??;
     let stderr = stderr?;
@@ -498,6 +670,8 @@ fn wait_for_child_and_readers(
     should_cancel: impl Fn() -> bool,
     readers_finished: impl Fn() -> bool,
     reader_stop: &AtomicBool,
+    drain_deadline: &Mutex<Option<Instant>>,
+    drain_timeout: Duration,
 ) -> io::Result<(ExitStatus, CommandTermination)> {
     let deadline = timeout.map(|timeout| {
         Instant::now()
@@ -508,7 +682,13 @@ fn wait_for_child_and_readers(
 
     loop {
         if status.is_none() {
-            status = try_observe_child_exit(child, process_job, reader_stop)?;
+            status = try_observe_child_exit(
+                child,
+                process_job,
+                reader_stop,
+                drain_deadline,
+                drain_timeout,
+            )?;
         }
         if let Some(exit_status) = status
             && readers_finished()
@@ -517,7 +697,13 @@ fn wait_for_child_and_readers(
         }
         if should_cancel() {
             if status.is_none() {
-                status = try_observe_child_exit(child, process_job, reader_stop)?;
+                status = try_observe_child_exit(
+                    child,
+                    process_job,
+                    reader_stop,
+                    drain_deadline,
+                    drain_timeout,
+                )?;
             }
             let termination = if status.is_some() {
                 CommandTermination::Exited
@@ -528,12 +714,18 @@ fn wait_for_child_and_readers(
                 terminate_child_tree(child, process_job);
                 status = Some(child.wait()?);
             }
-            reader_stop.store(true, Ordering::Release);
+            stop_reader_drain(reader_stop, drain_deadline, drain_timeout);
             return Ok((status.expect("cancelled child status"), termination));
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             if status.is_none() {
-                status = try_observe_child_exit(child, process_job, reader_stop)?;
+                status = try_observe_child_exit(
+                    child,
+                    process_job,
+                    reader_stop,
+                    drain_deadline,
+                    drain_timeout,
+                )?;
             }
             let termination = if status.is_some() {
                 CommandTermination::Exited
@@ -544,8 +736,17 @@ fn wait_for_child_and_readers(
                 terminate_child_tree(child, process_job);
                 status = Some(child.wait()?);
             }
-            reader_stop.store(true, Ordering::Release);
+            stop_reader_drain(reader_stop, drain_deadline, drain_timeout);
             return Ok((status.expect("timed out child status"), termination));
+        }
+        // A reader that ignores the drain deadline must not make the caller
+        // wait forever after the child has gone.
+        if status.is_some() && drain_expired(drain_deadline) {
+            stop_reader_drain(reader_stop, drain_deadline, drain_timeout);
+            return Ok((
+                status.expect("exited child status"),
+                CommandTermination::Exited,
+            ));
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -555,6 +756,8 @@ fn try_observe_child_exit(
     child: &mut Child,
     process_job: &ProcessJob,
     reader_stop: &AtomicBool,
+    drain_deadline: &Mutex<Option<Instant>>,
+    drain_timeout: Duration,
 ) -> io::Result<Option<ExitStatus>> {
     match child.try_wait() {
         Ok(Some(exit_status)) => {
@@ -562,17 +765,42 @@ fn try_observe_child_exit(
             // this operation, then release readers held by escaped descendants.
             let _ = process_job.terminate(1);
             kill_process_group_by_pid(child);
-            reader_stop.store(true, Ordering::Release);
+            stop_reader_drain(reader_stop, drain_deadline, drain_timeout);
             Ok(Some(exit_status))
         }
         Ok(None) => Ok(None),
         Err(error) => {
             terminate_child_tree(child, process_job);
             let _ = child.wait();
-            reader_stop.store(true, Ordering::Release);
+            stop_reader_drain(reader_stop, drain_deadline, drain_timeout);
             Err(error)
         }
     }
+}
+
+fn stop_reader_drain(
+    reader_stop: &AtomicBool,
+    drain_deadline: &Mutex<Option<Instant>>,
+    drain_timeout: Duration,
+) {
+    reader_stop.store(true, Ordering::Release);
+    let mut deadline = drain_deadline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if deadline.is_none() {
+        *deadline = Some(
+            Instant::now()
+                .checked_add(drain_timeout)
+                .unwrap_or_else(Instant::now),
+        );
+    }
+}
+
+fn drain_expired(drain_deadline: &Mutex<Option<Instant>>) -> bool {
+    drain_deadline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some_and(|deadline| Instant::now() >= deadline)
 }
 
 struct BoundedLineRead<T> {
@@ -588,6 +816,7 @@ fn spawn_bounded_line_reader<R, T, F>(
     mut value: T,
     mut on_line: F,
     stop: Arc<AtomicBool>,
+    drain_deadline: Arc<Mutex<Option<Instant>>>,
 ) -> thread::JoinHandle<io::Result<BoundedLineRead<T>>>
 where
     R: ChildPipeReader + 'static,
@@ -595,7 +824,11 @@ where
     F: FnMut(&mut T, BoundedLine<'_>) -> io::Result<()> + Send + 'static,
 {
     thread::spawn(move || {
-        let mut reader = StoppableReader { reader, stop };
+        let mut reader = StoppableReader {
+            reader,
+            stop,
+            drain_deadline,
+        };
         let mut buffer = [0_u8; orca_core::retained_output::RETAINED_OUTPUT_READ_CHUNK_BYTES];
         let mut line = Vec::with_capacity(max_line_bytes.min(buffer.len()));
         let mut line_observed_bytes = 0usize;
@@ -927,11 +1160,21 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn escaped_pipe_holder_helper() {
-        if std::env::var_os("ORCA_PROCESS_ESCAPE_HOLDER").is_none() {
+        let Some(mode) = std::env::var_os("ORCA_PROCESS_ESCAPE_HOLDER") else {
             return;
-        }
+        };
         unsafe {
             libc::setsid();
+        }
+        if mode == "stream" {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let _ = stdout.write_all(b"escaped-output\n");
+                let _ = stdout.flush();
+            }
+            return;
         }
         thread::sleep(Duration::from_secs(5));
     }
@@ -984,9 +1227,14 @@ fn spawn_stoppable_reader<R: ChildPipeReader + 'static>(
     reader: R,
     max_retained_bytes: usize,
     stop: Arc<AtomicBool>,
+    drain_deadline: Arc<Mutex<Option<Instant>>>,
 ) -> thread::JoinHandle<io::Result<RetainedOutputSnapshot>> {
     thread::spawn(move || {
-        let mut reader = StoppableReader { reader, stop };
+        let mut reader = StoppableReader {
+            reader,
+            stop,
+            drain_deadline,
+        };
         read_to_retained(&mut reader, max_retained_bytes)
     })
 }
@@ -994,6 +1242,7 @@ fn spawn_stoppable_reader<R: ChildPipeReader + 'static>(
 struct StoppableReader<R> {
     reader: R,
     stop: Arc<AtomicBool>,
+    drain_deadline: Arc<Mutex<Option<Instant>>>,
 }
 
 #[cfg(not(windows))]
@@ -1022,7 +1271,17 @@ impl<R: Read + std::os::windows::io::AsRawHandle + Send> ChildPipeReader for R {
 
 impl<R: ChildPipeReader> Read for StoppableReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.reader.read_interruptibly(self.stop.as_ref(), buffer)
+        if drain_expired(&self.drain_deadline) {
+            return Ok(0);
+        }
+        let read = self.reader.read_interruptibly(self.stop.as_ref(), buffer)?;
+        // Check after a successful read too: a descendant that continuously
+        // writes to an inherited pipe would otherwise never hit WouldBlock,
+        // and the stop flag alone would not release the reader.
+        if drain_expired(&self.drain_deadline) {
+            return Ok(0);
+        }
+        Ok(read)
     }
 }
 
@@ -1046,6 +1305,24 @@ fn join_reader(
     handle
         .join()
         .map_err(|_| io::Error::other(format!("{stream} reader thread panicked")))?
+}
+
+/// Joins a reader without letting a stuck pipe reader hold the whole command
+/// past the drain deadline. A reader still alive after the bound is detached;
+/// the command returns the output retained so far by a fresh snapshot.
+fn join_reader_until(
+    handle: thread::JoinHandle<io::Result<RetainedOutputSnapshot>>,
+    stream: &str,
+    drain_deadline: &Mutex<Option<Instant>>,
+    max_retained_bytes: usize,
+) -> io::Result<RetainedOutputSnapshot> {
+    while !handle.is_finished() && !drain_expired(drain_deadline) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !handle.is_finished() {
+        return Ok(RetainedOutput::new(max_retained_bytes).into_snapshot());
+    }
+    join_reader(handle, stream)
 }
 
 #[cfg(test)]
@@ -1086,9 +1363,9 @@ fn kill_process_group_by_pid(child: &mut Child) {
 /// killed outright. Long enough for a shell to forward the signal to its
 /// children and run a trap; short enough that a stop stays responsive.
 #[cfg(unix)]
-const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(5);
+const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(50);
 #[cfg(unix)]
-const PROCESS_GROUP_TERM_POLL: Duration = Duration::from_millis(20);
+const PROCESS_GROUP_TERM_POLL: Duration = Duration::from_millis(10);
 
 /// Stops a whole process group, preferring a graceful exit.
 ///
@@ -1129,6 +1406,69 @@ mod cancellation_tests {
     use super::*;
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn force_kill_stops_a_registered_process_group() {
+        let handle = ProcessInterruptHandle::new();
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 30");
+        prepare_non_interactive_command(&mut command);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let (mut child, _process_job) = spawn_test(&mut command).expect("spawn child");
+        handle.register(child.id());
+        let started = Instant::now();
+
+        assert!(
+            handle.force_kill(),
+            "registered process group receives SIGKILL"
+        );
+        let _ = child.wait();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "force kill waited for the child: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(handle.current(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaped_descendant_writing_to_the_pipe_cannot_outlive_the_drain_timeout() {
+        let helper = std::env::current_exe().expect("resolve test executable");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                "\"$ORCA_PROCESS_ESCAPE_HELPER\" --exact process::tests::escaped_pipe_holder_helper --nocapture & printf parent-done",
+            )
+            .env("ORCA_PROCESS_ESCAPE_HELPER", helper)
+            .env("ORCA_PROCESS_ESCAPE_HOLDER", "stream")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        prepare_non_interactive_command(&mut command);
+        let (child, process_job) =
+            spawn_test(&mut command).expect("spawn shell with escaped pipe writter");
+        let start = Instant::now();
+
+        let output = wait_for_child_output_or_cancel_with_drain_timeout(
+            child,
+            process_job,
+            None,
+            || false,
+            Duration::from_millis(200),
+        )
+        .expect("bounded escaped-session wait");
+
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "escaped pipe writer held the wait: {:?}",
+            start.elapsed()
+        );
+        assert!(output.stdout_text().contains("parent-done"));
+        assert_eq!(output.termination, CommandTermination::Exited);
+    }
+
     #[test]
     fn completed_process_wins_cancellation_observed_during_callback() {
         let temp = tempfile::tempdir().expect("tempdir");
