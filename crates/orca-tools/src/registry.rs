@@ -781,8 +781,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
             "subagent",
-            "Dispatch a background subtask to a subagent with an isolated context. \
-             Runs concurrently; use task_list to check status or subagent_message to interact.",
+            "Launch/resume a bounded multi-step child; quickly returns task_id (queued means accepted: do not resubmit). Continue independent work; task_wait for needed results, task_read_output for evidence, subagent_message for guidance, task_stop to cancel. Wait timeouts do not stop execution. Completion: concise summary and resume hint. No mode parameter.",
             json!({
                 "type": "object",
                 "properties": {

@@ -1296,7 +1296,7 @@ mod tests {
         let second = subagent_request("second");
         let mut conversation = orca_core::conversation::Conversation::new();
 
-        let error = match super::record_subagent_batch_results(
+        super::record_subagent_batch_results(
             &mut conversation,
             Some(&mut writer),
             vec![
@@ -1314,24 +1314,29 @@ mod tests {
                 ),
             ],
             true,
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("history append must fail"),
-        };
+        )
+        .expect("a history append failure must not fail the subagent batch");
 
-        assert!(error.raw_os_error().is_some());
+        // The writer is degraded but both live results (and their terminals)
+        // stay in the conversation.
+        assert!(writer.is_degraded());
         assert_eq!(
             conversation
                 .messages
                 .iter()
                 .map(|message| match message {
-                    orca_core::conversation::Message::Tool { tool_call_id, .. } => {
-                        tool_call_id.as_str()
-                    }
-                    _ => panic!("expected tool result"),
+                    orca_core::conversation::Message::Tool {
+                        tool_call_id,
+                        terminal: Some(terminal),
+                        ..
+                    } => (tool_call_id.as_str(), terminal.status),
+                    _ => panic!("expected terminal-aware tool result"),
                 })
                 .collect::<Vec<_>>(),
-            ["first", "second"]
+            [
+                ("first", tool_types::ToolStatus::Completed),
+                ("second", tool_types::ToolStatus::Completed),
+            ]
         );
     }
 

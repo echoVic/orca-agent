@@ -2321,7 +2321,7 @@ mod tests {
             raw_arguments: None,
         };
 
-        let error = record_readonly_batch_results(
+        record_readonly_batch_results(
             &mut conversation,
             Some(&mut writer),
             vec![
@@ -2330,19 +2330,28 @@ mod tests {
             ],
             true,
         )
-        .expect_err("history append must fail");
+        .expect("a history append failure must not fail the batch");
 
-        assert!(error.raw_os_error().is_some());
+        // The writer is degraded but both live results (and their terminals)
+        // stay in the conversation.
+        assert!(writer.is_degraded());
         assert_eq!(
             conversation
                 .messages
                 .iter()
                 .map(|message| match message {
-                    Message::Tool { tool_call_id, .. } => tool_call_id.as_str(),
-                    _ => panic!("expected tool result"),
+                    Message::Tool {
+                        tool_call_id,
+                        terminal: Some(terminal),
+                        ..
+                    } => (tool_call_id.as_str(), terminal.status),
+                    _ => panic!("expected terminal-aware tool result"),
                 })
                 .collect::<Vec<_>>(),
-            ["tool-1", "tool-2"]
+            [
+                ("tool-1", ToolStatus::Completed),
+                ("tool-2", ToolStatus::Completed),
+            ]
         );
     }
 
@@ -3386,7 +3395,7 @@ mod tests {
     }
 
     #[test]
-    fn run_tool_turns_closes_readonly_batch_and_sibling_after_history_failure() {
+    fn run_tool_turns_degrades_history_and_keeps_sibling_running() {
         let cwd = tempfile::tempdir().expect("cwd");
         std::fs::write(cwd.path().join("one.txt"), "one\n").expect("write first fixture");
         std::fs::write(cwd.path().join("two.txt"), "two\n").expect("write second fixture");
@@ -3411,11 +3420,13 @@ mod tests {
                 raw_arguments: Some(r#"{"path":"two.txt"}"#.to_string()),
             },
             ToolRequest {
-                id: "never-run".to_string(),
+                id: "sibling".to_string(),
                 name: ToolName::Bash,
                 action: ActionKind::Shell,
-                target: Some("printf never".to_string()),
-                raw_arguments: Some(r#"{"command":"printf never"}"#.to_string()),
+                // Portable across the host shells used by the test matrix:
+                // the degraded turn must still run this sibling request.
+                target: Some("echo never".to_string()),
+                raw_arguments: Some(r#"{"command":"echo never"}"#.to_string()),
             },
         ];
         let mut events = EventFactory::new("tool-turn-history-error".to_string());
@@ -3451,7 +3462,7 @@ mod tests {
             None,
         );
 
-        let error = match run_tool_turns(RuntimeToolTurnsContext {
+        let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state: &mut sampling_state,
             operation: None,
@@ -3469,12 +3480,14 @@ mod tests {
                 workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
                 batch_child_executor: unused_child_executor::<io::Sink>,
             },
-        }) {
-            Err(error) => error,
-            Ok(_) => panic!("history append failure must remain visible"),
-        };
+        })
+        .expect("a history append failure must not fail the tool turn");
 
-        assert!(error.raw_os_error().is_some());
+        // Persistence is degraded, but the batch and its sibling stay live:
+        // the read-only results were recorded in memory and the turn went on
+        // to run the remaining request to completion.
+        assert!(history_writer.is_degraded());
+        assert!(matches!(outcome, ToolTurnOutcome::Continue));
         assert_eq!(sampling_state.tool_cursor_position(), 3);
         assert_eq!(
             conversation
@@ -3492,7 +3505,9 @@ mod tests {
             [
                 ("read-one", ToolStatus::Completed),
                 ("read-two", ToolStatus::Completed),
-                ("never-run", ToolStatus::Cancelled),
+                // The sibling is no longer force-cancelled by the persistence
+                // failure: the degraded turn keeps going and runs it.
+                ("sibling", ToolStatus::Completed),
             ]
         );
     }

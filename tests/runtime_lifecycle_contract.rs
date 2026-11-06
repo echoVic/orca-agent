@@ -1620,9 +1620,15 @@ fn tool_actor_context_reuses_one_runtime_task_for_approval_hooks_and_execution()
         payload["task_id"].is_string(),
         "every command result carries its task identity: {payload}"
     );
-    assert!(
-        payload["effective_deadline_ms"].is_null(),
-        "no caller deadline and no configured cap means no execution limit: {payload}"
+    // A configured shell timeout of zero applies the built-in ten-minute
+    // administrator hard cap: commands are never unbounded by default.
+    assert_eq!(
+        payload["effective_deadline_ms"], 600_000,
+        "a zero configured shell timeout applies the administrator hard cap: {payload}"
+    );
+    assert_eq!(
+        payload["deadline_source"], "administrator command cap",
+        "the result must name the administrator cap as the deadline source: {payload}"
     );
     let shell_tasks = task_registry.list();
     assert_eq!(shell_tasks.len(), 1, "one command must create one task");

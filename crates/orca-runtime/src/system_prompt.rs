@@ -415,10 +415,12 @@ mod tests {
         let prefix =
             prompt.chars().count() + serde_json::to_string(&tools).unwrap().chars().count();
         // The measured #143 prefix was 32.9k chars. Leave room for request
-        // framing while protecting a further 15% reduction in total size.
+        // framing while protecting a double-digit reduction in total size.
         // Windows adds its native-shell guidance and a longer temp path.
         // +200 (2026-11-01) for the blocker-honesty and untrusted-text rules.
-        let limit = if cfg!(windows) { 28_700 } else { 28_000 };
+        // +600 (2026-11-07) for the web_fetch tool; the measured prefix is
+        // 28,440 chars with the subagent routing description restored.
+        let limit = if cfg!(windows) { 29_300 } else { 28_600 };
         assert!(
             prefix <= limit,
             "system + tool prefix is {prefix} chars (limit {limit})"
