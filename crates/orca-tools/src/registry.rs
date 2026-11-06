@@ -19,7 +19,7 @@ use orca_mcp::{McpElicitationHandler, McpRegistry, McpRequestError, client::McpC
 
 use crate::{
     edit, external, git, glob, grep, list_files, read_file, report_blocker, skills, update_goal,
-    update_plan, web_search, write_file,
+    update_plan, web_fetch, web_search, write_file,
 };
 
 #[cfg(test)]
@@ -754,9 +754,35 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::WebSearch,
     ));
     registry.register(BuiltinTool::new(
+        cooperative_builtin_spec(
+            "web_fetch",
+            "Fetch a URL and return its readable text content. Extracts the main body from HTML pages. Optionally filter the result to sections relevant to a prompt.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch (http or https)"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Optional topic or question; when provided, only sections relevant to the prompt are returned"
+                    }
+                },
+                "required": ["url"]
+            }),
+            CapabilitySet::network_search(),
+            ToolExposure::Direct,
+            RendererHint::Network,
+            false,
+        ),
+        BuiltinExecutor::WebFetch,
+    ));
+    registry.register(BuiltinTool::new(
         conservative_builtin_spec(
             "subagent",
-            "Launch/resume a bounded multi-step child; quickly returns task_id (queued means accepted: do not resubmit). Continue independent work; task_wait for needed results, task_read_output for evidence, subagent_message for guidance, task_stop to cancel. Wait timeouts do not stop execution. Completion: concise summary and resume hint. No mode parameter.",
+            "Dispatch a background subtask to a subagent with an isolated context. \
+             Runs concurrently; use task_list to check status or subagent_message to interact.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2001,6 +2027,11 @@ impl Tool for BuiltinTool {
                     ctx.is_cancelled()
                 })
             }
+            BuiltinExecutor::WebFetch => {
+                web_fetch::execute_or_cancel(request, ctx.max_output_bytes(), || {
+                    ctx.is_cancelled()
+                })
+            }
             BuiltinExecutor::Subagent => ToolResult::failed(
                 request,
                 "subagent tool must be executed by the runtime",
@@ -2086,6 +2117,7 @@ enum BuiltinExecutor {
     WriteFile,
     GitStatus,
     WebSearch,
+    WebFetch,
     Subagent,
     TaskList,
     TaskStop,
