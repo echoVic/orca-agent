@@ -284,11 +284,20 @@ fn check_model(cwd: &Path, config_is_usable: bool) -> DiagnosticCheck {
     match file::load_effective_config(cwd, ConfigOverrides::default()) {
         Ok(config) => {
             let model = config.model.as_deref().unwrap_or("auto");
-            let base_url = config
+            let configured_base_url = config
                 .base_url
                 .as_deref()
-                .unwrap_or("https://api.deepseek.com");
-            pass_check("model", format!("{model}; endpoint {base_url}"))
+                .map(str::trim)
+                .filter(|url| !url.is_empty());
+            let base_url = configured_base_url.unwrap_or("https://api.deepseek.com");
+            let detail = if configured_base_url.is_some() {
+                format!(
+                    "{model}; endpoint {base_url} (custom; third-party endpoints usually do not support /beta strict tools)"
+                )
+            } else {
+                format!("{model}; endpoint {base_url}")
+            };
+            pass_check("model", detail)
         }
         Err(error) => fail_check(
             "model",
