@@ -2631,6 +2631,7 @@ dependencies = [
  "tokio-util",
  "toml 0.8.23",
  "toml 1.1.7+spec-1.1.0",
+ "tracing",
  "uuid",
  "walkdir",
  "zstd",

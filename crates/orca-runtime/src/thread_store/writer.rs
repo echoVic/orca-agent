@@ -5,6 +5,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
@@ -1218,6 +1219,7 @@ pub struct SessionWriter {
     path: PathBuf,
     conversation_records: Arc<Mutex<Vec<StoredConversationRecord>>>,
     event_sequence_cursor: Arc<Mutex<u64>>,
+    degraded: Arc<AtomicBool>,
     turn_id: Option<TurnId>,
     session_id: Option<String>,
 }
@@ -1270,6 +1272,20 @@ impl SessionWriter {
         &self.path
     }
 
+    /// Marks this transcript as no longer durably recording new items.
+    ///
+    /// The live conversation keeps running; only future persistence attempts
+    /// are known to be unreliable. Marking is idempotent and shared by every
+    /// clone of this writer.
+    pub fn mark_degraded(&self) {
+        self.degraded.store(true, Ordering::Release);
+    }
+
+    /// Whether a persistence failure has degraded this transcript.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Acquire)
+    }
+
     /// The session id of this transcript, when known (from the session meta
     /// record). `None` for transcripts without one.
     pub(crate) fn session_id(&self) -> Option<String> {
@@ -1305,6 +1321,7 @@ impl SessionWriter {
             path,
             conversation_records: Arc::new(Mutex::new(Vec::new())),
             event_sequence_cursor: Arc::new(Mutex::new(0)),
+            degraded: Arc::new(AtomicBool::new(false)),
             turn_id: None,
             session_id: Some(session_id),
         })
@@ -1361,6 +1378,7 @@ impl SessionWriter {
             path,
             conversation_records: Arc::new(Mutex::new(conversation_records)),
             event_sequence_cursor: Arc::new(Mutex::new(event_sequence_cursor)),
+            degraded: Arc::new(AtomicBool::new(false)),
             turn_id: None,
             session_id,
         })
@@ -1992,6 +2010,7 @@ mod tests {
             path: path.clone(),
             conversation_records: Arc::new(Mutex::new(Vec::new())),
             event_sequence_cursor: Arc::new(Mutex::new(0)),
+            degraded: Arc::new(AtomicBool::new(false)),
             turn_id: None,
             session_id: None,
         };

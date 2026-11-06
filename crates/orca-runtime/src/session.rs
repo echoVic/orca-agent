@@ -106,13 +106,25 @@ pub(crate) fn record_tool_result_for_agent(
         terminal: Some(result.terminal().clone()),
         pinned: false,
     };
-    let history_result = if emit_deltas && let Some(writer) = history_writer {
-        writer.append_message(&message)
-    } else {
-        Ok(())
-    };
     conversation.add_tool_result_with_terminal(result, result_content.clone());
-    history_result?;
+    // Persistence is a durability concern, not an execution concern: a broken
+    // transcript must not stop the tool turn. The item is already in memory, so
+    // record the failure, mark the writer degraded, and let the turn continue.
+    if emit_deltas
+        && let Some(writer) = history_writer
+        && let Err(error) = writer.append_message(&message)
+    {
+        tracing::warn!(
+            path = %writer.path().display(),
+            %error,
+            "session history write failed; continuing with an in-memory tool result"
+        );
+        eprintln!(
+            "orca: warning: session history write failed ({}); continuing in degraded mode: {error}",
+            writer.path().display()
+        );
+        writer.mark_degraded();
+    }
     Ok(result_content)
 }
 
@@ -129,8 +141,15 @@ pub(crate) fn record_assistant_response_for_agent<W: io::Write>(
             "assistant response did not contain content or tool calls",
         ));
     }
-    if emit_deltas {
-        sink.emit(events.model_response_completed(response))?;
+    if emit_deltas && let Err(error) = sink.emit(events.model_response_completed(response)) {
+        // As with tool results, the assistant turn is live state first. A
+        // failed event/session append must not prevent it from entering the
+        // conversation; the caller's semantic persistence boundary still
+        // reports its own failures separately.
+        tracing::warn!(%error, "assistant response event write failed; keeping the in-memory response");
+        eprintln!(
+            "orca: warning: assistant response event write failed; keeping the in-memory response: {error}"
+        );
     }
     conversation.internal_context.note_assistant_turn();
     conversation.messages.push(response.assistant_message());
@@ -1294,6 +1313,42 @@ mod tests {
             matches!(&conversation.messages[1], orca_core::conversation::Message::User { content, .. }
                 if content == "inspect repo")
         );
+    }
+
+    #[test]
+    fn tool_result_persistence_failure_keeps_the_live_result_and_marks_degraded() {
+        with_orca_home(|_| {
+            let cwd = tempdir().unwrap();
+            let mut writer = SessionWriter::start(cwd.path(), "mock", None, "prompt")
+                .expect("start session writer");
+            writer.enter_turn(orca_core::thread_identity::TurnId::new());
+            // Make the transcript path unwritable without touching the
+            // in-memory ledger: a directory cannot be opened for append.
+            let transcript = writer.path().to_path_buf();
+            std::fs::remove_file(&transcript).expect("remove transcript");
+            std::fs::create_dir(&transcript).expect("replace transcript with directory");
+
+            let request = ToolRequest {
+                id: "call-persist-failure".to_string(),
+                name: ToolName::ReadFile,
+                action: orca_core::approval_types::ActionKind::Read,
+                target: None,
+                raw_arguments: None,
+            };
+            let result = ToolResult::completed(&request, "tool output survives".to_string(), false);
+            let mut conversation = Conversation::new();
+
+            let recorded =
+                record_tool_result_for_agent(&mut conversation, Some(&mut writer), &result, true)
+                    .expect("persistence failure must not fail the tool result");
+
+            assert_eq!(recorded, "tool output survives");
+            assert!(matches!(
+                conversation.messages.last(),
+                Some(Message::Tool { content, .. }) if content == "tool output survives"
+            ));
+            assert!(writer.is_degraded());
+        });
     }
 
     #[test]

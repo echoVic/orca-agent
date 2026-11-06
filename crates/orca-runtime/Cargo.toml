@@ -41,6 +41,7 @@ async-trait = { workspace = true }
 agent-client-protocol = { workspace = true }
 futures = { workspace = true }
 tempfile = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 orca-computer-use = { path = "../orca-computer-use", features = ["test-utils"] }
