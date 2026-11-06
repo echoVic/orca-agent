@@ -101,8 +101,7 @@ struct FetchArgs {
 
 fn parse_args(request: &ToolRequest) -> Result<FetchArgs, String> {
     let raw = request.raw_arguments.as_deref().unwrap_or("{}").trim();
-    serde_json::from_str::<FetchArgs>(raw)
-        .map_err(|e| format!("invalid web_fetch arguments: {e}"))
+    serde_json::from_str::<FetchArgs>(raw).map_err(|e| format!("invalid web_fetch arguments: {e}"))
 }
 
 // ── fetch pipeline ─────────────────────────────────────────────────────────────
@@ -210,7 +209,13 @@ async fn fetch_with_redirects(
                 .unwrap_or_else(|| location.to_string());
 
             return if is_permitted_redirect(url, &resolved) {
-                Box::pin(fetch_with_redirects(client, &resolved, should_cancel, depth + 1)).await
+                Box::pin(fetch_with_redirects(
+                    client,
+                    &resolved,
+                    should_cancel,
+                    depth + 1,
+                ))
+                .await
             } else {
                 Err(FetchError::Failed(format!(
                     "cross-origin redirect blocked: {resolved}"
@@ -220,9 +225,7 @@ async fn fetch_with_redirects(
     }
 
     if !status.is_success() {
-        return Err(FetchError::Failed(format!(
-            "HTTP {status} fetching {url}"
-        )));
+        return Err(FetchError::Failed(format!("HTTP {status} fetching {url}")));
     }
 
     let bytes = await_or_cancel(response.bytes(), should_cancel)
@@ -359,17 +362,15 @@ fn extract_meta_description(html: &str) -> Option<String> {
         return Some(caps.get(1)?.as_str().to_string());
     }
     // Alternative attribute order: content= before name=
-    let re2 =
-        Regex::new(r#"(?i)<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']"#)
-            .ok()?;
+    let re2 = Regex::new(r#"(?i)<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']"#)
+        .ok()?;
     re2.captures(html)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
 }
 
 fn remove_tag_block(html: &str, tag: &str) -> String {
-    let re =
-        Regex::new(&format!(r"(?is)<{tag}[^>]*>.*?</{tag}>")).expect("valid regex");
+    let re = Regex::new(&format!(r"(?is)<{tag}[^>]*>.*?</{tag}>")).expect("valid regex");
     re.replace_all(html, " ").into_owned()
 }
 
@@ -492,7 +493,10 @@ mod tests {
         let html = r#"<html><head><title>Hello World</title></head>
             <body><p>First paragraph.</p><p>Second paragraph.</p></body></html>"#;
         let text = html_to_text(html);
-        assert!(text.contains("# Hello World"), "title should appear as header");
+        assert!(
+            text.contains("# Hello World"),
+            "title should appear as header"
+        );
         assert!(text.contains("First paragraph."));
         assert!(text.contains("Second paragraph."));
         assert!(!text.contains('<'), "no raw tags should remain");
@@ -507,7 +511,10 @@ mod tests {
         </body></html>"#;
         let text = html_to_text(html);
         assert!(!text.contains("var x"), "script content should be removed");
-        assert!(!text.contains("color: red"), "style content should be removed");
+        assert!(
+            !text.contains("color: red"),
+            "style content should be removed"
+        );
         assert!(text.contains("Visible text."));
     }
 

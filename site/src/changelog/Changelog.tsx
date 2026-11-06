@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.18":
+        "Esc now stops a stuck shell at the OS level: the TUI kills the active process group directly, so an interrupt works even when session history is broken, and a timed-out command stops with SIGTERM then SIGKILL after a short grace. A failed history write keeps the tool result or assistant turn in the live conversation and marks the transcript degraded instead of blocking the turn. Custom and reverse-proxy endpoints gain /base-url, trailing-slash trimming for ORCA_BASE_URL and DEEPSEEK_BASE_URL, custom-endpoint notes in orca doctor and /status, and ORCA_STRICT_TOOLS=1 to force strict tools. The new web_fetch tool returns a page's readable text, optionally filtered by a prompt, with a 60-second timeout and same-origin redirects only.",
       "v0.5.17":
         "New TUI sessions start with Full Access; --yolo also works for launches and resumes, and pending approvals can switch the active session. Headless completion reports durable recovery, unresolved child blockers and bounded workspace changes. Provider retries share a cooldown and budget. Compression and streamed responses record observed cost and latency; capability evals retain verifier evidence, and tool screenshots keep vision descriptions for models that need them.",
       "v0.5.16":
@@ -708,6 +710,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.18":
+        "Esc 现在直接在系统层面停止卡住的 shell：TUI 先杀掉当前进程组，即使会话历史写入损坏也能中断；超时的命令先收到 SIGTERM，短暂宽限后再收到 SIGKILL。历史写入失败时，工具结果或助手回复仍保留在实时会话里，并把该记录标记为降级，而不是阻塞这一轮。自定义和反向代理端点新增 /base-url 命令、ORCA_BASE_URL 与 DEEPSEEK_BASE_URL 的末尾斜杠清理、orca doctor 和 /status 的自定义端点提示，以及用 ORCA_STRICT_TOOLS=1 强制严格工具模式。新增 web_fetch 工具，返回网页的可读文本，可按 prompt 过滤，限制 60 秒超时，只跟随同源重定向。",
       "v0.5.17":
         "新 TUI 会话默认 Full Access；启动和恢复支持 --yolo，待审批的任务也能切换当前会话权限。Headless 完成记录提供真实恢复状态、子任务 blocker 和有预算限制的工作区净变化。Provider 重试共享冷却与预算，压缩和流式响应记录已观测费用与延迟，评测保留独立验收证据，工具截图为需要旁路视觉的模型保留描述。",
       "v0.5.16":

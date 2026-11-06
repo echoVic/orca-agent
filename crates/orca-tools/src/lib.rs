@@ -24,8 +24,8 @@ pub mod schema;
 pub mod skills;
 pub mod update_goal;
 pub mod update_plan;
-pub mod web_search;
 pub mod web_fetch;
+pub mod web_search;
 pub mod write_file;
 
 pub use registry::{Tool, ToolContext, ToolRegistry, validate_tool_request};

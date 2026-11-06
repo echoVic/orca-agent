@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.17";
+export const releaseVersion = "v0.5.18";
 
 export const releases = [
+  {
+    version: "v0.5.18",
+    date: "2026-11-07",
+    title: "Interrupt a stuck shell, fetch a page",
+    body: "Esc now stops the command the TUI is showing at the OS level, so a shell stuck in a network wait is interrupted even when session history is broken. A failed history write keeps the tool result or assistant turn in the live conversation and marks the transcript degraded instead of failing the call, and timed-out commands stop with SIGTERM then SIGKILL after a short grace. Custom and reverse-proxy provider endpoints are easier to configure: ORCA_BASE_URL and DEEPSEEK_BASE_URL are trimmed, /base-url shows and sets the effective endpoint, orca doctor and /status call out a custom endpoint, and ORCA_STRICT_TOOLS=1 forces strict tool schemas where the service supports them. The new web_fetch tool returns a page's readable text with a prompt filter, a 60-second timeout and same-origin redirects only.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.18",
+  },
   {
     version: "v0.5.17",
     date: "2026-11-05",

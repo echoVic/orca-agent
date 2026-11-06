@@ -2028,9 +2028,7 @@ impl Tool for BuiltinTool {
                 })
             }
             BuiltinExecutor::WebFetch => {
-                web_fetch::execute_or_cancel(request, ctx.max_output_bytes(), || {
-                    ctx.is_cancelled()
-                })
+                web_fetch::execute_or_cancel(request, ctx.max_output_bytes(), || ctx.is_cancelled())
             }
             BuiltinExecutor::Subagent => ToolResult::failed(
                 request,
