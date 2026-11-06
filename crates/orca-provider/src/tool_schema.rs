@@ -76,9 +76,20 @@ fn deepseek_tool_schema(definition: &ProviderToolDefinition) -> Value {
     tool
 }
 
+/// Whether `base_url` is an endpoint that accepts the strict tools payload.
+///
+/// Only DeepSeek's official beta endpoint is known to support it. Compatible
+/// third-party endpoints rarely implement strict mode, so they stay off unless
+/// the user explicitly forces it with `ORCA_STRICT_TOOLS=1` after checking
+/// that their endpoint accepts `strict: true` function schemas.
 fn is_strict_capable_endpoint(base_url: &str) -> bool {
-    base_url.trim_end_matches('/').ends_with("/beta")
+    let url = base_url.trim_end_matches('/');
+    url.ends_with("/beta") || std::env::var("ORCA_STRICT_TOOLS").as_deref() == Ok("1")
 }
+
+/// Serializes tests that read or write `ORCA_STRICT_TOOLS`.
+#[cfg(test)]
+pub(crate) static STRICT_TOOLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn require_all_properties(schema: &mut Value) {
     let Some(object) = schema.as_object_mut() else {
@@ -230,5 +241,63 @@ mod tests {
                 "https://api.deepseek.com/beta",
             )
         );
+    }
+
+    fn with_strict_tools_env<T>(value: Option<&str>, test: impl FnOnce() -> T) -> T {
+        let _guard = STRICT_TOOLS_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var("ORCA_STRICT_TOOLS").ok();
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var("ORCA_STRICT_TOOLS", value),
+                None => std::env::remove_var("ORCA_STRICT_TOOLS"),
+            }
+        }
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(value) => std::env::set_var("ORCA_STRICT_TOOLS", value),
+                        None => std::env::remove_var("ORCA_STRICT_TOOLS"),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(previous);
+        test()
+    }
+
+    #[test]
+    fn custom_and_trailing_slash_endpoints_are_not_strict_by_default() {
+        with_strict_tools_env(None, || {
+            for base_url in [
+                "https://api.siliconflow.cn/v1",
+                "https://api.siliconflow.cn/v1/",
+                "https://openrouter.ai/api/v1",
+                "http://localhost:11434/v1",
+                "https://api.deepseek.com",
+            ] {
+                assert!(
+                    !is_strict_capable_endpoint(base_url),
+                    "{base_url} must not get the strict payload by default"
+                );
+            }
+            assert!(is_strict_capable_endpoint("https://api.deepseek.com/beta"));
+            assert!(is_strict_capable_endpoint("https://api.deepseek.com/beta/"));
+        });
+    }
+
+    #[test]
+    fn strict_tools_can_be_forced_for_a_custom_endpoint() {
+        with_strict_tools_env(Some("1"), || {
+            assert!(is_strict_capable_endpoint("https://api.siliconflow.cn/v1"));
+            assert!(is_strict_capable_endpoint("http://localhost:11434/v1/"));
+        });
+        with_strict_tools_env(Some("true"), || {
+            assert!(
+                !is_strict_capable_endpoint("https://api.siliconflow.cn/v1"),
+                "only the exact value 1 enables strict tools"
+            );
+        });
     }
 }

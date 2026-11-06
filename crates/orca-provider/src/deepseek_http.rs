@@ -1809,6 +1809,12 @@ mod tests {
 
     #[test]
     fn strict_tools_apply_only_on_beta_endpoint_to_eligible_definitions() {
+        // This test expects the default endpoint to be non-strict; keep the
+        // process-wide override from a concurrent test out of it.
+        let _guard = crate::tool_schema::STRICT_TOOLS_ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("ORCA_STRICT_TOOLS");
+        }
         let definitions = vec![
             crate::tool_schema::ProviderToolDefinition {
                 name: "strict_capable".to_string(),
