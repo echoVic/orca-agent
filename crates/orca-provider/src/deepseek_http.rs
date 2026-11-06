@@ -21,6 +21,11 @@ use crate::http_client::RetryBudget;
 use crate::tool_schema::{deepseek_strict_tools_schema_for_endpoint, deepseek_tools_schema};
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
+// 免费/第三方兼容端点示例（通过 ORCA_BASE_URL 或 config.toml base_url 配置）：
+//   SiliconFlow:  "https://api.siliconflow.cn/v1"
+//   OpenRouter:   "https://openrouter.ai/api/v1"
+//   本地 Ollama:  "http://localhost:11434/v1"
+// 注意：第三方端点通常不支持 /beta strict 模式，请勿加 /beta 后缀
 pub(crate) const DEFAULT_MODEL: &str = FLASH_MODEL;
 const DEEPSEEK_MAX_TOOLS: usize = 128;
 const EMPTY_RESPONSE_RETRIES: usize = 1;
