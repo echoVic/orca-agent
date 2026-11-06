@@ -60,7 +60,7 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 
 [package]
 name = "orca-agent"
-version = "0.5.17"
+version = "0.5.18"
 edition = "2024"
 description = "Orca Agent: a DeepSeek-native terminal coding agent"
 license = "MIT"

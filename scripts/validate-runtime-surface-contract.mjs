@@ -1247,6 +1247,8 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     1,
   ],
   ["crates/orca-tui/src/hosted_controller.rs:spawn_recap_request:successes.insert", 1],
+  // Esc force-kill clears the registered process-group slot; not a runtime mutation.
+  ["crates/orca-tui/src/process_interrupt.rs:force_kill:self.clear", 1],
   ["crates/orca-tui/src/mcp_dialog_actions.rs:start_action:state.mcp_actions_in_flight.insert", 1],
   ["crates/orca-tui/src/acp_client.rs:text:self.indices.insert", 1],
   ["crates/orca-tui/src/acp_client.rs:image:self.indices.insert", 1],

@@ -329,7 +329,7 @@
       "shell-session-unix-process-api",
       "crates/orca-runtime/src/shell_session.rs",
       "unix_libc_process",
-      4,
+      6,
       "conpty-tui-plan"
     ],
     [
@@ -469,7 +469,7 @@
       "process-helper-shells",
       "crates/orca-tools/src/process.rs",
       "unix_shell_spawn",
-      6,
+      8,
       "process-ownership-plan"
     ],
     [
@@ -483,7 +483,7 @@
       "process-helper-unix-libc",
       "crates/orca-tools/src/process.rs",
       "unix_libc_process",
-      4,
+      6,
       "process-ownership-plan"
     ],
     [
