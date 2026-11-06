@@ -32,7 +32,7 @@ pub(crate) fn handle_idle_submit(
     theme: &Theme,
     state: &mut AppState,
     config: &mut RunConfig,
-    _shared_config: &Arc<Mutex<RunConfig>>,
+    shared_config: &Arc<Mutex<RunConfig>>,
     action_tx: &mpsc::Sender<UserAction>,
 ) -> bool {
     if state.composer_images.is_paste_in_flight() {
@@ -83,6 +83,7 @@ pub(crate) fn handle_idle_submit(
             &text,
             &pending_pastes,
             config,
+            shared_config,
             state,
             action_tx,
         )

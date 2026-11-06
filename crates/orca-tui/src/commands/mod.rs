@@ -2,6 +2,7 @@
 pub enum SlashCommand {
     New,
     Model(Option<String>),
+    BaseUrl(Option<String>),
     Compact,
     Recap,
     Resume,
@@ -133,6 +134,7 @@ pub fn invalid_slash_command_message(input: &str) -> String {
     let usage = match command {
         "/workflow" => "/workflow:<name> [args]",
         "/model" => "/model or /model <name>",
+        "/base-url" => "/base-url, /base-url <url>, or /base-url reset",
         "/mode" => "/mode or /mode suggest|auto-edit|full-auto|plan",
         "/plan" => "/plan or /plan off",
         "/queue" => "/queue, /queue pause, or /queue start",
@@ -161,6 +163,8 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
         "new" | "clear" => no_arguments(parts).then_some(SlashCommand::New),
         "model" => optional_single_argument(parts)
             .map(|model| SlashCommand::Model(model.map(str::to_string))),
+        "base-url" => optional_single_argument(parts)
+            .map(|url| SlashCommand::BaseUrl(url.map(str::to_string))),
         "compact" => no_arguments(parts).then_some(SlashCommand::Compact),
         "recap" => no_arguments(parts).then_some(SlashCommand::Recap),
         "resume" => no_arguments(parts).then_some(SlashCommand::Resume),
@@ -231,6 +235,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
     &[
         ("/new", "Start a new conversation"),
         ("/model", "Switch model and reasoning effort"),
+        ("/base-url", "Show or change the provider base URL"),
         ("/compact", "Compress conversation context"),
         ("/recap", "Recap what this conversation has done so far"),
         ("/resume", "Resume a saved conversation"),
@@ -541,6 +546,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_base_url_command() {
+        assert_eq!(parse("/base-url"), Some(SlashCommand::BaseUrl(None)));
+        assert_eq!(
+            parse("/base-url https://api.siliconflow.cn/v1"),
+            Some(SlashCommand::BaseUrl(Some(
+                "https://api.siliconflow.cn/v1".to_string()
+            )))
+        );
+        assert_eq!(
+            parse("/base-url reset"),
+            Some(SlashCommand::BaseUrl(Some("reset".to_string())))
+        );
+        assert!(
+            all_commands()
+                .iter()
+                .any(|(command, _)| *command == "/base-url")
+        );
+    }
+
+    #[test]
     fn parses_mode_commands() {
         assert_eq!(parse("/mode"), Some(SlashCommand::Mode(None)));
         assert_eq!(
@@ -564,6 +589,7 @@ mod tests {
             "/new now",
             "/clear now",
             "/model auto extra",
+            "/base-url https://a.example https://b.example",
             "/compact now",
             "/resume latest",
             "/status now",
@@ -635,6 +661,10 @@ mod tests {
         assert_eq!(
             invalid_slash_command_message("/model a b"),
             "Use /model or /model <name>."
+        );
+        assert_eq!(
+            invalid_slash_command_message("/base-url a b"),
+            "Use /base-url, /base-url <url>, or /base-url reset."
         );
         assert_eq!(
             invalid_slash_command_message("/queue clear"),

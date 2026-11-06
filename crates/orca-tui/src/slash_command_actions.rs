@@ -162,7 +162,7 @@ fn mcp_prompt_server_connecting(
 pub(crate) fn handle_slash_command(
     text: &str,
     config: &mut RunConfig,
-    _shared_config: &Arc<Mutex<RunConfig>>,
+    shared_config: &Arc<Mutex<RunConfig>>,
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
 ) -> Option<SlashOutcome> {
@@ -174,7 +174,7 @@ pub(crate) fn handle_slash_command(
     let Some(command) = commands::parse_with_cwd(text, &cwd, &state.mcp_catalog.prompts) else {
         return mcp_prompt_server_connecting(text, config, state);
     };
-    dispatch_slash_command(command, None, config, state, action_tx)
+    dispatch_slash_command(command, None, config, shared_config, state, action_tx)
 }
 
 pub(crate) fn handle_composer_slash_command(
@@ -182,6 +182,7 @@ pub(crate) fn handle_composer_slash_command(
     expanded_text: &str,
     pending_pastes: &[(String, String)],
     config: &mut RunConfig,
+    shared_config: &Arc<Mutex<RunConfig>>,
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
 ) -> Option<SlashOutcome> {
@@ -200,6 +201,7 @@ pub(crate) fn handle_composer_slash_command(
                 SlashCommand::Goal(GoalSlashCommand::Set(objective)),
                 Some(draft),
                 config,
+                shared_config,
                 state,
                 action_tx,
             )
@@ -213,6 +215,7 @@ pub(crate) fn handle_composer_slash_command(
                 SlashCommand::Goal(GoalSlashCommand::Edit(objective)),
                 Some(draft),
                 config,
+                shared_config,
                 state,
                 action_tx,
             )
@@ -223,7 +226,7 @@ pub(crate) fn handle_composer_slash_command(
             else {
                 return mcp_prompt_server_connecting(expanded_text, config, state);
             };
-            dispatch_slash_command(command, None, config, state, action_tx)
+            dispatch_slash_command(command, None, config, shared_config, state, action_tx)
         }
     }
 }
@@ -232,6 +235,7 @@ fn dispatch_slash_command(
     command: SlashCommand,
     goal_draft: Option<GoalDraft>,
     config: &mut RunConfig,
+    shared_config: &Arc<Mutex<RunConfig>>,
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
 ) -> Option<SlashOutcome> {
@@ -271,6 +275,37 @@ fn dispatch_slash_command(
                 expanded: false,
             });
         }
+        SlashCommand::BaseUrl(argument) => match argument.as_deref() {
+            None => state.push_message(ChatMessage::System {
+                text: format!(
+                    "Current base URL: {}",
+                    crate::diagnostics::base_url_summary(config.base_url.as_deref())
+                ),
+                expanded: false,
+            }),
+            Some("reset") => {
+                set_session_base_url(config, shared_config, None);
+                state.push_message(ChatMessage::System {
+                    text: format!(
+                        "Base URL reset to the default: {}",
+                        crate::diagnostics::DEFAULT_BASE_URL
+                    ),
+                    expanded: false,
+                });
+            }
+            Some(value) => match normalize_base_url_argument(value) {
+                Ok(url) => {
+                    set_session_base_url(config, shared_config, Some(url.clone()));
+                    state.push_message(ChatMessage::System {
+                        text: format!(
+                            "Base URL set to {url} for this session. Third-party compatible endpoints usually do not support /beta strict tools."
+                        ),
+                        expanded: false,
+                    });
+                }
+                Err(error) => state.push_message(ChatMessage::Error(error)),
+            },
+        },
         SlashCommand::Cost => {
             let usage = state.usage();
             state.push_message(ChatMessage::System {
@@ -551,6 +586,32 @@ fn dispatch_slash_command(
     Some(SlashOutcome::Continue)
 }
 
+fn set_session_base_url(
+    config: &mut RunConfig,
+    shared_config: &Arc<Mutex<RunConfig>>,
+    base_url: Option<String>,
+) {
+    config.base_url = base_url.clone();
+    if let Ok(mut shared) = shared_config.lock() {
+        shared.base_url = base_url;
+    }
+}
+
+/// A user-typed endpoint without a trailing slash. `/base-url reset` is the
+/// way to go back to the default, so an empty value is refused here.
+fn normalize_base_url_argument(value: &str) -> Result<String, String> {
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty() {
+        return Err(
+            "usage: /base-url <url>, or /base-url reset to restore the default".to_string(),
+        );
+    }
+    if !(value.starts_with("http://") || value.starts_with("https://")) {
+        return Err("base URL must start with http:// or https://".to_string());
+    }
+    Ok(value.to_string())
+}
+
 fn format_status(state: &AppState, config: &RunConfig) -> String {
     let session_id = state.current_session_id().unwrap_or("-");
     let title = state.current_session_title().unwrap_or("-");
@@ -611,6 +672,7 @@ fn format_status(state: &AppState, config: &RunConfig) -> String {
          title: {title}\n\
          id: {session_id}\n\
          model: {} ({})\n\
+         endpoint: {}\n\
          mode: {}\n\
          execution profile: {execution_profile}\n\
          shell sandbox: {shell_sandbox}\n\
@@ -624,6 +686,7 @@ fn format_status(state: &AppState, config: &RunConfig) -> String {
          recoverable: {}",
         state.model_name,
         state.reasoning_effort.as_str(),
+        crate::diagnostics::base_url_summary(config.base_url.as_deref()),
         state.approval_mode.as_str(),
         state.cwd,
         usage.input_tokens,
@@ -924,6 +987,7 @@ mod tests {
             "Release triage",
             "session-1",
             "deepseek-v4-pro",
+            "endpoint: default: https://api.deepseek.com",
             "plan",
             "execution profile: read-only",
             "shell sandbox: read-only",
@@ -934,6 +998,73 @@ mod tests {
             "recoverable: yes",
         ] {
             assert!(status.contains(expected), "missing {expected}: {status}");
+        }
+    }
+
+    #[test]
+    fn base_url_command_reads_sets_and_resets_the_session_endpoint() {
+        let mut state = state();
+        let mut config = test_run_config();
+        config.base_url = None;
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        handle_slash_command("/base-url", &mut config, &shared, &mut state, &action_tx);
+        assert!(matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::System { text, .. })
+                if text == "Current base URL: default: https://api.deepseek.com"
+        ));
+
+        handle_slash_command(
+            "/base-url https://api.siliconflow.cn/v1///",
+            &mut config,
+            &shared,
+            &mut state,
+            &action_tx,
+        );
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://api.siliconflow.cn/v1")
+        );
+        assert_eq!(
+            shared.lock().unwrap().base_url.as_deref(),
+            Some("https://api.siliconflow.cn/v1")
+        );
+
+        handle_slash_command("/base-url", &mut config, &shared, &mut state, &action_tx);
+        assert!(matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::System { text, .. })
+                if text == "Current base URL: https://api.siliconflow.cn/v1 (custom)"
+        ));
+
+        handle_slash_command(
+            "/base-url reset",
+            &mut config,
+            &shared,
+            &mut state,
+            &action_tx,
+        );
+        assert_eq!(config.base_url, None);
+        assert_eq!(shared.lock().unwrap().base_url, None);
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn base_url_command_rejects_values_that_are_not_http_endpoints() {
+        let mut state = state();
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, _) = mpsc::unbounded();
+
+        for command in ["/base-url ftp://example.test", "/base-url https://"] {
+            handle_slash_command(command, &mut config, &shared, &mut state, &action_tx);
+            assert_eq!(config.base_url, None, "accepted {command}");
+            assert!(matches!(
+                state.transcript.messages.last(),
+                Some(ChatMessage::Error(_))
+            ));
         }
     }
 
@@ -1354,6 +1485,7 @@ mod tests {
         ] {
             let mut state = state();
             let mut config = test_run_config();
+            let shared = Arc::new(Mutex::new(config.clone()));
             let (action_tx, action_rx) = mpsc::unbounded();
             let pending = vec![("[Pasted Content 1001 chars]".to_string(), "x".repeat(1001))];
             let expanded = visible.replace(&pending[0].0, &pending[0].1);
@@ -1363,6 +1495,7 @@ mod tests {
                 &expanded,
                 &pending,
                 &mut config,
+                &shared,
                 &mut state,
                 &action_tx,
             );

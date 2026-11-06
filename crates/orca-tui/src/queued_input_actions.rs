@@ -257,7 +257,7 @@ pub(crate) fn handle_running_key(
     key: &KeyEvent,
     state: &mut AppState,
     config: &mut RunConfig,
-    _shared_config: &Arc<Mutex<RunConfig>>,
+    shared_config: &Arc<Mutex<RunConfig>>,
     action_tx: &mpsc::Sender<UserAction>,
     textarea: &mut TextArea,
     vim_state: &mut VimState,
@@ -315,6 +315,7 @@ pub(crate) fn handle_running_key(
                         &expanded,
                         &pending_pastes,
                         config,
+                        shared_config,
                         state,
                         action_tx,
                     ) {

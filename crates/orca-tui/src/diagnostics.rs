@@ -12,6 +12,19 @@ use orca_runtime::surface::{
 /// The TUI prefixes a refused workflow launch with this text; `from_message` strips it.
 pub(crate) const WORKFLOW_NOT_STARTED_PREFIX: &str = "workflow was not started: ";
 
+/// The endpoint requests go to when the session config has no override.
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
+
+/// The effective base URL as diagnostics should show it. A configured value
+/// is marked custom because it means prompts and tool schemas go to a service
+/// other than the DeepSeek default.
+pub(crate) fn base_url_summary(base_url: Option<&str>) -> String {
+    match base_url.map(str::trim).filter(|url| !url.is_empty()) {
+        Some(url) => format!("{url} (custom)"),
+        None => format!("default: {DEFAULT_BASE_URL}"),
+    }
+}
+
 const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -942,5 +955,18 @@ mod tests {
 
         assert!(diagnostic.detail().len() <= MAX_DIAGNOSTIC_DETAIL_BYTES + 27);
         assert!(diagnostic.detail().ends_with("[diagnostic truncated]"));
+    }
+
+    #[test]
+    fn base_url_summary_marks_default_and_custom_endpoints() {
+        assert_eq!(base_url_summary(None), "default: https://api.deepseek.com");
+        assert_eq!(
+            base_url_summary(Some("  ")),
+            "default: https://api.deepseek.com"
+        );
+        assert_eq!(
+            base_url_summary(Some("https://api.siliconflow.cn/v1")),
+            "https://api.siliconflow.cn/v1 (custom)"
+        );
     }
 }
