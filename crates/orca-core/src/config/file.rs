@@ -360,7 +360,8 @@ pub fn environment_overrides() -> Result<ConfigOverrides, String> {
             .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()),
         base_url: std::env::var("ORCA_BASE_URL")
             .ok()
-            .or_else(|| std::env::var("DEEPSEEK_BASE_URL").ok()),
+            .or_else(|| std::env::var("DEEPSEEK_BASE_URL").ok())
+            .and_then(|value| normalize_base_url_override(&value)),
         reasoning_effort: std::env::var("ORCA_REASONING_EFFORT")
             .ok()
             .or_else(|| std::env::var("DEEPSEEK_REASONING_EFFORT").ok())
@@ -373,6 +374,14 @@ pub fn parse_approval_mode_value(mode: &str) -> Result<ApprovalMode, String> {
     ApprovalMode::from_str(mode, true).map_err(|_| {
         format!("unsupported mode '{mode}'. Use suggest, auto-edit, full-auto, or plan")
     })
+}
+
+/// An endpoint override without a trailing slash. An empty value means no
+/// override, so an exported-but-empty `ORCA_BASE_URL` falls back to the
+/// default endpoint instead of producing requests to `/chat/completions`.
+fn normalize_base_url_override(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches('/');
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort, String> {
@@ -707,6 +716,39 @@ mod tests {
     // Shared with the `home` tests: both change the process-wide `ORCA_HOME`.
     use crate::home::ENV_LOCK as EFFECTIVE_CONFIG_ENV_LOCK;
 
+    /// Runs `test` with `ORCA_BASE_URL` set to `value` and the legacy
+    /// `DEEPSEEK_BASE_URL` cleared, restoring both afterwards.
+    fn with_base_url_env<T>(value: &str, test: impl FnOnce() -> T) -> T {
+        struct Restore {
+            orca: Option<String>,
+            deepseek: Option<String>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.orca {
+                        Some(value) => std::env::set_var("ORCA_BASE_URL", value),
+                        None => std::env::remove_var("ORCA_BASE_URL"),
+                    }
+                    match &self.deepseek {
+                        Some(value) => std::env::set_var("DEEPSEEK_BASE_URL", value),
+                        None => std::env::remove_var("DEEPSEEK_BASE_URL"),
+                    }
+                }
+            }
+        }
+        let _guard = EFFECTIVE_CONFIG_ENV_LOCK.lock().unwrap();
+        let _restore = Restore {
+            orca: std::env::var("ORCA_BASE_URL").ok(),
+            deepseek: std::env::var("DEEPSEEK_BASE_URL").ok(),
+        };
+        unsafe {
+            std::env::set_var("ORCA_BASE_URL", value);
+            std::env::remove_var("DEEPSEEK_BASE_URL");
+        }
+        test()
+    }
+
     fn load_toml(path: &Path) -> FileConfig {
         let Ok(content) = fs::read_to_string(path) else {
             return FileConfig::default();
@@ -815,6 +857,19 @@ mod tests {
             error,
             "unsupported mode 'reckless'. Use suggest, auto-edit, full-auto, or plan"
         );
+    }
+
+    #[test]
+    fn environment_base_url_is_trimmed_and_empty_means_default() {
+        with_base_url_env(" https://api.siliconflow.cn/v1/// ", || {
+            assert_eq!(
+                environment_overrides().unwrap().base_url.as_deref(),
+                Some("https://api.siliconflow.cn/v1")
+            );
+        });
+        with_base_url_env("", || {
+            assert_eq!(environment_overrides().unwrap().base_url, None);
+        });
     }
 
     #[test]
