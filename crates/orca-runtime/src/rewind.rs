@@ -26,11 +26,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use chrono::Utc;
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::{Conversation, Message, is_internal_image_analysis};
+use orca_core::cost_types::UsageTotals;
 use orca_core::rewind::{
-    ConversationRewindReport, RewindCheckpointView, RewindFilesReport, RewindMode, RewindOutcome,
-    RewindReport, RewindSkip, RewindStats, RewindWarning,
+    ConversationRewindReport, RewindCheckpointView, RewindFilePreview, RewindFilesReport,
+    RewindMode, RewindOutcome, RewindReport, RewindSkip, RewindStats, RewindWarning,
 };
 use orca_core::tool_types::{ToolName, ToolRequest};
+use orca_provider::{ProviderConfig, context};
 use orca_rewind::{
     Applier, BlobEncoding, BlobRef as RewindBlobRef, PlanOptions, PlanSkip, PlanWarning, PreImage,
     RestorePlan, RewindStore, SnapshotFileView, SnapshotView, build_plan, file_sha256,
@@ -52,6 +54,12 @@ const DISABLE_OBSERVE_ENV: &str = "ORCA_REWIND_DISABLE_OBSERVE";
 /// Characters of the first prompt line kept for the picker.
 const PROMPT_PREVIEW_CHARS: usize = 80;
 const REWIND_SCHEMA_VERSION: u32 = 1;
+/// Snapshots retained per session; older ordinals are evicted by a
+/// `session.snapshot_retention` watermark.
+pub(crate) const MAX_CHECKPOINTS: usize = 100;
+/// Dry-run preview caps: files and unified-diff bytes per file.
+const MAX_PREVIEW_FILES: usize = 20;
+const MAX_PREVIEW_DIFF_BYTES: usize = 64 * 1024;
 
 /// File checkpointing is on unless explicitly disabled.
 pub(crate) fn is_rewind_enabled() -> bool {
@@ -239,6 +247,11 @@ impl RewindTurn {
             )
         })?;
         writer.append_file_snapshot(record.clone())?;
+        // Retention is best effort: losing the watermark only means the
+        // picker keeps offering older checkpoints that still exist on disk.
+        if let Err(error) = enforce_snapshot_retention(writer, &record.session_id) {
+            tracing::warn!(%error, "rewind snapshot retention watermark was not saved");
+        }
         Ok(Some(record))
     }
 
@@ -538,13 +551,24 @@ pub(crate) fn list_checkpoints(
     let Some(path) = session.writer_path() else {
         return Ok(Vec::new());
     };
-    checkpoint_views(path)
+    let mut views = checkpoint_views(path)?;
+    // An unfinished journal means a previous file restore did not commit; the
+    // workspace is not a trustworthy target until it is resolved.
+    if let Some(op_id) = pending_rewind_journal(session.transcript_session_id().as_deref())? {
+        for view in &mut views {
+            view.files_available = false;
+            view.unavailable_reasons
+                .push(format!("pending_rewind_recovery: {op_id}"));
+        }
+    }
+    Ok(views)
 }
 
 /// Path-only form of [`list_checkpoints`], reused by the contract tests.
 pub(crate) fn checkpoint_views(path: &Path) -> io::Result<Vec<RewindCheckpointView>> {
     let users = read_effective_user_messages(path)?;
     let snapshots = read_snapshots(path)?;
+    let evicted_through = snapshot_retention_watermark(path)?;
     Ok(users
         .into_iter()
         .map(|user| {
@@ -552,10 +576,16 @@ pub(crate) fn checkpoint_views(path: &Path) -> io::Result<Vec<RewindCheckpointVi
                 .iter()
                 .find(|snapshot| snapshot.at_message_id == user.message_id);
             let stats = snapshot.and_then(|snapshot| snapshot.change_stats.as_ref());
+            let evicted = snapshot.is_some()
+                && evicted_through
+                    .is_some_and(|through| snapshot.is_some_and(|s| s.ordinal <= through));
             let mut unavailable_reasons = Vec::new();
             if snapshot.is_none() {
                 unavailable_reasons.push("snapshot_missing".to_string());
+            } else if evicted {
+                unavailable_reasons.push("snapshot_evicted".to_string());
             }
+            let has_snapshot = snapshot.is_some();
             RewindCheckpointView {
                 message_id: user.message_id,
                 ordinal: user.ordinal,
@@ -564,10 +594,10 @@ pub(crate) fn checkpoint_views(path: &Path) -> io::Result<Vec<RewindCheckpointVi
                 files_changed: stats.map_or(0, |stats| u64::from(stats.files)),
                 insertions: stats.map_or(0, |stats| stats.insertions),
                 deletions: stats.map_or(0, |stats| stats.deletions),
-                has_snapshot: snapshot.is_some(),
-                snapshot_evicted: false,
+                has_snapshot,
+                snapshot_evicted: evicted,
                 conversation_available: true,
-                files_available: snapshot.is_some(),
+                files_available: has_snapshot && !evicted,
                 unavailable_reasons,
             }
         })
@@ -586,6 +616,86 @@ fn prompt_preview(prompt: &str) -> String {
     preview
 }
 
+/// Summary text and aggregated usage produced for a rewind range.
+pub(crate) struct SummarizedRange {
+    pub(crate) summary: String,
+    pub(crate) usage: Option<UsageTotals>,
+}
+
+/// Summarizes `messages` into one historical context summary with the
+/// auxiliary model the session already uses for compaction.
+///
+/// This deliberately does not go through [`context::compact_with_summary`]:
+/// that path only requests a summary once the prompt exceeds the context
+/// window, which would make a rewind of a short range fail. `summarize_range`
+/// always asks the model.
+pub(crate) fn summarize_messages(
+    config: &RunConfig,
+    cwd: &Path,
+    messages: &[Message],
+) -> io::Result<SummarizedRange> {
+    // Reserved for the `pre_rewind`/`post_rewind` hooks of a later milestone;
+    // summarizing itself needs no working directory today.
+    let _ = cwd;
+    if messages.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "nothing to summarize in the selected range",
+        ));
+    }
+    let model = config.model.as_option();
+    let context_config = context::ContextConfig::for_model_with_runtime(
+        model.as_deref(),
+        &config.model_runtime,
+        config.reasoning_effort,
+    );
+    let provider_config = ProviderConfig {
+        api_key: config.api_key.clone(),
+        base_url: config.base_url.clone(),
+        model: Some(orca_core::model::auxiliary_model().to_string()),
+        reasoning_effort: config.reasoning_effort,
+        tools_override: Some(Vec::new()),
+        mcp_registry: None,
+        external_tools: Vec::new(),
+        max_output_tokens: None,
+    };
+    let summary = orca_provider::summarize_range(
+        config.provider,
+        messages,
+        &context_config,
+        &provider_config,
+        None,
+    )
+    .ok_or_else(|| io::Error::other("the model returned no summary for the selected range"))?;
+    let usage = summary.usage.map(|usage| {
+        let mut tracker = crate::cost::CostTracker::new(Some(orca_core::model::auxiliary_model()));
+        tracker.add_usage(usage)
+    });
+    Ok(SummarizedRange {
+        summary: summary.text,
+        usage,
+    })
+}
+
+fn current_system_prompt(session: &InteractiveSession) -> String {
+    session
+        .conversation()
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            Message::System { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn rewind_cwd(config: &RunConfig) -> PathBuf {
+    config
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+}
+
 /// Validates and (unless `dry_run`) applies a rewind to `target_message_id`.
 ///
 /// Order matters and mirrors the crash story in the design doc: plan, apply
@@ -594,16 +704,11 @@ fn prompt_preview(prompt: &str) -> String {
 /// the already-applied files back (that would need a second write).
 pub(crate) fn apply_rewind(
     session: &mut InteractiveSession,
+    config: &RunConfig,
     target_message_id: &str,
     mode: RewindMode,
     dry_run: bool,
 ) -> io::Result<RewindOutcome> {
-    if mode.is_summarize() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "summarize rewind is not implemented yet",
-        ));
-    }
     let (transcript_path, writer_session_id) = {
         let writer = session.writer_mut().ok_or_else(|| {
             io::Error::new(
@@ -646,16 +751,23 @@ pub(crate) fn apply_rewind(
     };
     let mut warnings: Vec<RewindWarning> = Vec::new();
 
-    // The transcript cut is needed for conversation modes, and also lets a
-    // dry-run report the kept counts the apply would persist.
-    let cut = if mode.includes_conversation() {
-        Some(read_transcript_before_message(
-            &transcript_path,
-            target_message_id,
-        )?)
-    } else {
-        None
-    };
+    // A journal left by an interrupted apply means the workspace state is
+    // uncertain: surface it, and refuse a new file restore until it is
+    // resolved. Conversation-only rewinds stay available.
+    if let Some(op_id) = pending_rewind_journal(writer_session_id.as_deref())? {
+        warnings.push(RewindWarning {
+            kind: "pending_journal".to_string(),
+            paths: Vec::new(),
+            detail: Some(format!(
+                "an unfinished rewind operation ({op_id}) must be resolved first; run                  `orca rewind --rollback {op_id}` or remove its journal"
+            )),
+        });
+        if !dry_run && mode.includes_files() {
+            return Err(io::Error::other(format!(
+                "an unfinished rewind operation ({op_id}) is pending; resolve it with                  `orca rewind --rollback {op_id}` before restoring files"
+            )));
+        }
+    }
 
     let mut applied_files: Option<RewindFilesSummary> = None;
     let mut op_id: Option<String> = None;
@@ -726,7 +838,26 @@ pub(crate) fn apply_rewind(
         for warning in &plan.warnings {
             warnings.push(stored_warning(warning));
         }
-        if !dry_run {
+        if dry_run {
+            // Previews are best effort: a preview failure must not hide the
+            // plan the user needs to confirm.
+            match orca_rewind::plan_diff_previews(
+                &root,
+                &store,
+                &plan,
+                MAX_PREVIEW_FILES,
+                MAX_PREVIEW_DIFF_BYTES,
+            ) {
+                Ok(previews) => {
+                    report.previews = previews.into_iter().map(stored_preview).collect();
+                }
+                Err(error) => warnings.push(RewindWarning {
+                    kind: "preview_unavailable".to_string(),
+                    paths: Vec::new(),
+                    detail: Some(error.to_string()),
+                }),
+            }
+        } else {
             let applier = Applier::new(root, store, store_dir.join("journals"));
             let apply_report = applier.apply(&plan)?;
             op_id = Some(apply_report.op_id.clone());
@@ -755,26 +886,99 @@ pub(crate) fn apply_rewind(
         }
     }
 
-    let mut conversation_report = None;
-    let mut prompt = None;
+    let mut conversation_report: Option<ConversationRewindReport> = None;
+    let mut conversation_record: Option<ConversationRewindRecord> = None;
+    let mut prompt: Option<String> = None;
     let mut user_ordinal = target_ordinal;
-    let mut kept = (0_u32, 0_u32, 0_u32);
-    if let Some(cut) = cut.as_ref() {
+    let mut kept_messages = 0_u32;
+    let mut kept_compactions = 0_u32;
+    let mut kept_summaries = 0_u32;
+    let mut dropped_messages = 0_u32;
+
+    if mode.is_summarize() {
+        let split = crate::thread_store::read_transcript_split_at_message(
+            &transcript_path,
+            target_message_id,
+        )?;
+        user_ordinal = split.ordinal;
+        prompt = Some(split.prompt.clone());
+        let kept_from_before = u32::try_from(split.before.messages.len()).unwrap_or(u32::MAX);
+        let kept_after = split.kept_after_messages;
+        let kind = match mode {
+            RewindMode::SummarizeFrom => "summarize_from",
+            _ => "summarize_up_to",
+        };
+        let kept = match mode {
+            RewindMode::SummarizeFrom => kept_from_before,
+            _ => kept_after,
+        };
+        conversation_report = Some(ConversationRewindReport {
+            kind: kind.to_string(),
+            kept_messages: kept,
+        });
+        if dry_run {
+            // Dry-run must not spend tokens: only describe what apply would do.
+            warnings.push(RewindWarning {
+                kind: "summarize_requires_model".to_string(),
+                paths: Vec::new(),
+                detail: Some("apply will call the summarizer".to_string()),
+            });
+        } else {
+            let system_prompt = current_system_prompt(session);
+            let range = match mode {
+                RewindMode::SummarizeFrom => {
+                    summarize_messages(config, &rewind_cwd(config), &split.after_messages)?
+                }
+                _ => summarize_messages(config, &rewind_cwd(config), &split.before.messages)?,
+            };
+            match mode {
+                RewindMode::SummarizeFrom => {
+                    kept_messages = kept_from_before;
+                    kept_compactions =
+                        u32::try_from(split.before.compactions.len()).unwrap_or(u32::MAX);
+                    kept_summaries =
+                        u32::try_from(split.before.summaries.len()).unwrap_or(u32::MAX);
+                    let mut conversation =
+                        crate::history::resume_conversation(&split.before, system_prompt);
+                    conversation
+                        .messages
+                        .push(Message::pinned_system(range.summary.clone()));
+                    session.replace_conversation(conversation);
+                    dropped_messages = 0;
+                }
+                _ => {
+                    kept_messages = kept_after;
+                    kept_compactions = 0;
+                    kept_summaries = 0;
+                    dropped_messages = split.dropped_messages;
+                    let mut conversation = Conversation::new();
+                    conversation.add_system(system_prompt);
+                    conversation
+                        .messages
+                        .push(Message::pinned_system(range.summary.clone()));
+                    conversation
+                        .messages
+                        .extend(split.after_messages.iter().cloned());
+                    session.replace_conversation(conversation);
+                }
+            }
+            conversation_record = Some(ConversationRewindRecord {
+                kind: kind.to_string(),
+                summary: Some(range.summary),
+                summary_usage: range.usage,
+            });
+        }
+    } else if mode.includes_conversation() {
+        let cut = read_transcript_before_message(&transcript_path, target_message_id)?;
         user_ordinal = cut.ordinal;
         prompt = Some(cut.prompt.clone());
-        kept = (cut.kept_messages, cut.kept_compactions, cut.kept_summaries);
+        kept_messages = cut.kept_messages;
+        kept_compactions = cut.kept_compactions;
+        kept_summaries = cut.kept_summaries;
         if !dry_run {
             // Rebuild the conversation from the truncated transcript so the
             // system prompt and compaction replay match a fresh resume.
-            let system_prompt = session
-                .conversation()
-                .messages
-                .iter()
-                .find_map(|message| match message {
-                    Message::System { content, .. } => Some(content.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let system_prompt = current_system_prompt(session);
             let conversation = crate::history::resume_conversation(&cut.transcript, system_prompt);
             session.replace_conversation(conversation);
             if cut.kept_summaries == 0 {
@@ -785,6 +989,11 @@ pub(crate) fn apply_rewind(
             kind: "truncate".to_string(),
             kept_messages: cut.kept_messages,
         });
+        conversation_record = Some(ConversationRewindRecord {
+            kind: "truncate".to_string(),
+            summary: None,
+            summary_usage: None,
+        });
     }
 
     let rewind_id_value = format!("rw_{}", uuid::Uuid::now_v7());
@@ -794,16 +1003,11 @@ pub(crate) fn apply_rewind(
             session_id: writer_session_id.unwrap_or_default(),
             rewind_id: rewind_id_value.clone(),
             at_message_id: target_message_id.to_string(),
-            kept_messages: kept.0,
-            kept_compactions: kept.1,
-            kept_summaries: kept.2,
-            conversation: conversation_report
-                .as_ref()
-                .map(|_| ConversationRewindRecord {
-                    kind: "truncate".to_string(),
-                    summary: None,
-                    summary_usage: None,
-                }),
+            kept_messages,
+            kept_compactions,
+            kept_summaries,
+            dropped_messages,
+            conversation: conversation_record,
             files: applied_files,
             recorded_at: Utc::now(),
         };
@@ -832,6 +1036,64 @@ pub(crate) fn apply_rewind(
         report,
         prompt,
         user_ordinal,
+    })
+}
+
+/// Rewind blob store directory for a session.
+fn session_rewind_store_dir(session_id: Option<&str>) -> io::Result<PathBuf> {
+    Ok(orca_core::home::orca_home()
+        .ok_or_else(|| io::Error::other("the Orca home directory is unavailable"))?
+        .join("rewind")
+        .join("sessions")
+        .join(session_id.unwrap_or_default()))
+}
+
+/// Operation id of a journal left behind by an interrupted file restore.
+fn pending_rewind_journal(session_id: Option<&str>) -> io::Result<Option<String>> {
+    let Some(session_id) = session_id.filter(|session_id| !session_id.is_empty()) else {
+        return Ok(None);
+    };
+    let store_dir = session_rewind_store_dir(Some(session_id))?;
+    let journal_dir = store_dir.join("journals");
+    // Reading the checkpoint list must not create store directories.
+    if !journal_dir.exists() {
+        return Ok(None);
+    }
+    let store = RewindStore::open(&store_dir)?;
+    Applier::new(PathBuf::new(), store, journal_dir).pending_journal()
+}
+
+/// Highest ordinal whose snapshot blob state is no longer promised.
+fn snapshot_retention_watermark(path: &Path) -> io::Result<Option<u32>> {
+    Ok(crate::thread_store::read_snapshot_retention(path)?
+        .map(|record| record.evicted_through_ordinal))
+}
+
+/// Retains the newest [`MAX_CHECKPOINTS`] snapshots by turn ordinal and
+/// appends an eviction watermark for the rest. The watermark is audit state:
+/// the `session.snapshot` records themselves stay in the transcript.
+pub(crate) fn enforce_snapshot_retention(
+    writer: &mut SessionWriter,
+    session_id: &str,
+) -> io::Result<()> {
+    let path = writer.path().to_path_buf();
+    let mut snapshots = read_snapshots(&path)?;
+    if snapshots.len() <= MAX_CHECKPOINTS {
+        return Ok(());
+    }
+    snapshots.sort_by_key(|snapshot| snapshot.ordinal);
+    let oldest_kept = snapshots[snapshots.len() - MAX_CHECKPOINTS].ordinal;
+    let evicted_through_ordinal = oldest_kept.saturating_sub(1);
+    if snapshot_retention_watermark(&path)?
+        .is_some_and(|previous| previous >= evicted_through_ordinal)
+    {
+        return Ok(());
+    }
+    writer.append_snapshot_retention(crate::thread_store::SnapshotRetentionRecord {
+        schema_version: REWIND_SCHEMA_VERSION,
+        session_id: session_id.to_string(),
+        evicted_through_ordinal,
+        recorded_at: Utc::now(),
     })
 }
 
@@ -871,6 +1133,17 @@ fn stored_skip(skip: &PlanSkip) -> RewindSkip {
     RewindSkip {
         path: skip.path.clone(),
         reason: skip.reason.clone(),
+    }
+}
+
+fn stored_preview(preview: orca_rewind::FileDiffPreview) -> RewindFilePreview {
+    RewindFilePreview {
+        path: preview.path,
+        diff: preview.diff,
+        truncated: preview.truncated,
+        binary: preview.binary,
+        insertions: preview.insertions,
+        deletions: preview.deletions,
     }
 }
 

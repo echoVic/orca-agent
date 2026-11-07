@@ -13,7 +13,7 @@
       "subcommands": []
     },
     "rewind": {
-      "options": ["--last", "--at", "--mode", "--dry-run", "--json", "--force"],
+      "options": ["--last", "--at", "--mode", "--dry-run", "--json", "--force", "--rollback", "--prune"],
       "subcommands": []
     },
     "exec": {

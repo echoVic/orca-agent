@@ -16,6 +16,11 @@ use crate::types::{AppState, RewindPhase, RewindState};
 /// panel clamps this to the room the terminal gives it.
 pub(crate) const REWIND_VISIBLE_CHECKPOINTS: usize = 9;
 
+/// How many file diffs the confirm page previews before it stops, and how
+/// many lines PgUp/PgDn move them.
+pub(crate) const REWIND_PREVIEW_FILES: usize = 3;
+pub(crate) const REWIND_PREVIEW_PAGE: usize = 10;
+
 /// The entries of the action menu: every [`RewindMode`] in its canonical
 /// order, then the cancel entry.
 pub(crate) const REWIND_MODE_CHOICES: usize = RewindMode::ALL.len() + 1;
@@ -60,15 +65,12 @@ pub(crate) fn rewind_mode_description(mode: RewindMode) -> &'static str {
 }
 
 /// Why `mode` cannot be chosen for `view`, when it cannot: the runtime's
-/// unavailable reasons, plus the summarize modes, which this version does
-/// not implement yet (`orca_core::rewind` documents the reservation).
+/// unavailable reasons. Summarize modes are conversation-scoped, so they are
+/// unavailable only when the target's conversation is.
 pub(crate) fn rewind_mode_unavailable_reason(
     view: &RewindCheckpointView,
     mode: RewindMode,
 ) -> Option<String> {
-    if mode.is_summarize() {
-        return Some("not implemented yet".to_string());
-    }
     let mut reasons = Vec::new();
     if mode.includes_files() && !view.files_available {
         if view.snapshot_evicted {
@@ -132,6 +134,7 @@ pub(crate) fn handle_rewind_key(
     let mut close = false;
     let mut notice = None;
     let mut submit = false;
+    let mut summarize_apply = false;
 
     // Ctrl+C always closes the dialog without applying anything, whatever
     // the step.
@@ -181,6 +184,9 @@ pub(crate) fn handle_rewind_key(
             let last = len - 1;
             match key.code {
                 KeyCode::Esc => {
+                    // A dry-run preview still in flight is abandoned: back on
+                    // the list the dialog is not waiting on it any more.
+                    rewind.pending = false;
                     next_phase = Some(RewindPhase::PickCheckpoint {
                         selected: *checkpoint,
                         scroll: rewind_list_window(
@@ -191,7 +197,32 @@ pub(crate) fn handle_rewind_key(
                         ),
                     })
                 }
-                KeyCode::Tab => *show_preview = !*show_preview,
+                // Tab previews the highlighted mode: its dry-run comes back
+                // with the file diffs, shown on the confirm page.
+                KeyCode::Tab if !rewind.pending => {
+                    let chosen = *selected;
+                    if let Some(mode) = rewind_mode_at(chosen) {
+                        match rewind.checkpoints.get(*checkpoint) {
+                            None => {}
+                            Some(view) => match rewind_mode_unavailable_reason(view, mode) {
+                                Some(reason) => {
+                                    notice = Some(format!(
+                                        "cannot preview mode with this checkpoint: {reason}"
+                                    ));
+                                }
+                                None => {
+                                    *show_preview = true;
+                                    action = Some(UserAction::RewindToCheckpoint {
+                                        target: view.message_id.clone(),
+                                        mode,
+                                        dry_run: true,
+                                    });
+                                    submit = true;
+                                }
+                            },
+                        }
+                    }
+                }
                 KeyCode::Up | KeyCode::Char('k') if plain => *selected = selected.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') if plain => {
                     *selected = (*selected + 1).min(last)
@@ -241,6 +272,8 @@ pub(crate) fn handle_rewind_key(
             mode,
             report: _,
             selected,
+            show_preview,
+            preview_scroll,
         } => match key.code {
             KeyCode::Esc | KeyCode::Char('n') if plain => {
                 next_phase = Some(RewindPhase::PickMode {
@@ -249,8 +282,18 @@ pub(crate) fn handle_rewind_key(
                     show_preview: true,
                 });
             }
+            KeyCode::Tab => *show_preview = !*show_preview,
+            KeyCode::PageUp if *show_preview => {
+                *preview_scroll = preview_scroll.saturating_sub(REWIND_PREVIEW_PAGE);
+            }
+            KeyCode::PageDown if *show_preview => {
+                *preview_scroll = preview_scroll.saturating_add(REWIND_PREVIEW_PAGE);
+            }
+            KeyCode::Home if *show_preview => *preview_scroll = 0,
+            // The panel clamps to the end of the rendered diffs.
+            KeyCode::End if *show_preview => *preview_scroll = usize::MAX / 2,
             KeyCode::Left | KeyCode::Up => *selected = 0,
-            KeyCode::Right | KeyCode::Down | KeyCode::Tab => *selected = 1,
+            KeyCode::Right | KeyCode::Down => *selected = 1,
             KeyCode::Char('y') if plain => {
                 if let Some(view) = rewind.checkpoints.get(*checkpoint)
                     && !rewind.pending
@@ -261,6 +304,7 @@ pub(crate) fn handle_rewind_key(
                         dry_run: false,
                     });
                     submit = true;
+                    summarize_apply = mode.is_summarize();
                 }
             }
             KeyCode::Enter if !rewind.pending => {
@@ -274,6 +318,7 @@ pub(crate) fn handle_rewind_key(
                         dry_run: false,
                     });
                     submit = true;
+                    summarize_apply = mode.is_summarize();
                 } else {
                     next_phase = Some(RewindPhase::PickMode {
                         checkpoint: *checkpoint,
@@ -306,6 +351,12 @@ pub(crate) fn handle_rewind_key(
     state.rewind = Some(rewind);
     if let Some(action) = action {
         let _ = action_tx.send(action);
+    }
+    if summarize_apply {
+        // Summarizing one side of the conversation is a context compaction in
+        // all but name: the status line shows it, and the confirm page shows
+        // the keys as busy until the runtime answers.
+        state.set_status(crate::types::AppStatus::Compacting);
     }
 }
 
@@ -365,15 +416,28 @@ mod tests {
     }
 
     #[test]
-    fn summarize_modes_are_marked_not_implemented() {
+    fn summarize_modes_are_available_for_a_usable_conversation() {
         let view = checkpoint(0, true);
         assert_eq!(
-            rewind_mode_unavailable_reason(&view, RewindMode::SummarizeFrom).as_deref(),
-            Some("not implemented yet")
+            rewind_mode_unavailable_reason(&view, RewindMode::SummarizeFrom),
+            None
         );
         assert_eq!(
-            rewind_mode_unavailable_reason(&view, RewindMode::SummarizeUpTo).as_deref(),
-            Some("not implemented yet")
+            rewind_mode_unavailable_reason(&view, RewindMode::SummarizeUpTo),
+            None
+        );
+        // Conversation-scoped like a plain conversation rewind.
+        let mut gone = view.clone();
+        gone.conversation_available = false;
+        assert!(
+            rewind_mode_unavailable_reason(&gone, RewindMode::SummarizeFrom)
+                .is_some_and(|reason| reason.contains("conversation"))
+        );
+        // File-only modes need the snapshot, summarize modes do not.
+        let no_snapshot = checkpoint(1, false);
+        assert_eq!(
+            rewind_mode_unavailable_reason(&no_snapshot, RewindMode::SummarizeFrom),
+            None
         );
     }
 

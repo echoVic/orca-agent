@@ -20234,6 +20234,7 @@ impl ThreadActor {
                 dry_run,
                 reply,
             } => {
+                let config = &self.config;
                 let result = self
                     .state
                     .as_mut()
@@ -20242,7 +20243,7 @@ impl ThreadActor {
                         state
                             .thread
                             .session_mut()
-                            .rewind_to_checkpoint(&target_message_id, mode, dry_run)
+                            .rewind_to_checkpoint(config, &target_message_id, mode, dry_run)
                             .map_err(|error| RuntimeHostError::RewindFailed {
                                 message: error.to_string(),
                             })

@@ -321,9 +321,10 @@ it) and `post_sha256` the digest after the last successful write:
  "untracked":["docs/x.md"],"limitations":[],"recorded_at":"..."}
 ```
 
-`orca rewind --at <MESSAGE_ID> [--mode both|code|conversation] [--dry-run]
-[--json] [--force]` restores the state at that user message: files from the
-recorded pre-images and/or the conversation truncated to before the message.
+`orca rewind --at <MESSAGE_ID> [--mode both|code|conversation|summarize-from|summarize-up-to] [--dry-run]
+[--json] [--force] [--rollback OP_ID] [--prune]` restores the state at that
+user message: files from the recorded pre-images and/or the conversation
+truncated to before the message.
 The interactive TUI exposes the same operation as `/rewind` (alias
 `/checkpoint`). File restores are applied atomically with a crash journal; a
 conversation rewind appends a `session.rewind` record that the transcript
@@ -341,9 +342,22 @@ loader folds in:
 Rewind never changes recorded token usage or budget history, and it keeps the
 same session id. The CLI refuses to overwrite files whose current contents were
 changed outside tracked tool writes unless `--force` is passed; the TUI asks
-for explicit confirmation instead. Summarize-based modes are reserved and
-report `Unsupported`. Transcripts that contain `session.snapshot` or
-`session.rewind` records are not readable by Orca versions that predate them.
+for explicit confirmation instead. A session keeps its most recent 100
+checkpoints; evicting older ones appends a `session.snapshot_retention`
+watermark, after which their records stay in the transcript for audit but only
+their conversation rewind remains available (`snapshot_evicted`). An
+interrupted file restore leaves a journal behind: the next rewind reports
+`pending_rewind_recovery` and `orca rewind --rollback OP_ID` restores the
+workspace to its pre-restore state. `orca rewind --prune` garbage-collects
+checkpoint blobs that no retained, non-evicted snapshot references.
+
+The `summarize-from` and `summarize-up-to` modes replace one side of the target
+boundary with a model-written historical summary instead of dropping it: the
+summary is generated when the rewind is applied (never on a dry run), is
+persisted in the `session.rewind` record, and is replayed as a pinned system
+message on resume. A failed summary leaves the transcript untouched.
+Transcripts that contain `session.snapshot` or `session.rewind` records are not
+readable by Orca versions that predate them.
 
 ## Exit Codes
 

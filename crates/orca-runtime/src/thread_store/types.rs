@@ -294,6 +294,11 @@ pub(crate) enum SessionRecord {
     /// counts so a resumed session sees the effective (rewound) history.
     #[serde(rename = "session.rewind")]
     SessionRewind(SessionRewindRecord),
+    /// Retention watermark: snapshot ordinals up to and including this one have
+    /// been evicted from the rewind store. Audit-only; never folded into the
+    /// conversation.
+    #[serde(rename = "session.snapshot_retention")]
+    SnapshotRetention(SnapshotRetentionRecord),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -430,10 +435,26 @@ pub struct SessionRewindRecord {
     pub kept_messages: u32,
     pub kept_compactions: u32,
     pub kept_summaries: u32,
+    /// Messages removed from the front by `summarize_up_to` (0 for every other
+    /// kind, and for records written before this field existed).
+    #[serde(default)]
+    pub dropped_messages: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<ConversationRewindRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<RewindFilesSummary>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// Retention watermark written by the rewind store: snapshots with
+/// `ordinal <= evicted_through_ordinal` are no longer restorable (they stay in
+/// the log as audit evidence). Audit-only for the transcript fold.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SnapshotRetentionRecord {
+    #[serde(default = "default_rewind_schema_version")]
+    pub schema_version: u32,
+    pub session_id: String,
+    pub evicted_through_ordinal: u32,
     pub recorded_at: DateTime<Utc>,
 }
 

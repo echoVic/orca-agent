@@ -11,8 +11,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::display_text::truncate_to_display_width;
 use crate::rewind_actions::{
-    REWIND_MODE_CHOICES, REWIND_VISIBLE_CHECKPOINTS, rewind_list_window, rewind_mode_at,
-    rewind_mode_description, rewind_mode_label, rewind_mode_unavailable_reason,
+    REWIND_MODE_CHOICES, REWIND_PREVIEW_FILES, REWIND_VISIBLE_CHECKPOINTS, rewind_list_window,
+    rewind_mode_at, rewind_mode_description, rewind_mode_label, rewind_mode_unavailable_reason,
 };
 use crate::theme::Theme;
 use crate::types::{AppState, RewindPhase, RewindState};
@@ -61,6 +61,8 @@ pub(crate) fn render_rewind_dialog(frame: &mut Frame, state: &AppState, theme: &
             mode,
             report,
             selected,
+            show_preview,
+            preview_scroll,
         } => (
             "Rewind · confirm",
             confirm_lines(
@@ -69,6 +71,8 @@ pub(crate) fn render_rewind_dialog(frame: &mut Frame, state: &AppState, theme: &
                 *mode,
                 report,
                 *selected,
+                *show_preview,
+                *preview_scroll,
                 theme,
                 inner_width,
                 body_rows,
@@ -263,36 +267,51 @@ fn mode_lines(
     }
     if show_preview {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Files",
-            theme.accent_style().add_modifier(Modifier::BOLD),
-        )));
-        match view {
-            Some(view) => {
-                let (summary, warning) = checkpoint_files_summary(view);
-                lines.push(Line::from(Span::styled(
-                    summary,
-                    if warning {
-                        Style::default().fg(theme.warning)
-                    } else {
-                        theme.muted_style()
-                    },
-                )));
-                for reason in &view.unavailable_reasons {
+        if rewind_mode_at(selected).is_some_and(|mode| mode.is_summarize()) {
+            lines.push(Line::from(Span::styled(
+                "Conversation",
+                theme.accent_style().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Files stay as they are; this action calls one summarization request.",
+                theme.muted_style(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "The confirm page shows the summary plan after a dry-run.",
+                theme.dim_style(),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "Files",
+                theme.accent_style().add_modifier(Modifier::BOLD),
+            )));
+            match view {
+                Some(view) => {
+                    let (summary, warning) = checkpoint_files_summary(view);
                     lines.push(Line::from(Span::styled(
-                        format!("· {reason}"),
-                        Style::default().fg(theme.warning),
+                        summary,
+                        if warning {
+                            Style::default().fg(theme.warning)
+                        } else {
+                            theme.muted_style()
+                        },
+                    )));
+                    for reason in &view.unavailable_reasons {
+                        lines.push(Line::from(Span::styled(
+                            format!("· {reason}"),
+                            Style::default().fg(theme.warning),
+                        )));
+                    }
+                    lines.push(Line::from(Span::styled(
+                        "The confirm page shows the full plan after a dry-run.",
+                        theme.dim_style(),
                     )));
                 }
-                lines.push(Line::from(Span::styled(
-                    "The confirm page shows the full plan after a dry-run.",
-                    theme.dim_style(),
-                )));
+                None => lines.push(Line::from(Span::styled(
+                    "No preview is available.",
+                    theme.muted_style(),
+                ))),
             }
-            None => lines.push(Line::from(Span::styled(
-                "No preview is available.",
-                theme.muted_style(),
-            ))),
         }
     }
     if let Some(error) = &rewind.error {
@@ -329,14 +348,18 @@ fn mode_lines(
     lines
 }
 
-/// The confirm page: what the dry-run reported, with the warnings it raised
-/// and the files it would skip, then Apply / Cancel.
+/// The confirm page: what the dry-run reported, with the warnings it raised,
+/// the files it would skip, optionally the per-file unified diffs, then
+/// Apply / Cancel. While the apply runs it says what the runtime is doing.
+#[allow(clippy::too_many_arguments)]
 fn confirm_lines(
     rewind: &RewindState,
     checkpoint: usize,
     mode: RewindMode,
     report: &RewindReport,
     selected: usize,
+    show_preview: bool,
+    preview_scroll: usize,
     theme: &Theme,
     width: usize,
     rows: usize,
@@ -370,13 +393,20 @@ fn confirm_lines(
         "File plan",
         theme.accent_style().add_modifier(Modifier::BOLD),
     )));
-    lines.push(Line::from(Span::styled(
-        format!(
-            "{} to restore · {} to delete · {} unchanged",
-            files.changed, files.deleted, files.unchanged
-        ),
-        Style::default().fg(theme.text),
-    )));
+    if mode.is_summarize() {
+        lines.push(Line::from(Span::styled(
+            "Files unchanged by this action",
+            Style::default().fg(theme.text),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} to restore · {} to delete · {} unchanged",
+                files.changed, files.deleted, files.unchanged
+            ),
+            Style::default().fg(theme.text),
+        )));
+    }
     if report.stats.insertions > 0 || report.stats.deletions > 0 || report.stats.omitted {
         let mut stats = format!("+{} −{}", report.stats.insertions, report.stats.deletions);
         if report.stats.omitted {
@@ -395,6 +425,25 @@ fn confirm_lines(
             Style::default().fg(theme.warning),
         )));
     }
+    // The summarize request is the expensive part of those modes: say so
+    // before the warnings, so a short window cannot cut it away.
+    if mode.is_summarize() {
+        lines.push(Line::from(Span::styled(
+            "Summarize  one summarization request will run; it can take a while.",
+            Style::default().fg(theme.warning),
+        )));
+        for warning in report
+            .warnings
+            .iter()
+            .filter(|warning| warning.kind.contains("summar"))
+        {
+            let (text, style) = summarize_warning_text(warning, theme);
+            lines.push(Line::from(Span::styled(
+                truncate_to_display_width(&text, width),
+                style,
+            )));
+        }
+    }
     // Warnings, which the user must see before applying.
     if !report.warnings.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -404,7 +453,13 @@ fn confirm_lines(
                 .add_modifier(Modifier::BOLD),
         )));
         let mut warning_slots = 6usize;
-        for warning in &report.warnings {
+        for warning in report
+            .warnings
+            .iter()
+            // A summarize request's warning was already shown above, with the
+            // other summarize-mode details.
+            .filter(|warning| !(mode.is_summarize() && warning.kind.contains("summar")))
+        {
             if warning_slots == 0 {
                 break;
             }
@@ -433,21 +488,73 @@ fn confirm_lines(
             theme.muted_style(),
         )));
     }
-    // Keep the options and keys on screen in a short window: the body is
-    // cut from the top of the middle, below the target line.
-    let tail = 4; // blank, two options, keys
-    let budget = rows.saturating_sub(3).max(tail);
-    while lines.len() + tail > budget && lines.len() > 3 {
-        lines.remove(2);
+
+    let tail = 4 + usize::from(rewind.error.is_some()) + usize::from(rewind.pending);
+    if show_preview {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Diff preview",
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        )));
+        let previews = diff_preview_lines(report, theme);
+        if previews.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No file diffs: the dry-run returned none for this action.",
+                theme.muted_style(),
+            )));
+        } else {
+            let total = previews.len();
+            let budget = rows
+                .saturating_sub(lines.len() + tail + usize::from(total > 0))
+                .max(1);
+            let scroll = preview_scroll.min(total.saturating_sub(1));
+            let end = (scroll + budget).min(total);
+            lines.extend(previews.into_iter().skip(scroll).take(budget));
+            if total > budget {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "… lines {}–{} of {total} · PgUp/PgDn scroll",
+                        scroll + 1,
+                        end
+                    ),
+                    theme.dim_style(),
+                )));
+            }
+        }
+    } else {
+        // Keep the options and keys on screen in a short window: the body is
+        // cut from the top of the middle, below the target line.
+        while lines.len() + tail > rows && lines.len() > 3 {
+            lines.remove(2);
+        }
+    }
+
+    if rewind.pending {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            if mode.is_summarize() {
+                "Summarizing the conversation… (this can take a while)"
+            } else {
+                "Applying the rewind…"
+            },
+            Style::default().fg(theme.warning),
+        )));
     }
     lines.push(Line::from(""));
+    let apply_detail = if rewind.pending {
+        "waiting for the runtime…"
+    } else if mode.is_summarize() {
+        "apply and summarize now"
+    } else {
+        "rewind now"
+    };
     lines.push(crate::chrome::option_line(
         theme,
         selected == 0,
         "y",
         "Apply",
         6,
-        "rewind now",
+        apply_detail,
         width,
     ));
     lines.push(crate::chrome::option_line(
@@ -465,11 +572,96 @@ fn confirm_lines(
             Style::default().fg(theme.error),
         )));
     }
-    lines.push(crate::chrome::hint_line(
-        theme,
-        width,
-        &[("y/Enter", "apply"), ("n/Esc", "back")],
-    ));
+    let hints: &[(&str, &str)] = if rewind.pending {
+        &[("Esc", "hide"), ("Ctrl+C", "close")]
+    } else if mode.is_summarize() {
+        &[
+            ("y/Enter", "apply & summarize"),
+            ("n/Esc", "back"),
+            ("Tab", "diff"),
+        ]
+    } else {
+        &[("y/Enter", "apply"), ("n/Esc", "back"), ("Tab", "diff")]
+    };
+    lines.push(crate::chrome::hint_line(theme, width, hints));
+    lines
+}
+
+/// The warning a summarize mode's runtime adds about the request it will run
+/// (the model, the cost), when it adds one.
+fn summarize_warning_text(
+    warning: &orca_core::rewind::RewindWarning,
+    theme: &Theme,
+) -> (String, Style) {
+    let mut text = warning
+        .detail
+        .clone()
+        .unwrap_or_else(|| format!("summarization: {}", warning.kind));
+    if !warning.paths.is_empty() {
+        text.push_str(": ");
+        text.push_str(&warning.paths.join(", "));
+    }
+    (text, Style::default().fg(theme.warning))
+}
+
+/// The per-file unified diffs of a dry-run, each under its path with its line
+/// stats; binary files and capped diffs are marked instead of rendered.
+fn diff_preview_lines(report: &RewindReport, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for preview in report.previews.iter().take(REWIND_PREVIEW_FILES) {
+        let mut header = vec![Span::styled(
+            preview.path.clone(),
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        )];
+        header.push(Span::styled(
+            format!("  +{} −{}", preview.insertions, preview.deletions),
+            theme.muted_style(),
+        ));
+        if preview.binary {
+            header.push(Span::styled("  binary", Style::default().fg(theme.warning)));
+        }
+        if preview.truncated {
+            header.push(Span::styled(
+                "  truncated",
+                Style::default().fg(theme.warning),
+            ));
+        }
+        lines.push(Line::from(header));
+        if preview.binary {
+            lines.push(Line::from(Span::styled(
+                "  binary file: no text diff",
+                theme.dim_style(),
+            )));
+            continue;
+        }
+        if preview.diff.trim().is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  (no diff text)",
+                theme.dim_style(),
+            )));
+            continue;
+        }
+        lines.extend(crate::diff_highlight::render_unified_diff(
+            &preview.diff,
+            theme,
+            None,
+        ));
+        if preview.truncated {
+            lines.push(Line::from(Span::styled(
+                "  … diff truncated",
+                theme.dim_style(),
+            )));
+        }
+    }
+    if report.previews.len() > REWIND_PREVIEW_FILES {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "… and {} more file(s)",
+                report.previews.len() - REWIND_PREVIEW_FILES
+            ),
+            theme.dim_style(),
+        )));
+    }
     lines
 }
 
@@ -552,6 +744,17 @@ mod tests {
         }
     }
 
+    fn preview(path: &str, diff: &str) -> orca_core::rewind::RewindFilePreview {
+        orca_core::rewind::RewindFilePreview {
+            path: path.to_string(),
+            diff: diff.to_string(),
+            truncated: false,
+            binary: false,
+            insertions: 1,
+            deletions: 1,
+        }
+    }
+
     fn report(mode: &str) -> RewindReport {
         RewindReport {
             target_message_id: "item_1".to_string(),
@@ -583,6 +786,7 @@ mod tests {
             }),
             rewind_id: None,
             op_id: None,
+            previews: Vec::new(),
         }
     }
 
@@ -619,9 +823,16 @@ mod tests {
         let frame = frame_string(&mut state, 100, 30);
         assert!(frame.contains("Restore code and conversation"), "{frame}");
         assert!(frame.contains("no file snapshot"), "{frame}");
-        assert!(frame.contains("not implemented yet"), "{frame}");
         assert!(frame.contains("Cancel"), "{frame}");
         assert!(frame.contains("Files"), "{frame}");
+        // Summarize modes are available: they are conversation-scoped, which
+        // this checkpoint still has.
+        assert!(
+            frame
+                .lines()
+                .any(|line| line.contains("4  Summarize from here") && !line.contains("no file")),
+            "{frame}"
+        );
     }
 
     #[test]
@@ -633,6 +844,8 @@ mod tests {
             mode: RewindMode::Both,
             report: report("both"),
             selected: 0,
+            show_preview: false,
+            preview_scroll: 0,
         };
         state.rewind = Some(rewind);
         let frame = frame_string(&mut state, 100, 34);
@@ -676,9 +889,132 @@ mod tests {
     }
 
     #[test]
-    fn a_summarize_mode_is_labelled_not_implemented() {
+    fn summarize_modes_are_available_and_carry_their_request_notice() {
         let view = checkpoint(0, true);
-        let reason = rewind_mode_unavailable_reason(&view, RewindMode::SummarizeFrom);
-        assert_eq!(reason.as_deref(), Some("not implemented yet"));
+        assert_eq!(
+            rewind_mode_unavailable_reason(&view, RewindMode::SummarizeFrom),
+            None
+        );
+        assert_eq!(
+            rewind_mode_unavailable_reason(&view, RewindMode::SummarizeUpTo),
+            None
+        );
+
+        let mut state = test_state();
+        let mut rewind = RewindState::new(vec![checkpoint(1, true)]);
+        let report = orca_core::rewind::RewindReport {
+            mode: "summarize_from".to_string(),
+            conversation: Some(orca_core::rewind::ConversationRewindReport {
+                kind: "summarize_from".to_string(),
+                kept_messages: 4,
+            }),
+            warnings: vec![orca_core::rewind::RewindWarning {
+                kind: "summarize_request".to_string(),
+                paths: Vec::new(),
+                detail: Some("model deepseek-flash · one request".to_string()),
+            }],
+            ..report("summarize_from")
+        };
+        rewind.phase = RewindPhase::Confirm {
+            checkpoint: 0,
+            mode: RewindMode::SummarizeFrom,
+            report,
+            selected: 0,
+            show_preview: false,
+            preview_scroll: 0,
+        };
+        state.rewind = Some(rewind);
+        let frame = frame_string(&mut state, 100, 34);
+        assert!(frame.contains("Files unchanged by this action"), "{frame}");
+        assert!(
+            frame.contains("one summarization request will run"),
+            "{frame}"
+        );
+        assert!(frame.contains("model deepseek-flash"), "{frame}");
+        assert!(frame.contains("Conversation: summarize_from"), "{frame}");
+        assert!(frame.contains("apply & summarize"), "{frame}");
+    }
+
+    #[test]
+    fn the_confirm_page_renders_real_unified_diffs_on_tab() {
+        let mut state = test_state();
+        let mut rewind = RewindState::new(vec![checkpoint(1, true)]);
+        let mut report = report("both");
+        report.previews = vec![
+            preview(
+                "src/main.rs",
+                "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,2 +1,2 @@\n-fn old() {}\n+fn new() {}\n",
+            ),
+            orca_core::rewind::RewindFilePreview {
+                binary: true,
+                truncated: true,
+                ..preview("assets/logo.bin", "")
+            },
+        ];
+        rewind.phase = RewindPhase::Confirm {
+            checkpoint: 0,
+            mode: RewindMode::Both,
+            report,
+            selected: 0,
+            show_preview: true,
+            preview_scroll: 0,
+        };
+        state.rewind = Some(rewind);
+        let frame = frame_string(&mut state, 120, 40);
+        assert!(frame.contains("Diff preview"), "{frame}");
+        assert!(frame.contains("src/main.rs"), "{frame}");
+        assert!(frame.contains("fn old() {}"), "{frame}");
+        assert!(frame.contains("fn new() {}"), "{frame}");
+        assert!(frame.contains("assets/logo.bin"), "{frame}");
+        assert!(frame.contains("binary file: no text diff"), "{frame}");
+        // Both flags are marked on the file's header row.
+        assert!(frame.contains("binary  truncated"), "{frame}");
+        assert!(frame.contains("Tab diff"), "{frame}");
+    }
+
+    #[test]
+    fn the_diff_preview_scrolls_and_says_where_it_is() {
+        let mut state = test_state();
+        let mut rewind = RewindState::new(vec![checkpoint(1, true)]);
+        let mut report = report("both");
+        let mut diff = String::from("--- a/big.rs\n+++ b/big.rs\n@@ -1,30 +1,30 @@\n");
+        for line in 0..30 {
+            diff.push_str(&format!("-old line {line}\n+new line {line}\n"));
+        }
+        report.previews = vec![preview("big.rs", &diff)];
+        rewind.phase = RewindPhase::Confirm {
+            checkpoint: 0,
+            mode: RewindMode::Both,
+            report,
+            selected: 0,
+            show_preview: true,
+            preview_scroll: 20,
+        };
+        state.rewind = Some(rewind);
+        let frame = frame_string(&mut state, 120, 30);
+        assert!(frame.contains("lines 21–"), "{frame}");
+        assert!(frame.contains("PgUp/PgDn scroll"), "{frame}");
+    }
+
+    #[test]
+    fn a_pending_summarize_says_what_the_runtime_is_doing() {
+        let mut state = test_state();
+        let mut rewind = RewindState::new(vec![checkpoint(1, true)]);
+        rewind.phase = RewindPhase::Confirm {
+            checkpoint: 0,
+            mode: RewindMode::SummarizeUpTo,
+            report: orca_core::rewind::RewindReport {
+                mode: "summarize_up_to".to_string(),
+                ..report("summarize_up_to")
+            },
+            selected: 0,
+            show_preview: false,
+            preview_scroll: 0,
+        };
+        rewind.pending = true;
+        state.rewind = Some(rewind);
+        let frame = frame_string(&mut state, 100, 34);
+        assert!(frame.contains("Summarizing the conversation"), "{frame}");
+        assert!(frame.contains("waiting for the runtime"), "{frame}");
     }
 }

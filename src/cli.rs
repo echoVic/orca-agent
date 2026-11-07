@@ -190,6 +190,14 @@ struct RewindArgs {
     /// Overwrite files that changed outside tracked tool writes.
     #[arg(long)]
     force: bool,
+
+    /// Roll back an interrupted restore journal by operation id.
+    #[arg(long, value_name = "OP_ID")]
+    rollback: Option<String>,
+
+    /// Remove checkpoint blobs that no retained snapshot references.
+    #[arg(long)]
+    prune: bool,
 }
 
 impl RewindArgs {
@@ -202,6 +210,8 @@ impl RewindArgs {
             dry_run: self.dry_run,
             json: self.json,
             force: self.force,
+            rollback: self.rollback,
+            prune: self.prune,
         }
     }
 }

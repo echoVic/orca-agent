@@ -144,6 +144,22 @@ pub struct ConversationRewindReport {
     pub kept_messages: u32,
 }
 
+/// One file's unified-diff preview for the TUI confirmation page.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RewindFilePreview {
+    pub path: String,
+    #[serde(default)]
+    pub diff: String,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub binary: bool,
+    #[serde(default)]
+    pub insertions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+}
+
 /// Complete, JSON-serializable outcome of a rewind (dry-run or applied).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RewindReport {
@@ -161,6 +177,10 @@ pub struct RewindReport {
     pub rewind_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_id: Option<String>,
+    /// Per-file unified-diff previews for the planned restore (dry-run only,
+    /// capped by the runtime). Empty when files are not part of the mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previews: Vec<RewindFilePreview>,
 }
 
 impl RewindReport {

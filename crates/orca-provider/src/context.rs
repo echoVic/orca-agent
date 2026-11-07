@@ -857,6 +857,80 @@ pub fn compact_with_summary_cancellable(
     )
 }
 
+/// A forced summary of an explicit message range, independent of context
+/// pressure. `/rewind` uses it for its `summarize_from` / `summarize_up_to`
+/// modes, where the user picked the boundary rather than the context window.
+#[derive(Clone, Debug, Default)]
+pub struct RangeSummary {
+    pub text: String,
+    pub usage: Option<Usage>,
+    pub requests: usize,
+}
+
+/// Summarize `messages` into one historical context summary. Returns `None`
+/// when the provider declines, the range is empty, cancellation wins, or the
+/// returned text is unusable.
+pub fn summarize_range(
+    provider_kind: ProviderKind,
+    messages: &[Message],
+    context_config: &ContextConfig,
+    provider_config: &ProviderConfig,
+    cancel: Option<&CancelToken>,
+) -> Option<RangeSummary> {
+    if messages.is_empty() || cancel.is_some_and(CancelToken::is_cancelled) {
+        return None;
+    }
+    let rendered = render_summary_evidence(messages);
+    if rendered.trim().is_empty() {
+        return None;
+    }
+    let output_tokens = summary_budget(context_config)
+        .min(SUMMARY_OUTPUT_TOKENS)
+        .max(64);
+    let mut observation = CompactionObservation::new();
+    let mut requests_left = MAX_SUMMARY_REQUESTS;
+    let text = hierarchical_summary_observed(
+        provider_kind,
+        provider_config,
+        "rewind_range",
+        &rendered,
+        output_tokens,
+        cancel,
+        &mut requests_left,
+        &mut observation,
+    )?
+    .trim()
+    .to_string();
+    if text.is_empty() {
+        return None;
+    }
+    let mut usage: Option<Usage> = None;
+    for request in &observation.summary_requests {
+        let Some(request_usage) = request.usage else {
+            continue;
+        };
+        let total = usage.get_or_insert(Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_tokens: 0,
+        });
+        total.input_tokens = total
+            .input_tokens
+            .saturating_add(request_usage.input_tokens);
+        total.output_tokens = total
+            .output_tokens
+            .saturating_add(request_usage.output_tokens);
+        total.cache_tokens = total
+            .cache_tokens
+            .saturating_add(request_usage.cache_tokens);
+    }
+    Some(RangeSummary {
+        text,
+        usage,
+        requests: observation.summary_requests.len(),
+    })
+}
+
 fn compact_with_summary_inner(
     provider_kind: ProviderKind,
     conversation: &Conversation,

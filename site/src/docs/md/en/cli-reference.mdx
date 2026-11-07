@@ -93,8 +93,9 @@ archive policy, image ownership, and backup contract.
 ## `orca rewind`
 
 ```text
-orca rewind [SESSION_ID] [--last] [--at MESSAGE_ID] [--mode both|code|conversation]
-            [--dry-run] [--json] [--force]
+orca rewind [SESSION_ID] [--last] [--at MESSAGE_ID]
+            [--mode both|code|conversation|summarize-from|summarize-up-to]
+            [--dry-run] [--json] [--force] [--rollback OP_ID] [--prune]
 ```
 
 Restores the files and/or conversation of a saved session to the state when a
@@ -104,8 +105,13 @@ target (undo the last turn). `--mode code` restores files only,
 both. `--dry-run` prints the plan without changing anything and `--json`
 emits the stable JSON report. Files changed by bash or other external
 processes are not part of a checkpoint; the CLI refuses to overwrite them
-unless `--force` is passed. Summarize modes (`summarize-*`) are not
-implemented yet and fail with an error. Checkpoints require a session that
+unless `--force` is passed. `summarize-from` / `summarize-up-to` replace one
+side of the target boundary with a model-written summary (a dry run never
+calls the model); the summary is persisted in the `session.rewind` record and
+replayed on resume. A session keeps its most recent 100 checkpoints; evicted
+ones support the `conversation` mode only. `--rollback OP_ID` rolls back an
+interrupted restore that left a journal, and `--prune` removes checkpoint
+blobs no retained snapshot references. Checkpoints require a session that
 records history and only cover files written by `edit` / `write_file`; set
 `ORCA_DISABLE_FILE_HISTORY=1` to disable capture. The TUI equivalent is
 `/rewind`.

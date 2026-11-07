@@ -10,13 +10,15 @@
 use std::path::{Path, PathBuf};
 
 use crate::history::{SessionWriter, TestOrcaHomeGuard, load_session, redirect_test_orca_home};
+use crate::session::InteractiveSession;
 use crate::thread_store::{
     BlobRef, ConversationRewindRecord, FileSnapshotRecord, SessionRewindRecord,
-    SnapshotChangeStats, SnapshotFileEntry, read_effective_user_messages, read_snapshots,
-    read_transcript_before_message,
+    SnapshotChangeStats, SnapshotFileEntry, read_effective_user_messages, read_snapshot_retention,
+    read_snapshots, read_transcript_before_message,
 };
 use orca_core::approval_types::ActionKind;
 use orca_core::conversation::{Conversation, Message};
+use orca_core::rewind::RewindMode;
 use orca_core::thread_identity::TurnId;
 use orca_core::tool_types::{ToolName, ToolRequest};
 use orca_rewind::{
@@ -433,6 +435,7 @@ fn conversation_rewind_record_folds_the_transcript() {
             kept_messages: cut.kept_messages,
             kept_compactions: cut.kept_compactions,
             kept_summaries: cut.kept_summaries,
+            dropped_messages: 0,
             conversation: Some(ConversationRewindRecord {
                 kind: "truncate".to_string(),
                 summary: None,
@@ -640,4 +643,363 @@ fn pinned_user_turns_open_a_listable_checkpoint() {
     assert_eq!(views[0].ordinal, 0);
     assert!(views[0].has_snapshot);
     assert!(views[0].files_available);
+}
+
+/// A session resumed from `fixture`, with a config that names the same cwd.
+fn resumed_session(fixture: &Fixture) -> (InteractiveSession, orca_core::config::RunConfig) {
+    let transcript = load_session(&fixture.session_id).expect("transcript");
+    let mut config = orca_core::config::RunConfig::default();
+    config.cwd = Some(fixture.cwd().to_path_buf());
+    config.history_mode = orca_core::config::HistoryMode::Resume(fixture.session_id.clone());
+    let session =
+        InteractiveSession::new_with_preloaded(&config, "rewind phase2", Some(transcript))
+            .expect("resumed session");
+    (session, config)
+}
+
+/// Two turns: the second user message is the summarize target.
+fn two_turn_fixture() -> (Fixture, String) {
+    let mut fixture = Fixture::new();
+    fixture.append_turn("first prompt", "first reply");
+    fixture.append_turn("second prompt", "second reply");
+    let target = fixture.users()[1].0.clone();
+    (fixture, target)
+}
+
+/// A dry-run summarize reports what apply would do, spends no tokens, and
+/// touches neither the transcript nor the in-memory conversation.
+#[test]
+fn summarize_dry_run_reports_the_plan_without_calling_the_model() {
+    let (fixture, target) = two_turn_fixture();
+    let (mut session, config) = resumed_session(&fixture);
+    let before_transcript = std::fs::read_to_string(&fixture.transcript).expect("transcript");
+    let before_messages = session.conversation().messages.len();
+
+    let outcome = session
+        .rewind_to_checkpoint(&config, &target, RewindMode::SummarizeFrom, true)
+        .expect("dry run from");
+    let conversation = outcome
+        .report
+        .conversation
+        .as_ref()
+        .expect("conversation report");
+    assert_eq!(conversation.kind, "summarize_from");
+    assert_eq!(conversation.kept_messages, 2, "the first turn stays");
+    assert_eq!(outcome.report.target_message_id, target);
+    assert_eq!(outcome.prompt.as_deref(), Some("second prompt"));
+    assert_eq!(outcome.user_ordinal, 1);
+    assert!(
+        outcome
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.detail.as_deref() == Some("apply will call the summarizer")),
+        "dry run tells the user apply spends a model request"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture.transcript).expect("transcript"),
+        before_transcript,
+        "a dry run appends no record"
+    );
+    assert_eq!(session.conversation().messages.len(), before_messages);
+
+    let outcome = session
+        .rewind_to_checkpoint(&config, &target, RewindMode::SummarizeUpTo, true)
+        .expect("dry run up to");
+    let conversation = outcome
+        .report
+        .conversation
+        .as_ref()
+        .expect("conversation report");
+    assert_eq!(conversation.kind, "summarize_up_to");
+    assert_eq!(
+        conversation.kept_messages, 2,
+        "the target turn and every later message are kept"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture.transcript).expect("transcript"),
+        before_transcript
+    );
+    assert_eq!(session.conversation().messages.len(), before_messages);
+}
+
+/// Applying `SummarizeFrom` records the summary kind, appends a rewind
+/// record, and both the in-memory conversation and a fresh load agree on the
+/// folded result (first turn + pinned summary).
+#[test]
+fn summarize_from_apply_rewrites_the_conversation_and_records_the_kind() {
+    let (fixture, target) = two_turn_fixture();
+    let (mut session, config) = resumed_session(&fixture);
+    let before_transcript = std::fs::read_to_string(&fixture.transcript).expect("transcript");
+
+    let outcome = session
+        .rewind_to_checkpoint(&config, &target, RewindMode::SummarizeFrom, false)
+        .expect("summarize from");
+    let conversation = outcome
+        .report
+        .conversation
+        .as_ref()
+        .expect("conversation report");
+    assert_eq!(conversation.kind, "summarize_from");
+    assert_eq!(conversation.kept_messages, 2, "the first turn stays");
+    assert!(outcome.report.rewind_id.is_some());
+    assert_eq!(outcome.prompt.as_deref(), Some("second prompt"));
+
+    let after_transcript = std::fs::read_to_string(&fixture.transcript).expect("transcript");
+    assert!(after_transcript.len() > before_transcript.len());
+    assert!(after_transcript.contains("\"summarize_from\""));
+
+    // The durable fold: truncate to the first turn, then append the summary.
+    let folded = load_session(&fixture.session_id).expect("folded transcript");
+    assert_eq!(folded.messages.len(), 3);
+    assert!(
+        matches!(
+            folded.messages.last(),
+            Some(Message::System { pinned: true, .. })
+        ),
+        "the folded history ends with the pinned summary"
+    );
+
+    // The running conversation matches: system prompt, first turn, summary.
+    let messages = &session.conversation().messages;
+    assert_eq!(messages.len(), 4);
+    assert!(matches!(
+        messages.first(),
+        Some(Message::System { pinned: false, .. })
+    ));
+    assert!(matches!(
+        messages.last(),
+        Some(Message::System { pinned: true, .. })
+    ));
+    assert!(
+        session.conversation().summary.is_empty(),
+        "summarize folds do not fabricate compaction summary state"
+    );
+}
+
+/// Applying `SummarizeUpTo` keeps the target turn and later messages and
+/// places the pinned summary right after the system prompt.
+#[test]
+fn summarize_up_to_apply_keeps_the_target_turn() {
+    let (fixture, target) = two_turn_fixture();
+    let (mut session, config) = resumed_session(&fixture);
+
+    let outcome = session
+        .rewind_to_checkpoint(&config, &target, RewindMode::SummarizeUpTo, false)
+        .expect("summarize up to");
+    let conversation = outcome
+        .report
+        .conversation
+        .as_ref()
+        .expect("conversation report");
+    assert_eq!(conversation.kind, "summarize_up_to");
+    assert_eq!(
+        conversation.kept_messages, 2,
+        "target turn and reply are kept"
+    );
+
+    let folded = load_session(&fixture.session_id).expect("folded transcript");
+    assert_eq!(folded.messages.len(), 3, "summary + target turn and reply");
+    assert!(matches!(
+        &folded.messages[0],
+        Message::System { pinned: true, .. }
+    ));
+    assert!(
+        matches!(&folded.messages[1], Message::User { content, .. } if content == "second prompt")
+    );
+
+    let messages = &session.conversation().messages;
+    assert_eq!(
+        messages.len(),
+        4,
+        "system + summary + target turn and reply"
+    );
+    assert!(matches!(
+        &messages[0],
+        Message::System { pinned: false, .. }
+    ));
+    assert!(matches!(&messages[1], Message::System { pinned: true, .. }));
+    assert!(matches!(&messages[2], Message::User { content, .. } if content == "second prompt"));
+}
+
+/// A failed summarize writes no record and leaves the running conversation
+/// untouched. Summarizing everything before the first turn has no range.
+#[test]
+fn summarize_apply_failure_leaves_files_and_conversation_untouched() {
+    let mut fixture = Fixture::new();
+    fixture.append_turn("first prompt", "first reply");
+    let target = fixture.users()[0].0.clone();
+    let (mut session, config) = resumed_session(&fixture);
+    let before_transcript = std::fs::read_to_string(&fixture.transcript).expect("transcript");
+    let before_messages = session.conversation().messages.len();
+
+    let error = session
+        .rewind_to_checkpoint(&config, &target, RewindMode::SummarizeUpTo, false)
+        .expect_err("there is nothing before the first turn to summarize");
+    assert!(
+        error.to_string().contains("nothing to summarize"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture.transcript).expect("transcript"),
+        before_transcript,
+        "a failed summarize writes no session.rewind record"
+    );
+    assert_eq!(session.conversation().messages.len(), before_messages);
+}
+
+/// Snapshots beyond the retention window are evicted from the picker through
+/// a durable watermark record.
+#[test]
+fn snapshot_retention_evicts_old_checkpoints_from_the_picker() {
+    let mut fixture = Fixture::new();
+    let total = crate::rewind::MAX_CHECKPOINTS + 1;
+    for index in 0..total {
+        fixture.writer.enter_turn(TurnId::new());
+        fixture
+            .writer
+            .append_message(&Message::user(format!("prompt {index}")))
+            .expect("user message");
+    }
+    let users = fixture.users();
+    assert_eq!(users.len(), total);
+    for (index, (message_id, _)) in users.iter().enumerate() {
+        fixture
+            .writer
+            .append_file_snapshot(fixture.snapshot_record(
+                message_id.clone(),
+                index as u32,
+                Vec::new(),
+                None,
+            ))
+            .expect("snapshot record");
+    }
+
+    crate::rewind::enforce_snapshot_retention(&mut fixture.writer, &fixture.session_id)
+        .expect("retention watermark");
+    let retention = read_snapshot_retention(&fixture.transcript)
+        .expect("read retention")
+        .expect("watermark");
+    assert_eq!(retention.evicted_through_ordinal, 0);
+
+    let views = crate::rewind::checkpoint_views(&fixture.transcript).expect("views");
+    assert_eq!(views.len(), total);
+    assert!(views[0].snapshot_evicted);
+    assert!(!views[0].files_available);
+    assert!(
+        views[0]
+            .unavailable_reasons
+            .iter()
+            .any(|reason| reason == "snapshot_evicted")
+    );
+    assert!(!views[1].snapshot_evicted);
+    assert!(views[1].files_available);
+
+    // Idempotent: re-running keeps the same watermark.
+    crate::rewind::enforce_snapshot_retention(&mut fixture.writer, &fixture.session_id)
+        .expect("retention watermark");
+    let retention = read_snapshot_retention(&fixture.transcript)
+        .expect("read retention")
+        .expect("watermark");
+    assert_eq!(retention.evicted_through_ordinal, 0);
+}
+
+/// A dry-run file restore carries unified-diff previews for the TUI
+/// confirmation page; applying does not (the plan is already gone).
+#[test]
+fn dry_run_code_restore_includes_file_previews() {
+    let mut fixture = Fixture::new();
+    fixture.append_turn("edit the notes", "edited");
+    let target = fixture.users()[0].0.clone();
+    let store = fixture.store();
+    let notes = fixture.write_workspace_file("notes.txt", "before\n");
+    let pre = store.put_pre_image(&notes).expect("pre-image");
+    fixture.write_workspace_file("notes.txt", "after\n");
+    let post = file_sha256(&notes).expect("hash");
+    fixture
+        .writer
+        .append_file_snapshot(fixture.snapshot_record(
+            target.clone(),
+            0,
+            vec![(
+                "notes.txt".to_string(),
+                SnapshotFileEntry {
+                    pre: Some(blob_ref(&pre)),
+                    post_sha256: post,
+                },
+            )],
+            None,
+        ))
+        .expect("snapshot record");
+
+    let (mut session, config) = resumed_session(&fixture);
+    let outcome = session
+        .rewind_to_checkpoint(&config, &target, RewindMode::Code, true)
+        .expect("dry run");
+    assert_eq!(outcome.report.files.changed, 1);
+    let preview = outcome
+        .report
+        .previews
+        .first()
+        .expect("the plan has a preview");
+    assert_eq!(preview.path, "notes.txt");
+    assert!(!preview.binary);
+    assert!(!preview.truncated);
+    assert!(
+        preview.diff.contains("--- a/notes.txt") && preview.diff.contains("+++ b/notes.txt"),
+        "the preview shows the restore direction: {}",
+        preview.diff
+    );
+    assert!(preview.diff.contains("-after") && preview.diff.contains("+before"));
+}
+
+/// An unfinished restore journal disables file restores, surfaces the
+/// operation id in the picker, and refuses an apply until it is resolved.
+#[test]
+fn pending_journal_blocks_file_restores_and_is_surfaced() {
+    let mut fixture = Fixture::new();
+    fixture.append_turn("fix the build", "fixed");
+    let target = fixture.users()[0].0.clone();
+    fixture
+        .writer
+        .append_file_snapshot(fixture.snapshot_record(target.clone(), 0, Vec::new(), None))
+        .expect("snapshot record");
+    let journal_dir = fixture.store_dir().join("journals");
+    std::fs::create_dir_all(&journal_dir).expect("journal directory");
+    std::fs::write(
+        journal_dir.join("rw_pending.jsonl"),
+        "{\"kind\":\"intent\"}\n",
+    )
+    .expect("journal file");
+
+    let (mut session, config) = resumed_session(&fixture);
+    let views = session.rewind_checkpoints().expect("checkpoints");
+    assert!(!views.is_empty());
+    assert!(views.iter().all(|view| {
+        !view.files_available
+            && view
+                .unavailable_reasons
+                .iter()
+                .any(|reason| reason.contains("pending_rewind_recovery: rw_pending"))
+    }));
+
+    let error = session
+        .rewind_to_checkpoint(&config, &target, RewindMode::Code, false)
+        .expect_err("a pending journal refuses a file restore");
+    assert!(
+        error.to_string().contains("rw_pending"),
+        "unexpected error: {error}"
+    );
+
+    // A dry run still reports the plan together with the pending warning.
+    let outcome = session
+        .rewind_to_checkpoint(&config, &target, RewindMode::Code, true)
+        .expect("dry run");
+    assert!(
+        outcome
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == "pending_journal")
+    );
 }

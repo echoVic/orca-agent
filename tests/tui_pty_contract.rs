@@ -2354,6 +2354,69 @@ fn reconstruct_screen(output: &[u8]) -> String {
     lines.join("\n")
 }
 
+#[test]
+fn tui_rewind_opens_the_checkpoint_picker_and_esc_closes_it() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "rewind pty seed")
+        .expect("spawn TUI in PTY");
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    receive_until(
+        &process,
+        &mut output,
+        ASSISTANT_SENTINEL,
+        Duration::from_secs(10),
+        "TUI did not complete the seed turn before /rewind",
+    );
+
+    // `/rewind` lists the conversation's checkpoints in their own dialog.
+    process.write(b"/rewind\r").expect("open the rewind picker");
+    receive_until(
+        &process,
+        &mut output,
+        "Enter choose",
+        Duration::from_secs(5),
+        "TUI did not open the /rewind picker",
+    );
+    assert_screen_shows(&process, &mut output, "Rewind", "rewind dialog title");
+
+    // Esc closes it without rewinding: the composer takes the next prompt.
+    // A lone ESC byte is only delivered as `Esc` if nothing follows it
+    // immediately, so wait for the dialog's keys to leave the screen before
+    // typing into the composer again.
+    process.write(&[0x1b]).expect("close the rewind picker");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while screen_contains(&output, "Enter choose") {
+        assert!(
+            Instant::now() < deadline,
+            "Esc did not close the /rewind picker; reconstructed screen=\n{}",
+            reconstruct_screen(&output)
+        );
+        if let Some(chunk) = process.receive_output(Duration::from_millis(250)) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+    process.drain_output(&mut output);
+    let closed = output.len();
+    process
+        .write(b"mock_history_echo\r")
+        .expect("submit after closing the picker");
+    receive_until_after(
+        &process,
+        &mut output,
+        "Mock history users: rewind pty seed | mock_history_echo",
+        closed,
+        Duration::from_secs(10),
+        "the /rewind picker did not close on Esc",
+    );
+
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
 struct PtyProcess {
     child: Option<Child>,
     writer: Option<File>,

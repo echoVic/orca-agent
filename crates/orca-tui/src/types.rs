@@ -318,12 +318,16 @@ pub(crate) enum RewindPhase {
         show_preview: bool,
     },
     /// Confirming `mode` on `checkpoint` with the report its dry-run
-    /// returned: `selected` is 0 to apply and 1 to cancel.
+    /// returned: `selected` is 0 to apply and 1 to cancel. `show_preview`
+    /// toggles the per-file unified diffs, `preview_scroll` the first line
+    /// shown of them.
     Confirm {
         checkpoint: usize,
         mode: RewindMode,
         report: RewindReport,
         selected: usize,
+        show_preview: bool,
+        preview_scroll: usize,
     },
 }
 

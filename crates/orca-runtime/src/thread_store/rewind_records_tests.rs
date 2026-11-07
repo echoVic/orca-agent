@@ -116,6 +116,7 @@ fn rewind_record(session_id: &str, at_message_id: &str, kept_messages: u32) -> S
         kept_messages,
         kept_compactions: 0,
         kept_summaries: 0,
+        dropped_messages: 0,
         conversation: Some(ConversationRewindRecord {
             kind: "truncate".to_string(),
             summary: None,
@@ -163,6 +164,45 @@ fn snapshot_record(session_id: &str, at_message_id: &str) -> FileSnapshotRecord 
         }),
         untracked: vec!["docs/x.md".to_string()],
         limitations: vec!["observation_budget".to_string()],
+        recorded_at: Utc::now(),
+    }
+}
+
+fn retention_record(
+    session_id: &str,
+    evicted_through_ordinal: u32,
+) -> super::SnapshotRetentionRecord {
+    super::SnapshotRetentionRecord {
+        schema_version: 1,
+        session_id: session_id.to_string(),
+        evicted_through_ordinal,
+        recorded_at: Utc::now(),
+    }
+}
+
+fn summarize_rewind_record(
+    session_id: &str,
+    at_message_id: &str,
+    kind: &str,
+    kept_messages: u32,
+    dropped_messages: u32,
+    summary: &str,
+) -> SessionRewindRecord {
+    SessionRewindRecord {
+        schema_version: 1,
+        session_id: session_id.to_string(),
+        rewind_id: format!("rw_{kind}"),
+        at_message_id: at_message_id.to_string(),
+        kept_messages,
+        kept_compactions: 0,
+        kept_summaries: 0,
+        dropped_messages,
+        conversation: Some(ConversationRewindRecord {
+            kind: kind.to_string(),
+            summary: Some(summary.to_string()),
+            summary_usage: None,
+        }),
+        files: None,
         recorded_at: Utc::now(),
     }
 }
@@ -314,7 +354,7 @@ fn unknown_conversation_rewind_kind_fails_closed() {
         let (user_one, _) = fixture.append_turn("hello", "hi");
         let mut record = rewind_record(&fixture.session_id, &user_one, 1);
         record.conversation = Some(ConversationRewindRecord {
-            kind: "summarize_from".to_string(),
+            kind: "future_mode".to_string(),
             summary: Some("summarized".to_string()),
             summary_usage: None,
         });
@@ -327,7 +367,7 @@ fn unknown_conversation_rewind_kind_fails_closed() {
             read_transcript(&fixture.path).expect_err("unknown rewind kind must fail closed");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(
-            error.to_string().contains("summarize_from"),
+            error.to_string().contains("future_mode"),
             "error must name the unsupported kind: {error}"
         );
     });
@@ -475,5 +515,238 @@ fn transcript_before_message_returns_self_consistent_resumable_cut() {
         let error = super::read_transcript_before_message(&fixture.path, &third_id)
             .expect_err("rewound-away message must not match");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    });
+}
+
+#[test]
+fn snapshot_retention_records_are_last_write_wins_and_audit_only() {
+    crate::history::with_redirected_orca_home("rewind-retention", |_home| {
+        let mut fixture = Fixture::new();
+        let (user_one, _) = fixture.append_turn("hello", "hi");
+        assert!(
+            super::read_snapshot_retention(&fixture.path)
+                .expect("read retention")
+                .is_none()
+        );
+
+        fixture
+            .writer
+            .append_snapshot_retention(retention_record(&fixture.session_id, 2))
+            .expect("append first retention record");
+        fixture
+            .writer
+            .append_snapshot_retention(retention_record(&fixture.session_id, 5))
+            .expect("append second retention record");
+
+        let latest = super::read_snapshot_retention(&fixture.path)
+            .expect("read retention")
+            .expect("retention record");
+        assert_eq!(latest.evicted_through_ordinal, 5);
+        assert_eq!(latest.session_id, fixture.session_id);
+
+        // The watermark never changes the folded conversation.
+        assert_eq!(
+            texts(&fixture.transcript()),
+            ["hello".to_string(), "hi".to_string()]
+        );
+        assert!(!user_one.is_empty());
+    });
+}
+
+#[test]
+fn split_at_message_splits_before_and_after_the_target() {
+    crate::history::with_redirected_orca_home("rewind-split", |_home| {
+        let mut fixture = Fixture::new();
+        let (user_one, assistant_one) = fixture.append_turn("first prompt", "reply one");
+        let (user_two, _) = fixture.append_turn("second prompt", "reply two");
+        assert_eq!(fixture.message_ids().len(), 4);
+
+        // Middle message: everything before it moves to `before`.
+        let middle = super::read_transcript_split_at_message(&fixture.path, &assistant_one)
+            .expect("split at middle message");
+        assert_eq!(middle.dropped_messages, 1);
+        assert_eq!(middle.kept_after_messages, 3);
+        assert_eq!(middle.prompt, "reply one");
+        assert_eq!(middle.ordinal, 1);
+        assert_eq!(texts(&middle.before), ["first prompt".to_string()]);
+        assert_eq!(
+            middle
+                .after_messages
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>(),
+            [
+                "reply one".to_string(),
+                "second prompt".to_string(),
+                "reply two".to_string()
+            ]
+        );
+        assert_eq!(middle.before.messages.len() as u32, middle.dropped_messages);
+
+        // First message: `before` is empty.
+        let first = super::read_transcript_split_at_message(&fixture.path, &user_one)
+            .expect("split at first message");
+        assert_eq!(first.dropped_messages, 0);
+        assert_eq!(first.kept_after_messages, 4);
+        assert_eq!(first.ordinal, 0);
+        assert!(first.before.messages.is_empty());
+        assert_eq!(first.after_messages.len(), 4);
+
+        // Last message: `after_messages` holds only the target.
+        let last = super::read_transcript_split_at_message(&fixture.path, &user_two)
+            .expect("split at last user message");
+        assert_eq!(last.dropped_messages, 2);
+        assert_eq!(last.kept_after_messages, 2);
+        assert_eq!(last.ordinal, 1);
+        assert_eq!(
+            last.after_messages
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>(),
+            ["second prompt".to_string(), "reply two".to_string()]
+        );
+
+        // Unknown ids and rewound-away messages are not part of effective
+        // history.
+        let error = super::read_transcript_split_at_message(&fixture.path, "item_missing")
+            .expect_err("unknown id must not split");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            error.to_string().contains("no saved message matches"),
+            "unexpected error: {error}"
+        );
+        fixture.append_rewind(&assistant_one, 2);
+        let error = super::read_transcript_split_at_message(&fixture.path, &user_two)
+            .expect_err("rewound-away message must not split");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    });
+}
+
+#[test]
+fn summarize_from_fold_truncates_and_appends_a_pinned_summary() {
+    crate::history::with_redirected_orca_home("rewind-summarize-from", |_home| {
+        let mut fixture = Fixture::new();
+        fixture.append_turn("first prompt", "reply one");
+        fixture.append_turn("second prompt", "reply two");
+
+        fixture
+            .writer
+            .append_session_rewind(summarize_rewind_record(
+                &fixture.session_id,
+                "item_unused",
+                "summarize_from",
+                2,
+                0,
+                "summary of the removed tail",
+            ))
+            .expect("append summarize_from record");
+
+        let transcript = fixture.transcript();
+        assert_eq!(transcript.messages.len(), 3);
+        assert_eq!(
+            texts(&transcript)[..2],
+            ["first prompt".to_string(), "reply one".to_string()]
+        );
+        match &transcript.messages[2] {
+            Message::System { content, pinned } => {
+                assert!(pinned, "folded summary must be pinned");
+                assert_eq!(content, "summary of the removed tail");
+            }
+            other => panic!("expected pinned summary system message, got {other:?}"),
+        }
+
+        // The folded transcript is directly resumable and stays consistent.
+        let conversation =
+            crate::history::resume_conversation(&transcript, "system prompt".to_string());
+        assert_eq!(conversation.messages.len(), 4);
+        // A second load replays the same fold.
+        assert_eq!(texts(&fixture.transcript()).len(), 3);
+    });
+}
+
+#[test]
+fn summarize_up_to_fold_drains_the_front_and_keeps_the_system_position() {
+    crate::history::with_redirected_orca_home("rewind-summarize-up-to", |_home| {
+        let mut fixture = Fixture::new();
+        // A persisted legacy system message leads the conversation.
+        fixture
+            .writer
+            .append_message(&Message::system("persisted system prompt".to_string()))
+            .expect("append legacy system message");
+        fixture.append_turn("first prompt", "reply one");
+        fixture.append_turn("second prompt", "reply two");
+
+        fixture
+            .writer
+            .append_session_rewind(summarize_rewind_record(
+                &fixture.session_id,
+                "item_unused",
+                "summarize_up_to",
+                0,
+                0,
+                "summary of the prefix",
+            ))
+            .expect("append summarize_up_to record");
+
+        let transcript = fixture.transcript();
+        assert_eq!(transcript.messages.len(), 6);
+        // The system prompt keeps its position; the summary is inserted right
+        // after it.
+        assert_eq!(texts(&transcript)[0], "persisted system prompt");
+        match &transcript.messages[1] {
+            Message::System { content, pinned } => {
+                assert!(pinned, "folded summary must be pinned");
+                assert_eq!(content, "summary of the prefix");
+            }
+            other => panic!("expected pinned summary after the system prompt, got {other:?}"),
+        }
+        assert_eq!(
+            texts(&transcript)[2..],
+            [
+                "first prompt".to_string(),
+                "reply one".to_string(),
+                "second prompt".to_string(),
+                "reply two".to_string()
+            ]
+        );
+
+        let conversation =
+            crate::history::resume_conversation(&transcript, "fresh system prompt".to_string());
+        assert!(!conversation.messages.is_empty());
+    });
+}
+
+#[test]
+fn summarize_up_to_fold_drains_leading_messages_before_the_target() {
+    crate::history::with_redirected_orca_home("rewind-summarize-up-to-drain", |_home| {
+        let mut fixture = Fixture::new();
+        fixture.append_turn("first prompt", "reply one");
+        fixture.append_turn("second prompt", "reply two");
+
+        fixture
+            .writer
+            .append_session_rewind(summarize_rewind_record(
+                &fixture.session_id,
+                "item_unused",
+                "summarize_up_to",
+                0,
+                2,
+                "summary of the first turn",
+            ))
+            .expect("append summarize_up_to record");
+
+        let transcript = fixture.transcript();
+        assert_eq!(transcript.messages.len(), 3);
+        match &transcript.messages[0] {
+            Message::System { content, pinned } => {
+                assert!(pinned, "folded summary must be pinned");
+                assert_eq!(content, "summary of the first turn");
+            }
+            other => panic!("expected pinned summary first, got {other:?}"),
+        }
+        assert_eq!(
+            texts(&transcript)[1..],
+            ["second prompt".to_string(), "reply two".to_string()]
+        );
     });
 }

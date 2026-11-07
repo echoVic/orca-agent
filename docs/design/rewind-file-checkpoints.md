@@ -759,38 +759,34 @@ orca rewind --session <id|latest> [--at <message-id>] [--mode both|code|conversa
 
 本节记录实际实现与本章设计之间的差异；本节之前的内容保持为设计意图，实现以代码为准。
 
-### 已落地
+### 已落地（phase 1 + phase 2）
 
-- `crates/orca-rewind`：CAS blob 存储（sha256、zstd/raw、mode 保留、去重、GC）、撤销日志 planner（tombstone、untracked 检测、diff stats、路径安全/排除目录）、两阶段 journal applier（原子写、备份、partial 报告、rollback）、52 个单测。
-- `session.snapshot` / `session.rewind` transcript 记录 + durable append + 载入 fold（仅 `conversation.is_some()` 时截断，未知 kind fail closed）+ `read_snapshots` / `read_effective_user_messages` / `read_transcript_before_message`。
-- runtime 捕获：turn 开始建 `RewindTurn`（thread extension），写工具（`edit` / `write_file`）dispatch 前记前像，turn 结束补 post 摘要 + 有界观察的 untracked + append `session.snapshot`。
-- runtime 协调器 `InteractiveSession::{rewind_checkpoints, rewind_to_checkpoint}`；host `RuntimeThreadHandle` / `RuntimeSurfaceThreadHandle` 的 `list_rewind_checkpoints` / `rewind_checkpoint`；`ThreadCommand` 两条空闲命令。
-- `orca rewind --at/--mode/--dry-run/--json/--force`（CLI）+ `docs/public-cli-manifest.json`。
-- TUI `/rewind`（别名 `/checkpoint`）：检查点列表 → 模式菜单 → 确认页（文件计划/统计/skip/warnings/kept_messages）→ `RewindCompleted` reducer 截断视图 + prefill composer；新增 UserAction/TuiEvent 与 surface 边界 manifest。
-- `docs/harness-contract.md` 更新为条件承诺（文件检查点/rewind 记录/CLI 语义）。
+- `crates/orca-rewind`：CAS blob 存储（sha256、zstd/raw、mode 保留、去重、GC）、撤销日志 planner（tombstone、untracked 检测、行级 stats、路径安全/排除目录）、两阶段 journal applier（原子写、备份、partial 报告、rollback）、`plan_diff_previews`（TUI 确认页的 unified diff），62 个单测。
+- transcript：`session.snapshot` / `session.rewind` / `session.snapshot_retention` 记录；durable append；载入 fold 支持 `truncate`、`summarize_from`（截断 + 末尾 pinned summary）、`summarize_up_to`（drain + 清空 compaction/summary + system prompt 后插入 summary），未知 kind fail closed；`read_snapshots` / `read_effective_user_messages` / `read_transcript_before_message` / `read_transcript_split_at_message` / `read_snapshot_retention`。
+- runtime 捕获：turn 开始建 `RewindTurn`（thread extension，覆盖交互 `BacktrackableUser` 与 headless `PinnedUser`）；写工具 dispatch 前记前像；turn 末 post 摘要 + 有界观察 untracked + `line_diff_stats` change_stats + append snapshot；按 ordinal 保留最近 100 个检查点并追加 retention 水位。
+- runtime 协调器：`InteractiveSession::{rewind_checkpoints, rewind_to_checkpoint}`；文件恢复（plan → CAS 校验 → journal apply）与对话回退（truncate / summarize_from / summarize_up_to）；summarize 用 `orca_provider::summarize_range`（新增强制范围摘要 API，不受上下文压力门槛限制），dry-run 不调用模型；失败不写记录、不动内存；pending journal 检测与拒绝。
+- host/CLI：`RuntimeThreadHandle` / `RuntimeSurfaceThreadHandle::{list_rewind_checkpoints, rewind_checkpoint}`、`ThreadCommand` 两条空闲命令；`orca rewind` 支持 `--at/--mode(both|code|conversation|summarize-from|summarize-up-to)/--dry-run/--json/--force/--rollback OP_ID/--prune`（CLI summarize 也调用真实摘要器）。
+- TUI `/rewind`（别名 `/checkpoint`）：检查点列表（含 `snapshot_evicted` / pending journal 不可用原因）→ 模式菜单（summarize 已启用）→ 确认页（文件计划、skip、warnings、summarize 提示、unified diff 预览：Tab 折叠/展开、PgUp/PgDn 滚动、binary/truncated 标记）→ apply 等待显示 Compacting → `RewindCompleted` reducer 截断/不截断视图 + Notice + prompt 回填 composer；模式页 Tab 可预览 dry-run。PTY 冒烟测试覆盖 `/rewind` 打开与 Esc 关闭。
+- 文档：`docs/harness-contract.md`（条件承诺、记录/CLI/retention/rollback/prune/summarize 语义）、zh/en CLI reference 与 terminal-ui、README、public CLI manifest、surface 边界 manifest、TUI golden。
 
-### 与设计的偏差 / 延期项
+### 剩余偏差 / 已知限制
 
-1. **summarize 模式未实现**：`RewindMode::SummarizeFrom/SummarizeUpTo` 在 runtime 与 CLI 返回 `Unsupported`；TUI 菜单中灰显。`partial_compact` 的 range 化改造留待后续（依赖现有 compaction 摘要器）。
-2. **无 `[rewind]` 配置项**：只用环境变量 `ORCA_DISABLE_FILE_HISTORY`（关闭捕获）与 `ORCA_REWIND_DISABLE_OBSERVE`（关闭 turn 边界观察）；`max_checkpoints` / 字节上限等常量尚未暴露为配置。
-3. **保留与 GC 未自动接线**：`RewindStore::gc` 已实现并有单测，但没有在 session 打开/`orca storage` 中自动触发；也没有 `session.snapshot_retention` 水位记录，因此 `RewindCheckpointView::snapshot_evicted` 恒为 false（淘汰策略暂未生效）。
-4. **无 `session.rewind` 流事件**：仅 TUI 内部事件；JSONL/ACP 客户端暂收不到 rewind 事件（`session.rewind` 记录可用于审计）。如需要再补 `EventType` + 投影 + golden wire。
-5. **root 校验模型**：restore 以目标 snapshot 的 `root` 为准，并校验参与计划的快照 root 一致；不检测「session cwd 已切换」（即用户把同一 session 换目录）——v1 已知限制。
-10. **TUI 细节偏差**：Ctrl+C 单击即关闭 rewind 对话框（设计 §10.6 写的是两次，为避免误触全局退出改为单次）；列表/模式页的预览是文件统计与不可用原因，不是真实 unified diff（`diff_highlight::render_unified_diff` 未接入）；选择器数据走异步 `UserAction`/`TuiEvent` 往返（与 Backtrack 同框架），而不是 slash handler 同步取。
-11. **`change_stats` 已实现**：turn 末用 `orca_rewind::line_diff_stats` 对 pre→当前内容求行级增删（>4 MiB 或非 UTF-8 记 `omitted`），检查点行可显示 `N files +X −Y`。
-12. **未补 PTY 冒烟**：`tests/tui_pty_contract.rs` 的 `/rewind` 端到端冒烟未加入；TUI 侧由 `app_integration_tests` 的 hosted runtime wiring 测试覆盖。
-6. **对话回退实现方式**：用 `read_transcript_before_message` 得到截断 transcript，再 `history::resume_conversation` 整体替换内存 conversation（保留 system prompt；下一 turn 会重新注入 mode/memory/skill 等 pinned context）。不采用「按 ordinal 原地截断」，因此与 transcript fold 语义天然一致。
-7. **子代理写入捕获**：主 thread 的 turn 捕获挂在 thread extension 上；同进程子代理若共享该 extension 才会被计入父 turn 快照，否则其写入通过有界观察进入 `untracked`（不还原）。worktree 隔离的子代理由子 session 自己记录。
-8. **pending journal 未接到 UI**：`Applier::pending_journal` / `rollback` 已实现，但 TUI/CLI 尚没有「检测未完成 rewind 并提示回滚」的入口。
-9. **CLI 无 `--rollback`**：设计里的 `orca rewind --rollback <op>` 未实现（`Applier::rollback` 已有，可在后续 CLI 里暴露）。
+1. **无 `[rewind]` 配置项**：只用环境变量 `ORCA_DISABLE_FILE_HISTORY`（关闭捕获）与 `ORCA_REWIND_DISABLE_OBSERVE`（关闭 turn 边界观察）；`max_checkpoints`/字节上限等仍是常量（100 条、16 MiB/file、4 MiB diff）。
+2. **GC 只在 `orca rewind --prune` 手动触发**：没有在 session 打开或 `orca storage` 中自动 GC；retention watermark 已让旧检查点不可文件回退。
+3. **无 `session.rewind` 流事件**：仅 TUI 内部事件；JSONL/ACP 客户端暂收不到 rewind 事件（`session.rewind` 记录可用于审计）。
+4. **root 校验模型**：restore 以目标 snapshot 的 `root` 为准并校验参与快照一致；不检测「session cwd 已切换」。
+5. **子代理写入捕获**：主 thread 的 turn 捕获挂在 thread extension 上；同进程子代理共享该 extension 才计入父 turn，否则进入 `untracked`；worktree 隔离子代理由子 session 自己记录。
+6. **CLI summarize 的模型/成本**：用当前有效配置 + session 的 provider/model 构建摘要请求；usage 记入记录，但 `estimated_cost_usd` 记 0（未接 pricing 折算）。
+7. **TUI 细节**：Ctrl+C 单击关闭对话框（设计 §10.6 为两次）；选择器数据走异步 `UserAction`/`TuiEvent` 往返；previews 仅 dry-run 填充、最多 3 个文件显示。
+8. **对话回退实现方式**：truncate/summarize 都通过截断 transcript + `resume_conversation` 重建内存 conversation（保留 system prompt；下一 turn 重新注入 pinned context），与 fold 语义一致。
 
-### 验证
+### 验证（phase 2）
 
-- `cargo test -p orca-rewind`：**55 passed / 0 failed**。
-- `cargo test -p orca-runtime --lib rewind`：**22 passed / 0 failed**（capture/coordinator/session + records + CLI）。
-- `cargo test -p orca-runtime --lib`：2122 passed / 1 failed（`server::tests::command_exec_permission_profile_domain_policy_allows_http_request` 在并行满载下 30s 内没连上测试 socket；**单跑通过**，且该文件未被本特性修改，属既有负载 flake）。
-- `cargo test -p orca-tui --lib`：1876 passed / 1 failed（`idle_submit_actions::tests::a_skill_run_typed_before_the_history_loads_is_held`，已知 ORCA_HOME/skills 并行测试隔离 flake；**单跑通过**，文件未被修改）。
-- `cargo test -p orca-tui --lib rewind`：**22 passed / 0 failed**（含 golden `rewind-confirm.txt`、hosted runtime wiring）。
-- `cargo test -p orca-agent --bin orca public_cli_manifest_matches_visible_clap_surface`：通过（CLI manifest 与 clap 面一致）。
+- `cargo test -p orca-rewind`：**62 passed / 0 failed**。
+- `cargo test -p orca-runtime --lib rewind`：**37 passed / 0 failed**（capture/summarize/retention/previews/pending journal/split/fold/CLI）。
+- `cargo test -p orca-tui --lib rewind`：**25 passed / 0 failed**（含 summarize/review/preview/golden）。
+- `cargo test -p orca-agent --bin orca public_cli_manifest_matches_visible_clap_surface`：通过。
+- `cargo test -p orca-agent --test tui_pty_contract tui_rewind_opens_the_checkpoint_picker_and_esc_closes_it -- --exact`：通过。
 - `cargo check --workspace --all-targets`：通过。
-- 最终低并发回归（并行 flake 的确认跑）：`cargo test -p orca-runtime --lib -- --test-threads=2` → **2123 passed / 0 failed**；`cargo test -p orca-tui --lib -- --test-threads=2` → **1877 passed / 0 failed**。
+- `cargo test -p orca-runtime --lib -- --test-threads=2`：2137 passed / 1 failed（`shell_session::tests::registration_failure_reaps_spawned_shell_process_group` 在满载下进程组回收竞态；**单跑通过**，文件未被本特性修改，属既有 flake）。
+- `cargo test -p orca-tui --lib -- --test-threads=2`：**1885 passed / 0 failed**。

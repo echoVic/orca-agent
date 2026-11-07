@@ -1116,6 +1116,11 @@ impl AppState {
                 if let Some(rewind) = self.rewind.as_mut() {
                     rewind.pending = false;
                 }
+                if self.status == AppStatus::Compacting {
+                    // A summarize that failed leaves the conversation as it
+                    // was; its compacting status must not outlive the dialog.
+                    self.set_status(AppStatus::Idle);
+                }
                 self.push_message(ChatMessage::Error(message));
             }
         }
@@ -1141,11 +1146,14 @@ impl AppState {
         let Some(mode) = orca_core::rewind::RewindMode::parse(&outcome.report.mode) else {
             return;
         };
+        let show_preview = !outcome.report.previews.is_empty();
         rewind.phase = RewindPhase::Confirm {
             checkpoint,
             mode,
             report: outcome.report,
             selected: 0,
+            show_preview,
+            preview_scroll: 0,
         };
         rewind.pending = false;
     }
@@ -1166,14 +1174,16 @@ impl AppState {
             .map(|conversation| conversation.kind.as_str());
         let touches_conversation = mode.is_some_and(|mode| mode.includes_conversation())
             || conversation_kind == Some("truncate");
-        if matches!(
-            conversation_kind,
-            Some("summarize_from" | "summarize_up_to")
-        ) {
+        let summarized = mode.is_some_and(|mode| mode.is_summarize())
+            || matches!(
+                conversation_kind,
+                Some("summarize_from" | "summarize_up_to")
+            );
+        if summarized {
             // The visible history is not cut by a summarize: the summary
             // replaces earlier context only.
             self.push_message(ChatMessage::System {
-                text: "Conversation summarized (ctrl+o to view history)".to_string(),
+                text: "Conversation summarized (Ctrl+O for history)".to_string(),
                 expanded: false,
             });
         } else if touches_conversation {

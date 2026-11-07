@@ -17144,8 +17144,11 @@ mod tests {
                     }),
                     rewind_id: None,
                     op_id: None,
+                    previews: Vec::new(),
                 },
                 selected: 0,
+                show_preview: false,
+                preview_scroll: 0,
             },
             checkpoints: vec![orca_core::rewind::RewindCheckpointView {
                 message_id: "item_0".into(),

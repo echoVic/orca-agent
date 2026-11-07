@@ -19,7 +19,7 @@
                │                                                                    │
                │ › y  Apply   rewind now                                            │
                │   n  Cancel  go back                                               │
-               │ y/Enter apply · n/Esc back                                         │
+               │ y/Enter apply · n/Esc back · Tab diff                              │
                ╰────────────────────────────────────────────────────────────────────╯
 
 
