@@ -456,6 +456,20 @@ fn dispatch_slash_command(
             let _ = action_tx.send(UserAction::Compact);
         }
         SlashCommand::Recap => request_recap(state, action_tx),
+        SlashCommand::Rewind => {
+            // A rewind restores the workspace as the target turn began, so it
+            // needs the turn to be over: mid-turn files are still changing.
+            if state.status != AppStatus::Idle {
+                state.push_message(ChatMessage::Error(
+                    "stop the current turn before rewinding".to_string(),
+                ));
+            } else {
+                // The checkpoint list comes from the runtime as
+                // `TuiEvent::RewindCheckpoints`; an empty one is reported
+                // there, with the rest of the dialog's state.
+                let _ = action_tx.send(UserAction::ListRewindCheckpoints);
+            }
+        }
         SlashCommand::Resume => match open_session_picker(state) {
             Ok(true) => {}
             Ok(false) => state.push_message(ChatMessage::System {

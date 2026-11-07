@@ -2259,6 +2259,7 @@ pub enum RuntimeHostError {
     ResponseChannelClosed { owner: &'static str },
     OperationActive { operation_id: OperationId },
     GoalControlFailed { message: String },
+    RewindFailed { message: String },
     ThreadStartFailed { message: String },
     WorkflowLaunchFailed { message: String },
     RuntimeStartFailed { message: String },
@@ -2282,6 +2283,9 @@ impl fmt::Display for RuntimeHostError {
             }
             Self::GoalControlFailed { message } => {
                 write!(formatter, "goal control command failed: {message}")
+            }
+            Self::RewindFailed { message } => {
+                write!(formatter, "rewind failed: {message}")
             }
             Self::ThreadStartFailed { message } => {
                 write!(formatter, "failed to start runtime thread: {message}")
@@ -4290,6 +4294,34 @@ impl RuntimeThreadHandle {
         receive_reply(reply_rx, "runtime thread")?
     }
 
+    /// Lists the rewindable user messages of this thread's effective
+    /// conversation together with their file-checkpoint statistics.
+    pub fn list_rewind_checkpoints(
+        &self,
+    ) -> Result<Vec<orca_core::rewind::RewindCheckpointView>, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::ListRewindCheckpoints { reply: reply_tx })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
+    /// Restores files and/or the conversation to the submission boundary of
+    /// `target_message_id`. With `dry_run` only the plan is computed.
+    pub fn rewind_checkpoint(
+        &self,
+        target_message_id: &str,
+        mode: orca_core::rewind::RewindMode,
+        dry_run: bool,
+    ) -> Result<orca_core::rewind::RewindOutcome, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::RewindCheckpoint {
+            target_message_id: target_message_id.to_string(),
+            mode,
+            dry_run,
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
     #[cfg(test)]
     fn surface_actor_probe_for_test(
         &self,
@@ -5518,6 +5550,15 @@ enum ThreadCommand {
     },
     BacktrackLastUser {
         reply: SyncSender<Result<Option<String>, RuntimeHostError>>,
+    },
+    ListRewindCheckpoints {
+        reply: SyncSender<Result<Vec<orca_core::rewind::RewindCheckpointView>, RuntimeHostError>>,
+    },
+    RewindCheckpoint {
+        target_message_id: String,
+        mode: orca_core::rewind::RewindMode,
+        dry_run: bool,
+        reply: SyncSender<Result<orca_core::rewind::RewindOutcome, RuntimeHostError>>,
     },
     ShutdownThread {
         reply: Option<SyncSender<ThreadShutdownAck>>,
@@ -18989,6 +19030,12 @@ impl ThreadActor {
                 ThreadCommand::BacktrackLastUser { reply } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
+                ThreadCommand::ListRewindCheckpoints { reply } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::RewindCheckpoint { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
                 ThreadCommand::ShutdownThread { reply, .. } => {
                     if let Some(reply) = reply {
                         let _ = reply.send(ThreadShutdownAck::Failed(
@@ -20163,6 +20210,43 @@ impl ThreadActor {
                     .as_mut()
                     .ok_or(RuntimeHostError::ThreadUnavailable)
                     .map(|state| state.thread.session_mut().backtrack_last_user());
+                let _ = reply.send(result);
+            }
+            ThreadCommand::ListRewindCheckpoints { reply } => {
+                let result = self
+                    .state
+                    .as_mut()
+                    .ok_or(RuntimeHostError::ThreadUnavailable)
+                    .and_then(|state| {
+                        state
+                            .thread
+                            .session_mut()
+                            .rewind_checkpoints()
+                            .map_err(|error| RuntimeHostError::RewindFailed {
+                                message: error.to_string(),
+                            })
+                    });
+                let _ = reply.send(result);
+            }
+            ThreadCommand::RewindCheckpoint {
+                target_message_id,
+                mode,
+                dry_run,
+                reply,
+            } => {
+                let result = self
+                    .state
+                    .as_mut()
+                    .ok_or(RuntimeHostError::ThreadUnavailable)
+                    .and_then(|state| {
+                        state
+                            .thread
+                            .session_mut()
+                            .rewind_to_checkpoint(&target_message_id, mode, dry_run)
+                            .map_err(|error| RuntimeHostError::RewindFailed {
+                                message: error.to_string(),
+                            })
+                    });
                 let _ = reply.send(result);
             }
             ThreadCommand::ShutdownThread { .. } => unreachable!("shutdown handled by actor loop"),
@@ -21389,6 +21473,16 @@ impl ThreadActor {
                 }));
             }
             ThreadCommand::BacktrackLastUser { reply } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
+            ThreadCommand::ListRewindCheckpoints { reply } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
+            ThreadCommand::RewindCheckpoint { reply, .. } => {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
                     operation_id: active.operation_id,
                 }));

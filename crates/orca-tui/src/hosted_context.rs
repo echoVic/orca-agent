@@ -18,6 +18,16 @@ pub(crate) enum HostedContextAction {
     Remember { scope: TuiMemoryScope, note: String },
     Compact,
     Backtrack,
+    /// `/rewind`: the conversation's rewindable checkpoints, which come back
+    /// as `TuiEvent::RewindCheckpoints`.
+    ListRewindCheckpoints,
+    /// `/rewind`: apply `mode` to the checkpoint `target`, or with `dry_run`
+    /// report what applying it would do.
+    RewindCheckpoint {
+        target: String,
+        mode: orca_core::rewind::RewindMode,
+        dry_run: bool,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -109,6 +119,78 @@ pub(crate) fn handle_hosted_context_action(
                 }
                 Err(error) => {
                     let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+                }
+            }
+        }
+        HostedContextAction::ListRewindCheckpoints => {
+            // A conversation resumed at launch has its history, but no thread
+            // yet; the checkpoints belong to that history, so start it first.
+            let thread_was_missing = thread.is_none();
+            if thread.is_none()
+                && let Err(error) = ensure_hosted_thread(
+                    thread,
+                    host,
+                    config,
+                    preloaded,
+                    "Rewind checkpoints",
+                    event_tx,
+                    control,
+                )
+            {
+                let _ = event_tx.send(TuiEvent::Error(error));
+                return;
+            }
+            if thread_was_missing {
+                announce_runtime_ready(thread.as_ref().expect("rewind thread"), event_tx, control);
+            }
+            let result = thread
+                .as_ref()
+                .map(|runtime_thread| {
+                    TuiSurfaceActions::new(runtime_thread.typed_surface()).list_rewind_checkpoints()
+                })
+                .transpose();
+            match result {
+                Ok(Some(checkpoints)) => {
+                    let _ = event_tx.send(TuiEvent::RewindCheckpoints(checkpoints));
+                }
+                Ok(None) => {
+                    let _ = event_tx.send(TuiEvent::Error(
+                        "no rewindable checkpoints in this session".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::Error(format!(
+                        "failed to list rewind checkpoints: {error}"
+                    )));
+                }
+            }
+        }
+        HostedContextAction::RewindCheckpoint {
+            target,
+            mode,
+            dry_run,
+        } => {
+            let result = thread
+                .as_ref()
+                .map(|runtime_thread| {
+                    TuiSurfaceActions::new(runtime_thread.typed_surface())
+                        .rewind_checkpoint(&target, mode, dry_run)
+                })
+                .transpose();
+            match result {
+                Ok(Some(outcome)) if dry_run => {
+                    let _ = event_tx.send(TuiEvent::RewindPreviewed(outcome));
+                }
+                Ok(Some(outcome)) => {
+                    let _ = event_tx.send(TuiEvent::RewindCompleted(outcome));
+                }
+                Ok(None) => {
+                    let _ = event_tx.send(TuiEvent::RewindFailed(
+                        "no active conversation to rewind".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::RewindFailed(error));
                 }
             }
         }

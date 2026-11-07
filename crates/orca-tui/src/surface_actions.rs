@@ -246,6 +246,29 @@ impl TuiSurfaceActions {
             .map_err(|error| error.to_string())
     }
 
+    /// The conversation's rewindable checkpoints, oldest first, for the
+    /// `/rewind` picker.
+    pub(crate) fn list_rewind_checkpoints(
+        &self,
+    ) -> Result<Vec<orca_core::rewind::RewindCheckpointView>, String> {
+        self.thread
+            .list_rewind_checkpoints()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Applies `mode` to the checkpoint `target`, or with `dry_run` returns
+    /// what it would do without touching the workspace or the conversation.
+    pub(crate) fn rewind_checkpoint(
+        &self,
+        target: &str,
+        mode: orca_core::rewind::RewindMode,
+        dry_run: bool,
+    ) -> Result<orca_core::rewind::RewindOutcome, String> {
+        self.thread
+            .rewind_checkpoint(target, mode, dry_run)
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn goal(&self, session_id: &str) -> Result<Option<ThreadGoal>, String> {
         let _ = session_id;
         crate::surface_client::read_goal(&self.thread).map_err(|error| error.to_string())

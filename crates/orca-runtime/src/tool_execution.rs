@@ -1327,6 +1327,15 @@ impl ToolExecutionActor {
                 call_id: &execution_request.id,
             });
         }
+        // Capture the write target's pre-image before the tool can touch it.
+        // This runs on the dispatch path so no `edit`/`write_file` can bypass
+        // the checkpoint; capture failures are recorded on the turn and never
+        // block the tool.
+        if let Some(stores) = extension_stores
+            && let Some(turn) = stores.thread_store().get::<crate::rewind::RewindTurn>()
+        {
+            turn.capture_pre_image(cwd, execution_request);
+        }
         let mut dispatch_event_error = None;
         let dispatch = match RuntimeToolRouter::new(&mut self.runtime).dispatch(
             RuntimeToolInvocationContext {

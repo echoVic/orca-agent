@@ -84,6 +84,21 @@ orca storage [--max-bytes BYTES] [--older-than-days DAYS] [--apply]
 不带 `--apply` 时只预览占用和候选项。归档策略、图片所有权与备份规则见
 [存储与清理](session-commands.md#存储与清理)。
 
+## `orca rewind`
+
+```text
+orca rewind [SESSION_ID] [--last] [--at MESSAGE_ID] [--mode both|code|conversation]
+            [--dry-run] [--json] [--force]
+```
+
+把已保存会话的文件和/或对话回退到某一用户消息提交时的状态。不带 `--at`
+时以最近的用户消息为目标（即撤销最后一轮）。`--mode code` 只恢复文件，
+`conversation` 只截断对话，`both`（默认）两者都做。`--dry-run` 只输出计划；
+`--json` 输出稳定 JSON 报告。外部进程或 bash 改动的文件不在检查点内，CLI
+默认拒绝覆盖它们，需要显式 `--force`。总结模式（`summarize-*`）尚未实现，会
+返回错误。检查点要求会话已记录历史，并且只记录 `edit` / `write_file` 触及的
+文件；`ORCA_DISABLE_FILE_HISTORY=1` 可关闭捕获。对应 TUI 命令是 `/rewind`。
+
 ## `orca exec`
 
 ```text

@@ -2596,6 +2596,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "orca-rewind"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "similar",
+ "tempfile",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
 name = "orca-runtime"
 version = "0.1.0"
 dependencies = [
@@ -2618,6 +2632,7 @@ dependencies = [
  "orca-mcp",
  "orca-platform",
  "orca-provider",
+ "orca-rewind",
  "orca-tools",
  "orca-windows-sandbox",
  "reqwest",

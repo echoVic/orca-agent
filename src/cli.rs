@@ -72,6 +72,8 @@ enum Command {
     Doctor(DoctorArgs),
     /// Inspect disk usage and optionally prune archived sessions.
     Storage(StorageArgs),
+    /// Restore files and/or the conversation of a saved session to an earlier turn.
+    Rewind(RewindArgs),
     /// Run a task and emit events.
     Exec(ExecArgs),
     /// Serve the JSON-RPC app protocol over standard input and output.
@@ -157,6 +159,77 @@ struct StorageArgs {
     /// Apply the explicit policy. Without this flag, only preview candidates.
     #[arg(long)]
     apply: bool,
+}
+
+#[derive(Debug, Parser)]
+struct RewindArgs {
+    /// Session id, prefix, or 'latest'. Defaults to the most recent session.
+    #[arg(value_name = "SESSION_ID")]
+    session: Option<String>,
+
+    /// Use the most recent saved session (explicit alias of the default).
+    #[arg(long)]
+    last: bool,
+
+    /// Restore the state at this persisted message id (default: the latest user message).
+    #[arg(long = "at", value_name = "MESSAGE_ID")]
+    at: Option<String>,
+
+    /// What to restore: files, conversation, or both.
+    #[arg(long, value_enum, default_value_t = RewindModeArg::Both)]
+    mode: RewindModeArg,
+
+    /// Show the restore plan without changing any file or the transcript.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Print the stable JSON report.
+    #[arg(long)]
+    json: bool,
+
+    /// Overwrite files that changed outside tracked tool writes.
+    #[arg(long)]
+    force: bool,
+}
+
+impl RewindArgs {
+    fn into_request(self) -> orca_runtime::command::rewind::RewindCommandRequest {
+        orca_runtime::command::rewind::RewindCommandRequest {
+            session: self.session,
+            last: self.last,
+            at: self.at,
+            mode: self.mode.into(),
+            dry_run: self.dry_run,
+            json: self.json,
+            force: self.force,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RewindModeArg {
+    /// Restore files and truncate the conversation.
+    Both,
+    /// Restore files only.
+    Code,
+    /// Truncate the conversation only.
+    Conversation,
+    /// Summarize the conversation from the target onward (not implemented yet).
+    SummarizeFrom,
+    /// Summarize the conversation up to the target (not implemented yet).
+    SummarizeUpTo,
+}
+
+impl From<RewindModeArg> for orca_core::rewind::RewindMode {
+    fn from(value: RewindModeArg) -> Self {
+        match value {
+            RewindModeArg::Both => Self::Both,
+            RewindModeArg::Code => Self::Code,
+            RewindModeArg::Conversation => Self::Conversation,
+            RewindModeArg::SummarizeFrom => Self::SummarizeFrom,
+            RewindModeArg::SummarizeUpTo => Self::SummarizeUpTo,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -1227,6 +1300,7 @@ pub fn run() -> i32 {
                 }
             }
         }
+        Some(Command::Rewind(args)) => orca_runtime::command::rewind::run(args.into_request()),
         Some(Command::Doctor(args)) => {
             orca_runtime::diagnostics::run(orca_runtime::diagnostics::DoctorRequest {
                 cwd: args.cwd,

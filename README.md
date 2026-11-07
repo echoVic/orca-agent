@@ -80,6 +80,7 @@ orca exec resume --last "continue"        # resume the most recent session
 orca exec resume SID --resume-at MID "continue"  # resume up to a message boundary
 orca --resume [SESSION_ID]                # resume a saved conversation
 orca --fork SESSION_ID                    # fork a saved conversation
+orca rewind --at MID --dry-run            # preview a file/conversation rollback
 orca acp                                  # connect an ACP client
 orca app-server                           # serve the JSON-RPC app protocol
 orca --plan exec --json -C ./project "inspect it"  # read-only JSONL run

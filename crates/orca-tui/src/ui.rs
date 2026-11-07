@@ -306,6 +306,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         crate::mcp_panel::render_mcp_dialog(frame, state, theme);
     }
 
+    if state.rewind.is_some() {
+        crate::rewind_panel::render_rewind_dialog(frame, state, theme);
+    }
+
     if state.full_access_confirmation.is_some() {
         render_full_access_confirmation(frame, state, theme);
     }
@@ -7437,7 +7441,9 @@ mod tests {
     use crate::protocol::{TuiEvent, TuiInteractionKey, TuiInteractionKind};
     use crate::surface_projection::SurfaceProjectionState;
     use crate::test_support::frame_string;
-    use crate::types::{ApprovalDialog, PlanApprovalDialog, SlashMenu, SlashMenuItem};
+    use crate::types::{
+        ApprovalDialog, PlanApprovalDialog, RewindPhase, RewindState, SlashMenu, SlashMenuItem,
+    };
     use chrono::Utc;
     use crossbeam_channel as mpsc;
     use orca_core::config::{AdditionalWorkingDirectory, ThemeName};
@@ -17099,6 +17105,66 @@ mod tests {
             diff_scroll: 0,
         });
         assert_golden("approval", &frame_string(&mut state, 100, 30));
+    }
+
+    #[test]
+    fn golden_rewind_confirm_dialog() {
+        let mut state = golden_state();
+        state.rewind = Some(RewindState {
+            phase: RewindPhase::Confirm {
+                checkpoint: 0,
+                mode: orca_core::rewind::RewindMode::Both,
+                report: orca_core::rewind::RewindReport {
+                    target_message_id: "item_0".into(),
+                    ordinal: 0,
+                    mode: "both".into(),
+                    dry_run: true,
+                    files: orca_core::rewind::RewindFilesReport {
+                        changed: 3,
+                        deleted: 1,
+                        unchanged: 5,
+                        skipped: vec![orca_core::rewind::RewindSkip {
+                            path: "assets/logo.bin".into(),
+                            reason: "blob_missing".into(),
+                        }],
+                    },
+                    stats: orca_core::rewind::RewindStats {
+                        insertions: 41,
+                        deletions: 7,
+                        omitted: false,
+                    },
+                    warnings: vec![orca_core::rewind::RewindWarning {
+                        kind: "untracked_change".into(),
+                        paths: vec!["docs/x.md".into()],
+                        detail: None,
+                    }],
+                    conversation: Some(orca_core::rewind::ConversationRewindReport {
+                        kind: "truncate".into(),
+                        kept_messages: 12,
+                    }),
+                    rewind_id: None,
+                    op_id: None,
+                },
+                selected: 0,
+            },
+            checkpoints: vec![orca_core::rewind::RewindCheckpointView {
+                message_id: "item_0".into(),
+                ordinal: 0,
+                prompt_preview: "fix the parser".into(),
+                recorded_at: None,
+                files_changed: 4,
+                insertions: 48,
+                deletions: 7,
+                has_snapshot: true,
+                snapshot_evicted: false,
+                conversation_available: true,
+                files_available: true,
+                unavailable_reasons: Vec::new(),
+            }],
+            pending: false,
+            error: None,
+        });
+        assert_golden("rewind-confirm", &frame_string(&mut state, 100, 30));
     }
 
     #[test]

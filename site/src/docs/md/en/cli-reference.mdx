@@ -90,6 +90,26 @@ Without `--apply`, this command only previews usage and candidates. See
 [Storage and retention](session-commands.md#storage-and-retention) for the
 archive policy, image ownership, and backup contract.
 
+## `orca rewind`
+
+```text
+orca rewind [SESSION_ID] [--last] [--at MESSAGE_ID] [--mode both|code|conversation]
+            [--dry-run] [--json] [--force]
+```
+
+Restores the files and/or conversation of a saved session to the state when a
+user message was submitted. Without `--at`, the latest user message is the
+target (undo the last turn). `--mode code` restores files only,
+`conversation` truncates the conversation only, and `both` (the default) does
+both. `--dry-run` prints the plan without changing anything and `--json`
+emits the stable JSON report. Files changed by bash or other external
+processes are not part of a checkpoint; the CLI refuses to overwrite them
+unless `--force` is passed. Summarize modes (`summarize-*`) are not
+implemented yet and fail with an error. Checkpoints require a session that
+records history and only cover files written by `edit` / `write_file`; set
+`ORCA_DISABLE_FILE_HISTORY=1` to disable capture. The TUI equivalent is
+`/rewind`.
+
 ## `orca exec`
 
 ```text

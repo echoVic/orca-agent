@@ -149,6 +149,7 @@ pub(crate) fn handle_runtime_event(
     let new_session_started = matches!(&tui_event, TuiEvent::NewSessionStarted);
     let restored_composer = match &tui_event {
         TuiEvent::Backtracked { prompt } => Some(prompt.clone()),
+        TuiEvent::RewindCompleted(outcome) => outcome.prompt.clone(),
         TuiEvent::SubmissionRejected { prompt, .. } => Some(prompt.clone()),
         _ => None,
     };

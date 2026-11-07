@@ -17,6 +17,7 @@ use crate::mcp_dialog_actions::handle_mcp_dialog_key;
 use crate::plan_approval_actions::handle_plan_approval_key;
 use crate::protocol::UserAction;
 use crate::queued_input_actions::handle_running_key;
+use crate::rewind_actions::handle_rewind_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::session_picker_actions::handle_session_picker_key;
 use crate::setup_actions::{SetupFlow, handle_setup_key};
@@ -107,6 +108,12 @@ where
     if state.mcp_dialog.is_some() {
         vim_state.cancel_pending_command();
         handle_mcp_dialog_key(key, state, action_tx);
+        return Ok(StatusKeyFlow::Continue);
+    }
+
+    if state.rewind.is_some() {
+        vim_state.cancel_pending_command();
+        handle_rewind_key(key, state, action_tx);
         return Ok(StatusKeyFlow::Continue);
     }
 

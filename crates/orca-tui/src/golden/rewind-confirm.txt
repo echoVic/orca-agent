@@ -1,0 +1,30 @@
+
+               ⢀⣤⣶⣶⣶⣶⣄⢀⣤⣶
+             ⡠⠾⠿⠿⢿⣿⠻⠿⢻⣿⠿⠋                    ___
+                   ⣿⣿                       / _ \ _ __ ___ __ _
+                 ⢀⣀⣿⣿⡀    ⢠⡄               | | | | '__/ __/ _` |
+      ⣀⣤⣴⣶⣶⣿⣿⣿⣶⣾⣿⣿⣿⣿⠋     ⣿⣿⣶⣤⡀    ⣀⣠⣦     | |_| | | | (_| (_| |
+    ⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⣄   ⢻⣿⣿⣿⣿⣴⣿⣿⣿⣿⣿⠇      \___/|_|  \___\__,_|  v0.4.32
+  ⢀⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿╭ Rewind · confirm ──────────────────────────────────────────────────╮
+  ⣼⣿⡏⠉⠉⠉⠉⠙⠛⠻⢿⣿⣿│ #1  fix the parser                                                 │
+  ⣿⣿⣧        ⠈⠙│ Mode  Restore code and conversation                                │eepseek
+  ⢸⣿⣿⣆         │                                                                    │
+   ⠻⣿⣿⣧⡀       │ File plan                                                          │
+    ⠙⢿⣿⣿⣶⣄⡀  ⠘⢿│ 3 to restore · 1 to delete · 5 unchanged                           │
+      ⠉⠻⢿⣿⣿⣷⣶⣶⣾│ +41 −7                                                             │
+         ⠈⠉⠛⠻⠿⠿│ Skip  assets/logo.bin (blob_missing)                               │
+               │ Warnings                                                           │
+               │ files changed since the snapshot (overwritten): docs/x.md          │
+               │ Conversation: truncate · keeps 12 messages                         │
+               │                                                                    │
+               │ › y  Apply   rewind now                                            │
+               │   n  Cancel  go back                                               │
+               │ y/Enter apply · n/Esc back                                         │
+               ╰────────────────────────────────────────────────────────────────────╯
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ ›  Message Orca…  / commands · @ files · $ skills
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ ⇧Tab auto-edit      /Users/dev/Documents/GitHub/blade-deepseek       deepseek-flash · max · ? help

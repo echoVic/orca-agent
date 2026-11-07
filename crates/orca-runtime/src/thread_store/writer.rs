@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
-use orca_core::conversation::{Message, SummaryState};
+use orca_core::conversation::{Message, SummaryState, is_internal_image_analysis};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventEnvelope, EventPublicationStore, EventType};
 use orca_core::plan_types::{PlanItem, PlanStatus};
@@ -31,9 +31,9 @@ use super::reader::{INDEX_BUDGET, SessionRecords, iter_records};
 #[cfg(not(test))]
 use super::session_index;
 use super::types::{
-    ManualCompactionDurableSnapshot, ManualCompactionSnapshotRecord, SessionMeta, SessionRecord,
-    SessionTranscript, StoredConversationRecord, StoredMessage, StoredSessionHealth,
-    StoredSessionHealthIssue,
+    FileSnapshotRecord, ManualCompactionDurableSnapshot, ManualCompactionSnapshotRecord,
+    SessionMeta, SessionRecord, SessionRewindRecord, SessionTranscript, StoredConversationRecord,
+    StoredMessage, StoredSessionHealth, StoredSessionHealthIssue,
 };
 
 /// Durable JSONL record bound, including the line terminator. Total history
@@ -693,6 +693,361 @@ pub(crate) fn read_transcript_until(
     )
 }
 
+/// A user message that a `/rewind` can target, in effective-history order.
+///
+/// `ordinal` is the 0-based index among rewindable user messages: every real
+/// user prompt (pinned headless prompts included), excluding only internal
+/// image-analysis sidecars.
+#[derive(Clone, Debug)]
+pub struct RewindUserMessage {
+    pub message_id: String,
+    pub ordinal: u32,
+    pub prompt: String,
+}
+
+/// The effective transcript strictly before a rewind boundary, ready to be fed
+/// to `history::resume_conversation`, together with the kept counts a new
+/// `session.rewind` record should persist.
+#[derive(Clone, Debug)]
+pub struct RewindTranscriptCut {
+    pub transcript: SessionTranscript,
+    pub kept_messages: u32,
+    pub kept_compactions: u32,
+    pub kept_summaries: u32,
+    /// Body of the boundary message (the prompt to put back in the composer).
+    pub prompt: String,
+    /// 0-based index of the boundary among rewindable user messages.
+    pub ordinal: u32,
+}
+
+fn read_all_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
+    iter_records(path, HydrateImages::NotToolMessages)?.collect()
+}
+
+fn no_saved_message(boundary_message_id: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no saved message matches '{boundary_message_id}'"),
+    )
+}
+
+/// A persisted user message that a `/rewind` can target. Unlike
+/// `Conversation::backtrack_last_user`, pinned user messages are included:
+/// headless `orca exec --save-history` persists real prompts as pinned user
+/// turns, and those must stay rewindable. Only internal image-analysis
+/// sidecar observations are excluded (pinned *system* messages are a different
+/// variant and are naturally not candidates).
+fn is_rewindable_user_message(message: &StoredMessage) -> bool {
+    matches!(
+        message,
+        StoredMessage::User {
+            content, images, ..
+        } if !images.is_empty() || !is_internal_image_analysis(content)
+    )
+}
+
+fn stored_message_text(message: &StoredMessage) -> String {
+    match message {
+        StoredMessage::System { content, .. }
+        | StoredMessage::User { content, .. }
+        | StoredMessage::Tool { content, .. } => content.clone(),
+        StoredMessage::Assistant { content, .. } => content.clone().unwrap_or_default(),
+    }
+}
+
+fn rewind_exceeds_transcript(field: &str, kept: usize, available: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("rewind record exceeds transcript: kept_{field}={kept} > {available}"),
+    )
+}
+
+/// Kept counts of a rewind record only when it cuts the conversation. A
+/// code-only rewind (files restored, `conversation: None`) is audit data and
+/// never truncates messages, compactions or summaries.
+fn rewind_conversation_counts(
+    record: &SessionRewindRecord,
+) -> io::Result<Option<(usize, usize, usize)>> {
+    let Some(conversation) = &record.conversation else {
+        return Ok(None);
+    };
+    match conversation.kind.as_str() {
+        "truncate" => {}
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported conversation rewind kind '{other}'"),
+            ));
+        }
+    }
+    Ok(Some((
+        usize::try_from(record.kept_messages).unwrap_or(usize::MAX),
+        usize::try_from(record.kept_compactions).unwrap_or(usize::MAX),
+        usize::try_from(record.kept_summaries).unwrap_or(usize::MAX),
+    )))
+}
+
+/// Fold one `session.rewind` marker into the transcript fold state.
+fn apply_rewind_to_transcript(
+    messages: &mut Vec<Message>,
+    compactions: &mut Vec<CompactionRecord>,
+    summaries: &mut Vec<ContextSummaryRecord>,
+    record: &SessionRewindRecord,
+) -> io::Result<()> {
+    let Some((kept_messages, kept_compactions, kept_summaries)) =
+        rewind_conversation_counts(record)?
+    else {
+        return Ok(());
+    };
+    if kept_messages > messages.len() {
+        return Err(rewind_exceeds_transcript(
+            "messages",
+            kept_messages,
+            messages.len(),
+        ));
+    }
+    if kept_compactions > compactions.len() {
+        return Err(rewind_exceeds_transcript(
+            "compactions",
+            kept_compactions,
+            compactions.len(),
+        ));
+    }
+    if kept_summaries > summaries.len() {
+        return Err(rewind_exceeds_transcript(
+            "summaries",
+            kept_summaries,
+            summaries.len(),
+        ));
+    }
+    messages.truncate(kept_messages);
+    compactions.truncate(kept_compactions);
+    summaries.truncate(kept_summaries);
+    // Reserved for the summarize modes: the folded summary is self-contained
+    // in the record, so replaying it never needs to rewrite older records.
+    if let Some(summary) = record
+        .conversation
+        .as_ref()
+        .and_then(|conversation| conversation.summary.as_ref())
+    {
+        messages.push(Message::system(summary.clone()));
+    }
+    Ok(())
+}
+
+/// Slot for a summary system message synthesized by a rewind record; it has no
+/// backing transcript record that could be dropped.
+const SYNTHETIC_MESSAGE_SLOT: usize = usize::MAX;
+
+fn truncate_rewind_slots(
+    slots: &mut Vec<usize>,
+    kept: usize,
+    dropped: &mut [bool],
+    records: &[SessionRecord],
+    field: &str,
+) -> io::Result<()> {
+    if kept > slots.len() {
+        return Err(rewind_exceeds_transcript(field, kept, slots.len()));
+    }
+    for removed in slots.drain(kept..) {
+        if removed == SYNTHETIC_MESSAGE_SLOT {
+            continue;
+        }
+        // A manual-compaction snapshot contributes several folded entries at
+        // once; removing it wholesale would drop entries a rewind keeps, so
+        // the fold re-applies this rewind to it instead.
+        if !matches!(records[removed], SessionRecord::ManualCompactionSnapshot(_)) {
+            dropped[removed] = true;
+        }
+    }
+    Ok(())
+}
+
+/// Returns the record stream as the folded transcript sees it: message,
+/// compaction and summary records superseded by a later rewind marker are
+/// dropped, while everything else (meta, usage, events, the markers
+/// themselves) is kept in order. Rewind markers therefore become no-ops when
+/// the resulting stream is folded again.
+fn effective_records_after_rewinds(records: &[SessionRecord]) -> io::Result<Vec<SessionRecord>> {
+    let mut dropped = vec![false; records.len()];
+    // Each slot names the record that contributed one folded messages /
+    // compactions / summaries entry, in folded order.
+    let mut message_slots: Vec<usize> = Vec::new();
+    let mut compaction_slots: Vec<usize> = Vec::new();
+    let mut summary_slots: Vec<usize> = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        match record {
+            SessionRecord::Message { .. } => message_slots.push(index),
+            SessionRecord::SemanticEvent { event } => {
+                if conversation_record_from_semantic_event(event)?.is_some() {
+                    message_slots.push(index);
+                }
+            }
+            SessionRecord::ContextCollapsed(_) => compaction_slots.push(index),
+            SessionRecord::ContextSummary(_) => summary_slots.push(index),
+            SessionRecord::ManualCompactionSnapshot(snapshot) => {
+                // Mirrors the transcript fold: the snapshot replaces the
+                // message, compaction and summary state with its own.
+                message_slots.clear();
+                message_slots.extend(std::iter::repeat_n(index, snapshot.messages.len()));
+                compaction_slots.clear();
+                summary_slots.clear();
+                if snapshot.rolling_summary.is_some() || !snapshot.summary_state.is_empty() {
+                    summary_slots.push(index);
+                }
+            }
+            SessionRecord::SessionRewind(rewind) => {
+                let Some((kept_messages, kept_compactions, kept_summaries)) =
+                    rewind_conversation_counts(rewind)?
+                else {
+                    // Code-only rewind: audit record, nothing is truncated.
+                    continue;
+                };
+                truncate_rewind_slots(
+                    &mut message_slots,
+                    kept_messages,
+                    &mut dropped,
+                    records,
+                    "messages",
+                )?;
+                truncate_rewind_slots(
+                    &mut compaction_slots,
+                    kept_compactions,
+                    &mut dropped,
+                    records,
+                    "compactions",
+                )?;
+                truncate_rewind_slots(
+                    &mut summary_slots,
+                    kept_summaries,
+                    &mut dropped,
+                    records,
+                    "summaries",
+                )?;
+                if rewind
+                    .conversation
+                    .as_ref()
+                    .and_then(|conversation| conversation.summary.as_ref())
+                    .is_some()
+                {
+                    message_slots.push(SYNTHETIC_MESSAGE_SLOT);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(records
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| (!dropped[index]).then(|| record.clone()))
+        .collect())
+}
+
+/// Read a transcript but restore the *effective* message log up to
+/// `boundary_message_id` (inclusive), i.e. after every `session.rewind` marker
+/// has been folded. Records after the boundary are not replayed. Messages that
+/// a later rewind removed are not part of the effective history and therefore
+/// never match the boundary.
+#[allow(dead_code)]
+pub(crate) fn read_transcript_until_effective(
+    path: &Path,
+    boundary_message_id: &str,
+) -> io::Result<SessionTranscript> {
+    let records = read_all_records(path)?;
+    let effective = effective_records_after_rewinds(&records)?;
+    let boundary = effective
+        .iter()
+        .rposition(|record| {
+            matches!(
+                record,
+                SessionRecord::Message { id: Some(id), .. } if id.as_str() == boundary_message_id
+            )
+        })
+        .ok_or_else(|| no_saved_message(boundary_message_id))?;
+    transcript_from_records(path, effective.into_iter().take(boundary + 1).map(Ok))
+}
+
+/// Read a transcript strictly before `boundary_message_id` (exclusive) in the
+/// effective (rewind-folded) history, plus the kept counts a new
+/// `session.rewind` record must persist. The returned transcript is
+/// self-consistent: `kept_*` are exactly its `messages`/`compactions`/
+/// `summaries` lengths.
+pub(crate) fn read_transcript_before_message(
+    path: &Path,
+    boundary_message_id: &str,
+) -> io::Result<RewindTranscriptCut> {
+    let records = read_all_records(path)?;
+    let effective = effective_records_after_rewinds(&records)?;
+    let boundary = effective
+        .iter()
+        .rposition(|record| {
+            matches!(
+                record,
+                SessionRecord::Message { id: Some(id), .. } if id.as_str() == boundary_message_id
+            )
+        })
+        .ok_or_else(|| no_saved_message(boundary_message_id))?;
+    let prompt = match &effective[boundary] {
+        SessionRecord::Message { message, .. } => stored_message_text(message),
+        _ => String::new(),
+    };
+    let ordinal = effective[..boundary]
+        .iter()
+        .filter(|record| {
+            matches!(
+                record,
+                SessionRecord::Message { message, .. } if is_rewindable_user_message(message)
+            )
+        })
+        .count();
+    let transcript = transcript_from_records(path, effective.into_iter().take(boundary).map(Ok))?;
+    Ok(RewindTranscriptCut {
+        kept_messages: u32::try_from(transcript.messages.len()).unwrap_or(u32::MAX),
+        kept_compactions: u32::try_from(transcript.compactions.len()).unwrap_or(u32::MAX),
+        kept_summaries: u32::try_from(transcript.summaries.len()).unwrap_or(u32::MAX),
+        prompt,
+        ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+        transcript,
+    })
+}
+
+/// Rewindable user messages in effective (rewind-folded) history order.
+pub(crate) fn read_effective_user_messages(path: &Path) -> io::Result<Vec<RewindUserMessage>> {
+    let records = read_all_records(path)?;
+    let effective = effective_records_after_rewinds(&records)?;
+    let mut messages = Vec::new();
+    for record in &effective {
+        let SessionRecord::Message {
+            id: Some(id),
+            message,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if is_rewindable_user_message(message) {
+            messages.push(RewindUserMessage {
+                message_id: id.as_str().to_string(),
+                ordinal: u32::try_from(messages.len()).unwrap_or(u32::MAX),
+                prompt: stored_message_text(message),
+            });
+        }
+    }
+    Ok(messages)
+}
+
+/// Every `session.snapshot` record in file order. Everything else is ignored;
+/// the audit record never contributes conversation state.
+pub(crate) fn read_snapshots(path: &Path) -> io::Result<Vec<FileSnapshotRecord>> {
+    let mut snapshots = Vec::new();
+    for record in iter_records(path, HydrateImages::NotToolMessages)? {
+        if let SessionRecord::FileSnapshot(snapshot) = record? {
+            snapshots.push(snapshot);
+        }
+    }
+    Ok(snapshots)
+}
+
 /// Apply a message boundary to an already-loaded transcript by re-reading the
 /// records from its durable path, so preloaded transcripts honor the boundary
 /// exactly like freshly loaded ones.
@@ -800,6 +1155,17 @@ pub(crate) fn transcript_from_records(
                 }
             }
             SessionRecord::Checkpoint(_) | SessionRecord::PromptCacheCheckpoint(_) => {}
+            // File snapshots are audit data for `/rewind`; they never add or
+            // remove conversation messages.
+            SessionRecord::FileSnapshot(_) => {}
+            SessionRecord::SessionRewind(record) => {
+                apply_rewind_to_transcript(
+                    &mut messages,
+                    &mut compactions,
+                    &mut summaries,
+                    &record,
+                )?;
+            }
         }
     }
 
@@ -948,6 +1314,25 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
             }
         }
         SessionRecord::PromptCacheCheckpoint(_) => {}
+        SessionRecord::FileSnapshot(record) => {
+            redact_string_in_place(&mut record.root);
+            if let Some(fingerprint) = &mut record.workspace_fingerprint {
+                redact_string_in_place(fingerprint);
+            }
+            for path in &mut record.untracked {
+                redact_string_in_place(path);
+            }
+            for limitation in &mut record.limitations {
+                redact_string_in_place(limitation);
+            }
+        }
+        SessionRecord::SessionRewind(record) => {
+            if let Some(conversation) = &mut record.conversation
+                && let Some(summary) = &mut conversation.summary
+            {
+                redact_string_in_place(summary);
+            }
+        }
     }
     redacted
 }
@@ -1611,6 +1996,24 @@ impl SessionWriter {
                 },
             ),
         )
+    }
+
+    /// Durably append a `session.snapshot` file-checkpoint record. Audit data:
+    /// it never changes the folded conversation.
+    pub(crate) fn append_file_snapshot(&mut self, record: FileSnapshotRecord) -> io::Result<()> {
+        write_durable_record(&self.path, &SessionRecord::FileSnapshot(record))
+    }
+
+    /// Durably append a `session.rewind` marker. Folding the transcript applies
+    /// its conversation cut (when one is present).
+    pub(crate) fn append_session_rewind(&mut self, record: SessionRewindRecord) -> io::Result<()> {
+        write_durable_record(&self.path, &SessionRecord::SessionRewind(record))
+    }
+
+    /// Alias for [`Self::append_session_rewind`].
+    #[allow(dead_code)]
+    pub(crate) fn append_rewind(&mut self, record: SessionRewindRecord) -> io::Result<()> {
+        self.append_session_rewind(record)
     }
 
     pub fn append_background_task_provider_response(

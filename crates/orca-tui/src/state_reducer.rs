@@ -20,8 +20,8 @@ use crate::surface_projection::{
 };
 use crate::transcript_state::ChatMessage;
 use crate::types::{
-    AppState, AppStatus, ApprovalDialog, PanelMode, PlanApprovalDialog, RecapState,
-    SessionPickerPhase, SideConversationUiState, TaskTranscriptViewState,
+    AppState, AppStatus, ApprovalDialog, PanelMode, PlanApprovalDialog, RecapState, RewindPhase,
+    RewindState, SessionPickerPhase, SideConversationUiState, TaskTranscriptViewState,
 };
 use crate::user_input_dialog::UserInputDialog;
 
@@ -1091,7 +1091,137 @@ impl AppState {
                 });
                 self.set_status(AppStatus::Idle);
             }
+            TuiEvent::RewindCheckpoints(checkpoints) => {
+                if self.status != AppStatus::Idle {
+                    // A turn started while the list was read: a rewind needs
+                    // a still workspace.
+                    return;
+                }
+                if checkpoints.is_empty() {
+                    self.rewind = None;
+                    self.push_message(ChatMessage::Error(
+                        "no rewindable checkpoints in this session".to_string(),
+                    ));
+                } else {
+                    self.rewind = Some(RewindState::new(checkpoints));
+                }
+            }
+            TuiEvent::RewindPreviewed(outcome) => {
+                self.apply_rewind_preview(outcome);
+            }
+            TuiEvent::RewindCompleted(outcome) => {
+                self.apply_rewind_completed(outcome);
+            }
+            TuiEvent::RewindFailed(message) => {
+                if let Some(rewind) = self.rewind.as_mut() {
+                    rewind.pending = false;
+                }
+                self.push_message(ChatMessage::Error(message));
+            }
         }
+    }
+
+    /// The dry-run of the rewind the dialog asked for: if the dialog still
+    /// waits on it for the same checkpoint and mode (it may have been closed,
+    /// or the selection may have moved), it moves to the confirm page.
+    fn apply_rewind_preview(&mut self, outcome: orca_core::rewind::RewindOutcome) {
+        let Some(rewind) = self.rewind.as_mut() else {
+            return;
+        };
+        let checkpoint = match &rewind.phase {
+            RewindPhase::PickMode { checkpoint, .. } => *checkpoint,
+            _ => return,
+        };
+        let Some(view) = rewind.checkpoints.get(checkpoint) else {
+            return;
+        };
+        if outcome.report.target_message_id != view.message_id {
+            return;
+        }
+        let Some(mode) = orca_core::rewind::RewindMode::parse(&outcome.report.mode) else {
+            return;
+        };
+        rewind.phase = RewindPhase::Confirm {
+            checkpoint,
+            mode,
+            report: outcome.report,
+            selected: 0,
+        };
+        rewind.pending = false;
+    }
+
+    /// Applies an applied rewind to the view: the conversation is cut before
+    /// the `user_ordinal`-th user message (the message the rewind targeted),
+    /// with a rule marking where, and the files report becomes a notice. The
+    /// prompt of the target message goes back to the composer in
+    /// `runtime_event_actions`.
+    fn apply_rewind_completed(&mut self, outcome: orca_core::rewind::RewindOutcome) {
+        self.rewind = None;
+        self.invalidate_recap();
+        let mode = orca_core::rewind::RewindMode::parse(&outcome.report.mode);
+        let conversation_kind = outcome
+            .report
+            .conversation
+            .as_ref()
+            .map(|conversation| conversation.kind.as_str());
+        let touches_conversation = mode.is_some_and(|mode| mode.includes_conversation())
+            || conversation_kind == Some("truncate");
+        if matches!(
+            conversation_kind,
+            Some("summarize_from" | "summarize_up_to")
+        ) {
+            // The visible history is not cut by a summarize: the summary
+            // replaces earlier context only.
+            self.push_message(ChatMessage::System {
+                text: "Conversation summarized (ctrl+o to view history)".to_string(),
+                expanded: false,
+            });
+        } else if touches_conversation {
+            let ordinal = outcome.user_ordinal as usize;
+            let target = self
+                .transcript
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| matches!(message, ChatMessage::User(_)))
+                .map(|(index, _)| index)
+                .nth(ordinal);
+            match target {
+                Some(index) => {
+                    self.truncate_messages(index);
+                    self.push_message(ChatMessage::System {
+                        text: format!("── Rewound to message #{} ──", ordinal + 1),
+                        expanded: false,
+                    });
+                }
+                None => {
+                    self.truncate_messages(0);
+                    self.push_message(ChatMessage::Error(format!(
+                        "the conversation has no message #{}, so the view was cleared",
+                        ordinal + 1
+                    )));
+                }
+            }
+        }
+        let files = &outcome.report.files;
+        let skipped = files.skipped.len();
+        if files.changed > 0 || files.deleted > 0 || files.unchanged > 0 || skipped > 0 {
+            let mut text = format!(
+                "Restored {} files (+{} −{}), deleted {}",
+                files.changed,
+                outcome.report.stats.insertions,
+                outcome.report.stats.deletions,
+                files.deleted
+            );
+            if skipped > 0 {
+                text.push_str(&format!(", skipped {skipped}"));
+            }
+            self.push_message(ChatMessage::System {
+                text,
+                expanded: false,
+            });
+        }
+        self.set_status(AppStatus::Idle);
     }
 
     pub(crate) fn push_goal_notice(&mut self, notice: String) {

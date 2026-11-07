@@ -292,8 +292,58 @@ projection:
 
 The checkpoint is audit data — execution always resumes from the transcript's
 committed messages, and uncommitted side effects are never claimed as
-exactly-once (restore repairs them as indeterminate). File rewind is not
-promised: Orca does not snapshot external workspace state.
+exactly-once (restore repairs them as indeterminate).
+
+### File checkpoints and `/rewind`
+
+When a session records history, the runtime captures one file checkpoint per
+turn. Before a write-class tool (`edit`, `write_file`) applies a change, the
+pre-image of the target file is stored as a content-addressed blob under
+`$ORCA_HOME/rewind/sessions/<session_id>/objects/<sha256>`; when the turn ends,
+the runtime appends a `session.snapshot` transcript record. Bash commands,
+external tools and other processes that edit the workspace are not captured:
+the bounded workspace observation reports them as untracked paths, and a
+rewind never restores them. Set `ORCA_DISABLE_FILE_HISTORY=1` to disable
+capture entirely.
+
+A `session.snapshot` record carries the turn's user message id
+(`at_message_id`), its `ordinal` among rewindable user messages, the canonical
+workspace `root`, and a `files` map whose `pre` entry is the state before the
+first write of that turn (`null` = the file did not exist, so a rewind deletes
+it) and `post_sha256` the digest after the last successful write:
+
+```json
+{"type":"session.snapshot","schema_version":1,"snapshot_id":"snap_...",
+ "session_id":"...","at_message_id":"item_...","ordinal":12,
+ "root":"/workspace","complete":true,
+ "files":{"src/a.rs":{"pre":{"sha256":"ab...","size":812,"encoding":"zstd"},
+                      "post_sha256":"cd..."}},
+ "untracked":["docs/x.md"],"limitations":[],"recorded_at":"..."}
+```
+
+`orca rewind --at <MESSAGE_ID> [--mode both|code|conversation] [--dry-run]
+[--json] [--force]` restores the state at that user message: files from the
+recorded pre-images and/or the conversation truncated to before the message.
+The interactive TUI exposes the same operation as `/rewind` (alias
+`/checkpoint`). File restores are applied atomically with a crash journal; a
+conversation rewind appends a `session.rewind` record that the transcript
+loader folds in:
+
+```json
+{"type":"session.rewind","schema_version":1,"session_id":"...",
+ "rewind_id":"rw_...","at_message_id":"item_...",
+ "kept_messages":12,"kept_compactions":0,"kept_summaries":0,
+ "conversation":{"kind":"truncate"},
+ "files":{"restored":3,"deleted":1,"skipped":0},
+ "recorded_at":"..."}
+```
+
+Rewind never changes recorded token usage or budget history, and it keeps the
+same session id. The CLI refuses to overwrite files whose current contents were
+changed outside tracked tool writes unless `--force` is passed; the TUI asks
+for explicit confirmation instead. Summarize-based modes are reserved and
+report `Unsupported`. Transcripts that contain `session.snapshot` or
+`session.rewind` records are not readable by Orca versions that predate them.
 
 ## Exit Codes
 
