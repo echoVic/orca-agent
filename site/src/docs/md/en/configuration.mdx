@@ -96,6 +96,28 @@ Set it to `false` to refuse those actions, including all Command shortcuts.
 See [Computer Use](computer-use.md) for system permissions, app and window
 approval, and disabling the tool with a deny rule.
 
+## File checkpoints (`/rewind`)
+
+When a session records history, Orca captures one file checkpoint per turn so
+`/rewind` can restore files and the conversation. The `[rewind]` table belongs
+in the user configuration; a trusted workspace may also set it in
+`.orca/config.toml`:
+
+```toml
+[rewind]
+enabled = true            # capture a checkpoint per turn; false also empties /rewind
+observe_untracked = true  # report changes made outside tracked tool writes
+max_checkpoints = 100     # checkpoints kept per session (minimum 1)
+```
+
+`ORCA_DISABLE_FILE_HISTORY` (non-empty, not `0`) disables capture and
+`ORCA_REWIND_DISABLE_OBSERVE` (any value) disables the turn-boundary workspace
+observation; the environment always overrides the file. Evicted checkpoints
+are stamped with a retention watermark, after which only their conversation
+rewind remains available, and their file blobs are garbage-collected
+automatically. A file restore is refused when the workspace no longer matches
+the workspace the checkpoint was recorded in.
+
 ## Permission-rule targets
 
 `[[permissions.rules]]` belongs in the user configuration. A rule names a

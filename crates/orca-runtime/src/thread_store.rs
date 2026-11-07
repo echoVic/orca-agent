@@ -58,7 +58,7 @@ pub use writer::SessionWriter;
 pub(crate) use writer::{
     RewindTranscriptCut, RewindTranscriptSplit, RewindUserMessage, read_effective_user_messages,
     read_latest_context_tokens, read_manual_compaction_snapshot, read_prompt_queue_snapshot,
-    read_snapshot_retention, read_snapshots, read_transcript_before_message,
+    read_session_meta, read_snapshot_retention, read_snapshots, read_transcript_before_message,
     read_transcript_split_at_message, read_transcript_until_effective, redact_sensitive_text,
     stored_session_health_error_details, truncate_transcript_at_boundary,
     write_prompt_queue_snapshot,

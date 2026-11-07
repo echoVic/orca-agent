@@ -19,11 +19,13 @@
 //! failure into `RuntimeHostError::RewindFailed` and surface it to the user.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use chrono::Utc;
+use orca_core::config::file::RewindFileConfig;
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::{Conversation, Message, is_internal_image_analysis};
 use orca_core::cost_types::UsageTotals;
@@ -43,7 +45,7 @@ use crate::session::InteractiveSession;
 use crate::thread_store::{
     BlobRef, ConversationRewindRecord, FileSnapshotRecord, RewindFilesSummary, SessionRewindRecord,
     SessionWriter, SnapshotChangeStats, SnapshotFileEntry, read_effective_user_messages,
-    read_snapshots, read_transcript_before_message,
+    read_session_meta, read_snapshots, read_transcript_before_message,
 };
 use crate::workspace_observation;
 
@@ -54,27 +56,90 @@ const DISABLE_OBSERVE_ENV: &str = "ORCA_REWIND_DISABLE_OBSERVE";
 /// Characters of the first prompt line kept for the picker.
 const PROMPT_PREVIEW_CHARS: usize = 80;
 const REWIND_SCHEMA_VERSION: u32 = 1;
-/// Snapshots retained per session; older ordinals are evicted by a
-/// `session.snapshot_retention` watermark.
+/// Retention window used by the crate-internal contract tests; the runtime
+/// value comes from `[rewind] max_checkpoints` (see [`RewindSettings`]).
+#[cfg(test)]
 pub(crate) const MAX_CHECKPOINTS: usize = 100;
 /// Dry-run preview caps: files and unified-diff bytes per file.
 const MAX_PREVIEW_FILES: usize = 20;
 const MAX_PREVIEW_DIFF_BYTES: usize = 64 * 1024;
 
-/// File checkpointing is on unless explicitly disabled.
-pub(crate) fn is_rewind_enabled() -> bool {
-    match std::env::var_os(DISABLE_ENV) {
-        Some(value) => {
-            let value = value.to_string_lossy();
-            let value = value.trim();
-            value.is_empty() || value == "0"
-        }
-        None => true,
+/// The `[rewind]` section of the effective configuration with the environment
+/// kill switches applied on top.
+///
+/// The environment always wins: `ORCA_DISABLE_FILE_HISTORY` overrides
+/// `enabled` and `ORCA_REWIND_DISABLE_OBSERVE` overrides `observe_untracked`,
+/// so an operator can turn capture off without editing a config file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RewindSettings {
+    pub(crate) enabled: bool,
+    pub(crate) observe_untracked: bool,
+    pub(crate) max_checkpoints: usize,
+}
+
+impl Default for RewindSettings {
+    fn default() -> Self {
+        Self::from_parts(RewindFileConfig::default(), false, false)
     }
 }
 
-fn observation_enabled() -> bool {
-    std::env::var_os(DISABLE_OBSERVE_ENV).is_none()
+impl RewindSettings {
+    /// Loads `[rewind]` from the effective configuration resolved at `cwd`.
+    /// A configuration error falls back to the documented defaults instead of
+    /// disabling checkpoints.
+    pub(crate) fn load(cwd: &Path) -> Self {
+        let config = orca_core::config::file::load_effective_config(
+            cwd,
+            orca_core::config::file::ConfigOverrides::default(),
+        )
+        .map(|config| config.rewind)
+        .unwrap_or_default();
+        Self::from_env(config)
+    }
+
+    fn from_env(config: RewindFileConfig) -> Self {
+        let disable_file_history = std::env::var_os(DISABLE_ENV);
+        let disable_observe = std::env::var_os(DISABLE_OBSERVE_ENV);
+        Self::from_parts(
+            config,
+            env_disables_file_history(disable_file_history.as_deref()),
+            disable_observe.is_some(),
+        )
+    }
+
+    fn from_parts(
+        config: RewindFileConfig,
+        env_disable_file_history: bool,
+        env_disable_observe: bool,
+    ) -> Self {
+        Self {
+            enabled: config.enabled && !env_disable_file_history,
+            observe_untracked: config.observe_untracked && !env_disable_observe,
+            // A zero window would evict every checkpoint; one is the minimum
+            // that still leaves a usable rewind target.
+            max_checkpoints: usize::try_from(config.max_checkpoints)
+                .unwrap_or(usize::MAX)
+                .max(1),
+        }
+    }
+}
+
+/// Whether file checkpointing is on for the workspace at `cwd`.
+pub(crate) fn is_rewind_enabled(cwd: &Path) -> bool {
+    RewindSettings::load(cwd).enabled
+}
+
+/// `ORCA_DISABLE_FILE_HISTORY` uses the historical contract: an empty value or
+/// `0` leaves capture on, anything else disables it.
+fn env_disables_file_history(value: Option<&OsStr>) -> bool {
+    match value {
+        Some(value) => {
+            let value = value.to_string_lossy();
+            let value = value.trim();
+            !(value.is_empty() || value == "0")
+        }
+        None => false,
+    }
 }
 
 /// A user message that represents a real turn and can therefore be a rewind
@@ -108,6 +173,8 @@ struct RewindTurnState {
     at_message_id: String,
     turn_id: Option<String>,
     ordinal: u32,
+    /// Retention window from the `[rewind]` configuration at turn start.
+    max_checkpoints: usize,
     start: Option<workspace_observation::Snapshot>,
     files: BTreeMap<String, CapturedFile>,
     limitations: BTreeSet<String>,
@@ -136,7 +203,8 @@ pub(crate) fn begin_turn(
     conversation: &Conversation,
     writer: Option<&mut SessionWriter>,
 ) -> Option<RewindTurn> {
-    if !is_rewind_enabled() || matches!(config.history_mode, HistoryMode::Disabled) {
+    let settings = RewindSettings::load(cwd);
+    if !settings.enabled || matches!(config.history_mode, HistoryMode::Disabled) {
         return None;
     }
     let writer = writer?;
@@ -155,7 +223,10 @@ pub(crate) fn begin_turn(
         .filter(|message| is_rewindable_user(message))
         .count()
         .saturating_sub(1) as u32;
-    let start = observation_enabled().then(|| workspace_observation::Snapshot::capture(&root));
+    let start =
+        settings
+            .observe_untracked
+            .then(|| workspace_observation::Snapshot::capture(&root));
     Some(RewindTurn {
         inner: Arc::new(Mutex::new(RewindTurnState {
             root,
@@ -164,6 +235,7 @@ pub(crate) fn begin_turn(
             at_message_id,
             turn_id: Some(turn_id.to_string()),
             ordinal,
+            max_checkpoints: settings.max_checkpoints,
             start,
             files: BTreeMap::new(),
             limitations: BTreeSet::new(),
@@ -249,7 +321,9 @@ impl RewindTurn {
         writer.append_file_snapshot(record.clone())?;
         // Retention is best effort: losing the watermark only means the
         // picker keeps offering older checkpoints that still exist on disk.
-        if let Err(error) = enforce_snapshot_retention(writer, &record.session_id) {
+        if let Err(error) =
+            enforce_snapshot_retention_with_limit(writer, &record.session_id, self.max_checkpoints())
+        {
             tracing::warn!(%error, "rewind snapshot retention watermark was not saved");
         }
         Ok(Some(record))
@@ -340,6 +414,11 @@ impl RewindTurn {
             }
         };
         Ok(record)
+    }
+
+    /// Retention window captured when the turn started.
+    fn max_checkpoints(&self) -> usize {
+        lock_state(&self.inner).max_checkpoints
     }
 }
 
@@ -551,6 +630,11 @@ pub(crate) fn list_checkpoints(
     let Some(path) = session.writer_path() else {
         return Ok(Vec::new());
     };
+    // A disabled `[rewind]` section must look like a session with no
+    // checkpoints rather than exposing the ones already on disk.
+    if !is_rewind_enabled(&session_workspace(path)?) {
+        return Ok(Vec::new());
+    }
     let mut views = checkpoint_views(path)?;
     // An unfinished journal means a previous file restore did not commit; the
     // workspace is not a trustworthy target until it is resolved.
@@ -562,6 +646,12 @@ pub(crate) fn list_checkpoints(
         }
     }
     Ok(views)
+}
+
+/// Workspace a saved session was recorded in; used to resolve its effective
+/// `[rewind]` configuration.
+fn session_workspace(path: &Path) -> io::Result<PathBuf> {
+    read_session_meta(path).map(|meta| PathBuf::from(meta.cwd))
 }
 
 /// Path-only form of [`list_checkpoints`], reused by the contract tests.
@@ -783,6 +873,33 @@ pub(crate) fn apply_rewind(
                 ),
             )
         })?;
+        // The workspace this session was recorded in must still be the
+        // workspace of the checkpoint: restoring pre-images into a resumed
+        // session that moved to another directory would write into the wrong
+        // tree. Comparing canonical paths also normalizes symlinked roots.
+        let session_meta = read_session_meta(&transcript_path)?;
+        let session_root = PathBuf::from(&session_meta.cwd)
+            .canonicalize()
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "session workspace '{}' is not accessible: {error}",
+                        session_meta.cwd
+                    ),
+                )
+            })?;
+        if session_root != root {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "session workspace '{}' does not match the checkpoint workspace \
+                     '{}'; refusing to restore files into a different workspace",
+                    session_root.display(),
+                    root.display()
+                ),
+            ));
+        }
         // A restore never remaps paths across roots: every snapshot that
         // participates in the plan must have been recorded in this workspace.
         for candidate in snapshots
@@ -1070,19 +1187,32 @@ fn snapshot_retention_watermark(path: &Path) -> io::Result<Option<u32>> {
 }
 
 /// Retains the newest [`MAX_CHECKPOINTS`] snapshots by turn ordinal and
-/// appends an eviction watermark for the rest. The watermark is audit state:
-/// the `session.snapshot` records themselves stay in the transcript.
+/// appends an eviction watermark for the rest; then best-effort garbage
+/// collects the blobs that only evicted snapshots referenced.
+#[cfg(test)]
 pub(crate) fn enforce_snapshot_retention(
     writer: &mut SessionWriter,
     session_id: &str,
 ) -> io::Result<()> {
+    enforce_snapshot_retention_with_limit(writer, session_id, MAX_CHECKPOINTS)
+}
+
+/// [`enforce_snapshot_retention`] for the `[rewind] max_checkpoints` window
+/// (clamped to at least one). The watermark is audit state: the
+/// `session.snapshot` records themselves stay in the transcript.
+pub(crate) fn enforce_snapshot_retention_with_limit(
+    writer: &mut SessionWriter,
+    session_id: &str,
+    max_checkpoints: usize,
+) -> io::Result<()> {
+    let max_checkpoints = max_checkpoints.max(1);
     let path = writer.path().to_path_buf();
     let mut snapshots = read_snapshots(&path)?;
-    if snapshots.len() <= MAX_CHECKPOINTS {
+    if snapshots.len() <= max_checkpoints {
         return Ok(());
     }
     snapshots.sort_by_key(|snapshot| snapshot.ordinal);
-    let oldest_kept = snapshots[snapshots.len() - MAX_CHECKPOINTS].ordinal;
+    let oldest_kept = snapshots[snapshots.len() - max_checkpoints].ordinal;
     let evicted_through_ordinal = oldest_kept.saturating_sub(1);
     if snapshot_retention_watermark(&path)?
         .is_some_and(|previous| previous >= evicted_through_ordinal)
@@ -1094,7 +1224,48 @@ pub(crate) fn enforce_snapshot_retention(
         session_id: session_id.to_string(),
         evicted_through_ordinal,
         recorded_at: Utc::now(),
-    })
+    })?;
+    // Eviction promises only conversation rewind for the dropped ordinals, so
+    // their pre-images are no longer needed. Failure to collect is logged, not
+    // propagated: retention itself already committed.
+    if let Err(error) = gc_evicted_snapshot_blobs(&path, session_id) {
+        tracing::warn!(%error, "rewind checkpoint blobs were not garbage-collected");
+    }
+    Ok(())
+}
+
+/// Deletes the blobs that only evicted snapshots (`ordinal <=` the retention
+/// watermark) referenced. Retained snapshots and their pre-images stay live.
+fn gc_evicted_snapshot_blobs(path: &Path, session_id: &str) -> io::Result<()> {
+    let Some(home) = orca_core::home::orca_home() else {
+        return Ok(());
+    };
+    let store_dir = home.join("rewind").join("sessions").join(session_id);
+    if !store_dir.is_dir() {
+        return Ok(());
+    }
+    let watermark = snapshot_retention_watermark(path)?;
+    let mut live = BTreeSet::new();
+    for snapshot in read_snapshots(path)? {
+        if watermark.is_some_and(|through| snapshot.ordinal <= through) {
+            continue;
+        }
+        for entry in snapshot.files.values() {
+            if let Some(blob) = entry.pre.as_ref() {
+                live.insert(blob.sha256.clone());
+            }
+        }
+    }
+    let store = RewindStore::open(&store_dir)?;
+    let report = store.gc(&live)?;
+    if report.removed_blobs > 0 {
+        tracing::debug!(
+            removed_blobs = report.removed_blobs,
+            removed_bytes = report.removed_bytes,
+            "rewind checkpoint blobs garbage-collected"
+        );
+    }
+    Ok(())
 }
 
 fn snapshot_views(snapshots: &[FileSnapshotRecord]) -> Vec<SnapshotView> {
@@ -1233,6 +1404,232 @@ mod tests {
         let (relative, _) =
             resolve_request_path(&root, &cwd, "./src/new.rs").expect("dot prefix is the same path");
         assert_eq!(relative, "src/new.rs");
+    }
+
+    #[test]
+    fn rewind_settings_default_to_capturing_with_the_default_window() {
+        let settings = RewindSettings::default();
+        assert!(settings.enabled);
+        assert!(settings.observe_untracked);
+        assert_eq!(settings.max_checkpoints, MAX_CHECKPOINTS);
+    }
+
+    #[test]
+    fn env_kill_switches_override_the_file_configuration() {
+        // `ORCA_DISABLE_FILE_HISTORY` keeps the historical contract: empty and
+        // `0` mean "not disabled", anything else disables.
+        assert!(!env_disables_file_history(None));
+        assert!(!env_disables_file_history(Some(OsStr::new(""))));
+        assert!(!env_disables_file_history(Some(OsStr::new("0"))));
+        assert!(env_disables_file_history(Some(OsStr::new("1"))));
+
+        // A set environment kill switch disables what the file enables.
+        let settings = RewindSettings::from_parts(RewindFileConfig::default(), true, true);
+        assert!(!settings.enabled);
+        assert!(!settings.observe_untracked);
+
+        // The environment can never re-enable a disabled file.
+        let settings = RewindSettings::from_parts(
+            RewindFileConfig {
+                enabled: false,
+                observe_untracked: false,
+                max_checkpoints: 5,
+            },
+            false,
+            false,
+        );
+        assert!(!settings.enabled);
+        assert!(!settings.observe_untracked);
+        assert_eq!(settings.max_checkpoints, 5);
+
+        // A zero retention window is clamped to the one checkpoint that still
+        // leaves a rewind target.
+        let settings = RewindSettings::from_parts(
+            RewindFileConfig {
+                max_checkpoints: 0,
+                ..RewindFileConfig::default()
+            },
+            false,
+            false,
+        );
+        assert_eq!(settings.max_checkpoints, 1);
+    }
+
+    #[test]
+    fn rewind_settings_load_the_effective_configuration() {
+        let home = tempfile::tempdir().expect("home");
+        let _home_guard = crate::history::redirect_test_orca_home(home.path());
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[rewind]\nenabled = false\nobserve_untracked = false\nmax_checkpoints = 7\n",
+        )
+        .expect("config file");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let settings = RewindSettings::load(workspace.path());
+        assert!(!settings.enabled);
+        assert!(!settings.observe_untracked);
+        assert_eq!(settings.max_checkpoints, 7);
+        assert!(!is_rewind_enabled(workspace.path()));
+    }
+
+    #[test]
+    fn retention_eviction_garbage_collects_only_evicted_blobs() {
+        let home = tempfile::tempdir().expect("home");
+        let _home_guard = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().expect("workspace");
+        let mut writer = SessionWriter::start(
+            cwd.path(),
+            "mock",
+            Some("mock-model".to_string()),
+            "rewind retention gc",
+        )
+        .expect("writer");
+        let session_id = writer.session_id().expect("session id").to_string();
+        let transcript = writer.path().to_path_buf();
+        let store = RewindStore::open(
+            &home
+                .path()
+                .join("rewind")
+                .join("sessions")
+                .join(&session_id),
+        )
+        .expect("store");
+        let root = cwd
+            .path()
+            .canonicalize()
+            .expect("canonical workspace")
+            .to_string_lossy()
+            .into_owned();
+
+        let mut blobs = Vec::new();
+        for ordinal in 0..3_u32 {
+            writer.enter_turn(orca_core::thread_identity::TurnId::new());
+            let message = Message::user(format!("prompt {ordinal}"));
+            writer.append_message(&message).expect("user message");
+            let message_id = writer.last_committed_message_id().expect("committed id");
+            let blob = store
+                .put_bytes(format!("before {ordinal}\n").as_bytes(), None)
+                .expect("pre-image blob");
+            let mut files = BTreeMap::new();
+            files.insert(
+                format!("file{ordinal}.txt"),
+                SnapshotFileEntry {
+                    pre: Some(BlobRef {
+                        sha256: blob.sha256.clone(),
+                        size: blob.size,
+                        mode: blob.mode,
+                        encoding: "raw".to_string(),
+                    }),
+                    post_sha256: None,
+                },
+            );
+            writer
+                .append_file_snapshot(FileSnapshotRecord {
+                    schema_version: REWIND_SCHEMA_VERSION,
+                    snapshot_id: format!("snap_{ordinal}"),
+                    session_id: session_id.clone(),
+                    at_message_id: message_id,
+                    turn_id: None,
+                    ordinal,
+                    root: root.clone(),
+                    workspace_fingerprint: None,
+                    complete: true,
+                    start_digest: None,
+                    end_digest: None,
+                    files,
+                    change_stats: None,
+                    untracked: Vec::new(),
+                    limitations: Vec::new(),
+                    recorded_at: Utc::now(),
+                })
+                .expect("snapshot record");
+            blobs.push(blob);
+        }
+
+        enforce_snapshot_retention_with_limit(&mut writer, &session_id, 2)
+            .expect("retention watermark and GC");
+
+        let retention = crate::thread_store::read_snapshot_retention(&transcript)
+            .expect("read retention")
+            .expect("watermark");
+        assert_eq!(retention.evicted_through_ordinal, 0);
+        assert!(
+            store.read_blob(&blobs[0]).is_err(),
+            "the evicted snapshot's pre-image is collected"
+        );
+        assert_eq!(
+            store.read_blob(&blobs[1]).expect("retained blob"),
+            b"before 1\n"
+        );
+        assert_eq!(
+            store.read_blob(&blobs[2]).expect("retained blob"),
+            b"before 2\n"
+        );
+    }
+
+    #[test]
+    fn restoring_files_into_a_different_workspace_is_refused() {
+        let home = tempfile::tempdir().expect("home");
+        let _home_guard = crate::history::redirect_test_orca_home(home.path());
+        let session_cwd = tempfile::tempdir().expect("session workspace");
+        let other_cwd = tempfile::tempdir().expect("other workspace");
+        let mut writer = SessionWriter::start(
+            session_cwd.path(),
+            "mock",
+            Some("mock-model".to_string()),
+            "rewind cwd drift",
+        )
+        .expect("writer");
+        writer.enter_turn(orca_core::thread_identity::TurnId::new());
+        writer
+            .append_message(&Message::user("edit a file".to_string()))
+            .expect("user message");
+        let message_id = writer
+            .last_committed_message_id()
+            .expect("committed message id");
+        let snapshot_root = other_cwd
+            .path()
+            .canonicalize()
+            .expect("canonical other workspace")
+            .to_string_lossy()
+            .into_owned();
+        writer
+            .append_file_snapshot(FileSnapshotRecord {
+                schema_version: REWIND_SCHEMA_VERSION,
+                snapshot_id: "snap_drift".to_string(),
+                session_id: writer.session_id().expect("session id").to_string(),
+                at_message_id: message_id.clone(),
+                turn_id: None,
+                ordinal: 0,
+                root: snapshot_root,
+                workspace_fingerprint: None,
+                complete: true,
+                start_digest: None,
+                end_digest: None,
+                files: BTreeMap::new(),
+                change_stats: None,
+                untracked: Vec::new(),
+                limitations: Vec::new(),
+                recorded_at: Utc::now(),
+            })
+            .expect("snapshot record");
+        let session_id = writer.session_id().expect("session id").to_string();
+        drop(writer);
+        let transcript = crate::history::load_session(&session_id).expect("transcript");
+        let mut config = RunConfig::default();
+        config.cwd = Some(other_cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Resume(session_id.clone());
+        let mut session =
+            InteractiveSession::new_with_preloaded(&config, "rewind cwd drift", Some(transcript))
+                .expect("resumed session");
+
+        let error = apply_rewind(&mut session, &config, &message_id, RewindMode::Code, true)
+            .expect_err("a moved workspace must not receive the restore");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("does not match the checkpoint workspace"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

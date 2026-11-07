@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn rewind_error_round_trips_through_io_error() {
         let error: io::Error = RewindError::TooLarge {
-            path: PathBuf::from("/tmp/big"),
+            path: std::env::temp_dir().join("orca-rewind-big"),
             observed_bytes: 17,
             limit: 16,
         }

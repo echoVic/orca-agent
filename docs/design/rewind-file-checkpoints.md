@@ -771,14 +771,15 @@ orca rewind --session <id|latest> [--at <message-id>] [--mode both|code|conversa
 
 ### 剩余偏差 / 已知限制
 
-1. **无 `[rewind]` 配置项**：只用环境变量 `ORCA_DISABLE_FILE_HISTORY`（关闭捕获）与 `ORCA_REWIND_DISABLE_OBSERVE`（关闭 turn 边界观察）；`max_checkpoints`/字节上限等仍是常量（100 条、16 MiB/file、4 MiB diff）。
-2. **GC 只在 `orca rewind --prune` 手动触发**：没有在 session 打开或 `orca storage` 中自动 GC；retention watermark 已让旧检查点不可文件回退。
-3. **无 `session.rewind` 流事件**：仅 TUI 内部事件；JSONL/ACP 客户端暂收不到 rewind 事件（`session.rewind` 记录可用于审计）。
-4. **root 校验模型**：restore 以目标 snapshot 的 `root` 为准并校验参与快照一致；不检测「session cwd 已切换」。
+1. **`[rewind]` 配置已落地**：`enabled`（默认 true）、`observe_untracked`（默认 true）、`max_checkpoints`（默认 100，最小 1）；env `ORCA_DISABLE_FILE_HISTORY` / `ORCA_REWIND_DISABLE_OBSERVE` 仍优先且只能关不能开（见 `site/src/docs/md/*/configuration.mdx` 与 `docs/harness-contract.md`）。
+2. **GC 已自动 + 可手动**：写 retention watermark 后自动对未淘汰快照引用集做 best-effort GC；`orca rewind --prune` 仍可手动清理。`orca storage` 未单独展示 rewind 占用。
+3. **`session.rewind` 事件已实现但线路可见性有限**：事件通过 attached surface observer 发布，并在 recorded session 的 transcript 事件日志里 journal；ACP `session/update` 与 JSONL server 线尚没有 rewind 请求通路，因此没有端到端 JSONL/ACP rewind 场景（见 `docs/harness-contract.md` 的说明）。
+4. **root 校验**：restore 以目标 snapshot 的 `root` 为准并校验参与快照一致，且比较 `session meta.cwd` 检测 session cwd 漂移（不一致 fail closed）；只有 target 快照缺失时才走“无 snapshot 只回退对话”的降级。
 5. **子代理写入捕获**：主 thread 的 turn 捕获挂在 thread extension 上；同进程子代理共享该 extension 才计入父 turn，否则进入 `untracked`；worktree 隔离子代理由子 session 自己记录。
-6. **CLI summarize 的模型/成本**：用当前有效配置 + session 的 provider/model 构建摘要请求；usage 记入记录，但 `estimated_cost_usd` 记 0（未接 pricing 折算）。
+6. **CLI summarize 成本已折算**：`execute_summarize` 用 `CostTracker`（book rates + `[models.*.pricing]` 覆盖 + 峰时倍率）把摘要 usage 折算 `estimated_cost_usd`；摘要模型为 provider config 实际使用的模型。
 7. **TUI 细节**：Ctrl+C 单击关闭对话框（设计 §10.6 为两次）；选择器数据走异步 `UserAction`/`TuiEvent` 往返；previews 仅 dry-run 填充、最多 3 个文件显示。
 8. **对话回退实现方式**：truncate/summarize 都通过截断 transcript + `resume_conversation` 重建内存 conversation（保留 system prompt；下一 turn 重新注入 pinned context），与 fold 语义一致。
+9. **2027 年中国节假日**：`pricing/rates.rs` 的 `WEEKDAY_HOLIDAYS` 目前只覆盖 2026 年；国务院公布 2027 年放假安排后需补录（与 rewind 无关，发布检查项）。
 
 ### 验证（phase 2）
 

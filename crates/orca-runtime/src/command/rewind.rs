@@ -513,12 +513,12 @@ fn execute_summarize(
             "the model returned no summary for the selected range; the conversation was not changed",
         )
     })?;
-    let summary_usage = summary.usage.map(|usage| UsageTotals {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_tokens: usage.cache_tokens,
-        estimated_cost_usd: 0.0,
-    });
+    // Summary requests are billed to the model that actually wrote the
+    // summary, the same one placed in the provider config above.
+    let summary_model = config.model.as_option().unwrap_or_default();
+    let summary_usage = summary
+        .usage
+        .map(|usage| summary_usage_totals(&summary_model, usage));
     let rewind_id = format!("rw_{}", uuid::Uuid::now_v7());
     let record = SessionRewindRecord {
         schema_version: 1,
@@ -542,6 +542,14 @@ fn execute_summarize(
     drop(writer);
     report.rewind_id = Some(rewind_id);
     Ok(report)
+}
+
+/// The usage recorded for a summarize rewind, with its cost priced for the
+/// model that served the summary request. The runtime's cost path applies the
+/// peak/off-peak multiplier and the user's `[models.<name>.pricing]` overrides.
+fn summary_usage_totals(model: &str, usage: orca_core::provider_types::Usage) -> UsageTotals {
+    let mut tracker = crate::cost::CostTracker::new(Some(model));
+    tracker.add_usage(usage)
 }
 
 /// Build the provider configuration used for a headless summarize rewind from
@@ -997,6 +1005,27 @@ mod tests {
             summary.content_str().is_some_and(|text| !text.is_empty()),
             "the model summary is persisted"
         );
+    }
+
+    #[test]
+    fn summarize_usage_is_priced_with_the_summary_model() {
+        let usage = orca_core::provider_types::Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_tokens: 0,
+        };
+        let totals = summary_usage_totals(orca_core::model::FLASH_MODEL, usage);
+        assert_eq!(totals.input_tokens, 1_000_000);
+        assert_eq!(totals.output_tokens, 1_000_000);
+        assert!(
+            totals.estimated_cost_usd > 0.0,
+            "a non-empty usage is priced, got {}",
+            totals.estimated_cost_usd
+        );
+
+        // Providers may omit usage (the mock one does): nothing is billed.
+        let totals = summary_usage_totals(orca_core::model::FLASH_MODEL, Default::default());
+        assert_eq!(totals.estimated_cost_usd, 0.0);
     }
 
     #[test]
