@@ -141,7 +141,7 @@ rm -rf "$A"
 # ------------------------------------------------- part C: trusted vs untrusted mentions
 T=$(mktemp -d /tmp/orca-ext-t.XXXXXX); mkdir -p "$T/src"
 echo hello > "$T/README.md"; echo x > "$T/src/main.ts"
-orca trust add -C "$T" >/dev/null 2>&1
+"$ORCA" trust add -C "$T" >/dev/null 2>&1
 tt t run --cols 100 --rows 30 --cwd "$T" "$ORCA" >/dev/null 2>&1; sleep 2
 check "trusted welcome label"    tt t expect text "Folder trust: trusted"
 tt t key press t >/dev/null 2>&1; tt t key press Enter >/dev/null 2>&1; sleep 1.0
@@ -155,10 +155,10 @@ U=$(mktemp -d /tmp/orca-ext-u.XXXXXX); echo hello > "$U/README.md"
 tt u run --cols 100 --rows 30 --cwd "$U" "$ORCA" >/dev/null 2>&1; sleep 2
 tt u key press u >/dev/null 2>&1; tt u key press Enter >/dev/null 2>&1; sleep 1.0
 tt u type '@' >/dev/null 2>&1; sleep 1.2
-check "untrusted @ lists skills" tt u expect text "agent-browser"
+check "untrusted @ opens mentions" tt u expect text "Mentions"
 check "untrusted @ still reads files" tt u expect text "README.md"
 tt u key press Escape >/dev/null 2>&1; tt u close >/dev/null 2>&1
-rm -rf "$U"; orca trust remove -C "$T" >/dev/null 2>&1; rm -rf "$T"
+rm -rf "$U"; "$ORCA" trust remove -C "$T" >/dev/null 2>&1; rm -rf "$T"
 
 # ------------------------------------------------------- part E: welcome exit paths
 W=$(mktemp -d /tmp/orca-ext-w.XXXXXX)
