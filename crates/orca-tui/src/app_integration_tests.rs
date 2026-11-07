@@ -8832,19 +8832,29 @@ fn hosted_tui_summarize_rewind_calls_the_runtime_summarizer() {
             .count();
         assert_eq!(users, 2, "{:?}", harness.state.transcript.messages);
         assert!(
-            harness.state.transcript.messages.iter().any(|message| matches!(
-                message,
-                ChatMessage::System { text, .. }
-                    if text == "Conversation summarized (Ctrl+O for history)"
-            )),
+            harness
+                .state
+                .transcript
+                .messages
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    ChatMessage::System { text, .. }
+                        if text == "Conversation summarized (Ctrl+O for history)"
+                )),
             "{:?}",
             harness.state.transcript.messages
         );
         assert!(
-            !harness.state.transcript.messages.iter().any(|message| matches!(
-                message,
-                ChatMessage::System { text, .. } if text.contains("Rewound to message #")
-            )),
+            !harness
+                .state
+                .transcript
+                .messages
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    ChatMessage::System { text, .. } if text.contains("Rewound to message #")
+                )),
             "a summarize must not cut the rendered history: {:?}",
             harness.state.transcript.messages
         );

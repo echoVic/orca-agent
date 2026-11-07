@@ -223,10 +223,9 @@ pub(crate) fn begin_turn(
         .filter(|message| is_rewindable_user(message))
         .count()
         .saturating_sub(1) as u32;
-    let start =
-        settings
-            .observe_untracked
-            .then(|| workspace_observation::Snapshot::capture(&root));
+    let start = settings
+        .observe_untracked
+        .then(|| workspace_observation::Snapshot::capture(&root));
     Some(RewindTurn {
         inner: Arc::new(Mutex::new(RewindTurnState {
             root,
@@ -321,9 +320,11 @@ impl RewindTurn {
         writer.append_file_snapshot(record.clone())?;
         // Retention is best effort: losing the watermark only means the
         // picker keeps offering older checkpoints that still exist on disk.
-        if let Err(error) =
-            enforce_snapshot_retention_with_limit(writer, &record.session_id, self.max_checkpoints())
-        {
+        if let Err(error) = enforce_snapshot_retention_with_limit(
+            writer,
+            &record.session_id,
+            self.max_checkpoints(),
+        ) {
             tracing::warn!(%error, "rewind snapshot retention watermark was not saved");
         }
         Ok(Some(record))
@@ -1627,7 +1628,9 @@ mod tests {
             .expect_err("a moved workspace must not receive the restore");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(
-            error.to_string().contains("does not match the checkpoint workspace"),
+            error
+                .to_string()
+                .contains("does not match the checkpoint workspace"),
             "unexpected error: {error}"
         );
     }

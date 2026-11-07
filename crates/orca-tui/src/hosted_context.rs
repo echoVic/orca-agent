@@ -15,7 +15,10 @@ use crate::protocol::TuiMemoryScope;
 use crate::surface_actions::TuiSurfaceActions;
 
 pub(crate) enum HostedContextAction {
-    Remember { scope: TuiMemoryScope, note: String },
+    Remember {
+        scope: TuiMemoryScope,
+        note: String,
+    },
     Compact,
     Backtrack,
     /// `/rewind`: the conversation's rewindable checkpoints, which come back

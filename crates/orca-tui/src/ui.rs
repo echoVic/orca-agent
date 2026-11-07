@@ -9671,9 +9671,15 @@ mod tests {
         let frame = frame_string(&mut state, 60, 20);
         // Both sentences are longer than the popup's interior; before this
         // they were cut mid-word ("...security", "...may request exp").
-        assert!(frame.contains("Before the first run, review this workspace"), "{frame}");
+        assert!(
+            frame.contains("Before the first run, review this workspace"),
+            "{frame}"
+        );
         assert!(frame.contains("security boundary."), "{frame}");
-        assert!(frame.contains("remain sandboxed and may request"), "{frame}");
+        assert!(
+            frame.contains("remain sandboxed and may request"),
+            "{frame}"
+        );
         assert!(frame.contains("explicit access."), "{frame}");
     }
 
@@ -12686,10 +12692,7 @@ mod tests {
         assert!(crammed.contains("full-auto"), "{crammed}");
         assert!(crammed.contains('…'), "{crammed}");
         assert!(!crammed.contains("? help"), "{crammed}");
-        assert!(
-            UnicodeWidthStr::width(crammed.as_str()) <= 30,
-            "{crammed}"
-        );
+        assert!(UnicodeWidthStr::width(crammed.as_str()) <= 30, "{crammed}");
     }
 
     #[test]

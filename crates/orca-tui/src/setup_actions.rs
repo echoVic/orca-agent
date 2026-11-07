@@ -51,13 +51,25 @@ pub(crate) fn handle_setup_key(
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 state.setup_selection = SETUP_TRUST_SELECTION;
                 return Ok(apply_welcome_selection(
-                    state, config, action_tx, textarea, vim_state, theme, initial_prompt,
+                    state,
+                    config,
+                    action_tx,
+                    textarea,
+                    vim_state,
+                    theme,
+                    initial_prompt,
                 ));
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
                 state.setup_selection = SETUP_UNTRUSTED_SELECTION;
                 return Ok(apply_welcome_selection(
-                    state, config, action_tx, textarea, vim_state, theme, initial_prompt,
+                    state,
+                    config,
+                    action_tx,
+                    textarea,
+                    vim_state,
+                    theme,
+                    initial_prompt,
                 ));
             }
             KeyCode::Char('e') | KeyCode::Char('E') => {
@@ -66,7 +78,13 @@ pub(crate) fn handle_setup_key(
             }
             KeyCode::Enter => {
                 return Ok(apply_welcome_selection(
-                    state, config, action_tx, textarea, vim_state, theme, initial_prompt,
+                    state,
+                    config,
+                    action_tx,
+                    textarea,
+                    vim_state,
+                    theme,
+                    initial_prompt,
                 ));
             }
             KeyCode::Esc => {
@@ -318,9 +336,8 @@ mod tests {
             folder_trust::set_trust_with_config_dir(workspace.path(), home.path(), opposite)
                 .unwrap();
             let mut state = welcome_state();
-            state.first_run = Some(
-                orca_runtime::onboarding::inspect_first_run_in(&config, home.path()).unwrap(),
-            );
+            state.first_run =
+                Some(orca_runtime::onboarding::inspect_first_run_in(&config, home.path()).unwrap());
 
             assert!(matches!(dispatch(&mut state, code), SetupFlow::Continue));
             assert_eq!(
@@ -329,7 +346,10 @@ mod tests {
                 "{code:?} must persist its trust level"
             );
             let first_run = state.first_run.as_ref().unwrap();
-            assert!(first_run.acknowledged, "{code:?} must record the disclosure");
+            assert!(
+                first_run.acknowledged,
+                "{code:?} must record the disclosure"
+            );
             assert_eq!(first_run.workspace_trusted, level == TrustLevel::Trusted);
             // It also advances the same way Enter does.
             assert_eq!(state.setup_step, 1, "{code:?} must leave the welcome step");

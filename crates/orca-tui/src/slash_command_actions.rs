@@ -1173,7 +1173,9 @@ mod tests {
             "{status}"
         );
         assert!(
-            status.contains("shell sandbox: danger-full-access (full-auto bypasses the folder-trust gate)"),
+            status.contains(
+                "shell sandbox: danger-full-access (full-auto bypasses the folder-trust gate)"
+            ),
             "{status}"
         );
         assert!(status.contains("active permission profile: -"), "{status}");
