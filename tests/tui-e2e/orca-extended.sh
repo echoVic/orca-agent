@@ -12,6 +12,24 @@ ORCA=${ORCA_BIN:-orca}
 command -v tui-test >/dev/null 2>&1 || { echo "tui-test not found; install from https://github.com/microsoft/tui-test" >&2; exit 2; }
 command -v "$ORCA" >/dev/null 2>&1 || { echo "orca not found (set ORCA_BIN or put it on PATH)" >&2; exit 2; }
 
+# Isolated Orca state: never touch the developer's (or CI runner's) ~/.orca.
+# LIVE runs use the real ~/.orca (or an explicit ORCA_HOME) so a logged-in
+# configuration can reach the provider.
+if [ "${LIVE:-0}" != "1" ] && [ -z "${ORCA_HOME:-}" ]; then
+  ORCA_HOME=$(mktemp -d "${TMPDIR:-/tmp}/orca-e2e-home.XXXXXX")
+  export ORCA_HOME
+  ORCA_E2E_HOME_CREATED=1
+fi
+# A placeholder key keeps the first-run Setup screen out of the way; the default
+# suites never call the model. LIVE=1 needs a real ORCA_API_KEY/DEEPSEEK_API_KEY.
+if [ "${LIVE:-0}" != "1" ] && [ -z "${ORCA_API_KEY:-}" ] && [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+  export ORCA_API_KEY=sk-tui-e2e-placeholder
+fi
+cleanup_orca_home() {
+  [ "${ORCA_E2E_HOME_CREATED:-0}" = 1 ] && rm -rf "$ORCA_HOME"
+}
+trap cleanup_orca_home EXIT
+
 BASE="$(cd "$(dirname "$0")" && pwd)"
 SHOT="$BASE/shots"
 mkdir -p "$SHOT"
@@ -79,9 +97,12 @@ check "/base-url shows endpoint" tt a expect text "api.deepseek.com"
 tt a key press Escape >/dev/null 2>&1; sleep 0.3
 
 tt a type '/resume' >/dev/null 2>&1; sleep 0.5; tt a key press Enter >/dev/null 2>&1; sleep 1.2
-check "/resume filter hint"      tt a expect text "type to filter"
-check "/resume footer"           tt a expect text "Enter resume"
-tt a key press Escape >/dev/null 2>&1; sleep 0.4
+if tt a text 2>/dev/null | grep -qE 'No saved conversations|type to filter'; then
+  ok "/resume shows list or empty state"
+else
+  no "/resume shows list or empty state"
+fi
+tt a key press Escape >/dev/null 2>&1; tt a key press Ctrl+u >/dev/null 2>&1; sleep 0.3
 
 tt a type '/side' >/dev/null 2>&1; sleep 0.5; tt a key press Enter >/dev/null 2>&1; sleep 1.0
 check "side before conversation errors" tt a expect text "start the main conversation"
@@ -150,6 +171,12 @@ check "--plan starts in plan"    tt p expect text "⇧Tab plan"
 tt p close >/dev/null 2>&1; rm -rf "$P"
 
 # ------------------------------------------------------------- part F: live (opt-in)
+if [ "${LIVE:-0}" = "1" ] && [ -z "${ORCA_API_KEY:-}" ] && [ -z "${DEEPSEEK_API_KEY:-}" ] \
+   && [ ! -f "${ORCA_HOME:-$HOME/.orca}/auth.json" ]; then
+  echo "LIVE=1 needs a configured key: ORCA_API_KEY, DEEPSEEK_API_KEY or ~/.orca/auth.json" >&2
+  exit 2
+fi
+
 if [ "${LIVE:-0}" = "1" ]; then
   L=$(mktemp -d /tmp/orca-ext-l.XXXXXX)
   tt l run --cols 100 --rows 30 --cwd "$L" "$ORCA" >/dev/null 2>&1; sleep 2
