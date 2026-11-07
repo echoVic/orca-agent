@@ -1,0 +1,72 @@
+name: TUI E2E
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "tests/tui-e2e/**"
+      - ".github/workflows/tui-e2e.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "crates/**"
+  push:
+    branches: [main]
+    paths:
+      - "tests/tui-e2e/**"
+      - ".github/workflows/tui-e2e.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "crates/**"
+
+permissions:
+  contents: read
+
+jobs:
+  macos-tui-e2e:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build orca
+        run: cargo build --locked --bin orca
+      - name: Install tui-test
+        run: |
+          brew tap microsoft/tui-test https://github.com/microsoft/tui-test
+          brew trust microsoft/tui-test || true
+          brew install tui-test || {
+            curl -fsSL https://raw.githubusercontent.com/microsoft/tui-test/main/install/install.sh | sh
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          }
+          tui-test --version
+      - name: Mark the Orca home before the run
+        run: touch "$RUNNER_TEMP/orca-home-before"
+      - name: TUI smoke suite
+        env:
+          ORCA_BIN: ${{ github.workspace }}/target/debug/orca
+        run: ./tests/tui-e2e/orca-smoke.sh
+      - name: TUI extended suite (UI only)
+        env:
+          ORCA_BIN: ${{ github.workspace }}/target/debug/orca
+        run: ./tests/tui-e2e/orca-extended.sh
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-e2e-screenshots
+          path: tests/tui-e2e/shots/
+          if-no-files-found: ignore
+      - name: Check the run left ~/.orca alone
+        if: always()
+        run: |
+          if [ -e "$HOME/.orca" ] && [ -n "$(find "$HOME/.orca" -newer "$RUNNER_TEMP/orca-home-before" -print -quit)" ]; then
+            echo "TUI e2e wrote to $HOME/.orca:"
+            find "$HOME/.orca" -newer "$RUNNER_TEMP/orca-home-before" | head -50
+            exit 1
+          fi

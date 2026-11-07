@@ -13,6 +13,28 @@ ORCA=${ORCA_BIN:-orca}
 command -v tui-test >/dev/null 2>&1 || { echo "tui-test not found; install from https://github.com/microsoft/tui-test" >&2; exit 2; }
 command -v "$ORCA" >/dev/null 2>&1 || { echo "orca not found (set ORCA_BIN or put it on PATH)" >&2; exit 2; }
 
+# tui-test changes to --cwd before spawning, so a relative ORCA_BIN would
+# resolve against the workspace. Normalize it to an absolute path.
+case "$ORCA" in
+  */*) ORCA=$(cd "$(dirname "$ORCA")" && pwd -P)/$(basename "$ORCA") ;;
+esac
+
+# Isolated Orca state: never touch the developer's (or CI runner's) ~/.orca.
+if [ -z "${ORCA_HOME:-}" ]; then
+  ORCA_HOME=$(mktemp -d "${TMPDIR:-/tmp}/orca-e2e-home.XXXXXX")
+  export ORCA_HOME
+  ORCA_E2E_HOME_CREATED=1
+fi
+# A placeholder key keeps the first-run Setup screen out of the way; the default
+# suites never call the model. LIVE=1 needs a real ORCA_API_KEY/DEEPSEEK_API_KEY.
+if [ -z "${ORCA_API_KEY:-}" ] && [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+  export ORCA_API_KEY=sk-tui-e2e-placeholder
+fi
+cleanup_orca_home() {
+  [ "${ORCA_E2E_HOME_CREATED:-0}" = 1 ] && rm -rf "$ORCA_HOME"
+}
+trap cleanup_orca_home EXIT
+
 S=orca-smoke
 WS="${1:-}"
 if [ -z "$WS" ]; then
