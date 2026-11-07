@@ -2849,6 +2849,86 @@ fn hosted_tui_submit_clears_actor_operation_before_terminal_ui_event() {
     });
 }
 
+/// Regression: the hosted runtime reports provider usage on the generation
+/// stop, and the TUI's typed-surface projection must carry the cumulative
+/// totals into `AppState`-visible metrics. The context meter already worked
+/// from the same response, so zero tokens here means the usage channel, not
+/// the whole projection, was dropped.
+#[test]
+fn hosted_tui_projects_provider_usage_into_cumulative_metrics() {
+    with_orca_home(|_| {
+        let mut config = test_config(HistoryMode::Record);
+        config.model =
+            ModelSelection::from_unchecked(Some(orca_core::model::FLASH_MODEL.to_string()));
+        let config = Arc::new(Mutex::new(config));
+        let preloaded = Arc::new(Mutex::new(None));
+        let pending = test_pending_workflow_notifications();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let controller = TuiSurfaceTaskControl::new();
+        let agent_config = Arc::clone(&config);
+        let agent_preloaded = Arc::clone(&preloaded);
+        let agent_events = event_tx.clone();
+        let agent_pending = pending.clone();
+        let mut runtime = TuiAgentRuntime::spawn_hosted(
+            action_rx,
+            event_tx,
+            8,
+            controller,
+            move |controller, commands, host| {
+                hosted_tui_controller_loop(
+                    agent_config,
+                    agent_preloaded,
+                    agent_events,
+                    commands,
+                    controller,
+                    agent_pending,
+                    host,
+                );
+            },
+        )
+        .expect("hosted TUI runtime");
+
+        action_tx
+            .send(UserAction::Submit("mock_usage".to_string()))
+            .unwrap();
+        let (mut state, _state_actions) = test_state();
+        let mut latest_usage = None;
+        loop {
+            match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                TuiEvent::SurfaceProjectionSynced(projection) => {
+                    latest_usage = Some(projection.usage.clone());
+                    state.update(TuiEvent::SurfaceProjectionSynced(projection));
+                }
+                TuiEvent::SessionCompleted { status } => {
+                    assert_eq!(status, "success");
+                    break;
+                }
+                TuiEvent::OperationRejected(message) | TuiEvent::Error(message) => {
+                    panic!("hosted usage turn failed: {message}");
+                }
+                _ => {}
+            }
+        }
+        let usage = latest_usage.expect("turn committed a typed surface projection");
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.cache_tokens, 10);
+        assert!(
+            usage.estimated_cost_usd > 0.0,
+            "priced turn reported zero cost"
+        );
+        assert_eq!(
+            state.usage().total_tokens(),
+            150,
+            "the TUI metrics did not apply the committed usage"
+        );
+
+        runtime.shutdown().expect("hosted runtime shutdown");
+    });
+}
+
 #[test]
 fn ordinary_tui_dispatch_commits_user_and_provider_items_to_typed_surface() {
     with_orca_home(|_| {

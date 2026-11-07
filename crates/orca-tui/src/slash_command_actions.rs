@@ -515,9 +515,12 @@ fn dispatch_slash_command(
             let _ = action_tx.send(UserAction::RenameCurrentSession { title });
         }
         SlashCommand::Status => {
+            // The card is requested on purpose and its key rows (mode, folder
+            // trust, sandbox, cwd, usage) are the point: show it expanded
+            // instead of collapsing it to "+15 lines · ctrl+o".
             state.push_message(ChatMessage::System {
                 text: format_status(state, config),
-                expanded: false,
+                expanded: true,
             });
         }
         SlashCommand::Copy(argument) => {
@@ -681,6 +684,19 @@ fn format_status(state: &AppState, config: &RunConfig) -> String {
         .active_permission_profile
         .as_ref()
         .map_or("-", |profile| profile.id.as_str());
+    let folder_trust = if TuiHostActions::folder_is_trusted(status_cwd) {
+        "trusted"
+    } else {
+        "untrusted"
+    };
+    // Full-auto deliberately skips the folder-trust gate, so name that here:
+    // "capability profile: trusted-host" beside "folder trust: untrusted"
+    // reads like a contradiction unless the bypass is spelled out.
+    let sandbox_note = if state.approval_mode == ApprovalMode::FullAuto {
+        " (full-auto bypasses the folder-trust gate)"
+    } else {
+        ""
+    };
     format!(
         "Session status\n\
          title: {title}\n\
@@ -688,8 +704,9 @@ fn format_status(state: &AppState, config: &RunConfig) -> String {
          model: {} ({})\n\
          endpoint: {}\n\
          mode: {}\n\
-         execution profile: {execution_profile}\n\
-         shell sandbox: {shell_sandbox}\n\
+         folder trust: {folder_trust}\n\
+         capability profile: {execution_profile}\n\
+         shell sandbox: {shell_sandbox}{sandbox_note}\n\
          active permission profile: {active_permission_profile}\n\
          cwd: {}\n\
          context: {context}\n\
@@ -1003,7 +1020,8 @@ mod tests {
             "deepseek-v4-pro",
             "endpoint: default: https://api.deepseek.com",
             "plan",
-            "execution profile: read-only",
+            "capability profile: read-only",
+            "folder trust: ",
             "shell sandbox: read-only",
             "/tmp/project",
             "750 left before compaction (compacts at 1000)",
@@ -1151,11 +1169,11 @@ mod tests {
         };
         assert!(status.contains("mode: full-auto"), "{status}");
         assert!(
-            status.contains("execution profile: trusted-host"),
+            status.contains("capability profile: trusted-host"),
             "{status}"
         );
         assert!(
-            status.contains("shell sandbox: danger-full-access"),
+            status.contains("shell sandbox: danger-full-access (full-auto bypasses the folder-trust gate)"),
             "{status}"
         );
         assert!(status.contains("active permission profile: -"), "{status}");

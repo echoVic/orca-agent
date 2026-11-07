@@ -50,96 +50,24 @@ pub(crate) fn handle_setup_key(
             }
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 state.setup_selection = SETUP_TRUST_SELECTION;
-                let Some(first_run) = state.first_run.as_mut() else {
-                    return Ok(SetupFlow::Continue);
-                };
-                if let Err(error) = folder_trust::set_trust_with_config_dir(
-                    &first_run.workspace,
-                    &first_run.config_dir,
-                    TrustLevel::Trusted,
-                ) {
-                    state.push_message(ChatMessage::Error(format!(
-                        "failed to trust workspace: {error}"
-                    )));
-                } else {
-                    first_run.workspace_trusted = true;
-                }
+                return Ok(apply_welcome_selection(
+                    state, config, action_tx, textarea, vim_state, theme, initial_prompt,
+                ));
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
                 state.setup_selection = SETUP_UNTRUSTED_SELECTION;
-                let Some(first_run) = state.first_run.as_mut() else {
-                    return Ok(SetupFlow::Continue);
-                };
-                if let Err(error) = folder_trust::set_trust_with_config_dir(
-                    &first_run.workspace,
-                    &first_run.config_dir,
-                    TrustLevel::Untrusted,
-                ) {
-                    state.push_message(ChatMessage::Error(format!(
-                        "failed to keep workspace untrusted: {error}"
-                    )));
-                } else {
-                    first_run.workspace_trusted = false;
-                }
+                return Ok(apply_welcome_selection(
+                    state, config, action_tx, textarea, vim_state, theme, initial_prompt,
+                ));
             }
             KeyCode::Char('e') | KeyCode::Char('E') => {
                 state.setup_selection = SETUP_EXIT_SELECTION;
                 return Ok(SetupFlow::Exit(0));
             }
             KeyCode::Enter => {
-                if state.setup_selection == SETUP_EXIT_SELECTION {
-                    return Ok(SetupFlow::Exit(0));
-                }
-                if matches!(
-                    state.setup_selection,
-                    SETUP_TRUST_SELECTION | SETUP_UNTRUSTED_SELECTION
-                ) {
-                    let trusted = state.setup_selection == SETUP_TRUST_SELECTION;
-                    let Some(first_run) = state.first_run.as_mut() else {
-                        return Ok(SetupFlow::Continue);
-                    };
-                    if let Err(error) = folder_trust::set_trust_with_config_dir(
-                        &first_run.workspace,
-                        &first_run.config_dir,
-                        if trusted {
-                            TrustLevel::Trusted
-                        } else {
-                            TrustLevel::Untrusted
-                        },
-                    ) {
-                        state.push_message(ChatMessage::Error(format!(
-                            "failed to persist workspace trust: {error}"
-                        )));
-                        return Ok(SetupFlow::Continue);
-                    }
-                    first_run.workspace_trusted = trusted;
-                }
-                let Some(first_run) = state.first_run.as_mut() else {
-                    state.push_message(ChatMessage::Error(
-                        state
-                            .first_run_error
-                            .clone()
-                            .unwrap_or_else(|| "cannot inspect first-run security state".into()),
-                    ));
-                    return Ok(SetupFlow::Continue);
-                };
-                if !first_run.acknowledged {
-                    if let Err(error) = acknowledge_first_run_in(first_run) {
-                        state.push_message(ChatMessage::Error(format!(
-                            "failed to record security disclosure: {error}"
-                        )));
-                        return Ok(SetupFlow::Continue);
-                    }
-                    first_run.acknowledged = true;
-                }
-                if config.api_key.is_none() {
-                    state.setup_step = 1;
-                    *textarea = make_setup_textarea(theme);
-                } else {
-                    // A key is already configured, so there is nothing to save.
-                    // Skip the "API key saved" confirmation and enter the main UI.
-                    finish_setup(state, action_tx, textarea, vim_state, theme, initial_prompt);
-                }
+                return Ok(apply_welcome_selection(
+                    state, config, action_tx, textarea, vim_state, theme, initial_prompt,
+                ));
             }
             KeyCode::Esc => {
                 return Ok(SetupFlow::Exit(0));
@@ -187,6 +115,68 @@ pub(crate) fn handle_setup_key(
         _ => {}
     }
     Ok(SetupFlow::Continue)
+}
+
+/// Commits the welcome step's selected option. Trust and untrusted persist the
+/// folder's level, record the security disclosure and move on; Enter and the
+/// `T` / `U` labels share this path so the accelerator letters do what their
+/// labels promise instead of only moving the highlight. Exit is handled by the
+/// caller that returns `SetupFlow::Exit`.
+fn apply_welcome_selection(
+    state: &mut AppState,
+    config: &mut RunConfig,
+    action_tx: &mpsc::Sender<UserAction>,
+    textarea: &mut TextArea,
+    vim_state: &VimState,
+    theme: &Theme,
+    initial_prompt: Option<String>,
+) -> SetupFlow {
+    if state.setup_selection == SETUP_EXIT_SELECTION {
+        return SetupFlow::Exit(0);
+    }
+    let trusted = state.setup_selection == SETUP_TRUST_SELECTION;
+    let Some(first_run) = state.first_run.as_mut() else {
+        state.push_message(ChatMessage::Error(
+            state
+                .first_run_error
+                .clone()
+                .unwrap_or_else(|| "cannot inspect first-run security state".into()),
+        ));
+        return SetupFlow::Continue;
+    };
+    if let Err(error) = folder_trust::set_trust_with_config_dir(
+        &first_run.workspace,
+        &first_run.config_dir,
+        if trusted {
+            TrustLevel::Trusted
+        } else {
+            TrustLevel::Untrusted
+        },
+    ) {
+        state.push_message(ChatMessage::Error(format!(
+            "failed to persist workspace trust: {error}"
+        )));
+        return SetupFlow::Continue;
+    }
+    first_run.workspace_trusted = trusted;
+    if !first_run.acknowledged {
+        if let Err(error) = acknowledge_first_run_in(first_run) {
+            state.push_message(ChatMessage::Error(format!(
+                "failed to record security disclosure: {error}"
+            )));
+            return SetupFlow::Continue;
+        }
+        first_run.acknowledged = true;
+    }
+    if config.api_key.is_none() {
+        state.setup_step = 1;
+        *textarea = make_setup_textarea(theme);
+    } else {
+        // A key is already configured, so there is nothing to save.
+        // Skip the "API key saved" confirmation and enter the main UI.
+        finish_setup(state, action_tx, textarea, vim_state, theme, initial_prompt);
+    }
+    SetupFlow::Continue
 }
 
 /// Leave the first-run flow and enter the main interactive UI. Shared by the
@@ -289,8 +279,61 @@ mod tests {
     #[test]
     fn quick_keys_move_selection_to_matching_option() {
         let mut state = welcome_state();
+        // With no first-run context to persist against, the two security
+        // letters fail closed, but they still land on their own option.
+        assert!(matches!(
+            dispatch(&mut state, KeyCode::Char('t')),
+            SetupFlow::Continue
+        ));
+        assert_eq!(state.setup_selection, SETUP_TRUST_SELECTION);
+        assert!(matches!(
+            dispatch(&mut state, KeyCode::Char('U')),
+            SetupFlow::Continue
+        ));
+        assert_eq!(state.setup_selection, SETUP_UNTRUSTED_SELECTION);
         dispatch(&mut state, KeyCode::Char('e'));
         assert_eq!(state.setup_selection, SETUP_EXIT_SELECTION);
+    }
+
+    /// The `T` / `U` badges are real accelerators: each commits its option the
+    /// way Enter does (persist trust, record the disclosure, advance) instead
+    /// of only highlighting the row.
+    #[test]
+    fn trust_letters_commit_their_choice_like_enter() {
+        for (code, level) in [
+            (KeyCode::Char('T'), TrustLevel::Trusted),
+            (KeyCode::Char('u'), TrustLevel::Untrusted),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let mut config = crate::test_support::test_run_config();
+            config.cwd = Some(workspace.path().to_path_buf());
+            // Start from the opposite level so the assertion proves the key
+            // wrote the value rather than leaving the store untouched.
+            let opposite = if level == TrustLevel::Trusted {
+                TrustLevel::Untrusted
+            } else {
+                TrustLevel::Trusted
+            };
+            folder_trust::set_trust_with_config_dir(workspace.path(), home.path(), opposite)
+                .unwrap();
+            let mut state = welcome_state();
+            state.first_run = Some(
+                orca_runtime::onboarding::inspect_first_run_in(&config, home.path()).unwrap(),
+            );
+
+            assert!(matches!(dispatch(&mut state, code), SetupFlow::Continue));
+            assert_eq!(
+                folder_trust::trust_level_with_config_dir(workspace.path(), home.path()),
+                Some(level),
+                "{code:?} must persist its trust level"
+            );
+            let first_run = state.first_run.as_ref().unwrap();
+            assert!(first_run.acknowledged, "{code:?} must record the disclosure");
+            assert_eq!(first_run.workspace_trusted, level == TrustLevel::Trusted);
+            // It also advances the same way Enter does.
+            assert_eq!(state.setup_step, 1, "{code:?} must leave the welcome step");
+        }
     }
 
     #[test]

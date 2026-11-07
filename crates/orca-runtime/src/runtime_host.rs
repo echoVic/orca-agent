@@ -11393,7 +11393,7 @@ fn hydrate_session_pinned_context_from_surface(
 }
 
 /// The context meter's ceiling: the line where automatic compaction starts,
-/// so "ctx 0%" means compaction is due rather than that requests will fail.
+/// so "ctx 100%" means compaction is due rather than that requests will fail.
 fn surface_context_limit_tokens(config: &RunConfig) -> u64 {
     let model = config.model.as_option();
     orca_provider::context::ContextConfig::for_model_with_runtime(
