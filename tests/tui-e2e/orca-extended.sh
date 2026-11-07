@@ -12,6 +12,12 @@ ORCA=${ORCA_BIN:-orca}
 command -v tui-test >/dev/null 2>&1 || { echo "tui-test not found; install from https://github.com/microsoft/tui-test" >&2; exit 2; }
 command -v "$ORCA" >/dev/null 2>&1 || { echo "orca not found (set ORCA_BIN or put it on PATH)" >&2; exit 2; }
 
+# tui-test changes to --cwd before spawning, so a relative ORCA_BIN would
+# resolve against the workspace. Normalize it to an absolute path.
+case "$ORCA" in
+  */*) ORCA=$(cd "$(dirname "$ORCA")" && pwd -P)/$(basename "$ORCA") ;;
+esac
+
 # Isolated Orca state: never touch the developer's (or CI runner's) ~/.orca.
 # LIVE runs use the real ~/.orca (or an explicit ORCA_HOME) so a logged-in
 # configuration can reach the provider.

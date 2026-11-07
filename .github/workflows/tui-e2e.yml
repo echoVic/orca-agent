@@ -49,11 +49,11 @@ jobs:
         run: touch "$RUNNER_TEMP/orca-home-before"
       - name: TUI smoke suite
         env:
-          ORCA_BIN: target/debug/orca
+          ORCA_BIN: ${{ github.workspace }}/target/debug/orca
         run: ./tests/tui-e2e/orca-smoke.sh
       - name: TUI extended suite (UI only)
         env:
-          ORCA_BIN: target/debug/orca
+          ORCA_BIN: ${{ github.workspace }}/target/debug/orca
         run: ./tests/tui-e2e/orca-extended.sh
       - name: Upload screenshots
         if: always()
