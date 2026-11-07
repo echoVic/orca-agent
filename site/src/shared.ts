@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.18";
+export const releaseVersion = "v0.5.19";
 
 export const releases = [
+  {
+    version: "v0.5.19",
+    date: "2026-11-07",
+    title: "Rewind to any turn",
+    body: "New /rewind (and orca rewind) restores files to the state before a chosen user turn. Before every edit or write_file Orca stores the file's pre-image in a content-addressed checkpoint; rewinding replays those pre-images atomically with a crash journal, truncates the conversation through a durable session.rewind marker, or replaces one side of the boundary with a model-written summary (summarize-from / summarize-up-to). The most recent 100 checkpoints stay file-restorable, older ones keep conversation rewind only, and unreferenced blobs are garbage-collected with orca rewind --prune; an interrupted restore can be rolled back with --rollback. New [rewind] settings control capture, observation and retention, and a session.rewind event reaches ACP/JSONL clients. This patch also folds provider usage from the generation stop into cumulative ACP/TUI metrics, makes the first-run welcome T/U letters commit their trust choice, adds a status-bar context ring and a responsive right zone, and lists folder trust and the capability profile in /status.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.19",
+  },
   {
     version: "v0.5.18",
     date: "2026-11-07",

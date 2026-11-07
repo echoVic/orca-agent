@@ -167,6 +167,14 @@ Full Access on resume. Headless `exec` and shared daemons default to `auto-edit`
   shell sandbox, and permission profile. `Ctrl+L` clears the screen but keeps
   the conversation, and on exit Orca prints the `orca --resume <SESSION_ID>`
   command.
+- **Rewind.** `/rewind` (alias `/checkpoint`, or `orca rewind --at MID`)
+  lists the session's user turns and can restore files to their state before a
+  chosen turn, rewind only the conversation, do both, or replace one side of the
+  boundary with a model-written summary. Before each `edit` / `write_file`
+  Orca stores the file's pre-image in a content-addressed checkpoint; the most
+  recent 100 stay file-restorable, edits made by bash or other processes are
+  reported as untracked and never restored, and an interrupted restore can be
+  rolled back from its journal.
 
 The [Terminal UI guide](https://orcaagent.dev/docs/#terminal-ui) walks through
 the screen and every key.

@@ -110,8 +110,8 @@ const copy = {
         body: "Markdown skills can be explicitly injected with $skill ids, and the TUI can answer structured ask_user_question prompts without ending the turn.",
       },
       {
-        title: "Resumable history",
-        body: "Local JSONL transcripts support --resume for continuation and --fork for branching.",
+        title: "Rewind and resume",
+        body: "Local JSONL transcripts support --resume for continuation and --fork for branching; /rewind restores files and conversation to any earlier turn, with model summaries for the dropped side and checkpoints kept in content-addressed storage.",
       },
     ],
     cacheCard: {
@@ -392,8 +392,8 @@ const copy = {
         body: "Markdown skills 可通过 $skill id 显式注入；TUI 能回答结构化 ask_user_question 问题，并继续同一轮任务。",
       },
       {
-        title: "可恢复历史",
-        body: "本地 JSONL 会话支持用 --resume 继续，也支持用 --fork 分支。",
+        title: "回退与恢复",
+        body: "本地 JSONL transcript 支持 --resume 继续、--fork 分叉；/rewind 可把文件和对话回退到任意更早的一轮，丢弃的一侧可换成模型摘要，检查点存放在内容寻址存储中。",
       },
     ],
     cacheCard: {
