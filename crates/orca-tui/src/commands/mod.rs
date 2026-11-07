@@ -6,6 +6,7 @@ pub enum SlashCommand {
     Compact,
     Recap,
     Resume,
+    Rewind,
     Fork(Option<String>),
     Side(Option<String>),
     Rename(Option<String>),
@@ -168,6 +169,7 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
         "compact" => no_arguments(parts).then_some(SlashCommand::Compact),
         "recap" => no_arguments(parts).then_some(SlashCommand::Recap),
         "resume" => no_arguments(parts).then_some(SlashCommand::Resume),
+        "rewind" | "checkpoint" => no_arguments(parts).then_some(SlashCommand::Rewind),
         "fork" => Some(SlashCommand::Fork(optional_argument(parts))),
         "side" => Some(SlashCommand::Side(optional_argument(parts))),
         "rename" => Some(SlashCommand::Rename(optional_argument(parts))),
@@ -239,6 +241,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/compact", "Compress conversation context"),
         ("/recap", "Recap what this conversation has done so far"),
         ("/resume", "Resume a saved conversation"),
+        ("/rewind", "List checkpoints and restore code/conversation"),
         ("/fork", "Fork this conversation"),
         ("/side", "Ask without disrupting the main conversation"),
         ("/rename", "Rename this conversation"),
@@ -414,6 +417,8 @@ fn builtin_command_names() -> std::collections::BTreeSet<&'static str> {
         })
         .collect::<std::collections::BTreeSet<_>>();
     names.insert("clear");
+    // An alias of `/rewind`.
+    names.insert("checkpoint");
     names
 }
 
@@ -543,6 +548,24 @@ mod tests {
             Some(SlashCommand::Model(Some("deepseek-v4-pro".to_string())))
         );
         assert_eq!(parse("/model"), Some(SlashCommand::Model(None)));
+    }
+
+    #[test]
+    fn parses_rewind_command_and_its_checkpoint_alias() {
+        assert_eq!(parse("/rewind"), Some(SlashCommand::Rewind));
+        assert_eq!(parse("/checkpoint"), Some(SlashCommand::Rewind));
+        assert_eq!(parse("/rewind now"), None);
+        assert_eq!(parse("/checkpoint 1"), None);
+        assert!(
+            all_commands()
+                .iter()
+                .any(|(command, _)| *command == "/rewind"),
+            "the `/` menu must list /rewind"
+        );
+        assert_eq!(
+            invalid_slash_command_message("/rewind now"),
+            "/rewind takes no arguments."
+        );
     }
 
     #[test]

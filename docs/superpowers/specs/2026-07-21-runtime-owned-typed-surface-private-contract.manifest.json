@@ -268,6 +268,8 @@
       "ReadTaskTranscript",
       "RespondToInteraction",
       "Backtrack",
+      "ListRewindCheckpoints",
+      "RewindToCheckpoint",
       "BackgroundCurrentTurn",
       "Interrupt",
       "Cancel",
@@ -1727,6 +1729,20 @@
       "compatibility_projection_only_no_ingress",
       "CommandResult",
       "PromptTerminal",
+      "ExistingEvent"
+    ],
+    [
+      "SessionRewind",
+      265,
+      "recorded",
+      "None",
+      "TypedSourceRequired",
+      "NoSurfaceScope",
+      "none",
+      [],
+      "split_by_authoritative_source_no_direct_ingress",
+      "CommandResult",
+      "ExtensionOnly",
       "ExistingEvent"
     ]
   ],
@@ -4916,6 +4932,49 @@
       "remove_direct_backtrack_and_client_restored_input_event_authority"
     ],
     [
+      "ListRewindCheckpoints",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:775",
+        "crates/orca-tui/src/slash_command_actions.rs:470",
+        "crates/orca-tui/src/hosted_context.rs:125",
+        "crates/orca-tui/src/hosted_controller.rs:1039"
+      ],
+      "authoritative_read",
+      "UserAction::ListRewindCheckpoints",
+      "list_rewind_checkpoints()",
+      "RuntimeSurfaceThreadHandle::list_rewind_checkpoints()",
+      [],
+      [],
+      "TuiEvent::RewindCheckpoints",
+      "TUI opens the checkpoint picker from the listed checkpoints",
+      "none"
+    ],
+    [
+      "RewindToCheckpoint",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:778",
+        "crates/orca-tui/src/rewind_actions.rs:1",
+        "crates/orca-tui/src/hosted_context.rs:172",
+        "crates/orca-tui/src/hosted_controller.rs:1050"
+      ],
+      "history_mutation",
+      "UserAction::RewindToCheckpoint{target,mode,dry_run}",
+      "rewind_checkpoint(target,mode,dry_run)",
+      "RuntimeSurfaceThreadHandle::rewind_checkpoint(target,mode,dry_run)",
+      [
+        "SubmitOperation"
+      ],
+      [
+        "SurfaceCursor",
+        "Revision"
+      ],
+      "TuiEvent::RewindPreviewed|RewindCompleted",
+      "TUI shows the dry-run report on the confirm page, then truncates the rendered view before the target user message and restores the prompt to the composer",
+      "remove_direct_backtrack_and_client_restored_input_event_authority"
+    ],
+    [
       "BackgroundCurrentTurn",
       "current",
       [
@@ -5436,6 +5495,22 @@
       ],
       "typed command result consumer",
       "route_resume_through_typed_session_surface"
+    ],
+    [
+      "slash.rewind",
+      [
+        "crates/orca-tui/src/slash_command_actions.rs:459"
+      ],
+      "history_mutation",
+      "UserAction_ListRewindCheckpoints_and_RewindToCheckpoint",
+      "ListRewindCheckpoints+RewindToCheckpoint",
+      [
+        "SubmitOperation",
+        "SurfaceCursor",
+        "Revision"
+      ],
+      "typed event consumer",
+      "typed_event_result_consumer"
     ],
     [
       "slash.trust_show",
@@ -7879,8 +7954,8 @@
     }
   ],
   "phase_0a_manifest_invariants": [
-    "source_facts has exactly 58 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 55 unique variants matching UserAction at baseline",
+    "source_facts has exactly 59 unique variants matching EventType at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 57 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",

@@ -466,6 +466,26 @@ impl RuntimeSurfaceThreadHandle {
         self.runtime.backtrack_last_user()
     }
 
+    /// Lists the rewindable user messages of the live thread with their
+    /// checkpoint statistics.
+    pub fn list_rewind_checkpoints(
+        &self,
+    ) -> Result<Vec<orca_core::rewind::RewindCheckpointView>, RuntimeHostError> {
+        self.runtime.list_rewind_checkpoints()
+    }
+
+    /// Restores files and/or the conversation to the submission boundary of
+    /// `target_message_id`.
+    pub fn rewind_checkpoint(
+        &self,
+        target_message_id: &str,
+        mode: orca_core::rewind::RewindMode,
+        dry_run: bool,
+    ) -> Result<orca_core::rewind::RewindOutcome, RuntimeHostError> {
+        self.runtime
+            .rewind_checkpoint(target_message_id, mode, dry_run)
+    }
+
     fn with_goal<T>(
         &self,
         run: impl FnOnce(&GoalRuntimeHandle) -> Result<T, crate::goal_actor::GoalActorError>,

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use crossbeam_channel as mpsc;
 use orca_core::approval_types::{ApprovalDecision, ApprovalResolution};
 use orca_core::config::HistoryMode;
-use orca_core::conversation::Message;
+use orca_core::conversation::{Message, is_internal_image_analysis};
 use orca_core::event_schema::{EventEnvelope, EventType};
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_mcp::{
@@ -719,6 +719,12 @@ pub(crate) fn chat_messages_from_history(message: Message) -> Vec<ChatMessage> {
         Message::User {
             content, images, ..
         } => {
+            // A persisted image-analysis record is runtime context, not a
+            // turn the user took: the runtime's rewindable-user predicate
+            // skips it too, so skipping it here keeps their ordinals equal.
+            if images.is_empty() && is_internal_image_analysis(&content) {
+                return Vec::new();
+            }
             let (visible, attachments) = ComposerImageState::restore_from_inputs(&content, images);
             let mut messages = vec![ChatMessage::User(visible)];
             messages.extend(
@@ -860,6 +866,35 @@ mod tests {
     use orca_core::event_schema::{EventEnvelope, EventType};
 
     use super::*;
+
+    #[test]
+    fn persisted_image_analysis_is_not_a_user_turn_in_the_transcript() {
+        let header = format!(
+            "{}{}]",
+            orca_core::conversation::IMAGE_ANALYSIS_MESSAGE_PREFIX,
+            "a".repeat(64)
+        );
+        let record = r#"{"trust":"untrusted_observation_data","description":"Save button","query":"inspect","image_count":1,"provenance":null}"#;
+        let analysis = Message::user(format!("{header}\n{record}"));
+        assert!(
+            chat_messages_from_history(analysis).is_empty(),
+            "a persisted analysis is runtime context, not a user turn"
+        );
+
+        // Text that merely mentions the format stays the user's own turn.
+        let prose = Message::user("[Image analysis:please explain this syntax".to_string());
+        assert!(matches!(
+            chat_messages_from_history(prose).as_slice(),
+            [ChatMessage::User(text)] if text == "[Image analysis:please explain this syntax"
+        ));
+
+        // A pinned user prompt (headless `--save-history`) is a real turn.
+        let pinned = Message::pinned_user("do the thing".to_string());
+        assert!(matches!(
+            chat_messages_from_history(pinned).as_slice(),
+            [ChatMessage::User(text)] if text == "do the thing"
+        ));
+    }
 
     #[test]
     fn prompt_queue_watcher_spawn_failure_emits_error() {

@@ -2261,7 +2261,31 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
     {
         drain_subagent_notifications(session);
     }
-    let context = ThreadTurnContext::prepare(config, session, request)?;
+    let mut context = ThreadTurnContext::prepare(config, session, request)?;
+    // File checkpoints are captured per backtrackable user turn. The capture is
+    // registered on the thread extension store because the tool dispatch path
+    // does not see the session but must record pre-images before writes run.
+    // Both interactive and headless (pinned-prompt) turns open a checkpoint;
+    // `PinnedSystem` and continuations carry no new user message and must not
+    // attribute a snapshot to an earlier turn.
+    let rewind_turn = if matches!(
+        request.prompt_placement(),
+        ThreadTurnPromptPlacement::BacktrackableUser | ThreadTurnPromptPlacement::PinnedUser
+    ) {
+        crate::rewind::begin_turn(
+            config,
+            &context.cwd,
+            request.turn_id().as_str(),
+            context.parts.conversation,
+            context.parts.writer.as_deref_mut(),
+        )
+    } else {
+        None
+    };
+    if let (Some(turn), Some(extensions)) = (rewind_turn.as_ref(), thread_extensions.as_deref()) {
+        extensions.insert(turn.clone());
+    }
+    let rewind_extensions = thread_extensions.clone();
     if let Some(events) = events {
         let mut sink = request.event_sink(writer, config.output_format);
         let mut background_workflows = Vec::new();
@@ -2277,8 +2301,12 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
             thread_extensions,
             turn_extension_id,
         }
-        .execute()?
-        .commit(config, session, request, &cancel, events, &mut sink);
+        .execute();
+        let outcome = match outcome {
+            Ok(outcome) => outcome.commit(config, session, request, &cancel, events, &mut sink),
+            Err(error) => Err(error),
+        };
+        finish_rewind_turn(rewind_turn, rewind_extensions.as_deref(), session);
         if request.coalesce_jsonl_deltas {
             sink.finish()?;
         }
@@ -2303,19 +2331,41 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
         thread_extensions,
         turn_extension_id,
     }
-    .execute()?
-    .commit(
-        config,
-        session,
-        request,
-        &execution.cancel,
-        &mut execution.events,
-        &mut execution.sink,
-    );
+    .execute();
+    let outcome = match outcome {
+        Ok(outcome) => outcome.commit(
+            config,
+            session,
+            request,
+            &execution.cancel,
+            &mut execution.events,
+            &mut execution.sink,
+        ),
+        Err(error) => Err(error),
+    };
+    finish_rewind_turn(rewind_turn, rewind_extensions.as_deref(), session);
     if request.coalesce_jsonl_deltas {
         execution.sink.finish()?;
     }
     outcome
+}
+
+/// Ends the turn's checkpoint capture and unregisters it from the extension
+/// store. A failed snapshot write is logged, never surfaced as a turn failure.
+fn finish_rewind_turn(
+    rewind_turn: Option<crate::rewind::RewindTurn>,
+    thread_extensions: Option<&ExtensionData>,
+    session: &mut InteractiveSession,
+) {
+    let Some(turn) = rewind_turn else {
+        return;
+    };
+    if let Some(extensions) = thread_extensions {
+        extensions.remove::<crate::rewind::RewindTurn>();
+    }
+    if let Err(error) = turn.finish(session) {
+        tracing::warn!(%error, "rewind file checkpoint was not saved");
+    }
 }
 
 fn drain_terminal_notifications(

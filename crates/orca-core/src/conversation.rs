@@ -749,6 +749,45 @@ impl Conversation {
         Some(prompt)
     }
 
+    /// Truncates the conversation immediately before the `ordinal`-th
+    /// rewindable user message (0-based) and returns that message's prompt.
+    ///
+    /// `/rewind` targets a user message's submission boundary: the message and
+    /// everything after it are dropped, and the returned prompt is put back in
+    /// the composer. Unlike [`Self::backtrack_last_user`], pinned user messages
+    /// are rewindable because headless turns submit their prompt pinned.
+    pub fn truncate_before_user_ordinal(&mut self, ordinal: u32) -> Option<String> {
+        let mut seen = 0_u32;
+        let mut index = None;
+        for (position, message) in self.messages.iter().enumerate() {
+            if matches!(message,
+                Message::User { content, images, .. }
+                    if !images.is_empty() || !is_internal_image_analysis(content))
+            {
+                if seen == ordinal {
+                    index = Some(position);
+                    break;
+                }
+                seen += 1;
+            }
+        }
+        let index = index?;
+        let prompt = match &self.messages[index] {
+            Message::User { content, .. } => content.clone(),
+            _ => unreachable!("only rewindable user messages are considered"),
+        };
+        self.messages.truncate(index);
+        self.refresh_retained_tool_images();
+        Some(prompt)
+    }
+
+    /// Drops summary/compaction-derived state. Used after a conversation rewind
+    /// whose kept transcript no longer contains any summary records.
+    pub fn clear_summary_state(&mut self) {
+        self.rolling_summary = None;
+        self.summary = SummaryState::default();
+    }
+
     /// Anchors measurement on a request built from the first `message_count`
     /// messages.
     pub fn record_usage_anchor(

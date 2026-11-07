@@ -197,7 +197,36 @@ cancellation and deadline controls.
 - `verification.started`
 - `verification.completed`
 - `error`
+- `session.rewind`
 - `session.completed`
+
+`session.rewind` is emitted on the live runtime event stream after `/rewind`
+actually applied and its durable `session.rewind` transcript record was
+written. A dry run never emits it: a plan that applies nothing is not a run
+fact. It is stream/audit data only: resume never replays it as a conversation
+message, and it does not change recorded usage or budget history. The event is
+published to observers attached to the live surface and journaled in recorded
+sessions; a JSONL server client observes it only when a rewind is driven over
+that client's request path. Payload:
+
+```json
+{"session_id":"...","target_message_id":"item_...","ordinal":12,
+ "mode":"both","dry_run":false,
+ "files":{"changed":3,"deleted":1,"unchanged":5,
+          "skipped":[{"path":"a.bin","reason":"blob_missing"}]},
+ "conversation":{"kind":"truncate","kept_messages":12},
+ "rewind_id":"rw_...","duration_ms":41}
+```
+
+`mode` is one of `both`, `code`, `conversation`, `summarize_from`,
+`summarize_up_to`; `files.skipped` lists restore paths that were intentionally
+skipped together with the reason; `conversation` is `null` when the mode did
+not touch the conversation, otherwise `kind` is `truncate`, `summarize_from` or
+`summarize_up_to` and `kept_messages` is the effective message count after the
+rewind; `rewind_id` matches the durable record and is `null` only outside a
+recorded session; `duration_ms` is the wall-clock time of the applied command.
+Consumers that persist it must treat the transcript `session.rewind` record as
+the audit source of truth.
 
 ## Run Status
 
@@ -292,8 +321,95 @@ projection:
 
 The checkpoint is audit data — execution always resumes from the transcript's
 committed messages, and uncommitted side effects are never claimed as
-exactly-once (restore repairs them as indeterminate). File rewind is not
-promised: Orca does not snapshot external workspace state.
+exactly-once (restore repairs them as indeterminate).
+
+### File checkpoints and `/rewind`
+
+When a session records history, the runtime captures one file checkpoint per
+turn. Before a write-class tool (`edit`, `write_file`) applies a change, the
+pre-image of the target file is stored as a content-addressed blob under
+`$ORCA_HOME/rewind/sessions/<session_id>/objects/<sha256>`; when the turn ends,
+the runtime appends a `session.snapshot` transcript record. Bash commands,
+external tools and other processes that edit the workspace are not captured:
+the bounded workspace observation reports them as untracked paths, and a
+rewind never restores them.
+
+Capture is configured by the `[rewind]` table of the effective configuration
+(user `config.toml`, and for a trusted workspace `.orca/config.toml`):
+
+```toml
+[rewind]
+enabled = true            # capture a checkpoint per turn; false also empties /rewind
+observe_untracked = true  # compare the turn-start/end observation for untracked changes
+max_checkpoints = 100     # snapshots retained per session (minimum 1)
+```
+
+The environment kill switches still win over the file:
+`ORCA_DISABLE_FILE_HISTORY` (a non-empty value other than `0`) disables
+capture, and `ORCA_REWIND_DISABLE_OBSERVE` (any value) disables the
+turn-boundary workspace observation. A configuration error falls back to these
+documented defaults.
+
+A `session.snapshot` record carries the turn's user message id
+(`at_message_id`), its `ordinal` among rewindable user messages, the canonical
+workspace `root`, and a `files` map whose `pre` entry is the state before the
+first write of that turn (`null` = the file did not exist, so a rewind deletes
+it) and `post_sha256` the digest after the last successful write:
+
+```json
+{"type":"session.snapshot","schema_version":1,"snapshot_id":"snap_...",
+ "session_id":"...","at_message_id":"item_...","ordinal":12,
+ "root":"/workspace","complete":true,
+ "files":{"src/a.rs":{"pre":{"sha256":"ab...","size":812,"encoding":"zstd"},
+                      "post_sha256":"cd..."}},
+ "untracked":["docs/x.md"],"limitations":[],"recorded_at":"..."}
+```
+
+`orca rewind --at <MESSAGE_ID> [--mode both|code|conversation|summarize-from|summarize-up-to] [--dry-run]
+[--json] [--force] [--rollback OP_ID] [--prune]` restores the state at that
+user message: files from the recorded pre-images and/or the conversation
+truncated to before the message.
+The interactive TUI exposes the same operation as `/rewind` (alias
+`/checkpoint`). File restores are applied atomically with a crash journal; a
+conversation rewind appends a `session.rewind` record that the transcript
+loader folds in:
+
+```json
+{"type":"session.rewind","schema_version":1,"session_id":"...",
+ "rewind_id":"rw_...","at_message_id":"item_...",
+ "kept_messages":12,"kept_compactions":0,"kept_summaries":0,
+ "conversation":{"kind":"truncate"},
+ "files":{"restored":3,"deleted":1,"skipped":0},
+ "recorded_at":"..."}
+```
+
+Rewind never changes recorded token usage or budget history, and it keeps the
+same session id. A file restore is refused when the workspace moved: the
+session metadata's `cwd` and the target snapshot's `root` are compared after
+canonicalization, and a mismatch returns an `InvalidInput` error (the session
+workspace vs. the checkpoint workspace) instead of writing pre-images into a
+different tree. The CLI refuses to overwrite files whose current contents were
+changed outside tracked tool writes unless `--force` is passed; the TUI asks
+for explicit confirmation instead. A session keeps its most recent
+`max_checkpoints` (default 100) checkpoints; evicting older ones appends a
+`session.snapshot_retention` watermark, after which their records stay in the
+transcript for audit but only their conversation rewind remains available
+(`snapshot_evicted`). Eviction also garbage-collects, best effort, the
+pre-image blobs that only evicted snapshots referenced; a failure is logged and
+never fails the turn. An interrupted file restore leaves a journal behind: the
+next rewind reports `pending_rewind_recovery` and
+`orca rewind --rollback OP_ID` restores the workspace to its pre-restore
+state. `orca rewind --prune` still garbage-collects on demand.
+
+The `summarize-from` and `summarize-up-to` modes replace one side of the target
+boundary with a model-written historical summary instead of dropping it: the
+summary is generated when the rewind is applied (never on a dry run), is
+persisted in the `session.rewind` record, and is replayed as a pinned system
+message on resume. Its usage is priced for the model that served the summary
+request into `summary_usage.estimated_cost_usd`. A failed summary leaves the
+transcript untouched.
+Transcripts that contain `session.snapshot` or `session.rewind` records are not
+readable by Orca versions that predate them.
 
 ## Exit Codes
 

@@ -35,6 +35,32 @@ impl Default for PricingFileConfig {
     }
 }
 
+/// `[rewind]`: per-turn file checkpoint capture (`/rewind`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct RewindFileConfig {
+    /// Capture a file checkpoint for every turn; `false` also makes the
+    /// checkpoint list empty.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Compare the turn-start and turn-end workspace observation to report
+    /// changes made outside tracked tool writes.
+    #[serde(default = "default_true")]
+    pub observe_untracked: bool,
+    /// Snapshots retained per session; older ones are evicted (at least 1).
+    #[serde(default = "default_rewind_max_checkpoints")]
+    pub max_checkpoints: u32,
+}
+
+impl Default for RewindFileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            observe_untracked: true,
+            max_checkpoints: default_rewind_max_checkpoints(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(from = "RawFileConfig")]
 pub struct FileConfig {
@@ -81,6 +107,8 @@ pub struct FileConfig {
     pub terminal_notifications: bool,
     #[serde(default = "default_true")]
     pub auto_memory: bool,
+    #[serde(default)]
+    pub rewind: RewindFileConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -135,6 +163,8 @@ struct RawFileConfig {
     pub terminal_notifications: bool,
     #[serde(default = "default_true")]
     pub auto_memory: bool,
+    #[serde(default)]
+    pub rewind: RewindFileConfig,
 }
 
 impl Default for FileConfig {
@@ -164,6 +194,7 @@ impl Default for FileConfig {
             desktop_notifications: false,
             terminal_notifications: true,
             auto_memory: true,
+            rewind: RewindFileConfig::default(),
         }
     }
 }
@@ -202,6 +233,7 @@ impl From<RawFileConfig> for FileConfig {
             desktop_notifications: raw.desktop_notifications,
             terminal_notifications: raw.terminal_notifications,
             auto_memory: raw.auto_memory,
+            rewind: raw.rewind,
         }
     }
 }
@@ -307,6 +339,14 @@ impl WorkflowFileConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// Snapshots retained per session unless `[rewind] max_checkpoints` says
+/// otherwise.
+pub const DEFAULT_REWIND_MAX_CHECKPOINTS: u32 = 100;
+
+fn default_rewind_max_checkpoints() -> u32 {
+    DEFAULT_REWIND_MAX_CHECKPOINTS
 }
 
 /// Resolve the user-owned Orca configuration directory without creating it.
@@ -763,6 +803,33 @@ mod tests {
         let config: FileConfig =
             toml::from_str("[computer_use]\nforeground_fallback = false\n").unwrap();
         assert!(!config.computer_use.foreground_fallback);
+    }
+
+    #[test]
+    fn rewind_defaults_on_and_reads_from_the_file() {
+        let config: FileConfig = toml::from_str("").unwrap();
+        assert_eq!(config.rewind, RewindFileConfig::default());
+        assert!(config.rewind.enabled);
+        assert!(config.rewind.observe_untracked);
+        assert_eq!(
+            config.rewind.max_checkpoints,
+            DEFAULT_REWIND_MAX_CHECKPOINTS
+        );
+
+        let config: FileConfig = toml::from_str(
+            "[rewind]\nenabled = false\nobserve_untracked = false\nmax_checkpoints = 7\n",
+        )
+        .unwrap();
+        assert!(!config.rewind.enabled);
+        assert!(!config.rewind.observe_untracked);
+        assert_eq!(config.rewind.max_checkpoints, 7);
+
+        // A partial table keeps the documented defaults for the other keys,
+        // and `0` survives parsing so the runtime can clamp it to one.
+        let config: FileConfig = toml::from_str("[rewind]\nmax_checkpoints = 0\n").unwrap();
+        assert!(config.rewind.enabled);
+        assert!(config.rewind.observe_untracked);
+        assert_eq!(config.rewind.max_checkpoints, 0);
     }
 
     #[test]

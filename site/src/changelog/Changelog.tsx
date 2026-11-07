@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.19":
+        "Rewind to any turn. /rewind (alias /checkpoint) and orca rewind restore files to the state before a chosen user turn from per-turn pre-images captured before edit and write_file, then truncate the conversation through a durable session.rewind marker; summarize-from and summarize-up-to replace one side of the boundary with a model-written summary. The newest 100 checkpoints stay file-restorable, older ones support conversation rewind only, orca rewind --prune collects unreferenced blobs, and an interrupted restore rolls back with --rollback. A [rewind] config section and a session.rewind stream event complete the feature. Provider usage from the generation stop now reaches ACP and TUI cumulative metrics, first-run T/Welcome trust letters commit their choice, and /status lists folder trust and the capability profile while the status bar gains a context ring and a responsive right zone.",
       "v0.5.18":
         "Esc now stops a stuck shell at the OS level: the TUI kills the active process group directly, so an interrupt works even when session history is broken, and a timed-out command stops with SIGTERM then SIGKILL after a short grace. A failed history write keeps the tool result or assistant turn in the live conversation and marks the transcript degraded instead of blocking the turn. Custom and reverse-proxy endpoints gain /base-url, trailing-slash trimming for ORCA_BASE_URL and DEEPSEEK_BASE_URL, custom-endpoint notes in orca doctor and /status, and ORCA_STRICT_TOOLS=1 to force strict tools. The new web_fetch tool returns a page's readable text, optionally filtered by a prompt, with a 60-second timeout and same-origin redirects only.",
       "v0.5.17":
@@ -710,6 +712,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.19":
+        "回退到任意一轮。/rewind（别名 /checkpoint）和 orca rewind 会利用 edit / write_file 前记录的每轮文件前像，把文件恢复到所选用户轮次提交时的状态，再通过持久化的 session.rewind 记录截断对话；summarize-from 与 summarize-up-to 可以把边界一侧替换成模型摘要。最近 100 个检查点保留文件回退能力，更早的只支持对话回退，orca rewind --prune 清理无引用 blob，中断的恢复可用 --rollback 回滚。新增 [rewind] 配置节与 session.rewind 流事件。提供方在生成结束上报的用量现在会计入 ACP 与 TUI 的累计指标，首次欢迎页的 T/U 字母会直接提交信任选择，/status 增加 folder trust 与能力档位，状态栏新增上下文环形指示与自适应右侧区域。",
       "v0.5.18":
         "Esc 现在直接在系统层面停止卡住的 shell：TUI 先杀掉当前进程组，即使会话历史写入损坏也能中断；超时的命令先收到 SIGTERM，短暂宽限后再收到 SIGKILL。历史写入失败时，工具结果或助手回复仍保留在实时会话里，并把该记录标记为降级，而不是阻塞这一轮。自定义和反向代理端点新增 /base-url 命令、ORCA_BASE_URL 与 DEEPSEEK_BASE_URL 的末尾斜杠清理、orca doctor 和 /status 的自定义端点提示，以及用 ORCA_STRICT_TOOLS=1 强制严格工具模式。新增 web_fetch 工具，返回网页的可读文本，可按 prompt 过滤，限制 60 秒超时，只跟随同源重定向。",
       "v0.5.17":

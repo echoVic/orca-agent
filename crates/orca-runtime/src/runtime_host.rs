@@ -2259,6 +2259,7 @@ pub enum RuntimeHostError {
     ResponseChannelClosed { owner: &'static str },
     OperationActive { operation_id: OperationId },
     GoalControlFailed { message: String },
+    RewindFailed { message: String },
     ThreadStartFailed { message: String },
     WorkflowLaunchFailed { message: String },
     RuntimeStartFailed { message: String },
@@ -2282,6 +2283,9 @@ impl fmt::Display for RuntimeHostError {
             }
             Self::GoalControlFailed { message } => {
                 write!(formatter, "goal control command failed: {message}")
+            }
+            Self::RewindFailed { message } => {
+                write!(formatter, "rewind failed: {message}")
             }
             Self::ThreadStartFailed { message } => {
                 write!(formatter, "failed to start runtime thread: {message}")
@@ -4290,6 +4294,34 @@ impl RuntimeThreadHandle {
         receive_reply(reply_rx, "runtime thread")?
     }
 
+    /// Lists the rewindable user messages of this thread's effective
+    /// conversation together with their file-checkpoint statistics.
+    pub fn list_rewind_checkpoints(
+        &self,
+    ) -> Result<Vec<orca_core::rewind::RewindCheckpointView>, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::ListRewindCheckpoints { reply: reply_tx })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
+    /// Restores files and/or the conversation to the submission boundary of
+    /// `target_message_id`. With `dry_run` only the plan is computed.
+    pub fn rewind_checkpoint(
+        &self,
+        target_message_id: &str,
+        mode: orca_core::rewind::RewindMode,
+        dry_run: bool,
+    ) -> Result<orca_core::rewind::RewindOutcome, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::RewindCheckpoint {
+            target_message_id: target_message_id.to_string(),
+            mode,
+            dry_run,
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
     #[cfg(test)]
     fn surface_actor_probe_for_test(
         &self,
@@ -5518,6 +5550,15 @@ enum ThreadCommand {
     },
     BacktrackLastUser {
         reply: SyncSender<Result<Option<String>, RuntimeHostError>>,
+    },
+    ListRewindCheckpoints {
+        reply: SyncSender<Result<Vec<orca_core::rewind::RewindCheckpointView>, RuntimeHostError>>,
+    },
+    RewindCheckpoint {
+        target_message_id: String,
+        mode: orca_core::rewind::RewindMode,
+        dry_run: bool,
+        reply: SyncSender<Result<orca_core::rewind::RewindOutcome, RuntimeHostError>>,
     },
     ShutdownThread {
         reply: Option<SyncSender<ThreadShutdownAck>>,
@@ -11352,7 +11393,7 @@ fn hydrate_session_pinned_context_from_surface(
 }
 
 /// The context meter's ceiling: the line where automatic compaction starts,
-/// so "ctx 0%" means compaction is due rather than that requests will fail.
+/// so "ctx 100%" means compaction is due rather than that requests will fail.
 fn surface_context_limit_tokens(config: &RunConfig) -> u64 {
     let model = config.model.as_option();
     orca_provider::context::ContextConfig::for_model_with_runtime(
@@ -18989,6 +19030,12 @@ impl ThreadActor {
                 ThreadCommand::BacktrackLastUser { reply } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
+                ThreadCommand::ListRewindCheckpoints { reply } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::RewindCheckpoint { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
                 ThreadCommand::ShutdownThread { reply, .. } => {
                     if let Some(reply) = reply {
                         let _ = reply.send(ThreadShutdownAck::Failed(
@@ -19110,6 +19157,24 @@ impl ThreadActor {
             self.recap_inflight_keys
                 .retain(|_, inflight_id| *inflight_id != request_id);
         }
+    }
+
+    /// Publish a stream-only runtime event produced by an idle command.
+    ///
+    /// Turn events reach clients through the request's `EventObserver`/sink,
+    /// but an idle command has no operation writer. The interactive surface
+    /// that shows this thread installs the thread's event observer; when one
+    /// is attached the event flows through the same observer chain as turn
+    /// events. A recorded session additionally journals it for audit, but the
+    /// event is not semantic, so a resume never replays it as a message.
+    fn publish_idle_stream_event(&self, event: EventDraft) {
+        let observer = self
+            .handle
+            .prompt_queue_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let _ = observe_event(observer.as_deref(), event);
     }
 
     fn handle_idle_command(&mut self, command: ThreadCommand) {
@@ -20163,6 +20228,71 @@ impl ThreadActor {
                     .as_mut()
                     .ok_or(RuntimeHostError::ThreadUnavailable)
                     .map(|state| state.thread.session_mut().backtrack_last_user());
+                let _ = reply.send(result);
+            }
+            ThreadCommand::ListRewindCheckpoints { reply } => {
+                let result = self
+                    .state
+                    .as_mut()
+                    .ok_or(RuntimeHostError::ThreadUnavailable)
+                    .and_then(|state| {
+                        state
+                            .thread
+                            .session_mut()
+                            .rewind_checkpoints()
+                            .map_err(|error| RuntimeHostError::RewindFailed {
+                                message: error.to_string(),
+                            })
+                    });
+                let _ = reply.send(result);
+            }
+            ThreadCommand::RewindCheckpoint {
+                target_message_id,
+                mode,
+                dry_run,
+                reply,
+            } => {
+                let config = &self.config;
+                let started_at = Instant::now();
+                let result = self
+                    .state
+                    .as_mut()
+                    .ok_or(RuntimeHostError::ThreadUnavailable)
+                    .and_then(|state| {
+                        state
+                            .thread
+                            .session_mut()
+                            .rewind_to_checkpoint(config, &target_message_id, mode, dry_run)
+                            .map_err(|error| RuntimeHostError::RewindFailed {
+                                message: error.to_string(),
+                            })
+                    });
+                // Only an applied rewind is a run fact worth the event: a dry
+                // run plans without truncating the conversation or touching
+                // the workspace, so it stays silent. The event is a live
+                // stream event journaled for audit (never a semantic
+                // conversation event); publish it through the attached
+                // surface's observer and/or the recorded session journal.
+                // Reuse the thread actor's event factory so the sequence stays
+                // contiguous with the turn events around it.
+                let event = if let Ok(outcome) = &result
+                    && !outcome.report.dry_run
+                    && let Some(state) = self.state.as_mut()
+                {
+                    let session_id = state.thread.session().session_id().map(ToString::to_string);
+                    let duration_ms =
+                        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    Some(state.events.session_rewind(
+                        session_id.as_deref(),
+                        &outcome.report,
+                        duration_ms,
+                    ))
+                } else {
+                    None
+                };
+                if let Some(event) = event {
+                    self.publish_idle_stream_event(event);
+                }
                 let _ = reply.send(result);
             }
             ThreadCommand::ShutdownThread { .. } => unreachable!("shutdown handled by actor loop"),
@@ -21389,6 +21519,16 @@ impl ThreadActor {
                 }));
             }
             ThreadCommand::BacktrackLastUser { reply } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
+            ThreadCommand::ListRewindCheckpoints { reply } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
+            ThreadCommand::RewindCheckpoint { reply, .. } => {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
                     operation_id: active.operation_id,
                 }));

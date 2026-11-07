@@ -11,6 +11,7 @@ use crate::composer_textarea::{
 use crate::shortcuts::{EditorShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::slash_menu_actions::update_slash_menu;
 use crate::theme::Theme;
+use crate::transcript_state::ChatMessage;
 use crate::types::{AppState, AppStatus};
 use crate::vim::VimState;
 
@@ -54,7 +55,14 @@ pub(crate) fn clear_composer_input(
     state.reset_history_navigation();
     vim_state.cancel_pending_command();
     *textarea = make_textarea(vim_state, theme);
-    textarea.set_placeholder_text("Draft cleared · ↑ brings it back");
+    // Say it in the transcript rather than on the composer placeholder: the
+    // placeholder is the composer's permanent affordance line ("/ commands ·
+    // @ files · $ skills"), and parking a recovery hint there buried it for
+    // the rest of the session — through help, dialogs and resizes.
+    state.push_message(ChatMessage::System {
+        text: "Draft cleared · ↑ brings it back".to_string(),
+        expanded: false,
+    });
     true
 }
 

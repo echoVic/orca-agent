@@ -330,6 +330,18 @@ impl<W: Write> EventSink<W> {
                 }
                 Ok(())
             }
+            EventType::SessionRewind => {
+                let target = event.payload["target_message_id"]
+                    .as_str()
+                    .unwrap_or("unknown");
+                let mode = event.payload["mode"].as_str().unwrap_or("unknown");
+                let changed = event.payload["files"]["changed"].as_u64().unwrap_or(0);
+                let deleted = event.payload["files"]["deleted"].as_u64().unwrap_or(0);
+                writeln!(
+                    self.writer,
+                    "rewound to {target} ({mode}): {changed} changed, {deleted} deleted"
+                )
+            }
         }
     }
 }
@@ -907,6 +919,41 @@ mod tests {
             EventType::SessionCompleted,
         ];
         assert!(semantic.iter().all(|event_type| event_type.is_semantic()));
+        assert!(
+            transient
+                .iter()
+                .all(|event_type| !event_type.is_journaled()),
+            "stream-only transient events are never journaled"
+        );
+        // A rewind is a live stream event that is journaled for audit but is
+        // not semantic: replay never turns it into a conversation message.
+        assert!(!EventType::SessionRewind.is_semantic());
+        assert!(EventType::SessionRewind.is_journaled());
+    }
+
+    #[test]
+    fn stream_only_rewind_event_is_journaled_without_an_observer() {
+        let store = Arc::new(RecordingPublicationStore::default());
+        let publication_store: Arc<dyn EventPublicationStore> = store.clone();
+        let mut events = EventFactory::with_publication_store(
+            "rewind-event-journal".to_string(),
+            0,
+            publication_store,
+        );
+        let report = crate::rewind::RewindReport {
+            target_message_id: "item_1".to_string(),
+            mode: "both".to_string(),
+            ..crate::rewind::RewindReport::default()
+        };
+        let draft = events.session_rewind(Some("session-1"), &report, 5);
+        assert!(!draft.event_type.is_semantic());
+
+        observe_event(None, draft).unwrap();
+
+        let journal = store.semantic_events.lock().unwrap();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].event_type, EventType::SessionRewind);
+        assert_eq!(journal[0].payload["target_message_id"], "item_1");
     }
 
     #[test]

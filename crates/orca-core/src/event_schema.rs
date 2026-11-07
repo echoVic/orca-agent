@@ -127,7 +127,7 @@ impl EventDraft {
         };
         let publication = EventPublicationGuard { state };
         let result = (|| {
-            if event.event_type.is_semantic()
+            if event.event_type.is_journaled()
                 && let Some(store) = self.publication.store.as_deref()
             {
                 store.append_semantic_event(&event)?;
@@ -139,7 +139,7 @@ impl EventDraft {
     }
 
     pub(crate) fn requires_publication_without_observer(&self) -> bool {
-        self.event_type.is_semantic() && self.publication.store.is_some()
+        self.event_type.is_journaled() && self.publication.store.is_some()
     }
 }
 
@@ -261,6 +261,8 @@ pub enum EventType {
     Error,
     #[serde(rename = "session.completed")]
     SessionCompleted,
+    #[serde(rename = "session.rewind")]
+    SessionRewind,
 }
 
 impl EventType {
@@ -324,7 +326,22 @@ impl EventType {
             | Self::SubagentProgress
             | Self::WorkflowTasksUpdated
             | Self::TaskStatusUpdated => false,
+            // A rewind is a side effect worth reporting on the live stream, but
+            // it must never be replayed into the model context: the durable
+            // `session.rewind` transcript record already carries the auditable
+            // facts, and folding a rewind back in as a semantic event would
+            // make it a conversation message.
+            Self::SessionRewind => false,
         }
+    }
+
+    /// Whether a publication store journals this event in the durable runtime
+    /// event journal. This is not the same question as [`Self::is_semantic`]:
+    /// a journaled event may be stream-only, and loading the transcript only
+    /// turns `model.response.completed` records into conversation messages.
+    /// `session.rewind` is journaled for audit but never becomes a message.
+    pub const fn is_journaled(self) -> bool {
+        self.is_semantic() || matches!(self, Self::SessionRewind)
     }
 }
 
@@ -1321,6 +1338,48 @@ impl EventFactory {
         self.make(EventType::SessionCompleted, payload)
     }
 
+    /// Event emitted after `/rewind` actually applied, on the live stream (and
+    /// in the recorded event journal when the session records history). It is
+    /// never replayed as a conversation message. `dry_run` rewinds never emit
+    /// it: a plan that changed nothing is not a run fact. The payload mirrors
+    /// [`crate::rewind::RewindReport`].
+    pub fn session_rewind(
+        &mut self,
+        session_id: Option<&str>,
+        report: &crate::rewind::RewindReport,
+        duration_ms: u64,
+    ) -> EventDraft {
+        let conversation = report
+            .conversation
+            .as_ref()
+            .map(|conversation| {
+                json!({
+                    "kind": conversation.kind,
+                    "kept_messages": conversation.kept_messages
+                })
+            })
+            .unwrap_or(Value::Null);
+        self.make(
+            EventType::SessionRewind,
+            json!({
+                "session_id": session_id,
+                "target_message_id": report.target_message_id,
+                "ordinal": report.ordinal,
+                "mode": report.mode,
+                "dry_run": report.dry_run,
+                "files": {
+                    "changed": report.files.changed,
+                    "deleted": report.files.deleted,
+                    "unchanged": report.files.unchanged,
+                    "skipped": report.files.skipped
+                },
+                "conversation": conversation,
+                "rewind_id": report.rewind_id,
+                "duration_ms": duration_ms
+            }),
+        )
+    }
+
     fn make(&mut self, event_type: EventType, payload: Value) -> EventDraft {
         EventDraft {
             run_id: self.run_id.clone(),
@@ -1548,6 +1607,110 @@ mod tests {
         let not_applied =
             factory.session_completed_terminal_with_verification(&terminal, None, None, false);
         assert_eq!(not_applied.payload["writes_applied"], false);
+    }
+
+    #[test]
+    fn session_rewind_payload_reports_the_applied_outcome() {
+        use crate::rewind::{
+            ConversationRewindReport, RewindFilesReport, RewindReport, RewindSkip, RewindStats,
+        };
+
+        let report = RewindReport {
+            target_message_id: "item_42".to_string(),
+            ordinal: 12,
+            mode: "both".to_string(),
+            dry_run: false,
+            files: RewindFilesReport {
+                changed: 3,
+                deleted: 1,
+                unchanged: 5,
+                skipped: vec![RewindSkip {
+                    path: "a.bin".to_string(),
+                    reason: "blob_missing".to_string(),
+                }],
+            },
+            stats: RewindStats {
+                insertions: 41,
+                deletions: 7,
+                omitted: false,
+            },
+            conversation: Some(ConversationRewindReport {
+                kind: "truncate".to_string(),
+                kept_messages: 12,
+            }),
+            rewind_id: Some("rw_1".to_string()),
+            ..RewindReport::default()
+        };
+        let mut factory = EventFactory::new("thread-rewind".to_string());
+
+        let event = factory.session_rewind(Some("session-1"), &report, 37);
+
+        assert_eq!(event.event_type, EventType::SessionRewind);
+        assert_eq!(
+            serde_json::to_string(&event.event_type).unwrap(),
+            "\"session.rewind\""
+        );
+        assert_eq!(
+            event.payload,
+            json!({
+                "session_id": "session-1",
+                "target_message_id": "item_42",
+                "ordinal": 12,
+                "mode": "both",
+                "dry_run": false,
+                "files": {
+                    "changed": 3,
+                    "deleted": 1,
+                    "unchanged": 5,
+                    "skipped": [{"path": "a.bin", "reason": "blob_missing"}]
+                },
+                "conversation": {"kind": "truncate", "kept_messages": 12},
+                "rewind_id": "rw_1",
+                "duration_ms": 37
+            })
+        );
+    }
+
+    #[test]
+    fn session_rewind_omits_conversation_and_session_when_absent() {
+        use crate::rewind::RewindReport;
+
+        let report = RewindReport {
+            target_message_id: "item_7".to_string(),
+            ordinal: 3,
+            mode: "code".to_string(),
+            dry_run: false,
+            ..RewindReport::default()
+        };
+        let mut factory = EventFactory::new("thread-rewind".to_string());
+
+        let event = factory.session_rewind(None, &report, 0);
+
+        assert_eq!(event.event_type, EventType::SessionRewind);
+        assert!(event.payload["session_id"].is_null());
+        assert!(event.payload["conversation"].is_null());
+        assert!(event.payload["rewind_id"].is_null());
+        assert_eq!(event.payload["files"]["changed"], 0);
+        assert_eq!(event.payload["files"]["skipped"], json!([]));
+    }
+
+    #[test]
+    fn session_rewind_is_a_stream_event_and_never_becomes_a_message() {
+        use crate::rewind::RewindReport;
+
+        let report = RewindReport {
+            target_message_id: "item_1".to_string(),
+            mode: "conversation".to_string(),
+            ..RewindReport::default()
+        };
+        let mut factory = EventFactory::new("thread-rewind".to_string());
+
+        let event = factory.session_rewind(Some("session-1"), &report, 1);
+
+        // The durable `session.rewind` record carries the audit trail; the
+        // runtime event stays a live stream event and must not be replayed as
+        // a semantic transcript message on resume.
+        assert!(!event.event_type.is_semantic());
     }
 
     #[test]

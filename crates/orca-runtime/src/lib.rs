@@ -68,6 +68,9 @@ mod provider_retry;
 pub mod provider_stream;
 pub mod provider_turn;
 pub mod recap;
+pub(crate) mod rewind;
+#[cfg(test)]
+mod rewind_tests;
 mod runtime_actor;
 pub(crate) mod runtime_approval;
 pub mod runtime_capability;

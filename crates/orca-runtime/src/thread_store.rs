@@ -5,6 +5,8 @@ mod pagination;
 mod projection;
 mod reader;
 mod retention;
+#[cfg(test)]
+mod rewind_records_tests;
 #[cfg_attr(test, allow(dead_code))]
 mod session_index;
 #[cfg(test)]
@@ -35,8 +37,13 @@ pub use retention::{
     SessionRetentionError, SessionRetentionPolicy, SessionRetentionReport, retain_sessions,
 };
 pub use session_index::SessionSummaryPage;
+// Consumed by the `/rewind` coordinator and by the crate-internal contract
+// tests; keep the re-exports stable for both.
+#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use types::{
-    ManualCompactionDurableSnapshot, SessionRecord, StoredAgentScope, StoredConversationRecord,
+    BlobRef, ConversationRewindRecord, FileSnapshotRecord, ManualCompactionDurableSnapshot,
+    RewindFilesSummary, SessionRecord, SessionRewindRecord, SnapshotChangeStats, SnapshotFileEntry,
+    SnapshotRetentionRecord, StoredAgentScope, StoredConversationRecord,
 };
 pub use types::{
     SessionCheckpointRecord, SessionMeta, SessionSummary, SessionTranscript, SortDirection,
@@ -47,9 +54,13 @@ pub use types::{
     ThreadSortKey, ThreadStore, TurnItemsView,
 };
 pub use writer::SessionWriter;
+#[allow(unused_imports)]
 pub(crate) use writer::{
+    RewindTranscriptCut, RewindTranscriptSplit, RewindUserMessage, read_effective_user_messages,
     read_latest_context_tokens, read_manual_compaction_snapshot, read_prompt_queue_snapshot,
-    redact_sensitive_text, stored_session_health_error_details, truncate_transcript_at_boundary,
+    read_session_meta, read_snapshot_retention, read_snapshots, read_transcript_before_message,
+    read_transcript_split_at_message, read_transcript_until_effective, redact_sensitive_text,
+    stored_session_health_error_details, truncate_transcript_at_boundary,
     write_prompt_queue_snapshot,
 };
 

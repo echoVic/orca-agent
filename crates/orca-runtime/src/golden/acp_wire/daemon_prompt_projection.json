@@ -537,6 +537,33 @@
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": {
+          "_meta": {
+            "orca.dev/projection": {
+              "usage": {
+                "cache_tokens": 10,
+                "estimated_cost_usd_micros": 35,
+                "input_tokens": 120,
+                "output_tokens": 30
+              },
+              "version": 1
+            }
+          },
+          "sessionId": "<uuid>",
+          "update": {
+            "cost": {
+              "amount": 0.000035,
+              "currency": "USD"
+            },
+            "sessionUpdate": "usage_update",
+            "size": 768928,
+            "used": 120
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
           "sessionId": "<uuid>",
           "update": {
             "configOptions": [
