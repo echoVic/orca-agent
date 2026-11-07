@@ -288,6 +288,60 @@ fn tui_submit_renders_and_restores_the_terminal() {
     );
 }
 
+/// A provider-reported usage must reach the cumulative surface totals, so the
+/// status bar shows tokens and `/status` reports the turn's spend. The context
+/// meter already came from the same provider response; the usage totals are
+/// the ones that used to stay at zero.
+#[test]
+fn tui_status_reports_usage_and_cost_after_a_priced_turn() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "mock_usage")
+        .expect("spawn usage TUI in PTY");
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    receive_until(
+        &process,
+        &mut output,
+        "Mock runtime completed with usage accounting.",
+        Duration::from_secs(10),
+        "TUI did not complete the priced turn",
+    );
+
+    // Mock usage is 120 input (10 cached) and 30 output tokens; the cache
+    // count is already part of input, so the status cell shows 150. The cost
+    // depends on DeepSeek's peak/off-peak clock, so only the token cell is
+    // pinned here.
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "· 150 ·",
+        "the status bar did not show the turn's tokens",
+    );
+
+    process.write(b"/status\r").expect("ask for session status");
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "usage: 120 input, 30 output, 10 cache",
+        "/status did not report the turn's cumulative usage",
+    );
+    let screen = reconstruct_screen(&output);
+    let cost_line = screen
+        .lines()
+        .find(|line| line.contains("cost: $"))
+        .expect("/status did not report a cost line");
+    assert!(
+        !cost_line.contains("cost: $0.000000"),
+        "/status priced the turn at zero: {cost_line}"
+    );
+
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
 #[test]
 fn tui_permission_round_trips_through_the_runtime_surface() {
     if !matches!(
@@ -2352,6 +2406,69 @@ fn reconstruct_screen(output: &[u8]) -> String {
         lines.push(line.trim_end().to_string());
     }
     lines.join("\n")
+}
+
+#[test]
+fn tui_rewind_opens_the_checkpoint_picker_and_esc_closes_it() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "rewind pty seed")
+        .expect("spawn TUI in PTY");
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    receive_until(
+        &process,
+        &mut output,
+        ASSISTANT_SENTINEL,
+        Duration::from_secs(10),
+        "TUI did not complete the seed turn before /rewind",
+    );
+
+    // `/rewind` lists the conversation's checkpoints in their own dialog.
+    process.write(b"/rewind\r").expect("open the rewind picker");
+    receive_until(
+        &process,
+        &mut output,
+        "Enter choose",
+        Duration::from_secs(5),
+        "TUI did not open the /rewind picker",
+    );
+    assert_screen_shows(&process, &mut output, "Rewind", "rewind dialog title");
+
+    // Esc closes it without rewinding: the composer takes the next prompt.
+    // A lone ESC byte is only delivered as `Esc` if nothing follows it
+    // immediately, so wait for the dialog's keys to leave the screen before
+    // typing into the composer again.
+    process.write(&[0x1b]).expect("close the rewind picker");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while screen_contains(&output, "Enter choose") {
+        assert!(
+            Instant::now() < deadline,
+            "Esc did not close the /rewind picker; reconstructed screen=\n{}",
+            reconstruct_screen(&output)
+        );
+        if let Some(chunk) = process.receive_output(Duration::from_millis(250)) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+    process.drain_output(&mut output);
+    let closed = output.len();
+    process
+        .write(b"mock_history_echo\r")
+        .expect("submit after closing the picker");
+    receive_until_after(
+        &process,
+        &mut output,
+        "Mock history users: rewind pty seed | mock_history_echo",
+        closed,
+        Duration::from_secs(10),
+        "the /rewind picker did not close on Esc",
+    );
+
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
 }
 
 struct PtyProcess {

@@ -394,6 +394,7 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
   ["slash.remember", /SlashCommand::Remember/],
   ["slash.compact", /SlashCommand::Compact/],
   ["slash.resume", /SlashCommand::Resume|"\/resume"/],
+  ["slash.rewind", /SlashCommand::Rewind|"\/rewind"/],
   ["slash.trust_show", /TrustSlashCommand::Show/],
   ["slash.trust_mutation", /TrustSlashCommand::Add|TrustSlashCommand::Remove/],
   ["slash_menu.discovery", /update_slash_menu|available_commands|discover_saved_workflows/],
@@ -1107,6 +1108,7 @@ const TUI_RUNTIME_ASSOCIATED_METHODS = tuiRuntimeAssociatedMethods();
 
 const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/input_event_actions.rs:handle_mouse_event:user_action.route", 1],
+  ["crates/orca-tui/src/rewind_actions.rs:handle_rewind_key:user_action.route", 1],
   ["crates/orca-tui/src/hosted_controller.rs:hosted_tui_controller_loop:thread.tool_result_images", 1],
   ["crates/orca-tui/src/action_dispatcher.rs:route_action:controller.control", 3],
   ["crates/orca-tui/src/action_dispatcher.rs:drop:controller.control", 1],
@@ -1209,7 +1211,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   // Ending first-run setup starts the MCP servers held back for it
   // (SetupFinished), and then sends the initial prompt.
   ["crates/orca-tui/src/setup_actions.rs:finish_setup:user_action.route", 1],
-  ["crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:user_action.route", 13],
+  ["crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:user_action.route", 14],
   ["crates/orca-tui/src/slash_command_actions.rs:request_recap:user_action.route", 1],
   ["crates/orca-tui/src/mcp_dialog_actions.rs:start_action:user_action.route", 1],
   ["crates/orca-tui/src/slash_command_actions.rs:run_mcp_prompt:user_action.route", 1],
@@ -1293,7 +1295,7 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     1,
   ],
   ["crates/orca-tui/src/capability_backend.rs:clear:self.inner.clear", 1],
-  ["crates/orca-tui/src/commands/mod.rs:builtin_command_names:names.insert", 1],
+  ["crates/orca-tui/src/commands/mod.rs:builtin_command_names:names.insert", 2],
   ["crates/orca-tui/src/commands/mod.rs:collect_workflow_dir:seen.insert", 1],
   ["crates/orca-tui/src/diff_highlight.rs:accepts:self.hunk_ranges.insert", 1],
   ["crates/orca-tui/src/diff_highlight.rs:cluster_inline_segments:segments.insert", 4],
@@ -1906,18 +1908,18 @@ function commandRow(manifest, table, name) {
 function invariantRegistry() {
   return new Map([
     [
-      "source_facts has exactly 58 unique variants matching EventType at baseline",
+      "source_facts has exactly 59 unique variants matching EventType at baseline",
       (manifest) => {
-        assertCondition(manifest.source_facts.length === 58, "source_facts must contain 58 rows");
+        assertCondition(manifest.source_facts.length === 59, "source_facts must contain 59 rows");
         assertUnique(manifest.source_facts.map((row) => row[0]), "source_facts");
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 55 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 57 unique variants matching UserAction at baseline",
         (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 55,
-          "current_tui_user_actions must contain 55 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 57,
+          "current_tui_user_actions must contain 57 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,

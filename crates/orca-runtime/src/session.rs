@@ -521,6 +521,45 @@ impl InteractiveSession {
         self.writer.as_mut()
     }
 
+    /// Path of the live transcript, when this session is being recorded.
+    pub(crate) fn writer_path(&self) -> Option<&Path> {
+        self.writer.as_ref().map(SessionWriter::path)
+    }
+
+    /// Durable session id of the live transcript, when known.
+    pub(crate) fn transcript_session_id(&self) -> Option<String> {
+        self.writer.as_ref().and_then(SessionWriter::session_id)
+    }
+
+    /// Replaces the in-memory conversation wholesale (a conversation rewind
+    /// rebuilds it from the truncated transcript).
+    pub(crate) fn replace_conversation(&mut self, conversation: Conversation) {
+        self.conversation = conversation;
+        self.turn_starts.clear();
+    }
+
+    /// Lists the rewindable user messages with their checkpoint statistics.
+    pub(crate) fn rewind_checkpoints(
+        &self,
+    ) -> io::Result<Vec<orca_core::rewind::RewindCheckpointView>> {
+        crate::rewind::list_checkpoints(self)
+    }
+
+    /// Restores files and/or the conversation to the submission boundary of
+    /// `target_message_id`. `dry_run` computes and returns the plan only.
+    ///
+    /// `config` supplies the provider settings the summarize modes use for
+    /// their one summarizer request.
+    pub(crate) fn rewind_to_checkpoint(
+        &mut self,
+        config: &RunConfig,
+        target_message_id: &str,
+        mode: orca_core::rewind::RewindMode,
+        dry_run: bool,
+    ) -> io::Result<orca_core::rewind::RewindOutcome> {
+        crate::rewind::apply_rewind(self, config, target_message_id, mode, dry_run)
+    }
+
     pub(crate) fn conversation_records(&self) -> Option<Vec<StoredConversationRecord>> {
         self.writer
             .as_ref()

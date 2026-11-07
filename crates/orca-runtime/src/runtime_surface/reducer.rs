@@ -12,8 +12,9 @@ use super::identity::{
     SurfaceGoalRunId, SurfaceInteractionId, SurfaceItemId, SurfaceOperationFence,
     SurfaceOperationId, SurfaceRequestId, SurfaceScope, SurfaceSettlementId, SurfaceSubagentId,
     SurfaceTaskFence, SurfaceTaskId, SurfaceTaskOwnerRef, SurfaceToolCallId, SurfaceTurnId,
-    SurfaceWorkflowFence, SurfaceWorkflowRunId, TaskRevision, ThreadOwnerEpoch, UnixMillis, UuidV7,
-    WorkflowRevision, canonical_background_fence_v1, canonical_surface_scope_v1,
+    SurfaceWorkflowFence, SurfaceWorkflowRunId, TaskRevision, ThreadOwnerEpoch, UnixMillis,
+    UsageRevision, UuidV7, WorkflowRevision, canonical_background_fence_v1,
+    canonical_surface_scope_v1,
 };
 use super::interaction::{
     AuthorityFingerprint, CanonicalInteractionPatchV1,
@@ -6606,7 +6607,7 @@ fn apply_operation_patch(
         OperationPatch::GenerationStopped {
             fence,
             reason,
-            usage_delta: _,
+            usage_delta,
         } => {
             if let Some(background) = snapshot
                 .background_operations
@@ -6624,25 +6625,62 @@ fn apply_operation_patch(
                     ));
                 }
             }
-            let generation = generation_mut(snapshot, envelope, fence)?;
-            let allowed = match generation.phase {
-                GenerationPhase::Reserved => {
-                    matches!(reason, GenerationStopReason::NotStarted { .. })
+            {
+                let generation = generation_mut(snapshot, envelope, fence)?;
+                let allowed = match generation.phase {
+                    GenerationPhase::Reserved => {
+                        matches!(reason, GenerationStopReason::NotStarted { .. })
+                    }
+                    GenerationPhase::Started | GenerationPhase::Transferred => {
+                        !matches!(reason, GenerationStopReason::NotStarted { .. })
+                    }
+                    GenerationPhase::Stopped => false,
+                };
+                if !allowed {
+                    return Err(event_error(
+                        envelope,
+                        SurfaceReducerErrorCode::IllegalTransition,
+                        "generation stop is not allowed from its current phase",
+                    ));
                 }
-                GenerationPhase::Started | GenerationPhase::Transferred => {
-                    !matches!(reason, GenerationStopReason::NotStarted { .. })
-                }
-                GenerationPhase::Stopped => false,
-            };
-            if !allowed {
-                return Err(event_error(
-                    envelope,
-                    SurfaceReducerErrorCode::IllegalTransition,
-                    "generation stop is not allowed from its current phase",
-                ));
+                generation.phase = GenerationPhase::Stopped;
+                generation.stop_reason = Some(reason.clone());
             }
-            generation.phase = GenerationPhase::Stopped;
-            generation.stop_reason = Some(reason.clone());
+            // A generation's stop is the only carrier of the tokens and cost it
+            // spent; no other production event publishes a Usage snapshot. Fold
+            // it into the thread total so the surface (and every reader: ACP
+            // usage updates, the TUI status bar, `/status`) sees cumulative
+            // accounting. Recovery stops carry a zero delta, which must not move
+            // the revision.
+            if usage_delta.input_tokens != 0
+                || usage_delta.output_tokens != 0
+                || usage_delta.cache_tokens != 0
+                || usage_delta.estimated_cost_usd_micros != 0
+            {
+                let next_revision = snapshot
+                    .usage
+                    .revision
+                    .get()
+                    .checked_add(1)
+                    .and_then(|revision| UsageRevision::try_new(revision).ok())
+                    .ok_or_else(|| {
+                        event_error(
+                            envelope,
+                            SurfaceReducerErrorCode::StaleRevision,
+                            "usage revision is exhausted",
+                        )
+                    })?;
+                let total = &mut snapshot.usage.thread_total;
+                total.input_tokens = total.input_tokens.saturating_add(usage_delta.input_tokens);
+                total.output_tokens = total
+                    .output_tokens
+                    .saturating_add(usage_delta.output_tokens);
+                total.cache_tokens = total.cache_tokens.saturating_add(usage_delta.cache_tokens);
+                total.estimated_cost_usd_micros = total
+                    .estimated_cost_usd_micros
+                    .saturating_add(usage_delta.estimated_cost_usd_micros);
+                snapshot.usage.revision = next_revision;
+            }
             Ok(())
         }
         OperationPatch::GenerationTransferred {

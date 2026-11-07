@@ -285,6 +285,20 @@ pub(crate) enum SessionRecord {
     Checkpoint(SessionCheckpointRecord),
     #[serde(rename = "provider.prompt_cache_checkpoint")]
     PromptCacheCheckpoint(SessionPromptCacheCheckpointRecord),
+    /// Audit record for the file state captured at the end of a turn. It never
+    /// contributes conversation messages; `/rewind` joins it with the
+    /// transcript through `at_message_id`.
+    #[serde(rename = "session.snapshot")]
+    FileSnapshot(FileSnapshotRecord),
+    /// Conversation rewind marker. Folding the transcript applies its kept
+    /// counts so a resumed session sees the effective (rewound) history.
+    #[serde(rename = "session.rewind")]
+    SessionRewind(SessionRewindRecord),
+    /// Retention watermark: snapshot ordinals up to and including this one have
+    /// been evicted from the rewind store. Audit-only; never folded into the
+    /// conversation.
+    #[serde(rename = "session.snapshot_retention")]
+    SnapshotRetention(SnapshotRetentionRecord),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -306,6 +320,141 @@ pub struct SessionCheckpointRecord {
 pub(crate) struct SessionPromptCacheCheckpointRecord {
     pub turn_id: TurnId,
     pub checkpoint: orca_provider::prompt_cache::PromptCacheCheckpoint,
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// Content-addressed reference to one pre-image blob stored under
+/// `$ORCA_HOME/rewind/sessions/<session_id>/objects`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BlobRef {
+    pub sha256: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    #[serde(default = "default_blob_encoding")]
+    pub encoding: String,
+}
+
+fn default_blob_encoding() -> String {
+    "raw".into()
+}
+
+/// Per-file state captured by a `session.snapshot` record. `pre` is the
+/// state before the first write of the turn (`None` = the file did not exist,
+/// i.e. a tombstone); `post_sha256` is the content digest after the last
+/// successful write.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SnapshotFileEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre: Option<BlobRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_sha256: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+pub struct SnapshotChangeStats {
+    #[serde(default)]
+    pub files: u32,
+    #[serde(default)]
+    pub insertions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+    #[serde(default)]
+    pub omitted: bool,
+}
+
+/// One `session.snapshot` record: the durable, per-turn file checkpoint used
+/// by `/rewind` to restore workspace files.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FileSnapshotRecord {
+    #[serde(default = "default_rewind_schema_version")]
+    pub schema_version: u32,
+    pub snapshot_id: String,
+    pub session_id: String,
+    pub at_message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub ordinal: u32,
+    pub root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_fingerprint: Option<String>,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub files: std::collections::BTreeMap<String, SnapshotFileEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_stats: Option<SnapshotChangeStats>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untracked: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limitations: Vec<String>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+fn default_rewind_schema_version() -> u32 {
+    1
+}
+
+/// Conversation-only rewind payload stored inside a `session.rewind` record.
+/// v1 only writes `kind: "truncate"`; the summarize kinds are reserved.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ConversationRewindRecord {
+    /// `"truncate"` (v1); `"summarize_from"`/`"summarize_up_to"` are reserved.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_usage: Option<UsageTotals>,
+}
+
+/// Files restored by a rewind that also restored workspace state.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+pub struct RewindFilesSummary {
+    #[serde(default)]
+    pub restored: u32,
+    #[serde(default)]
+    pub deleted: u32,
+    #[serde(default)]
+    pub skipped: u32,
+}
+
+/// One `session.rewind` record: the durable conversation cut applied when a
+/// transcript is folded. The kept counts are authoritative; `at_message_id`
+/// is used by the UI and for consistency checks.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionRewindRecord {
+    #[serde(default = "default_rewind_schema_version")]
+    pub schema_version: u32,
+    pub session_id: String,
+    pub rewind_id: String,
+    pub at_message_id: String,
+    pub kept_messages: u32,
+    pub kept_compactions: u32,
+    pub kept_summaries: u32,
+    /// Messages removed from the front by `summarize_up_to` (0 for every other
+    /// kind, and for records written before this field existed).
+    #[serde(default)]
+    pub dropped_messages: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ConversationRewindRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<RewindFilesSummary>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// Retention watermark written by the rewind store: snapshots with
+/// `ordinal <= evicted_through_ordinal` are no longer restorable (they stay in
+/// the log as audit evidence). Audit-only for the transcript fold.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SnapshotRetentionRecord {
+    #[serde(default = "default_rewind_schema_version")]
+    pub schema_version: u32,
+    pub session_id: String,
+    pub evicted_through_ordinal: u32,
     pub recorded_at: DateTime<Utc>,
 }
 

@@ -2178,6 +2178,61 @@ fn usage_context_settings_catalog_and_pinned_families_require_exact_revisions() 
 }
 
 #[test]
+fn generation_stop_accumulates_usage_into_the_thread_total() {
+    let operation = operation_record();
+    let generation = generation_at(&operation, 0, GenerationPhase::Started, None);
+    let initial = foreground_generation_state(operation, generation.clone());
+    assert_eq!(initial.snapshot().usage.thread_total, usage());
+    assert_eq!(initial.snapshot().usage.revision.get(), 1);
+
+    let delta = vector_usage();
+    let stopped = batch(
+        &initial,
+        14_500,
+        vec![(
+            generation_scope(&generation),
+            SurfaceEvent::Operation(OperationPatch::GenerationStopped {
+                fence: generation.fence.clone(),
+                reason: GenerationStopReason::Completed {
+                    status: GenerationCompletionStatus::Success,
+                },
+                usage_delta: delta.clone(),
+            }),
+        )],
+    );
+    let next = applied(reduce_batch(SurfaceReduceMode::Live, &initial, &stopped));
+
+    assert_eq!(next.snapshot().usage.thread_total, delta);
+    assert_eq!(next.snapshot().usage.revision.get(), 2);
+}
+
+#[test]
+fn zero_usage_generation_stop_leaves_the_thread_total_revision_alone() {
+    let operation = operation_record();
+    let generation = generation_at(&operation, 0, GenerationPhase::Reserved, None);
+    let initial = foreground_generation_state(operation, generation.clone());
+
+    let stopped = batch(
+        &initial,
+        14_501,
+        vec![(
+            generation_scope(&generation),
+            SurfaceEvent::Operation(OperationPatch::GenerationStopped {
+                fence: generation.fence.clone(),
+                reason: GenerationStopReason::NotStarted {
+                    reason: NotStartedReason::RuntimeRestart,
+                },
+                usage_delta: usage(),
+            }),
+        )],
+    );
+    let next = applied(reduce_batch(SurfaceReduceMode::Live, &initial, &stopped));
+
+    assert_eq!(next.snapshot().usage.thread_total, usage());
+    assert_eq!(next.snapshot().usage.revision.get(), 1);
+}
+
+#[test]
 fn session_metadata_health_and_close_barriers_are_ordered() {
     let initial = state();
     let metadata = batch(

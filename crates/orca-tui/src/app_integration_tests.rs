@@ -2760,11 +2760,19 @@ impl AttachedHostedTuiHarness {
             .expect("attached hosted TUI action");
     }
 
-    fn recv_until(&mut self, mut predicate: impl FnMut(&TuiEvent) -> bool) -> TuiEvent {
+    fn recv_until(&mut self, predicate: impl FnMut(&TuiEvent) -> bool) -> TuiEvent {
+        self.recv_until_timeout(Duration::from_secs(10), predicate)
+    }
+
+    fn recv_until_timeout(
+        &mut self,
+        timeout: Duration,
+        mut predicate: impl FnMut(&TuiEvent) -> bool,
+    ) -> TuiEvent {
         loop {
             let event = self
                 .event_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(timeout)
                 .expect("attached hosted TUI event");
             let event = match accept_attached_tui_event(&mut self.state, event) {
                 Ok(Some(event)) => event,
@@ -2845,6 +2853,86 @@ fn hosted_tui_submit_clears_actor_operation_before_terminal_ui_event() {
                 _ => {}
             }
         }
+        runtime.shutdown().expect("hosted runtime shutdown");
+    });
+}
+
+/// Regression: the hosted runtime reports provider usage on the generation
+/// stop, and the TUI's typed-surface projection must carry the cumulative
+/// totals into `AppState`-visible metrics. The context meter already worked
+/// from the same response, so zero tokens here means the usage channel, not
+/// the whole projection, was dropped.
+#[test]
+fn hosted_tui_projects_provider_usage_into_cumulative_metrics() {
+    with_orca_home(|_| {
+        let mut config = test_config(HistoryMode::Record);
+        config.model =
+            ModelSelection::from_unchecked(Some(orca_core::model::FLASH_MODEL.to_string()));
+        let config = Arc::new(Mutex::new(config));
+        let preloaded = Arc::new(Mutex::new(None));
+        let pending = test_pending_workflow_notifications();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let event_tx = spawn_unwrapped_tui_test_event_sender(event_tx);
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let controller = TuiSurfaceTaskControl::new();
+        let agent_config = Arc::clone(&config);
+        let agent_preloaded = Arc::clone(&preloaded);
+        let agent_events = event_tx.clone();
+        let agent_pending = pending.clone();
+        let mut runtime = TuiAgentRuntime::spawn_hosted(
+            action_rx,
+            event_tx,
+            8,
+            controller,
+            move |controller, commands, host| {
+                hosted_tui_controller_loop(
+                    agent_config,
+                    agent_preloaded,
+                    agent_events,
+                    commands,
+                    controller,
+                    agent_pending,
+                    host,
+                );
+            },
+        )
+        .expect("hosted TUI runtime");
+
+        action_tx
+            .send(UserAction::Submit("mock_usage".to_string()))
+            .unwrap();
+        let (mut state, _state_actions) = test_state();
+        let mut latest_usage = None;
+        loop {
+            match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                TuiEvent::SurfaceProjectionSynced(projection) => {
+                    latest_usage = Some(projection.usage.clone());
+                    state.update(TuiEvent::SurfaceProjectionSynced(projection));
+                }
+                TuiEvent::SessionCompleted { status } => {
+                    assert_eq!(status, "success");
+                    break;
+                }
+                TuiEvent::OperationRejected(message) | TuiEvent::Error(message) => {
+                    panic!("hosted usage turn failed: {message}");
+                }
+                _ => {}
+            }
+        }
+        let usage = latest_usage.expect("turn committed a typed surface projection");
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.cache_tokens, 10);
+        assert!(
+            usage.estimated_cost_usd > 0.0,
+            "priced turn reported zero cost"
+        );
+        assert_eq!(
+            state.usage().total_tokens(),
+            150,
+            "the TUI metrics did not apply the committed usage"
+        );
+
         runtime.shutdown().expect("hosted runtime shutdown");
     });
 }
@@ -7575,7 +7663,7 @@ fn slash_menu_tab_opens_resume_picker_like_enter() {
         let shared_config = Arc::new(Mutex::new(config.clone()));
         let (action_tx, _action_rx) = mpsc::unbounded();
         let theme = Theme::named(ThemeName::Dark);
-        let mut textarea = make_textarea(&VimState::new(false), &theme);
+        let mut textarea = make_textarea_with_text("", &VimState::new(false), &theme);
         let vim_state = VimState::new(false);
         let event = Event::Key(crossterm::event::KeyEvent::new(
             KeyCode::Tab,
@@ -8109,4 +8197,922 @@ fn idle_submit_with_open_empty_mention_popup_keeps_unbound_at_literal() {
     };
     assert_eq!(prompt, "@oai/sky还能逆向吗");
     assert!(bindings.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// `/rewind`
+// ---------------------------------------------------------------------------
+
+fn rewind_checkpoint_view(
+    ordinal: u32,
+    files_available: bool,
+) -> orca_core::rewind::RewindCheckpointView {
+    orca_core::rewind::RewindCheckpointView {
+        message_id: format!("item_{ordinal}"),
+        ordinal,
+        prompt_preview: format!("prompt {ordinal}"),
+        recorded_at: None,
+        files_changed: 2,
+        insertions: 10,
+        deletions: 3,
+        has_snapshot: files_available,
+        snapshot_evicted: false,
+        conversation_available: true,
+        files_available,
+        unavailable_reasons: Vec::new(),
+    }
+}
+
+fn rewind_outcome(
+    mode: orca_core::rewind::RewindMode,
+    user_ordinal: u32,
+    dry_run: bool,
+) -> orca_core::rewind::RewindOutcome {
+    let conversation_rewound = mode.includes_conversation();
+    let conversation_kind = match mode {
+        orca_core::rewind::RewindMode::SummarizeFrom => "summarize_from",
+        orca_core::rewind::RewindMode::SummarizeUpTo => "summarize_up_to",
+        _ => "truncate",
+    };
+    let files_touched = mode.includes_files();
+    orca_core::rewind::RewindOutcome {
+        report: orca_core::rewind::RewindReport {
+            target_message_id: format!("item_{user_ordinal}"),
+            ordinal: user_ordinal,
+            mode: mode.as_str().to_string(),
+            dry_run,
+            files: orca_core::rewind::RewindFilesReport {
+                changed: if files_touched { 2 } else { 0 },
+                deleted: u64::from(files_touched),
+                unchanged: if files_touched { 4 } else { 0 },
+                skipped: Vec::new(),
+            },
+            stats: orca_core::rewind::RewindStats {
+                insertions: 10,
+                deletions: 3,
+                omitted: false,
+            },
+            warnings: Vec::new(),
+            conversation: conversation_rewound.then_some(
+                orca_core::rewind::ConversationRewindReport {
+                    kind: conversation_kind.to_string(),
+                    kept_messages: user_ordinal,
+                },
+            ),
+            rewind_id: (!dry_run).then(|| "rw_test".to_string()),
+            op_id: None,
+            previews: Vec::new(),
+        },
+        prompt: conversation_rewound.then(|| format!("prompt {user_ordinal}")),
+        user_ordinal,
+    }
+}
+
+#[test]
+fn slash_rewind_requests_the_checkpoint_list_only_when_idle() {
+    let (mut state, _rx) = test_state();
+    let mut config = test_config(HistoryMode::Record);
+    let shared_config = Arc::new(Mutex::new(config.clone()));
+    let (action_tx, action_rx) = mpsc::unbounded();
+
+    state.enter_running();
+    handle_slash_command(
+        "/rewind",
+        &mut config,
+        &shared_config,
+        &mut state,
+        &action_tx,
+    );
+    assert!(action_rx.try_recv().is_err());
+    assert!(
+        matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::Error(text)) if text == "stop the current turn before rewinding"
+        ),
+        "{:?}",
+        state.transcript.messages
+    );
+
+    state.set_status(AppStatus::Idle);
+    handle_slash_command(
+        "/rewind",
+        &mut config,
+        &shared_config,
+        &mut state,
+        &action_tx,
+    );
+    assert!(matches!(
+        action_rx.try_recv(),
+        Ok(UserAction::ListRewindCheckpoints)
+    ));
+    // The `/checkpoint` spelling is the same command.
+    handle_slash_command(
+        "/checkpoint",
+        &mut config,
+        &shared_config,
+        &mut state,
+        &action_tx,
+    );
+    assert!(matches!(
+        action_rx.try_recv(),
+        Ok(UserAction::ListRewindCheckpoints)
+    ));
+    assert!(action_rx.try_recv().is_err());
+}
+
+#[test]
+fn rewind_checkpoints_open_the_picker_and_an_empty_list_is_an_error() {
+    let (mut state, _rx) = test_state();
+    state.update(TuiEvent::RewindCheckpoints(vec![
+        rewind_checkpoint_view(0, true),
+        rewind_checkpoint_view(1, false),
+    ]));
+    let rewind = state.rewind.as_ref().expect("rewind picker");
+    assert_eq!(rewind.checkpoints.len(), 2);
+    assert!(matches!(
+        rewind.phase,
+        crate::types::RewindPhase::PickCheckpoint {
+            selected: 0,
+            scroll: 0
+        }
+    ));
+
+    state.rewind = None;
+    state.update(TuiEvent::RewindCheckpoints(Vec::new()));
+    assert!(state.rewind.is_none());
+    assert!(
+        matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::Error(text)) if text == "no rewindable checkpoints in this session"
+        ),
+        "{:?}",
+        state.transcript.messages
+    );
+}
+
+#[test]
+fn rewind_picker_walks_checkpoints_modes_and_unavailable_reasons() {
+    let (mut state, action_rx) = test_state();
+    state.update(TuiEvent::RewindCheckpoints(vec![
+        rewind_checkpoint_view(0, true),
+        rewind_checkpoint_view(1, false),
+        rewind_checkpoint_view(2, true),
+    ]));
+    // Down moves the selection; Enter opens the mode menu of the selected
+    // checkpoint.
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Down);
+    assert!(matches!(
+        state.rewind.as_ref().unwrap().phase,
+        crate::types::RewindPhase::PickCheckpoint { selected: 1, .. }
+    ));
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Enter);
+    assert!(matches!(
+        state.rewind.as_ref().unwrap().phase,
+        crate::types::RewindPhase::PickMode {
+            checkpoint: 1,
+            selected: 0,
+            show_preview: false
+        }
+    ));
+    // Tab previews the highlighted mode through a dry-run; an unavailable
+    // mode says why instead of asking the runtime.
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Tab);
+    assert!(matches!(
+        state.rewind.as_ref().unwrap().phase,
+        crate::types::RewindPhase::PickMode {
+            show_preview: false,
+            ..
+        }
+    ));
+    assert!(
+        matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::Error(text)) if text.contains("no file snapshot")
+        ),
+        "{:?}",
+        state.transcript.messages
+    );
+    // The second checkpoint has no snapshot: file modes say why they cannot
+    // be used, and stay on the menu.
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Enter);
+    assert!(matches!(
+        state.rewind.as_ref().unwrap().phase,
+        crate::types::RewindPhase::PickMode { .. }
+    ));
+    assert!(
+        matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::Error(text))
+                if text.contains("no file snapshot") && text.contains("#2")
+        ),
+        "{:?}",
+        state.transcript.messages
+    );
+    // The summarize modes are available even without a file snapshot: they
+    // ask the runtime for a dry-run like the file modes do.
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Char('4'));
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Enter);
+    assert!(matches!(
+        state.rewind.as_ref().unwrap().phase,
+        crate::types::RewindPhase::PickMode { .. }
+    ));
+    assert!(state.rewind.as_ref().unwrap().pending);
+    assert!(
+        matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RewindToCheckpoint {
+                mode: orca_core::rewind::RewindMode::SummarizeFrom,
+                dry_run: true,
+                ..
+            })
+        ),
+        "the summarize dry-run must be asked of the runtime"
+    );
+    // Esc backs out step by step; Esc on the list closes it.
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Esc);
+    assert!(matches!(
+        state.rewind.as_ref().unwrap().phase,
+        crate::types::RewindPhase::PickCheckpoint { .. }
+    ));
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Esc);
+    assert!(state.rewind.is_none());
+}
+
+#[test]
+fn rewind_mode_dry_run_opens_the_confirm_page_and_y_applies() {
+    let (mut state, action_rx) = test_state();
+    state.update(TuiEvent::RewindCheckpoints(vec![rewind_checkpoint_view(
+        1, true,
+    )]));
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Enter);
+    // Both is the default mode: Enter starts its dry-run.
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Enter);
+    assert!(
+        state.transcript.messages.is_empty(),
+        "{:?}",
+        state.transcript.messages
+    );
+    assert!(
+        matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RewindToCheckpoint {
+                mode: orca_core::rewind::RewindMode::Both,
+                dry_run: true,
+                ..
+            })
+        ),
+        "the dry-run must be asked of the runtime"
+    );
+    let rewind = state.rewind.as_ref().unwrap();
+    assert!(matches!(
+        rewind.phase,
+        crate::types::RewindPhase::PickMode { .. }
+    ));
+    assert!(rewind.pending);
+    state.update(TuiEvent::RewindPreviewed(rewind_outcome(
+        orca_core::rewind::RewindMode::Both,
+        1,
+        true,
+    )));
+    let rewind = state.rewind.as_ref().unwrap();
+    assert!(!rewind.pending);
+    let crate::types::RewindPhase::Confirm { mode, report, .. } = &rewind.phase else {
+        panic!("confirm page: {:?}", rewind.phase);
+    };
+    assert_eq!(*mode, orca_core::rewind::RewindMode::Both);
+    assert!(report.dry_run);
+    // `y` applies the mode the dry-run showed.
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Char('y'));
+    assert!(state.rewind.as_ref().unwrap().pending);
+    assert!(matches!(
+        action_rx.try_recv(),
+        Ok(UserAction::RewindToCheckpoint { dry_run: false, .. })
+    ));
+}
+
+#[test]
+fn a_failed_rewind_keeps_the_dialog_open_and_can_be_retried() {
+    let (mut state, _rx) = test_state();
+    state.update(TuiEvent::RewindCheckpoints(vec![rewind_checkpoint_view(
+        0, true,
+    )]));
+    let mut rewind = state.rewind.take().unwrap();
+    rewind.phase = crate::types::RewindPhase::Confirm {
+        checkpoint: 0,
+        mode: orca_core::rewind::RewindMode::Both,
+        report: rewind_outcome(orca_core::rewind::RewindMode::Both, 0, true).report,
+        selected: 0,
+        show_preview: false,
+        preview_scroll: 0,
+    };
+    rewind.pending = true;
+    state.rewind = Some(rewind);
+
+    state.update(TuiEvent::RewindFailed("disk full".to_string()));
+    assert!(state.rewind.is_some());
+    assert!(!state.rewind.as_ref().unwrap().pending);
+    assert!(
+        matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::Error(text)) if text == "disk full"
+        ),
+        "{:?}",
+        state.transcript.messages
+    );
+}
+
+#[test]
+fn rewind_completed_truncates_the_view_and_restores_the_prompt() {
+    let (mut state, _rx) = test_state();
+    state.push_message(ChatMessage::User("first".to_string()));
+    state.push_message(ChatMessage::Assistant("answer one".to_string()));
+    state.push_message(ChatMessage::User("second".to_string()));
+    state.push_message(ChatMessage::Assistant("answer two".to_string()));
+    state.push_message(ChatMessage::User("third".to_string()));
+    let action_tx = state.event_tx.clone();
+    let pending = test_pending_workflow_notifications();
+    let theme = Theme::named(ThemeName::Dark);
+    let mut textarea = make_textarea(&VimState::new(false), &theme);
+    let mut vim_state = VimState::new(false);
+    let mut presentation = TerminalPresentation::new(
+        false,
+        TerminalPresentationProfile {
+            osc9_supported: false,
+            tmux_passthrough: false,
+        },
+    );
+
+    crate::runtime_event_actions::handle_runtime_event(
+        TuiEvent::RewindCompleted(rewind_outcome(
+            orca_core::rewind::RewindMode::Both,
+            1,
+            false,
+        )),
+        &mut state,
+        &action_tx,
+        &pending,
+        &mut textarea,
+        &mut vim_state,
+        &theme,
+        &mut presentation,
+    );
+
+    assert!(state.rewind.is_none());
+    assert_eq!(textarea_text(&textarea), "prompt 1");
+    let users = state
+        .transcript
+        .messages
+        .iter()
+        .filter(|message| matches!(message, ChatMessage::User(_)))
+        .count();
+    assert_eq!(users, 1, "{:?}", state.transcript.messages);
+    assert!(
+        state.transcript.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::System { text, .. }
+                if text.contains("Rewound to message #2")
+        )),
+        "{:?}",
+        state.transcript.messages
+    );
+    assert!(
+        state.transcript.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::System { text, .. }
+                if text.contains("Restored 2 files (+10 −3), deleted 1")
+        )),
+        "{:?}",
+        state.transcript.messages
+    );
+}
+
+#[test]
+fn rewind_completed_out_of_range_clears_the_view_and_reports() {
+    let (mut state, _rx) = test_state();
+    state.push_message(ChatMessage::User("only".to_string()));
+    state.update(TuiEvent::RewindCompleted(rewind_outcome(
+        orca_core::rewind::RewindMode::Both,
+        7,
+        false,
+    )));
+    assert!(
+        state
+            .transcript
+            .messages
+            .iter()
+            .all(|message| !matches!(message, ChatMessage::User(_) | ChatMessage::Assistant(_))),
+        "{:?}",
+        state.transcript.messages
+    );
+    assert!(
+        state.transcript.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::Error(text) if text.contains("no message #8")
+        )),
+        "{:?}",
+        state.transcript.messages
+    );
+}
+
+#[test]
+fn a_code_only_rewind_leaves_the_conversation_view_alone() {
+    let (mut state, _rx) = test_state();
+    state.push_message(ChatMessage::User("first".to_string()));
+    state.push_message(ChatMessage::User("second".to_string()));
+    state.update(TuiEvent::RewindCompleted(rewind_outcome(
+        orca_core::rewind::RewindMode::Code,
+        0,
+        false,
+    )));
+    let users = state
+        .transcript
+        .messages
+        .iter()
+        .filter(|message| matches!(message, ChatMessage::User(_)))
+        .count();
+    assert_eq!(users, 2, "{:?}", state.transcript.messages);
+    assert!(
+        state.transcript.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::System { text, .. }
+                if text.contains("Restored 2 files (+10 −3), deleted 1")
+        )),
+        "{:?}",
+        state.transcript.messages
+    );
+}
+
+#[test]
+fn hosted_tui_routes_rewind_requests_through_the_runtime() {
+    with_orca_home(|_| {
+        let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+        // Listing a fresh recorded conversation starts its thread and comes
+        // back empty rather than failing.
+        harness.send(UserAction::ListRewindCheckpoints);
+        let listed = harness.recv_until_timeout(Duration::from_secs(30), |event| {
+            matches!(event, TuiEvent::RewindCheckpoints(_) | TuiEvent::Error(_))
+        });
+        assert!(
+            matches!(&listed, TuiEvent::RewindCheckpoints(checkpoints) if checkpoints.is_empty()),
+            "{listed:?}"
+        );
+        // A target the runtime cannot resolve is reported as a rewind
+        // failure, which the dialog shows and keeps open on.
+        harness.send(UserAction::RewindToCheckpoint {
+            target: "item_missing".to_string(),
+            mode: orca_core::rewind::RewindMode::Conversation,
+            dry_run: true,
+        });
+        let failed = harness.recv_until(|event| {
+            matches!(
+                event,
+                TuiEvent::RewindFailed(_) | TuiEvent::RewindPreviewed(_)
+            )
+        });
+        assert!(
+            matches!(&failed, TuiEvent::RewindFailed(message) if !message.is_empty()),
+            "{failed:?}"
+        );
+        harness.shutdown();
+    });
+}
+
+/// Concatenates every recorded `*.jsonl` transcript under an isolated Orca
+/// home. The TUI never reads the writer's path itself; this is only how a test
+/// inspects the durable side of a rewind without exposing that path.
+fn recorded_session_logs(home: &std::path::Path) -> String {
+    fn collect(dir: &std::path::Path, out: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("jsonl") {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    out.push_str(&text);
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    collect(&home.join("sessions"), &mut out);
+    out
+}
+
+/// A summarize rewind is the one rewind that spends a model call, and that
+/// call has to happen in the runtime's summarizer rather than in the TUI's
+/// reducer. This drives the whole hosted path — controller → runtime thread →
+/// `summarize_range` with the mock provider — over a conversation with two
+/// recorded prompts: the first checkpoint is dry-run (which must not call the
+/// model and must not write anything durable), then applied, and the test
+/// asserts the report, the notice, the untouched view, and the durable
+/// `session.rewind` record.
+#[test]
+fn hosted_tui_summarize_rewind_calls_the_runtime_summarizer() {
+    with_orca_home(|home| {
+        let mut harness = AttachedHostedTuiHarness::start(test_config(HistoryMode::Record));
+        // The composer mirrors the user row before the turn runs, so seed the
+        // view the summarize must leave alone.
+        for prompt in ["first summarize prompt", "second summarize prompt"] {
+            harness
+                .state
+                .push_message(ChatMessage::User(prompt.to_string()));
+            harness.send(UserAction::Submit(prompt.to_string()));
+            let terminal = harness.recv_until_timeout(Duration::from_secs(30), |event| {
+                matches!(event, TuiEvent::SessionCompleted { .. })
+            });
+            assert!(
+                matches!(&terminal, TuiEvent::SessionCompleted { status } if status == "success"),
+                "{terminal:?}"
+            );
+        }
+
+        harness.send(UserAction::ListRewindCheckpoints);
+        let listed = harness.recv_until_timeout(Duration::from_secs(30), |event| {
+            matches!(event, TuiEvent::RewindCheckpoints(_) | TuiEvent::Error(_))
+        });
+        let checkpoints = match listed {
+            TuiEvent::RewindCheckpoints(checkpoints) => checkpoints,
+            other => panic!("listing rewind checkpoints failed: {other:?}"),
+        };
+        assert!(checkpoints.len() >= 2, "{checkpoints:?}");
+        let first = checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.prompt_preview == "first summarize prompt")
+            .expect("the first prompt is a rewindable checkpoint");
+        assert!(first.conversation_available);
+        let first_ordinal = first.ordinal;
+        // Summarize modes need no file snapshot: the conversation is enough.
+        let target = first.message_id.clone();
+
+        // Dry-run: describe what apply would summarize, without spending tokens.
+        harness.send(UserAction::RewindToCheckpoint {
+            target: target.clone(),
+            mode: orca_core::rewind::RewindMode::SummarizeFrom,
+            dry_run: true,
+        });
+        let previewed = harness.recv_until_timeout(Duration::from_secs(30), |event| {
+            matches!(
+                event,
+                TuiEvent::RewindPreviewed(_) | TuiEvent::RewindFailed(_)
+            )
+        });
+        let preview = match previewed {
+            TuiEvent::RewindPreviewed(preview) => preview,
+            other => panic!("the summarize dry-run failed: {other:?}"),
+        };
+        assert!(preview.report.dry_run);
+        assert_eq!(preview.report.mode, "summarize_from");
+        assert_eq!(preview.user_ordinal, first_ordinal);
+        assert_eq!(preview.prompt.as_deref(), Some("first summarize prompt"));
+        let conversation = preview
+            .report
+            .conversation
+            .as_ref()
+            .expect("the summarize dry-run describes the conversation cut");
+        assert_eq!(conversation.kind, "summarize_from");
+        assert!(
+            preview
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == "summarize_requires_model"),
+            "the dry-run must say apply calls the summarizer: {:?}",
+            preview.report.warnings
+        );
+        assert!(preview.report.rewind_id.is_none());
+        // No model call, no rewrite: nothing durable changed yet.
+        assert!(
+            !recorded_session_logs(home).contains("\"session.rewind\""),
+            "a dry-run must not append a rewind record"
+        );
+
+        // Apply: the runtime summarizes the range after the first prompt with
+        // the mock provider and records the rewind.
+        harness.send(UserAction::RewindToCheckpoint {
+            target,
+            mode: orca_core::rewind::RewindMode::SummarizeFrom,
+            dry_run: false,
+        });
+        let completed = harness.recv_until_timeout(Duration::from_secs(30), |event| {
+            matches!(
+                event,
+                TuiEvent::RewindCompleted(_) | TuiEvent::RewindFailed(_)
+            )
+        });
+        let outcome = match completed {
+            TuiEvent::RewindCompleted(outcome) => outcome,
+            other => panic!("applying the summarize rewind failed: {other:?}"),
+        };
+        assert!(!outcome.report.dry_run);
+        assert_eq!(outcome.report.mode, "summarize_from");
+        assert_eq!(
+            outcome
+                .report
+                .conversation
+                .as_ref()
+                .map(|conversation| conversation.kind.as_str()),
+            Some("summarize_from")
+        );
+        assert!(
+            outcome.report.rewind_id.is_some(),
+            "an applied rewind is recorded: {:?}",
+            outcome.report
+        );
+
+        // The reducer left the visible history alone and said what happened.
+        let users = harness
+            .state
+            .transcript
+            .messages
+            .iter()
+            .filter(|message| matches!(message, ChatMessage::User(_)))
+            .count();
+        assert_eq!(users, 2, "{:?}", harness.state.transcript.messages);
+        assert!(
+            harness
+                .state
+                .transcript
+                .messages
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    ChatMessage::System { text, .. }
+                        if text == "Conversation summarized (Ctrl+O for history)"
+                )),
+            "{:?}",
+            harness.state.transcript.messages
+        );
+        assert!(
+            !harness
+                .state
+                .transcript
+                .messages
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    ChatMessage::System { text, .. } if text.contains("Rewound to message #")
+                )),
+            "a summarize must not cut the rendered history: {:?}",
+            harness.state.transcript.messages
+        );
+
+        // The durable audit record carries the summary the model returned.
+        let logs = recorded_session_logs(home);
+        assert!(logs.contains("\"session.rewind\""), "{logs}");
+        assert!(logs.contains("summarize_from"), "{logs}");
+        assert!(
+            logs.contains("Mock runtime completed the headless harness contract."),
+            "the recorded summary is the provider's: {logs}"
+        );
+    });
+}
+
+#[test]
+fn a_summarize_mode_dry_runs_and_applies_without_cutting_the_view() {
+    let (mut state, action_rx) = test_state();
+    state.push_message(ChatMessage::User("first".to_string()));
+    state.push_message(ChatMessage::Assistant("answer one".to_string()));
+    state.push_message(ChatMessage::User("second".to_string()));
+    state.update(TuiEvent::RewindCheckpoints(vec![rewind_checkpoint_view(
+        1, true,
+    )]));
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Enter);
+    // 4 picks Summarize from here; Enter starts its dry-run instead of
+    // refusing the mode.
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Char('4'));
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Enter);
+    assert!(
+        matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RewindToCheckpoint {
+                mode: orca_core::rewind::RewindMode::SummarizeFrom,
+                dry_run: true,
+                ..
+            })
+        ),
+        "the summarize dry-run must be asked of the runtime"
+    );
+    assert!(state.rewind.as_ref().unwrap().pending);
+
+    state.update(TuiEvent::RewindPreviewed(rewind_outcome(
+        orca_core::rewind::RewindMode::SummarizeFrom,
+        1,
+        true,
+    )));
+    let rewind = state.rewind.as_ref().expect("confirm page");
+    assert!(matches!(
+        rewind.phase,
+        crate::types::RewindPhase::Confirm {
+            mode: orca_core::rewind::RewindMode::SummarizeFrom,
+            ..
+        }
+    ));
+    // Tab shows the (empty here) diff preview area without leaving the page.
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Tab);
+    assert!(matches!(
+        state.rewind.as_ref().unwrap().phase,
+        crate::types::RewindPhase::Confirm {
+            show_preview: true,
+            ..
+        }
+    ));
+    // Applying shows the compacting status until the runtime answers.
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Char('y'));
+    assert_eq!(state.status, AppStatus::Compacting);
+    assert!(
+        matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RewindToCheckpoint { dry_run: false, .. })
+        ),
+        "the summarize apply must be asked of the runtime"
+    );
+
+    let mut outcome = rewind_outcome(orca_core::rewind::RewindMode::SummarizeFrom, 0, false);
+    outcome.prompt = Some("second".to_string());
+    state.update(TuiEvent::RewindCompleted(outcome));
+    assert_eq!(state.status, AppStatus::Idle);
+    assert!(state.rewind.is_none());
+    // The visible history is untouched; only a notice says what happened.
+    let users = state
+        .transcript
+        .messages
+        .iter()
+        .filter(|message| matches!(message, ChatMessage::User(_)))
+        .count();
+    assert_eq!(users, 2, "{:?}", state.transcript.messages);
+    assert!(
+        state.transcript.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::System { text, .. } if text == "Conversation summarized (Ctrl+O for history)"
+        )),
+        "{:?}",
+        state.transcript.messages
+    );
+}
+
+#[test]
+fn a_failed_summarize_returns_to_idle_and_keeps_the_dialog() {
+    let (mut state, _rx) = test_state();
+    state.update(TuiEvent::RewindCheckpoints(vec![rewind_checkpoint_view(
+        0, true,
+    )]));
+    let mut rewind = state.rewind.take().unwrap();
+    rewind.phase = crate::types::RewindPhase::Confirm {
+        checkpoint: 0,
+        mode: orca_core::rewind::RewindMode::SummarizeUpTo,
+        report: rewind_outcome(orca_core::rewind::RewindMode::SummarizeUpTo, 0, true).report,
+        selected: 0,
+        show_preview: false,
+        preview_scroll: 0,
+    };
+    rewind.pending = true;
+    state.rewind = Some(rewind);
+    state.set_status(AppStatus::Compacting);
+
+    state.update(TuiEvent::RewindFailed("summarizer unavailable".to_string()));
+    assert_eq!(state.status, AppStatus::Idle);
+    assert!(state.rewind.is_some());
+    assert!(!state.rewind.as_ref().unwrap().pending);
+    assert!(
+        matches!(
+            state.transcript.messages.last(),
+            Some(ChatMessage::Error(text)) if text == "summarizer unavailable"
+        ),
+        "{:?}",
+        state.transcript.messages
+    );
+}
+
+#[test]
+fn a_confirm_preview_renders_the_dry_run_diffs() {
+    let (mut state, _rx) = test_state();
+    state.update(TuiEvent::RewindCheckpoints(vec![rewind_checkpoint_view(
+        1, true,
+    )]));
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Enter);
+    let mut outcome = rewind_outcome(orca_core::rewind::RewindMode::Both, 1, true);
+    outcome.report.previews = vec![orca_core::rewind::RewindFilePreview {
+        path: "src/main.rs".to_string(),
+        diff: "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new() {}\n"
+            .to_string(),
+        truncated: true,
+        binary: false,
+        insertions: 1,
+        deletions: 1,
+    }];
+    state.update(TuiEvent::RewindPreviewed(outcome));
+    // The confirm page opens with the dry-run's diffs expanded.
+    let frame = crate::test_support::frame_string(&mut state, 120, 40);
+    assert!(frame.contains("Diff preview"), "{frame}");
+    assert!(frame.contains("fn old() {}"), "{frame}");
+    assert!(frame.contains("fn new() {}"), "{frame}");
+    assert!(frame.contains("truncated"), "{frame}");
+    // Tab collapses them, and Tab again brings them back.
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Tab);
+    let collapsed = crate::test_support::frame_string(&mut state, 120, 40);
+    assert!(!collapsed.contains("Diff preview"), "{collapsed}");
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Tab);
+    let expanded = crate::test_support::frame_string(&mut state, 120, 40);
+    assert!(expanded.contains("Diff preview"), "{expanded}");
+}
+
+#[test]
+fn tab_in_the_mode_menu_previews_the_modes_dry_run_diffs() {
+    let (mut state, action_rx) = test_state();
+    state.update(TuiEvent::RewindCheckpoints(vec![rewind_checkpoint_view(
+        1, true,
+    )]));
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Enter);
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Tab);
+    assert!(
+        matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RewindToCheckpoint {
+                mode: orca_core::rewind::RewindMode::Both,
+                dry_run: true,
+                ..
+            })
+        ),
+        "Tab must ask the runtime for the highlighted mode's dry-run"
+    );
+    assert!(state.rewind.as_ref().unwrap().pending);
+    assert!(matches!(
+        state.rewind.as_ref().unwrap().phase,
+        crate::types::RewindPhase::PickMode {
+            show_preview: true,
+            ..
+        }
+    ));
+
+    let mut outcome = rewind_outcome(orca_core::rewind::RewindMode::Both, 1, true);
+    outcome.report.previews = vec![orca_core::rewind::RewindFilePreview {
+        path: "src/lib.rs".to_string(),
+        diff: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old();\n+new();\n".to_string(),
+        truncated: false,
+        binary: false,
+        insertions: 1,
+        deletions: 1,
+    }];
+    state.update(TuiEvent::RewindPreviewed(outcome));
+    let rewind = state.rewind.as_ref().expect("confirm page after preview");
+    assert!(
+        matches!(
+            rewind.phase,
+            crate::types::RewindPhase::Confirm {
+                show_preview: true,
+                ..
+            }
+        ),
+        "the preview arrives with the diffs expanded"
+    );
+    let frame = crate::test_support::frame_string(&mut state, 120, 40);
+    assert!(frame.contains("old();"), "{frame}");
+    assert!(frame.contains("new();"), "{frame}");
+}
+
+#[test]
+fn escaping_a_pending_mode_preview_abandons_it() {
+    let (mut state, action_rx) = test_state();
+    state.update(TuiEvent::RewindCheckpoints(vec![rewind_checkpoint_view(
+        1, true,
+    )]));
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Enter);
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Tab);
+    assert!(matches!(
+        action_rx.try_recv(),
+        Ok(UserAction::RewindToCheckpoint { dry_run: true, .. })
+    ));
+    assert!(state.rewind.as_ref().unwrap().pending);
+
+    // Esc leaves the menu and stops waiting on the dry-run.
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Esc);
+    let rewind = state.rewind.as_ref().unwrap();
+    assert!(matches!(
+        rewind.phase,
+        crate::types::RewindPhase::PickCheckpoint { .. }
+    ));
+    assert!(!rewind.pending, "the abandoned preview stops the wait");
+
+    // Its late reply changes nothing.
+    state.update(TuiEvent::RewindPreviewed(rewind_outcome(
+        orca_core::rewind::RewindMode::Both,
+        1,
+        true,
+    )));
+    assert!(matches!(
+        state.rewind.as_ref().unwrap().phase,
+        crate::types::RewindPhase::PickCheckpoint { .. }
+    ));
+
+    // The menu is usable again.
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Enter);
+    crate::test_support::press_in_rewind_dialog(&mut state, KeyCode::Tab);
+    assert!(state.rewind.as_ref().unwrap().pending);
+    assert!(matches!(
+        action_rx.try_recv(),
+        Ok(UserAction::RewindToCheckpoint { dry_run: true, .. })
+    ));
 }

@@ -11,7 +11,8 @@ pub mod tool_schema;
 
 pub use context::{
     DISPLAY_SUMMARY_INPUT_TOKENS, DISPLAY_SUMMARY_OUTPUT_TOKENS, DisplaySummaryError,
-    DisplaySummaryEvidence, DisplaySummaryResult, request_display_summary,
+    DisplaySummaryEvidence, DisplaySummaryResult, RangeSummary, request_display_summary,
+    summarize_range,
 };
 
 use std::collections::VecDeque;

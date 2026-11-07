@@ -112,6 +112,36 @@
       "crates/orca-runtime/src/workspace_observation.rs",
       "unix_libc_process",
       3
+    ],
+    [
+      "rewind-apply-file-mode",
+      "crates/orca-rewind/src/apply.rs",
+      "unix_std_api",
+      1
+    ],
+    [
+      "rewind-store-file-mode",
+      "crates/orca-rewind/src/store.rs",
+      "unix_std_api",
+      2
+    ],
+    [
+      "rewind-path-file-mode",
+      "crates/orca-rewind/src/path.rs",
+      "unix_std_api",
+      3
+    ],
+    [
+      "rewind-plan-test-symlink",
+      "crates/orca-rewind/src/plan.rs",
+      "unix_std_api",
+      1
+    ],
+    [
+      "rewind-workspace-fingerprint",
+      "crates/orca-runtime/src/rewind.rs",
+      "unix_std_api",
+      1
     ]
   ],
   "deferred_boundaries": [

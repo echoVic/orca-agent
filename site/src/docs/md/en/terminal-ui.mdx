@@ -390,6 +390,22 @@ forks the current one, and `/rename` renames it. When you quit, Orca prints the
 See [Conversation continuity](session-commands.md) for resuming from the
 command line.
 
+## Rewind
+
+`/rewind` (alias `/checkpoint`) opens a checkpoint list: one row per rewindable
+user message, with that turn's prompt and file-change statistics. Selecting a
+row can restore the files to their state when the message was submitted,
+rewind only the conversation, do both, or replace one side of the boundary
+with a model-written summary (`summarize-from` / `summarize-up-to`; the
+confirmation page announces the summarization request). A message without a
+file checkpoint supports the conversation modes only. The confirmation page
+shows the file plan, skipped paths, warnings, and a unified-diff preview (Tab
+toggles it, PgUp/PgDn scrolls); files changed by bash or external processes
+are never restored. A session keeps its most recent 100 checkpoints and older
+ones support the conversation rewind only. Checkpoints cover only files
+written by `edit` / `write_file`; set `ORCA_DISABLE_FILE_HISTORY=1` to disable
+capture. The command-line equivalent is `orca rewind`.
+
 ## Quitting
 
 `Ctrl+C` twice, while no turn runs, quits: Orca stops every stdio MCP server,

@@ -156,6 +156,7 @@ fn supersedes_recap(action: &UserAction) -> bool {
             | UserAction::ForkSavedSession { .. }
             | UserAction::Compact
             | UserAction::Backtrack
+            | UserAction::RewindToCheckpoint { .. }
             | UserAction::FocusChildThread { .. }
             | UserAction::ReturnToParentThread
             | UserAction::StartSideConversation { .. }
@@ -401,6 +402,8 @@ pub(crate) fn hosted_tui_controller_loop(
                     | UserAction::ResumeTask { .. }
                     | UserAction::RetryTask { .. }
                     | UserAction::FollowUpTask { .. }
+                    | UserAction::ListRewindCheckpoints
+                    | UserAction::RewindToCheckpoint { .. }
                     | UserAction::Backtrack)
             );
         if side_disallowed {
@@ -1025,6 +1028,36 @@ pub(crate) fn hosted_tui_controller_loop(
             Ok(UserAction::Backtrack) => {
                 handle_hosted_context_action(
                     HostedContextAction::Backtrack,
+                    &mut thread,
+                    &host,
+                    &config,
+                    &preloaded,
+                    &event_tx,
+                    &control,
+                );
+            }
+            Ok(UserAction::ListRewindCheckpoints) => {
+                handle_hosted_context_action(
+                    HostedContextAction::ListRewindCheckpoints,
+                    &mut thread,
+                    &host,
+                    &config,
+                    &preloaded,
+                    &event_tx,
+                    &control,
+                );
+            }
+            Ok(UserAction::RewindToCheckpoint {
+                target,
+                mode,
+                dry_run,
+            }) => {
+                handle_hosted_context_action(
+                    HostedContextAction::RewindCheckpoint {
+                        target,
+                        mode,
+                        dry_run,
+                    },
                     &mut thread,
                     &host,
                     &config,

@@ -396,9 +396,19 @@ mod tests {
         );
         assert!(textarea.is_empty(), "Esc clears the draft");
         assert!(state.pending_pastes.is_empty());
-        assert_eq!(
-            textarea.placeholder_text(),
-            "Draft cleared · ↑ brings it back"
+        // The recovery hint is a transcript line, not a placeholder that
+        // outlives the moment: the composer keeps its normal affordances.
+        assert!(
+            !textarea.placeholder_text().contains("Draft cleared"),
+            "the composer placeholder must stay the default one"
+        );
+        assert!(
+            matches!(
+                state.transcript.messages.last(),
+                Some(crate::transcript_state::ChatMessage::System { text, .. })
+                    if text == "Draft cleared · ↑ brings it back"
+            ),
+            "the cleared draft must be announced in the transcript"
         );
 
         press_idle(KeyCode::Up, &mut state, &mut textarea, &mut vim, &action_tx);

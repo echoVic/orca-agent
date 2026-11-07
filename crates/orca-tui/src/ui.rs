@@ -306,6 +306,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         crate::mcp_panel::render_mcp_dialog(frame, state, theme);
     }
 
+    if state.rewind.is_some() {
+        crate::rewind_panel::render_rewind_dialog(frame, state, theme);
+    }
+
     if state.full_access_confirmation.is_some() {
         render_full_access_confirmation(frame, state, theme);
     }
@@ -3423,12 +3427,47 @@ fn build_welcome_lines<'a>(
         // art; without the art beside it, it only separates the art above.
         for row in rows.into_iter().skip(usize::from(!stacked)) {
             let mut spans = vec![Span::raw("  ")];
-            spans.extend(row);
+            // A tip that overflows would wrap onto a continuation row with no
+            // `›` marker, so cut it at the pane edge instead.
+            spans.extend(fit_welcome_row(row, text_width));
             lines.push(Line::from(spans));
         }
     }
     lines.push(Line::from(""));
     lines
+}
+
+/// Cuts a welcome row to `width` display cells, ending in an ellipsis when
+/// anything was dropped. The welcome is drawn inside a paragraph that wraps, so
+/// a row wider than the pane would otherwise continue on an unmarked line.
+fn fit_welcome_row(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let total: usize = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    if total <= width {
+        return spans;
+    }
+    let budget = width.saturating_sub(1);
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        let span_width = UnicodeWidthStr::width(span.content.as_ref());
+        if used + span_width <= budget {
+            used += span_width;
+            out.push(span);
+            continue;
+        }
+        let room = width - used;
+        if room > 0 {
+            out.push(Span::styled(
+                truncate_to_display_width(span.content.as_ref(), room),
+                span.style,
+            ));
+        }
+        return out;
+    }
+    out
 }
 
 /// Render the lines for a contiguous slice of messages. Used both to flush a settled
@@ -5210,9 +5249,10 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
         ));
     }
 
-    // Right zone, highest priority first: `? help` › `ctx N%` › model ·
-    // effort (truncated to an 8-cell floor before it is dropped) › tokens ·
-    // cost (the first thing dropped).
+    // Right zone, shrunk in this order: tokens · cost first, then the model ·
+    // effort cell (down to an 8-cell floor), then `ctx ◔ N%`, then the
+    // `? help` hint, and only then the model itself. Identity outranks the
+    // hint on a 40-cell terminal: `?` is still discoverable without it.
     let mut model_text = format!(
         "{}{separator}{}",
         displayed_model_name(&state.model_name),
@@ -5250,28 +5290,32 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
     let left_width = span_width(&left);
 
     // Total right-zone width for a given state of the shrinkable cells.
-    let total = |model_width: usize, has_context: bool, has_usage: bool| {
+    let total = |model_width: usize, has_context: bool, has_usage: bool, has_help: bool| {
         left_width
             + model_width
             + if has_context { context_width } else { 0 }
             + if has_usage { usage_width } else { 0 }
-            + help_width
+            + if has_help { help_width } else { 0 }
             + 2
     };
 
     const MODEL_MIN_WIDTH: usize = 8;
     let mut has_context = context_span.is_some();
     let mut has_usage = usage_span.is_some();
+    let mut has_help = true;
     let mut has_model = true;
     let mut model_width = UnicodeWidthStr::width(model_text.as_str());
 
     // 1. Drop tokens/cost first.
-    if has_usage && total(model_width, has_context, has_usage) > width {
+    if has_usage && total(model_width, has_context, has_usage, has_help) > width {
         has_usage = false;
     }
     // 2. Truncate model · effort down to the 8-cell floor.
-    if total(model_width, has_context, has_usage) > width {
-        let reserved = left_width + help_width + 2 + if has_context { context_width } else { 0 };
+    if total(model_width, has_context, has_usage, has_help) > width {
+        let reserved = left_width
+            + if has_help { help_width } else { 0 }
+            + 2
+            + if has_context { context_width } else { 0 };
         let floor = MODEL_MIN_WIDTH.min(model_width);
         let budget = width.saturating_sub(reserved).max(floor);
         if budget < model_width {
@@ -5280,11 +5324,15 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
         }
     }
     // 3. Drop context entirely.
-    if has_context && total(model_width, has_context, has_usage) > width {
+    if has_context && total(model_width, has_context, has_usage, has_help) > width {
         has_context = false;
     }
-    // 4. Drop model · effort entirely — only once context is already gone.
-    if has_model && total(model_width, has_context, has_usage) > width {
+    // 4. Drop the `? help` hint before the model.
+    if has_help && total(model_width, has_context, has_usage, has_help) > width {
+        has_help = false;
+    }
+    // 5. Drop model · effort entirely — only once everything else is gone.
+    if has_model && total(model_width, has_context, has_usage, has_help) > width {
         has_model = false;
     }
 
@@ -5298,7 +5346,9 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
     if has_usage {
         right.push(usage_span.expect("has_usage implies usage_span is Some"));
     }
-    right.push(Span::styled(help_text, theme.muted_style()));
+    if has_help {
+        right.push(Span::styled(help_text, theme.muted_style()));
+    }
     let right_width = span_width(&right);
 
     // Middle zone: cwd · branch, only when there is room for at least 12 cells.
@@ -5766,11 +5816,11 @@ fn format_elapsed_compact(elapsed_secs: u64) -> String {
     format!("{hours}h {minutes:02}m {seconds:02}s")
 }
 
-/// Room left before automatic compaction, as a percentage of the compaction
-/// line (100% = empty, 0% = compaction is due). Fed by the provider-reported
-/// prompt tokens once a turn completes. Pure local observability — never sent
-/// upstream, so it cannot affect DeepSeek's prefix cache. Hidden until a real
-/// budget is known.
+/// Consumed share of the compaction line, as a ring glyph beside the same
+/// number (0% = empty, 100% = automatic compaction is due). Fed by the
+/// provider-reported prompt tokens once a turn completes. Pure local
+/// observability — never sent upstream, so it cannot affect DeepSeek's prefix
+/// cache. Hidden until a real budget is known.
 fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
     let used_tokens = state.context_used_tokens();
     let limit_tokens = state.context_limit_tokens();
@@ -5778,16 +5828,31 @@ fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
         return Span::raw("");
     }
     let used = used_tokens.min(limit_tokens);
-    let remaining = limit_tokens.saturating_sub(used);
-    let percent = (remaining * 100) / limit_tokens;
-    let color = if percent > 50 {
+    let percent = u32::try_from((used * 100) / limit_tokens).unwrap_or(u32::MAX);
+    let color = if percent < 50 {
         theme.success
-    } else if percent > 20 {
+    } else if percent < 80 {
         theme.warning
     } else {
         theme.error
     };
-    Span::styled(format!(" · ctx {percent}%"), Style::default().fg(color))
+    Span::styled(
+        format!(" · ctx {} {percent}%", context_ring(percent)),
+        Style::default().fg(color),
+    )
+}
+
+/// A quarter-step ring that fills with the number beside it, so the glyph
+/// cannot be read as the opposite of the percentage: `○ 0%` is an untouched
+/// window, `● 100%` is the line where compaction starts.
+fn context_ring(percent: u32) -> &'static str {
+    match percent {
+        0..=12 => "○",
+        13..=37 => "◔",
+        38..=62 => "◑",
+        63..=87 => "◕",
+        _ => "●",
+    }
 }
 
 /// The help panel's rows and how many of them fit in `area`.
@@ -6755,41 +6820,60 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
         0 => {
             let width = 78u16.min(area.width.saturating_sub(4));
             let inner_width = usize::from(width.saturating_sub(4));
-            let mut content = vec![Line::from(Span::styled(
-                "Before the first run, review this workspace security boundary.",
-                Style::default().fg(theme.text),
-            ))];
+            // Content rows the popup can actually draw: its own height cap,
+            // minus the panel border, and never past the frame.
+            let max_rows = usize::from(area.height.saturating_sub(4)).min(26);
+
+            let workspace_lines = || {
+                state.first_run.as_ref().map(|first_run| {
+                    wrap_notice_line(
+                        &format!("Workspace: {}", first_run.workspace.display()),
+                        inner_width,
+                        Style::default().fg(theme.border),
+                    )
+                })
+            };
+            let trust_line = || {
+                state.first_run.as_ref().map(|first_run| {
+                    Line::from(Span::styled(
+                        format!(
+                            "Folder trust: {}",
+                            if first_run.workspace_trusted {
+                                "trusted"
+                            } else {
+                                "untrusted"
+                            }
+                        ),
+                        Style::default().fg(if first_run.workspace_trusted {
+                            theme.warning
+                        } else {
+                            theme.success
+                        }),
+                    ))
+                })
+            };
+
+            let mut details: Vec<Line<'static>> = Vec::new();
+            if let Some(lines) = workspace_lines() {
+                details.extend(lines);
+            }
             if let Some(first_run) = &state.first_run {
-                content.extend(wrap_notice_line(
-                    &format!("Workspace: {}", first_run.workspace.display()),
-                    inner_width,
-                    Style::default().fg(theme.border),
-                ));
-                content.extend(wrap_notice_line(
+                details.extend(wrap_notice_line(
                     &format!("Auth file: {}", first_run.auth_path.display()),
                     inner_width,
                     Style::default().fg(theme.muted),
                 ));
-                content.push(Line::from(Span::styled(
-                    format!(
-                        "Folder trust: {}",
-                        if first_run.workspace_trusted {
-                            "trusted"
-                        } else {
-                            "untrusted"
-                        }
-                    ),
-                    Style::default().fg(if first_run.workspace_trusted {
-                        theme.warning
-                    } else {
-                        theme.success
-                    }),
-                )));
-                content.push(Line::from(Span::styled(
+            }
+            if let Some(line) = trust_line() {
+                details.push(line);
+            }
+            if let Some(first_run) = &state.first_run {
+                details.extend(wrap_notice_line(
                     "Generated tools remain sandboxed and may request explicit access.",
+                    inner_width,
                     Style::default().fg(theme.text),
-                )));
-                content.push(Line::from(Span::styled(
+                ));
+                details.push(Line::from(Span::styled(
                     format!(
                         "Local doctor checks: {} pass, {} warn, {} fail",
                         first_run
@@ -6820,14 +6904,14 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                     Style::default().fg(theme.muted),
                 )));
             } else if let Some(error) = &state.first_run_error {
-                content.extend(wrap_notice_line(
+                details.extend(wrap_notice_line(
                     &format!("Cannot inspect security state: {error}"),
                     inner_width,
                     Style::default().fg(theme.error),
                 ));
             }
-            content.extend([
-                Line::from(""),
+
+            let options = [
                 setup_option_line(
                     state.setup_selection == crate::setup_actions::SETUP_TRUST_SELECTION,
                     "Trust workspace",
@@ -6846,13 +6930,51 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                     "E",
                     theme,
                 ),
-                Line::from(""),
-                crate::chrome::hint_line(
-                    theme,
-                    inner_width,
-                    &[("↑↓", "move"), ("Enter", "select"), ("Esc", "exit")],
-                ),
-            ]);
+            ];
+            // The actions row count adapts to the frame: on a 12-row terminal
+            // there is no room for a blank row or the key hint, and dropping
+            // them is always better than dropping the options themselves.
+            let mut actions: Vec<Line<'static>> = Vec::new();
+            if max_rows > options.len() {
+                actions.push(Line::from(""));
+            }
+            actions.extend(options);
+            let hint = crate::chrome::hint_line(
+                theme,
+                inner_width,
+                &[("↑↓", "move"), ("Enter", "select"), ("Esc", "exit")],
+            );
+            if max_rows > actions.len() + 1 {
+                actions.push(Line::from(""));
+                actions.push(hint);
+            } else if max_rows > actions.len() {
+                actions.push(hint);
+            }
+
+            let mut content = wrap_notice_line(
+                "Before the first run, review this workspace security boundary.",
+                inner_width,
+                Style::default().fg(theme.text),
+            );
+            content.extend(details);
+            content.extend(actions.clone());
+            if content.len() > max_rows {
+                // Short frame: the prose and the auth/doctor rows are context,
+                // the trust state and the three options are the decision. Keep
+                // the decision, drop the context from the top.
+                let mut compact: Vec<Line<'static>> = Vec::new();
+                if let Some(lines) = workspace_lines() {
+                    compact.extend(lines);
+                }
+                if let Some(line) = trust_line() {
+                    compact.push(line);
+                }
+                while compact.len() + actions.len() > max_rows && !compact.is_empty() {
+                    compact.remove(0);
+                }
+                compact.extend(actions);
+                content = compact;
+            }
 
             // Sized to the security notice's real content instead of a fixed
             // height so a trust-state-free first run doesn't pad with blank rows.
@@ -7437,7 +7559,9 @@ mod tests {
     use crate::protocol::{TuiEvent, TuiInteractionKey, TuiInteractionKind};
     use crate::surface_projection::SurfaceProjectionState;
     use crate::test_support::frame_string;
-    use crate::types::{ApprovalDialog, PlanApprovalDialog, SlashMenu, SlashMenuItem};
+    use crate::types::{
+        ApprovalDialog, PlanApprovalDialog, RewindPhase, RewindState, SlashMenu, SlashMenuItem,
+    };
     use chrono::Utc;
     use crossbeam_channel as mpsc;
     use orca_core::config::{AdditionalWorkingDirectory, ThemeName};
@@ -9503,6 +9627,99 @@ mod tests {
         });
         let frame = frame_string(&mut state, 100, 30);
         assert!(frame.contains("wraptestmarker"), "{frame}");
+    }
+
+    fn first_run_state() -> orca_runtime::onboarding::FirstRunState {
+        orca_runtime::onboarding::FirstRunState {
+            schema_version: 1,
+            workspace: platform_temp_path("orca-workspace"),
+            config_dir: platform_temp_path("orca-config"),
+            auth_path: platform_temp_path("orca-config/auth.json"),
+            acknowledgement_path: platform_temp_path("orca-config/onboarding.toml"),
+            security_policy_digest: "digest".to_string(),
+            acknowledged: false,
+            workspace_trusted: false,
+            diagnostics: orca_runtime::diagnostics::DiagnosticReport {
+                schema_version: orca_runtime::diagnostics::DOCTOR_SCHEMA_VERSION,
+                package: orca_runtime::diagnostics::CANONICAL_PACKAGE,
+                website: orca_runtime::diagnostics::CANONICAL_WEBSITE,
+                version: "test".to_string(),
+                platform: "test".to_string(),
+                cwd: orca_runtime::diagnostics::DiagnosticCwd {
+                    requested: "/tmp".to_string(),
+                    canonical: None,
+                },
+                checks: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn welcome_wraps_its_notice_lines_instead_of_clipping_them() {
+        let mut state = test_state();
+        state.status = AppStatus::Setup;
+        state.setup_step = 0;
+        // The popup sizes itself from the workspace path, so keep it short
+        // here: the notice sentences must be the content that wraps, and a
+        // long platform temp path would push them out of the popup instead.
+        let mut first_run = first_run_state();
+        // A short, host-neutral workspace keeps the popup narrow enough for
+        // this wrapping assertion on every platform.
+        first_run.workspace = std::path::PathBuf::from("project");
+        state.first_run = Some(first_run);
+
+        let frame = frame_string(&mut state, 60, 20);
+        // Both sentences are longer than the popup's interior; before this
+        // they were cut mid-word ("...security", "...may request exp").
+        assert!(
+            frame.contains("Before the first run, review this workspace"),
+            "{frame}"
+        );
+        assert!(frame.contains("security boundary."), "{frame}");
+        assert!(
+            frame.contains("remain sandboxed and may request"),
+            "{frame}"
+        );
+        assert!(frame.contains("explicit access."), "{frame}");
+    }
+
+    #[test]
+    fn welcome_keeps_its_options_and_hint_on_a_short_frame() {
+        let mut state = test_state();
+        state.status = AppStatus::Setup;
+        state.setup_step = 0;
+        state.first_run = Some(first_run_state());
+
+        let frame = frame_string(&mut state, 40, 12);
+        // 12 rows fit the trust state and the three options, nothing else: the
+        // decision must never be the part that gets clipped.
+        assert!(frame.contains("Trust workspace"), "{frame}");
+        assert!(frame.contains("Continue untrusted"), "{frame}");
+        assert!(frame.contains("Exit"), "{frame}");
+        assert!(frame.contains("Enter select"), "{frame}");
+        assert!(frame.contains("Folder trust: untrusted"), "{frame}");
+        assert!(!frame.contains("Local doctor checks"), "{frame}");
+        assert!(!frame.contains("Auth file"), "{frame}");
+    }
+
+    #[test]
+    fn narrow_welcome_tips_are_cut_instead_of_wrapping_off_their_marker() {
+        let mut state = test_state();
+        state.cwd = "/tmp/project".to_string();
+
+        let frame = frame_string(&mut state, 40, 12);
+        let tips: Vec<&str> = frame
+            .lines()
+            .filter(|line| line.contains("› /resume") || line.contains("› ? keys"))
+            .collect();
+        assert_eq!(tips.len(), 2, "{frame}");
+        for tip in tips {
+            assert!(
+                tip.trim_end().ends_with('…'),
+                "a narrow tip should be cut, not wrapped: {tip:?}"
+            );
+        }
+        assert!(!frame.contains("conversation"), "{frame}");
     }
 
     #[test]
@@ -12156,24 +12373,25 @@ mod tests {
     }
 
     #[test]
-    fn context_cell_starts_at_full_remaining_capacity() {
+    fn context_cell_starts_empty_when_nothing_is_used() {
         let mut state = test_state();
         set_surface_context(&mut state, 0, 1_000_000);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
 
-        assert_eq!(cell.content.as_ref(), " · ctx 100%");
+        assert_eq!(cell.content.as_ref(), " · ctx ○ 0%");
         assert_eq!(cell.style.fg, Some(theme.success));
     }
 
     #[test]
-    fn context_cell_shows_remaining_percentage() {
+    fn context_cell_shows_consumed_percentage_with_a_matching_ring() {
         let mut state = test_state();
         set_surface_context(&mut state, 250, 1_000);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
-        // 25% of the window used means 75% remains.
-        assert_eq!(cell.content.as_ref(), " · ctx 75%");
+        // A quarter of the compaction line is consumed: the ring and the
+        // number say the same thing, so neither can be read backwards.
+        assert_eq!(cell.content.as_ref(), " · ctx ◔ 25%");
         assert_eq!(cell.style.fg, Some(theme.success));
     }
 
@@ -12183,13 +12401,31 @@ mod tests {
         set_surface_context(&mut state, 1_200, 1_000);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
-        assert_eq!(cell.content.as_ref(), " · ctx 0%");
+        assert_eq!(cell.content.as_ref(), " · ctx ● 100%");
         assert_eq!(cell.style.fg, Some(theme.error));
     }
 
     #[test]
-    fn context_cell_warns_then_errors_as_remaining_context_shrinks() {
+    fn context_ring_rounds_to_the_nearest_quarter() {
+        assert_eq!(context_ring(0), "○");
+        assert_eq!(context_ring(12), "○");
+        assert_eq!(context_ring(13), "◔");
+        assert_eq!(context_ring(37), "◔");
+        assert_eq!(context_ring(38), "◑");
+        assert_eq!(context_ring(62), "◑");
+        assert_eq!(context_ring(63), "◕");
+        assert_eq!(context_ring(87), "◕");
+        assert_eq!(context_ring(88), "●");
+        assert_eq!(context_ring(100), "●");
+    }
+
+    #[test]
+    fn context_cell_warns_then_errors_as_consumed_context_grows() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        let mut plenty = test_state();
+        set_surface_context(&mut plenty, 100, 1_000);
+        assert_eq!(context_cell(&plenty, &theme).style.fg, Some(theme.success));
 
         let mut warn = test_state();
         set_surface_context(&mut warn, 700, 1_000);
@@ -12385,7 +12621,7 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
         let wide = status_line(&state, &theme, 180).to_string();
-        assert!(wide.contains("ctx 75%"));
+        assert!(wide.contains("ctx ◔ 25%"));
         assert!(wide.contains("~/Documents/GitHub/blade-deepseek"));
         assert!(wide.contains("git:feature/footer"));
         assert!(wide.contains("8.7k"));
@@ -12394,7 +12630,7 @@ mod tests {
         // The workspace cell loses its git segment before the right zone
         // gives up anything: context and usage both survive.
         let medium = status_line(&state, &theme, 92).to_string();
-        assert!(medium.contains("ctx 75%"));
+        assert!(medium.contains("ctx ◔ 25%"));
         assert!(medium.contains("blade-deepseek"), "{medium}");
         assert!(!medium.contains("git:"));
         assert!(medium.contains("8.7k"));
@@ -12404,30 +12640,59 @@ mod tests {
         // the right zone; context survives a while longer.
         let narrow = status_line(&state, &theme, 60).to_string();
         assert!(narrow.contains("auto-edit"));
-        assert!(narrow.contains("ctx 75%"));
+        assert!(narrow.contains("ctx ◔ 25%"));
         assert!(!narrow.contains("8.7k"));
         assert!(!narrow.contains("git:"));
         assert!(narrow.contains("? help"));
 
         // Narrower still: the model · effort cell truncates (ending in `…`)
         // rather than disappearing, and context keeps showing in full.
-        let narrower = status_line(&state, &theme, 46).to_string();
+        let narrower = status_line(&state, &theme, 48).to_string();
         assert!(narrower.contains("auto-edit"));
-        assert!(narrower.contains("ctx 75%"));
+        assert!(narrower.contains("ctx ◔ 25%"));
         assert!(!narrower.contains("8.7k"));
         assert!(!narrower.contains("git:"));
         assert!(narrower.contains('…'), "{narrower}");
         assert!(narrower.contains("? help"));
 
-        // Narrowest: context itself is dropped and the model cell disappears
-        // entirely, but the mode chip and the help hint never do.
+        // Narrowest: the context cell and the help hint are gone, but the
+        // mode chip and a truncated model — the session's identity — remain.
         let narrowest = status_line(&state, &theme, 32).to_string();
         assert!(narrowest.contains("auto-edit"));
         assert!(!narrowest.contains("ctx"));
         assert!(!narrowest.contains("git:"));
         assert!(!narrowest.contains("blade-deepseek"));
-        assert!(!narrowest.contains("deepseek"));
-        assert!(narrowest.contains("? help"));
+        assert!(!narrowest.contains("? help"), "{narrowest}");
+        assert!(narrowest.contains('…'), "{narrowest}");
+        assert!(
+            UnicodeWidthStr::width(narrowest.as_str()) <= 32,
+            "{narrowest}"
+        );
+    }
+
+    #[test]
+    fn status_line_keeps_the_model_before_the_help_hint_when_cramped() {
+        let mut state = test_state();
+        state.model_name = "deepseek-v4-pro".to_string();
+        state.approval_mode = ApprovalMode::FullAuto;
+        set_surface_context(&mut state, 250, 1_000);
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        // At 40 cells the model and the hint both still fit beside the mode
+        // chip: only the context meter is gone.
+        let wide = status_line(&state, &theme, 40).to_string();
+        assert!(wide.contains("full-auto"), "{wide}");
+        assert!(wide.contains('…'), "{wide}");
+        assert!(!wide.contains("ctx"), "{wide}");
+        assert!(wide.contains("? help"), "{wide}");
+
+        // Cramped below that, identity outranks the hint: a truncated model
+        // replaces `? help` instead of vanishing.
+        let crammed = status_line(&state, &theme, 30).to_string();
+        assert!(crammed.contains("full-auto"), "{crammed}");
+        assert!(crammed.contains('…'), "{crammed}");
+        assert!(!crammed.contains("? help"), "{crammed}");
+        assert!(UnicodeWidthStr::width(crammed.as_str()) <= 30, "{crammed}");
     }
 
     #[test]
@@ -12460,7 +12725,7 @@ mod tests {
         assert!(
             status_line(&state, &theme, 100)
                 .to_string()
-                .contains("ctx 60%")
+                .contains("ctx ◑ 39%")
         );
     }
 
@@ -12476,9 +12741,9 @@ mod tests {
         state.workspace_git = Some(GitIdentity::Branch("main".to_string()));
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
-        let narrow = status_line(&state, &theme, 46).to_string();
+        let narrow = status_line(&state, &theme, 48).to_string();
         assert!(narrow.contains("auto-edit"));
-        assert!(narrow.contains("ctx 75%"), "{narrow}");
+        assert!(narrow.contains("ctx ◔ 25%"), "{narrow}");
         assert!(
             narrow.contains('…'),
             "an oversized model cell should truncate, not vanish: {narrow}"
@@ -12487,16 +12752,16 @@ mod tests {
         assert!(!narrow.contains("~/workspace"));
         assert!(!narrow.contains("git:main"));
         assert!(narrow.contains("? help"));
-        assert!(UnicodeWidthStr::width(narrow.as_str()) <= 46);
+        assert!(UnicodeWidthStr::width(narrow.as_str()) <= 48);
 
-        let wide = status_line(&state, &theme, 120).to_string();
+        let wide = status_line(&state, &theme, 124).to_string();
         assert!(wide.contains("auto-edit"));
         assert!(wide.contains("a-very-long-model-name-that-would-fill-the-footer · max"));
-        assert!(wide.contains("ctx 75%"));
-        assert!(wide.contains("~/workspace"));
+        assert!(wide.contains("ctx ◔ 25%"));
+        assert!(wide.contains("~/workspace"), "{wide}");
         assert!(wide.contains("git:main"));
         assert!(wide.contains("? help"));
-        assert!(UnicodeWidthStr::width(wide.as_str()) <= 120);
+        assert!(UnicodeWidthStr::width(wide.as_str()) <= 124);
     }
 
     #[test]
@@ -12531,7 +12796,7 @@ mod tests {
         // mode chip, context and the help hint all survive at this width.
         let narrow = status_line(&state, &theme, 60).to_string();
         assert!(narrow.contains("auto-edit"));
-        assert!(narrow.contains("ctx 75%"));
+        assert!(narrow.contains("ctx ◔ 25%"));
         assert!(!narrow.contains("8.7k"));
         assert!(narrow.contains("? help"));
 
@@ -17099,6 +17364,69 @@ mod tests {
             diff_scroll: 0,
         });
         assert_golden("approval", &frame_string(&mut state, 100, 30));
+    }
+
+    #[test]
+    fn golden_rewind_confirm_dialog() {
+        let mut state = golden_state();
+        state.rewind = Some(RewindState {
+            phase: RewindPhase::Confirm {
+                checkpoint: 0,
+                mode: orca_core::rewind::RewindMode::Both,
+                report: orca_core::rewind::RewindReport {
+                    target_message_id: "item_0".into(),
+                    ordinal: 0,
+                    mode: "both".into(),
+                    dry_run: true,
+                    files: orca_core::rewind::RewindFilesReport {
+                        changed: 3,
+                        deleted: 1,
+                        unchanged: 5,
+                        skipped: vec![orca_core::rewind::RewindSkip {
+                            path: "assets/logo.bin".into(),
+                            reason: "blob_missing".into(),
+                        }],
+                    },
+                    stats: orca_core::rewind::RewindStats {
+                        insertions: 41,
+                        deletions: 7,
+                        omitted: false,
+                    },
+                    warnings: vec![orca_core::rewind::RewindWarning {
+                        kind: "untracked_change".into(),
+                        paths: vec!["docs/x.md".into()],
+                        detail: None,
+                    }],
+                    conversation: Some(orca_core::rewind::ConversationRewindReport {
+                        kind: "truncate".into(),
+                        kept_messages: 12,
+                    }),
+                    rewind_id: None,
+                    op_id: None,
+                    previews: Vec::new(),
+                },
+                selected: 0,
+                show_preview: false,
+                preview_scroll: 0,
+            },
+            checkpoints: vec![orca_core::rewind::RewindCheckpointView {
+                message_id: "item_0".into(),
+                ordinal: 0,
+                prompt_preview: "fix the parser".into(),
+                recorded_at: None,
+                files_changed: 4,
+                insertions: 48,
+                deletions: 7,
+                has_snapshot: true,
+                snapshot_evicted: false,
+                conversation_available: true,
+                files_available: true,
+                unavailable_reasons: Vec::new(),
+            }],
+            pending: false,
+            error: None,
+        });
+        assert_golden("rewind-confirm", &frame_string(&mut state, 100, 30));
     }
 
     #[test]

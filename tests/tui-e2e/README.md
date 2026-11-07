@@ -31,8 +31,8 @@ No API key is required for the default suites.
 
 ```sh
 cargo build --locked --bin orca
-ORCA_BIN=target/debug/orca tests/tui-e2e/orca-smoke.sh      # 21 checks
-ORCA_BIN=target/debug/orca tests/tui-e2e/orca-extended.sh   # 40 checks
+ORCA_BIN=target/debug/orca tests/tui-e2e/orca-smoke.sh      # 25 checks
+ORCA_BIN=target/debug/orca tests/tui-e2e/orca-extended.sh   # 44 checks
 LIVE=1 ORCA_API_KEY=sk-... ORCA_BIN=target/debug/orca tests/tui-e2e/orca-extended.sh
 ```
 
@@ -55,16 +55,18 @@ The suites never read or write `~/.orca`:
 
 ## Coverage
 
-`orca-smoke.sh` (21): welcome/trust screen, continue-untrusted, splash, `?` help,
-`/` palette, `/status` expansion, resize, double `Ctrl+C` quit.
+`orca-smoke.sh` (25): welcome/trust screen, continue-untrusted, splash, `?` help,
+`/` palette, `/status` (expanded security rows, `Ctrl+O` collapse/expand), resize,
+double `Ctrl+C` quit.
 
-`orca-extended.sh` (40, +6 with `LIVE=1`):
+`orca-extended.sh` (44, +6 with `LIVE=1`):
 
 - welcome T/U/E, `Esc` exits, `--plan` starts in plan mode
 - help keys (`?` only on empty composer, `Ctrl+K`, `F1`), `Esc`/draft semantics
 - approval cycle: full-auto → plan → suggest → auto-edit → Full Access modal
 - `Ctrl+L`, `Ctrl+U`, `Ctrl+C` arming quit
-- `/model`, `/base-url`, `/resume`, `/trust`, `/side`
+- `/model`, `/base-url`, `/resume`, `/trust`, `/status` trust rows, `/rewind`
+  empty state, `/side`
 - `@` mentions (files + skills, trusted and untrusted), `$` skills
 - trusted vs untrusted welcome, unicode input, 40x12 layout
 - live: prompt/reply, `/copy` clipboard, `/status` title+usage, `Esc` backtrack,

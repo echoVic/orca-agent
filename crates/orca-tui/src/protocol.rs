@@ -7,6 +7,7 @@ use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::OperationId;
 use orca_core::mcp_types::McpServerConfig;
 use orca_core::plan_types::PlanItem;
+use orca_core::rewind::{RewindCheckpointView, RewindMode, RewindOutcome};
 use orca_runtime::mentions::MentionBindings;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 use orca_runtime::surface::{
@@ -493,6 +494,20 @@ pub enum TuiEvent {
     Backtracked {
         prompt: String,
     },
+    /// The rewindable checkpoints of the conversation in view, listed when
+    /// `/rewind` opens: the rewind dialog shows them, or says there are none.
+    RewindCheckpoints(Vec<RewindCheckpointView>),
+    /// The dry-run of a rewind: what applying its mode to its target would
+    /// do, for the dialog's confirm page.
+    RewindPreviewed(RewindOutcome),
+    /// A rewind was applied: the conversation is truncated before the
+    /// `user_ordinal`-th user message, the prompt of the target message is
+    /// restored to the composer, and the files report describes what
+    /// changed.
+    RewindCompleted(RewindOutcome),
+    /// A rewind, or its dry-run, failed: the dialog stays open, showing the
+    /// error, so the user can pick again or cancel.
+    RewindFailed(String),
     /// The reconnect, login or logout `/mcp` started for the MCP server the
     /// catalog names `server` is over, however it went.
     McpActionFinished {
@@ -755,6 +770,16 @@ pub enum UserAction {
         response: TuiInteractionResponse,
     },
     Backtrack,
+    /// `/rewind`: list the conversation's rewindable checkpoints, which come
+    /// back as `TuiEvent::RewindCheckpoints`.
+    ListRewindCheckpoints,
+    /// `/rewind`: apply `mode` to the checkpoint `target`, or with
+    /// `dry_run`, report what that would do as `TuiEvent::RewindPreviewed`.
+    RewindToCheckpoint {
+        target: String,
+        mode: RewindMode,
+        dry_run: bool,
+    },
     BackgroundCurrentTurn,
     Interrupt,
     Cancel,

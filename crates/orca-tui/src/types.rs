@@ -17,6 +17,7 @@ use orca_core::mcp_types::McpServerConfig;
 #[cfg(test)]
 use orca_core::plan_types::PlanItem;
 use orca_core::proposed_plan::ProposedPlanStreamParser;
+use orca_core::rewind::{RewindCheckpointView, RewindMode, RewindReport};
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_file_search::{SearchPhase, SearchProgress};
 use orca_mcp::oauth::McpLoginCancel;
@@ -269,6 +270,65 @@ pub(crate) fn mcp_config_name<'a>(configs: &'a [McpServerConfig], server: &'a st
 pub(crate) struct McpDialog {
     pub(crate) selected: usize,
     pub(crate) showing_details: bool,
+}
+
+/// The `/rewind` dialog: the checkpoints of the conversation in view, and
+/// the step of the picker it is on. The renderer draws it while it is set
+/// (see `rewind_panel`); its keys are handled in `rewind_actions`.
+#[derive(Debug, Clone)]
+pub(crate) struct RewindState {
+    pub(crate) phase: RewindPhase,
+    pub(crate) checkpoints: Vec<RewindCheckpointView>,
+    /// A runtime read the dialog waits on: the list, a dry-run on the way to
+    /// the confirm page, or the apply from it. Keys that would start another
+    /// call are ignored while it is set; Esc still closes the dialog.
+    pub(crate) pending: bool,
+    /// Why the last choice could not be made (an unavailable mode), shown in
+    /// the dialog until the selection changes.
+    pub(crate) error: Option<String>,
+}
+
+impl RewindState {
+    pub(crate) fn new(checkpoints: Vec<RewindCheckpointView>) -> Self {
+        Self {
+            phase: RewindPhase::PickCheckpoint {
+                selected: 0,
+                scroll: 0,
+            },
+            checkpoints,
+            pending: false,
+            error: None,
+        }
+    }
+}
+
+/// The step of the `/rewind` picker: the checkpoint list, the mode menu of a
+/// checkpoint, or the confirm page of a rewind's dry-run.
+#[derive(Debug, Clone)]
+pub(crate) enum RewindPhase {
+    /// Choosing the checkpoint: `selected` indexes `RewindState::checkpoints`,
+    /// `scroll` is the first row the windowed list shows.
+    PickCheckpoint { selected: usize, scroll: usize },
+    /// Choosing the mode of checkpoint `checkpoint`: `selected` indexes the
+    /// action menu in [`crate::rewind_actions`], whose last entry cancels;
+    /// `show_preview` toggles the file preview.
+    PickMode {
+        checkpoint: usize,
+        selected: usize,
+        show_preview: bool,
+    },
+    /// Confirming `mode` on `checkpoint` with the report its dry-run
+    /// returned: `selected` is 0 to apply and 1 to cancel. `show_preview`
+    /// toggles the per-file unified diffs, `preview_scroll` the first line
+    /// shown of them.
+    Confirm {
+        checkpoint: usize,
+        mode: RewindMode,
+        report: RewindReport,
+        selected: usize,
+        show_preview: bool,
+        preview_scroll: usize,
+    },
 }
 
 /// A server as `/mcp` lists it.
@@ -601,6 +661,8 @@ pub struct AppState {
     pub plan_approval_dialog: Option<PlanApprovalDialog>,
     pub config_dialog: Option<ConfigDialog>,
     pub(crate) mcp_dialog: Option<McpDialog>,
+    /// The `/rewind` picker, while it is open.
+    pub(crate) rewind: Option<RewindState>,
     /// The MCP servers of the thread in view, with their tools and prompts,
     /// from its latest projection; before a thread, those that started with
     /// the TUI, as they stand.
@@ -1071,6 +1133,7 @@ impl AppState {
             plan_approval_dialog: None,
             config_dialog: None,
             mcp_dialog: None,
+            rewind: None,
             mcp_catalog: McpCatalogView::default(),
             surface_mcp_catalog_applied: false,
             mcp_server_configs: Vec::new(),
@@ -1506,6 +1569,7 @@ impl AppState {
         self.plan_approval_dialog = None;
         self.config_dialog = None;
         self.mcp_dialog = None;
+        self.rewind = None;
         self.full_access_confirmation = None;
         self.user_input_dialog = None;
         self.pre_plan_approval_mode = None;
@@ -1692,6 +1756,7 @@ impl AppState {
         self.plan_approval_dialog = None;
         self.config_dialog = None;
         self.mcp_dialog = None;
+        self.rewind = None;
         if self.running_started_at.is_none() {
             self.running_started_at = Some(Instant::now());
             self.turn_diagnostic_seen = false;

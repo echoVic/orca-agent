@@ -86,6 +86,8 @@ mod renderer_interaction_acks;
 mod renderer_loop;
 mod renderer_runtime;
 mod renderer_runtime_inbox;
+mod rewind_actions;
+mod rewind_panel;
 mod running_actions;
 mod runtime_event_actions;
 mod scrollback;
@@ -268,6 +270,20 @@ pub(crate) mod test_support {
     ) {
         let action_tx = state.event_tx.clone();
         crate::mcp_dialog_actions::handle_mcp_dialog_key(
+            &crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            state,
+            &action_tx,
+        );
+    }
+
+    /// Presses `code` in the `/rewind` dialog of `state`, which sends what
+    /// that asks for on the state's own action channel.
+    pub(crate) fn press_in_rewind_dialog(
+        state: &mut crate::types::AppState,
+        code: crossterm::event::KeyCode,
+    ) {
+        let action_tx = state.event_tx.clone();
+        crate::rewind_actions::handle_rewind_key(
             &crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
             state,
             &action_tx,

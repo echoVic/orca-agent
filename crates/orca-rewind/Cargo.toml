@@ -1,0 +1,16 @@
+[package]
+name = "orca-rewind"
+version = "0.1.0"
+edition = "2024"
+description = "Content-addressed file checkpoints for Orca /rewind: blob store, restore planner and crash-safe applier"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+zstd = { workspace = true }
+similar = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }

@@ -83,6 +83,25 @@ foreground_fallback = false
 应用和鼠标位置。设为 `false` 后，这些动作会被拒绝，包括所有 Command 快捷键。
 系统权限、应用与窗口授权，以及用 deny 规则关闭工具的方法，见 [Computer Use](computer-use.md)。
 
+## 文件检查点（`/rewind`）
+
+会话记录历史时，Orca 会为每个 turn 捕获一个文件检查点，`/rewind` 可据此恢复文件与
+对话历史。`[rewind]` 表写在用户配置中；受信任的工作区也可以在 `.orca/config.toml`
+里设置：
+
+```toml
+[rewind]
+enabled = true            # 每个 turn 捕获检查点；设为 false 时 /rewind 列表为空
+observe_untracked = true  # 报告由写工具之外的改动造成的未跟踪文件
+max_checkpoints = 100     # 每个会话保留的检查点数（最小 1）
+```
+
+`ORCA_DISABLE_FILE_HISTORY`（非空且不为 `0`）关闭捕获，
+`ORCA_REWIND_DISABLE_OBSERVE`（任意值）关闭 turn 边界的工作区观察；环境变量
+优先于配置文件。被淘汰的检查点会写入保留水位（retention watermark），此后只剩对话
+回退可用，其文件 blob 会被自动垃圾回收。当会话所在工作区与检查点记录的工作区不一致
+时，文件恢复会被拒绝。
+
 ## 权限规则的目标
 
 `[[permissions.rules]]` 写在用户配置中。规则包含 `tool`、可选的目标 `pattern`，

@@ -6,7 +6,7 @@ use crate::protocol::UserAction;
 const MANIFEST: &str = include_str!(
     "../../../docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json"
 );
-const CURRENT_ACTIONS: [(&str, &str); 55] = [
+const CURRENT_ACTIONS: [(&str, &str); 57] = [
     ("OpenToolImages", "authoritative_read"),
     ("StartSideConversation", "host_session_lifecycle_mutation"),
     ("ToggleSideConversation", "host_session_lifecycle_mutation"),
@@ -49,6 +49,8 @@ const CURRENT_ACTIONS: [(&str, &str); 55] = [
     ("ReadTaskTranscript", "task_read"),
     ("RespondToInteraction", "interaction_mutation"),
     ("Backtrack", "history_mutation"),
+    ("ListRewindCheckpoints", "authoritative_read"),
+    ("RewindToCheckpoint", "history_mutation"),
     ("BackgroundCurrentTurn", "operation_ownership_mutation"),
     ("Interrupt", "operation_mutation"),
     ("Cancel", "host_lifecycle_mutation"),
@@ -110,6 +112,8 @@ fn current_user_action_name(action: &UserAction) -> &'static str {
         UserAction::ReadTaskTranscript(_) => "ReadTaskTranscript",
         UserAction::RespondToInteraction { .. } => "RespondToInteraction",
         UserAction::Backtrack => "Backtrack",
+        UserAction::ListRewindCheckpoints => "ListRewindCheckpoints",
+        UserAction::RewindToCheckpoint { .. } => "RewindToCheckpoint",
         UserAction::BackgroundCurrentTurn => "BackgroundCurrentTurn",
         UserAction::Interrupt => "Interrupt",
         UserAction::Cancel => "Cancel",
@@ -126,7 +130,7 @@ fn current_user_action_name(action: &UserAction) -> &'static str {
     }
 }
 
-const TUI_ENTRYPOINTS: [&str; 43] = [
+const TUI_ENTRYPOINTS: [&str; 44] = [
     "slash.new",
     "slash.model_write",
     "slash.model_read",
@@ -142,6 +146,7 @@ const TUI_ENTRYPOINTS: [&str; 43] = [
     "slash.remember",
     "slash.compact",
     "slash.resume",
+    "slash.rewind",
     "slash.trust_show",
     "slash.trust_mutation",
     "slash_menu.discovery",
