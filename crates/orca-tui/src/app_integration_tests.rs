@@ -2760,11 +2760,19 @@ impl AttachedHostedTuiHarness {
             .expect("attached hosted TUI action");
     }
 
-    fn recv_until(&mut self, mut predicate: impl FnMut(&TuiEvent) -> bool) -> TuiEvent {
+    fn recv_until(&mut self, predicate: impl FnMut(&TuiEvent) -> bool) -> TuiEvent {
+        self.recv_until_timeout(Duration::from_secs(10), predicate)
+    }
+
+    fn recv_until_timeout(
+        &mut self,
+        timeout: Duration,
+        mut predicate: impl FnMut(&TuiEvent) -> bool,
+    ) -> TuiEvent {
         loop {
             let event = self
                 .event_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(timeout)
                 .expect("attached hosted TUI event");
             let event = match accept_attached_tui_event(&mut self.state, event) {
                 Ok(Some(event)) => event,
@@ -8641,7 +8649,7 @@ fn hosted_tui_routes_rewind_requests_through_the_runtime() {
         // Listing a fresh recorded conversation starts its thread and comes
         // back empty rather than failing.
         harness.send(UserAction::ListRewindCheckpoints);
-        let listed = harness.recv_until(|event| {
+        let listed = harness.recv_until_timeout(Duration::from_secs(30), |event| {
             matches!(event, TuiEvent::RewindCheckpoints(_) | TuiEvent::Error(_))
         });
         assert!(
@@ -8666,6 +8674,189 @@ fn hosted_tui_routes_rewind_requests_through_the_runtime() {
             "{failed:?}"
         );
         harness.shutdown();
+    });
+}
+
+/// Concatenates every recorded `*.jsonl` transcript under an isolated Orca
+/// home. The TUI never reads the writer's path itself; this is only how a test
+/// inspects the durable side of a rewind without exposing that path.
+fn recorded_session_logs(home: &std::path::Path) -> String {
+    fn collect(dir: &std::path::Path, out: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("jsonl") {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    out.push_str(&text);
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    collect(&home.join("sessions"), &mut out);
+    out
+}
+
+/// A summarize rewind is the one rewind that spends a model call, and that
+/// call has to happen in the runtime's summarizer rather than in the TUI's
+/// reducer. This drives the whole hosted path — controller → runtime thread →
+/// `summarize_range` with the mock provider — over a conversation with two
+/// recorded prompts: the first checkpoint is dry-run (which must not call the
+/// model and must not write anything durable), then applied, and the test
+/// asserts the report, the notice, the untouched view, and the durable
+/// `session.rewind` record.
+#[test]
+fn hosted_tui_summarize_rewind_calls_the_runtime_summarizer() {
+    with_orca_home(|home| {
+        let mut harness = AttachedHostedTuiHarness::start(test_config(HistoryMode::Record));
+        // The composer mirrors the user row before the turn runs, so seed the
+        // view the summarize must leave alone.
+        for prompt in ["first summarize prompt", "second summarize prompt"] {
+            harness
+                .state
+                .push_message(ChatMessage::User(prompt.to_string()));
+            harness.send(UserAction::Submit(prompt.to_string()));
+            let terminal = harness.recv_until_timeout(Duration::from_secs(30), |event| {
+                matches!(event, TuiEvent::SessionCompleted { .. })
+            });
+            assert!(
+                matches!(&terminal, TuiEvent::SessionCompleted { status } if status == "success"),
+                "{terminal:?}"
+            );
+        }
+
+        harness.send(UserAction::ListRewindCheckpoints);
+        let listed = harness.recv_until_timeout(Duration::from_secs(30), |event| {
+            matches!(event, TuiEvent::RewindCheckpoints(_) | TuiEvent::Error(_))
+        });
+        let checkpoints = match listed {
+            TuiEvent::RewindCheckpoints(checkpoints) => checkpoints,
+            other => panic!("listing rewind checkpoints failed: {other:?}"),
+        };
+        assert!(checkpoints.len() >= 2, "{checkpoints:?}");
+        let first = checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.prompt_preview == "first summarize prompt")
+            .expect("the first prompt is a rewindable checkpoint");
+        assert!(first.conversation_available);
+        let first_ordinal = first.ordinal;
+        // Summarize modes need no file snapshot: the conversation is enough.
+        let target = first.message_id.clone();
+
+        // Dry-run: describe what apply would summarize, without spending tokens.
+        harness.send(UserAction::RewindToCheckpoint {
+            target: target.clone(),
+            mode: orca_core::rewind::RewindMode::SummarizeFrom,
+            dry_run: true,
+        });
+        let previewed = harness.recv_until_timeout(Duration::from_secs(30), |event| {
+            matches!(
+                event,
+                TuiEvent::RewindPreviewed(_) | TuiEvent::RewindFailed(_)
+            )
+        });
+        let preview = match previewed {
+            TuiEvent::RewindPreviewed(preview) => preview,
+            other => panic!("the summarize dry-run failed: {other:?}"),
+        };
+        assert!(preview.report.dry_run);
+        assert_eq!(preview.report.mode, "summarize_from");
+        assert_eq!(preview.user_ordinal, first_ordinal);
+        assert_eq!(preview.prompt.as_deref(), Some("first summarize prompt"));
+        let conversation = preview
+            .report
+            .conversation
+            .as_ref()
+            .expect("the summarize dry-run describes the conversation cut");
+        assert_eq!(conversation.kind, "summarize_from");
+        assert!(
+            preview
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == "summarize_requires_model"),
+            "the dry-run must say apply calls the summarizer: {:?}",
+            preview.report.warnings
+        );
+        assert!(preview.report.rewind_id.is_none());
+        // No model call, no rewrite: nothing durable changed yet.
+        assert!(
+            !recorded_session_logs(home).contains("\"session.rewind\""),
+            "a dry-run must not append a rewind record"
+        );
+
+        // Apply: the runtime summarizes the range after the first prompt with
+        // the mock provider and records the rewind.
+        harness.send(UserAction::RewindToCheckpoint {
+            target,
+            mode: orca_core::rewind::RewindMode::SummarizeFrom,
+            dry_run: false,
+        });
+        let completed = harness.recv_until_timeout(Duration::from_secs(30), |event| {
+            matches!(
+                event,
+                TuiEvent::RewindCompleted(_) | TuiEvent::RewindFailed(_)
+            )
+        });
+        let outcome = match completed {
+            TuiEvent::RewindCompleted(outcome) => outcome,
+            other => panic!("applying the summarize rewind failed: {other:?}"),
+        };
+        assert!(!outcome.report.dry_run);
+        assert_eq!(outcome.report.mode, "summarize_from");
+        assert_eq!(
+            outcome
+                .report
+                .conversation
+                .as_ref()
+                .map(|conversation| conversation.kind.as_str()),
+            Some("summarize_from")
+        );
+        assert!(
+            outcome.report.rewind_id.is_some(),
+            "an applied rewind is recorded: {:?}",
+            outcome.report
+        );
+
+        // The reducer left the visible history alone and said what happened.
+        let users = harness
+            .state
+            .transcript
+            .messages
+            .iter()
+            .filter(|message| matches!(message, ChatMessage::User(_)))
+            .count();
+        assert_eq!(users, 2, "{:?}", harness.state.transcript.messages);
+        assert!(
+            harness.state.transcript.messages.iter().any(|message| matches!(
+                message,
+                ChatMessage::System { text, .. }
+                    if text == "Conversation summarized (Ctrl+O for history)"
+            )),
+            "{:?}",
+            harness.state.transcript.messages
+        );
+        assert!(
+            !harness.state.transcript.messages.iter().any(|message| matches!(
+                message,
+                ChatMessage::System { text, .. } if text.contains("Rewound to message #")
+            )),
+            "a summarize must not cut the rendered history: {:?}",
+            harness.state.transcript.messages
+        );
+
+        // The durable audit record carries the summary the model returned.
+        let logs = recorded_session_logs(home);
+        assert!(logs.contains("\"session.rewind\""), "{logs}");
+        assert!(logs.contains("summarize_from"), "{logs}");
+        assert!(
+            logs.contains("Mock runtime completed the headless harness contract."),
+            "the recorded summary is the provider's: {logs}"
+        );
     });
 }
 

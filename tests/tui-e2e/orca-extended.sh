@@ -54,7 +54,9 @@ check "welcome: T option"        tt a expect text "Trust workspace"
 check "welcome: U option"        tt a expect text "Continue untrusted"
 check "welcome: E option"        tt a expect text "Exit"
 check "welcome: doctor line"     tt a expect text "Local doctor checks"
-tt a key press u >/dev/null 2>&1; tt a key press Enter >/dev/null 2>&1; sleep 1.2
+# T/U commit the highlighted choice directly (their labels are the action);
+# no Enter-to-confirm step is needed.
+tt a key press u >/dev/null 2>&1; sleep 1.2
 check "splash version"           tt a expect text "v[0-9]+\.[0-9]+\.[0-9]+" --regex
 check "splash model"             tt a expect text "deepseek-flash"
 tt a screenshot -o "$SHOT/10-splash.png" >/dev/null 2>&1
@@ -112,6 +114,17 @@ tt a key press Escape >/dev/null 2>&1; tt a key press Ctrl+u >/dev/null 2>&1; sl
 
 tt a type '/side' >/dev/null 2>&1; sleep 0.5; tt a key press Enter >/dev/null 2>&1; sleep 1.0
 check "side before conversation errors" tt a expect text "start the main conversation"
+
+# /rewind with no recorded prompts has nothing to pick: it reports the empty
+# list instead of opening a dialog, and Esc keys the composer back to normal.
+tt a type '/rewind' >/dev/null 2>&1; sleep 0.5; tt a key press Enter >/dev/null 2>&1; sleep 1.0
+check "/rewind reports no checkpoints" tt a expect text "no rewindable checkpoints"
+tt a screenshot -o "$SHOT/17-rewind-empty.png" >/dev/null 2>&1
+tt a key press Escape >/dev/null 2>&1; sleep 0.3
+tt a type 'composer alive' >/dev/null 2>&1; sleep 0.3
+check "/rewind esc back to composer" tt a expect text "composer alive"
+tt a key press Ctrl+u >/dev/null 2>&1; sleep 0.3
+
 tt a type '/new' >/dev/null 2>&1; sleep 0.5; tt a key press Enter >/dev/null 2>&1; sleep 1.2
 tt a type '/side' >/dev/null 2>&1; sleep 0.5; tt a key press Enter >/dev/null 2>&1; sleep 1.2
 check "/side opens after /new"   tt a expect text "Side · main idle"
@@ -122,6 +135,13 @@ check "ctrl+/ back to main"      tt a expect text "Message Orca"
 tt a type '/trust' >/dev/null 2>&1; sleep 0.6
 check "/trust palette entry"     tt a expect text "Manage folder trust"
 tt a key press Escape >/dev/null 2>&1; tt a key press Ctrl+u >/dev/null 2>&1; sleep 0.3
+
+# /status names the security boundary the approval modes gate on; the card
+# opens expanded so the rows are visible without Ctrl+O.
+tt a type '/status' >/dev/null 2>&1; sleep 0.5; tt a key press Enter >/dev/null 2>&1; sleep 1.0
+check "/status names folder trust"  tt a expect text "folder trust: untrusted"
+check "/status names capability profile" tt a expect text "capability profile:"
+tt a screenshot -o "$SHOT/16-status.png" >/dev/null 2>&1
 
 # unicode + narrow layout
 tt a type '你好世界 🐋' >/dev/null 2>&1; sleep 0.5
@@ -144,7 +164,7 @@ echo hello > "$T/README.md"; echo x > "$T/src/main.ts"
 "$ORCA" trust add -C "$T" >/dev/null 2>&1
 tt t run --cols 100 --rows 30 --cwd "$T" "$ORCA" >/dev/null 2>&1; sleep 2
 check "trusted welcome label"    tt t expect text "Folder trust: trusted"
-tt t key press t >/dev/null 2>&1; tt t key press Enter >/dev/null 2>&1; sleep 1.0
+tt t key press t >/dev/null 2>&1; sleep 1.0
 tt t type '@' >/dev/null 2>&1; sleep 1.2
 check "trusted @ lists files"    tt t expect text "README.md"
 check "trusted @ lists dirs"     tt t expect text "src/"
@@ -153,7 +173,7 @@ tt t key press Escape >/dev/null 2>&1; tt t close >/dev/null 2>&1
 
 U=$(mktemp -d /tmp/orca-ext-u.XXXXXX); echo hello > "$U/README.md"
 tt u run --cols 100 --rows 30 --cwd "$U" "$ORCA" >/dev/null 2>&1; sleep 2
-tt u key press u >/dev/null 2>&1; tt u key press Enter >/dev/null 2>&1; sleep 1.0
+tt u key press u >/dev/null 2>&1; sleep 1.0
 tt u type '@' >/dev/null 2>&1; sleep 1.2
 check "untrusted @ opens mentions" tt u expect text "Mentions"
 check "untrusted @ still reads files" tt u expect text "README.md"
@@ -172,7 +192,7 @@ rm -rf "$W"
 P=$(mktemp -d /tmp/orca-ext-p.XXXXXX)
 tt p run --cols 100 --rows 30 --cwd "$P" "$ORCA" --plan >/dev/null 2>&1; sleep 2
 check "--plan keeps welcome"     tt p expect text "Welcome"
-tt p key press u >/dev/null 2>&1; tt p key press Enter >/dev/null 2>&1; sleep 1.2
+tt p key press u >/dev/null 2>&1; sleep 1.2
 check "--plan starts in plan"    tt p expect text "⇧Tab plan"
 tt p close >/dev/null 2>&1; rm -rf "$P"
 
@@ -186,7 +206,7 @@ fi
 if [ "${LIVE:-0}" = "1" ]; then
   L=$(mktemp -d /tmp/orca-ext-l.XXXXXX)
   tt l run --cols 100 --rows 30 --cwd "$L" "$ORCA" >/dev/null 2>&1; sleep 2
-  tt l key press u >/dev/null 2>&1; tt l key press Enter >/dev/null 2>&1; sleep 1.0
+  tt l key press u >/dev/null 2>&1; sleep 1.0
   tt l type 'Reply with the four-letter ping response' >/dev/null 2>&1
   tt l key press Enter >/dev/null 2>&1
   check "live: model answers pong"  tt l expect text "pong" --timeout 60000

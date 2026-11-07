@@ -9632,7 +9632,7 @@ mod tests {
     fn first_run_state() -> orca_runtime::onboarding::FirstRunState {
         orca_runtime::onboarding::FirstRunState {
             schema_version: 1,
-            workspace: std::path::PathBuf::from("/tmp/project"),
+            workspace: platform_temp_path("orca-workspace"),
             config_dir: platform_temp_path("orca-config"),
             auth_path: platform_temp_path("orca-config/auth.json"),
             acknowledgement_path: platform_temp_path("orca-config/onboarding.toml"),
@@ -9659,7 +9659,14 @@ mod tests {
         let mut state = test_state();
         state.status = AppStatus::Setup;
         state.setup_step = 0;
-        state.first_run = Some(first_run_state());
+        // The popup sizes itself from the workspace path, so keep it short
+        // here: the notice sentences must be the content that wraps, and a
+        // long platform temp path would push them out of the popup instead.
+        let mut first_run = first_run_state();
+        // A short, host-neutral workspace keeps the popup narrow enough for
+        // this wrapping assertion on every platform.
+        first_run.workspace = std::path::PathBuf::from("project");
+        state.first_run = Some(first_run);
 
         let frame = frame_string(&mut state, 60, 20);
         // Both sentences are longer than the popup's interior; before this

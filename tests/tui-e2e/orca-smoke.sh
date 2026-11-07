@@ -70,9 +70,9 @@ check "window title is Orca"          tt expect title "Orca"
 check "alternate screen enabled"      tt expect mode alternate_screen
 tt screenshot -o "$SHOT/01-welcome.png" >/dev/null 2>&1
 
-# 2. choose "Continue untrusted" -> main chat UI
+# 2. choose "Continue untrusted" -> main chat UI (the U accelerator commits
+# the choice directly; there is no Enter-to-confirm step)
 tt key press u >/dev/null 2>&1
-tt key press Enter >/dev/null 2>&1
 tt wait idle --timeout 15000 >/dev/null 2>&1
 check "version in splash"             tt expect text "v[0-9]+\.[0-9]+\.[0-9]+" --regex
 check "model in splash"               tt expect text "deepseek-flash"
@@ -97,13 +97,19 @@ tt screenshot -o "$SHOT/04-palette.png" >/dev/null 2>&1
 tt key press Escape >/dev/null 2>&1
 tt key press Ctrl+u >/dev/null 2>&1
 
-# 5. /status card and expansion
+# 5. /status card: the security rows are the point, so it opens expanded
 tt type '/status' >/dev/null 2>&1
 tt key press Enter >/dev/null 2>&1
 check "status card renders"           tt expect text "Session status"
-tt key press Ctrl+o >/dev/null 2>&1
-check "status details expand"         tt expect text "mode: full-auto"
+check "status details are expanded"   tt expect text "mode: full-auto"
+check "status names folder trust"     tt expect text "folder trust:"
+check "status names capability profile" tt expect text "capability profile:"
 check "status shows cwd"              tt expect text "$WSREAL"
+# Ctrl+O still collapses the long card and brings it back.
+tt key press Ctrl+o >/dev/null 2>&1
+check "ctrl+o collapses status"       tt expect text "ctrl+o to expand"
+tt key press Ctrl+o >/dev/null 2>&1
+check "ctrl+o re-expands status"      tt expect text "mode: full-auto"
 tt screenshot -o "$SHOT/05-status.png" >/dev/null 2>&1
 
 # 6. resize down and back
