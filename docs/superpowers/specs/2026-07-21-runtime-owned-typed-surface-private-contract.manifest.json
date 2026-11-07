@@ -1730,6 +1730,20 @@
       "CommandResult",
       "PromptTerminal",
       "ExistingEvent"
+    ],
+    [
+      "SessionRewind",
+      265,
+      "recorded",
+      "None",
+      "TypedSourceRequired",
+      "NoSurfaceScope",
+      "none",
+      [],
+      "split_by_authoritative_source_no_direct_ingress",
+      "CommandResult",
+      "ExtensionOnly",
+      "ExistingEvent"
     ]
   ],
   "non_event_source_columns": [
@@ -7940,8 +7954,8 @@
     }
   ],
   "phase_0a_manifest_invariants": [
-    "source_facts has exactly 58 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 55 unique variants matching UserAction at baseline",
+    "source_facts has exactly 59 unique variants matching EventType at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 57 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",

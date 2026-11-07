@@ -78,6 +78,7 @@ event_inventory!(
     VerificationCompleted,
     Error,
     SessionCompleted,
+    SessionRewind,
 );
 
 #[test]
@@ -95,7 +96,7 @@ fn manifest_source_facts_exactly_match_the_typed_event_inventory() {
         .map(event_variant_name)
         .collect::<Vec<_>>();
 
-    assert_eq!(declared.len(), 58, "the reviewed baseline has 58 events");
+    assert_eq!(declared.len(), 59, "the reviewed baseline has 59 events");
     assert_eq!(
         declared.iter().collect::<BTreeSet<_>>().len(),
         declared.len(),

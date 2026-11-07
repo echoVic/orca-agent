@@ -4972,3 +4972,105 @@ fn failed_goal_generation_stalls_active_goal_and_clears_context() {
         host.shutdown().expect("shutdown runtime host");
     });
 }
+
+#[test]
+fn applied_idle_rewind_emits_one_session_rewind_stream_event() {
+    with_orca_home(|_home| {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .start_thread(config, "rewind stream event")
+            .expect("start recorded runtime thread");
+        let session_id = thread
+            .session_id()
+            .expect("recorded session id")
+            .to_string();
+
+        // One recorded turn leaves a rewindable user message in the transcript.
+        let operation = thread
+            .start_turn(HostedTurnRequest::new("first prompt"), io::sink())
+            .expect("start recorded turn");
+        assert_eq!(
+            operation
+                .wait_timeout(TEST_TIMEOUT)
+                .expect("recorded terminal")
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+
+        let target = thread
+            .list_rewind_checkpoints()
+            .expect("list rewind checkpoints")
+            .last()
+            .expect("recorded turn leaves a rewindable user message")
+            .message_id
+            .clone();
+
+        let observer = Arc::new(RecordingEventObserver::default());
+        thread.set_prompt_queue_event_observer(observer.clone());
+
+        // A failed rewind does not apply anything, so it must stay silent.
+        assert!(
+            thread
+                .rewind_checkpoint(
+                    "item_missing",
+                    orca_core::rewind::RewindMode::Conversation,
+                    false,
+                )
+                .is_err()
+        );
+        assert_eq!(observer.count(EventType::SessionRewind), 0);
+
+        // A dry run plans without applying, so it must stay silent.
+        let dry_run = thread
+            .rewind_checkpoint(&target, orca_core::rewind::RewindMode::Conversation, true)
+            .expect("dry-run rewind");
+        assert!(dry_run.report.dry_run);
+        assert_eq!(observer.count(EventType::SessionRewind), 0);
+
+        let messages_before_rewind = history::load_session(&session_id)
+            .expect("load pre-rewind transcript")
+            .messages
+            .len();
+        let applied = thread
+            .rewind_checkpoint(&target, orca_core::rewind::RewindMode::Conversation, false)
+            .expect("applied rewind");
+        assert!(!applied.report.dry_run);
+        assert_eq!(observer.count(EventType::SessionRewind), 1);
+
+        let events = observer.events();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == EventType::SessionRewind)
+            .expect("applied rewind publishes the stream event");
+        assert_eq!(event.run_id, thread.thread_id());
+        assert_eq!(event.payload["session_id"], session_id);
+        assert_eq!(event.payload["target_message_id"], target);
+        assert_eq!(event.payload["mode"], "conversation");
+        assert_eq!(event.payload["dry_run"], false);
+        assert_eq!(event.payload["conversation"]["kind"], "truncate");
+        assert_eq!(event.payload["files"]["changed"], 0);
+        assert!(event.payload["duration_ms"].as_u64().is_some());
+        assert!(!event.payload["rewind_id"].is_null());
+
+        // The event is a stream event, not a semantic one: it is journaled for
+        // audit but a resumed session never replays it as a conversation
+        // message (only model.response.completed is reconstructed). The fold
+        // still truncates the conversation through the session.rewind record.
+        let transcript = history::load_session(&session_id).expect("load recorded transcript");
+        let journaled = transcript
+            .semantic_events
+            .iter()
+            .find(|event| event.event_type == EventType::SessionRewind)
+            .expect("applied rewind is journaled for audit");
+        assert_eq!(journaled.payload["target_message_id"], target);
+        assert!(
+            transcript.messages.len() < messages_before_rewind,
+            "the conversation rewind truncates the recorded messages"
+        );
+
+        host.shutdown().expect("shutdown runtime host");
+    });
+}

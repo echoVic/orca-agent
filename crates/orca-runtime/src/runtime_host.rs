@@ -19159,6 +19159,24 @@ impl ThreadActor {
         }
     }
 
+    /// Publish a stream-only runtime event produced by an idle command.
+    ///
+    /// Turn events reach clients through the request's `EventObserver`/sink,
+    /// but an idle command has no operation writer. The interactive surface
+    /// that shows this thread installs the thread's event observer; when one
+    /// is attached the event flows through the same observer chain as turn
+    /// events. A recorded session additionally journals it for audit, but the
+    /// event is not semantic, so a resume never replays it as a message.
+    fn publish_idle_stream_event(&self, event: EventDraft) {
+        let observer = self
+            .handle
+            .prompt_queue_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let _ = observe_event(observer.as_deref(), event);
+    }
+
     fn handle_idle_command(&mut self, command: ThreadCommand) {
         let permitted_during_goal_blocking = matches!(
             &command,
@@ -20235,6 +20253,7 @@ impl ThreadActor {
                 reply,
             } => {
                 let config = &self.config;
+                let started_at = Instant::now();
                 let result = self
                     .state
                     .as_mut()
@@ -20248,6 +20267,32 @@ impl ThreadActor {
                                 message: error.to_string(),
                             })
                     });
+                // Only an applied rewind is a run fact worth the event: a dry
+                // run plans without truncating the conversation or touching
+                // the workspace, so it stays silent. The event is a live
+                // stream event journaled for audit (never a semantic
+                // conversation event); publish it through the attached
+                // surface's observer and/or the recorded session journal.
+                // Reuse the thread actor's event factory so the sequence stays
+                // contiguous with the turn events around it.
+                let event = if let Ok(outcome) = &result
+                    && !outcome.report.dry_run
+                    && let Some(state) = self.state.as_mut()
+                {
+                    let session_id = state.thread.session().session_id().map(ToString::to_string);
+                    let duration_ms =
+                        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    Some(state.events.session_rewind(
+                        session_id.as_deref(),
+                        &outcome.report,
+                        duration_ms,
+                    ))
+                } else {
+                    None
+                };
+                if let Some(event) = event {
+                    self.publish_idle_stream_event(event);
+                }
                 let _ = reply.send(result);
             }
             ThreadCommand::ShutdownThread { .. } => unreachable!("shutdown handled by actor loop"),
