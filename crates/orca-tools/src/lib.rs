@@ -8,6 +8,7 @@ use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolRes
 use orca_mcp::{McpElicitationHandler, McpRegistry};
 
 pub mod bash;
+pub mod deepseek_web;
 pub mod edit;
 pub mod external;
 pub mod file_admission;
@@ -141,6 +142,7 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel_and_elicitation(
         shell_timeout_secs,
         mcp_elicitation_handler,
         orca_core::capability::ExecutionProfile::Workspace,
+        None,
         should_cancel,
     )
 }
@@ -156,6 +158,7 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_pro
     shell_timeout_secs: u64,
     mcp_elicitation_handler: Option<&dyn McpElicitationHandler>,
     execution_profile: orca_core::capability::ExecutionProfile,
+    deepseek_web: Option<deepseek_web::DeepSeekWebAccess>,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
     // 0 is the default and sets no administrator cap, so an external tool runs
@@ -171,6 +174,7 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_pro
                 .with_shell_timeout(shell_timeout)
                 .with_additional_working_directories(additional_roots.iter().cloned())
                 .with_execution_profile(execution_profile)
+                .with_deepseek_web(deepseek_web)
                 .with_cancel(should_cancel);
             return reg.execute(request, &ctx);
         }
@@ -180,6 +184,7 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_pro
             .with_shell_timeout(shell_timeout)
             .with_additional_working_directories(additional_roots.iter().cloned())
             .with_execution_profile(execution_profile)
+            .with_deepseek_web(deepseek_web)
             .with_cancel(should_cancel);
         return reg.execute(request, &ctx);
     }
@@ -191,6 +196,7 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_pro
         .with_additional_working_directories(additional_roots.iter().cloned())
         .with_execution_profile(execution_profile)
         .with_mcp(mcp_registry)
+        .with_deepseek_web(deepseek_web)
         .with_cancel(should_cancel);
     if let Some(handler) = mcp_elicitation_handler {
         ctx = ctx.with_mcp_elicitation_handler(handler);

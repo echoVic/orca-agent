@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use orca_core::config::RunConfig;
 use orca_core::tool_types::{ToolName, ToolResult};
+use orca_tools::deepseek_web::DeepSeekWebAccess;
 use serde::Deserialize;
 
 use crate::network_proxy::RuntimeNetworkBlockDecision;
@@ -105,7 +107,20 @@ pub(crate) fn execute_runtime_normal_tool(
         invocation.effective_shell_timeout_secs(),
         context.mcp_elicitation_handler,
         invocation.config.execution_profile,
+        deepseek_web_access(&invocation.config),
         || context.cancel.is_cancelled(),
+    )
+}
+
+/// The DeepSeek web API access this session's `web_search` and `web_fetch`
+/// may use: only on the official endpoint, with the session's key, while
+/// `[tools] deepseek_web` is on.
+fn deepseek_web_access(config: &RunConfig) -> Option<DeepSeekWebAccess> {
+    DeepSeekWebAccess::for_provider(
+        config.provider,
+        config.base_url.as_deref(),
+        config.api_key.as_deref(),
+        config.tools.deepseek_web,
     )
 }
 
@@ -1421,5 +1436,23 @@ mod git_metadata_approval_tests {
             git_metadata_approval(&invocation, &context),
             GitMetadataApproval::NotApplicable
         ));
+    }
+}
+
+#[cfg(test)]
+mod deepseek_web_access_tests {
+    use orca_core::config::{ProviderKind, RunConfig};
+
+    #[test]
+    fn deepseek_web_access_follows_provider_and_switch() {
+        let mut config = RunConfig {
+            provider: ProviderKind::DeepSeek,
+            api_key: Some("sk-test".to_string()),
+            ..RunConfig::default()
+        };
+        assert!(super::deepseek_web_access(&config).is_some());
+
+        config.tools.deepseek_web = false;
+        assert!(super::deepseek_web_access(&config).is_none());
     }
 }

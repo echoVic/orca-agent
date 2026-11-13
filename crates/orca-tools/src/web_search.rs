@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
 
+use crate::deepseek_web::DeepSeekWebAccess;
+
 /// How recent the results must be.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Recency {
@@ -55,12 +57,13 @@ enum SearchError {
 }
 
 pub fn execute(request: &ToolRequest, max_bytes: usize) -> ToolResult {
-    execute_or_cancel(request, max_bytes, || false)
+    execute_or_cancel(request, max_bytes, None, || false)
 }
 
 pub fn execute_or_cancel(
     request: &ToolRequest,
     max_bytes: usize,
+    _deepseek: Option<&DeepSeekWebAccess>,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
     let args = match parse_args(request) {

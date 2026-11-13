@@ -2385,6 +2385,47 @@ decision = "allow"
     }
 
     #[test]
+    fn tools_deepseek_web_defaults_on_and_parses_off() {
+        assert!(ToolConfig::default().deepseek_web);
+        assert!(
+            crate::config::format_config_show(&crate::config::RunConfig::default())
+                .contains("deepseek_web = true")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(project_dir.join(".orca")).unwrap();
+
+        std::fs::write(&user_path, "[tools]\nmax_read_parallel = 4\n").unwrap();
+        assert!(
+            load_layered_config_from_paths(&user_path, &project_dir)
+                .tools
+                .deepseek_web,
+            "a [tools] table without the key keeps the default"
+        );
+
+        std::fs::write(&user_path, "[tools]\ndeepseek_web = false\n").unwrap();
+        std::fs::write(
+            project_dir.join(".orca/config.toml"),
+            "[tools]\ndeepseek_web = true\n",
+        )
+        .unwrap();
+        crate::config::folder_trust::set_trust_with_config_dir(
+            &project_dir,
+            dir.path(),
+            crate::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+        assert!(
+            !load_layered_config_from_paths(&user_path, &project_dir)
+                .tools
+                .deepseek_web,
+            "the user turned it off and a trusted project cannot turn it back on"
+        );
+    }
+
+    #[test]
     fn trusted_project_config_cannot_change_execution_capabilities() {
         let dir = tempfile::tempdir().unwrap();
         let user_path = dir.path().join("user.toml");

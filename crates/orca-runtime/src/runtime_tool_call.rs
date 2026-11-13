@@ -336,6 +336,9 @@ impl RuntimeReadonlyToolExecutor for DefaultRuntimeReadonlyToolExecutor {
             READONLY_TOOL_TIMEOUT_SECS,
             None,
             orca_core::capability::ExecutionProfile::ReadOnly,
+            // web_search and web_fetch are not concurrent-safe, so they never
+            // reach this batch and need no DeepSeek web access here.
+            None,
             || cancel.is_cancelled(),
         )
     }

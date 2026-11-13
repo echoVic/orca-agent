@@ -17,6 +17,7 @@ use orca_core::tool_types::{
 };
 use orca_mcp::{McpElicitationHandler, McpRegistry, McpRequestError, client::McpCallOutput};
 
+use crate::deepseek_web::DeepSeekWebAccess;
 use crate::{
     edit, external, git, glob, grep, list_files, read_file, report_blocker, skills, update_goal,
     update_plan, web_fetch, web_search, write_file,
@@ -74,6 +75,9 @@ pub struct ToolContext<'a> {
     pub mcp_elicitation_handler: Option<&'a dyn McpElicitationHandler>,
     pub should_cancel: Option<&'a dyn Fn() -> bool>,
     pub execution_profile: orca_core::capability::ExecutionProfile,
+    /// DeepSeek web API access for `web_search` and `web_fetch`; `None`
+    /// keeps them on Brave/Exa and local fetching.
+    pub deepseek_web: Option<DeepSeekWebAccess>,
 }
 
 impl<'a> ToolContext<'a> {
@@ -87,7 +91,13 @@ impl<'a> ToolContext<'a> {
             mcp_elicitation_handler: None,
             should_cancel: None,
             execution_profile: orca_core::capability::ExecutionProfile::Workspace,
+            deepseek_web: None,
         }
+    }
+
+    pub fn with_deepseek_web(mut self, deepseek_web: Option<DeepSeekWebAccess>) -> Self {
+        self.deepseek_web = deepseek_web;
+        self
     }
 
     pub fn with_output_truncation(mut self, output_truncation: ToolOutputTruncation) -> Self {
@@ -2021,14 +2031,18 @@ impl Tool for BuiltinTool {
             }
             BuiltinExecutor::WriteFile => write_file::execute(request, ctx.cwd),
             BuiltinExecutor::GitStatus => git::status(request, ctx.cwd, ctx.max_output_bytes()),
-            BuiltinExecutor::WebSearch => {
-                web_search::execute_or_cancel(request, ctx.max_output_bytes(), || {
-                    ctx.is_cancelled()
-                })
-            }
-            BuiltinExecutor::WebFetch => {
-                web_fetch::execute_or_cancel(request, ctx.max_output_bytes(), || ctx.is_cancelled())
-            }
+            BuiltinExecutor::WebSearch => web_search::execute_or_cancel(
+                request,
+                ctx.max_output_bytes(),
+                ctx.deepseek_web.as_ref(),
+                || ctx.is_cancelled(),
+            ),
+            BuiltinExecutor::WebFetch => web_fetch::execute_or_cancel(
+                request,
+                ctx.max_output_bytes(),
+                ctx.deepseek_web.as_ref(),
+                || ctx.is_cancelled(),
+            ),
             BuiltinExecutor::Subagent => ToolResult::failed(
                 request,
                 "subagent tool must be executed by the runtime",

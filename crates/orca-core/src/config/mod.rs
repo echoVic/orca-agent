@@ -295,6 +295,12 @@ pub struct ToolConfig {
     /// namespace that needs an operational cap sets this value explicitly.
     #[serde(default = "default_shell_timeout_secs")]
     pub shell_timeout_secs: u64,
+    /// Whether `web_search` and `web_fetch` may use DeepSeek's Search and
+    /// Fetch APIs, billed per request, when the session runs against the
+    /// official DeepSeek endpoint. Off restores Brave/Exa search and
+    /// local-only fetching.
+    #[serde(default = "default_deepseek_web")]
+    pub deepseek_web: bool,
     /// Runtime-captured host evidence. It is never loaded from or persisted to
     /// user configuration.
     #[serde(skip)]
@@ -304,12 +310,17 @@ pub struct ToolConfig {
     pub headless_exec: bool,
 }
 
+fn default_deepseek_web() -> bool {
+    true
+}
+
 impl Default for ToolConfig {
     fn default() -> Self {
         Self {
             max_read_parallel: DEFAULT_MAX_READ_PARALLEL_TOOLS,
             output_truncation: ToolOutputTruncation::default(),
             shell_timeout_secs: default_shell_timeout_secs(),
+            deepseek_web: default_deepseek_web(),
             shell_enforcement_decision: None,
             headless_exec: false,
         }
@@ -881,6 +892,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "max_read_parallel = {}\n",
             "output_truncation = \"{}\"\n",
             "shell_timeout_secs = {}\n",
+            "deepseek_web = {}\n",
             "\n",
             "[subagents]\n",
             "max_depth = {}\n",
@@ -945,6 +957,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         config.tools.max_read_parallel,
         config.tools.output_truncation,
         config.tools.shell_timeout_secs,
+        config.tools.deepseek_web,
         config.subagents.max_depth,
         config.subagents.delegation.as_str(),
         config.subagents.max_running(),
