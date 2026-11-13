@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
 
-use crate::deepseek_web::DeepSeekWebAccess;
+use crate::deepseek_web::{self, DeepSeekSearchHit, DeepSeekWebAccess, DeepSeekWebError};
 
 /// How recent the results must be.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,14 +46,45 @@ struct SearchResult {
     title: String,
     url: String,
     description: String,
+    /// The publication day as `YYYY-MM-DD`; only DeepSeek reports one.
+    published: Option<String>,
 }
 
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(25);
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const EXA_ENDPOINT: &str = "https://mcp.exa.ai/mcp";
+/// DeepSeek rejects longer queries; the limit counts the operators too.
+const DEEPSEEK_QUERY_CHARS: usize = 128;
+/// DeepSeek summaries run to several thousand characters; this keeps five
+/// results to a few thousand tokens.
+const DEEPSEEK_SUMMARY_CHARS: usize = 800;
 
 enum SearchError {
     Cancelled,
     Failed(String),
+}
+
+/// Which search service answers a query.
+enum SearchBackend<'a> {
+    /// Brave, with the key from `BRAVE_SEARCH_API_KEY`.
+    Brave(&'a str),
+    /// DeepSeek's Search API, falling back to Exa when it fails.
+    DeepSeek(&'a DeepSeekWebAccess),
+    /// Exa's keyless MCP endpoint.
+    Exa,
+}
+
+/// A Brave key the user set wins; otherwise DeepSeek when the session may use
+/// it, otherwise Exa.
+fn choose_search_backend<'a>(
+    brave_key: Option<&'a str>,
+    deepseek: Option<&'a DeepSeekWebAccess>,
+) -> SearchBackend<'a> {
+    match (brave_key.filter(|key| !key.trim().is_empty()), deepseek) {
+        (Some(key), _) => SearchBackend::Brave(key),
+        (None, Some(access)) => SearchBackend::DeepSeek(access),
+        (None, None) => SearchBackend::Exa,
+    }
 }
 
 pub fn execute(request: &ToolRequest, max_bytes: usize) -> ToolResult {
@@ -63,7 +94,7 @@ pub fn execute(request: &ToolRequest, max_bytes: usize) -> ToolResult {
 pub fn execute_or_cancel(
     request: &ToolRequest,
     max_bytes: usize,
-    _deepseek: Option<&DeepSeekWebAccess>,
+    deepseek: Option<&DeepSeekWebAccess>,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
     let args = match parse_args(request) {
@@ -88,43 +119,126 @@ pub fn execute_or_cancel(
         }
     };
 
-    let results = runtime.block_on(async {
-        match std::env::var("BRAVE_SEARCH_API_KEY") {
-            Ok(key) if !key.trim().is_empty() => {
-                search_brave_or_cancel(&args, &key, &should_cancel).await
-            }
-            _ => search_exa_or_cancel(&args, &should_cancel).await,
-        }
-    });
+    let brave_key = std::env::var("BRAVE_SEARCH_API_KEY").ok();
+    let backend = choose_search_backend(brave_key.as_deref(), deepseek);
+    let output = runtime.block_on(search_output(
+        &args,
+        backend,
+        EXA_ENDPOINT,
+        chrono::Utc::now().date_naive(),
+        &should_cancel,
+    ));
 
-    let results = match results {
-        Ok(results) => results,
+    match output {
+        Ok(output) => {
+            let (output, truncated) = truncate_output(output, max_bytes);
+            ToolResult::completed(request, output, truncated)
+        }
         Err(SearchError::Cancelled) => {
-            return ToolResult::cancelled(request, "web search was cancelled", None);
+            ToolResult::cancelled(request, "web search was cancelled", None)
         }
-        Err(SearchError::Failed(error)) => return ToolResult::failed(request, error, None),
-    };
+        Err(SearchError::Failed(error)) => ToolResult::failed(request, error, None),
+    }
+}
 
-    let output = if results.is_empty() {
-        "(no web search results)".to_string()
-    } else {
-        results
-            .into_iter()
-            .enumerate()
-            .map(|(index, result)| {
-                format!(
-                    "{}. {}\n{}\n{}",
-                    index + 1,
-                    result.title,
-                    result.description,
-                    result.url
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n")
+/// Runs the search on `backend` and renders the results. A failed DeepSeek
+/// search is answered by Exa, with a note saying so.
+async fn search_output(
+    args: &SearchArgs,
+    backend: SearchBackend<'_>,
+    exa_endpoint: &str,
+    today: NaiveDate,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<String, SearchError> {
+    match backend {
+        SearchBackend::Brave(key) => search_brave_or_cancel(args, key, today, should_cancel)
+            .await
+            .map(format_results),
+        SearchBackend::Exa => search_exa_at_or_cancel_async(args, exa_endpoint, should_cancel)
+            .await
+            .map(format_results),
+        SearchBackend::DeepSeek(access) => {
+            let query = deepseek_query(&args.query, args.recency.as_ref(), today);
+            match deepseek_web::search(access, &query, args.count, should_cancel).await {
+                Ok(hits) => Ok(format_results(
+                    hits.into_iter().map(deepseek_result).collect(),
+                )),
+                Err(DeepSeekWebError::Cancelled) => Err(SearchError::Cancelled),
+                Err(DeepSeekWebError::Failed(reason)) => {
+                    match search_exa_at_or_cancel_async(args, exa_endpoint, should_cancel).await {
+                        Ok(results) => Ok(format!(
+                            "[DeepSeek search failed: {reason}. These results come from Exa.]\n\n{}",
+                            format_results(results)
+                        )),
+                        Err(SearchError::Cancelled) => Err(SearchError::Cancelled),
+                        Err(SearchError::Failed(exa_error)) => Err(SearchError::Failed(format!(
+                            "DeepSeek search failed: {reason}; {exa_error}"
+                        ))),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn format_results(results: Vec<SearchResult>) -> String {
+    if results.is_empty() {
+        return "(no web search results)".to_string();
+    }
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let published = result
+                .published
+                .map(|day| format!(" ({day})"))
+                .unwrap_or_default();
+            format!(
+                "{}. {}{published}\n{}\n{}",
+                index + 1,
+                result.title,
+                result.description,
+                result.url
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+// --- DeepSeek Search API ---
+
+/// The query DeepSeek receives: the recency as `after:`/`before:` operators,
+/// with the query text cut so the whole stays within DeepSeek's limit.
+fn deepseek_query(query: &str, recency: Option<&Recency>, today: NaiveDate) -> String {
+    let query = query.trim();
+    let operators = match recency {
+        Some(Recency::LastDays(days)) => format!("after:{}", days_before(today, *days)),
+        Some(Recency::Range { start, end }) => format!("after:{start} before:{end}"),
+        None => return query.chars().take(DEEPSEEK_QUERY_CHARS).collect(),
     };
-    let (output, truncated) = truncate_output(output, max_bytes);
-    ToolResult::completed(request, output, truncated)
+    let room = DEEPSEEK_QUERY_CHARS.saturating_sub(operators.chars().count() + 1);
+    let head: String = query.chars().take(room).collect();
+    format!("{} {operators}", head.trim_end())
+}
+
+fn deepseek_result(hit: DeepSeekSearchHit) -> SearchResult {
+    SearchResult {
+        title: hit.title,
+        url: hit.url,
+        description: truncate_chars(&hit.summary, DEEPSEEK_SUMMARY_CHARS),
+        published: hit.date,
+    }
+}
+
+/// The first `limit` characters of `text`, with `…` when anything was cut.
+fn truncate_chars(text: &str, limit: usize) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(limit).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
 }
 
 // --- Brave Search API ---
@@ -150,10 +264,11 @@ struct BraveResult {
 async fn search_brave_or_cancel(
     args: &SearchArgs,
     api_key: &str,
+    today: NaiveDate,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<SearchResult>, SearchError> {
     let count = args.count.clamp(1, 10);
-    let query_params = brave_query_params(args, count, chrono::Utc::now().date_naive());
+    let query_params = brave_query_params(args, count, today);
     let client = search_client()?;
     let response = await_or_cancel(
         client
@@ -187,6 +302,7 @@ async fn search_brave_or_cancel(
             title: r.title,
             url: r.url,
             description: r.description.unwrap_or_default(),
+            published: None,
         })
         .collect())
 }
@@ -226,13 +342,6 @@ fn days_before(today: NaiveDate, days: u32) -> NaiveDate {
 }
 
 // --- Exa MCP fallback (no API key required) ---
-
-async fn search_exa_or_cancel(
-    args: &SearchArgs,
-    should_cancel: &dyn Fn() -> bool,
-) -> Result<Vec<SearchResult>, SearchError> {
-    search_exa_at_or_cancel_async(args, "https://mcp.exa.ai/mcp", should_cancel).await
-}
 
 async fn search_exa_at_or_cancel_async(
     args: &SearchArgs,
@@ -331,21 +440,7 @@ fn execute_exa_at_or_cancel(
         &should_cancel,
     )) {
         Ok(results) => {
-            let output = results
-                .into_iter()
-                .enumerate()
-                .map(|(index, result)| {
-                    format!(
-                        "{}. {}\n{}\n{}",
-                        index + 1,
-                        result.title,
-                        result.description,
-                        result.url
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            let (output, truncated) = truncate_output(output, max_bytes);
+            let (output, truncated) = truncate_output(format_results(results), max_bytes);
             ToolResult::completed(request, output, truncated)
         }
         Err(SearchError::Cancelled) => {
@@ -393,6 +488,7 @@ fn parse_exa_text_results(text: &str) -> Vec<SearchResult> {
                     title: std::mem::take(&mut title),
                     url: std::mem::take(&mut url),
                     description: std::mem::take(&mut snippet),
+                    published: None,
                 });
             }
             title = t.to_string();
@@ -410,6 +506,7 @@ fn parse_exa_text_results(text: &str) -> Vec<SearchResult> {
             title,
             url,
             description: snippet,
+            published: None,
         });
     }
 
@@ -768,6 +865,216 @@ mod tests {
         assert_eq!(
             exa_query(&args(Some(range("2026-01-01", "2026-02-01")))),
             "q published between 2026-01-01 and 2026-02-01"
+        );
+    }
+
+    /// An Exa endpoint nothing listens on; a test that reaches it fails.
+    const UNREACHABLE_EXA: &str = "http://127.0.0.1:9/mcp";
+
+    const EXA_ONE_RESULT: &str = r#"data: {"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"Title: Example\nURL: https://example.com/\nText: An example site."}]}}"#;
+
+    const DEEPSEEK_BOOM: &str = r#"{"error":{"message":"boom"}}"#;
+
+    fn search_args(query: &str, count: usize, recency: Option<Recency>) -> SearchArgs {
+        SearchArgs {
+            query: query.to_string(),
+            count,
+            recency,
+        }
+    }
+
+    fn search_with(
+        backend: SearchBackend<'_>,
+        args: &SearchArgs,
+        exa_endpoint: &str,
+    ) -> Result<String, String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test search runtime");
+        match runtime.block_on(search_output(args, backend, exa_endpoint, today(), &|| {
+            false
+        })) {
+            Ok(output) => Ok(output),
+            Err(SearchError::Cancelled) => Err("cancelled".to_string()),
+            Err(SearchError::Failed(error)) => Err(error),
+        }
+    }
+
+    #[test]
+    fn deepseek_search_posts_query_with_recency_operator_and_bearer_key() {
+        let fixture = crate::test_http::serve(vec![(200, r#"{"results":[]}"#.into())]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        search_with(
+            SearchBackend::DeepSeek(&access),
+            &search_args("rust release", 3, Some(Recency::LastDays(7))),
+            UNREACHABLE_EXA,
+        )
+        .expect("search succeeds");
+
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(
+            request.starts_with("POST /v1/tools/search HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("\r\nauthorization: bearer sk-test\r\n"),
+            "{request}"
+        );
+        let body: Value =
+            serde_json::from_str(crate::test_http::body(request)).expect("JSON request body");
+        assert_eq!(
+            body,
+            serde_json::json!({"query": "rust release after:2026-11-07", "count": 3})
+        );
+    }
+
+    #[test]
+    fn deepseek_search_formats_date_and_caps_summary_at_800_chars() {
+        let response = serde_json::json!({"results": [{
+            "title": "Title",
+            "url": "https://example.com/a",
+            "summary": "长".repeat(1000),
+            "snippet": "short",
+            "date": "2026-11-12T16:00:00+00:00"
+        }]})
+        .to_string();
+        let fixture = crate::test_http::serve(vec![(200, response)]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let output = search_with(
+            SearchBackend::DeepSeek(&access),
+            &search_args("rust", 5, None),
+            UNREACHABLE_EXA,
+        )
+        .expect("search succeeds");
+        fixture.requests();
+
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines[0], "1. Title (2026-11-12)");
+        assert_eq!(lines[1], format!("{}…", "长".repeat(800)));
+        assert_eq!(lines[2], "https://example.com/a");
+    }
+
+    #[test]
+    fn deepseek_query_with_operators_stays_within_128_chars() {
+        let query = "查".repeat(150);
+
+        let built = deepseek_query(&query, Some(&Recency::LastDays(7)), today());
+
+        assert!(
+            built.chars().count() <= 128,
+            "{} chars",
+            built.chars().count()
+        );
+        assert!(built.ends_with(" after:2026-11-07"), "{built}");
+    }
+
+    #[test]
+    fn auto_backend_prefers_brave_then_deepseek_then_exa() {
+        let access = DeepSeekWebAccess::for_test("http://127.0.0.1:9", "sk-test");
+
+        assert!(matches!(
+            choose_search_backend(Some("k"), Some(&access)),
+            SearchBackend::Brave("k")
+        ));
+        assert!(matches!(
+            choose_search_backend(Some("k"), None),
+            SearchBackend::Brave("k")
+        ));
+        assert!(matches!(
+            choose_search_backend(None, Some(&access)),
+            SearchBackend::DeepSeek(_)
+        ));
+        assert!(matches!(
+            choose_search_backend(Some("  "), Some(&access)),
+            SearchBackend::DeepSeek(_)
+        ));
+        assert!(matches!(
+            choose_search_backend(None, None),
+            SearchBackend::Exa
+        ));
+        assert!(matches!(
+            choose_search_backend(Some("  "), None),
+            SearchBackend::Exa
+        ));
+    }
+
+    #[test]
+    fn deepseek_failure_falls_back_to_exa_with_note() {
+        let deepseek = crate::test_http::serve(vec![(500, DEEPSEEK_BOOM.into())]);
+        let exa = crate::test_http::serve(vec![(200, EXA_ONE_RESULT.into())]);
+        let access = DeepSeekWebAccess::for_test(&deepseek.origin, "sk-test");
+
+        let output = search_with(
+            SearchBackend::DeepSeek(&access),
+            &search_args("rust", 3, None),
+            &format!("{}/mcp", exa.origin),
+        )
+        .expect("the Exa fallback succeeds");
+
+        assert!(
+            output.starts_with(
+                "[DeepSeek search failed: DeepSeek returned HTTP 500: boom. These results come from Exa.]"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("1. Example\nAn example site.\nhttps://example.com/"),
+            "{output}"
+        );
+        assert_eq!(deepseek.requests().len(), 1);
+        assert_eq!(exa.requests().len(), 1);
+    }
+
+    #[test]
+    fn deepseek_and_exa_failures_are_reported_together() {
+        let deepseek = crate::test_http::serve(vec![(500, DEEPSEEK_BOOM.into())]);
+        let exa = crate::test_http::serve(vec![(503, "{}".into())]);
+        let access = DeepSeekWebAccess::for_test(&deepseek.origin, "sk-test");
+
+        let error = search_with(
+            SearchBackend::DeepSeek(&access),
+            &search_args("rust", 3, None),
+            &format!("{}/mcp", exa.origin),
+        )
+        .expect_err("both backends fail");
+
+        assert!(
+            error.starts_with("DeepSeek search failed: DeepSeek returned HTTP 500: boom; "),
+            "{error}"
+        );
+        assert!(error.contains("Exa search failed with 503"), "{error}");
+        deepseek.requests();
+        exa.requests();
+    }
+
+    #[test]
+    fn empty_deepseek_results_do_not_fall_back() {
+        let deepseek = crate::test_http::serve(vec![(200, r#"{"results":[]}"#.into())]);
+        let exa = TcpListener::bind("127.0.0.1:0").expect("bind Exa listener");
+        let exa_endpoint = format!("http://{}/mcp", exa.local_addr().unwrap());
+        let access = DeepSeekWebAccess::for_test(&deepseek.origin, "sk-test");
+
+        let output = search_with(
+            SearchBackend::DeepSeek(&access),
+            &search_args("rust", 3, None),
+            &exa_endpoint,
+        )
+        .expect("search succeeds");
+
+        assert_eq!(output, "(no web search results)");
+        deepseek.requests();
+        exa.set_nonblocking(true)
+            .expect("non-blocking Exa listener");
+        assert!(
+            matches!(exa.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "Exa must not be contacted"
         );
     }
 

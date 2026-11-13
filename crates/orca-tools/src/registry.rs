@@ -737,7 +737,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         cooperative_builtin_spec(
             "web_search",
-            "Search the web for current information using Brave Search. Returns top results with title, summary, and URL.",
+            "Search the web for current information. Returns the top results with title, URL, publication date when known, and a summary.",
             json!({
                 "type": "object",
                 "properties": {

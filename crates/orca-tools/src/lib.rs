@@ -23,6 +23,8 @@ pub mod report_blocker;
 pub mod sandbox;
 pub mod schema;
 pub mod skills;
+#[cfg(test)]
+mod test_http;
 pub mod update_goal;
 pub mod update_plan;
 pub mod web_fetch;
