@@ -1,3 +1,4 @@
+use chrono::NaiveDate;
 use serde::Deserialize;
 use serde_json::Value;
 use std::future::Future;
@@ -5,13 +6,38 @@ use std::time::Duration;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
 
+/// How recent the results must be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Recency {
+    /// Published in the last N days, 1 to [`MAX_FRESH_DAYS`].
+    LastDays(u32),
+    /// Published between two ISO dates.
+    Range { start: String, end: String },
+}
+
+/// The longest recency window `fresh_days` accepts; larger values are clamped.
+const MAX_FRESH_DAYS: u32 = 365;
+
+/// The arguments as the model sends them.
 #[derive(Debug, Deserialize)]
-struct SearchArgs {
+struct RawSearchArgs {
     query: String,
     #[serde(default = "default_count")]
     count: usize,
-    #[serde(default, deserialize_with = "deserialize_freshness")]
-    freshness: Option<String>,
+    /// The recency window in days, the parameter the schema advertises.
+    #[serde(default, deserialize_with = "deserialize_fresh_days")]
+    fresh_days: Option<u32>,
+    /// Brave-style codes the schema advertised before `fresh_days`; still
+    /// accepted from models and transcripts that use them.
+    #[serde(default, deserialize_with = "deserialize_legacy_freshness")]
+    freshness: Option<Recency>,
+}
+
+#[derive(Debug)]
+struct SearchArgs {
+    query: String,
+    count: usize,
+    recency: Option<Recency>,
 }
 
 struct SearchResult {
@@ -124,7 +150,7 @@ async fn search_brave_or_cancel(
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<SearchResult>, SearchError> {
     let count = args.count.clamp(1, 10);
-    let query_params = brave_query_params(args, count);
+    let query_params = brave_query_params(args, count, chrono::Utc::now().date_naive());
     let client = search_client()?;
     let response = await_or_cancel(
         client
@@ -162,15 +188,38 @@ async fn search_brave_or_cancel(
         .collect())
 }
 
-fn brave_query_params(args: &SearchArgs, count: usize) -> Vec<(&'static str, String)> {
+fn brave_query_params(
+    args: &SearchArgs,
+    count: usize,
+    today: NaiveDate,
+) -> Vec<(&'static str, String)> {
     let mut params = vec![
         ("q", args.query.clone()),
         ("count", count.clamp(1, 10).to_string()),
     ];
-    if let Some(freshness) = args.freshness.as_ref() {
-        params.push(("freshness", freshness.clone()));
+    if let Some(recency) = args.recency.as_ref() {
+        params.push(("freshness", brave_freshness(recency, today)));
     }
     params
+}
+
+/// Brave's `freshness` value: a named window when one matches, otherwise an
+/// explicit date range ending today.
+fn brave_freshness(recency: &Recency, today: NaiveDate) -> String {
+    match recency {
+        Recency::LastDays(1) => "pd".to_string(),
+        Recency::LastDays(7) => "pw".to_string(),
+        Recency::LastDays(30 | 31) => "pm".to_string(),
+        Recency::LastDays(365) => "py".to_string(),
+        Recency::LastDays(days) => format!("{}to{today}", days_before(today, *days)),
+        Recency::Range { start, end } => format!("{start}to{end}"),
+    }
+}
+
+fn days_before(today: NaiveDate, days: u32) -> NaiveDate {
+    today
+        .checked_sub_days(chrono::Days::new(u64::from(days)))
+        .unwrap_or(today)
 }
 
 // --- Exa MCP fallback (no API key required) ---
@@ -373,18 +422,24 @@ fn parse_args(request: &ToolRequest) -> Result<SearchArgs, String> {
             .map(|query| SearchArgs {
                 query: query.to_string(),
                 count: default_count(),
-                freshness: infer_freshness(query),
+                recency: infer_recency(query),
             })
             .ok_or_else(|| "web_search query is required".to_string());
     };
-    let args: SearchArgs =
+    let args: RawSearchArgs =
         serde_json::from_str(raw).map_err(|error| format!("invalid arguments: {error}"))?;
     if args.query.trim().is_empty() {
         return Err("web_search query is required".to_string());
     }
+    let recency = args
+        .fresh_days
+        .map(Recency::LastDays)
+        .or(args.freshness)
+        .or_else(|| infer_recency(&args.query));
     Ok(SearchArgs {
-        freshness: args.freshness.or_else(|| infer_freshness(&args.query)),
-        ..args
+        query: args.query,
+        count: args.count,
+        recency,
     })
 }
 
@@ -392,40 +447,71 @@ fn default_count() -> usize {
     5
 }
 
-fn deserialize_freshness<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+/// A positive whole number of days, sent as a number or a digit string.
+/// Anything else is dropped rather than failing the call, and values above
+/// [`MAX_FRESH_DAYS`] are clamped.
+fn deserialize_fresh_days<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = Option::<String>::deserialize(deserializer)?;
-    Ok(raw.and_then(|value| {
-        let value = value.trim();
-        matches!(value, "pd" | "pw" | "pm" | "py" | _ if is_custom_freshness(value))
-            .then(|| value.to_string())
-    }))
+    let days = match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Number(number)) => number.as_i64(),
+        Some(Value::String(text)) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    };
+    Ok(days
+        .filter(|days| *days > 0)
+        .and_then(|days| u32::try_from(days.min(i64::from(MAX_FRESH_DAYS))).ok()))
 }
 
-fn infer_freshness(query: &str) -> Option<String> {
-    let query = query.to_ascii_lowercase();
-    if query
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .any(|token| {
-            matches!(
-                token,
-                "latest" | "current" | "recent" | "today" | "news" | "updates" | "update"
-            )
-        })
-    {
-        Some("pm".to_string())
-    } else {
-        None
+fn deserialize_legacy_freshness<'de, D>(deserializer: D) -> Result<Option<Recency>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::String(text)) => legacy_freshness(text.trim()),
+        _ => None,
+    })
+}
+
+fn legacy_freshness(value: &str) -> Option<Recency> {
+    match value {
+        "pd" => Some(Recency::LastDays(1)),
+        "pw" => Some(Recency::LastDays(7)),
+        "pm" => Some(Recency::LastDays(31)),
+        "py" => Some(Recency::LastDays(MAX_FRESH_DAYS)),
+        custom => {
+            let (start, end) = custom.split_once("to")?;
+            (is_iso_date(start) && is_iso_date(end)).then(|| Recency::Range {
+                start: start.to_string(),
+                end: end.to_string(),
+            })
+        }
     }
 }
 
-fn is_custom_freshness(value: &str) -> bool {
-    let Some((start, end)) = value.split_once("to") else {
-        return false;
+/// The recency a query implies by its wording, used when the model passes
+/// none. When words for several windows appear, the shortest window wins.
+fn infer_recency(query: &str) -> Option<Recency> {
+    let lowered = query.to_ascii_lowercase();
+    let tokens: Vec<&str> = lowered
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .collect();
+    let has_word = |words: &[&str]| tokens.iter().any(|token| words.contains(token));
+    let has_phrase = |phrases: &[&str]| phrases.iter().any(|phrase| query.contains(phrase));
+
+    let days = if has_word(&["today"]) || has_phrase(&["今天", "今日"]) {
+        1
+    } else if has_phrase(&["本周", "这周"]) {
+        7
+    } else if has_word(&["latest", "current", "recent", "news", "updates", "update"])
+        || has_phrase(&["最新", "最近", "近期", "新闻"])
+    {
+        31
+    } else {
+        return None;
     };
-    is_iso_date(start) && is_iso_date(end)
+    Some(Recency::LastDays(days))
 }
 
 fn is_iso_date(value: &str) -> bool {
@@ -440,16 +526,12 @@ fn is_iso_date(value: &str) -> bool {
 }
 
 fn exa_query(args: &SearchArgs) -> String {
-    match args.freshness.as_deref() {
-        Some("pd") => format!("{} from the last 24 hours", args.query),
-        Some("pw") => format!("{} from the last 7 days", args.query),
-        Some("pm") => format!("{} from the last 31 days", args.query),
-        Some("py") => format!("{} from the last year", args.query),
-        Some(custom) => format!(
-            "{} published between {}",
-            args.query,
-            custom.replace("to", " and ")
-        ),
+    match &args.recency {
+        Some(Recency::LastDays(1)) => format!("{} from the last 24 hours", args.query),
+        Some(Recency::LastDays(days)) => format!("{} from the last {days} days", args.query),
+        Some(Recency::Range { start, end }) => {
+            format!("{} published between {start} and {end}", args.query)
+        }
         None => args.query.clone(),
     }
 }
@@ -540,7 +622,7 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(args.freshness.as_deref(), Some("pm"));
+        assert_eq!(args.recency, Some(Recency::LastDays(31)));
     }
 
     #[test]
@@ -551,7 +633,7 @@ mod tests {
         ))
         .unwrap();
 
-        let params = brave_query_params(&args, args.count);
+        let params = brave_query_params(&args, args.count, today());
 
         assert_eq!(
             params,
@@ -560,6 +642,129 @@ mod tests {
                 ("count", "3".to_string()),
                 ("freshness", "pm".to_string())
             ]
+        );
+    }
+
+    fn today() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 14).expect("valid test date")
+    }
+
+    fn recency_of(raw: &str) -> Option<Recency> {
+        parse_args(&request(Some(raw.to_string()), None))
+            .expect("arguments parse")
+            .recency
+    }
+
+    fn range(start: &str, end: &str) -> Recency {
+        Recency::Range {
+            start: start.to_string(),
+            end: end.to_string(),
+        }
+    }
+
+    #[test]
+    fn fresh_days_maps_to_brave_codes_and_custom_ranges() {
+        for (days, expected) in [
+            (1, "pd"),
+            (7, "pw"),
+            (30, "pm"),
+            (31, "pm"),
+            (365, "py"),
+            (3, "2026-11-11to2026-11-14"),
+        ] {
+            assert_eq!(
+                brave_freshness(&Recency::LastDays(days), today()),
+                expected,
+                "{days} days"
+            );
+        }
+        assert_eq!(
+            brave_freshness(&range("2026-01-01", "2026-02-01"), today()),
+            "2026-01-01to2026-02-01"
+        );
+    }
+
+    #[test]
+    fn fresh_days_accepts_numeric_strings_and_clamps() {
+        assert_eq!(
+            recency_of(r#"{"query":"x","fresh_days":"7"}"#),
+            Some(Recency::LastDays(7))
+        );
+        assert_eq!(recency_of(r#"{"query":"x","fresh_days":0}"#), None);
+        assert_eq!(recency_of(r#"{"query":"x","fresh_days":-3}"#), None);
+        assert_eq!(
+            recency_of(r#"{"query":"x","fresh_days":9999}"#),
+            Some(Recency::LastDays(365))
+        );
+        assert_eq!(recency_of(r#"{"query":"x","fresh_days":"abc"}"#), None);
+    }
+
+    #[test]
+    fn legacy_freshness_codes_still_parse() {
+        assert_eq!(
+            recency_of(r#"{"query":"x","freshness":"pw"}"#),
+            Some(Recency::LastDays(7))
+        );
+        assert_eq!(
+            recency_of(r#"{"query":"x","freshness":"pm"}"#),
+            Some(Recency::LastDays(31))
+        );
+        assert_eq!(
+            recency_of(r#"{"query":"x","freshness":"2026-01-01to2026-02-01"}"#),
+            Some(range("2026-01-01", "2026-02-01"))
+        );
+    }
+
+    #[test]
+    fn fresh_days_wins_over_legacy_freshness() {
+        assert_eq!(
+            recency_of(r#"{"query":"x","fresh_days":1,"freshness":"py"}"#),
+            Some(Recency::LastDays(1))
+        );
+    }
+
+    #[test]
+    fn explicit_fresh_days_wins_over_inferred_keywords() {
+        assert_eq!(
+            recency_of(r#"{"query":"rust news today","fresh_days":30}"#),
+            Some(Recency::LastDays(30))
+        );
+    }
+
+    #[test]
+    fn inferred_recency_understands_today_and_chinese_keywords() {
+        assert_eq!(infer_recency("rust news today"), Some(Recency::LastDays(1)));
+        assert_eq!(infer_recency("今天 天气"), Some(Recency::LastDays(1)));
+        assert_eq!(infer_recency("本周 rust 发布"), Some(Recency::LastDays(7)));
+        assert_eq!(
+            infer_recency("deepseek 最新 模型"),
+            Some(Recency::LastDays(31))
+        );
+        assert_eq!(
+            infer_recency("latest rust release"),
+            Some(Recency::LastDays(31))
+        );
+        assert_eq!(infer_recency("rust ownership"), None);
+    }
+
+    #[test]
+    fn exa_query_describes_day_windows_and_ranges() {
+        let args = |recency| SearchArgs {
+            query: "q".to_string(),
+            count: 5,
+            recency,
+        };
+        assert_eq!(
+            exa_query(&args(Some(Recency::LastDays(1)))),
+            "q from the last 24 hours"
+        );
+        assert_eq!(
+            exa_query(&args(Some(Recency::LastDays(3)))),
+            "q from the last 3 days"
+        );
+        assert_eq!(
+            exa_query(&args(Some(range("2026-01-01", "2026-02-01")))),
+            "q published between 2026-01-01 and 2026-02-01"
         );
     }
 

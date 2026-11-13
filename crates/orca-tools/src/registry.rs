@@ -739,9 +739,9 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                         "type": "integer",
                         "description": "Number of results to return, 1-10 (default: 5)"
                     },
-                    "freshness": {
-                        "type": "string",
-                        "description": "Optional recency filter. Use pd for last 24 hours, pw for last 7 days, pm for last 31 days, py for last year, or YYYY-MM-DDtoYYYY-MM-DD."
+                    "fresh_days": {
+                        "type": "integer",
+                        "description": "Optional recency window in days (1-365): only return pages published in the last N days. Use 1 for today, 7 for this week, 30 for recent news or releases."
                     }
                 },
                 "required": ["query"]
@@ -2642,6 +2642,16 @@ mod tests {
             read_only: false,
         });
         assert_eq!(write.action_kind(), ActionKind::Write);
+    }
+
+    #[test]
+    fn web_search_schema_exposes_fresh_days() {
+        let registry = default_tool_registry();
+        let web_search = registry.resolve("web_search").expect("web search tool");
+        let properties = &web_search.spec.input_schema["properties"];
+
+        assert_eq!(properties["fresh_days"]["type"], "integer");
+        assert!(properties.get("freshness").is_none());
     }
 
     #[test]
